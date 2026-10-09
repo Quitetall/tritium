@@ -1,22 +1,12 @@
 import { blake3 } from "@noble/hashes/blake3.js";
 
-import { TRAINING_MANIFEST_DIGEST_V2 } from "./identity.ts";
-import type {
-  WebTrainingInitialTensorsV1,
-  WebTrainingPayloadErrorCode,
-} from "./payload-types.js";
+import type { WebTrainingInitialTensorsV1, WebTrainingPayloadErrorCode } from "./payload-types.js";
 import type {
   PortableScheduleTensorStoreV1,
   PortableScheduleTensorV1,
 } from "./portable-schedule-types.js";
-import {
-  PortableSchedulePlanError,
-  admittedCompiledBufferMap,
-} from "./portable-schedule.ts";
-import type {
-  CompiledTrainingBufferV1,
-  CompiledTrainingPlanV1,
-} from "./session.ts";
+import { PortableSchedulePlanError, admittedCompiledBufferMap } from "./portable-schedule.ts";
+import type { CompiledTrainingBufferV1, CompiledTrainingPlanV1 } from "./session.ts";
 
 export type {
   WebTrainingInitialTensorsV1,
@@ -73,18 +63,24 @@ function exactNameBytes(name: string): Uint8Array {
   return encoded;
 }
 
-function encodeTensor(tensor: PortableScheduleTensorV1): Readonly<{ dtype: DType; data: Uint8Array }> {
+function encodeTensor(
+  tensor: PortableScheduleTensorV1,
+): Readonly<{ dtype: DType; data: Uint8Array }> {
   if (tensor instanceof Float32Array) {
     const data = new Uint8Array(tensor.byteLength);
     const output = new DataView(data.buffer);
     const lanes = new Uint32Array(tensor.buffer, tensor.byteOffset, tensor.length);
-    lanes.forEach((value, index) => output.setUint32(index * 4, value, true));
+    lanes.forEach((value, index) => {
+      output.setUint32(index * 4, value, true);
+    });
     return { dtype: "f32", data };
   }
   if (tensor instanceof Uint32Array) {
     const data = new Uint8Array(tensor.byteLength);
     const output = new DataView(data.buffer);
-    tensor.forEach((value, index) => output.setUint32(index * 4, value, true));
+    tensor.forEach((value, index) => {
+      output.setUint32(index * 4, value, true);
+    });
     return { dtype: "u32", data };
   }
   if (tensor instanceof Uint8Array) {
@@ -113,9 +109,7 @@ function checkedSize(current: number, addition: number): number {
 }
 
 /** Encode canonical, checksummed root parameter and optimizer-state bytes. */
-export function encodeWebTrainingPayload(
-  tensors: WebTrainingInitialTensorsV1,
-): Uint8Array {
+export function encodeWebTrainingPayload(tensors: WebTrainingInitialTensorsV1): Uint8Array {
   if (typeof tensors !== "object" || tensors === null || Array.isArray(tensors)) {
     fail("invalid_schema", "initial tensors must be an object");
   }
@@ -183,7 +177,9 @@ function decodeTensor(dtype: DType, bytes: Uint8Array): PortableScheduleTensorV1
   return dtype === "u32" ? lanes : new Float32Array(lanes.buffer);
 }
 
-function parsePayload(payload: Uint8Array): ReadonlyMap<string, Readonly<{ dtype: DType; tensor: PortableScheduleTensorV1 }>> {
+function parsePayload(
+  payload: Uint8Array,
+): ReadonlyMap<string, Readonly<{ dtype: DType; tensor: PortableScheduleTensorV1 }>> {
   if (!(payload instanceof Uint8Array)) fail("invalid_schema", "payload must be Uint8Array");
   if (payload.length < HEADER_BYTES || payload.length > MAX_PAYLOAD_BYTES) {
     fail("capacity", "payload length is outside V1 bounds");
@@ -213,7 +209,8 @@ function parsePayload(payload: Uint8Array): ReadonlyMap<string, Readonly<{ dtype
   let offset = 0;
   let previousName: Uint8Array | null = null;
   for (let index = 0; index < count; index += 1) {
-    if (offset + ENTRY_HEADER_BYTES > body.length) fail("invalid_schema", "payload entry header is truncated");
+    if (offset + ENTRY_HEADER_BYTES > body.length)
+      fail("invalid_schema", "payload entry header is truncated");
     const nameLength = view.getUint16(offset, true);
     const dtype = codeDtype(view.getUint8(offset + 2));
     const flags = view.getUint8(offset + 3);
@@ -230,7 +227,8 @@ function parsePayload(payload: Uint8Array): ReadonlyMap<string, Readonly<{ dtype
     } catch {
       fail("invalid_schema", "payload tensor name is invalid UTF-8");
     }
-    if (!equalBytes(UTF8.encode(name), nameBytes)) fail("invalid_schema", "payload tensor name is not canonical UTF-8");
+    if (!equalBytes(UTF8.encode(name), nameBytes))
+      fail("invalid_schema", "payload tensor name is not canonical UTF-8");
     if (previousName !== null && byteOrder(previousName, nameBytes) >= 0) {
       fail("invalid_schema", "payload tensor names are not strictly ordered");
     }
@@ -287,7 +285,10 @@ export function decodeWebTrainingPayload(
   for (const [id, buffer] of owners) {
     const entry = entries.get(id);
     const tensor = entry?.tensor ?? emptyTensor(buffer);
-    if (entry !== undefined && (entry.dtype !== buffer.dtype || tensor.byteLength !== buffer.byteLength)) {
+    if (
+      entry !== undefined &&
+      (entry.dtype !== buffer.dtype || tensor.byteLength !== buffer.byteLength)
+    ) {
       fail("buffer_mismatch", `payload tensor ${id} differs from compiled dtype/shape`);
     }
     if (entry === undefined && buffer.backwardInitialization === "one") tensor.fill(1);

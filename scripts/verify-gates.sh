@@ -122,18 +122,26 @@ JSON
         # The package's WASM release check requires a clean Git tree. Build an
         # independent temporary repository inside the staged snapshot; never
         # call git worktree while the caller's commit index is locked.
-        git -C "$staged_snapshot" init --quiet
-        printf '%s\n' 'packages/tritium-web/node_modules' >>"$staged_snapshot/.gitignore"
-        git -C "$staged_snapshot" add -A
-        git -C "$staged_snapshot" \
-            -c user.name=tritium-precommit \
-            -c user.email=precommit@invalid \
-            commit --quiet --no-verify -m "pre-commit staged snapshot"
-        if [ -d "$repo/packages/tritium-web/node_modules" ]; then
-            ln -s "$repo/packages/tritium-web/node_modules" \
-                "$staged_snapshot/packages/tritium-web/node_modules"
-        fi
+        # commit --only supplies a temporary GIT_INDEX_FILE. Git's other local
+        # repository variables can likewise redirect nested test repositories.
+        # Keep those bindings for staged snapshot capture above, but clear them
+        # only inside this independent repository and its package-check children.
+        git_local_env=$(git rev-parse --local-env-vars)
         (
+            for name in $git_local_env; do
+                unset "$name"
+            done
+            git -C "$staged_snapshot" init --quiet
+            printf '%s\n' 'packages/tritium-web/node_modules' >>"$staged_snapshot/.gitignore"
+            git -C "$staged_snapshot" add -A
+            git -C "$staged_snapshot" \
+                -c user.name=tritium-precommit \
+                -c user.email=precommit@invalid \
+                commit --quiet --no-verify -m "pre-commit staged snapshot"
+            if [ -d "$repo/packages/tritium-web/node_modules" ]; then
+                ln -s "$repo/packages/tritium-web/node_modules" \
+                    "$staged_snapshot/packages/tritium-web/node_modules"
+            fi
             cd "$staged_snapshot"
             run npm --prefix packages/tritium-web run check
         )

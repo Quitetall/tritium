@@ -14,10 +14,7 @@ const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../.
 
 test("WASM build reads guest from Cargo's effective target directory", () => {
   const repository = resolve("/tmp", "tritium-target-fixture");
-  assert.equal(
-    resolveCargoTargetDirectory({}, repository),
-    resolve(repository, "target"),
-  );
+  assert.equal(resolveCargoTargetDirectory({}, repository), resolve(repository, "target"));
   assert.equal(
     resolveCargoTargetDirectory({ CARGO_TARGET_DIR: "build/cargo" }, repository),
     resolve(repository, "build/cargo"),
@@ -49,16 +46,10 @@ test("effective WASM target directory honors Cargo configuration", async () => {
 });
 
 test("WASM build binds current clean Git identity", () => {
-  assert.equal(
-    canonicalSourceIdentity("a".repeat(40), ""),
-    `source-git:${"a".repeat(40)}`,
-  );
+  assert.equal(canonicalSourceIdentity("a".repeat(40), ""), `source-git:${"a".repeat(40)}`);
   assert.throws(
     () => canonicalSourceIdentity("a".repeat(40), " M packages/tritium-web/src/index.ts"),
     /clean Git worktree/,
   );
-  assert.throws(
-    () => canonicalSourceIdentity("not-a-revision", ""),
-    /full lowercase object ID/,
-  );
+  assert.throws(() => canonicalSourceIdentity("not-a-revision", ""), /full lowercase object ID/);
 });

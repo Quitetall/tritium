@@ -34,11 +34,10 @@ export async function resolveEffectiveCargoTargetDirectory(
     return resolveCargoTargetDirectory(environment, repositoryRoot);
   }
 
-  const { stdout } = await run(
-    "cargo",
-    ["metadata", "--no-deps", "--format-version", "1"],
-    { cwd: repositoryRoot, env: environment },
-  );
+  const { stdout } = await run("cargo", ["metadata", "--no-deps", "--format-version", "1"], {
+    cwd: repositoryRoot,
+    env: environment,
+  });
   let metadata;
   try {
     metadata = JSON.parse(stdout);
@@ -140,25 +139,13 @@ export async function buildPortableWasm(output) {
       env: { ...process.env, TRITIUM_SOURCE_ID: sourceIdentity },
     },
   );
-  const { stdout: actualWasmBindgenVersion } = await run("wasm-bindgen", [
-    "--version",
-  ]);
+  const { stdout: actualWasmBindgenVersion } = await run("wasm-bindgen", ["--version"]);
   if (actualWasmBindgenVersion.trim() !== wasmBindgenVersion) {
-    throw new Error(
-      `expected ${wasmBindgenVersion}, got ${actualWasmBindgenVersion.trim()}`,
-    );
+    throw new Error(`expected ${wasmBindgenVersion}, got ${actualWasmBindgenVersion.trim()}`);
   }
   await run(
     "wasm-bindgen",
-    [
-      "--target",
-      "web",
-      "--out-dir",
-      generated,
-      "--out-name",
-      "tritium_wasm",
-      guest,
-    ],
+    ["--target", "web", "--out-dir", generated, "--out-name", "tritium_wasm", guest],
     { cwd: repository },
   );
   const guestBytes = await readFile(resolve(generated, "tritium_wasm_bg.wasm"));
@@ -169,10 +156,7 @@ export async function buildPortableWasm(output) {
     `export const WASM_GUEST_DIGEST_V1 = "${guestDigest}" as const;\n`,
   );
   if (output !== undefined) {
-    await cp(
-      resolve(generated, "tritium_wasm_bg.wasm"),
-      resolve(output, "tritium_wasm_bg.wasm"),
-    );
+    await cp(resolve(generated, "tritium_wasm_bg.wasm"), resolve(output, "tritium_wasm_bg.wasm"));
   }
 }
 

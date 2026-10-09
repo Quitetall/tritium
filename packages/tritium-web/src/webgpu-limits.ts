@@ -1,7 +1,4 @@
-import {
-  WEBGPU_DISPATCH_FORMS_V1,
-  WEBGPU_KERNEL_MODULES_V1,
-} from "./generated-webgpu-kernels.ts";
+import { WEBGPU_DISPATCH_FORMS_V1, WEBGPU_KERNEL_MODULES_V1 } from "./generated-webgpu-kernels.ts";
 
 /**
  * Return the minimum device limits needed to compile every frozen dispatch
@@ -16,20 +13,19 @@ export function webGpuRequiredDeviceLimitsV1(): Readonly<Record<string, number>>
 
   for (const form of Object.values(WEBGPU_DISPATCH_FORMS_V1)) {
     for (const stage of form.stages) {
-      const module = Reflect.get(
-        WEBGPU_KERNEL_MODULES_V1,
-        stage.moduleId,
-      ) as Readonly<{
-        entryPointBindings: Readonly<
-          Record<
-            string,
-            readonly {
-              group: number;
-              addressSpace: "uniform" | "storage";
-            }[]
-          >
-        >;
-      }> | undefined;
+      const module = Reflect.get(WEBGPU_KERNEL_MODULES_V1, stage.moduleId) as
+        | Readonly<{
+            entryPointBindings: Readonly<
+              Record<
+                string,
+                readonly {
+                  group: number;
+                  addressSpace: "uniform" | "storage";
+                }[]
+              >
+            >;
+          }>
+        | undefined;
       const bindings = module?.entryPointBindings[stage.entryPoint];
       if (bindings === undefined) {
         throw new Error(
@@ -44,18 +40,9 @@ export function webGpuRequiredDeviceLimitsV1(): Readonly<Record<string, number>>
         if (binding.addressSpace === "storage") storage += 1;
         else uniform += 1;
       }
-      maxBindingsPerBindGroup = Math.max(
-        maxBindingsPerBindGroup,
-        ...groupCounts.values(),
-      );
-      maxStorageBuffersPerShaderStage = Math.max(
-        maxStorageBuffersPerShaderStage,
-        storage,
-      );
-      maxUniformBuffersPerShaderStage = Math.max(
-        maxUniformBuffersPerShaderStage,
-        uniform,
-      );
+      maxBindingsPerBindGroup = Math.max(maxBindingsPerBindGroup, ...groupCounts.values());
+      maxStorageBuffersPerShaderStage = Math.max(maxStorageBuffersPerShaderStage, storage);
+      maxUniformBuffersPerShaderStage = Math.max(maxUniformBuffersPerShaderStage, uniform);
     }
   }
 

@@ -48,44 +48,40 @@ test("WGSL candidate dependency index keys every frozen tensor operation", () =>
       );
     }
   }
-  assert.deepEqual(
-    bundle.candidateOperationModuleDependencies["optimizer.adamw"],
-    ["adamw", "adamw_terms", "adamw_variance", "adamw_finish"],
-  );
-  assert.deepEqual(
-    bundle.candidateOperationModuleDependencies["optimizer.int8_adamw"],
-    ["byte_codec", "int8_adamw"],
-  );
+  assert.deepEqual(bundle.candidateOperationModuleDependencies["optimizer.adamw"], [
+    "adamw",
+    "adamw_terms",
+    "adamw_variance",
+    "adamw_finish",
+  ]);
+  assert.deepEqual(bundle.candidateOperationModuleDependencies["optimizer.int8_adamw"], [
+    "byte_codec",
+    "int8_adamw",
+  ]);
   assert.deepEqual(
     bundle.modules.int8_adamw.entryPointBindings.dequantize.map((binding) => binding.binding),
     [0, 3, 4, 5, 6],
   );
   assert.deepEqual(
-    bundle.modules.int8_adamw.entryPointBindings.square_variance.map(
-      (binding) => binding.binding,
-    ),
+    bundle.modules.int8_adamw.entryPointBindings.square_variance.map((binding) => binding.binding),
     [0, 4],
   );
   assert.deepEqual(
-    bundle.modules.attention.entryPointBindings.attention_forward.map(
-      (binding) => binding.binding,
-    ),
+    bundle.modules.attention.entryPointBindings.attention_forward.map((binding) => binding.binding),
     [0, 1, 2, 3, 5, 8],
   );
   assert.deepEqual(
-    bundle.modules.attention.entryPointBindings.attention_vjp.map(
-      (binding) => binding.binding,
-    ),
+    bundle.modules.attention.entryPointBindings.attention_vjp.map((binding) => binding.binding),
     [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
   );
-  assert.deepEqual(
-    bundle.candidateOperationModuleDependencies["graph.salt_ste"],
-    ["salt", "pointwise"],
-  );
-  assert.deepEqual(
-    bundle.candidateOperationModuleDependencies["graph.concat_cols"],
-    ["concat", "pointwise"],
-  );
+  assert.deepEqual(bundle.candidateOperationModuleDependencies["graph.salt_ste"], [
+    "salt",
+    "pointwise",
+  ]);
+  assert.deepEqual(bundle.candidateOperationModuleDependencies["graph.concat_cols"], [
+    "concat",
+    "pointwise",
+  ]);
 });
 
 test("WebGPU dispatch catalog covers all 59 frozen execution forms", () => {
@@ -93,11 +89,12 @@ test("WebGPU dispatch catalog covers all 59 frozen execution forms", () => {
   const expected = [];
   for (const operation of manifest.operations) {
     if (operation.category === "lifecycle") continue;
-    const executions = operation.category === "optimizer"
-      ? ["step"]
-      : operation.vjp === "first_order"
-        ? ["forward", "vjp"]
-        : ["forward"];
+    const executions =
+      operation.category === "optimizer"
+        ? ["step"]
+        : operation.vjp === "first_order"
+          ? ["forward", "vjp"]
+          : ["forward"];
     for (const execution of executions) expected.push(`${operation.id}|${execution}`);
   }
   const catalog = webGpuDispatchCatalogV2();
@@ -121,20 +118,19 @@ test("WebGPU dispatch catalog covers all 59 frozen execution forms", () => {
     }
   }
 
-  assert.deepEqual(
-    webGpuDispatchFormV1("graph.salt_ste", "vjp").stages,
-    [{ moduleId: "pointwise", entryPoint: "main", selector: 0,
-      dispatch: "linear_output_64", repeat: "once" }],
-  );
+  assert.deepEqual(webGpuDispatchFormV1("graph.salt_ste", "vjp").stages, [
+    {
+      moduleId: "pointwise",
+      entryPoint: "main",
+      selector: 0,
+      dispatch: "linear_output_64",
+      repeat: "once",
+    },
+  ]);
   assert.equal(webGpuDispatchFormV1("graph.add", "vjp").stages.length, 2);
-  assert.equal(
-    webGpuDispatchFormV1("graph.concat_cols", "vjp").stages[0].repeat,
-    "per_output",
-  );
+  assert.equal(webGpuDispatchFormV1("graph.concat_cols", "vjp").stages[0].repeat, "per_output");
   assert.deepEqual(
-    webGpuDispatchFormV1("optimizer.int8_adamw", "step").stages.map(
-      (stage) => stage.entryPoint,
-    ),
+    webGpuDispatchFormV1("optimizer.int8_adamw", "step").stages.map((stage) => stage.entryPoint),
     [
       "unpack",
       "unpack",

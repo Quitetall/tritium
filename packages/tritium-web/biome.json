@@ -1,0 +1,55 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.15/schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "files": {
+    "ignoreUnknown": true,
+    "includes": [
+      "**",
+      "!src/generated-webgpu-kernels.ts",
+      "!src/operation-bindings.ts",
+      "!package-lock.json"
+    ]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "preset": "recommended"
+    }
+  },
+  "overrides": [
+    {
+      "includes": [
+        "src/geometry.ts",
+        "src/payload.ts",
+        "src/physical-browser-lane.ts",
+        "src/portable-schedule.ts",
+        "src/salt-export.ts",
+        "src/session.ts",
+        "src/wasm-adapter.ts",
+        "src/wasm.ts",
+        "src/webgpu-adapter.ts",
+        "src/webgpu-conformance.ts",
+        "src/webgpu-lowering.ts",
+        "src/webgpu-runtime.ts",
+        "src/webgpu-schedule.ts"
+      ],
+      "linter": {
+        "rules": {
+          "style": {
+            "noNonNullAssertion": "off"
+          }
+        }
+      }
+    }
+  ]
+}

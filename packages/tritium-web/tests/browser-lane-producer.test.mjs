@@ -36,17 +36,20 @@ function sha256(bytes) {
 function canonical(value) {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
   if (value !== null && typeof value === "object") {
-    return `{${Object.keys(value).sort().map((key) =>
-      `${JSON.stringify(key)}:${canonical(value[key])}`
-    ).join(",")}}`;
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`)
+      .join(",")}}`;
   }
   return JSON.stringify(value);
 }
 
-const CANONICAL_VECTOR_CORPUS = JSON.parse(readFileSync(
-  new URL("../../../crates/tritium-spec/data/training/v2/vectors/v2.json", import.meta.url),
-  "utf8",
-));
+const CANONICAL_VECTOR_CORPUS = JSON.parse(
+  readFileSync(
+    new URL("../../../crates/tritium-spec/data/training/v2/vectors/v2.json", import.meta.url),
+    "utf8",
+  ),
+);
 
 function canonicalVectorCases() {
   return CANONICAL_VECTOR_CORPUS.cases.map((item) => {
@@ -163,8 +166,12 @@ function nativeReference(artifact, revision = "a".repeat(40)) {
 
 function browserTrace(referenceDigest) {
   const lifecycleOperations = [
-    "session.forward", "session.backward", "session.step", "session.checkpoint",
-    "session.resume", "session.export",
+    "session.forward",
+    "session.backward",
+    "session.step",
+    "session.checkpoint",
+    "session.resume",
+    "session.export",
   ];
   const lifecycle = {
     prepare: true,
@@ -282,12 +289,7 @@ test("browser producer rejects nonignored untracked source", async () => {
 test("npm archive receipt validates full schema, integrity, and canonical identity", () => {
   const archiveBytes = Buffer.from("exact npm archive bytes");
   const { archive, receipt } = npmArchiveReceipt(archiveBytes);
-  const admitted = validateNpmReceiptV1(
-    receipt,
-    archive,
-    archiveBytes,
-    "a".repeat(40),
-  );
+  const admitted = validateNpmReceiptV1(receipt, archive, archiveBytes, "a".repeat(40));
   assert.equal(admitted.receiptId, receipt.receipt_id);
 
   const extraField = structuredClone(receipt);
@@ -308,9 +310,7 @@ test("npm archive receipt validates full schema, integrity, and canonical identi
 test("native CPU reference is revision, artifact, and receipt bound", () => {
   const artifact = Buffer.from("native artifact");
   const receipt = nativeReference(artifact);
-  const admitted = validateNativeReferenceV1(
-    receipt, artifact, "native.salt", "a".repeat(40),
-  );
+  const admitted = validateNativeReferenceV1(receipt, artifact, "native.salt", "a".repeat(40));
   assert.equal(admitted.receiptDigest, sha256(Buffer.from(canonical(receipt))));
   assert.equal(admitted.artifactSha256, sha256(artifact));
   assert.equal(admitted.reload.reloadedSha256, sha256(artifact));
@@ -345,7 +345,10 @@ test("lane assembly derives every pass claim from browser trace", () => {
     sha256: "3".repeat(64),
   };
   const reference = validateNativeReferenceV1(
-    nativeReference(artifact), artifact, "native.salt", "a".repeat(40),
+    nativeReference(artifact),
+    artifact,
+    "native.salt",
+    "a".repeat(40),
   );
   const result = assembleBrowserLaneV1({
     engine: "chrome",
@@ -385,7 +388,10 @@ test("lane assembly derives every pass claim from browser trace", () => {
 test("lane assembly rejects a rehashed non-canonical vector inventory", () => {
   const artifact = Buffer.from("native artifact");
   const reference = validateNativeReferenceV1(
-    nativeReference(artifact), artifact, "native.salt", "a".repeat(40),
+    nativeReference(artifact),
+    artifact,
+    "native.salt",
+    "a".repeat(40),
   );
   const trace = structuredClone(browserTrace(reference.receiptDigest));
   trace.vector.cases[0].caseId = "fabricated.vector.case";
@@ -394,43 +400,8 @@ test("lane assembly rejects a rehashed non-canonical vector inventory", () => {
   delete unsigned.executionDigest;
   trace.executionDigest = sha256(Buffer.from(canonical(unsigned)));
   assert.throws(
-    () => assembleBrowserLaneV1({
-      engine: "chrome",
-      browserVersion: "140.0.1",
-      os: { name: "Linux", version: "6.8", architecture: "x86_64" },
-      runId: "chrome-physical-1",
-      sourceRevision: "a".repeat(40),
-      archive: {
-        name: `tritium-ai-web-${RELEASE}.tgz`,
-        bytes: 123,
-        sha256: "3".repeat(64),
-      },
-      nativeReference: reference,
-      webdriverCapabilities: {
-        browserName: "chrome",
-        browserVersion: "140.0.1",
-        platformName: "linux",
-      },
-      browserTrace: trace,
-      traceFile: "trace.json",
-    }),
-    (error) => error instanceof BrowserLaneProducerError && error.code === "browser_trace",
-  );
-});
-
-test("lane assembly rejects unobserved submitted cancellation and allocation injection", () => {
-  const artifact = Buffer.from("native artifact");
-  const reference = validateNativeReferenceV1(
-    nativeReference(artifact), artifact, "native.salt", "a".repeat(40),
-  );
-  for (const field of ["cancellation", "allocationFailure"]) {
-    const trace = structuredClone(browserTrace(reference.receiptDigest));
-    trace.faults[field].observedEvents = 0;
-    const unsigned = { ...trace };
-    delete unsigned.executionDigest;
-    trace.executionDigest = sha256(Buffer.from(canonical(unsigned)));
-    assert.throws(
-      () => assembleBrowserLaneV1({
+    () =>
+      assembleBrowserLaneV1({
         engine: "chrome",
         browserVersion: "140.0.1",
         os: { name: "Linux", version: "6.8", architecture: "x86_64" },
@@ -450,6 +421,46 @@ test("lane assembly rejects unobserved submitted cancellation and allocation inj
         browserTrace: trace,
         traceFile: "trace.json",
       }),
+    (error) => error instanceof BrowserLaneProducerError && error.code === "browser_trace",
+  );
+});
+
+test("lane assembly rejects unobserved submitted cancellation and allocation injection", () => {
+  const artifact = Buffer.from("native artifact");
+  const reference = validateNativeReferenceV1(
+    nativeReference(artifact),
+    artifact,
+    "native.salt",
+    "a".repeat(40),
+  );
+  for (const field of ["cancellation", "allocationFailure"]) {
+    const trace = structuredClone(browserTrace(reference.receiptDigest));
+    trace.faults[field].observedEvents = 0;
+    const unsigned = { ...trace };
+    delete unsigned.executionDigest;
+    trace.executionDigest = sha256(Buffer.from(canonical(unsigned)));
+    assert.throws(
+      () =>
+        assembleBrowserLaneV1({
+          engine: "chrome",
+          browserVersion: "140.0.1",
+          os: { name: "Linux", version: "6.8", architecture: "x86_64" },
+          runId: "chrome-physical-1",
+          sourceRevision: "a".repeat(40),
+          archive: {
+            name: `tritium-ai-web-${RELEASE}.tgz`,
+            bytes: 123,
+            sha256: "3".repeat(64),
+          },
+          nativeReference: reference,
+          webdriverCapabilities: {
+            browserName: "chrome",
+            browserVersion: "140.0.1",
+            platformName: "linux",
+          },
+          browserTrace: trace,
+          traceFile: "trace.json",
+        }),
       (error) => error instanceof BrowserLaneProducerError && error.code === "browser_trace",
     );
   }
@@ -467,14 +478,18 @@ test("classic WebDriver client uses W3C session and async-script routes", async 
     requests.push({ method: request.method, url: request.url, body: body && JSON.parse(body) });
     response.setHeader("content-type", "application/json");
     if (request.method === "POST" && request.url === "/session") {
-      response.end(JSON.stringify({ value: {
-        sessionId: "session-1",
-        capabilities: {
-          browserName: "chrome",
-          browserVersion: "140.0.1",
-          platformName: "linux",
-        },
-      } }));
+      response.end(
+        JSON.stringify({
+          value: {
+            sessionId: "session-1",
+            capabilities: {
+              browserName: "chrome",
+              browserVersion: "140.0.1",
+              platformName: "linux",
+            },
+          },
+        }),
+      );
     } else if (request.url === "/session/session-1/execute/async") {
       response.end(JSON.stringify({ value: { ok: true, value: { passed: true } } }));
     } else {
@@ -491,24 +506,29 @@ test("classic WebDriver client uses W3C session and async-script routes", async 
     const result = await client.executeAsync(session.id, "return 1", [[1, 2, 3]]);
     await client.deleteSession(session.id);
     assert.deepEqual(result, { ok: true, value: { passed: true } });
-    assert.deepEqual(requests.map(({ method, url }) => [method, url]), [
-      ["POST", "/session"],
-      ["POST", "/session/session-1/timeouts"],
-      ["POST", "/session/session-1/url"],
-      ["POST", "/session/session-1/execute/async"],
-      ["DELETE", "/session/session-1"],
-    ]);
     assert.deepEqual(
-      requests[0].body.capabilities.alwaysMatch["goog:chromeOptions"].args,
-      ["--enable-unsafe-webgpu", "--enable-features=Vulkan"],
+      requests.map(({ method, url }) => [method, url]),
+      [
+        ["POST", "/session"],
+        ["POST", "/session/session-1/timeouts"],
+        ["POST", "/session/session-1/url"],
+        ["POST", "/session/session-1/execute/async"],
+        ["DELETE", "/session/session-1"],
+      ],
     );
+    assert.deepEqual(requests[0].body.capabilities.alwaysMatch["goog:chromeOptions"].args, [
+      "--enable-unsafe-webgpu",
+      "--enable-features=Vulkan",
+    ]);
     const firefoxSession = await client.createSession("firefox");
     await client.deleteSession(firefoxSession.id);
-    assert.deepEqual(
-      requests[5].body.capabilities.alwaysMatch["moz:firefoxOptions"].prefs,
-      { "dom.webgpu.enabled": true, "webgl.enable-debug-renderer-info": true },
-    );
+    assert.deepEqual(requests[5].body.capabilities.alwaysMatch["moz:firefoxOptions"].prefs, {
+      "dom.webgpu.enabled": true,
+      "webgl.enable-debug-renderer-info": true,
+    });
   } finally {
-    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await new Promise((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
   }
 });

@@ -1,9 +1,5 @@
 import type { PortableScheduleTensorV1 } from "./portable-schedule-types.js";
-import type {
-  CompiledTrainingBufferV1,
-  CompiledTrainingPlanV1,
-  TrainingAttributeSpecV1,
-} from "./session.ts";
+import type { CompiledTrainingPlanV1, TrainingAttributeSpecV1 } from "./session.ts";
 
 const TILE = 256;
 const GROUP = 128;
@@ -44,10 +40,7 @@ function fail(code: SaltExportErrorCode, message: string): never {
   throw new SaltExportError(code, message);
 }
 
-function u64Attribute(
-  attributes: readonly TrainingAttributeSpecV1[],
-  name: string,
-): number {
+function u64Attribute(attributes: readonly TrainingAttributeSpecV1[], name: string): number {
   const attribute = attributes.find((candidate) => candidate.name === name);
   if (
     attribute?.kind !== "u64" ||
@@ -109,10 +102,7 @@ export function compileSaltExportTargets(
       fail("invalid_schema", `${operation.id} SALT export requires 1..=3 planes`);
     }
     if (rows > 1 && cols % GROUP !== 0) {
-      fail(
-        "invalid_schema",
-        `${operation.id} row boundaries do not align to SALT group128 scales`,
-      );
+      fail("invalid_schema", `${operation.id} row boundaries do not align to SALT group128 scales`);
     }
     const candidate = Object.freeze({
       name: owner.id,
@@ -170,16 +160,10 @@ export function saltExportLayout(
       semanticBytes,
       checkedAdd(
         checkedMultiply(elements, target.planes),
-        checkedMultiply(
-          checkedMultiply(Math.ceil(elements / GROUP), 2),
-          target.planes,
-        ),
+        checkedMultiply(checkedMultiply(Math.ceil(elements / GROUP), 2), target.planes),
       ),
     );
-    maxFitScratchBytes = Math.max(
-      maxFitScratchBytes,
-      checkedMultiply(target.cols, 4),
-    );
+    maxFitScratchBytes = Math.max(maxFitScratchBytes, checkedMultiply(target.cols, 4));
   }
   packageBytes = checkedAdd(packageBytes, (8 - (packageBytes % 8)) % 8);
   return Object.freeze({ packageBytes, semanticBytes, maxFitScratchBytes });
@@ -238,10 +222,7 @@ interface EncodedTensor {
   readonly elements: number;
 }
 
-function encodeTensor(
-  target: CompiledSaltExportTargetV1,
-  parameter: Float32Array,
-): EncodedTensor {
+function encodeTensor(target: CompiledSaltExportTargetV1, parameter: Float32Array): EncodedTensor {
   const elements = target.rows * target.cols;
   if (parameter.length !== elements) {
     fail("invalid_state", `parameter ${target.ownerId} changed length before export`);
@@ -299,20 +280,15 @@ function encodeTensor(
         const index = start + column;
         const tile = tiles[Math.floor(index / TILE)]!;
         const local = index - tile.offset;
-        const byte =
-          tile.payloadOffset +
-          plane * tile.payloadBytesPerPlane +
-          Math.floor(local / 5);
-        payload[byte] = payload[byte]! + trit * (3 ** (local % 5));
+        const byte = tile.payloadOffset + plane * tile.payloadBytesPerPlane + Math.floor(local / 5);
+        payload[byte] = payload[byte]! + trit * 3 ** (local % 5);
         residual[column] = Math.fround(residual[column]! - Math.fround(scale * trit));
       }
       for (let group = start; group < start + target.cols; group += GROUP) {
         const tile = tiles[Math.floor(group / TILE)]!;
         const localGroup = Math.floor((group - tile.offset) / GROUP);
         const scaleOffset =
-          tile.scalesOffset +
-          plane * tile.scaleGroupsPerPlane * 2 +
-          localGroup * 2;
+          tile.scalesOffset + plane * tile.scaleGroupsPerPlane * 2 + localGroup * 2;
         scales[scaleOffset] = scaleBits & 0xff;
         scales[scaleOffset + 1] = scaleBits >>> 8;
       }
@@ -392,8 +368,8 @@ export function encodeStateDerivedSaltV2(
     view.setUint32(cursor + 4, tensor.target.dims.length, true);
     writeU64(view, cursor + 8, tensor.elements);
     const raggedValue = tensor.target.planes === 1 ? 0n : tensor.target.planes === 2 ? 1n : 3n;
-    const packedTileCount = BigInt(tensor.tileCount) |
-      (tensor.elements % TILE === 0 ? 0n : raggedValue << 62n);
+    const packedTileCount =
+      BigInt(tensor.tileCount) | (tensor.elements % TILE === 0 ? 0n : raggedValue << 62n);
     view.setBigUint64(cursor + 16, packedTileCount, true);
     writeU64(view, cursor + 24, tensor.payload.length);
     writeU64(view, cursor + 32, tensor.scales.length);

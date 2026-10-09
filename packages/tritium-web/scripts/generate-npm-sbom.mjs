@@ -30,8 +30,13 @@ function integrityHash(value) {
 }
 
 function component(path, value) {
-  if (value === null || typeof value !== "object" || Array.isArray(value) ||
-      typeof value.version !== "string" || value.version.length === 0) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    typeof value.version !== "string" ||
+    value.version.length === 0
+  ) {
     fail(`invalid package-lock component ${path}`);
   }
   const name = packageName(path);
@@ -50,7 +55,10 @@ function component(path, value) {
   }
   const properties = [];
   if (value.optional === true) properties.push({ name: "tritium:npm:optional", value: "true" });
-  for (const [name, values] of [["cpu", value.cpu], ["os", value.os]]) {
+  for (const [name, values] of [
+    ["cpu", value.cpu],
+    ["os", value.os],
+  ]) {
     if (Array.isArray(values)) {
       properties.push({ name: `tritium:npm:${name}`, value: [...values].sort().join(",") });
     }
@@ -59,28 +67,48 @@ function component(path, value) {
   return result;
 }
 
-export function generateNpmSbom(packageJson, packageLock, receipt, archiveFile,
-                                artifactId = "tritium-web-node22") {
+export function generateNpmSbom(
+  packageJson,
+  packageLock,
+  receipt,
+  archiveFile,
+  artifactId = "tritium-web-node22",
+) {
   if (!ARTIFACT_ID.test(artifactId)) fail("artifact id is not portable");
-  if (packageJson === null || typeof packageJson !== "object" ||
-      packageLock === null || typeof packageLock !== "object" ||
-      receipt === null || typeof receipt !== "object") {
+  if (
+    packageJson === null ||
+    typeof packageJson !== "object" ||
+    packageLock === null ||
+    typeof packageLock !== "object" ||
+    receipt === null ||
+    typeof receipt !== "object"
+  ) {
     fail("package, lock and receipt must be objects");
   }
-  if (packageLock.lockfileVersion !== 3 || packageLock.name !== packageJson.name ||
-      packageLock.version !== packageJson.version) {
+  if (
+    packageLock.lockfileVersion !== 3 ||
+    packageLock.name !== packageJson.name ||
+    packageLock.version !== packageJson.version
+  ) {
     fail("package-lock identity differs from package.json");
   }
   const artifact = receipt.artifact;
   const evidence = receipt.evidence;
-  if (artifact === null || typeof artifact !== "object" ||
-      evidence === null || typeof evidence !== "object" ||
-      artifact.package !== `${packageJson.name}@${packageJson.version}` ||
-      !DIGEST.test(artifact.sha256) || !Number.isSafeInteger(artifact.bytes) ||
-      artifact.bytes <= 0 || !/^[0-9a-f]{40}$/.test(receipt.source_revision) ||
-      typeof evidence.source_dirty !== "boolean" || !DIGEST.test(evidence.wasm_guest_digest) ||
-      typeof archiveFile !== "string" ||
-      !/^[A-Za-z0-9][A-Za-z0-9._+-]*\.tgz$/.test(archiveFile)) {
+  if (
+    artifact === null ||
+    typeof artifact !== "object" ||
+    evidence === null ||
+    typeof evidence !== "object" ||
+    artifact.package !== `${packageJson.name}@${packageJson.version}` ||
+    !DIGEST.test(artifact.sha256) ||
+    !Number.isSafeInteger(artifact.bytes) ||
+    artifact.bytes <= 0 ||
+    !/^[0-9a-f]{40}$/.test(receipt.source_revision) ||
+    typeof evidence.source_dirty !== "boolean" ||
+    !DIGEST.test(evidence.wasm_guest_digest) ||
+    typeof archiveFile !== "string" ||
+    !/^[A-Za-z0-9][A-Za-z0-9._+-]*\.tgz$/.test(archiveFile)
+  ) {
     fail("archive receipt does not bind package identity and bytes");
   }
   const packages = packageLock.packages;

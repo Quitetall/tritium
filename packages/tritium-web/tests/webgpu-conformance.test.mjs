@@ -12,10 +12,8 @@ test("qualification inventory binds every canonical vector", () => {
   assert.deepEqual(inventory, {
     schemaId: "tritium.webgpu_vector_conformance_inventory",
     schemaVersion: 1,
-    manifestDigest:
-      "9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098",
-    vectorDigest:
-      "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7",
+    manifestDigest: "9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098",
+    vectorDigest: "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7",
     caseCounts: {
       valid: 72,
       invalid: 45,
@@ -29,13 +27,10 @@ test("qualification inventory binds every canonical vector", () => {
 });
 
 test("qualification runner fails closed before claiming a non-device", async () => {
-  await assert.rejects(
-    runWebGpuVectorConformanceV1({}),
-    (error) => {
-      assert.match(String(error), /WebGPU|device|limits/);
-      return true;
-    },
-  );
+  await assert.rejects(runWebGpuVectorConformanceV1({}), (error) => {
+    assert.match(String(error), /WebGPU|device|limits/);
+    return true;
+  });
 });
 
 test("qualification runner destroys an admitted device when options fail", async () => {
@@ -56,18 +51,17 @@ test("qualification runner destroys an admitted device when options fail", async
       submit() {},
       async onSubmittedWorkDone() {},
     },
-    lost: { then() {} },
+    lost: new Promise(() => {}),
     createShaderModule() {},
     async createComputePipelineAsync() {},
     createBuffer() {},
     createBindGroup() {},
     createCommandEncoder() {},
-    destroy() { destroyed += 1; },
+    destroy() {
+      destroyed += 1;
+    },
   };
-  await assert.rejects(
-    runWebGpuVectorConformanceV1(device, { maxPeakBytes: 0 }),
-    /maxPeakBytes/,
-  );
+  await assert.rejects(runWebGpuVectorConformanceV1(device, { maxPeakBytes: 0 }), /maxPeakBytes/);
   assert.equal(destroyed, 1);
 });
 

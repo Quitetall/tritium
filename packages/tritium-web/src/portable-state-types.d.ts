@@ -1,14 +1,7 @@
 import type { PortableCheckpointStateV1 } from "./lifecycle-types.js";
-import type {
-  PortableTrainingReceiptV1,
-  PortableWasmSourceV1,
-} from "./portable.js";
+import type { PortableTrainingReceiptV1, PortableWasmSourceV1 } from "./portable.js";
 
-export type PortableWasmLifecycleErrorCode =
-  | "backend"
-  | "busy"
-  | "disposed"
-  | "invalid_state";
+export type PortableWasmLifecycleErrorCode = "backend" | "busy" | "disposed" | "invalid_state";
 
 export interface PortableWasmLifecycleBinaryV1 {
   readonly bytes: Uint8Array;

@@ -3,19 +3,9 @@ import {
   parseTrainingManifest,
 } from "../../../bindings/typescript/src/training_manifest.ts";
 
-import {
-  TRAINING_MANIFEST_DIGEST_V2,
-  TRAINING_VECTOR_DIGEST_V2,
-} from "./identity.ts";
-import {
-  TrainingGeometryError,
-  validateTrainingOperationGeometry,
-} from "./geometry.ts";
-import {
-  compileSaltExportTargets,
-  saltExportLayout,
-  SaltExportError,
-} from "./salt-export.ts";
+import { TRAINING_MANIFEST_DIGEST_V2, TRAINING_VECTOR_DIGEST_V2 } from "./identity.ts";
+import { TrainingGeometryError, validateTrainingOperationGeometry } from "./geometry.ts";
+import { compileSaltExportTargets, saltExportLayout, SaltExportError } from "./salt-export.ts";
 import { webGpuRequiredDeviceLimitsV1 } from "./webgpu-limits.ts";
 
 export type WebTrainingBackendPolicyV1 = "auto" | "webgpu" | "wasm";
@@ -116,13 +106,7 @@ export interface TrainingOperationSpecV1 {
   readonly attributes: readonly TrainingAttributeSpecV1[];
 }
 
-export type TrainingAttributeKindV1 =
-  | "f32"
-  | "u64"
-  | "bool"
-  | "text"
-  | "u64-list"
-  | "u32-list";
+export type TrainingAttributeKindV1 = "f32" | "u64" | "bool" | "text" | "u64-list" | "u32-list";
 
 export interface TrainingAttributeSpecV1 {
   readonly name: string;
@@ -178,9 +162,7 @@ export interface WebTrainingModelV1 {
 }
 
 export interface TrainingBatchV1 {
-  readonly inputs: Readonly<
-    Record<string, Float32Array | Uint32Array | Uint8Array>
-  >;
+  readonly inputs: Readonly<Record<string, Float32Array | Uint32Array | Uint8Array>>;
 }
 
 export interface WebTrainingConfigV1 {
@@ -314,10 +296,7 @@ function exactKeys(
   }
   const actual = Object.keys(value).sort();
   const wanted = [...expected].sort();
-  if (
-    actual.length !== wanted.length ||
-    actual.some((key, index) => key !== wanted[index])
-  ) {
+  if (actual.length !== wanted.length || actual.some((key, index) => key !== wanted[index])) {
     fail(code, `${name} fields do not match schema v1`);
   }
 }
@@ -336,11 +315,7 @@ function validateAndCopyBatch(
   state: WebTrainingState,
 ): TrainingBatchV1 {
   exactKeys(batch, ["inputs"], "batch");
-  if (
-    typeof batch.inputs !== "object" ||
-    batch.inputs === null ||
-    Array.isArray(batch.inputs)
-  ) {
+  if (typeof batch.inputs !== "object" || batch.inputs === null || Array.isArray(batch.inputs)) {
     fail("invalid_schema", "batch.inputs must be an object", state);
   }
   const expected = plan.buffers.filter((buffer) => buffer.role === "batch");
@@ -352,10 +327,7 @@ function validateAndCopyBatch(
   ) {
     fail("invalid_schema", "batch inputs do not match the compiled plan", state);
   }
-  const copied = Object.create(null) as Record<
-    string,
-    Float32Array | Uint32Array | Uint8Array
-  >;
+  const copied = Object.create(null) as Record<string, Float32Array | Uint32Array | Uint8Array>;
   for (const buffer of expected) {
     const value = batch.inputs[buffer.id];
     const dtypeMatches =
@@ -363,11 +335,7 @@ function validateAndCopyBatch(
       (buffer.dtype === "u32" && value instanceof Uint32Array) ||
       (buffer.dtype === "bytes" && value instanceof Uint8Array);
     if (!dtypeMatches || value === undefined || value.byteLength !== buffer.byteLength) {
-      fail(
-        "invalid_schema",
-        `batch input ${buffer.id} does not match compiled dtype/shape`,
-        state,
-      );
+      fail("invalid_schema", `batch input ${buffer.id} does not match compiled dtype/shape`, state);
     }
     copied[buffer.id] = copyTypedArray(value);
   }
@@ -434,11 +402,7 @@ function nonemptyUniqueStrings(values: readonly string[], name: string): void {
   }
 }
 
-function uniqueStrings(
-  values: readonly string[],
-  name: string,
-  allowEmpty: boolean,
-): void {
+function uniqueStrings(values: readonly string[], name: string, allowEmpty: boolean): void {
   if (
     !Array.isArray(values) ||
     !isDenseArray(values) ||
@@ -538,24 +502,19 @@ function validateModel(model: WebTrainingModelV1): void {
       tensor.id.length === 0 ||
       tensor.id.startsWith("__tritium.") ||
       !(["f32", "u32", "bytes"] as const).includes(tensor.dtype) ||
-      !([
-        "batch",
-        "parameter",
-        "gradient",
-        "optimizer-state",
-        "activation",
-        "result",
-      ] as const).includes(tensor.role) ||
+      !(
+        ["batch", "parameter", "gradient", "optimizer-state", "activation", "result"] as const
+      ).includes(tensor.role) ||
       !Array.isArray(tensor.shape) ||
       !isDenseArray(tensor.shape) ||
       tensor.shape.some(
         (dimension: unknown) =>
-          typeof dimension !== "number" ||
-          !Number.isSafeInteger(dimension) ||
-          dimension <= 0,
+          typeof dimension !== "number" || !Number.isSafeInteger(dimension) || dimension <= 0,
       ) ||
-      !(tensor.aliasOf === null ||
-        (typeof tensor.aliasOf === "string" && tensor.aliasOf.length > 0))
+      !(
+        tensor.aliasOf === null ||
+        (typeof tensor.aliasOf === "string" && tensor.aliasOf.length > 0)
+      )
     ) {
       fail("invalid_schema", `invalid tensor ${String(tensor.id)}`);
     }
@@ -576,10 +535,7 @@ function validateModel(model: WebTrainingModelV1): void {
     }
     uniqueStrings(operation.inputs, `${operation.id}.inputs`, true);
     uniqueStrings(operation.outputs, `${operation.id}.outputs`, true);
-    if (
-      !Array.isArray(operation.attributes) ||
-      !isDenseArray(operation.attributes)
-    ) {
+    if (!Array.isArray(operation.attributes) || !isDenseArray(operation.attributes)) {
       fail("invalid_schema", `${operation.id}.attributes must be an array`);
     }
     for (const attribute of operation.attributes) {
@@ -640,9 +596,10 @@ function align16(value: number): number {
   return checkedAdd(value, (16 - (value % 16)) % 16, "buffer alignment");
 }
 
-function operationDTypes(
-  operation: string,
-): { readonly inputs: readonly TrainingDTypeV1[]; readonly outputs: readonly TrainingDTypeV1[] } {
+function operationDTypes(operation: string): {
+  readonly inputs: readonly TrainingDTypeV1[];
+  readonly outputs: readonly TrainingDTypeV1[];
+} {
   switch (operation) {
     case "graph.causal_mask":
     case "graph.detach":
@@ -857,9 +814,7 @@ export function compileTrainingPlan(
       (operation) => [operation.id, operation] as const,
     ),
   );
-  const tensors = new Map(
-    model.recipe.tensors.map((tensor) => [tensor.id, tensor] as const),
-  );
+  const tensors = new Map(model.recipe.tensors.map((tensor) => [tensor.id, tensor] as const));
   const allocations = new Map<
     string,
     { readonly byteOffset: number; readonly byteLength: number }
@@ -901,17 +856,17 @@ export function compileTrainingPlan(
       ownerId,
       byteOffset: allocation.byteOffset,
       byteLength: allocation.byteLength,
-      backwardInitialization:
-        tensor.role === "gradient" ? ("zero" as const) : ("none" as const),
+      backwardInitialization: tensor.role === "gradient" ? ("zero" as const) : ("none" as const),
     });
   });
 
   const defined = new Set(
     model.recipe.tensors
-      .filter((tensor) =>
-        tensor.role === "batch" ||
-        tensor.role === "parameter" ||
-        tensor.role === "optimizer-state",
+      .filter(
+        (tensor) =>
+          tensor.role === "batch" ||
+          tensor.role === "parameter" ||
+          tensor.role === "optimizer-state",
       )
       .map((tensor) => tensor.id),
   );
@@ -924,7 +879,8 @@ export function compileTrainingPlan(
     if (descriptor.category === "lifecycle") {
       fail("invalid_schema", "lifecycle operations are session methods, not recipe steps");
     }
-    const operationPhase = descriptor.category === "graph" ? 0 : descriptor.category === "loss" ? 1 : 2;
+    const operationPhase =
+      descriptor.category === "graph" ? 0 : descriptor.category === "loss" ? 1 : 2;
     if (operationPhase < phase) {
       fail("invalid_schema", `${operation.id} violates graph/loss/optimizer phase order`);
     }
@@ -980,16 +936,10 @@ export function compileTrainingPlan(
       if (descriptor.category === "optimizer") {
         const expectedRole = index === 0 ? "parameter" : "optimizer-state";
         if (tensor.role !== expectedRole) {
-          fail(
-            "invalid_schema",
-            `${operation.id} output ${tensorId} must be ${expectedRole}`,
-          );
+          fail("invalid_schema", `${operation.id} output ${tensorId} must be ${expectedRole}`);
         }
       }
-      if (
-        descriptor.category === "optimizer" &&
-        !operation.inputs.includes(tensorId)
-      ) {
+      if (descriptor.category === "optimizer" && !operation.inputs.includes(tensorId)) {
         fail("invalid_schema", `${operation.id} output ${tensorId} is not in-place state`);
       }
       if (!descriptor.mutates && defined.has(tensorId)) {
@@ -1056,10 +1006,7 @@ export function compileTrainingPlan(
       parameter.aliasOf !== null ||
       operation.outputs[0] !== parameter.id
     ) {
-      fail(
-        "invalid_schema",
-        `${operation.id} must update a canonical parameter owner in place`,
-      );
+      fail("invalid_schema", `${operation.id} must update a canonical parameter owner in place`);
     }
     if (
       gradient === undefined ||
@@ -1091,18 +1038,12 @@ export function compileTrainingPlan(
     const parameterElements = tensorByteLength(parameter) / 4;
     for (const [index, stateId] of stateInputIds.entries()) {
       const state = tensors.get(stateId);
-      if (
-        state === undefined ||
-        state.role !== "optimizer-state" ||
-        state.aliasOf !== null
-      ) {
+      if (state === undefined || state.role !== "optimizer-state" || state.aliasOf !== null) {
         fail("invalid_schema", `${operation.id} has invalid optimizer state ${stateId}`);
       }
-      const expectedScale =
-        operation.operation === "optimizer.int8_adamw" && index >= 2;
+      const expectedScale = operation.operation === "optimizer.int8_adamw" && index >= 2;
       const shapeMatches = expectedScale
-        ? state.shape.length === 1 &&
-          state.shape[0] === Math.ceil(parameterElements / 256)
+        ? state.shape.length === 1 && state.shape[0] === Math.ceil(parameterElements / 256)
         : sameShape(state, parameter);
       if (!shapeMatches) {
         fail("invalid_schema", `${operation.id} optimizer state ${stateId} has wrong shape`);
@@ -1126,17 +1067,12 @@ export function compileTrainingPlan(
     if (tensor.role === "gradient" && !claimedGradients.has(tensor.id)) {
       fail("invalid_schema", `gradient ${tensor.id} has no parameter owner`);
     }
-    if (
-      tensor.role === "optimizer-state" &&
-      !claimedOptimizerStates.has(tensor.id)
-    ) {
+    if (tensor.role === "optimizer-state" && !claimedOptimizerStates.has(tensor.id)) {
       fail("invalid_schema", `optimizer state ${tensor.id} has no parameter owner`);
     }
   }
 
-  const lossOperations = operations.filter((operation) =>
-    operation.operation.startsWith("loss."),
-  );
+  const lossOperations = operations.filter((operation) => operation.operation.startsWith("loss."));
   if (lossOperations.length !== 1) {
     fail("invalid_schema", "a training recipe must contain exactly one loss operation");
   }
@@ -1184,7 +1120,7 @@ export function compileTrainingPlan(
   }
   const gradientTargetKey = (tensorId: string): string => {
     const tensor = tensors.get(tensorId)!;
-    return tensor.role === "parameter" ? tensor.aliasOf ?? tensor.id : tensor.id;
+    return tensor.role === "parameter" ? (tensor.aliasOf ?? tensor.id) : tensor.id;
   };
 
   interface ActiveBackwardNode {
@@ -1216,10 +1152,7 @@ export function compileTrainingPlan(
   }
   for (const ownerId of parameterGradientByOwner.keys()) {
     if (!neededGradients.has(ownerId)) {
-      fail(
-        "invalid_schema",
-        `optimized parameter owner ${ownerId} is disconnected from the loss`,
-      );
+      fail("invalid_schema", `optimized parameter owner ${ownerId} is disconnected from the loss`);
     }
   }
 
@@ -1259,9 +1192,7 @@ export function compileTrainingPlan(
       const total = contributionCounts.get(key)!;
       const source = tensors.get(key)!;
       const bufferId =
-        total === 1
-          ? ensureGradientBuffer(key)
-          : allocateInternal(source, "contribution");
+        total === 1 ? ensureGradientBuffer(key) : allocateInternal(source, "contribution");
       const targetContributions = contributions.get(key) ?? [];
       targetContributions.push(bufferId);
       contributions.set(key, targetContributions);
@@ -1313,9 +1244,7 @@ export function compileTrainingPlan(
               Object.freeze({ role: "left", bufferId: accumulated }),
               Object.freeze({ role: "right", bufferId: parts[index]! }),
             ]),
-            outputs: Object.freeze([
-              Object.freeze({ role: "result", bufferId: result }),
-            ]),
+            outputs: Object.freeze([Object.freeze({ role: "result", bufferId: result })]),
             attributes: Object.freeze([]),
           }),
         );
@@ -1329,22 +1258,11 @@ export function compileTrainingPlan(
     2,
     "validation and preparation payloads",
   );
-  const preparePeakBytes = checkedAdd(
-    residentBytes,
-    isolatedPayloadBytes,
-    "prepared model memory",
-  );
+  const preparePeakBytes = checkedAdd(residentBytes, isolatedPayloadBytes, "prepared model memory");
   const batchStagingBytes = buffers
     .filter((buffer) => buffer.role === "batch")
-    .reduce(
-      (total, buffer) => checkedAdd(total, buffer.byteLength, "batch staging"),
-      0,
-    );
-  const forwardPeakBytes = checkedAdd(
-    residentBytes,
-    batchStagingBytes,
-    "forward memory",
-  );
+    .reduce((total, buffer) => checkedAdd(total, buffer.byteLength, "batch staging"), 0);
+  const forwardPeakBytes = checkedAdd(residentBytes, batchStagingBytes, "forward memory");
   const provisionalPeakBytes = Math.max(preparePeakBytes, forwardPeakBytes);
   const provisionalPlan: CompiledTrainingPlanV1 = Object.freeze({
     schemaId: "tritium.compiled_training_plan",
@@ -1419,25 +1337,19 @@ function validateCapabilities(
   recipe: TrainingRecipeV1,
   plan: CompiledTrainingPlanV1,
 ): void {
-  exactKeys(
-    capabilities,
-    CAPABILITY_KEYS,
-    "capabilities",
-    "capability_mismatch",
-  );
+  exactKeys(capabilities, CAPABILITY_KEYS, "capabilities", "capability_mismatch");
   if (
     capabilities.schemaId !== "tritium.web_training_capabilities" ||
     capabilities.schemaVersion !== 1 ||
     capabilities.manifestDigest !== TRAINING_MANIFEST_DIGEST_V2 ||
     capabilities.vectorDigest !== TRAINING_VECTOR_DIGEST_V2 ||
-    !(["webgpu", "wasm-fallback"] as const).includes(
-      capabilities.implementation,
-    ) ||
+    !(["webgpu", "wasm-fallback"] as const).includes(capabilities.implementation) ||
     typeof capabilities.buildId !== "string" ||
     capabilities.buildId.length === 0 ||
-    !(capabilities.physicalDevice === null ||
-      (typeof capabilities.physicalDevice === "string" &&
-        capabilities.physicalDevice.length > 0))
+    !(
+      capabilities.physicalDevice === null ||
+      (typeof capabilities.physicalDevice === "string" && capabilities.physicalDevice.length > 0)
+    )
   ) {
     fail("capability_mismatch", "adapter capability identity is invalid");
   }
@@ -1449,20 +1361,11 @@ function validateCapabilities(
   if (capabilities.maxResidentBytes === 0) {
     fail("capability_mismatch", "adapter maxResidentBytes must be positive");
   }
-  nonemptyUniqueStrings(
-    capabilities.supportedOperations,
-    "capabilities.supportedOperations",
-  );
-  if (
-    config.backend === "webgpu" &&
-    capabilities.implementation !== "webgpu"
-  ) {
+  nonemptyUniqueStrings(capabilities.supportedOperations, "capabilities.supportedOperations");
+  if (config.backend === "webgpu" && capabilities.implementation !== "webgpu") {
     fail("backend_policy", "backend webgpu cannot use a WASM adapter");
   }
-  if (
-    config.backend === "wasm" &&
-    capabilities.implementation !== "wasm-fallback"
-  ) {
+  if (config.backend === "wasm" && capabilities.implementation !== "wasm-fallback") {
     fail("backend_policy", "backend wasm cannot use a WebGPU adapter");
   }
   if (
@@ -1517,26 +1420,15 @@ function validateReceipt(
   ) {
     fail("invalid_receipt", `invalid ${expectedOperation} receipt identity`);
   }
-  safeNonnegativeInteger(
-    receipt.completedSteps,
-    "receipt.completedSteps",
-    "invalid_receipt",
-  );
-  safeNonnegativeInteger(
-    receipt.peakResidentBytes,
-    "receipt.peakResidentBytes",
-    "invalid_receipt",
-  );
+  safeNonnegativeInteger(receipt.completedSteps, "receipt.completedSteps", "invalid_receipt");
+  safeNonnegativeInteger(receipt.peakResidentBytes, "receipt.peakResidentBytes", "invalid_receipt");
   if (
     receipt.peakResidentBytes < minimumResidentBytes ||
     receipt.peakResidentBytes > maxResidentBytes
   ) {
     fail("memory_limit", `${expectedOperation} exceeded the memory ceiling`);
   }
-  if (
-    expectedCompletedSteps !== null &&
-    receipt.completedSteps !== expectedCompletedSteps
-  ) {
+  if (expectedCompletedSteps !== null && receipt.completedSteps !== expectedCompletedSteps) {
     fail("invalid_receipt", `${expectedOperation} reported the wrong step count`);
   }
 }
@@ -1557,10 +1449,7 @@ function snapshotReceipt(receipt: WebTrainingReceiptV1): WebTrainingReceiptV1 {
   });
 }
 
-function snapshotBinaryResult(
-  result: WebBinaryResultV1,
-  operation: string,
-): WebBinaryResultV1 {
+function snapshotBinaryResult(result: WebBinaryResultV1, operation: string): WebBinaryResultV1 {
   exactKeys(result, ["bytes", "receipt"], `${operation} result`, "invalid_receipt");
   const bytes = result.bytes;
   const receipt = snapshotReceipt(result.receipt);
@@ -1570,15 +1459,8 @@ function snapshotBinaryResult(
   return Object.freeze({ bytes: Uint8Array.from(bytes), receipt });
 }
 
-function snapshotCapabilities(
-  capabilities: WebTrainingCapabilitiesV1,
-): WebTrainingCapabilitiesV1 {
-  exactKeys(
-    capabilities,
-    CAPABILITY_KEYS,
-    "capabilities",
-    "capability_mismatch",
-  );
+function snapshotCapabilities(capabilities: WebTrainingCapabilitiesV1): WebTrainingCapabilitiesV1 {
+  exactKeys(capabilities, CAPABILITY_KEYS, "capabilities", "capability_mismatch");
   const supportedOperations = capabilities.supportedOperations;
   if (!Array.isArray(supportedOperations)) {
     fail("capability_mismatch", "supportedOperations must be an array");
@@ -1625,9 +1507,7 @@ function failureReceipt(
   });
 }
 
-function operationSignal(
-  options: WebTrainingOperationOptionsV1 | undefined,
-): AbortSignal | null {
+function operationSignal(options: WebTrainingOperationOptionsV1 | undefined): AbortSignal | null {
   if (options === undefined) return null;
   if (typeof options !== "object" || options === null || Array.isArray(options)) {
     fail("invalid_schema", "operation options must be an object");
@@ -1651,12 +1531,10 @@ function operationSignal(
 }
 
 function signalAborted(signal: AbortSignal | null): boolean {
-  return signal !== null && signal.aborted;
+  return signal?.aborted ?? false;
 }
 
-function adapterFailureCause(
-  error: unknown,
-): "cancelled" | "device_lost" | null {
+function adapterFailureCause(error: unknown): "cancelled" | "device_lost" | null {
   if (typeof error !== "object" || error === null) return null;
   try {
     const code = Reflect.get(error, "code");
@@ -1800,7 +1678,7 @@ export class WebTrainingSession {
       ...safeModel,
       payload: capturedPayload,
     });
-    let validation: void;
+    let validation: unknown;
     try {
       validation = await adapter.validate(safeModel, safeConfig, plan);
     } catch (error) {
@@ -1862,12 +1740,7 @@ export class WebTrainingSession {
         failed,
       );
     }
-    return new WebTrainingSession(
-      adapter,
-      safeConfig.maxResidentBytes,
-      capabilities,
-      plan,
-    );
+    return new WebTrainingSession(adapter, safeConfig.maxResidentBytes, capabilities, plan);
   }
 
   get state(): WebTrainingState {
@@ -1924,12 +1797,7 @@ export class WebTrainingSession {
   ): Promise<T> {
     const stateBefore = this.#state;
     if (signalAborted(signal)) {
-      const receipt = this.#failureReceipt(
-        operation,
-        "cancelled",
-        stateBefore,
-        stateBefore,
-      );
+      const receipt = this.#failureReceipt(operation, "cancelled", stateBefore, stateBefore);
       throw new WebTrainingError(
         "cancelled",
         `${operation} was cancelled before dispatch`,
@@ -1941,9 +1809,7 @@ export class WebTrainingSession {
       return await run(signal);
     } catch (error) {
       const recoverableCode =
-        error instanceof PostDispatchAdmissionError
-          ? null
-          : recoverableAdapterErrorCode(error);
+        error instanceof PostDispatchAdmissionError ? null : recoverableAdapterErrorCode(error);
       if (recoverableCode !== null) {
         throw new WebTrainingError(
           recoverableCode,
@@ -1974,17 +1840,9 @@ export class WebTrainingSession {
     }
   }
 
-  #rejectPreDispatchCancellation(
-    operation: string,
-    signal: AbortSignal | null,
-  ): void {
+  #rejectPreDispatchCancellation(operation: string, signal: AbortSignal | null): void {
     if (!signalAborted(signal)) return;
-    const receipt = this.#failureReceipt(
-      operation,
-      "cancelled",
-      this.#state,
-      this.#state,
-    );
+    const receipt = this.#failureReceipt(operation, "cancelled", this.#state, this.#state);
     throw new WebTrainingError(
       "cancelled",
       `${operation} was cancelled before dispatch`,
@@ -2012,34 +1870,30 @@ export class WebTrainingSession {
       const signal = operationSignal(options);
       this.#rejectPreDispatchCancellation("session.forward", signal);
       const safeBatch = validateAndCopyBatch(batch, this.plan, this.#state);
-      return this.#adapterTransaction(
-        "session.forward",
-        signal,
-        async (admittedSignal) => {
-          const result = await this.#adapter.forward(safeBatch, admittedSignal);
-          return admitPostDispatch(() => {
-            exactKeys(result, ["loss", "receipt"], "forward result", "invalid_receipt");
-            const safeResult = Object.freeze({
-              loss: result.loss,
-              receipt: snapshotReceipt(result.receipt),
-            });
-            if (!Number.isFinite(safeResult.loss)) {
-              fail("invalid_receipt", "forward loss must be finite", this.#state);
-            }
-            validateReceipt(
-              safeResult.receipt,
-              this.capabilities,
-              "session.forward",
-              this.plan.forwardPeakBytes,
-              this.#maxResidentBytes,
-              this.#completedSteps,
-            );
-            this.#lastResult = safeResult;
-            this.#state = "forward-complete";
-            return safeResult;
+      return this.#adapterTransaction("session.forward", signal, async (admittedSignal) => {
+        const result = await this.#adapter.forward(safeBatch, admittedSignal);
+        return admitPostDispatch(() => {
+          exactKeys(result, ["loss", "receipt"], "forward result", "invalid_receipt");
+          const safeResult = Object.freeze({
+            loss: result.loss,
+            receipt: snapshotReceipt(result.receipt),
           });
-        },
-      );
+          if (!Number.isFinite(safeResult.loss)) {
+            fail("invalid_receipt", "forward loss must be finite", this.#state);
+          }
+          validateReceipt(
+            safeResult.receipt,
+            this.capabilities,
+            "session.forward",
+            this.plan.forwardPeakBytes,
+            this.#maxResidentBytes,
+            this.#completedSteps,
+          );
+          this.#lastResult = safeResult;
+          this.#state = "forward-complete";
+          return safeResult;
+        });
+      });
     });
   }
 
@@ -2054,26 +1908,22 @@ export class WebTrainingSession {
       if (result !== this.#lastResult) {
         fail("invalid_state", "backward result is not the active forward", this.#state);
       }
-      return this.#adapterTransaction(
-        "session.backward",
-        signal,
-        async (admittedSignal) => {
-          const rawReceipt = await this.#adapter.backward(result, admittedSignal);
-          return admitPostDispatch(() => {
-            const receipt = snapshotReceipt(rawReceipt);
-            validateReceipt(
-              receipt,
-              this.capabilities,
-              "session.backward",
-              this.plan.peakBytes,
-              this.#maxResidentBytes,
-              this.#completedSteps,
-            );
-            this.#state = "backward-complete";
-            return receipt;
-          });
-        },
-      );
+      return this.#adapterTransaction("session.backward", signal, async (admittedSignal) => {
+        const rawReceipt = await this.#adapter.backward(result, admittedSignal);
+        return admitPostDispatch(() => {
+          const receipt = snapshotReceipt(rawReceipt);
+          validateReceipt(
+            receipt,
+            this.capabilities,
+            "session.backward",
+            this.plan.peakBytes,
+            this.#maxResidentBytes,
+            this.#completedSteps,
+          );
+          this.#state = "backward-complete";
+          return receipt;
+        });
+      });
     });
   }
 
@@ -2081,56 +1931,46 @@ export class WebTrainingSession {
     return this.#exclusive(async () => {
       this.#require("backward-complete", "step");
       const signal = operationSignal(options);
-      return this.#adapterTransaction(
-        "session.step",
-        signal,
-        async (admittedSignal) => {
-          const rawReceipt = await this.#adapter.step(admittedSignal);
-          return admitPostDispatch(() => {
-            const receipt = snapshotReceipt(rawReceipt);
-            validateReceipt(
-              receipt,
-              this.capabilities,
-              "session.step",
-              this.plan.peakBytes,
-              this.#maxResidentBytes,
-              this.#completedSteps + 1,
-            );
-            this.#completedSteps = receipt.completedSteps;
-            this.#lastResult = null;
-            this.#state = "prepared";
-            return receipt;
-          });
-        },
-      );
+      return this.#adapterTransaction("session.step", signal, async (admittedSignal) => {
+        const rawReceipt = await this.#adapter.step(admittedSignal);
+        return admitPostDispatch(() => {
+          const receipt = snapshotReceipt(rawReceipt);
+          validateReceipt(
+            receipt,
+            this.capabilities,
+            "session.step",
+            this.plan.peakBytes,
+            this.#maxResidentBytes,
+            this.#completedSteps + 1,
+          );
+          this.#completedSteps = receipt.completedSteps;
+          this.#lastResult = null;
+          this.#state = "prepared";
+          return receipt;
+        });
+      });
     });
   }
 
-  async checkpoint(
-    options?: WebTrainingOperationOptionsV1,
-  ): Promise<WebBinaryResultV1> {
+  async checkpoint(options?: WebTrainingOperationOptionsV1): Promise<WebBinaryResultV1> {
     return this.#exclusive(async () => {
       this.#require("prepared", "checkpoint");
       const signal = operationSignal(options);
-      return this.#adapterTransaction(
-        "session.checkpoint",
-        signal,
-        async (admittedSignal) => {
-          const rawResult = await this.#adapter.checkpoint(admittedSignal);
-          return admitPostDispatch(() => {
-            const result = snapshotBinaryResult(rawResult, "checkpoint");
-            validateReceipt(
-              result.receipt,
-              this.capabilities,
-              "session.checkpoint",
-              this.plan.peakBytes,
-              this.#maxResidentBytes,
-              this.#completedSteps,
-            );
-            return result;
-          });
-        },
-      );
+      return this.#adapterTransaction("session.checkpoint", signal, async (admittedSignal) => {
+        const rawResult = await this.#adapter.checkpoint(admittedSignal);
+        return admitPostDispatch(() => {
+          const result = snapshotBinaryResult(rawResult, "checkpoint");
+          validateReceipt(
+            result.receipt,
+            this.capabilities,
+            "session.checkpoint",
+            this.plan.peakBytes,
+            this.#maxResidentBytes,
+            this.#completedSteps,
+          );
+          return result;
+        });
+      });
     });
   }
 
@@ -2145,29 +1985,22 @@ export class WebTrainingSession {
       if (!(checkpoint instanceof Uint8Array) || checkpoint.byteLength === 0) {
         fail("invalid_schema", "checkpoint must not be empty", this.#state);
       }
-      return this.#adapterTransaction(
-        "session.resume",
-        signal,
-        async (admittedSignal) => {
-          const rawReceipt = await this.#adapter.resume(
-            Uint8Array.from(checkpoint),
-            admittedSignal,
+      return this.#adapterTransaction("session.resume", signal, async (admittedSignal) => {
+        const rawReceipt = await this.#adapter.resume(Uint8Array.from(checkpoint), admittedSignal);
+        return admitPostDispatch(() => {
+          const receipt = snapshotReceipt(rawReceipt);
+          validateReceipt(
+            receipt,
+            this.capabilities,
+            "session.resume",
+            this.plan.peakBytes,
+            this.#maxResidentBytes,
+            null,
           );
-          return admitPostDispatch(() => {
-            const receipt = snapshotReceipt(rawReceipt);
-            validateReceipt(
-              receipt,
-              this.capabilities,
-              "session.resume",
-              this.plan.peakBytes,
-              this.#maxResidentBytes,
-              null,
-            );
-            this.#completedSteps = receipt.completedSteps;
-            return receipt;
-          });
-        },
-      );
+          this.#completedSteps = receipt.completedSteps;
+          return receipt;
+        });
+      });
     });
   }
 
@@ -2175,25 +2008,21 @@ export class WebTrainingSession {
     return this.#exclusive(async () => {
       this.#require("prepared", "export");
       const signal = operationSignal(options);
-      return this.#adapterTransaction(
-        "session.export",
-        signal,
-        async (admittedSignal) => {
-          const rawResult = await this.#adapter.export(admittedSignal);
-          return admitPostDispatch(() => {
-            const result = snapshotBinaryResult(rawResult, "export");
-            validateReceipt(
-              result.receipt,
-              this.capabilities,
-              "session.export",
-              this.plan.exportPeakBytes,
-              this.#maxResidentBytes,
-              this.#completedSteps,
-            );
-            return result;
-          });
-        },
-      );
+      return this.#adapterTransaction("session.export", signal, async (admittedSignal) => {
+        const rawResult = await this.#adapter.export(admittedSignal);
+        return admitPostDispatch(() => {
+          const result = snapshotBinaryResult(rawResult, "export");
+          validateReceipt(
+            result.receipt,
+            this.capabilities,
+            "session.export",
+            this.plan.exportPeakBytes,
+            this.#maxResidentBytes,
+            this.#completedSteps,
+          );
+          return result;
+        });
+      });
     });
   }
 
@@ -2224,23 +2053,25 @@ async function requestDefaultWebGpuAdapter(): Promise<WebTrainingAdapterV1 | nul
   if (typeof gpu !== "object" || gpu === null) return null;
   const requestAdapter = capturedMember(gpu, "requestAdapter");
   if (typeof requestAdapter !== "function") return null;
-  const physicalAdapter = await Reflect.apply(requestAdapter, gpu, [{
-    powerPreference: "high-performance",
-  }]);
+  const physicalAdapter = await Reflect.apply(requestAdapter, gpu, [
+    {
+      powerPreference: "high-performance",
+    },
+  ]);
   if (typeof physicalAdapter !== "object" || physicalAdapter === null) return null;
   const requestDevice = capturedMember(physicalAdapter, "requestDevice");
   if (typeof requestDevice !== "function") return null;
-  const device = await Reflect.apply(requestDevice, physicalAdapter, [{
-    requiredLimits: webGpuRequiredDeviceLimitsV1(),
-  }]);
+  const device = await Reflect.apply(requestDevice, physicalAdapter, [
+    {
+      requiredLimits: webGpuRequiredDeviceLimitsV1(),
+    },
+  ]);
   if (typeof device !== "object" || device === null) {
     fail("adapter_unavailable", "WebGPU requestDevice returned no device");
   }
   try {
     const { createWebGpuTrainingAdapter } = await import("./webgpu-adapter.ts");
-    return createWebGpuTrainingAdapter(
-      device as Parameters<typeof createWebGpuTrainingAdapter>[0],
-    );
+    return createWebGpuTrainingAdapter(device as Parameters<typeof createWebGpuTrainingAdapter>[0]);
   } catch (error) {
     const destroy = capturedMember(device, "destroy");
     if (typeof destroy === "function") {
@@ -2265,7 +2096,7 @@ export async function prepareTraining(
   if (adapter === undefined) {
     if (config.backend !== "wasm") {
       try {
-        adapter = await requestDefaultWebGpuAdapter() ?? undefined;
+        adapter = (await requestDefaultWebGpuAdapter()) ?? undefined;
         ownsAutomaticAdapter = adapter !== undefined;
       } catch (error) {
         if (config.backend === "webgpu" || !config.allowWasmFallback) {
@@ -2279,14 +2110,14 @@ export async function prepareTraining(
         }
       }
     }
-    if (adapter === undefined &&
-        (config.backend === "wasm" ||
-          (config.backend === "auto" && config.allowWasmFallback))) {
+    if (
+      adapter === undefined &&
+      (config.backend === "wasm" || (config.backend === "auto" && config.allowWasmFallback))
+    ) {
       const plan = compileTrainingPlan(model, config);
-      const {
-        createPortableWasmTrainingAdapter,
-        validatePortableWasmPlan,
-      } = await import("./wasm-adapter.ts");
+      const { createPortableWasmTrainingAdapter, validatePortableWasmPlan } = await import(
+        "./wasm-adapter.ts"
+      );
       validatePortableWasmPlan(plan);
       try {
         adapter = await createPortableWasmTrainingAdapter();
@@ -2300,10 +2131,7 @@ export async function prepareTraining(
         );
       }
     } else if (adapter === undefined) {
-      fail(
-        "adapter_unavailable",
-        "no WebGPU adapter or device is available",
-      );
+      fail("adapter_unavailable", "no WebGPU adapter or device is available");
     }
   }
   try {

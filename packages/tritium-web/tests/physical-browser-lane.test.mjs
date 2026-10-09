@@ -40,7 +40,13 @@ test("physical browser lane rejects malformed options before GPU acquisition", a
   const priorNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
   Object.defineProperty(globalThis, "navigator", {
     configurable: true,
-    value: { gpu: { requestAdapter() { requests += 1; } } },
+    value: {
+      gpu: {
+        requestAdapter() {
+          requests += 1;
+        },
+      },
+    },
   });
   try {
     await rejectsCode(
@@ -116,10 +122,7 @@ test("no-op structural WebGPU cannot produce a physical lane", async () => {
               isFallbackAdapter: false,
             },
             async requestDevice(descriptor) {
-              assert.equal(
-                descriptor.requiredLimits.maxStorageBuffersPerShaderStage,
-                9,
-              );
+              assert.equal(descriptor.requiredLimits.maxStorageBuffersPerShaderStage, 9);
               assert.equal(descriptor.requiredLimits.maxUniformBuffersPerShaderStage, 1);
               const device = new FakeDevice();
               devices.push(device);
@@ -162,7 +165,7 @@ test("Firefox non-fallback adapter uses WebGL hardware identity before vector qu
   const document = {
     createElement(name) {
       assert.equal(name, "canvas");
-      return { getContext: (kind) => kind === "webgl2" ? webgl : null };
+      return { getContext: (kind) => (kind === "webgl2" ? webgl : null) };
     },
   };
   Object.defineProperty(globalThis, "navigator", {

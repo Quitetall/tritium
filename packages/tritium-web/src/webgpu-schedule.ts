@@ -109,8 +109,12 @@ function arraySnapshot<T>(
   } catch {
     fail("invalid_schema", `${context} could not be read`);
   }
-  if (!Number.isSafeInteger(length) || (length as number) < 0 ||
-      keys.length !== length || keys.some((key, index) => key !== String(index))) {
+  if (
+    !Number.isSafeInteger(length) ||
+    (length as number) < 0 ||
+    keys.length !== length ||
+    keys.some((key, index) => key !== String(index))
+  ) {
     fail("invalid_schema", `${context} must be dense without extra fields`);
   }
   const result: T[] = [];
@@ -150,32 +154,46 @@ function snapshotPlan(value: CompiledTrainingPlanV1): CompiledTrainingPlanV1 {
       bufferId: property(binding, "bufferId", context),
     }) as CompiledTrainingPlanV1["backwardOperations"][number]["inputs"][number];
   };
-  const buffers = arraySnapshot(property(source, "buffers", "compiled plan"), "buffers", (item, context) => {
-    const buffer = recordSnapshot(item, context);
-    return Object.freeze({
-      id: property(buffer, "id", context),
-      role: property(buffer, "role", context),
-      dtype: property(buffer, "dtype", context),
-      shape: captureShape(property(buffer, "shape", context), `${context}.shape`),
-      aliasOf: property(buffer, "aliasOf", context),
-      ownerId: property(buffer, "ownerId", context),
-      byteOffset: property(buffer, "byteOffset", context),
-      byteLength: property(buffer, "byteLength", context),
-      backwardInitialization: property(buffer, "backwardInitialization", context),
-    }) as CompiledTrainingPlanV1["buffers"][number];
-  });
+  const buffers = arraySnapshot(
+    property(source, "buffers", "compiled plan"),
+    "buffers",
+    (item, context) => {
+      const buffer = recordSnapshot(item, context);
+      return Object.freeze({
+        id: property(buffer, "id", context),
+        role: property(buffer, "role", context),
+        dtype: property(buffer, "dtype", context),
+        shape: captureShape(property(buffer, "shape", context), `${context}.shape`),
+        aliasOf: property(buffer, "aliasOf", context),
+        ownerId: property(buffer, "ownerId", context),
+        byteOffset: property(buffer, "byteOffset", context),
+        byteLength: property(buffer, "byteLength", context),
+        backwardInitialization: property(buffer, "backwardInitialization", context),
+      }) as CompiledTrainingPlanV1["buffers"][number];
+    },
+  );
   const operations = arraySnapshot(
-    property(source, "operations", "compiled plan"), "operations", (item, context) => {
+    property(source, "operations", "compiled plan"),
+    "operations",
+    (item, context) => {
       const operation = recordSnapshot(item, context);
       return Object.freeze({
         id: property(operation, "id", context),
         operation: property(operation, "operation", context),
-        inputs: arraySnapshot(property(operation, "inputs", context), `${context}.inputs`,
-          (entry) => entry as string),
-        outputs: arraySnapshot(property(operation, "outputs", context), `${context}.outputs`,
-          (entry) => entry as string),
+        inputs: arraySnapshot(
+          property(operation, "inputs", context),
+          `${context}.inputs`,
+          (entry) => entry as string,
+        ),
+        outputs: arraySnapshot(
+          property(operation, "outputs", context),
+          `${context}.outputs`,
+          (entry) => entry as string,
+        ),
         attributes: arraySnapshot(
-          property(operation, "attributes", context), `${context}.attributes`, captureAttribute,
+          property(operation, "attributes", context),
+          `${context}.attributes`,
+          captureAttribute,
         ),
       }) as CompiledTrainingPlanV1["operations"][number];
     },
@@ -191,13 +209,19 @@ function snapshotPlan(value: CompiledTrainingPlanV1): CompiledTrainingPlanV1 {
         operation: property(operation, "operation", context),
         execution: property(operation, "execution", context),
         inputs: arraySnapshot(
-          property(operation, "inputs", context), `${context}.inputs`, captureBinding,
+          property(operation, "inputs", context),
+          `${context}.inputs`,
+          captureBinding,
         ),
         outputs: arraySnapshot(
-          property(operation, "outputs", context), `${context}.outputs`, captureBinding,
+          property(operation, "outputs", context),
+          `${context}.outputs`,
+          captureBinding,
         ),
         attributes: arraySnapshot(
-          property(operation, "attributes", context), `${context}.attributes`, captureAttribute,
+          property(operation, "attributes", context),
+          `${context}.attributes`,
+          captureAttribute,
         ),
       }) as CompiledTrainingPlanV1["backwardOperations"][number];
     },
@@ -285,7 +309,9 @@ function uniform(bytes: number, write: (view: DataView) => void): Uint8Array {
 
 function u32Bytes(values: readonly number[]): Uint8Array {
   return uniform(values.length * 4, (view) => {
-    values.forEach((value, index) => view.setUint32(index * 4, value, true));
+    values.forEach((value, index) => {
+      view.setUint32(index * 4, value, true);
+    });
   });
 }
 
@@ -311,9 +337,12 @@ function expect(
   role: string,
 ): void {
   const buffer = buffers.get(bufferId);
-  if (buffer === undefined || buffer.dtype !== dtype ||
-      buffer.shape.length !== shape.length ||
-      buffer.shape.some((dimension, index) => dimension !== shape[index])) {
+  if (
+    buffer === undefined ||
+    buffer.dtype !== dtype ||
+    buffer.shape.length !== shape.length ||
+    buffer.shape.some((dimension, index) => dimension !== shape[index])
+  ) {
     fail("invalid_schema", `${role} differs from specialized WebGPU geometry`);
   }
 }
@@ -346,9 +375,11 @@ function indexedStage(
   expectedEntryPoint = "main",
 ): WebGpuResidentDispatchV1 {
   const form = webGpuDispatchFormV1(invocation.operation, invocation.execution);
-  if (form.stages[stageIndex]?.repeat !== expectedRepeat ||
-      form.stages[stageIndex]?.moduleId !== expectedModuleId ||
-      form.stages[stageIndex]?.entryPoint !== expectedEntryPoint) {
+  if (
+    form.stages[stageIndex]?.repeat !== expectedRepeat ||
+    form.stages[stageIndex]?.moduleId !== expectedModuleId ||
+    form.stages[stageIndex]?.entryPoint !== expectedEntryPoint
+  ) {
     fail("invalid_schema", `${invocation.operation} specialized catalog stage drifted`);
   }
   return Object.freeze({
@@ -376,7 +407,13 @@ function stage(
     fail("invalid_schema", `${invocation.operation} specialized catalog stage drifted`);
   }
   return indexedStage(
-    invocation, 0, expectedModuleId, uniformBytes, storageBindings, workgroups, expectedRepeat,
+    invocation,
+    0,
+    expectedModuleId,
+    uniformBytes,
+    storageBindings,
+    workgroups,
+    expectedRepeat,
     expectedEntryPoint,
   );
 }
@@ -393,8 +430,11 @@ export function compileWebGpuResidentScheduleV1(
   if (!Number.isSafeInteger(maxPeakBytes) || (maxPeakBytes as number) < 0) {
     fail("invalid_schema", "WebGPU schedule maxPeakBytes must be a nonnegative safe integer");
   }
-  if (!Number.isSafeInteger(uniformStride) || (uniformStride as number) < 256 ||
-      (uniformStride as number) % 256 !== 0) {
+  if (
+    !Number.isSafeInteger(uniformStride) ||
+    (uniformStride as number) < 256 ||
+    (uniformStride as number) % 256 !== 0
+  ) {
     fail("invalid_schema", "WebGPU schedule uniformStride must be a positive 256-byte multiple");
   }
   const buffers = admittedWebGpuBuffersV1(plan);
@@ -407,13 +447,15 @@ export function compileWebGpuResidentScheduleV1(
     plan.exportPeakBytes,
     plan.peakBytes,
   ];
-  if (metrics.some((value) => !Number.isSafeInteger(value) || value < 0) ||
-      plan.preparePeakBytes < plan.residentBytes ||
-      plan.forwardPeakBytes < plan.residentBytes ||
-      plan.peakBytes < plan.residentBytes ||
-      plan.peakBytes < plan.preparePeakBytes ||
-      plan.peakBytes < plan.forwardPeakBytes ||
-      plan.peakBytes < plan.exportPeakBytes) {
+  if (
+    metrics.some((value) => !Number.isSafeInteger(value) || value < 0) ||
+    plan.preparePeakBytes < plan.residentBytes ||
+    plan.forwardPeakBytes < plan.residentBytes ||
+    plan.peakBytes < plan.residentBytes ||
+    plan.peakBytes < plan.preparePeakBytes ||
+    plan.peakBytes < plan.forwardPeakBytes ||
+    plan.peakBytes < plan.exportPeakBytes
+  ) {
     fail("invalid_schema", "compiled plan memory metrics are inconsistent");
   }
   let rootBytes = 0;
@@ -421,8 +463,10 @@ export function compileWebGpuResidentScheduleV1(
   for (const buffer of buffers.values()) {
     if (buffer.ownerId !== buffer.id) continue;
     const physicalBytes = Math.max(4, Math.ceil(buffer.byteLength / 4) * 4);
-    if (rootBytes > Number.MAX_SAFE_INTEGER - buffer.byteLength ||
-        physicalRootBytes > Number.MAX_SAFE_INTEGER - physicalBytes) {
+    if (
+      rootBytes > Number.MAX_SAFE_INTEGER - buffer.byteLength ||
+      physicalRootBytes > Number.MAX_SAFE_INTEGER - physicalBytes
+    ) {
       fail("memory_limit", "compiled root buffers exceed safe integer range");
     }
     rootBytes += buffer.byteLength;
@@ -439,13 +483,13 @@ export function compileWebGpuResidentScheduleV1(
   let auxiliaryBytes = 0;
   let serial = 0;
 
-  const auxiliary = (
-    stem: string,
-    byteLength: number,
-    initialValues: readonly number[] | null,
-  ) => {
-    if (!Number.isSafeInteger(byteLength) || byteLength <= 0 || byteLength % 4 !== 0 ||
-        (initialValues !== null && initialValues.length * 4 !== byteLength)) {
+  const auxiliary = (stem: string, byteLength: number, initialValues: readonly number[] | null) => {
+    if (
+      !Number.isSafeInteger(byteLength) ||
+      byteLength <= 0 ||
+      byteLength % 4 !== 0 ||
+      (initialValues !== null && initialValues.length * 4 !== byteLength)
+    ) {
       fail("invalid_schema", `${stem} auxiliary resource is invalid`);
     }
     let id: string;
@@ -458,17 +502,17 @@ export function compileWebGpuResidentScheduleV1(
       fail("memory_limit", "specialized WebGPU auxiliary budget overflows");
     }
     auxiliaryBytes += byteLength;
-    pendingResources.push(Object.freeze({
-      id,
-      byteLength,
-      initialValues,
-    }));
+    pendingResources.push(
+      Object.freeze({
+        id,
+        byteLength,
+        initialValues,
+      }),
+    );
     return id;
   };
 
-  const compileSpecialized = (
-    invocation: WebGpuLoweringInvocationV1,
-  ): Template => {
+  const compileSpecialized = (invocation: WebGpuLoweringInvocationV1): Template => {
     const input = invocation.inputs;
     const output = invocation.outputs;
     const attributes = invocation.attributes;
@@ -489,9 +533,9 @@ export function compileWebGpuResidentScheduleV1(
           view.setUint32(8, planes, true);
         });
         return Object.freeze({
-          commands: Object.freeze([stage(
-            invocation, "salt", params, { 1: weight, 2: residual, 3: result }, [1, 1, 1],
-          )]),
+          commands: Object.freeze([
+            stage(invocation, "salt", params, { 1: weight, 2: residual, 3: result }, [1, 1, 1]),
+          ]),
           copies: Object.freeze([]),
         });
       }
@@ -512,13 +556,15 @@ export function compileWebGpuResidentScheduleV1(
           view.setUint32(4, 0, true);
         });
         return Object.freeze({
-          commands: Object.freeze([stage(
-            invocation,
-            "pointwise",
-            params,
-            { 1: gradient, 2: gradient, 3: gradient, 4: result },
-            [Math.ceil(len / 64), 1, 1],
-          )]),
+          commands: Object.freeze([
+            stage(
+              invocation,
+              "pointwise",
+              params,
+              { 1: gradient, 2: gradient, 3: gradient, 4: result },
+              [Math.ceil(len / 64), 1, 1],
+            ),
+          ]),
           copies: Object.freeze([]),
         });
       }
@@ -532,17 +578,21 @@ export function compileWebGpuResidentScheduleV1(
           fail("invalid_schema", "FSQ levels differ from channel geometry");
         }
         const bound = attributes.bound === "clamp" ? 0 : attributes.bound === "tanh" ? 1 : -1;
-        const estimator = attributes.ste === "hard" ? 0
-          : attributes.ste === "soft_round" ? 1
-            : attributes.ste === "stochastic" ? 2 : -1;
+        const estimator =
+          attributes.ste === "hard"
+            ? 0
+            : attributes.ste === "soft_round"
+              ? 1
+              : attributes.ste === "stochastic"
+                ? 2
+                : -1;
         if (bound < 0 || estimator < 0) fail("invalid_schema", "FSQ mode is unknown");
         const alpha = webGpuF32V1(attributes.alpha, "alpha");
         if (alpha < 0 || alpha > 1) fail("invalid_schema", "FSQ alpha must be in [0,1]");
         const seed = safeU64(attributes.seed, "seed");
         const x = requiredWebGpuRoleV1(input, "x");
-        const upstream = invocation.execution === "forward"
-          ? x
-          : requiredWebGpuRoleV1(input, "grad_output");
+        const upstream =
+          invocation.execution === "forward" ? x : requiredWebGpuRoleV1(input, "grad_output");
         const result = requiredWebGpuRoleV1(
           output,
           invocation.execution === "forward" ? "result" : "grad_x",
@@ -562,13 +612,13 @@ export function compileWebGpuResidentScheduleV1(
           view.setUint32(28, Math.floor(seed / 0x1_0000_0000), true);
         });
         return Object.freeze({
-          commands: Object.freeze([stage(
-            invocation,
-            "fsq",
-            params,
-            { 1: x, 2: levelsId, 3: upstream, 4: result },
-            [Math.ceil(total / 64), 1, 1],
-          )]),
+          commands: Object.freeze([
+            stage(invocation, "fsq", params, { 1: x, 2: levelsId, 3: upstream, 4: result }, [
+              Math.ceil(total / 64),
+              1,
+              1,
+            ]),
+          ]),
           copies: Object.freeze([]),
         });
       }
@@ -579,8 +629,11 @@ export function compileWebGpuResidentScheduleV1(
         const weight = requiredWebGpuRoleV1(input, "weight");
         const tokens = requiredWebGpuRoleV1(input, "tokens");
         const tokenBuffer = buffers.get(tokens);
-        if (tokenBuffer === undefined || tokenBuffer.dtype !== "u32" ||
-            tokenBuffer.shape.length !== 1) {
+        if (
+          tokenBuffer === undefined ||
+          tokenBuffer.dtype !== "u32" ||
+          tokenBuffer.shape.length !== 1
+        ) {
           fail("invalid_schema", "embedding tokens differ from WebGPU geometry");
         }
         const sequence = webGpuU32V1(tokenBuffer.shape[0], "sequence");
@@ -588,31 +641,43 @@ export function compileWebGpuResidentScheduleV1(
           output,
           invocation.execution === "forward" ? "result" : "grad_weight",
         );
-        const gradient = invocation.execution === "forward"
-          ? weight
-          : requiredWebGpuRoleV1(input, "grad_output");
+        const gradient =
+          invocation.execution === "forward" ? weight : requiredWebGpuRoleV1(input, "grad_output");
         expect(buffers, weight, "f32", [vocab, width], "embedding weight");
-        expect(buffers, gradient, "f32", invocation.execution === "forward"
-          ? [vocab, width] : [sequence, width], "embedding gradient");
-        expect(buffers, result, "f32", invocation.execution === "forward"
-          ? [sequence, width] : [vocab, width], "embedding result");
+        expect(
+          buffers,
+          gradient,
+          "f32",
+          invocation.execution === "forward" ? [vocab, width] : [sequence, width],
+          "embedding gradient",
+        );
+        expect(
+          buffers,
+          result,
+          "f32",
+          invocation.execution === "forward" ? [sequence, width] : [vocab, width],
+          "embedding result",
+        );
         const params = uniform(16, (view) => {
           view.setUint32(0, vocab, true);
           view.setUint32(4, width, true);
           view.setUint32(8, sequence, true);
           view.setUint32(12, Number(invocation.execution === "vjp"), true);
         });
-        const count = invocation.execution === "forward"
-          ? product("embedding output", sequence, width)
-          : product("embedding gradient", vocab, width);
+        const count =
+          invocation.execution === "forward"
+            ? product("embedding output", sequence, width)
+            : product("embedding gradient", vocab, width);
         return Object.freeze({
-          commands: Object.freeze([stage(
-            invocation,
-            "embedding",
-            params,
-            { 1: weight, 2: tokens, 3: gradient, 4: result },
-            [Math.max(1, Math.ceil(count / 64)), 1, 1],
-          )]),
+          commands: Object.freeze([
+            stage(
+              invocation,
+              "embedding",
+              params,
+              { 1: weight, 2: tokens, 3: gradient, 4: result },
+              [Math.max(1, Math.ceil(count / 64)), 1, 1],
+            ),
+          ]),
           copies: Object.freeze([]),
         });
       }
@@ -638,9 +703,7 @@ export function compileWebGpuResidentScheduleV1(
         const shape = [nToken, nHead, headDim];
         expect(buffers, source, "f32", shape, "RoPE input");
         expect(buffers, result, "f32", shape, "RoPE output");
-        const positionsId = auxiliary(
-          "rope-positions", positions.length * 4, positions,
-        );
+        const positionsId = auxiliary("rope-positions", positions.length * 4, positions);
         const params = uniform(32, (view) => {
           view.setUint32(0, nToken, true);
           view.setUint32(4, nHead, true);
@@ -650,13 +713,13 @@ export function compileWebGpuResidentScheduleV1(
         });
         const pairs = product("RoPE pairs", nToken, nHead, headDim / 2);
         return Object.freeze({
-          commands: Object.freeze([stage(
-            invocation,
-            "rope",
-            params,
-            { 1: source, 2: positionsId, 3: result },
-            [Math.ceil(pairs / 64), 1, 1],
-          )]),
+          commands: Object.freeze([
+            stage(invocation, "rope", params, { 1: source, 2: positionsId, 3: result }, [
+              Math.ceil(pairs / 64),
+              1,
+              1,
+            ]),
+          ]),
           copies: Object.freeze([]),
         });
       }
@@ -664,17 +727,20 @@ export function compileWebGpuResidentScheduleV1(
       case "graph.concat_cols|vjp": {
         const rows = positiveU32(attributes.rows, "rows");
         const lens = u32List(attributes.lens, "lens");
-        const expectedParts = invocation.execution === "forward"
-          ? Object.keys(input).length
-          : Object.keys(output).length;
-        if (lens.length === 0 || lens.length !== expectedParts ||
-            lens.some((width) => width === 0)) {
+        const expectedParts =
+          invocation.execution === "forward"
+            ? Object.keys(input).length
+            : Object.keys(output).length;
+        if (
+          lens.length === 0 ||
+          lens.length !== expectedParts ||
+          lens.some((width) => width === 0)
+        ) {
           fail("invalid_schema", "concat lens must match nonempty positive parts");
         }
         const total = lens.reduce((sum, width) => product("concat columns", 1, sum + width), 0);
-        const gradient = invocation.execution === "vjp"
-          ? requiredWebGpuRoleV1(input, "grad_output")
-          : "";
+        const gradient =
+          invocation.execution === "vjp" ? requiredWebGpuRoleV1(input, "grad_output") : "";
         if (invocation.execution === "vjp") {
           expect(buffers, gradient, "f32", [rows, total], "concat grad_output");
           let start = 0;
@@ -710,9 +776,7 @@ export function compileWebGpuResidentScheduleV1(
             copies: Object.freeze([]),
           });
         }
-        const values = auxiliary(
-          "concat-values", product("concat values", rows, total, 4), null,
-        );
+        const values = auxiliary("concat-values", product("concat values", rows, total, 4), null);
         const lengths = auxiliary("concat-lengths", lens.length * 4, lens);
         let elementOffset = 0;
         const offsets = lens.map((width) => {
@@ -727,13 +791,15 @@ export function compileWebGpuResidentScheduleV1(
           const part = requiredWebGpuRoleV1(input, `part.${index}`);
           expect(buffers, part, "f32", [rows, width], `concat part.${index}`);
           const byteLength = product("concat part bytes", rows, width, 4);
-          copies.push(Object.freeze({
-            source: part,
-            sourceOffset: 0,
-            destination: values,
-            destinationOffset,
-            byteLength,
-          }));
+          copies.push(
+            Object.freeze({
+              source: part,
+              sourceOffset: 0,
+              destination: values,
+              destinationOffset,
+              byteLength,
+            }),
+          );
           destinationOffset += byteLength;
         });
         const result = requiredWebGpuRoleV1(output, "result");
@@ -744,13 +810,15 @@ export function compileWebGpuResidentScheduleV1(
           view.setUint32(8, total, true);
         });
         return Object.freeze({
-          commands: Object.freeze([stage(
-            invocation,
-            "concat",
-            params,
-            { 1: values, 2: lengths, 3: offsetsId, 4: result },
-            [Math.ceil(product("concat output", rows, total) / 64), 1, 1],
-          )]),
+          commands: Object.freeze([
+            stage(
+              invocation,
+              "concat",
+              params,
+              { 1: values, 2: lengths, 3: offsetsId, 4: result },
+              [Math.ceil(product("concat output", rows, total) / 64), 1, 1],
+            ),
+          ]),
           copies: Object.freeze(copies),
         });
       }
@@ -787,10 +855,22 @@ export function compileWebGpuResidentScheduleV1(
         const padLeft = webGpuU32V1(attributes.pad_left, "pad_left");
         const padRight = webGpuU32V1(attributes.pad_right, "pad_right");
         const outputH = convAxis(
-          inputH, kernelH, strideH, dilationH, padTop, padBottom, "conv output_h",
+          inputH,
+          kernelH,
+          strideH,
+          dilationH,
+          padTop,
+          padBottom,
+          "conv output_h",
         );
         const outputW = convAxis(
-          inputW, kernelW, strideW, dilationW, padLeft, padRight, "conv output_w",
+          inputW,
+          kernelW,
+          strideW,
+          dilationW,
+          padLeft,
+          padRight,
+          "conv output_w",
         );
         const maximumH = sumU32(
           "conv h indexing",
@@ -802,19 +882,19 @@ export function compileWebGpuResidentScheduleV1(
           product("conv w indexing", outputW - 1, strideW),
           product("conv w indexing", kernelW - 1, dilationW),
         );
-        if (maximumH > 0x7fff_ffff || maximumW > 0x7fff_ffff ||
-            padTop > 0x7fff_ffff || padLeft > 0x7fff_ffff) {
+        if (
+          maximumH > 0x7fff_ffff ||
+          maximumW > 0x7fff_ffff ||
+          padTop > 0x7fff_ffff ||
+          padLeft > 0x7fff_ffff
+        ) {
           fail("invalid_schema", "convolution indexing exceeds i32");
         }
-        const inputShape = is1d
-          ? [batch, cIn, inputW]
-          : [batch, cIn, inputH, inputW];
+        const inputShape = is1d ? [batch, cIn, inputW] : [batch, cIn, inputH, inputW];
         const weightShape = is1d
           ? [cOut, cIn / groups, kernelW]
           : [cOut, cIn / groups, kernelH, kernelW];
-        const outputShape = is1d
-          ? [batch, cOut, outputW]
-          : [batch, cOut, outputH, outputW];
+        const outputShape = is1d ? [batch, cOut, outputW] : [batch, cOut, outputH, outputW];
         const x = requiredWebGpuRoleV1(input, "x");
         const weight = requiredWebGpuRoleV1(input, "weight");
         const scale = requiredWebGpuRoleV1(input, "scale");
@@ -828,19 +908,32 @@ export function compileWebGpuResidentScheduleV1(
         const tileRows = is1d ? outputW : Math.min(product("conv rows", outputH, outputW), 32);
         const columns = product("conv columns", tileRows, patch);
         const groupOutput = product("conv group output", tileRows, cOut / groups);
-        const contractElements = invocation.execution === "forward"
-          ? sumU32("conv scratch", outputElements, columns, groupOutput)
-          : sumU32(
-            "conv scratch", inputElements, weightElements, cOut, columns, groupOutput,
-            columns, weightElements / groups, cOut / groups,
-          );
+        const contractElements =
+          invocation.execution === "forward"
+            ? sumU32("conv scratch", outputElements, columns, groupOutput)
+            : sumU32(
+                "conv scratch",
+                inputElements,
+                weightElements,
+                cOut,
+                columns,
+                groupOutput,
+                columns,
+                weightElements / groups,
+                cOut / groups,
+              );
         if (contractElements * 4 > 64 * 1024 * 1024) {
           fail("memory_limit", "convolution scratch exceeds 64 MiB");
         }
         const resultRole = invocation.execution === "forward" ? "result" : "grad_x";
         const result = requiredWebGpuRoleV1(output, resultRole);
-        expect(buffers, result, "f32",
-          invocation.execution === "forward" ? outputShape : inputShape, `conv ${resultRole}`);
+        expect(
+          buffers,
+          result,
+          "f32",
+          invocation.execution === "forward" ? outputShape : inputShape,
+          `conv ${resultRole}`,
+        );
         let gradOutput: string;
         let gradWeight: string;
         let gradScale: string;
@@ -853,7 +946,9 @@ export function compileWebGpuResidentScheduleV1(
           expect(buffers, gradWeight, "f32", weightShape, "conv grad_weight");
           expect(buffers, gradScale, "f32", [cOut], "conv grad_scale");
           requireDisjointWrites(
-            buffers, [x, weight, scale, gradOutput], [result, gradWeight, gradScale],
+            buffers,
+            [x, weight, scale, gradOutput],
+            [result, gradWeight, gradScale],
             invocation.operation,
           );
           const zeroBytes = Math.max(inputElements, weightElements, cOut) * 4;
@@ -863,13 +958,15 @@ export function compileWebGpuResidentScheduleV1(
             [gradWeight, weightElements * 4],
             [gradScale, cOut * 4],
           ] as const) {
-            copies.push(Object.freeze({
-              source: zero,
-              sourceOffset: 0,
-              destination,
-              destinationOffset: 0,
-              byteLength,
-            }));
+            copies.push(
+              Object.freeze({
+                source: zero,
+                sourceOffset: 0,
+                destination,
+                destinationOffset: 0,
+                byteLength,
+              }),
+            );
           }
         } else {
           requireDisjointWrites(buffers, [x, weight, scale], [result], invocation.operation);
@@ -879,22 +976,48 @@ export function compileWebGpuResidentScheduleV1(
         }
         const params = uniform(80, (view) => {
           [
-            batch, cIn, cOut, inputH, inputW, kernelH, kernelW, strideH, strideW,
-            dilationH, dilationW, padTop, padLeft, groups, outputH, outputW,
-            Number(invocation.execution === "vjp"), padBottom, padRight, 0,
-          ].forEach((value, index) => view.setUint32(index * 4, value, true));
+            batch,
+            cIn,
+            cOut,
+            inputH,
+            inputW,
+            kernelH,
+            kernelW,
+            strideH,
+            strideW,
+            dilationH,
+            dilationW,
+            padTop,
+            padLeft,
+            groups,
+            outputH,
+            outputW,
+            Number(invocation.execution === "vjp"),
+            padBottom,
+            padRight,
+            0,
+          ].forEach((value, index) => {
+            view.setUint32(index * 4, value, true);
+          });
         });
         return Object.freeze({
-          commands: Object.freeze([stage(
-            invocation,
-            "conv",
-            params,
-            {
-              1: x, 2: weight, 3: scale, 4: gradOutput,
-              5: result, 6: gradWeight, 7: gradScale,
-            },
-            [1, 1, 1],
-          )]),
+          commands: Object.freeze([
+            stage(
+              invocation,
+              "conv",
+              params,
+              {
+                1: x,
+                2: weight,
+                3: scale,
+                4: gradOutput,
+                5: result,
+                6: gradWeight,
+                7: gradScale,
+              },
+              [1, 1, 1],
+            ),
+          ]),
           copies: Object.freeze(copies),
         });
       }
@@ -913,8 +1036,12 @@ export function compileWebGpuResidentScheduleV1(
         const kvElements = product("attention kv", ...kvShape);
         const probabilityElements = product("attention probabilities", seq, seq);
         const contractElements = sumU32(
-          "attention scratch", queryElements, kvElements, kvElements,
-          probabilityElements, probabilityElements,
+          "attention scratch",
+          queryElements,
+          kvElements,
+          kvElements,
+          probabilityElements,
+          probabilityElements,
         );
         if (contractElements * 4 > 64 * 1024 * 1024) {
           fail("memory_limit", "attention scratch exceeds 64 MiB");
@@ -925,9 +1052,7 @@ export function compileWebGpuResidentScheduleV1(
         expect(buffers, q, "f32", queryShape, "attention q");
         expect(buffers, k, "f32", kvShape, "attention k");
         expect(buffers, v, "f32", kvShape, "attention v");
-        const probabilities = auxiliary(
-          "attention-probabilities", probabilityElements * 4, null,
-        );
+        const probabilities = auxiliary("attention-probabilities", probabilityElements * 4, null);
         let output0: string;
         let storageBindings: Readonly<Record<number, string>>;
         let entryPoint: "attention_forward" | "attention_vjp";
@@ -937,7 +1062,9 @@ export function compileWebGpuResidentScheduleV1(
           const gradKBuffer = auxiliary("attention-grad-k", kvElements * 4, null);
           const gradVBuffer = auxiliary("attention-grad-v", kvElements * 4, null);
           const gradProbabilities = auxiliary(
-            "attention-grad-probabilities", probabilityElements * 4, null,
+            "attention-grad-probabilities",
+            probabilityElements * 4,
+            null,
           );
           const gradOutput = requiredWebGpuRoleV1(input, "grad_output");
           output0 = requiredWebGpuRoleV1(output, "grad_q");
@@ -948,12 +1075,12 @@ export function compileWebGpuResidentScheduleV1(
           expect(buffers, gradK, "f32", kvShape, "attention grad_k");
           expect(buffers, gradV, "f32", kvShape, "attention grad_v");
           requireDisjointWrites(
-            buffers, [q, k, v, gradOutput], [output0, gradK, gradV],
+            buffers,
+            [q, k, v, gradOutput],
+            [output0, gradK, gradV],
             invocation.operation,
           );
-          const zero = auxiliary(
-            "attention-zero", queryElements * 4, null,
-          );
+          const zero = auxiliary("attention-zero", queryElements * 4, null);
           copies.push(
             Object.freeze({
               source: zero,
@@ -980,8 +1107,14 @@ export function compileWebGpuResidentScheduleV1(
             }),
           );
           storageBindings = {
-            1: q, 2: k, 3: v, 4: gradOutput, 5: output0,
-            6: gradKBuffer, 7: gradVBuffer, 8: probabilities,
+            1: q,
+            2: k,
+            3: v,
+            4: gradOutput,
+            5: output0,
+            6: gradKBuffer,
+            7: gradVBuffer,
+            8: probabilities,
             9: gradProbabilities,
           };
           entryPoint = "attention_vjp";
@@ -1001,15 +1134,9 @@ export function compileWebGpuResidentScheduleV1(
           view.setUint32(20, Number(invocation.execution === "vjp"), true);
         });
         return Object.freeze({
-          commands: Object.freeze([stage(
-            invocation,
-            "attention",
-            params,
-            storageBindings,
-            [1, 1, 1],
-            "once",
-            entryPoint,
-          )]),
+          commands: Object.freeze([
+            stage(invocation, "attention", params, storageBindings, [1, 1, 1], "once", entryPoint),
+          ]),
           copies: Object.freeze(copies),
           commitCopies: Object.freeze(commitCopies),
         });
@@ -1021,32 +1148,43 @@ export function compileWebGpuResidentScheduleV1(
         product("softmax cross entropy", rows, cols);
         const logits = requiredWebGpuRoleV1(input, "logits");
         const target = requiredWebGpuRoleV1(input, "target");
-        const gradOutput = invocation.execution === "forward"
-          ? logits
-          : requiredWebGpuRoleV1(input, "grad_output");
+        const gradOutput =
+          invocation.execution === "forward" ? logits : requiredWebGpuRoleV1(input, "grad_output");
         const result = requiredWebGpuRoleV1(
           output,
           invocation.execution === "forward" ? "result" : "grad_logits",
         );
         expect(buffers, logits, "f32", [rows, cols], "logits");
         expect(buffers, target, "f32", [rows, cols], "target");
-        expect(buffers, gradOutput, "f32", invocation.execution === "forward"
-          ? [rows, cols] : [], "cross entropy cotangent");
-        expect(buffers, result, "f32", invocation.execution === "forward"
-          ? [] : [rows, cols], "cross entropy result");
+        expect(
+          buffers,
+          gradOutput,
+          "f32",
+          invocation.execution === "forward" ? [rows, cols] : [],
+          "cross entropy cotangent",
+        );
+        expect(
+          buffers,
+          result,
+          "f32",
+          invocation.execution === "forward" ? [] : [rows, cols],
+          "cross entropy result",
+        );
         const params = uniform(32, (view) => {
           view.setUint32(0, rows, true);
           view.setUint32(4, cols, true);
           view.setUint32(8, Number(invocation.execution === "vjp"), true);
         });
         return Object.freeze({
-          commands: Object.freeze([stage(
-            invocation,
-            "softmax_xent",
-            params,
-            { 1: logits, 2: target, 3: gradOutput, 4: result },
-            [1, 1, 1],
-          )]),
+          commands: Object.freeze([
+            stage(
+              invocation,
+              "softmax_xent",
+              params,
+              { 1: logits, 2: target, 3: gradOutput, 4: result },
+              [1, 1, 1],
+            ),
+          ]),
           copies: Object.freeze([]),
         });
       }
@@ -1061,9 +1199,8 @@ export function compileWebGpuResidentScheduleV1(
         const logits = requiredWebGpuRoleV1(input, "logits");
         const indices = requiredWebGpuRoleV1(input, "indices");
         const probabilities = requiredWebGpuRoleV1(input, "probabilities");
-        const gradOutput = invocation.execution === "forward"
-          ? logits
-          : requiredWebGpuRoleV1(input, "grad_output");
+        const gradOutput =
+          invocation.execution === "forward" ? logits : requiredWebGpuRoleV1(input, "grad_output");
         const result = requiredWebGpuRoleV1(
           output,
           invocation.execution === "forward" ? "result" : "grad_logits",
@@ -1098,19 +1235,21 @@ export function compileWebGpuResidentScheduleV1(
           view.setUint32(12, Number(invocation.execution === "vjp"), true);
         });
         return Object.freeze({
-          commands: Object.freeze([stage(
-            invocation,
-            "topk_kd",
-            params,
-            {
-              1: logits,
-              2: indices,
-              3: probabilities,
-              4: gradOutput,
-              5: result,
-            },
-            [1, 1, 1],
-          )]),
+          commands: Object.freeze([
+            stage(
+              invocation,
+              "topk_kd",
+              params,
+              {
+                1: logits,
+                2: indices,
+                3: probabilities,
+                4: gradOutput,
+                5: result,
+              },
+              [1, 1, 1],
+            ),
+          ]),
           copies: Object.freeze([]),
         });
       }
@@ -1143,33 +1282,39 @@ export function compileWebGpuResidentScheduleV1(
             view.setUint32(4, 21, true);
             view.setFloat32(8, learningRate, true);
           });
-          return Object.freeze([stage(
-            invocation,
-            "pointwise",
-            params,
-            { 1: parameter, 2: gradient, 3: gradient, 4: candidate },
-            [Math.ceil(len / 64), 1, 1],
-          )]);
+          return Object.freeze([
+            stage(
+              invocation,
+              "pointwise",
+              params,
+              { 1: parameter, 2: gradient, 3: gradient, 4: candidate },
+              [Math.ceil(len / 64), 1, 1],
+            ),
+          ]);
         };
         return Object.freeze({
           commands: Object.freeze([]),
           commandFactory,
           copies: Object.freeze([]),
-          commitCopies: Object.freeze([Object.freeze({
-            source: candidate,
-            sourceOffset: 0,
-            destination: result,
-            destinationOffset: 0,
-            byteLength: len * 4,
-          })]),
+          commitCopies: Object.freeze([
+            Object.freeze({
+              source: candidate,
+              sourceOffset: 0,
+              destination: result,
+              destinationOffset: 0,
+              byteLength: len * 4,
+            }),
+          ]),
         });
       }
       case "optimizer.adamw|step":
       case "optimizer.cautious_adamw|step": {
         const cautious = invocation.operation === "optimizer.cautious_adamw";
         const expectedStages = cautious ? 7 : 4;
-        if (webGpuDispatchFormV1(invocation.operation, invocation.execution).stages.length !==
-            expectedStages) {
+        if (
+          webGpuDispatchFormV1(invocation.operation, invocation.execution).stages.length !==
+          expectedStages
+        ) {
           fail("invalid_schema", `${invocation.operation} specialized catalog stage drifted`);
         }
         if (safeU64(attributes.step, "step") !== 0) {
@@ -1180,8 +1325,15 @@ export function compileWebGpuResidentScheduleV1(
         const beta2 = webGpuF32V1(attributes.beta2, "beta2");
         const epsilon = webGpuF32V1(attributes.eps, "eps");
         const weightDecay = webGpuF32V1(attributes.weight_decay, "weight_decay");
-        if (learningRate < 0 || beta1 < 0 || beta1 >= 1 || beta2 < 0 || beta2 >= 1 ||
-            epsilon <= 0 || weightDecay < 0) {
+        if (
+          learningRate < 0 ||
+          beta1 < 0 ||
+          beta1 >= 1 ||
+          beta2 < 0 ||
+          beta2 >= 1 ||
+          epsilon <= 0 ||
+          weightDecay < 0
+        ) {
           fail("invalid_schema", `${invocation.operation} scalar attributes are invalid`);
         }
         const parameter = requiredWebGpuRoleV1(input, "parameter");
@@ -1196,8 +1348,11 @@ export function compileWebGpuResidentScheduleV1(
           fail("invalid_schema", `${invocation.operation} parameter must be f32`);
         }
         for (const [id, role] of [
-          [gradient, "gradient"], [moment1, "moment1"], [moment2, "moment2"],
-          [resultParameter, "result parameter"], [resultMoment1, "result moment1"],
+          [gradient, "gradient"],
+          [moment1, "moment1"],
+          [moment2, "moment2"],
+          [resultParameter, "result parameter"],
+          [resultMoment1, "result moment1"],
           [resultMoment2, "result moment2"],
         ] as const) {
           expect(buffers, id, "f32", parameterBuffer.shape, `${invocation.operation} ${role}`);
@@ -1243,60 +1398,149 @@ export function compileWebGpuResidentScheduleV1(
             view.setFloat32(40, shrink, true);
           });
           const commands = [
-            indexedStage(invocation, 0, "adamw", params, {
-              1: parameter, 2: gradient, 3: moment1, 4: moment2,
-              5: candidateParameter, 6: candidateMoment1, 7: candidateMoment2,
-              8: scratch,
-            }, workgroups),
-            indexedStage(invocation, 1, "adamw_terms", params, {
-              2: gradient, 6: candidateMoment1, 8: scratch,
-            }, workgroups),
-            indexedStage(invocation, 2, "adamw_variance", params, {
-              7: candidateMoment2, 8: scratch,
-            }, workgroups),
+            indexedStage(
+              invocation,
+              0,
+              "adamw",
+              params,
+              {
+                1: parameter,
+                2: gradient,
+                3: moment1,
+                4: moment2,
+                5: candidateParameter,
+                6: candidateMoment1,
+                7: candidateMoment2,
+                8: scratch,
+              },
+              workgroups,
+            ),
+            indexedStage(
+              invocation,
+              1,
+              "adamw_terms",
+              params,
+              {
+                2: gradient,
+                6: candidateMoment1,
+                8: scratch,
+              },
+              workgroups,
+            ),
+            indexedStage(
+              invocation,
+              2,
+              "adamw_variance",
+              params,
+              {
+                7: candidateMoment2,
+                8: scratch,
+              },
+              workgroups,
+            ),
           ];
           if (cautious) {
             commands.push(
-              indexedStage(invocation, 3, "cautious_adamw_mask", params, {
-                2: gradient, 6: candidateMoment1, 7: candidateMoment2,
-                8: scratch, 10: aligned!,
-              }, workgroups),
-              indexedStage(invocation, 4, "cautious_adamw_lr", params, {
-                8: scratch,
-              }, workgroups),
-              indexedStage(invocation, 5, "cautious_adamw_rescale", params, {
-                8: scratch, 10: aligned!,
-              }, workgroups),
-              indexedStage(invocation, 6, "cautious_adamw_finish", params, {
-                5: candidateParameter, 8: scratch,
-              }, workgroups),
+              indexedStage(
+                invocation,
+                3,
+                "cautious_adamw_mask",
+                params,
+                {
+                  2: gradient,
+                  6: candidateMoment1,
+                  7: candidateMoment2,
+                  8: scratch,
+                  10: aligned!,
+                },
+                workgroups,
+              ),
+              indexedStage(
+                invocation,
+                4,
+                "cautious_adamw_lr",
+                params,
+                {
+                  8: scratch,
+                },
+                workgroups,
+              ),
+              indexedStage(
+                invocation,
+                5,
+                "cautious_adamw_rescale",
+                params,
+                {
+                  8: scratch,
+                  10: aligned!,
+                },
+                workgroups,
+              ),
+              indexedStage(
+                invocation,
+                6,
+                "cautious_adamw_finish",
+                params,
+                {
+                  5: candidateParameter,
+                  8: scratch,
+                },
+                workgroups,
+              ),
             );
           } else {
-            commands.push(indexedStage(invocation, 3, "adamw_finish", params, {
-              5: candidateParameter, 6: candidateMoment1, 7: candidateMoment2,
-            }, workgroups));
+            commands.push(
+              indexedStage(
+                invocation,
+                3,
+                "adamw_finish",
+                params,
+                {
+                  5: candidateParameter,
+                  6: candidateMoment1,
+                  7: candidateMoment2,
+                },
+                workgroups,
+              ),
+            );
           }
           return Object.freeze(commands);
         };
         return Object.freeze({
           commands: Object.freeze([]),
           commandFactory,
-          copies: cautious ? Object.freeze([Object.freeze({
-            source: zero!, sourceOffset: 0, destination: aligned!, destinationOffset: 0,
-            byteLength: 4,
-          })]) : Object.freeze([]),
+          copies: cautious
+            ? Object.freeze([
+                Object.freeze({
+                  source: zero!,
+                  sourceOffset: 0,
+                  destination: aligned!,
+                  destinationOffset: 0,
+                  byteLength: 4,
+                }),
+              ])
+            : Object.freeze([]),
           commitCopies: Object.freeze([
             Object.freeze({
-              source: candidateParameter, sourceOffset: 0, destination: resultParameter,
-              destinationOffset: 0, byteLength: bytes,
+              source: candidateParameter,
+              sourceOffset: 0,
+              destination: resultParameter,
+              destinationOffset: 0,
+              byteLength: bytes,
             }),
             Object.freeze({
-              source: candidateMoment1, sourceOffset: 0, destination: resultMoment1,
-              destinationOffset: 0, byteLength: bytes,
+              source: candidateMoment1,
+              sourceOffset: 0,
+              destination: resultMoment1,
+              destinationOffset: 0,
+              byteLength: bytes,
             }),
             Object.freeze({
-              source: candidateMoment2, sourceOffset: 0, destination: resultMoment2,
-              destinationOffset: 0, byteLength: bytes,
+              source: candidateMoment2,
+              sourceOffset: 0,
+              destination: resultMoment2,
+              destinationOffset: 0,
+              byteLength: bytes,
             }),
           ]),
         });
@@ -1313,8 +1557,15 @@ export function compileWebGpuResidentScheduleV1(
         const beta2 = webGpuF32V1(attributes.beta2, "beta2");
         const epsilon = webGpuF32V1(attributes.eps, "eps");
         const weightDecay = webGpuF32V1(attributes.weight_decay, "weight_decay");
-        if (learningRate < 0 || beta1 < 0 || beta1 >= 1 || beta2 < 0 || beta2 >= 1 ||
-            epsilon <= 0 || weightDecay < 0) {
+        if (
+          learningRate < 0 ||
+          beta1 < 0 ||
+          beta1 >= 1 ||
+          beta2 < 0 ||
+          beta2 >= 1 ||
+          epsilon <= 0 ||
+          weightDecay < 0
+        ) {
           fail("invalid_schema", "int8 AdamW scalar attributes are invalid");
         }
         const parameter = requiredWebGpuRoleV1(input, "parameter");
@@ -1337,14 +1588,18 @@ export function compileWebGpuResidentScheduleV1(
         expect(buffers, gradient, "f32", parameterBuffer.shape, "int8 AdamW gradient");
         expect(buffers, resultParameter, "f32", parameterBuffer.shape, "int8 AdamW result");
         for (const [id, role] of [
-          [moment1, "moment1_q8"], [moment2, "moment2_q8"],
-          [resultMoment1, "result moment1_q8"], [resultMoment2, "result moment2_q8"],
+          [moment1, "moment1_q8"],
+          [moment2, "moment2_q8"],
+          [resultMoment1, "result moment1_q8"],
+          [resultMoment2, "result moment2_q8"],
         ] as const) {
           expect(buffers, id, "bytes", [len], `int8 AdamW ${role}`);
         }
         for (const [id, role] of [
-          [scale1, "moment1_scale"], [scale2, "moment2_scale"],
-          [resultScale1, "result moment1_scale"], [resultScale2, "result moment2_scale"],
+          [scale1, "moment1_scale"],
+          [scale2, "moment2_scale"],
+          [resultScale1, "result moment1_scale"],
+          [resultScale2, "result moment2_scale"],
         ] as const) {
           expect(buffers, id, "f32", [blocks], `int8 AdamW ${role}`);
         }
@@ -1388,64 +1643,136 @@ export function compileWebGpuResidentScheduleV1(
             view.setFloat32(28, epsilon, true);
             view.setFloat32(32, Math.fround(1 - powiF32(beta1, exponent)), true);
             view.setFloat32(36, Math.fround(1 - powiF32(beta2, exponent)), true);
-            view.setFloat32(
-              40, Math.fround(1 - Math.fround(learningRate * weightDecay)), true,
-            );
+            view.setFloat32(40, Math.fround(1 - Math.fround(learningRate * weightDecay)), true);
           });
           const commands = [
-            indexedStage(invocation, 0, "byte_codec", codecParams, {
-              1: moment1, 2: expandedMoment1,
-            }, linearWorkgroups, "once", "unpack"),
-            indexedStage(invocation, 1, "byte_codec", codecParams, {
-              1: moment2, 2: expandedMoment2,
-            }, linearWorkgroups, "once", "unpack"),
+            indexedStage(
+              invocation,
+              0,
+              "byte_codec",
+              codecParams,
+              {
+                1: moment1,
+                2: expandedMoment1,
+              },
+              linearWorkgroups,
+              "once",
+              "unpack",
+            ),
+            indexedStage(
+              invocation,
+              1,
+              "byte_codec",
+              codecParams,
+              {
+                1: moment2,
+                2: expandedMoment2,
+              },
+              linearWorkgroups,
+              "once",
+              "unpack",
+            ),
           ];
-          const coreStages: readonly (readonly [
-            string, Readonly<Record<number, string>>,
-          ])[] = [
-            ["dequantize", {
-              3: expandedMoment1, 4: expandedMoment2, 5: candidateScale1, 6: candidateScale2,
-            }],
+          const coreStages: readonly (readonly [string, Readonly<Record<number, string>>])[] = [
+            [
+              "dequantize",
+              {
+                3: expandedMoment1,
+                4: expandedMoment2,
+                5: candidateScale1,
+                6: candidateScale2,
+              },
+            ],
             ["square_variance", { 4: expandedMoment2 }],
-            ["products", {
-              1: candidateParameter, 2: gradient, 3: expandedMoment1, 4: expandedMoment2,
-              7: scratch1, 8: scratch2,
-            }],
-            ["finish_products", {
-              2: gradient, 3: expandedMoment1, 7: scratch1, 8: scratch2,
-            }],
+            [
+              "products",
+              {
+                1: candidateParameter,
+                2: gradient,
+                3: expandedMoment1,
+                4: expandedMoment2,
+                7: scratch1,
+                8: scratch2,
+              },
+            ],
+            [
+              "finish_products",
+              {
+                2: gradient,
+                3: expandedMoment1,
+                7: scratch1,
+                8: scratch2,
+              },
+            ],
             ["finish_variance", { 4: expandedMoment2, 8: scratch2 }],
-            ["update_parameter", {
-              1: candidateParameter, 3: expandedMoment1, 4: expandedMoment2,
-            }],
-            ["reduce_scales", {
-              3: expandedMoment1, 4: expandedMoment2, 5: candidateScale1, 6: candidateScale2,
-            }],
-            ["quantize", {
-              3: expandedMoment1, 4: expandedMoment2, 5: candidateScale1, 6: candidateScale2,
-            }],
+            [
+              "update_parameter",
+              {
+                1: candidateParameter,
+                3: expandedMoment1,
+                4: expandedMoment2,
+              },
+            ],
+            [
+              "reduce_scales",
+              {
+                3: expandedMoment1,
+                4: expandedMoment2,
+                5: candidateScale1,
+                6: candidateScale2,
+              },
+            ],
+            [
+              "quantize",
+              {
+                3: expandedMoment1,
+                4: expandedMoment2,
+                5: candidateScale1,
+                6: candidateScale2,
+              },
+            ],
           ];
           for (const [offset, [entryPoint, stageBindings]] of coreStages.entries()) {
-            commands.push(indexedStage(
-              invocation,
-              offset + 2,
-              "int8_adamw",
-              params,
-              stageBindings,
-              entryPoint === "reduce_scales"
-                ? [blocks, 1, 1]
-                : linearWorkgroups,
-              "once",
-              entryPoint,
-            ));
+            commands.push(
+              indexedStage(
+                invocation,
+                offset + 2,
+                "int8_adamw",
+                params,
+                stageBindings,
+                entryPoint === "reduce_scales" ? [blocks, 1, 1] : linearWorkgroups,
+                "once",
+                entryPoint,
+              ),
+            );
           }
           commands.push(
-            indexedStage(invocation, 10, "byte_codec", codecParams, {
-              1: expandedMoment1, 2: packedMoment1,
-            }, packedWorkgroups, "once", "pack"),
-            indexedStage(invocation, 11, "byte_codec", codecParams, {
-              1: expandedMoment2, 2: packedMoment2,
-            }, packedWorkgroups, "once", "pack"),
+            indexedStage(
+              invocation,
+              10,
+              "byte_codec",
+              codecParams,
+              {
+                1: expandedMoment1,
+                2: packedMoment1,
+              },
+              packedWorkgroups,
+              "once",
+              "pack",
+            ),
+            indexedStage(
+              invocation,
+              11,
+              "byte_codec",
+              codecParams,
+              {
+                1: expandedMoment2,
+                2: packedMoment2,
+              },
+              packedWorkgroups,
+              "once",
+              "pack",
+            ),
           );
           return Object.freeze(commands);
         };
@@ -1454,38 +1781,62 @@ export function compileWebGpuResidentScheduleV1(
           commandFactory,
           copies: Object.freeze([
             Object.freeze({
-              source: parameter, sourceOffset: 0, destination: candidateParameter,
-              destinationOffset: 0, byteLength: tensorBytes,
+              source: parameter,
+              sourceOffset: 0,
+              destination: candidateParameter,
+              destinationOffset: 0,
+              byteLength: tensorBytes,
             }),
             Object.freeze({
-              source: scale1, sourceOffset: 0, destination: candidateScale1,
-              destinationOffset: 0, byteLength: scaleBytes,
+              source: scale1,
+              sourceOffset: 0,
+              destination: candidateScale1,
+              destinationOffset: 0,
+              byteLength: scaleBytes,
             }),
             Object.freeze({
-              source: scale2, sourceOffset: 0, destination: candidateScale2,
-              destinationOffset: 0, byteLength: scaleBytes,
+              source: scale2,
+              sourceOffset: 0,
+              destination: candidateScale2,
+              destinationOffset: 0,
+              byteLength: scaleBytes,
             }),
           ]),
           commitCopies: Object.freeze([
             Object.freeze({
-              source: candidateParameter, sourceOffset: 0, destination: resultParameter,
-              destinationOffset: 0, byteLength: tensorBytes,
+              source: candidateParameter,
+              sourceOffset: 0,
+              destination: resultParameter,
+              destinationOffset: 0,
+              byteLength: tensorBytes,
             }),
             Object.freeze({
-              source: packedMoment1, sourceOffset: 0, destination: resultMoment1,
-              destinationOffset: 0, byteLength: packedBytes,
+              source: packedMoment1,
+              sourceOffset: 0,
+              destination: resultMoment1,
+              destinationOffset: 0,
+              byteLength: packedBytes,
             }),
             Object.freeze({
-              source: packedMoment2, sourceOffset: 0, destination: resultMoment2,
-              destinationOffset: 0, byteLength: packedBytes,
+              source: packedMoment2,
+              sourceOffset: 0,
+              destination: resultMoment2,
+              destinationOffset: 0,
+              byteLength: packedBytes,
             }),
             Object.freeze({
-              source: candidateScale1, sourceOffset: 0, destination: resultScale1,
-              destinationOffset: 0, byteLength: scaleBytes,
+              source: candidateScale1,
+              sourceOffset: 0,
+              destination: resultScale1,
+              destinationOffset: 0,
+              byteLength: scaleBytes,
             }),
             Object.freeze({
-              source: candidateScale2, sourceOffset: 0, destination: resultScale2,
-              destinationOffset: 0, byteLength: scaleBytes,
+              source: candidateScale2,
+              sourceOffset: 0,
+              destination: resultScale2,
+              destinationOffset: 0,
+              byteLength: scaleBytes,
             }),
           ]),
         });
@@ -1503,8 +1854,13 @@ export function compileWebGpuResidentScheduleV1(
         const rows = positiveU32(attributes.rows, "rows");
         const cols = positiveU32(attributes.cols, "cols");
         const steps = positiveU32(attributes.ns_steps, "ns_steps");
-        if (learningRate < 0 || momentumDecay < 0 || momentumDecay >= 1 || weightDecay < 0 ||
-            steps > 32) {
+        if (
+          learningRate < 0 ||
+          momentumDecay < 0 ||
+          momentumDecay >= 1 ||
+          weightDecay < 0 ||
+          steps > 32
+        ) {
           fail("invalid_schema", "Muon scalar attributes are invalid");
         }
         const len = product("Muon parameter", rows, cols);
@@ -1514,24 +1870,33 @@ export function compileWebGpuResidentScheduleV1(
         const resultParameter = requiredWebGpuRoleV1(output, "parameter");
         const resultMomentum = requiredWebGpuRoleV1(output, "momentum");
         for (const [id, role] of [
-          [parameter, "parameter"], [gradient, "gradient"], [momentum, "momentum"],
-          [resultParameter, "result parameter"], [resultMomentum, "result momentum"],
+          [parameter, "parameter"],
+          [gradient, "gradient"],
+          [momentum, "momentum"],
+          [resultParameter, "result parameter"],
+          [resultMomentum, "result momentum"],
         ] as const) {
           expect(buffers, id, "f32", [rows, cols], `Muon ${role}`);
         }
-        if (buffers.get(parameter)!.ownerId !== buffers.get(resultParameter)!.ownerId ||
-            buffers.get(momentum)!.ownerId !== buffers.get(resultMomentum)!.ownerId) {
+        if (
+          buffers.get(parameter)!.ownerId !== buffers.get(resultParameter)!.ownerId ||
+          buffers.get(momentum)!.ownerId !== buffers.get(resultMomentum)!.ownerId
+        ) {
           fail("invalid_schema", "Muon outputs must commit to their input owners");
         }
         const bytes = product("Muon parameter bytes", len, 4);
         const r = Math.min(rows, cols);
         const square = product("Muon square workspace", r, r);
         const workspaceElements = sumU32(
-          "Muon workspace", product("Muon vector workspace", len, 3),
-          product("Muon matrix workspace", square, 3), 2,
+          "Muon workspace",
+          product("Muon vector workspace", len, 3),
+          product("Muon matrix workspace", square, 3),
+          2,
         );
         const workspace = auxiliary(
-          "muon-workspace", product("Muon workspace bytes", workspaceElements, 4), null,
+          "muon-workspace",
+          product("Muon workspace bytes", workspaceElements, 4),
+          null,
         );
         const candidateParameter = auxiliary("muon-parameter-candidate", bytes, null);
         const candidateMomentum = auxiliary("muon-momentum-candidate", bytes, null);
@@ -1552,31 +1917,54 @@ export function compileWebGpuResidentScheduleV1(
             view.setFloat32(20, scale, true);
             view.setFloat32(24, shrink, true);
           });
-          return Object.freeze([stage(invocation, "muon", params, {
-            1: candidateParameter, 2: gradient, 3: candidateMomentum, 4: workspace,
-          }, [1, 1, 1])]);
+          return Object.freeze([
+            stage(
+              invocation,
+              "muon",
+              params,
+              {
+                1: candidateParameter,
+                2: gradient,
+                3: candidateMomentum,
+                4: workspace,
+              },
+              [1, 1, 1],
+            ),
+          ]);
         };
         return Object.freeze({
           commands: Object.freeze([]),
           commandFactory,
           copies: Object.freeze([
             Object.freeze({
-              source: parameter, sourceOffset: 0, destination: candidateParameter,
-              destinationOffset: 0, byteLength: bytes,
+              source: parameter,
+              sourceOffset: 0,
+              destination: candidateParameter,
+              destinationOffset: 0,
+              byteLength: bytes,
             }),
             Object.freeze({
-              source: momentum, sourceOffset: 0, destination: candidateMomentum,
-              destinationOffset: 0, byteLength: bytes,
+              source: momentum,
+              sourceOffset: 0,
+              destination: candidateMomentum,
+              destinationOffset: 0,
+              byteLength: bytes,
             }),
           ]),
           commitCopies: Object.freeze([
             Object.freeze({
-              source: candidateParameter, sourceOffset: 0, destination: resultParameter,
-              destinationOffset: 0, byteLength: bytes,
+              source: candidateParameter,
+              sourceOffset: 0,
+              destination: resultParameter,
+              destinationOffset: 0,
+              byteLength: bytes,
             }),
             Object.freeze({
-              source: candidateMomentum, sourceOffset: 0, destination: resultMomentum,
-              destinationOffset: 0, byteLength: bytes,
+              source: candidateMomentum,
+              sourceOffset: 0,
+              destination: resultMomentum,
+              destinationOffset: 0,
+              byteLength: bytes,
             }),
           ]),
         });
@@ -1588,16 +1976,19 @@ export function compileWebGpuResidentScheduleV1(
 
   const entries = [
     ...plan.operations.map((operation) => ({ phase: "forward" as const, id: operation.id })),
-    ...plan.backwardOperations.map((operation) => ({ phase: "backward" as const, id: operation.id })),
+    ...plan.backwardOperations.map((operation) => ({
+      phase: "backward" as const,
+      id: operation.id,
+    })),
   ];
   for (const entry of entries) {
     const invocation = compiledWebGpuInvocationV1(plan, entry.phase, entry.id);
     let template: Template;
     if (isPointwiseWebGpuOperationV1(invocation.operation)) {
       template = Object.freeze({
-        commands: Object.freeze([...lowerPointwiseWebGpuOperationV1(
-          plan, entry.phase, entry.id, 0,
-        )]),
+        commands: Object.freeze([
+          ...lowerPointwiseWebGpuOperationV1(plan, entry.phase, entry.id, 0),
+        ]),
         copies: Object.freeze([]),
       });
     } else if (SPECIALIZED.has(invocation.operation)) {
@@ -1608,13 +1999,14 @@ export function compileWebGpuResidentScheduleV1(
     templates.set(key(entry.phase, entry.id), template);
   }
 
-  const uniformBytes = product(
-    "WebGPU uniform arena", uniformSlots, uniformStride as number,
-  );
+  const uniformBytes = product("WebGPU uniform arena", uniformSlots, uniformStride as number);
   const additionalBytes = auxiliaryBytes + uniformBytes + rootPaddingBytes + 8;
-  if (!Number.isSafeInteger(additionalBytes) ||
-      !Number.isSafeInteger(plan.peakBytes) || plan.peakBytes < 0 ||
-      plan.peakBytes > (maxPeakBytes as number) - additionalBytes) {
+  if (
+    !Number.isSafeInteger(additionalBytes) ||
+    !Number.isSafeInteger(plan.peakBytes) ||
+    plan.peakBytes < 0 ||
+    plan.peakBytes > (maxPeakBytes as number) - additionalBytes
+  ) {
     fail("memory_limit", "WebGPU resident schedule exceeds maxPeakBytes");
   }
   const residentPeakBytes = plan.peakBytes + additionalBytes;
@@ -1623,15 +2015,20 @@ export function compileWebGpuResidentScheduleV1(
       id: resource.id,
       byteLength: resource.byteLength,
       initialBytes: resource.initialValues === null ? null : u32Bytes(resource.initialValues),
-    }));
+    }),
+  );
 
-  const snapshotResources = () => Object.freeze(resources.map((resource) => Object.freeze({
-    id: resource.id,
-    byteLength: resource.byteLength,
-    initialBytes: resource.initialBytes === null
-      ? null
-      : Uint8Array.from(resource.initialBytes),
-  })));
+  const snapshotResources = () =>
+    Object.freeze(
+      resources.map((resource) =>
+        Object.freeze({
+          id: resource.id,
+          byteLength: resource.byteLength,
+          initialBytes:
+            resource.initialBytes === null ? null : Uint8Array.from(resource.initialBytes),
+        }),
+      ),
+    );
 
   return Object.freeze({
     peakBytes(): number {
@@ -1649,9 +2046,13 @@ export function compileWebGpuResidentScheduleV1(
       firstUniformSlot: number,
       optimizerStep?: number,
     ): WebGpuResidentTransactionV1 {
-      if ((phase !== "forward" && phase !== "backward") ||
-          typeof operationId !== "string" || operationId.length === 0 ||
-          !Number.isSafeInteger(firstUniformSlot) || firstUniformSlot < 0) {
+      if (
+        (phase !== "forward" && phase !== "backward") ||
+        typeof operationId !== "string" ||
+        operationId.length === 0 ||
+        !Number.isSafeInteger(firstUniformSlot) ||
+        firstUniformSlot < 0
+      ) {
         fail("invalid_schema", "WebGPU transaction selector is invalid");
       }
       const template = templates.get(key(phase, operationId));
@@ -1661,23 +2062,31 @@ export function compileWebGpuResidentScheduleV1(
       if ((template.commandFactory === undefined) !== (optimizerStep === undefined)) {
         fail("invalid_schema", "optimizerStep presence differs from compiled operation phase");
       }
-      const commands = template.commandFactory === undefined
-        ? template.commands
-        : template.commandFactory(optimizerStep!);
+      const commands =
+        template.commandFactory === undefined
+          ? template.commands
+          : template.commandFactory(optimizerStep!);
       const finalSlot = firstUniformSlot + commands.length - 1;
       if (!Number.isSafeInteger(finalSlot) || finalSlot >= uniformSlots) {
         fail("invalid_schema", "WebGPU transaction exceeds uniform arena");
       }
       return Object.freeze({
-        commands: Object.freeze(commands.map((command, index) => Object.freeze({
-          ...command,
-          uniformSlot: firstUniformSlot + index,
-          uniformBytes: command.uniformBytes === null
-            ? null
-            : Uint8Array.from(command.uniformBytes),
-          storageBindings: Object.freeze({ ...command.storageBindings }),
-          workgroups: Object.freeze([...command.workgroups]) as readonly [number, number, number],
-        }))),
+        commands: Object.freeze(
+          commands.map((command, index) =>
+            Object.freeze({
+              ...command,
+              uniformSlot: firstUniformSlot + index,
+              uniformBytes:
+                command.uniformBytes === null ? null : Uint8Array.from(command.uniformBytes),
+              storageBindings: Object.freeze({ ...command.storageBindings }),
+              workgroups: Object.freeze([...command.workgroups]) as readonly [
+                number,
+                number,
+                number,
+              ],
+            }),
+          ),
+        ),
         copies: Object.freeze(template.copies.map((copy) => Object.freeze({ ...copy }))),
         commitCopies: Object.freeze(
           (template.commitCopies ?? []).map((copy) => Object.freeze({ ...copy })),

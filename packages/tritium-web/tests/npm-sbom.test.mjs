@@ -51,12 +51,7 @@ test("npm SBOM binds archive, locked dependencies and runtime edge", () => {
 
 test("npm SBOM rejects weak integrity, drift and unbound receipts", () => {
   assert.throws(
-    () => generateNpmSbom(
-      packageJson,
-      { ...packageLock, version: "wrong" },
-      receipt,
-      "web.tgz",
-    ),
+    () => generateNpmSbom(packageJson, { ...packageLock, version: "wrong" }, receipt, "web.tgz"),
     /package-lock identity/,
   );
   const weak = structuredClone(packageLock);
@@ -66,12 +61,13 @@ test("npm SBOM rejects weak integrity, drift and unbound receipts", () => {
     /SHA-256 or stronger/,
   );
   assert.throws(
-    () => generateNpmSbom(
-      packageJson,
-      packageLock,
-      { ...receipt, artifact: { ...receipt.artifact, bytes: 0 } },
-      "web.tgz",
-    ),
+    () =>
+      generateNpmSbom(
+        packageJson,
+        packageLock,
+        { ...receipt, artifact: { ...receipt.artifact, bytes: 0 } },
+        "web.tgz",
+      ),
     /archive receipt/,
   );
 });

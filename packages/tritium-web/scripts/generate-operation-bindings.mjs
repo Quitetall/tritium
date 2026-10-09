@@ -19,19 +19,17 @@ for (const fixture of vectors.cases) {
     inputs: fixture.inputs.map((input) => input.name),
     attributes: fixture.attributes.map((attribute) => ({
       name: attribute.name,
-      kind: attribute.type === "u32_list"
-        ? "u32-list"
-        : attribute.type === "u64_list"
-          ? "u64-list"
-          : attribute.type,
+      kind:
+        attribute.type === "u32_list"
+          ? "u32-list"
+          : attribute.type === "u64_list"
+            ? "u64-list"
+            : attribute.type,
     })),
     outputs: fixture.expected.outputs.map((output) => output.name),
   };
   const previous = successful.get(key);
-  if (
-    previous !== undefined &&
-    JSON.stringify(previous) !== JSON.stringify(binding)
-  ) {
+  if (previous !== undefined && JSON.stringify(previous) !== JSON.stringify(binding)) {
     throw new Error(`canonical roles drift within ${key}`);
   }
   successful.set(key, binding);
