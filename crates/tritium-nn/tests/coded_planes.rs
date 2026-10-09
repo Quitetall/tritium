@@ -85,6 +85,7 @@
 //! TRITIUM_CORPUS=$HOME/.cache/tritium-corpora/wikitext2_400k_32k.json \
 //!   cargo test -p tritium-nn --release --test coded_planes -- --ignored --nocapture
 //! ```
+//! `TRITIUM_H8_ARMS=trellis` runs the trellis-coded arms.
 //! Knobs: `TRITIUM_H8_TS` (coarse planes for the coded arms, default `1,2`),
 //! `TRITIUM_H8_EVAL_WINDOWS` (default 64), `TRITIUM_H8_ARMS=uniform` (single-scalar comparators).
 
@@ -93,6 +94,10 @@ mod common;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use common::golay::{
+    BLOCK, GRID, GROUP, golay_codewords, golay_decode_block, golay_fit, golay_row, hadamard_blocks,
+    kmax,
+};
 use common::{Calib, calibrate, extract, fold, output_fishers, perplexity_windowed};
 use rayon::prelude::*;
 use tritium_nn::ModelRunner;
@@ -101,9 +106,6 @@ use tritium_train::ops::ste::{self, RotationPolicy};
 
 const WINDOW: usize = 512;
 const CALIB_WINDOWS: usize = 4;
-const GROUP: usize = 128;
-const GRID: usize = 16;
-const BLOCK: usize = 12;
 
 fn model_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -125,159 +127,6 @@ fn corpus() -> (Vec<u32>, Vec<u32>) {
             .collect()
     };
     (ids("train_ids"), ids("eval_ids"))
-}
-
-/// The 729 codewords of the extended ternary Golay code, balanced digits `{-1, 0, 1}`.
-///
-/// Generator `[I₆ | A]` with `A` the standard symmetric circulant-bordered form.
-fn golay_codewords() -> Vec<[i8; BLOCK]> {
-    const A: [[u8; 6]; 6] = [
-        [0, 1, 1, 1, 1, 1],
-        [1, 0, 1, 2, 2, 1],
-        [1, 1, 0, 1, 2, 2],
-        [1, 2, 1, 0, 1, 2],
-        [1, 2, 2, 1, 0, 1],
-        [1, 1, 2, 2, 1, 0],
-    ];
-    let mut out = Vec::with_capacity(729);
-    for m in 0..729u32 {
-        let msg: Vec<u8> = (0..6).map(|i| ((m / 3u32.pow(i)) % 3) as u8).collect();
-        let mut word = [0i8; BLOCK];
-        for i in 0..6 {
-            word[i] = msg[i] as i8;
-        }
-        for j in 0..6 {
-            let s: u32 = (0..6).map(|i| u32::from(msg[i]) * u32::from(A[i][j])).sum();
-            word[6 + j] = (s % 3) as i8;
-        }
-        for d in &mut word {
-            if *d == 2 {
-                *d = -1;
-            }
-        }
-        out.push(word);
-    }
-    out
-}
-
-fn kmax(t: usize) -> i64 {
-    (3i64.pow(t as u32) - 1) / 2
-}
-
-fn hadamard_blocks(row: &mut [f32]) {
-    for b in row.chunks_mut(GROUP) {
-        if b.len().is_power_of_two() && b.len() > 1 {
-            ste::fast_hadamard(b);
-        }
-    }
-}
-
-/// Nearest point of the scaled lattice for every 12-block of `y`: codes in step units, and the
-/// squared error. Per codeword the coarse digits round independently, so the minimum over the 729
-/// codewords is exact (up to the coarse range clamp).
-/// Nearest lattice point for ONE 12-block of target values `x` (weight units) starting at column
-/// `b0`; returns the codes in step units and the squared error.
-fn golay_decode_block(
-    x: &[f64],
-    b0: usize,
-    steps: &[f64],
-    k: f64,
-    code: &[[i8; BLOCK]],
-) -> ([i64; BLOCK], f64) {
-    let mut best = (f64::INFINITY, 0usize);
-    for (ci, c) in code.iter().enumerate() {
-        let mut cost = 0.0;
-        for i in 0..BLOCK {
-            let d = steps[(b0 + i) / GROUP];
-            let e = if d > 0.0 {
-                let kk = ((x[i] / d - f64::from(c[i])) / 3.0).round().clamp(-k, k);
-                x[i] - d * (3.0 * kk + f64::from(c[i]))
-            } else {
-                x[i]
-            };
-            cost += e * e;
-        }
-        if cost < best.0 {
-            best = (cost, ci);
-        }
-    }
-    let c = &code[best.1];
-    let mut units = [0i64; BLOCK];
-    for i in 0..BLOCK {
-        let d = steps[(b0 + i) / GROUP];
-        units[i] = if d > 0.0 {
-            let kk = ((x[i] / d - f64::from(c[i])) / 3.0).round().clamp(-k, k);
-            3 * kk as i64 + i64::from(c[i])
-        } else {
-            0
-        };
-    }
-    (units, best.0)
-}
-
-fn golay_decode(y: &[f32], steps: &[f64], k: f64, code: &[[i8; BLOCK]]) -> (Vec<i64>, f64) {
-    let mut units = vec![0i64; y.len()];
-    let mut total = 0.0;
-    for b0 in (0..y.len()).step_by(BLOCK) {
-        let x: Vec<f64> = y[b0..b0 + BLOCK].iter().map(|&v| f64::from(v)).collect();
-        let (u, e) = golay_decode_block(&x, b0, steps, k, code);
-        units[b0..b0 + BLOCK].copy_from_slice(&u);
-        total += e;
-    }
-    (units, total)
-}
-
-/// Golay-coded `T + ½` quantization of one rotated row: returns the reconstruction.
-///
-/// Steps start from the best uniform step of the `T+1`-plane grid the lattice sits on, scaled by a
-/// per-row multiplier searched over a small grid (the lattice is sparser than that grid, so its
-/// best step is larger), then refit per group by least squares given the codes.
-fn golay_row(y: &[f32], t: usize, code: &[[i8; BLOCK]]) -> Vec<f32> {
-    let (steps, units) = golay_fit(y, t, code);
-    units
-        .iter()
-        .enumerate()
-        .map(|(j, &r)| (steps[j / GROUP] * r as f64) as f32)
-        .collect()
-}
-
-/// The MSE fit behind [`golay_row`]: per-group steps and the codes in step units.
-fn golay_fit(y: &[f32], t: usize, code: &[[i8; BLOCK]]) -> (Vec<f64>, Vec<i64>) {
-    let cols = y.len();
-    assert!(
-        cols.is_multiple_of(BLOCK),
-        "row width {cols} is not a whole number of 12-blocks"
-    );
-    let k = kmax(t) as f64;
-    let base: Vec<f64> = y
-        .chunks(GROUP)
-        .map(|g| f64::from(ste::ladder_step(g, t + 1, GRID)))
-        .collect();
-    let (mut steps, mut units) = [1.0, 1.15, 1.3, 1.45, 1.6]
-        .iter()
-        .map(|&f| {
-            let steps: Vec<f64> = base.iter().map(|d| d * f).collect();
-            let (units, err) = golay_decode(y, &steps, k, code);
-            (err, steps, units)
-        })
-        .min_by(|a, b| a.0.total_cmp(&b.0))
-        .map(|(_, s, u)| (s, u))
-        .expect("non-empty grid");
-    for _ in 0..2 {
-        let mut refit = steps.clone();
-        for (g, step) in refit.iter_mut().enumerate() {
-            let (lo, hi) = (g * GROUP, ((g + 1) * GROUP).min(cols));
-            let num: f64 = (lo..hi).map(|j| f64::from(y[j]) * units[j] as f64).sum();
-            let den: f64 = (lo..hi).map(|j| (units[j] as f64).powi(2)).sum();
-            if den > 0.0 && num > 0.0 {
-                *step = num / den;
-            }
-        }
-        let (u, _) = golay_decode(y, &refit, k, code);
-        steps = refit;
-        units = u;
-    }
-    (steps, units)
 }
 
 /// Normalized Hadamard on each 128-block of an f64 row (ragged power-of-two tail included), the
@@ -482,6 +331,182 @@ fn golay_kron_tensor(
     out
 }
 
+/// A shift-register trellis over the three cosets of the finest trit: from state `s`, branch bit
+/// `b` moves to `(2s + b) mod S` and allows coset `table[s][b]` (the two branches allow different
+/// cosets). One bit per weight selects the branch, so the finest plane costs 1 bit, not 1 trit.
+#[derive(Clone, Debug)]
+struct Trellis {
+    states: usize,
+    table: Vec<[i8; 2]>,
+}
+
+impl Trellis {
+    /// A random table from a seeded stream: two distinct cosets per state.
+    fn random(states: usize, seed: u64) -> Self {
+        let mut s = seed | 1;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let table = (0..states)
+            .map(|_| {
+                let a = (next() % 3) as i8 - 1;
+                let b = ((i64::from(a + 1) + 1 + (next() % 2) as i64) % 3) as i8 - 1;
+                [a, b]
+            })
+            .collect();
+        Self { states, table }
+    }
+
+    /// The best of `tries` seeded tables by total MSE on synthetic Gaussian rows — a deterministic
+    /// design step, independent of any model.
+    fn search(states: usize, t: usize, tries: u64) -> Self {
+        let mut s = 0x007E_1115_u64;
+        let mut gauss = move || {
+            let mut u = || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+            };
+            let (a, b) = (u(), u());
+            ((-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()) as f32
+        };
+        let rows: Vec<Vec<f32>> = (0..48)
+            .map(|_| (0..GROUP * 2).map(|_| gauss()).collect())
+            .collect();
+        (0..tries)
+            .map(|k| Trellis::random(states, 0xC0DE + k))
+            .map(|tr| {
+                let err: f64 = rows.par_iter().map(|r| tcq_fit(r, t, &tr).2).sum();
+                (err, tr)
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .expect("tries > 0")
+            .1
+    }
+}
+
+/// Viterbi over one row: the minimum-error path through the trellis at fixed per-group steps.
+/// Returns the codes (in step units, values on the T+1-plane grid) and the squared error.
+fn tcq_decode(y: &[f32], steps: &[f64], t: usize, tr: &Trellis) -> (Vec<i64>, f64) {
+    let n = y.len();
+    let k = kmax(t) as f64;
+    let ns = tr.states;
+    let mut cost = vec![f64::INFINITY; ns];
+    cost[0] = 0.0;
+    // back[j * ns + s'] = (previous state, branch) that reached s' at step j.
+    let mut back = vec![(0u16, 0u8); n * ns];
+    for j in 0..n {
+        let d = steps[j / GROUP];
+        let x = f64::from(y[j]);
+        // Best coarse digit and error for each coset c ∈ {−1, 0, 1}.
+        let per_coset: [(f64, i64); 3] = std::array::from_fn(|ci| {
+            let c = ci as f64 - 1.0;
+            if d <= 0.0 {
+                return (x * x, 0);
+            }
+            let kk = ((x / d - c) / 3.0).round().clamp(-k, k);
+            let e = x - d * (3.0 * kk + c);
+            (e * e, 3 * kk as i64 + ci as i64 - 1)
+        });
+        let mut next = vec![f64::INFINITY; ns];
+        for (st, &c0) in cost.iter().enumerate() {
+            if !c0.is_finite() {
+                continue;
+            }
+            for b in 0..2u8 {
+                let to = (2 * st + usize::from(b)) % ns;
+                let coset = tr.table[st][usize::from(b)];
+                let total = c0 + per_coset[(coset + 1) as usize].0;
+                if total < next[to] {
+                    next[to] = total;
+                    back[j * ns + to] = (st as u16, b);
+                }
+            }
+        }
+        cost = next;
+    }
+    let (mut st, err) = cost
+        .iter()
+        .enumerate()
+        .min_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(s, &e)| (s, e))
+        .expect("states > 0");
+    let mut cosets = vec![0i8; n];
+    for j in (0..n).rev() {
+        let (prev, b) = back[j * ns + st];
+        cosets[j] = tr.table[usize::from(prev)][usize::from(b)];
+        st = usize::from(prev);
+    }
+    let units = (0..n)
+        .map(|j| {
+            let d = steps[j / GROUP];
+            if d <= 0.0 {
+                return 0;
+            }
+            let c = f64::from(cosets[j]);
+            let kk = ((f64::from(y[j]) / d - c) / 3.0).round().clamp(-k, k);
+            3 * kk as i64 + i64::from(cosets[j])
+        })
+        .collect();
+    (units, err)
+}
+
+/// Step fit for the trellis, as [`golay_fit`] does for the code: a per-row multiplier on the
+/// `T+1`-plane ladder step, then two least-squares step refits. Returns (steps, codes, error).
+fn tcq_fit(y: &[f32], t: usize, tr: &Trellis) -> (Vec<f64>, Vec<i64>, f64) {
+    let cols = y.len();
+    let base: Vec<f64> = y
+        .chunks(GROUP)
+        .map(|g| f64::from(ste::ladder_step(g, t + 1, GRID)))
+        .collect();
+    let (mut steps, mut units, mut err) = [1.0, 1.15, 1.3, 1.45, 1.6]
+        .iter()
+        .map(|&f| {
+            let steps: Vec<f64> = base.iter().map(|d| d * f).collect();
+            let (u, e) = tcq_decode(y, &steps, t, tr);
+            (steps, u, e)
+        })
+        .min_by(|a, b| a.2.total_cmp(&b.2))
+        .expect("non-empty grid");
+    for _ in 0..2 {
+        let mut refit = steps.clone();
+        for (g, step) in refit.iter_mut().enumerate() {
+            let (lo, hi) = (g * GROUP, ((g + 1) * GROUP).min(cols));
+            let num: f64 = (lo..hi).map(|j| f64::from(y[j]) * units[j] as f64).sum();
+            let den: f64 = (lo..hi).map(|j| (units[j] as f64).powi(2)).sum();
+            if den > 0.0 && num > 0.0 {
+                *step = num / den;
+            }
+        }
+        let (u, e) = tcq_decode(y, &refit, t, tr);
+        if e < err {
+            (steps, units, err) = (refit, u, e);
+        }
+    }
+    (steps, units, err)
+}
+
+/// One searched trellis per (states, planes), shared by every tensor of a run.
+fn trellis_for(states: usize, t: usize) -> Trellis {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(usize, usize), Trellis>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(tr) = cache.lock().expect("trellis cache").get(&(states, t)) {
+        return tr.clone();
+    }
+    let tr = Trellis::search(states, t, 32);
+    cache
+        .lock()
+        .expect("trellis cache")
+        .insert((states, t), tr.clone());
+    tr
+}
+
 #[derive(Clone, Copy)]
 enum Arm {
     Ladder(usize),
@@ -494,6 +519,8 @@ enum Arm {
     GolayLdlq(usize),
     /// [`Arm::GolayLdlq`] with the output side too: Kronecker `A ⊗ G`, λ_G = 0.5 (H6's best).
     GolayKron(usize),
+    /// Trellis-coded `T` planes + 1 bit: the finest trit restricted by a `states`-state trellis.
+    Trellis(usize, usize),
 }
 
 impl Arm {
@@ -505,6 +532,7 @@ impl Arm {
             Arm::GolayKron(t) => format!("Golay {t}+½ + Kron LDLQ"),
             Arm::TimeShare(t) => format!("time-share {t}/{}", t + 1),
             Arm::Uniform(l) => format!("uniform {l}-level scalar"),
+            Arm::Trellis(t, s) => format!("trellis {t}+1bit S={s}"),
         }
     }
     /// Stored bits per weight: trits plus one fp16 step per 128-group.
@@ -515,6 +543,7 @@ impl Arm {
                 (t as f64 + 0.5) * 3f64.log2()
             }
             Arm::Uniform(l) => (l as f64).log2(),
+            Arm::Trellis(t, _) => t as f64 * 3f64.log2() + 1.0,
         };
         payload + 16.0 / GROUP as f64
     }
@@ -629,6 +658,22 @@ fn quantize(
             out.par_chunks_mut(cols).for_each(hadamard_blocks);
             out
         }
+        Arm::Trellis(t, states) => {
+            let tr = trellis_for(states, t);
+            let mut out = vec![0.0f32; w.len()];
+            out.par_chunks_mut(cols)
+                .zip(w.par_chunks(cols))
+                .for_each(|(o, x)| {
+                    let mut y = x.to_vec();
+                    hadamard_blocks(&mut y);
+                    let (steps, units, _) = tcq_fit(&y, t, &tr);
+                    for (j, (v, &u)) in o.iter_mut().zip(&units).enumerate() {
+                        *v = (steps[j / GROUP] * u as f64) as f32;
+                    }
+                    hadamard_blocks(o);
+                });
+            out
+        }
         Arm::Golay(t) => {
             let mut out = vec![0.0f32; w.len()];
             out.par_chunks_mut(cols)
@@ -706,6 +751,35 @@ fn block_ldlq_factor_reduces_to_plain_decoding_on_an_identity_metric() {
         .map(|(j, &r)| (steps[j / GROUP] * r as f64) as f32)
         .collect();
     assert_eq!(golay_ldlq_row(&y, &steps, 1, &ut, 1.0, &code), plain);
+}
+
+/// Viterbi finds the minimum over ALL branch sequences from state 0 (brute force on short rows).
+#[test]
+fn trellis_viterbi_is_the_exhaustive_minimum() {
+    let tr = Trellis::random(4, 99);
+    let mut next = xorshift(7);
+    for t in 1..=2 {
+        let y: Vec<f32> = (0..7).map(|_| (next() * 3.0) as f32).collect();
+        let steps = vec![0.37f64];
+        let (_, err) = tcq_decode(&y, &steps, t, &tr);
+        let k = kmax(t) as f64;
+        let mut best = f64::INFINITY;
+        for bits in 0u32..(1 << y.len()) {
+            let (mut st, mut total) = (0usize, 0.0f64);
+            for (j, &x) in y.iter().enumerate() {
+                let b = ((bits >> j) & 1) as usize;
+                let c = f64::from(tr.table[st][b]);
+                let kk = ((f64::from(x) / steps[0] - c) / 3.0).round().clamp(-k, k);
+                total += (f64::from(x) - steps[0] * (3.0 * kk + c)).powi(2);
+                st = (2 * st + b) % tr.states;
+            }
+            best = best.min(total);
+        }
+        assert!(
+            (err - best).abs() < 1e-9,
+            "T={t}: viterbi {err} vs exhaustive {best}"
+        );
+    }
 }
 
 /// With `G = I` the Kronecker fit couples no rows: it is BlockLDLQ on every row, bit for bit.
@@ -829,6 +903,13 @@ fn golay_coded_planes_against_the_ladder() {
         arms = ts.iter().map(|&t| Arm::GolayKron(t)).collect();
     }
     let ldlq = ldlq || kron;
+    // `TRITIUM_H8_ARMS=trellis`: trellis-coded T planes + 1 bit at 64 and 256 states.
+    if std::env::var("TRITIUM_H8_ARMS").is_ok_and(|v| v == "trellis") {
+        arms = ts
+            .iter()
+            .flat_map(|&t| [Arm::Trellis(t, 64), Arm::Trellis(t, 256)])
+            .collect();
+    }
     let calib_tokens = 32 * WINDOW;
     let grams = ldlq.then(|| {
         let windows: Vec<&[u32]> = (0..32)

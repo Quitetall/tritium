@@ -4,6 +4,8 @@
 //! reuse the one validated forward instead of copying it.
 
 use rayon::prelude::*;
+pub mod golay;
+
 use tritium_nn::{Mlp, ModelRunner, Projection};
 use tritium_train::Tape;
 use tritium_train::nn::attention;
