@@ -4061,6 +4061,26 @@ error assertions passed. Treat the speed result as **inconclusive under
 contention**, not as a pass or a demonstrated regression; rerun this probe after
 the external workload ends. No performance threshold was changed.
 
+### Current Tritium Python source-tree suite — 2026-10-09
+
+At source revision `4fa3c6a55fda0cbe843b441ca4a9799180425e97`, the complete
+`crates/tritium-py/tests` suite passed with the timing-sensitive parallelism
+probe excluded:
+
+```text
+PYTHONPATH=crates/tritium-py/python python3 -m pytest -q \
+  crates/tritium-py/tests \
+  --ignore=crates/tritium-py/tests/test_ptq_parallelism.py
+383 passed, 27 skipped, 15 warnings in 52.17s
+```
+
+This source-tree result includes PTQ artifact, Hugging Face/QAT lifecycle,
+checkpoint, ONNX, and dispatch correctness tests. Skips and warnings remain
+visible in the test output; the excluded PTQ timing assertion is still
+unresolved pending an uncontended rerun. This does not establish installed-wheel
+qualification, full-Qwen quality, multi-GPU training, whole-model ONNX,
+performance, or candidate-bound release evidence.
+
 ### Current PyTorch/Hugging Face and ONNX source checks — 2026-10-09
 
 At source revision `44530ec99d9ef95d0c6f096a7f403aee6fce0a1f`, the focused
