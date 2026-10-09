@@ -42,6 +42,7 @@ from tritium.torch.module_onnx import (  # noqa: E402
     _first_decoder_attention_residual_name,
     _first_decoder_block_internal_names,
     _decoder_layer_residual_names,
+    _cpu_model_name,
     _session_options,
     _terminal_intermediate_names,
 )
@@ -78,6 +79,17 @@ def test_packed_onnx_runtime_disables_dense_constant_folding():
         options.graph_optimization_level
         == ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     )
+
+
+def test_cpu_model_name_reads_first_linux_cpu_label(tmp_path):
+    cpuinfo = tmp_path / "cpuinfo"
+    cpuinfo.write_text(
+        "processor : 0\nmodel name : Example CPU 9000\nflags : abc\n\n"
+        "processor : 1\nmodel name : Ignored second CPU\n",
+        encoding="utf-8",
+    )
+
+    assert _cpu_model_name(cpuinfo) == "Example CPU 9000"
 
 
 def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
@@ -595,6 +607,9 @@ def test_onnx_parity_failure_can_retain_opt_in_diagnostic_graph(
     assert runtime["session"]["intra_op_num_threads"] == 0
     assert runtime["session"]["inter_op_num_threads"] == 0
     assert runtime["cpu"]["logical_count"] == os.cpu_count()
+    assert runtime["cpu"]["model_name"] is None or isinstance(
+        runtime["cpu"]["model_name"], str
+    )
     assert runtime["thread_environment"]["OMP_NUM_THREADS"] == "3"
     assert runtime["thread_environment"]["MKL_NUM_THREADS"] == "2"
     assert set(runtime["thread_environment"]) <= {

@@ -240,6 +240,25 @@ def _session_options(ort):
     return options
 
 
+def _cpu_model_name(cpuinfo_path: Path = Path("/proc/cpuinfo")) -> Optional[str]:
+    """Read only the first CPU model label, with portable platform fallbacks."""
+
+    try:
+        with cpuinfo_path.open(encoding="utf-8", errors="replace") as source:
+            for line in source:
+                key, separator, value = line.partition(":")
+                if separator and key.strip().lower() in {"model name", "hardware"}:
+                    model_name = value.strip()
+                    if model_name:
+                        return model_name[:256]
+                if not line.strip():
+                    break
+    except OSError:
+        pass
+    fallback = os.environ.get("PROCESSOR_IDENTIFIER") or platform.processor()
+    return fallback[:256] if fallback else None
+
+
 def _parity_runtime_info(onnx, ort, session) -> dict[str, Any]:
     """Return bounded, secret-free runtime context for opt-in failure artifacts."""
 
@@ -275,6 +294,7 @@ def _parity_runtime_info(onnx, ort, session) -> dict[str, Any]:
             "release": platform.release(),
             "machine": platform.machine(),
             "processor": platform.processor() or None,
+            "model_name": _cpu_model_name(),
             "logical_count": os.cpu_count(),
             "affinity_count": affinity_count,
         },
