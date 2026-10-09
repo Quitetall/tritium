@@ -2826,3 +2826,25 @@ The public `prepare` → `calibrate` → `convert()` artifact-path test
 `test_public_convert_persists_grouped_fit_artifact` passes locally and verifies
 the persisted artifact hashes; the latest hosted failure confirms that this
 software seam is functional but does not yet make full-model PTQ fast enough.
+
+The exact-head CI and wheel runs for pushed revision
+`2960a097e14dd30f98785a273c17e197c35cc4ee` then completed. CI run
+[37863291103](https://github.com/Quitetall/tritium/actions/runs/37863291103)
+passed its executed jobs; hardware-only and real-model lanes were skipped.
+Wheel run
+[37863291107](https://github.com/Quitetall/tritium/actions/runs/37863291107)
+passed platform wheel builds, installed-wheel smoke, source-free tutorial, and
+the ABI3 matrix; its CUDA wheel lane was skipped. The pinned SmolLM2 tutorial
+completed functionally but failed the frozen `300s` gate at `527.413s`.
+Recorded stages were calibration `0.469s`, conversion `369.797s`, native
+checkpoint round-trip `385.945s`, generation `421.026s`, ONNX export
+`500.457s`, ONNX replay `521.624s`, and QAT resume `527.413s`. No tutorial
+receipt artifact was uploaded by the failed job.
+
+Compared with the immediately preceding hosted result of `749.959s`, this is
+`222.546s` faster end-to-end and `156.778s` faster at conversion. The runs are
+not controlled for runner variability, and both fail the same frozen gate; the
+difference is not attributed to a code change. The latest run is still
+`227.413s` over budget and does not qualify the full-model tutorial. It tested
+`2960a097`, before the locally committed relay-normalization buffer reuse, so a
+new exact-head wheel/tutorial run is required for that source change.
