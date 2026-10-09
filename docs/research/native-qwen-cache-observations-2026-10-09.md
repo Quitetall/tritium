@@ -62,6 +62,13 @@ selection and its added regression passed 33 tests. Producer, verifier and
 workflow regressions passed 11 tests. These controlled software tests do not
 establish final-candidate numerical parity or GPU state observation.
 
+The native Python adapter's five `qwen::tests` also passed, including shared
+snapshot-budget accounting and selecting decode without retaining prefill.
+The pre-push hook now honors explicit `CARGO_TARGET_DIR`, avoiding a second
+build cache when the project SSD cache was already selected. Its legacy
+default remains unchanged; three controlled shell-execution tests passed for
+explicit, unset and empty target settings, with formatting/Clippy still called.
+
 ## Remaining obligations
 
 - Production MTP promotion and Python `reference_mtp` remain unavailable.

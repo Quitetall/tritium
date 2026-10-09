@@ -10,8 +10,9 @@
 # Everything runs against the PUSHED COMMIT's tree in a persistent scratch
 # worktree, never against the working tree: this repo's working tree routinely
 # carries another session's uncommitted WIP, and the worktree's formatting says
-# nothing about what the push publishes. The scratch worktree + target dir live
-# under ~/.cache and are reused, so warm runs are incremental (a stable path
+# nothing about what the push publishes. The scratch worktree and default target
+# live under ~/.cache; CARGO_TARGET_DIR can select an existing project SSD cache.
+# Both are reused, so warm runs are incremental (a stable path
 # matters: cargo fingerprints include source paths, so a fresh mktemp worktree
 # per push would rebuild the world every time).
 #
@@ -29,7 +30,9 @@ set -u
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/tritium-prepush"
 WT="$CACHE/worktree"
 LOCK="$CACHE/lock"
-export CARGO_TARGET_DIR="$CACHE/target"
+# Honor an explicitly selected project SSD cache; do not silently duplicate it
+# into the legacy hook cache. The default preserves existing installations.
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$CACHE/target}"
 export RUSTFLAGS="-D warnings" # match CI so the cache fingerprints line up
 
 if ! mkdir -p "$CACHE"; then
