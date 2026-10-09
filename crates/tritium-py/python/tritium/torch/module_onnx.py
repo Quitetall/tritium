@@ -29,6 +29,7 @@ Pathish = Union[str, os.PathLike[str]]
 _MANIFEST = "tritium-module-onnx.json"
 _GRAPH = "model.onnx"
 _MAX_TERMINAL_PARITY_CAPTURE_BYTES = 64 * 1024 * 1024
+_PARITY_DIAGNOSTIC_LAYER_INDEX = 11
 _TOP_FIELDS_V1 = {
     "schema_version",
     "artifact_kind",
@@ -331,6 +332,23 @@ def _first_decoder_attention_residual_name(
     return residual_adds[0] if residual_adds else None
 
 
+def _decoder_layer_attention_residual_name(
+    graph, hidden_size: Optional[int], layer_count: Optional[int], layer_index: int
+) -> Optional[str]:
+    """Return one block's attention residual under the Llama Add contract."""
+
+    residual_adds = _decoder_layer_residual_add_names(
+        graph, hidden_size, layer_count
+    )
+    if (
+        type(layer_index) is not int
+        or layer_index < 0
+        or layer_index >= (len(residual_adds) // 2)
+    ):
+        return None
+    return residual_adds[2 * layer_index]
+
+
 def _first_decoder_block_internal_names(
     graph,
     hidden_size: Optional[int],
@@ -339,12 +357,32 @@ def _first_decoder_block_internal_names(
 ) -> Tuple[str, ...]:
     """Select hidden/MLP-width values inside block zero, excluding its residuals."""
 
+    return _decoder_block_internal_names(
+        graph, hidden_size, layer_count, intermediate_size, layer_index=0
+    )
+
+
+def _decoder_block_internal_names(
+    graph,
+    hidden_size: Optional[int],
+    layer_count: Optional[int],
+    intermediate_size: Optional[int],
+    *,
+    layer_index: int,
+) -> Tuple[str, ...]:
+    """Select hidden/MLP-width values inside one Llama-style block."""
+
     residual_adds = _decoder_layer_residual_add_names(
         graph, hidden_size, layer_count
     )
-    if not residual_adds:
+    if (
+        not residual_adds
+        or type(layer_index) is not int
+        or layer_index < 0
+        or layer_index >= (len(residual_adds) // 2)
+    ):
         return ()
-    first_add, block_output = residual_adds[:2]
+    first_add, block_output = residual_adds[2 * layer_index : 2 * layer_index + 2]
     node_indices = {
         output: index
         for index, node in enumerate(graph.node)
@@ -460,6 +498,21 @@ def _capture_terminal_intermediates(
     first_block_internal_names = _first_decoder_block_internal_names(
         graph.graph, hidden_size, layer_count, intermediate_size
     )
+    diagnostic_layer_index = (
+        min(_PARITY_DIAGNOSTIC_LAYER_INDEX, layer_count - 1)
+        if type(layer_count) is int and layer_count > 0
+        else 0
+    )
+    diagnostic_attention_residual_name = _decoder_layer_attention_residual_name(
+        graph.graph, hidden_size, layer_count, diagnostic_layer_index
+    )
+    diagnostic_block_internal_names = _decoder_block_internal_names(
+        graph.graph,
+        hidden_size,
+        layer_count,
+        intermediate_size,
+        layer_index=diagnostic_layer_index,
+    )
     available = {
         value.name: value
         for value in (*graph.graph.input, *graph.graph.output, *graph.graph.value_info)
@@ -472,6 +525,8 @@ def _capture_terminal_intermediates(
                 *residual_names,
                 attention_residual_name,
                 *first_block_internal_names,
+                diagnostic_attention_residual_name,
+                *diagnostic_block_internal_names,
             )
         )
         if name is not None
@@ -516,10 +571,13 @@ def _capture_terminal_intermediates(
                     (
                         "terminal-attention-residual"
                         if name == attention_residual_name
+                        or name == diagnostic_attention_residual_name
                         else "terminal-layer-residual"
                         if name in residual_names
                         else "terminal-first-block-internal"
                         if name in first_block_internal_names
+                        else "terminal-diagnostic-block-internal"
+                        if name in diagnostic_block_internal_names
                         else "terminal-intermediate"
                     ),
                     name,
@@ -568,6 +626,12 @@ def _capture_reference_terminal_outputs(
     backbone = getattr(model, "model", None)
     decoder_layers = getattr(backbone, "layers", None)
     first_layer = decoder_layers[0] if decoder_layers else None
+    diagnostic_layer_index = min(_PARITY_DIAGNOSTIC_LAYER_INDEX, layer_count - 1)
+    diagnostic_layer = (
+        decoder_layers[diagnostic_layer_index]
+        if decoder_layers and diagnostic_layer_index < len(decoder_layers)
+        else None
+    )
     post_attention_layernorm = getattr(
         first_layer, "post_attention_layernorm", None
     )
@@ -585,6 +649,27 @@ def _capture_reference_terminal_outputs(
         and isinstance(up_projection, nn.Module)
         and isinstance(mlp_activation, nn.Module)
     )
+    diagnostic_post_attention_layernorm = getattr(
+        diagnostic_layer, "post_attention_layernorm", None
+    )
+    diagnostic_mlp = getattr(diagnostic_layer, "mlp", None)
+    diagnostic_gate_projection = getattr(diagnostic_mlp, "gate_proj", None)
+    diagnostic_up_projection = getattr(diagnostic_mlp, "up_proj", None)
+    diagnostic_mlp_activation = getattr(diagnostic_mlp, "act_fn", None)
+    capture_diagnostic_block = diagnostic_layer_index != 0
+    can_capture_diagnostic_boundaries = (
+        capture_diagnostic_block
+        and isinstance(diagnostic_post_attention_layernorm, nn.Module)
+        and isinstance(diagnostic_mlp, nn.Module)
+    )
+    can_capture_diagnostic_projections = (
+        can_capture_diagnostic_boundaries
+        and type(intermediate_size) is int
+        and intermediate_size > 0
+        and isinstance(diagnostic_gate_projection, nn.Module)
+        and isinstance(diagnostic_up_projection, nn.Module)
+        and isinstance(diagnostic_mlp_activation, nn.Module)
+    )
     estimated_bytes = (
         (
             layer_count
@@ -592,16 +677,24 @@ def _capture_reference_terminal_outputs(
             + int(can_capture_attention_residual)
             + int(can_capture_mlp_input)
             + int(can_capture_mlp_output)
+            + int(can_capture_diagnostic_boundaries) * 3
         )
         * batch
         * sequence
         * hidden_size
         * 4
         + 3
-        * int(can_capture_mlp_projections)
+        * (
+            int(can_capture_mlp_projections)
+            + int(can_capture_diagnostic_projections)
+        )
         * batch
         * sequence
-        * (intermediate_size if can_capture_mlp_projections else 0)
+        * (
+            intermediate_size
+            if type(intermediate_size) is int and intermediate_size > 0
+            else 0
+        )
         * 4
         + batch * sequence * vocab_size * 4
     )
@@ -613,10 +706,16 @@ def _capture_reference_terminal_outputs(
     gate_projection_outputs = []
     up_projection_outputs = []
     mlp_activation_outputs = []
+    diagnostic_attention_residuals = []
+    diagnostic_mlp_inputs = []
+    diagnostic_mlp_outputs = []
+    diagnostic_gate_projection_outputs = []
+    diagnostic_up_projection_outputs = []
+    diagnostic_mlp_activation_outputs = []
 
-    def capture_attention_residual(_module, args):
+    def capture_attention_residual(target, _module, args):
         if args and isinstance(args[0], Tensor):
-            attention_residuals.append(args[0])
+            target.append(args[0])
 
     def capture_module_output(target, _module, _args, output):
         value = output[0] if isinstance(output, (tuple, list)) and output else output
@@ -627,7 +726,9 @@ def _capture_reference_terminal_outputs(
     if can_capture_attention_residual:
         hooks.append(
             post_attention_layernorm.register_forward_pre_hook(
-                capture_attention_residual
+                lambda module, args: capture_attention_residual(
+                    attention_residuals, module, args
+                )
             )
         )
         hooks.append(
@@ -661,6 +762,46 @@ def _capture_reference_terminal_outputs(
                 mlp_activation.register_forward_hook(
                     lambda module, args, output: capture_module_output(
                         mlp_activation_outputs, module, args, output
+                    )
+                ),
+            )
+        )
+    if can_capture_diagnostic_boundaries:
+        hooks.extend(
+            (
+                diagnostic_post_attention_layernorm.register_forward_pre_hook(
+                    lambda module, args: capture_attention_residual(
+                        diagnostic_attention_residuals, module, args
+                    )
+                ),
+                diagnostic_post_attention_layernorm.register_forward_hook(
+                    lambda module, args, output: capture_module_output(
+                        diagnostic_mlp_inputs, module, args, output
+                    )
+                ),
+                diagnostic_mlp.register_forward_hook(
+                    lambda module, args, output: capture_module_output(
+                        diagnostic_mlp_outputs, module, args, output
+                    )
+                ),
+            )
+        )
+    if can_capture_diagnostic_projections:
+        hooks.extend(
+            (
+                diagnostic_gate_projection.register_forward_hook(
+                    lambda module, args, output: capture_module_output(
+                        diagnostic_gate_projection_outputs, module, args, output
+                    )
+                ),
+                diagnostic_up_projection.register_forward_hook(
+                    lambda module, args, output: capture_module_output(
+                        diagnostic_up_projection_outputs, module, args, output
+                    )
+                ),
+                diagnostic_mlp_activation.register_forward_hook(
+                    lambda module, args, output: capture_module_output(
+                        diagnostic_mlp_activation_outputs, module, args, output
                     )
                 ),
             )
@@ -700,6 +841,16 @@ def _capture_reference_terminal_outputs(
         capture_tensors.append(up_projection_outputs[0])
     if mlp_activation_outputs:
         capture_tensors.append(mlp_activation_outputs[0])
+    for values in (
+        diagnostic_attention_residuals,
+        diagnostic_mlp_inputs,
+        diagnostic_mlp_outputs,
+        diagnostic_gate_projection_outputs,
+        diagnostic_up_projection_outputs,
+        diagnostic_mlp_activation_outputs,
+    ):
+        if values:
+            capture_tensors.append(values[0])
     if sum(value.numel() * value.element_size() for value in capture_tensors) > (
         _MAX_TERMINAL_PARITY_CAPTURE_BYTES
     ):
@@ -755,6 +906,54 @@ def _capture_reference_terminal_outputs(
                 "reference-mlp-output",
                 "layers[0].mlp.output",
                 mlp_outputs[0].detach().cpu().contiguous(),
+            )
+        )
+    if diagnostic_attention_residuals:
+        arrays.append(
+            (
+                "reference-attention-residual",
+                f"layers[{diagnostic_layer_index}].attention_residual",
+                diagnostic_attention_residuals[0].detach().cpu().contiguous(),
+            )
+        )
+    if diagnostic_mlp_inputs:
+        arrays.append(
+            (
+                "reference-mlp-input",
+                f"layers[{diagnostic_layer_index}].post_attention_layernorm.output",
+                diagnostic_mlp_inputs[0].detach().cpu().contiguous(),
+            )
+        )
+    if diagnostic_gate_projection_outputs:
+        arrays.append(
+            (
+                "reference-mlp-gate-projection",
+                f"layers[{diagnostic_layer_index}].mlp.gate_proj.output",
+                diagnostic_gate_projection_outputs[0].detach().cpu().contiguous(),
+            )
+        )
+    if diagnostic_up_projection_outputs:
+        arrays.append(
+            (
+                "reference-mlp-up-projection",
+                f"layers[{diagnostic_layer_index}].mlp.up_proj.output",
+                diagnostic_up_projection_outputs[0].detach().cpu().contiguous(),
+            )
+        )
+    if diagnostic_mlp_activation_outputs:
+        arrays.append(
+            (
+                "reference-mlp-activation",
+                f"layers[{diagnostic_layer_index}].mlp.act_fn.output",
+                diagnostic_mlp_activation_outputs[0].detach().cpu().contiguous(),
+            )
+        )
+    if diagnostic_mlp_outputs:
+        arrays.append(
+            (
+                "reference-mlp-output",
+                f"layers[{diagnostic_layer_index}].mlp.output",
+                diagnostic_mlp_outputs[0].detach().cpu().contiguous(),
             )
         )
     arrays.extend(

@@ -4477,3 +4477,78 @@ in-tolerance drift in block zero. Its gate/up projections, activation, and
 down projection were not separately compared, so the responsible operation
 remains unknown. Next capture and compare the gate/up projection outputs and
 activation before changing numerical kernels or release tolerances.
+
+#### First-block projection comparison and latest hosted replay — 2026-10-09
+
+Commit `ab7ae2cc4ef367482b22b874a97a8c662dba126a` adds failure-only capture
+of the first block's intermediate-width ONNX values and reference gate, up,
+and activation outputs. The exact-source wheels run
+[37946168132](https://github.com/Quitetall/tritium/actions/runs/37946168132)
+built Linux x86_64, macOS arm64, and Windows x64 wheels successfully; the
+CUDA wheel job was skipped. CI, docs, and CPU capstone checks passed. The
+SmolLM2 tutorial still failed at the frozen `rtol=atol=1e-4` check with the
+same 4 of 344,064 logits, maximum failing absolute difference
+`0.00010919570922851562` at `(0, 0, 34041)`, and maximum failing relative
+difference `1.7615385055541992`. The gate remains RED; no tolerance or runtime
+behavior changed.
+
+The retained `smollm2-onnx-parity-diagnostic` artifact (ID `11624157673`,
+36,579,643 bytes; archive SHA-256
+`a836dc444fcb3b4e624dac6dc9f2e2d4e4eb2a03b366046159527d0e229cd81b`) contains
+95 files. Its manifest SHA-256 is
+`81edaaad70b40ffcf9139b7db47e26e752972206f289a4a0612ddb362eb91fee`. All 94
+listed replay arrays and ONNX files passed the manifest's byte-count and
+SHA-256 checks. The checkpoint digest remains
+`sha256:057411d950e9d681f3bcea79e1378eaada734e0a3556ff64590e200144fbd3e2`.
+
+The newly mapped first-block path is numerically close at every captured
+boundary. The ONNX `linear_4` maps to the PyTorch gate projection, and
+`linear_5` maps to the up projection; swapping those mappings fails across all
+10,752 values, so the correspondence is unambiguous. `silu` is the activation
+output and `linear_6` is the down projection/MLP output.
+
+| Boundary | ONNX value | PyTorch value | Maximum absolute difference | Maximum tolerance ratio | Failures |
+|---|---|---|---:|---:|---:|
+| Gate projection | `linear_4` | `layers[0].mlp.gate_proj.output` | `7.152557373046875e-07` | `0.006249` | 0 |
+| Up projection | `linear_5` | `layers[0].mlp.up_proj.output` | `8.344650268554688e-07` | `0.006286` | 0 |
+| Activation | `silu` | `layers[0].mlp.act_fn.output` | `7.152557373046875e-07` | `0.003380` | 0 |
+| Down projection / MLP output | `linear_6` | `layers[0].mlp.output` | `4.76837158203125e-06` | `0.024855` | 0 |
+
+All 29 block residual comparisons remain within the elementwise tolerance;
+their maximum normalized tolerance ratio is `0.663240` at `add_6606` versus
+`hidden_states[29]`. The final normalized hidden state also has zero failures
+(maximum absolute difference `0.000118255615234375`, maximum ratio
+`0.110146`). This moves the investigation away from a first-block MLP
+projection/activation defect. The small residual differences accumulate
+across the model and the terminal output head produces four out-of-tolerance
+logits. The exact source of this accumulated numerical drift is still
+unidentified; do not call this a fix or a parity pass.
+
+The installed-wheel job in the same run failed earlier at
+`qualify public PTQ row-fitting parallelism`, so the selected public
+`prepare → calibrate → convert()` artifact test was skipped. The performance
+probe retained output equality but measured only `1.35x` speedup on a
+four-CPU hosted runner (`2.130s` serial, `1.576s` parallel), below its existing
+`1.5x` guard. The focused probe passed locally at `2.30x` (`3.105s` serial,
+`1.349s` parallel) with 32 CPUs in affinity and a heavily loaded host; this is
+not comparable hosted qualification. Neither result justifies weakening the
+guard. Revisit the probe's measurement stability and the actual parallel fit
+performance, then rerun the exact-wheel artifact test.
+
+The follow-up diagnostic now retains the first-block traces and additionally
+selects decoder block index 11 (or the last available block for a smaller
+model), including its attention residual, MLP input, gate/up projections,
+activation, and MLP output. The target is evidence-driven: the captured
+residual drift first jumps at block output `add_2832`, which is block index
+11. Local tests cover multi-block ONNX name selection and reference hooks
+(`18 passed`), and the public grouped-fit artifact test passed locally
+(`1 passed`). A local replay of the captured graph selected the expected
+block-11 ONNX names (`add_2782`, `linear_81`, `linear_82`, `silu_11`, and
+`linear_83`) within the 64 MiB capture bound. This diagnostic has not yet run
+against the hosted pinned model, and the installed-wheel version of the PTQ
+artifact test remains skipped after the separate row-fitting performance
+gate failed.
+
+Next compare those block-11 internals against PyTorch on the exact pinned
+tutorial, then test a source-backed numerical correction. Keep the tolerance
+frozen and the gate RED until that tutorial passes.
