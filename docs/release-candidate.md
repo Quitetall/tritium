@@ -3522,3 +3522,28 @@ or explain the whole-model gap. The next performance work must remain matched
 to this exact tutorial and preserve the deterministic public `convert()`
 artifact; if portable CPU optimization cannot close the gap, the runner
 contract itself needs an evidence-backed ADR rather than a relaxed timeout.
+
+### Diagonal objective deferred-check experiment — 2026-10-09 (rejected)
+
+A candidate removed the per-coefficient finite-check branch from fused
+nonnegative diagonal-objective reconstruction and checked the final sum once.
+The change kept the ordered f64 additions, and a new extreme-value regression
+verified that overflow still returns `NonFiniteObjective`. The complete
+quantizer suite passed (`240` unit tests plus applicable integration tests,
+`4` ignored), strict Clippy and formatting passed, and the selected public
+`prepare` → `calibrate` → `convert()` artifact test passed after rebuilding the
+release extension. Three candidate public conversions all retained artifact
+ID `sha256:4059a7c249fbf4d3aaa58a56d4d6c630da175d2c440a365fef025ea3e0b58c44`
+and weighted MSE `8.28580185e-05`.
+
+Matched release-mode profiles against the same pinned 256-row SmolLM2 fixture
+were mixed. P2 dual-relay median time was `23.104ms` for the candidate
+(`22.551`, `23.230`, `23.104`) versus `23.245ms` for baseline (`23.104`,
+`23.245`, `23.618`). P3 median was `58.805ms` for the candidate (`58.067`,
+`58.805`, `59.111`) versus `57.743ms` for baseline (`57.268`, `57.634`,
+`57.743`, `57.779`, `59.723`). Public one-projection conversion medians were
+`0.797s` candidate (`0.792–0.800s`) versus `0.810s` baseline
+(`0.802–0.813s`). The small local conversion difference is not a repeatable
+whole-model or hosted result, and P3 regressed. The candidate was removed; no
+production source change remains. Do not attribute a speedup or use this
+experiment to explain the hosted `608.171s` failure.
