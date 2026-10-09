@@ -3785,3 +3785,19 @@ run at `562.706s`, this separate-run result is about `1.6%` lower, which is not
 controlled evidence of an improvement. Keep the frozen budget unchanged; the
 next software work must target conversion and export separately, preserve exact
 PTQ artifact/quality checks, and earn a fresh hosted rerun.
+
+### Relay scale-prefix allocation reduction — 2026-10-09
+
+Commit `6aa06c19` replaces the relay initializer's per-prefix heap-backed
+scale vectors with fixed three-element prefixes. Prefix ordering and values
+remain bit-identical to the independent reference; an explicit all-zero case
+also checks each prefix length. The `tritium-quantize` suite passed (240 unit
+tests and all applicable integration tests; four declared ignores), strict
+crate Clippy passed, and `cargo fmt --all -- --check` passed.
+
+Three optimized synthetic G64/P3 profile runs measured `40.524`, `43.672`, and
+`41.095ms` (median `41.095ms`) versus the previous candidate's recorded
+`41.651ms` median. The roughly `1.3%` difference is not a reliable speedup and
+does not establish full-model improvement. This is retained as a bounded
+allocation-footprint reduction, not a performance claim; hosted public-wheel
+PTQ and the pinned tutorial remain the authority.

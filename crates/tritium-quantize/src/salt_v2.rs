@@ -837,7 +837,7 @@ pub fn fit_joint_ternary(
     };
     #[cfg(test)]
     record_solver_phase(4, order_started);
-    let mut relay_scale_prefixes: [Option<Vec<Vec<f32>>>; 2] = [None, None];
+    let mut relay_scale_prefixes: [Option<Vec<relay::ScalePrefix>>; 2] = [None, None];
     for (index, enabled, modulated) in [
         (0, config.relay_basins.softened, false),
         (1, config.relay_basins.modulated, true),
@@ -873,7 +873,7 @@ fn fit_joint_ternary_prepared(
     metric_diagonal: &[f64],
     metric_sum: f64,
     weighted_abs_order: &WeightedAbsOrder,
-    relay_scale_prefixes: &[Option<Vec<Vec<f32>>>; 2],
+    relay_scale_prefixes: &[Option<Vec<relay::ScalePrefix>>; 2],
 ) -> Result<JointTernaryFit, JointFitError> {
     let relay_starts =
         usize::from(config.relay_basins.softened) + usize::from(config.relay_basins.modulated);
@@ -921,8 +921,8 @@ fn fit_joint_ternary_prepared(
         let scales = relay_scale_prefixes[index]
             .as_ref()
             .and_then(|prefixes| prefixes.get(config.planes - 1))
-            .expect("enabled relay basin has cached scales for every plane prefix")
-            .clone();
+            .map(|prefix| prefix.to_vec())
+            .expect("enabled relay basin has cached scales for every plane prefix");
         starts.push(optimize_start(weights, fit_metric, config, scales, kind)?);
     }
 
@@ -1969,6 +1969,20 @@ mod relay {
         shift: f64,
     }
 
+    /// One descending scale prefix. At most three planes are supported, so a fixed array avoids
+    /// allocating a separate `Vec<f32>` for every prefix of every fitted row.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub(super) struct ScalePrefix {
+        values: [f32; 3],
+        len: usize,
+    }
+
+    impl ScalePrefix {
+        pub(super) fn to_vec(self) -> Vec<f32> {
+            self.values[..self.len].to_vec()
+        }
+    }
+
     /// Sequential per-plane residual soft fit returning `planes` deployment-rounded scale
     /// magnitudes, canonicalized descending like every other deterministic basin.
     ///
@@ -1984,6 +1998,7 @@ mod relay {
     ) -> Result<Vec<f32>, JointFitError> {
         Ok(basin_scale_prefixes(weights, planes, modulated, precision)?
             .pop()
+            .map(ScalePrefix::to_vec)
             .unwrap_or_default())
     }
 
@@ -1995,9 +2010,9 @@ mod relay {
         planes: usize,
         modulated: bool,
         precision: ScalePrecision,
-    ) -> Result<Vec<Vec<f32>>, JointFitError> {
+    ) -> Result<Vec<ScalePrefix>, JointFitError> {
         let mut residual = weights.to_vec();
-        let mut scales = Vec::with_capacity(planes);
+        let mut scales = [0.0_f32; 3];
         let mut prefixes = Vec::with_capacity(planes);
         // Every plane's descent needs the residual normalized by that plane's
         // absmean. Reuse one buffer instead of allocating a new f64 vector for
@@ -2010,17 +2025,15 @@ mod relay {
                 .sum::<f64>()
                 / residual.len() as f64;
             if absmean <= 0.0 {
-                scales.push(deployment_scale(0.0, precision, plane)?);
-                let mut prefix = scales.clone();
-                prefix.sort_by(|left, right| right.total_cmp(left));
-                prefixes.push(prefix);
+                scales[plane] = deployment_scale(0.0, precision, plane)?;
+                prefixes.push(scale_prefix(&scales[..=plane]));
                 continue;
             }
             normalized.clear();
             normalized.extend(residual.iter().map(|value| f64::from(*value) / absmean));
             let fit = descend(&normalized, modulated);
             let scale = deployment_scale((fit.scale * absmean) as f32, precision, plane)?;
-            scales.push(scale);
+            scales[plane] = scale;
             if scale > 0.0 {
                 let shift = (fit.shift * absmean) as f32;
                 let threshold = scale * fit.threshold as f32;
@@ -2036,11 +2049,20 @@ mod relay {
                     *value -= scale * trit;
                 }
             }
-            let mut prefix = scales.clone();
-            prefix.sort_by(|left, right| right.total_cmp(left));
-            prefixes.push(prefix);
+            prefixes.push(scale_prefix(&scales[..=plane]));
         }
         Ok(prefixes)
+    }
+
+    fn scale_prefix(scales: &[f32]) -> ScalePrefix {
+        debug_assert!(!scales.is_empty() && scales.len() <= 3);
+        let mut values = [0.0_f32; 3];
+        values[..scales.len()].copy_from_slice(scales);
+        values[..scales.len()].sort_by(|left, right| right.total_cmp(left));
+        ScalePrefix {
+            values,
+            len: scales.len(),
+        }
     }
 
     /// Minimize `L = mean_i (c_i - a * relay(c_i / a, s_k, delta))^2` with `c_i = w_i - mu` by
@@ -2229,6 +2251,16 @@ mod relay {
         }
 
         #[test]
+        fn fixed_scale_prefixes_preserve_zero_planes_and_prefix_lengths() {
+            let prefixes = basin_scale_prefixes(&[0.0; 64], 3, true, ScalePrecision::F16)
+                .expect("zero-weight prefixes");
+            assert_eq!(prefixes.len(), 3);
+            assert_eq!(prefixes[0].to_vec(), [0.0]);
+            assert_eq!(prefixes[1].to_vec(), [0.0, 0.0]);
+            assert_eq!(prefixes[2].to_vec(), [0.0, 0.0, 0.0]);
+        }
+
+        #[test]
         fn cached_scale_prefixes_match_independent_legacy_fits() {
             for length in [1, 3, 16, 64, 128] {
                 for seed in 0..8 {
@@ -2249,7 +2281,13 @@ mod relay {
                         let actual =
                             basin_scale_prefixes(&weights, 3, modulated, ScalePrecision::F16)
                                 .expect("cached prefixes");
-                        assert_eq!(actual, expected);
+                        assert_eq!(
+                            actual
+                                .iter()
+                                .map(|prefix| prefix.to_vec())
+                                .collect::<Vec<_>>(),
+                            expected
+                        );
                     }
                 }
             }
