@@ -1397,38 +1397,36 @@ def _tensor_outputs(value: Any) -> Tuple[Tensor, ...]:
     return tuple(values)
 
 
-def _promote_terminal_output_matmuls(graph, onnx) -> int:
-    """Use FP64 accumulation only for float32 MatMul/Gemm output projections."""
+def _promote_float32_matmuls_to_fp64(graph, onnx) -> int:
+    """Accumulate every typed float32 MatMul/Gemm in FP64, then restore FP32."""
 
-    producers = {
-        output: node
-        for node in graph.node
-        for output in node.output
-    }
-    terminal_matmul_outputs: set[str] = set()
-    for graph_output in graph.output:
+    value_types = {}
+    for value in (*graph.input, *graph.value_info, *graph.output):
+        if value.type.WhichOneof("value") == "tensor_type":
+            value_types[value.name] = value.type.tensor_type.elem_type
+    value_types.update(
+        (initializer.name, initializer.data_type)
+        for initializer in graph.initializer
+    )
+    promoted_outputs: set[str] = set()
+    for node in graph.node:
         if (
-            graph_output.type.WhichOneof("value") != "tensor_type"
-            or graph_output.type.tensor_type.elem_type != onnx.TensorProto.FLOAT
+            node.op_type not in {"MatMul", "Gemm"}
+            or len(node.output) != 1
+            or not node.output[0]
         ):
             continue
-        producer = producers.get(graph_output.name)
-        if producer is None:
-            continue
-        terminal_values = (
-            tuple(producer.input) if producer.op_type == "Concat"
-            else (graph_output.name,)
-        )
-        for value in terminal_values:
-            terminal = producers.get(value)
-            if (
-                terminal is not None
-                and terminal.op_type in {"MatMul", "Gemm"}
-                and len(terminal.input) in ({2} if terminal.op_type == "MatMul" else {2, 3})
-                and len(terminal.output) == 1
-            ):
-                terminal_matmul_outputs.add(terminal.output[0])
-    if not terminal_matmul_outputs:
+        output_type = value_types.get(node.output[0])
+        input_types = [value_types.get(name) for name in node.input if name]
+        if output_type is None and input_types and all(
+            value_type == onnx.TensorProto.FLOAT for value_type in input_types
+        ):
+            output_type = onnx.TensorProto.FLOAT
+        if output_type == onnx.TensorProto.FLOAT and all(
+            value_type == onnx.TensorProto.FLOAT for value_type in input_types
+        ):
+            promoted_outputs.add(node.output[0])
+    if not promoted_outputs:
         return 0
 
     used_names = {
@@ -1454,13 +1452,16 @@ def _promote_terminal_output_matmuls(graph, onnx) -> int:
     rewritten = []
     promoted = 0
     for node in graph.node:
-        if not node.output or node.output[0] not in terminal_matmul_outputs:
+        if not node.output or node.output[0] not in promoted_outputs:
             rewritten.append(node)
             continue
         original_output = node.output[0]
         double_inputs = []
         casts = []
         for index, input_name in enumerate(node.input):
+            if not input_name:
+                double_inputs.append(input_name)
+                continue
             double_input = fresh_name(f"{original_output}_input_{index}")
             casts.append(
                 onnx.helper.make_node(
@@ -1623,7 +1624,7 @@ def export_module_onnx(
             },
         )
         graph = onnx.load(graph_path, load_external_data=False)
-        if _promote_terminal_output_matmuls(graph.graph, onnx):
+        if _promote_float32_matmuls_to_fp64(graph.graph, onnx):
             onnx.save_model(graph, graph_path, save_as_external_data=False)
         # Path-based checking supplies ONNX with the external-data base directory.
         # Checking an in-memory ModelProto makes valid large graphs look missing.

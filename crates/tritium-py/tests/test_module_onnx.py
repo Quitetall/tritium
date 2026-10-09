@@ -125,7 +125,7 @@ def test_terminal_output_matmuls_accumulate_in_double_without_changing_output_ty
         graph, opset_imports=[helper.make_opsetid("", 18)]
     )
 
-    promoted = module_onnx._promote_terminal_output_matmuls(model.graph, onnx)
+    promoted = module_onnx._promote_float32_matmuls_to_fp64(model.graph, onnx)
 
     assert promoted == 2
     assert [node.input for node in model.graph.node if node.op_type == "Concat"] == [
@@ -145,25 +145,104 @@ def test_terminal_output_matmuls_accumulate_in_double_without_changing_output_ty
     checker.check_model(model)
 
 
-def test_exported_float32_output_projection_promotes_only_terminal_matmul(tmp_path):
-    model = torch.nn.Sequential(_model(), torch.nn.Linear(2, 4, bias=False)).eval()
-    artifact = export_module_onnx(
-        model, torch.randn(2, 8), tmp_path / "output-projection"
+def test_intermediate_float32_matmuls_are_promoted_for_model_parity():
+    from onnx import TensorProto, checker, helper
+
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 2])
+    logits = helper.make_tensor_value_info("logits", TensorProto.FLOAT, [1, 2])
+    hidden = helper.make_tensor_value_info("hidden", TensorProto.FLOAT, [1, 2])
+    graph = helper.make_graph(
+        [
+            helper.make_node("MatMul", ["x", "left"], ["hidden"]),
+            helper.make_node("MatMul", ["hidden", "right"], ["logits"]),
+        ],
+        "intermediate-and-terminal-logits",
+        [x],
+        [logits],
+        initializer=[
+            helper.make_tensor("left", TensorProto.FLOAT, [2, 2], [1, 0, 0, 1]),
+            helper.make_tensor("right", TensorProto.FLOAT, [2, 2], [1, 0, 0, 1]),
+        ],
+        value_info=[hidden],
     )
-    graph = onnx.load(artifact.artifact_dir / "model.onnx", load_external_data=False)
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 18)]
+    )
+
+    promoted = module_onnx._promote_float32_matmuls_to_fp64(model.graph, onnx)
+
+    assert promoted == 2
     double_casts = [
         node
-        for node in graph.graph.node
+        for node in model.graph.node
         if node.op_type == "Cast"
         and any(
-            attribute.name == "to" and attribute.i == onnx.TensorProto.DOUBLE
+            attribute.name == "to" and attribute.i == TensorProto.DOUBLE
             for attribute in node.attribute
         )
     ]
-    assert len(double_casts) == 2
-    runtime = load_module_onnx(artifact.artifact_dir)
+    assert len(double_casts) == 4
+    checker.check_model(model)
+
+
+def test_exported_float32_matmuls_use_fp64_accumulation(tmp_path):
+    torch.manual_seed(131)
+    model = torch.nn.Sequential(
+        torch.nn.Linear(8, 8), torch.nn.GELU(), torch.nn.Linear(8, 4)
+    ).eval()
+    example = torch.randn(2, 8)
+    prepared = prepare(
+        model,
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    calibration = calibrate(
+        prepared, [example], evidence_dir=tmp_path / "calibration"
+    )
+    quantized = convert(prepared, calibration, work_dir=tmp_path / "ptq")
+    artifact = export_onnx(
+        quantized,
+        tmp_path / "ptq-onnx",
+        model=model,
+        example_inputs=example,
+    )
+    graph = onnx.load(
+        artifact.artifact_dir / "model.onnx", load_external_data=False
+    )
+    producers = {
+        output: node for node in graph.graph.node for output in node.output
+    }
+    matmuls = [
+        node for node in graph.graph.node if node.op_type in {"MatMul", "Gemm"}
+    ]
+    assert len(matmuls) > 1
+    for node in matmuls:
+        assert all(
+            producers[name].op_type == "Cast"
+            and next(
+                attribute.i
+                for attribute in producers[name].attribute
+                if attribute.name == "to"
+            ) == onnx.TensorProto.DOUBLE
+            for name in node.input
+            if name
+        )
+        assert any(
+            candidate.op_type == "Cast"
+            and candidate.input[0] == node.output[0]
+            and next(
+                attribute.i
+                for attribute in candidate.attribute
+                if attribute.name == "to"
+            ) == onnx.TensorProto.FLOAT
+            for candidate in graph.graph.node
+        )
+    runtime = load_onnx(artifact.artifact_dir)
     replay = torch.randn(3, 8)
-    torch.testing.assert_close(runtime(replay), model(replay), rtol=1e-4, atol=1e-5)
+    quantized_model = load_quantized_module(model, quantized)
+    torch.testing.assert_close(
+        runtime(replay), quantized_model(replay), rtol=1e-4, atol=1e-5
+    )
 
 
 def test_cpu_model_name_reads_first_linux_cpu_label(tmp_path):
