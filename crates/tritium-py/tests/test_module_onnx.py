@@ -80,7 +80,7 @@ def test_packed_onnx_runtime_disables_dense_constant_folding(monkeypatch):
         options.graph_optimization_level
         == ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     )
-    assert options.intra_op_num_threads == 4
+    assert options.intra_op_num_threads == 2
     assert options.inter_op_num_threads == 0
 
 

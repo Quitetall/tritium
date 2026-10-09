@@ -21,7 +21,7 @@ import torch
 from tritium.torch import TernaryConfig, calibrate, convert, prepare
 
 torch.manual_seed(31)
-model = torch.nn.Linear(64, 8192, bias=False)
+model = torch.nn.Linear(256, 2048, bias=False)
 prepared = prepare(
     model,
     TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
@@ -30,7 +30,7 @@ prepared = prepare(
 with tempfile.TemporaryDirectory(prefix="tritium-ptq-parallelism-") as root:
     evidence = calibrate(
         prepared,
-        [torch.randn(1, 64)],
+        [torch.randn(1, 256)],
         evidence_dir=f"{root}/evidence",
     )
     started = time.perf_counter()
@@ -99,7 +99,7 @@ class PublicPtqParallelismTests(unittest.TestCase):
             parallel["elapsed_seconds"]
         )
         print(
-            "public PTQ convert rows=8192 columns=64 "
+            "public PTQ convert rows=2048 columns=256 "
             f"serial_seconds={serial['elapsed_seconds']:.3f} "
             f"parallel_seconds={parallel['elapsed_seconds']:.3f} "
             f"speedup={speedup:.2f}x "

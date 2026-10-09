@@ -441,6 +441,9 @@ pub(crate) fn fit_joint_ternary_diagonal_groups_with_objective(
                 batch_weights
                     .par_chunks_exact(columns)
                     .enumerate()
+                    // Narrow row fits are cheap enough that thousands of
+                    // single-row tasks spend avoidable time in Rayon scheduling.
+                    .with_min_len(16)
                     .map(|(batch_row, row_weights)| {
                         let group = first_group + batch_row / rows;
                         let start = group * columns;
