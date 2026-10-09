@@ -99,9 +99,21 @@ def _maximum_error(left: Sequence[float], right: Sequence[float]) -> float:
     return float(torch.max(torch.abs(left_tensor - right_tensor)).item())
 
 
+def _valid_state(state: Any) -> bool:
+    return (
+        isinstance(state, torch.Tensor)
+        and state.device.type == "cpu"
+        and state.dtype == torch.float32
+        and state.ndim > 0
+        and state.numel() > 0
+        and bool(torch.isfinite(state).all())
+    )
+
+
 def _states_equal(left: Sequence[torch.Tensor], right: Sequence[torch.Tensor]) -> bool:
-    return len(left) == len(right) and all(
-        tuple(a.shape) == tuple(b.shape) and torch.equal(a, b)
+    return bool(left) and len(left) == len(right) and all(
+        _valid_state(a) and _valid_state(b)
+        and tuple(a.shape) == tuple(b.shape) and torch.equal(a, b)
         for a, b in zip(left, right, strict=True)
     )
 
@@ -215,43 +227,96 @@ def _language_cases(native: Any, ort_model: Any) -> list[dict[str, Any]]:
     return cases
 
 
+def _mtp_inputs(
+    reference: Any, language: Any, tokens: list[int], sampled: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Bind shifted IDs and hidden rows to the independently executed target."""
+    shifted = list(reference.shifted_input_ids)
+    hidden = list(reference.target_hidden_states)
+    width = reference.hidden_size
+    if (
+        shifted != tokens[1:] + [sampled]
+        or any(type(token) is not int for token in shifted)
+        or list(language.token_ids) != tokens
+        or type(width) is not int
+        or width <= 0
+        or width != language.hidden_size
+        or len(hidden) != len(tokens) * width
+        or hidden != list(language.final_hidden_states)
+        or len(reference.final_hidden_states) != len(hidden)
+    ):
+        raise OnnxQualificationError("native MTP target/token alignment differs")
+    hidden_tensor = torch.tensor(hidden, dtype=torch.float32).view(len(tokens), width)
+    if not bool(torch.isfinite(hidden_tensor).all()):
+        raise OnnxQualificationError("native MTP target alignment contains non-finite rows")
+    return torch.tensor([shifted], dtype=torch.int64), hidden_tensor
+
+
+def _mtp_cache(states: Any) -> tuple[torch.Tensor, ...]:
+    if not isinstance(states, tuple) or not states or any(
+        not _valid_state(state) for state in states
+    ):
+        raise OnnxQualificationError("MTP cache must contain finite nonempty CPU float32 states")
+    return states
+
+
 def _mtp_cases(native: Any, ort_model: Any) -> list[dict[str, Any]]:
     oracle = _require_mtp_oracle(native)
     cases: list[dict[str, Any]] = []
     for ordinal, raw_prompt in enumerate(PROMPTS):
         prompt = list(raw_prompt)
-        language = native.reference_language([prompt], len(prompt) + 8)[0]
-        sampled = _greedy(language.last_logits)
-        references = oracle([prompt], [sampled], len(prompt) + 8)
-        if len(references) != 1:
-            raise OnnxQualificationError(
-                "native MTP oracle returned the wrong transaction count"
+        context = len(prompt) + 8
+        prefills = native.reference_language([prompt], context)
+        if len(prefills) != 1:
+            raise OnnxQualificationError("native language oracle returned the wrong transaction count")
+        sampled = _greedy(prefills[0].last_logits)
+        transactions = [prompt, [sampled]]
+        language = native.reference_language(transactions, context)
+        if len(language) != 2:
+            raise OnnxQualificationError("native language oracle returned the wrong transaction count")
+        if _greedy(language[0].last_logits) != sampled:
+            raise OnnxQualificationError("native MTP target sampling alignment differs")
+        samples = [sampled, _greedy(language[1].last_logits)]
+        references = oracle(transactions, samples, context)
+        if len(references) != 2:
+            raise OnnxQualificationError("native MTP oracle returned the wrong transaction count")
+
+        observed_cache = replay_cache = None
+        for step, (tokens, next_token, target, reference) in enumerate(
+            zip(transactions, samples, language, references, strict=True)
+        ):
+            shifted, hidden = _mtp_inputs(reference, target, tokens, next_token)
+            if step == 0:
+                observed = ort_model.draft(shifted, hidden)
+                replay = ort_model.draft(shifted, hidden)
+            else:
+                # Continue each actual prefill cache independently. Re-running
+                # a fresh draft would leave cache/position bugs unexercised.
+                observed = ort_model.draft(shifted, hidden, past_key_values=observed_cache)
+                replay = ort_model.draft(shifted, hidden, past_key_values=replay_cache)
+            observed_cache = _mtp_cache(observed.past_key_values)
+            replay_cache = _mtp_cache(replay.past_key_values)
+            logits = observed.logits[0, -1].tolist()
+            error = max(
+                _maximum_error(reference.last_logits, logits),
+                _maximum_error(reference.final_hidden_states, observed.final_hidden.reshape(-1).tolist()),
+                _maximum_error(reference.last_logits, replay.logits[0, -1].tolist()),
+                _maximum_error(reference.final_hidden_states, replay.final_hidden.reshape(-1).tolist()),
             )
-        reference = references[0]
-        shifted = torch.tensor([list(reference.shifted_input_ids)], dtype=torch.int64)
-        hidden = torch.tensor(reference.target_hidden_states, dtype=torch.float32).view(
-            len(reference.shifted_input_ids), reference.hidden_size
-        )
-        observed = ort_model.draft(shifted, hidden)
-        replay = ort_model.draft(shifted, hidden)
-        logits = observed.logits[0, -1].tolist()
-        final_hidden = observed.final_hidden.reshape(-1).tolist()
-        error = max(
-            _maximum_error(reference.last_logits, logits),
-            _maximum_error(reference.final_hidden_states, final_hidden),
-        )
-        cases.append(
-            _case(
-                "mtp",
-                f"mtp-{ordinal}",
-                error,
-                tokens_exact=list(reference.shifted_input_ids) == shifted[0].tolist(),
-                states_exact=_states_equal(
-                    observed.past_key_values, replay.past_key_values
-                ),
-                output_exact=_greedy(reference.last_logits) == _greedy(logits),
+            phase = "prefill" if step == 0 else "cached-decode"
+            cases.append(
+                _case(
+                    "mtp", f"mtp-{phase}-{ordinal}", error,
+                    tokens_exact=shifted[0].tolist() == tokens[1:] + [next_token],
+                    # Replay identity is an additional determinism check, not
+                    # native-versus-ONNX cache parity; that oracle remains open.
+                    states_exact=_states_equal(observed_cache, replay_cache),
+                    output_exact=(
+                        _greedy(reference.last_logits) == _greedy(logits)
+                        == _greedy(replay.logits[0, -1].tolist())
+                    ),
+                )
             )
-        )
     return cases
 
 
