@@ -3218,3 +3218,20 @@ temporary disk, and zero cgroup CPU throttling. The tutorial remains
 functionally complete but misses the frozen timing gate. Conversion is still
 the dominant stage; the available evidence does not yet isolate a new
 model-scale optimization beyond the existing row-fit profile.
+
+### Exact-head hosted SmolLM2 tutorial rerun — 2026-10-09
+
+Wheel run [37874448345](https://github.com/Quitetall/tritium/actions/runs/37874448345)
+tested pushed commit `fadfd45efac8e1074a7808980e3d31f252b12b94`. Platform
+wheels, the ABI3 matrix, installed-wheel smoke, and the source-free tutorial
+passed; the CUDA wheel lane was skipped. The pinned SmolLM2 CPU tutorial
+completed its functional path but failed the unchanged `300s` wall-time limit
+at `506.230s`. Calibration completed at `0.506s`; conversion at `335.681s`
+cumulative (`335.175s` conversion); native checkpoint round-trip at
+`351.884s`; generation at `386.017s`; ONNX export at `479.440s`; ONNX replay
+at `500.475s`; and QAT resume at `506.230s`. Resource samples show four
+logical CPUs, roughly `12.1–14.6 GiB` available memory, roughly `83.4–84.3
+GiB` temporary disk, and zero cgroup CPU throttling. CI and CodeQL passed on
+the same pushed commit. The local assignment-buffer reuse commit
+`5740deae` is not part of this run and still requires exact-revision hosted
+verification; this rerun does not clear the timing gate.
