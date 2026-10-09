@@ -3301,3 +3301,34 @@ the P2 regression. The change is rejected and the existing fused
 reconstruction/objective path is retained. These are local synthetic CPU
 profiles, not full-model or hosted evidence; the SmolLM2 `300s` timing gate
 remains open.
+
+### Pinned SmolLM2 public-convert solver phase profile — 2026-10-09
+
+The ignored `profile_smollm2_g64_p2_solver_phases` test exercised the public
+`prepare` → `calibrate` → `convert()` artifact path using the locally cached
+`HuggingFaceTB/SmolLM2-135M-Instruct` revision
+`12fd25f77366fa6b3b4b768ec3050bf629380bac`, with model downloads disabled.
+The fixture is the first 256 rows of `model.layers.0.mlp.up_proj`, group width
+64, with the public conversion artifact identity
+`sha256:f7fca859f0f982406cbd579886b01abf66239c555394c65e79f5f26b883955b5`.
+The serialized profile fixture SHA-256 was
+`2b4f5a522531a5894e98b2a0593db9764f1cef34962e62ecf9594e618437ff18`.
+
+In the optimized local CPU test profile, five repeats across 256 rows measured
+relay-off `11.338ms`, softened-only `18.757ms`, modulated-only `18.982ms`, and
+dual-relay `26.403ms`. For dual-relay, relay-scale initialization accounts for
+`9.739ms` and assignment for `6.864ms`; the objective sum improved from
+`0.130944935` relay-off to `0.130786244` dual-relay. This identifies relay
+initialization as a substantial local solver cost, but does not establish a
+full-model speed or quality improvement. The exact ignored test passed with:
+
+```sh
+TRITIUM_SMOLLM2_PROFILE_FIXTURE=/tmp/tritium-smollm2-profile-fixture.bin \
+  CARGO_TARGET_DIR=/mnt/4tb/tritium-smollm2-profile-target \
+  cargo test --locked --release -p tritium-quantize \
+  salt_v2::tests::profile_smollm2_g64_p2_solver_phases -- \
+  --ignored --exact --nocapture
+```
+
+This narrows a possible optimization target only; no solver behavior was
+changed. The pinned hosted tutorial timing gate remains independently open.
