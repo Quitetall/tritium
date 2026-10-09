@@ -3607,3 +3607,26 @@ This is a matched local thread-count result, not hosted-runner evidence. It
 supports testing explicit Rayon oversubscription as a hosted configuration
 experiment, but does not establish that sixteen workers help a four-vCPU
 shared runner. The hosted 300-second gate remains independent and unchanged.
+
+### Exact-head hosted SmolLM2 rerun after wheel installation — 2026-10-09
+
+Hosted workflow
+[37884828952](https://github.com/Quitetall/tritium/actions/runs/37884828952)
+tested source revision `87f744b02ef5eab04fe12b8942a4061bb4620a4f`. Linux,
+macOS and Windows wheel builds, clean installed-wheel smoke, source-free
+tutorial, installed-wheel dependency lane, and the complete abi3 matrix passed;
+the opt-in CUDA lane was skipped. The pinned SmolLM2 CPU tutorial completed
+every functional phase but failed the unchanged `300s` budget at `564.452s`.
+Calibration finished at `0.598s`, conversion at `342.597s` cumulative
+(`341.999s` after calibration), native checkpoint round-trip at `363.302s`,
+generation at `406.141s`, ONNX export at `532.269s`, ONNX replay at
+`557.504s`, and QAT resume at `564.452s`.
+
+Forty resource samples showed at least `12.00 GiB` available memory and
+`83.45 GiB` temporary disk; one-minute host load peaked at `5.68` on four
+logical CPUs, while cgroup CPU throttling remained zero. The repeated result
+confirms the failure is CPU wall time, not a failed functional phase, OOM, disk
+pressure or cgroup quota throttling. The local exact-wheel 4-versus-16 Rayon
+comparison motivates a single hosted `RAYON_NUM_THREADS=16` configuration
+experiment; the result must be measured on hosted CI before drawing a conclusion.
+The `300s` release gate is unchanged.
