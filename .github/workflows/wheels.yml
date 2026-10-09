@@ -355,7 +355,7 @@ jobs:
       - name: install pinned Hugging Face dependencies
         run: >-
           python -m pip install --disable-pip-version-check --only-binary=:all:
-          transformers==5.5.3 safetensors==0.8.0
+          transformers==5.5.3 safetensors==0.8.0 pytest==9.0.2
       - name: install exact Tritium wheel without dependency resolution
         shell: bash
         run: >-
@@ -363,6 +363,10 @@ jobs:
           --no-index --no-deps --only-binary=:all: dist/*.whl
       - name: qualify public PTQ row-fitting parallelism
         run: python -m unittest scripts.tests.test_ptq_parallelism -v
+      - name: test exact-wheel public PTQ artifacts
+        run: >-
+          python -I -m pytest -q
+          crates/tritium-py/tests/test_ptq_artifacts.py
       - name: test installed tutorial receipt admission
         run: >-
           python -m unittest discover
