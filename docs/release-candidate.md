@@ -3279,3 +3279,25 @@ to `4096`. After restoration, the public PTQ artifact suite passed
 (`35 passed, 4 skipped`) and the 8,192×64 parallel-conversion test passed
 (`3.48×` four-thread speedup, identical fitted artifact). This rejects the
 larger-cap tuning for this fixture; it is not full-model timing evidence.
+
+### Score-before-reconstruction solver experiment — 2026-10-08 (rejected)
+
+A candidate implementation scored diagonal-fit candidates without a
+reconstruction buffer, materializing the buffer only after acceptance. The P2
+objective sum remained `91.314144321` on every run. The code passed the
+quantizer all-target suite, focused public PyTorch PTQ artifact suite (`39
+passed`), strict Clippy, and format checks while under test; it is **not** in the
+current source because optimized-profile measurements did not show a win.
+
+The ignored `profile_g64_p2_compact_solver_phases` test ran three times on
+baseline `6cd455bc` and three times on the experimental candidate, in separate
+Cargo target directories. Each invocation profiles 256 synthetic G64/P2 rows
+over five repeats. In the default test profile the baseline median was
+`201.513 ms` and the candidate median `191.992 ms` (4.7% lower). In the
+optimized release profile the baseline median was `21.726 ms`; the candidate
+median was `22.070 ms` (1.6% slower). A single optimized G64/P3 pair measured
+`50.666 ms` baseline and `50.144 ms` candidate, too little evidence to offset
+the P2 regression. The change is rejected and the existing fused
+reconstruction/objective path is retained. These are local synthetic CPU
+profiles, not full-model or hosted evidence; the SmolLM2 `300s` timing gate
+remains open.
