@@ -3405,3 +3405,59 @@ single `58.593 ms` observation is too small and uncontrolled to support a
 speed claim. The candidate was removed. No production source change or
 artifact change remains from this experiment, and the hosted 300-second
 tutorial gate remains open.
+
+### Release-mode public-convert SmolLM2 projection profile — 2026-10-09
+
+After rebuilding the mixed Rust/Python extension in optimized release mode
+from the current checkout (quantizer source matches `fdd5bd17`; unrelated
+working-tree edits were present), the pinned public `prepare` → `calibrate` →
+`convert()` profiler was run four times on
+`model.layers.0.mlp.up_proj` (`1536 × 576`, G64). Conversion times were
+`0.249s`, `0.250s`, `0.256s`, and `0.256s`; all runs emitted fixture SHA-256
+`2b4f5a522531a5894e98b2a0593db9764f1cef34962e62ecf9594e618437ff18`, artifact
+ID `sha256:4059a7c249fbf4d3aaa58a56d4d6c630da175d2c440a365fef025ea3e0b58c44`,
+weighted MSE `8.28580185e-05`, calibration ID
+`sha256:7c42611e41b1e60300c1a123a6a3107e1d33becbd1129a4c3fd6b13d3f310dfd`,
+and source digest
+`sha256:6b00494f0d31aec4f41e418e1719ca349cec86843ffb786bedf97564f90ce341`.
+The fixture is retained under `/mnt/4tb/tritium-evidence/`.
+
+The rebuilt source-tree extension passed
+`test_public_convert_persists_grouped_fit_artifact` (`1 passed`). This is
+optimized local evidence for one real-model projection, not a full-model
+conversion, hosted runner comparison, or model-quality/runtime gate. The
+hosted tutorial job on commit `fdd5bd17` remains in progress; do not infer its
+result from this layer profile.
+
+### Hosted tutorial failure and matching four-thread local run — 2026-10-09
+
+The pinned tutorial on pushed commit `fdd5bd17` finished functionally but
+failed its frozen `300s` wall-time gate. Hosted run
+[37881266653](https://github.com/Quitetall/tritium/actions/runs/37881266653)
+recorded conversion at `307.782s`, native checkpoint round-trip at
+`327.208s`, generation at `370.675s`, ONNX export at `471.288s`, replay at
+`496.596s`, and QAT resume/final at `502.895s`. Calibration took `0.529s`.
+The runner exposed four logical CPUs, roughly `14.5 GiB` available memory,
+over `80 GiB` free temporary disk, and zero cgroup throttling. The peak sampled
+Python RSS was about `3.3 GiB`. This is not an OOM, disk-pressure, or tutorial
+functionality failure; it remains a strict timing failure.
+
+For comparison, the exact cached SmolLM2 revision and tutorial were run through
+the optimized local source-tree extension with PyTorch and Rayon capped at four
+threads. The complete tutorial passed in `213.921s`; its receipt passed the
+release tutorial validator. Stage times were conversion `113.738s`, native
+checkpoint round-trip `122.403s`, generation `138.602s`, ONNX export
+`189.739s`, ONNX replay `202.824s`, QAT step `205.949s`, and resume
+`213.921s`. Its PTQ artifact ID was
+`sha256:26dc412dfbb432458e4a85386c77a6bae895de89b7e14a1d8a192a4ae50fbaf6`;
+the durable local evidence bundle is
+`/mnt/4tb/tritium-evidence/smollm2-cpu-tutorial-fdd-local/` (about `2.2 GiB`).
+
+The local run proves this source-tree machine can finish the tutorial within
+the budget; it does not qualify the candidate wheel or satisfy the hosted gate.
+The hosted/local total-time ratio is about `2.35×`, and the conversion-stage
+ratio about `2.71×`. The runner's four-core quota was not throttled, but this
+comparison does not isolate CPU model, sustained frequency, or wheel/compiler
+differences. Keep the CI gate unchanged and investigate portable CPU
+throughput plus the hosted runner's effective compute before attributing the
+full gap to Tritium solver code.
