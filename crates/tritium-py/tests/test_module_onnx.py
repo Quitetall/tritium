@@ -154,6 +154,22 @@ def test_terminal_intermediate_capture_replays_concat_shards_and_shared_input(
         torch.from_numpy(values["shard1"]), sample @ weight1
     )
     assert not (tmp_path / ".terminal-diagnostic.onnx").exists()
+
+    oversized = onnx.load(model_path)
+    oversized.graph.output[0].type.tensor_type.shape.dim[-1].dim_value = 20_000_000
+    onnx.save(oversized, model_path)
+    assert (
+        _capture_terminal_intermediates(
+            tmp_path,
+            ["input"],
+            [sample],
+            ["logits"],
+            onnx,
+            ort,
+        )
+        == ()
+    )
+    assert not (tmp_path / ".terminal-diagnostic.onnx").exists()
     assert [name for _role, name, _value in captured] == [
         "logits",
         "shard0",

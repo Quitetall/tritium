@@ -4291,6 +4291,10 @@ additional arrays include the secondary graph's output as a scheduling-drift
 control and are stored with the original graph/reference/observed ledger. The
 secondary replay is diagnostic, not qualification evidence. If optional
 intermediate capture fails, the primary parity artifact is still retained.
-The local module suite passed (`16 passed`), and `actionlint` passed for the
-edited wheel workflow. This proves the diagnostic seam on a small synthetic
-graph only; no hosted AMD shard capture has been collected yet.
+Capture is capped at 64 MiB based on inferred runtime tensor shapes; unknown or
+oversized geometry skips the secondary replay rather than allocating
+unboundedly. The local module suite passed (`16 passed`), and `actionlint`
+passed for the edited wheel workflow. A local smoke against the retained
+SmolLM2 graph estimated 2,768,640 bytes and retrieved all seven shards plus
+`slice_187`; its temporary graph was removed. This is local diagnostic-path
+evidence only; no hosted AMD shard capture has been collected yet.

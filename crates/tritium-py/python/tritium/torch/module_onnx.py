@@ -28,6 +28,7 @@ from .errors import TritiumError
 Pathish = Union[str, os.PathLike[str]]
 _MANIFEST = "tritium-module-onnx.json"
 _GRAPH = "model.onnx"
+_MAX_TERMINAL_PARITY_CAPTURE_BYTES = 64 * 1024 * 1024
 _TOP_FIELDS_V1 = {
     "schema_version",
     "artifact_kind",
@@ -269,6 +270,64 @@ def _terminal_intermediate_names(graph, output_names: Sequence[str]) -> Tuple[st
     return ()
 
 
+def _terminal_capture_size_bytes(
+    graph,
+    names: Sequence[str],
+    input_names: Sequence[str],
+    inputs: Sequence[Tensor],
+    onnx,
+) -> Optional[int]:
+    """Return a conservative byte bound, or None when graph geometry is unknown."""
+
+    import numpy as np
+
+    available = {
+        value.name: value
+        for value in (*graph.input, *graph.output, *graph.value_info)
+    }
+    symbols = {}
+    for input_name, input_value in zip(input_names, inputs, strict=True):
+        info = available.get(input_name)
+        if info is None or not info.type.HasField("tensor_type"):
+            continue
+        dimensions = info.type.tensor_type.shape.dim
+        if len(dimensions) != input_value.ndim:
+            continue
+        for dimension, size in zip(dimensions, input_value.shape, strict=True):
+            if dimension.dim_param:
+                symbols[dimension.dim_param] = int(size)
+
+    total_bytes = 0
+    for name in dict.fromkeys(names):
+        info = available.get(name)
+        if info is None or not info.type.HasField("tensor_type"):
+            return None
+        tensor_type = info.type.tensor_type
+        if not tensor_type.HasField("shape"):
+            return None
+        elements = 1
+        for dimension in tensor_type.shape.dim:
+            if dimension.HasField("dim_value"):
+                size = dimension.dim_value
+            elif dimension.dim_param in symbols:
+                size = symbols[dimension.dim_param]
+            else:
+                return None
+            if size < 0:
+                return None
+            elements *= size
+        try:
+            item_size = np.dtype(
+                onnx.helper.tensor_dtype_to_np_dtype(tensor_type.elem_type)
+            ).itemsize
+        except (KeyError, TypeError, ValueError):
+            return None
+        total_bytes += elements * item_size
+        if total_bytes > _MAX_TERMINAL_PARITY_CAPTURE_BYTES:
+            return total_bytes
+    return total_bytes
+
+
 def _capture_terminal_intermediates(
     staging: Path,
     input_names: Sequence[str],
@@ -289,6 +348,16 @@ def _capture_terminal_intermediates(
     captured_names = tuple(name for name in candidates if name in available)
     if not captured_names:
         return ()
+    capture_names = (*output_names, *captured_names)
+    capture_bytes = _terminal_capture_size_bytes(
+        graph.graph,
+        capture_names,
+        input_names,
+        inputs,
+        onnx,
+    )
+    if capture_bytes is None or capture_bytes > _MAX_TERMINAL_PARITY_CAPTURE_BYTES:
+        return ()
     for name in captured_names:
         graph.graph.output.add().CopyFrom(available[name])
     diagnostic_graph = staging / ".terminal-diagnostic.onnx"
@@ -303,8 +372,7 @@ def _capture_terminal_intermediates(
             name: value.detach().contiguous().numpy()
             for name, value in zip(input_names, inputs, strict=True)
         }
-        run_names = (*output_names, *captured_names)
-        values = session.run(list(run_names), feed)
+        values = session.run(list(capture_names), feed)
         output_values = values[: len(output_names)]
         intermediate_values = values[len(output_names) :]
         return (
