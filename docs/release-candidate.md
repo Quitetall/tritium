@@ -2987,6 +2987,50 @@ not paired controlled benchmarks; no speedup claim is made. The result is
 limited to the same one-layer profile and does not satisfy full-model or hosted
 release gates.
 
+An ignored release-mode paired ablation on the same pinned 256-row SmolLM2
+layer compares the compact-v1 relay starts with the identical solver recipe
+minus either/both relay basins. Each value is the average over five repeats;
+all candidates use the same weights, diagonal curvature, plane count, EM
+restarts, iteration budget and scale precision:
+
+| Initialization | Mean time (ms) | Relay init (ms) | Aggregate weighted objective |
+|---|---:|---:|---:|
+| no relay | 11.867 | 0.000 | 0.130944935 |
+| softened only | 20.223 | 5.103 | 0.130882743 |
+| modulated only | 19.674 | 5.097 | 0.130848182 |
+| both (current compact-v1) | 27.127 | 9.837 | 0.130786244 |
+
+On this single layer, softened-only reduced the aggregate objective by 0.0475%
+for 70.4% more row-fit time; modulated-only reduced it by 0.0739% for 65.8%
+more time; both reduced it by 0.1212% for 128.6% more time. This quantifies a
+local compute/fit tradeoff, not held-out model quality, and is not sufficient
+evidence to remove a relay or change the frozen recipe. It does make relay
+basins a high-priority target for more efficient initialization and broader
+matched-quality ablation.
+
+The exact-source hosted wheel run on `345fde73aa5239b5e12067480d0389bf2cec7794`
+([run 37868066052](https://github.com/Quitetall/tritium/actions/runs/37868066052))
+completed the SmolLM2 workflow but still failed the frozen `300s` limit at
+`369.647s`. Stage markers recorded calibration `0.408s`, PTQ conversion
+`244.956s`, native checkpoint round trip `257.560s`, generation `282.985s`,
+ONNX export `349.426s`, ONNX replay `365.033s`, and QAT resume `369.647s`.
+The hosted runner exposed four logical CPUs, about 11.7 GiB or more available
+memory, about 83 GiB or more temporary disk, and no recorded cgroup CPU
+throttling. CI, CodeQL, capstone, and docs passed for the same source; the
+only failed gate was tutorial wall time. The earlier source `f169c7d3` run was
+`752.183s`, including `526.230s` conversion. The newer observation is
+`382.536s` lower end-to-end and `281.274s` lower for conversion, but these are
+not a controlled before/after experiment and do not qualify the timing gate.
+
+On the local Intel i9-14900K, Python 3.13.14 / PyTorch 2.11.0 CPU developmental
+run of the same public tutorial completed in `231.704s`; stage timings and the
+complete 2.2 GiB output tree are retained at
+`/mnt/4tb/tritium-evidence/smollm2-local-dev-345fde73/`. This is editable-source
+development evidence, not an installed exact-source wheel receipt. It shows
+the complete local flow can meet five minutes while the exact-source hosted
+wheel still misses by `69.647s`; neither result changes the hosted release
+gate.
+
 The existing public conversion golden test was rerun after both solver changes
 against the current release-built Python extension:
 `PYTHONPATH=crates/tritium-py/python RAYON_NUM_THREADS=4 OMP_NUM_THREADS=4

@@ -2296,7 +2296,15 @@ mod tests {
         let diagonal: Vec<f64> = (0..64)
             .map(|column| 0.25 + ((column * 17 % 31) as f64 / 31.0))
             .collect();
-        report_compact_g64_p2_phase_profile(&rows, &diagonal, "synthetic");
+        report_compact_g64_p2_phase_profile(
+            &rows,
+            &diagonal,
+            "synthetic relay-on",
+            RelayBasins {
+                softened: true,
+                modulated: true,
+            },
+        );
     }
 
     #[test]
@@ -2335,14 +2343,51 @@ mod tests {
             .chunks(8)
             .map(|value| f64::from_le_bytes(value.try_into().expect("validated f64 chunk")))
             .collect::<Vec<_>>();
-        report_compact_g64_p2_phase_profile(&weights, &diagonal, "pinned SmolLM2 layer");
+        let baseline_objective = report_compact_g64_p2_phase_profile(
+            &weights,
+            &diagonal,
+            "pinned SmolLM2 relay-off",
+            RelayBasins::default(),
+        );
+        let softened_objective = report_compact_g64_p2_phase_profile(
+            &weights,
+            &diagonal,
+            "pinned SmolLM2 softened-only",
+            RelayBasins {
+                softened: true,
+                modulated: false,
+            },
+        );
+        let modulated_objective = report_compact_g64_p2_phase_profile(
+            &weights,
+            &diagonal,
+            "pinned SmolLM2 modulated-only",
+            RelayBasins {
+                softened: false,
+                modulated: true,
+            },
+        );
+        let dual_objective = report_compact_g64_p2_phase_profile(
+            &weights,
+            &diagonal,
+            "pinned SmolLM2 dual-relay",
+            RelayBasins {
+                softened: true,
+                modulated: true,
+            },
+        );
+        assert!(softened_objective <= baseline_objective);
+        assert!(modulated_objective <= baseline_objective);
+        assert!(dual_objective <= softened_objective);
+        assert!(dual_objective <= modulated_objective);
     }
 
     fn report_compact_g64_p2_phase_profile(
         rows: &[Vec<f32>],
         diagonal: &[f64],
         fixture_kind: &str,
-    ) {
+        relay_basins: RelayBasins,
+    ) -> f64 {
         assert_eq!(rows.len(), 256);
         assert!(rows.iter().all(|row| row.len() == 64));
         assert_eq!(diagonal.len(), 64);
@@ -2353,33 +2398,38 @@ mod tests {
             em_restarts: 4,
             ridge_condition_limit: 1e6,
             scale_precision: ScalePrecision::F16,
-            relay_basins: RelayBasins {
-                softened: true,
-                modulated: true,
-            },
+            relay_basins,
         };
 
+        const REPEATS: usize = 5;
         SOLVER_PHASE_NANOS.with(|elapsed| elapsed.set([0; 7]));
         let started = std::time::Instant::now();
-        for row in rows {
-            fit_joint_ternary(row, JointFitMetric::DiagonalF64(diagonal), config)
-                .expect("profile compact G64/P2 row fit");
+        let mut objective_sum = 0.0;
+        for _ in 0..REPEATS {
+            for row in rows {
+                let fit = fit_joint_ternary(row, JointFitMetric::DiagonalF64(diagonal), config)
+                    .expect("profile compact G64/P2 row fit");
+                objective_sum += fit.objective;
+            }
         }
         let total = started.elapsed().as_nanos();
         let phases = SOLVER_PHASE_NANOS.with(std::cell::Cell::get);
         assert!(phases.iter().sum::<u128>() <= total);
+        let divisor = REPEATS as f64 * 1_000_000.0;
         eprintln!(
-            "G64/P2 compact {fixture_kind} 256-row profile: total={:.3}ms assignment={:.3}ms scale_solve={:.3}ms reconstruction={:.3}ms validate_metric={:.3}ms weighted_order={:.3}ms init_scales={:.3}ms relay_scales={:.3}ms other={:.3}ms",
-            total as f64 / 1_000_000.0,
-            phases[0] as f64 / 1_000_000.0,
-            phases[1] as f64 / 1_000_000.0,
-            phases[2] as f64 / 1_000_000.0,
-            phases[3] as f64 / 1_000_000.0,
-            phases[4] as f64 / 1_000_000.0,
-            phases[5] as f64 / 1_000_000.0,
-            phases[6] as f64 / 1_000_000.0,
-            (total - phases.iter().sum::<u128>()) as f64 / 1_000_000.0,
+            "G64/P2 compact {fixture_kind} 256-row profile over {REPEATS} repeats: total={:.3}ms assignment={:.3}ms scale_solve={:.3}ms reconstruction={:.3}ms validate_metric={:.3}ms weighted_order={:.3}ms init_scales={:.3}ms relay_scales={:.3}ms other={:.3}ms objective_sum={:.9}",
+            total as f64 / divisor,
+            phases[0] as f64 / divisor,
+            phases[1] as f64 / divisor,
+            phases[2] as f64 / divisor,
+            phases[3] as f64 / divisor,
+            phases[4] as f64 / divisor,
+            phases[5] as f64 / divisor,
+            phases[6] as f64 / divisor,
+            (total - phases.iter().sum::<u128>()) as f64 / divisor,
+            objective_sum / REPEATS as f64,
         );
+        objective_sum / REPEATS as f64
     }
 
     #[test]
