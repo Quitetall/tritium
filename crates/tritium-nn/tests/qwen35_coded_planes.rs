@@ -16,6 +16,27 @@
 //! at that rate (5 / 15 levels, not trit-storable). Each scored with the antithetic split
 //! (`even` = curvature cost with the first-order sample term cancelled; H5).
 //!
+//! # Measured 2026-10-09 — Qwen3.5-0.8B-Base, 4 × 1024 WikiText-2 test tokens, fp ppl 14.547
+//!
+//! ```text
+//! structure                 bits/w       ppl     even (curvature)    odd
+//! ladder T=1                 1.710  20158.907      +6.04488       +1.18917
+//! Golay-coded 1+½            2.518     61.642      +1.40464       +0.03934
+//! time-share 1/2             2.502    506.329      +3.07834       +0.47149
+//! uniform 5-level scalar     2.447    200.353      +2.53937       +0.08335
+//! ladder T=2                 3.295     21.532      +0.40670       -0.01451
+//! Golay-coded 2+½            4.103     16.242      +0.10020       +0.01003
+//! time-share 2/3             4.087     18.222      +0.20067       +0.02462
+//! uniform 15-level scalar    4.032     16.524      +0.12763       -0.00018
+//! ladder T=3                 4.880     15.190      +0.03979       +0.00349
+//! ```
+//!
+//! **The gain transfers, and is larger than on SmolLM2.** Against the ternary fallback (time-share)
+//! the code is 8.2× better in ppl at ~2.5 bpw and −10.9% at ~4.1 bpw, halving the curvature cost at
+//! both; against the best single scalar it is 3.3× / −1.7% in ppl and −45% / −22% in curvature
+//! (SmolLM2: −21% / −17%). Golay 2+½ at 4.10 bpw is within 7% of ladder T=3 at 4.88 bpw. Plain
+//! nearest-point fits only — no calibration on this model.
+//!
 //! ```text
 //! TRITIUM_QWEN35_DIR=/mnt/4tb/models/qwen3.5-0.8b-base-tritium \
 //! TRITIUM_CORPUS=$HOME/.cache/tritium-corpora/wikitext2_400k_32k_qwen35.json \
