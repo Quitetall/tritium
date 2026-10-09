@@ -3721,3 +3721,23 @@ on `df661840` took `564.452s`; because these were separate hosted runners, the
 large difference is not attributable to this test-only change. Retain the
 `300s` contract and require repeatable, matched software/configuration evidence
 before claiming a timing improvement.
+
+### Hosted tutorial regression confirmation — 2026-10-09 (still over budget)
+
+Hosted wheels workflow
+[37889580756](https://github.com/Quitetall/tritium/actions/runs/37889580756)
+ran source revision `097c9e2ba5c6ff38ddae05744800a39db9a9c0c8`. All functional
+phases completed, but the exact pinned SmolLM2 PTQ/QAT tutorial took `562.706s`,
+exceeding the unchanged `300s` limit by `262.706s`. Stage markers were
+calibration `0.602s`, conversion `342.267s`, checkpoint round-trip `363.097s`,
+generation `406.660s`, ONNX export `531.140s`, ONNX replay `555.810s`, and QAT
+resume `562.706s`. The failure is the wall-time assertion after QAT resume, not
+a functional or quality failure; no passing tutorial receipt was published.
+
+The resource samples show four logical CPUs and no cgroup CPU-throttle events;
+host load rose during conversion and later fell, so these data do not isolate
+whether the additional time came from host contention or software variance.
+Conversion accounts for `342.267s` and ONNX export adds `124.347s`, making both
+the immediate optimization targets. Keep the `300s` gate unchanged and require
+matched artifact/quality checks plus hosted confirmation before retaining any
+optimization.
