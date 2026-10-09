@@ -2986,3 +2986,13 @@ identity, weighted error, calibration identity, and fixture digest. These are
 not paired controlled benchmarks; no speedup claim is made. The result is
 limited to the same one-layer profile and does not satisfy full-model or hosted
 release gates.
+
+The existing public conversion golden test was rerun after both solver changes
+against the current release-built Python extension:
+`PYTHONPATH=crates/tritium-py/python RAYON_NUM_THREADS=4 OMP_NUM_THREADS=4
+MKL_NUM_THREADS=4 /home/brianklam/.cache/tritium-py313-ci/bin/python -m
+pytest -q crates/tritium-py/tests/test_ptq_artifacts.py::test_public_convert_persists_grouped_fit_artifact`.
+It passed and matched every pinned file hash for the public artifact, proving
+that these internal search/saturation changes preserve the fixture's emitted
+artifact bytes. This is a focused development-tree check, not candidate-wheel
+or release admission.
