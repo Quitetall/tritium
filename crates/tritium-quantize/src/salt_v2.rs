@@ -1920,6 +1920,10 @@ mod relay {
     ) -> Result<Vec<f32>, JointFitError> {
         let mut residual = weights.to_vec();
         let mut scales = Vec::with_capacity(planes);
+        // Every plane's descent needs the residual normalized by that plane's
+        // absmean. Reuse one buffer instead of allocating a new f64 vector for
+        // each of the three deterministic relay basins.
+        let mut normalized = Vec::with_capacity(residual.len());
         for plane in 0..planes {
             let absmean = residual
                 .iter()
@@ -1930,10 +1934,8 @@ mod relay {
                 scales.push(deployment_scale(0.0, precision, plane)?);
                 continue;
             }
-            let normalized: Vec<f64> = residual
-                .iter()
-                .map(|value| f64::from(*value) / absmean)
-                .collect();
+            normalized.clear();
+            normalized.extend(residual.iter().map(|value| f64::from(*value) / absmean));
             let fit = descend(&normalized, modulated);
             let scale = deployment_scale((fit.scale * absmean) as f32, precision, plane)?;
             scales.push(scale);
@@ -3078,6 +3080,14 @@ mod tests {
                     .expect("second basin fit");
                 let first_bits: Vec<u32> = first.iter().map(|scale| scale.to_bits()).collect();
                 let second_bits: Vec<u32> = second.iter().map(|scale| scale.to_bits()).collect();
+                if seed == 1 {
+                    let expected = if modulated {
+                        [0x3fd5_81fe, 0x3f2f_4664, 0x3e81_d4e6]
+                    } else {
+                        [0x3fd8_decd, 0x3f1b_3413, 0x3e66_d7aa]
+                    };
+                    assert_eq!(first_bits, expected);
+                }
                 assert_eq!(first_bits, second_bits);
                 assert_eq!(first.len(), 3);
                 assert!(first.iter().all(|scale| *scale >= 0.0));
