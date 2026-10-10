@@ -68,8 +68,11 @@ The final package test command passed at 20:52:42 EDT: 49 library, 4 binary,
 2 CLI, 35 HTTP contract and 1 OpenTelemetry tests, 91 executed tests in total.
 The atomic outcome regression subsequently passed 100 consecutive cached
 repeats; the polled and unpolled deadline/recovery variants each passed 10
-consecutive cached repeats. Final Clippy and formatting are still pending at
-the time of this record; pending is not a pass.
+consecutive cached repeats. Final warnings-denied Clippy completed at 20:55:19
+EDT; formatting also passed. The managed job ended with terminal success and
+exit 0 at 20:55:22 EDT. Implementation and regressions are saved in commit
+`83cac86a`; these are dirty-worktree developer results, not clean candidate
+qualification receipts. Unrelated source/document edits were preserved.
 CUDA batch/speculative and real-model e2e feature lanes are not exercised by
 these `serve`-feature software checks, and their zero-case targets do not count
 as qualification.
