@@ -14,6 +14,7 @@ use tritium_format::salt_v2_package::{
 pub(super) mod deltanet;
 mod salt_v2_reader_upload;
 mod salt_v2_runtime;
+mod semantic;
 pub use salt_v2_runtime::SaltV2GatherReceipt;
 
 /// A logical prefix of cudarc page-locked memory.
@@ -9084,6 +9085,33 @@ pub(super) enum AddKernel {
 }
 
 impl TernaryBackend for CudaBackend {
+    fn tensor_caps(
+        &self,
+        tensor: tritium_spec::TensorView<'_>,
+    ) -> Result<Option<tritium_spec::TensorCaps>, BackendError> {
+        semantic::CudaTensor::caps(tensor)
+    }
+
+    fn upload_tensor(
+        &self,
+        tensor: tritium_spec::TensorView<'_>,
+    ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        semantic::CudaTensor::upload(self, tensor)
+    }
+
+    fn matmul(&self, p: tritium_spec::TensorMatmul<'_>) -> Result<(), BackendError> {
+        semantic::CudaTensor::matmul(self, p)
+    }
+
+    fn embed_rows(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        ids: &[usize],
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        semantic::CudaTensor::embed(self, tensor, ids, out)
+    }
+
     fn device_id(&self) -> &str {
         &self.device_id
     }
