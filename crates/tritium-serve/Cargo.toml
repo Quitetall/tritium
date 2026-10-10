@@ -57,6 +57,7 @@ name = "tritium-serve"
 required-features = ["serve"]
 
 [dev-dependencies]
+tritium-core = { workspace = true }
 tower = { workspace = true }
 http-body-util = { workspace = true }
 tritium-runtime = { workspace = true }

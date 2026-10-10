@@ -186,6 +186,20 @@ enum PendingGoal {
 }
 
 impl Pending {
+    /// Run the next native chunk without publishing progress or adopting KV.
+    fn forward_chunk(
+        &self,
+        runner: &mut tritium_nn::ModelRunner,
+        chunk: usize,
+        draining: &AtomicBool,
+    ) -> Result<Option<Vec<f32>>, tritium_nn::NnError> {
+        let end = self.done.saturating_add(chunk).min(self.prompt().len());
+        let positions: Vec<usize> = (self.done..end).collect();
+        runner.forward_cancellable(&self.prompt()[self.done..end], &positions, &|| {
+            draining.load(Ordering::Acquire) || self.client_gone()
+        })
+    }
+
     fn prompt(&self) -> &[u32] {
         match &self.goal {
             PendingGoal::Admit { req, .. } | PendingGoal::SpecAdmit { req, .. } => {
@@ -318,6 +332,28 @@ fn release_slot(batch: &mut tritium_cuda::BatchKv, row: usize, telemetry: &Worke
                 eprintln!("tritium-serve: paged KV release failed for row {row}: {error}");
             }
         }
+    }
+}
+
+/// Consume a cancelled admission once. Its staging KV is not any live batch
+/// row's KV; resetting it must not retire peers or invalidate their pages.
+fn retire_pending_prefill(
+    pending: &mut Option<Pending>,
+    runner: &mut tritium_nn::ModelRunner,
+    batch: &mut tritium_cuda::BatchKv,
+    telemetry: &WorkerTelemetry,
+    draining: bool,
+) {
+    let Some(pending) = pending.take() else {
+        return;
+    };
+    let row = pending.row();
+    if draining {
+        pending.fail_draining();
+    }
+    runner.reset();
+    if let Some(row) = row {
+        release_slot(batch, row, telemetry);
     }
 }
 
@@ -1463,13 +1499,13 @@ pub(crate) fn run_batched(
                     release_slot(&mut batch, row, telemetry.as_ref());
                 }
             }
-            if let Some(p) = pending.take() {
-                let row = p.row();
-                p.fail_draining();
-                if let Some(row) = row {
-                    release_slot(&mut batch, row, telemetry.as_ref());
-                }
-            }
+            retire_pending_prefill(
+                &mut pending,
+                &mut runner,
+                &mut batch,
+                telemetry.as_ref(),
+                true,
+            );
             // Draining fails the solo spec sequence like an active slot.
             if let Some(s) = spec.take() {
                 let _ = s.tx.try_send(GenEvent::Error("server draining".into()));
@@ -1858,26 +1894,23 @@ pub(crate) fn run_batched(
         // the pool is empty).
         if let Some(p) = pending.as_mut() {
             if p.client_gone() {
-                // Client gone mid-prefill: abandon the remaining chunks (and
-                // free any reserved pages). The partial single-sequence KV is
-                // dead weight until the next admission's reset.
-                let row = p.row();
-                pending = None;
-                if let Some(row) = row {
-                    release_slot(&mut batch, row, telemetry.as_ref());
-                }
+                retire_pending_prefill(
+                    &mut pending,
+                    &mut runner,
+                    &mut batch,
+                    telemetry.as_ref(),
+                    draining.load(Ordering::Acquire),
+                );
             } else {
                 phase.store(PHASE_PREFILL, Ordering::Release);
                 let len = p.prompt().len();
                 let end = p.done.saturating_add(chunk).min(len);
-                let positions: Vec<usize> = (p.done..end).collect();
                 let prefill_span = tracing::info_span!(
                     parent: &p.request_span,
                     "model.prefill.chunk",
                     chunk_tokens = end - p.done,
                 );
-                match prefill_span.in_scope(|| runner.forward(&p.prompt()[p.done..end], &positions))
-                {
+                match prefill_span.in_scope(|| p.forward_chunk(&mut runner, chunk, &draining)) {
                     Err(e) => {
                         let p = pending.take().expect("pending checked above");
                         let row = p.row();
@@ -1886,7 +1919,21 @@ pub(crate) fn run_batched(
                             release_slot(&mut batch, row, telemetry.as_ref());
                         }
                     }
-                    Ok(logits) => {
+                    Ok(None) => {
+                        let draining_now = draining.load(Ordering::Acquire);
+                        retire_pending_prefill(
+                            &mut pending,
+                            &mut runner,
+                            &mut batch,
+                            telemetry.as_ref(),
+                            draining_now,
+                        );
+                        if draining_now {
+                            // Drain all peers before doing another decode.
+                            continue;
+                        }
+                    }
+                    Ok(Some(logits)) => {
                         p.done = end;
                         if p.done == len {
                             let prefill_elapsed = p.started_at.elapsed();
@@ -2216,5 +2263,434 @@ pub(crate) fn run_batched(
                 release_slot(&mut batch, row, telemetry.as_ref());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tritium_nn::{
+        DenseLinear, Mlp, ModelConfig, ModelRunner, ModelWeights, Projection, SwiGluMlp,
+        TernaryLinear, TokenEmbedding, TransformerBlock,
+    };
+    use tritium_spec::{
+        BackendError, DeviceBuffer, DeviceCaps, GemmShape, MpGemm, TernaryBackend, TernaryFormat,
+    };
+
+    type Trigger = Box<dyn FnOnce() + Send>;
+    type ArmedTrigger = Arc<Mutex<Option<Trigger>>>;
+
+    // Invoke the client-close/drain action inside the first real projection,
+    // not from a mocked cancellation result or a timing-dependent sleep.
+    struct ProjectionTrigger {
+        cpu: tritium_cpu::CpuBackend,
+        trigger: ArmedTrigger,
+    }
+
+    impl TernaryBackend for ProjectionTrigger {
+        fn device_id(&self) -> &str {
+            "pending-chunk-cpu-trigger"
+        }
+
+        fn capabilities(&self) -> DeviceCaps {
+            self.cpu.capabilities()
+        }
+
+        fn upload_weights(
+            &self,
+            packed: &[u8],
+            shape: GemmShape,
+            format: TernaryFormat,
+        ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+            self.cpu.upload_weights(packed, shape, format)
+        }
+
+        fn mpgemm(&self, parameters: MpGemm<'_>) -> Result<(), BackendError> {
+            self.cpu.mpgemm(parameters)?;
+            let trigger = self.trigger.lock().unwrap().take();
+            if let Some(trigger) = trigger {
+                trigger();
+            }
+            Ok(())
+        }
+    }
+
+    fn tiny_runner(trigger: ArmedTrigger) -> ModelRunner {
+        let backend = ProjectionTrigger {
+            cpu: tritium_cpu::CpuBackend::new(),
+            trigger,
+        };
+        let dense = || Projection::Dense(DenseLinear::new_exact(vec![0.03125; 16], 4, 4).unwrap());
+        let config = ModelConfig {
+            arch: "llama".into(),
+            n_layers: 2,
+            n_embd: 4,
+            n_head: 1,
+            n_head_kv: 1,
+            head_dim: 4,
+            n_ff: 4,
+            n_ctx: 16,
+            rope_theta: 10_000.0,
+            rms_eps: 1e-5,
+        };
+        let weights = ModelWeights {
+            token_embd: TokenEmbedding::from_dense(
+                (0..32).map(|i| (i as f32 - 16.0) / 64.0).collect(),
+                8,
+                4,
+            )
+            .unwrap(),
+            vocab: 8,
+            n_embd: 4,
+            layers: (0..2)
+                .map(|_| TransformerBlock {
+                    attn_norm: vec![1.0; 4],
+                    q_proj: Projection::Ternary(
+                        TernaryLinear::new(&backend, &[tritium_core::Trit::ZERO; 16], 4, 4, 1.0)
+                            .unwrap(),
+                    ),
+                    k_proj: dense(),
+                    v_proj: dense(),
+                    o_proj: dense(),
+                    attn_sub_norm: Vec::new(),
+                    q_bias: Vec::new(),
+                    k_bias: Vec::new(),
+                    v_bias: Vec::new(),
+                    q_norm: Vec::new(),
+                    k_norm: Vec::new(),
+                    ffn_norm: vec![1.0; 4],
+                    mlp: Mlp::SwiGlu(SwiGluMlp {
+                        gate: dense(),
+                        up: dense(),
+                        down: dense(),
+                    }),
+                })
+                .collect(),
+            output_norm: vec![1.0; 4],
+            lm_head: None,
+        };
+        ModelRunner::from_weights(config, weights, Box::new(backend))
+    }
+
+    fn pending(kind: usize, done: usize) -> (Pending, Trigger) {
+        let req = GenRequest {
+            prompt_tokens: vec![0, 1, 2, 3],
+            max_new: 2,
+            sampling: Sampling::Greedy,
+            stop_eos: false,
+            logprobs: None,
+        };
+        let (goal, close): (PendingGoal, Trigger) = if kind == 2 {
+            let (resp, receiver) = tokio::sync::oneshot::channel();
+            (
+                PendingGoal::TreeOpen {
+                    prompt: req.prompt_tokens,
+                    resp,
+                },
+                Box::new(move || drop(receiver)),
+            )
+        } else {
+            let (tx, receiver) = mpsc::channel(8);
+            let goal = if kind == 0 {
+                PendingGoal::Admit {
+                    tx,
+                    req,
+                    max_new: 2,
+                    row: 0,
+                }
+            } else {
+                PendingGoal::SpecAdmit {
+                    tx,
+                    req,
+                    max_new: 2,
+                    policy: DraftPolicy::Adaptive { acc: 0.75 },
+                    governor: SpecGovernor::Off,
+                    chain: false,
+                }
+            };
+            (goal, Box::new(move || drop(receiver)))
+        };
+        (
+            Pending {
+                done,
+                started_at: Instant::now(),
+                request_span: tracing::Span::none(),
+                goal,
+            },
+            close,
+        )
+    }
+
+    fn cache_bits(runner: &ModelRunner) -> Vec<(usize, Vec<u32>, Vec<u32>)> {
+        runner
+            .kv
+            .iter()
+            .map(|cache| {
+                (
+                    cache.len,
+                    cache.k.iter().map(|value| value.to_bits()).collect(),
+                    cache.v.iter().map(|value| value.to_bits()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pending_chunk_cancels_inside_native_forward() {
+        for kind in 0..3 {
+            for drain in [false, true] {
+                for done in [0, 2] {
+                    let trigger: ArmedTrigger = Arc::new(Mutex::new(None));
+                    let mut runner = tiny_runner(trigger.clone());
+                    if done != 0 {
+                        runner.forward(&[0, 1], &[0, 1]).unwrap();
+                    }
+                    let before = cache_bits(&runner);
+                    let (pending, close) = pending(kind, done);
+                    let mut keep_client = Some(close);
+                    let draining = Arc::new(AtomicBool::new(false));
+                    *trigger.lock().unwrap() = Some(if drain {
+                        let flag = draining.clone();
+                        Box::new(move || flag.store(true, Ordering::Release))
+                    } else {
+                        keep_client.take().unwrap()
+                    });
+                    assert!(
+                        pending
+                            .forward_chunk(&mut runner, 2, &draining)
+                            .unwrap()
+                            .is_none(),
+                        "pending chunk must cancel inside native forward (goal={kind}, drain={drain}, prefix={done})"
+                    );
+                    assert_eq!(pending.client_gone(), !drain);
+                    assert_eq!(pending.done, done);
+                    assert_eq!(cache_bits(&runner), before);
+                    let mut reference = tiny_runner(Arc::new(Mutex::new(None)));
+                    if done != 0 {
+                        reference.forward(&[0, 1], &[0, 1]).unwrap();
+                    }
+                    let tokens = &pending.prompt()[done..done + 2];
+                    let positions = [done, done + 1];
+                    let recovered = runner.forward(tokens, &positions).unwrap();
+                    let expected = reference.forward(tokens, &positions).unwrap();
+                    assert_eq!(
+                        recovered
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>(),
+                        expected
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>()
+                    );
+                    assert_eq!(cache_bits(&runner), cache_bits(&reference));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pending_chunk_preserves_uncancelled_output_and_runtime_errors() {
+        for kind in 0..3 {
+            let mut runner = tiny_runner(Arc::new(Mutex::new(None)));
+            let mut reference = tiny_runner(Arc::new(Mutex::new(None)));
+            let (pending, _keep_client) = pending(kind, 0);
+            let actual = pending
+                .forward_chunk(&mut runner, 2, &AtomicBool::new(false))
+                .unwrap()
+                .unwrap();
+            let expected = reference.forward(&[0, 1], &[0, 1]).unwrap();
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(cache_bits(&runner), cache_bits(&reference));
+            assert_eq!(
+                pending.done, 0,
+                "only scheduler publication advances progress"
+            );
+        }
+        let mut runner = tiny_runner(Arc::new(Mutex::new(None)));
+        let (mut pending, _keep_client) = pending(0, 0);
+        if let PendingGoal::Admit { req, .. } = &mut pending.goal {
+            req.prompt_tokens[0] = 8;
+        }
+        assert!(
+            pending
+                .forward_chunk(&mut runner, 2, &AtomicBool::new(false))
+                .is_err()
+        );
+        assert_eq!(pending.done, 0);
+        assert!(runner.kv.iter().all(|cache| cache.len == 0));
+    }
+
+    #[test]
+    fn pending_chunk_skips_closed_or_draining_work() {
+        for kind in 0..3 {
+            for drain in [false, true] {
+                let trigger: ArmedTrigger = Arc::new(Mutex::new(Some(Box::new(|| {
+                    panic!("already-cancelled chunk must not execute projections");
+                }))));
+                let mut runner = tiny_runner(trigger);
+                let (pending, close) = pending(kind, 0);
+                if !drain {
+                    close();
+                }
+                assert_eq!(pending.client_gone(), !drain);
+                assert!(
+                    pending
+                        .forward_chunk(&mut runner, 2, &AtomicBool::new(drain))
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(runner.kv.iter().all(|cache| cache.len == 0));
+            }
+        }
+    }
+
+    fn tiny_cuda_runner() -> Option<ModelRunner> {
+        let backend = match tritium_cuda::CudaBackend::new(0) {
+            Ok(backend) => backend,
+            Err(error) => {
+                assert!(
+                    std::env::var("TRITIUM_REQUIRE_CUDA").as_deref() != Ok("1"),
+                    "required CUDA fixture cannot initialize: {error}"
+                );
+                eprintln!("UNKNOWN: CUDA retirement fixture unavailable ({error})");
+                return None;
+            }
+        };
+        let projection = |rows, cols, seed| {
+            let trits: Vec<_> = (0..rows * cols)
+                .map(|i| tritium_core::Trit::from_i8(((i * 7 + seed) % 3) as i8 - 1).unwrap())
+                .collect();
+            Projection::Ternary(TernaryLinear::new(&backend, &trits, rows, cols, 0.03125).unwrap())
+        };
+        let config = ModelConfig {
+            arch: "bitnet".into(),
+            n_layers: 2,
+            n_embd: 64,
+            n_head: 2,
+            n_head_kv: 1,
+            head_dim: 32,
+            n_ff: 64,
+            n_ctx: 16,
+            rope_theta: 10_000.0,
+            rms_eps: 1e-5,
+        };
+        let weights = ModelWeights {
+            token_embd: TokenEmbedding::from_dense(
+                (0..512)
+                    .map(|i| ((i * 5 % 23) as f32 - 11.0) / 64.0)
+                    .collect(),
+                8,
+                64,
+            )
+            .unwrap(),
+            vocab: 8,
+            n_embd: 64,
+            layers: (0..2)
+                .map(|li| TransformerBlock {
+                    attn_norm: vec![1.0; 64],
+                    q_proj: projection(64, 64, li + 1),
+                    k_proj: projection(32, 64, li + 2),
+                    v_proj: projection(32, 64, li + 3),
+                    o_proj: projection(64, 64, li + 4),
+                    attn_sub_norm: Vec::new(),
+                    q_bias: Vec::new(),
+                    k_bias: Vec::new(),
+                    v_bias: Vec::new(),
+                    q_norm: Vec::new(),
+                    k_norm: Vec::new(),
+                    ffn_norm: vec![1.0; 64],
+                    mlp: Mlp::Relu2(tritium_nn::Relu2Mlp {
+                        gate: projection(64, 64, li + 5),
+                        up: projection(64, 64, li + 6),
+                        down: projection(64, 64, li + 7),
+                        ffn_sub_norm: Vec::new(),
+                        rms_eps: 1e-5,
+                    }),
+                })
+                .collect(),
+            output_norm: vec![1.0; 64],
+            lm_head: None,
+        };
+        Some(ModelRunner::from_weights(
+            config,
+            weights,
+            Box::new(backend),
+        ))
+    }
+
+    fn peer_bytes(runner: &mut ModelRunner, batch: &tritium_cuda::BatchKv) -> Vec<Vec<u8>> {
+        let model = runner.resident_cuda().unwrap().unwrap();
+        (0..2)
+            .flat_map(|layer| {
+                (0..3).flat_map(move |row| {
+                    [false, true]
+                        .into_iter()
+                        .map(move |value| (layer, row, value))
+                })
+            })
+            .map(|(layer, row, value)| {
+                model
+                    .debug_batch_kv_row(batch, layer, 1, row, value)
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pending_retirement_releases_once_and_preserves_live_cuda_peer() {
+        let Some(mut runner) = tiny_cuda_runner() else {
+            return;
+        };
+        let mut batch = runner.new_batch_paged(2, 2).unwrap();
+        let telemetry = WorkerTelemetry::default();
+        let capacity = kv_free_tokens(&batch);
+        telemetry.set_kv_pool(capacity, capacity);
+        reserve_pages(&mut batch, 0, 4, &telemetry).unwrap();
+        reserve_pages(&mut batch, 1, 4, &telemetry).unwrap();
+        runner.forward(&[0, 1, 2], &[0, 1, 2]).unwrap();
+        runner.adopt_into_batch_row(&mut batch, 1, 3).unwrap();
+        batch.set_position(1, 3).unwrap();
+        batch.set_live(1, true).unwrap();
+        let before = peer_bytes(&mut runner, &batch);
+        let free_before = batch.free_pages();
+        runner.reset();
+        runner.forward(&[3, 4], &[0, 1]).unwrap();
+        let (pending, _keep_client) = pending(0, 2);
+        let mut pending = Some(pending);
+        retire_pending_prefill(&mut pending, &mut runner, &mut batch, &telemetry, false);
+        assert!(pending.is_none());
+        assert_eq!(runner.resident_cuda().unwrap().unwrap().cache_len(), 0);
+        assert_eq!(batch.free_pages(), free_before + 1);
+        assert_eq!(batch.positions()[1], 3);
+        assert_eq!(peer_bytes(&mut runner, &batch), before);
+        assert_eq!(
+            telemetry.kv_pool_reservations_total.load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(telemetry.kv_pool_releases_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            telemetry
+                .kv_pool_release_failures_total
+                .load(Ordering::Relaxed),
+            0
+        );
+        // Repeating retirement must not release again or reset newer staging.
+        runner.forward(&[6, 7], &[0, 1]).unwrap();
+        retire_pending_prefill(&mut pending, &mut runner, &mut batch, &telemetry, true);
+        assert_eq!(runner.resident_cuda().unwrap().unwrap().cache_len(), 2);
+        assert_eq!(batch.free_pages(), free_before + 1);
+        assert_eq!(peer_bytes(&mut runner, &batch), before);
+        assert_eq!(telemetry.kv_pool_releases_total.load(Ordering::Relaxed), 1);
     }
 }

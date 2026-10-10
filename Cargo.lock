@@ -4928,6 +4928,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "tritium-build-info",
+ "tritium-core",
  "tritium-cpu",
  "tritium-cuda",
  "tritium-format",
