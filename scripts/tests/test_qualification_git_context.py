@@ -104,6 +104,8 @@ class QualificationGitContextTests(unittest.TestCase):
             def run(*args, **kwargs):
                 calls.append(kwargs)
                 self.assertEqual(kwargs["timeout"], 30)
+                if len(calls) == 2:
+                    self.assertEqual(kwargs["env"]["GIT_NO_REPLACE_OBJECTS"], "1")
                 if len(calls) == call:
                     raise subprocess.TimeoutExpired(args[0], 30)
                 return subprocess.CompletedProcess(
@@ -124,6 +126,25 @@ class QualificationGitContextTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "discover Git local"):
                     helper(ROOT, "rev-parse", "HEAD")
                 self.assertEqual(run.call_count, 1)
+
+    def test_local_replacement_cannot_hide_original_commit_content(self):
+        with tempfile.TemporaryDirectory() as raw:
+            origin, target, original = _fixture(Path(raw))
+            (origin / "tracked").write_text("replacement content\n")
+            _git(origin, "add", "tracked")
+            _git(origin, "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+                 "commit", "-qm", "replacement fixture")
+            replacement = _git(origin, "rev-parse", "HEAD")
+            _git(origin, "replace", original, replacement)
+            (target / "tracked").write_text("replacement content\n")
+            _git(target, "add", "tracked")
+            # Git's default replacement view makes this look clean, despite
+            # different bytes under the original advertised source revision.
+            self.assertEqual(_git(target, "status", "--porcelain"), "")
+            for name, module in MODULES.items():
+                with self.subTest(qualifier=name):
+                    with self.assertRaises(module["QualificationError"]):
+                        _check(module, target, original)
 
     def test_dirty_linked_checkout_is_not_hidden_by_foreign_context(self):
         with tempfile.TemporaryDirectory() as raw:

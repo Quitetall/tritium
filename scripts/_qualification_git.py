@@ -29,6 +29,9 @@ def run_git(repo: Path, *args: str, error_type=ValueError) -> str:
             if key not in local_names
             and not key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
         }
+        # Source admission refers to original commit objects, not an optional
+        # local replacement-ref view of the same advertised revision.
+        environment["GIT_NO_REPLACE_OBJECTS"] = "1"
         result = subprocess.run(
             ["git", *args], cwd=repo, env=environment,
             text=True, capture_output=True, check=False, timeout=30,
