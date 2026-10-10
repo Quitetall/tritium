@@ -79,9 +79,11 @@ Legacy defaults report entry/token-delivery checks, not interruption of an
 entered prefill. `unknown` is undeclared behavior; `not_enabled` is an
 unconfigured route. `cooperative_if_available` is conditional on native route
 availability and request eligibility, not a guarantee that the operation can
-run. Ordinary lockstep batch decode currently reports `worker_iteration`,
-separately from cooperative prompt/speculative work. Running kernels and graphs
-are not preempted: `kernel_preemption` is always false.
+run. Ordinary lockstep batch decode reports `cooperative_boundaries`: queries
+run outside capture/replay and between eager head rows, before a single
+whole-batch commit. Successful cancellation publishes no row result or history
+progress and preserves committed prefixes for peer retry. Running kernels and
+graphs are not preempted: `kernel_preemption` is always false.
 
 These declarations are descriptive, not evidence of rollback, cancellation
 latency, resource reclamation or release readiness. `qualification` is always

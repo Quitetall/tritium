@@ -335,6 +335,60 @@ fn release_slot(batch: &mut tritium_cuda::BatchKv, row: usize, telemetry: &Worke
     }
 }
 
+// The worker's ordinary lockstep round. Keep sampling/publication behind the
+// native whole-batch commit; tests cross this same borrowed-query seam.
+fn lockstep_round(
+    runner: &mut tritium_nn::ModelRunner,
+    batch: &mut tritium_cuda::BatchKv,
+    pool: &mut [Option<Active>],
+    eos: u32,
+    telemetry: &WorkerTelemetry,
+    is_draining: &dyn Fn() -> bool,
+) -> Result<bool, tritium_nn::ResidentOpError> {
+    let tokens: Vec<u32> = pool
+        .iter()
+        .map(|slot| slot.as_ref().map_or(0, |active| active.last_token))
+        .collect();
+    for (row, slot) in pool.iter().enumerate() {
+        let _ = batch.set_live(row, slot.is_some());
+    }
+    let started = Instant::now();
+    let step = runner.decode_batch_graph_cancellable(batch, &tokens, &|| {
+        is_draining() || pool.iter().flatten().any(|active| active.tx.is_closed())
+    });
+    telemetry.observe_decode(started.elapsed());
+    let Some(all_logits) = step? else {
+        return Ok(false);
+    };
+    SPEC_COST
+        .lockstep
+        .record(started.elapsed().as_secs_f64() * 1e6);
+    for (row, slot) in pool.iter_mut().enumerate() {
+        let Some(active) = slot.as_mut() else {
+            continue;
+        };
+        active.salt += 1;
+        let Some(token) = sample(
+            &all_logits[row],
+            &active.sampling,
+            (req_seed(&active.sampling), active.salt),
+        ) else {
+            if let Some(active) = slot.take() {
+                let _ = active.tx.try_send(GenEvent::Error("empty logits".into()));
+                release_slot(batch, row, telemetry);
+            }
+            continue;
+        };
+        active.last_token = token;
+        active.history.push(token);
+        if !emit(active, token, eos, &all_logits[row]) {
+            *slot = None;
+            release_slot(batch, row, telemetry);
+        }
+    }
+    Ok(true)
+}
+
 /// Consume a cancelled admission once. Its staging KV is not any live batch
 /// row's KV; resetting it must not retire peers or invalidate their pages.
 fn retire_pending_prefill(
@@ -2334,15 +2388,6 @@ pub(crate) fn run_batched(
         // their pad-token outputs are ignored. Liveness is re-derived from
         // the pool every step (self-healing; adoption/retirement need no
         // separate bookkeeping).
-        let tokens: Vec<u32> = pool
-            .iter()
-            .map(|s| s.as_ref().map_or(0, |a| a.last_token))
-            .collect();
-        for (row, slot) in pool.iter().enumerate() {
-            let _ = batch.set_live(row, slot.is_some());
-        }
-        let t_p = std::time::Instant::now();
-        let decode_started = Instant::now();
         let batch_span = tracing::info_span!(
             parent: None,
             "model.batch.decode",
@@ -2354,15 +2399,19 @@ pub(crate) fn run_batched(
                 batch_span.add_link(context);
             }
         }
-        let step = batch_span.in_scope(|| runner.decode_batch_graph(&mut batch, &tokens));
-        telemetry.observe_decode(decode_started.elapsed());
-        let all_logits = match step {
-            Ok(l) => {
-                // Cost-model P_lockstep: one lockstep step's wall (the
-                // batched floor's plain-step denominator).
-                SPEC_COST.lockstep.record(t_p.elapsed().as_secs_f64() * 1e6);
-                l
-            }
+        let step = batch_span.in_scope(|| {
+            lockstep_round(
+                &mut runner,
+                &mut batch,
+                &mut pool,
+                eos,
+                telemetry.as_ref(),
+                &|| draining.load(Ordering::Acquire),
+            )
+        });
+        match step {
+            Ok(false) => continue, // no same-tick fallback or host publication
+            Ok(true) => {}
             Err(e) => {
                 for (row, slot) in pool.iter_mut().enumerate() {
                     if let Some(a) = slot.take() {
@@ -2371,29 +2420,6 @@ pub(crate) fn run_batched(
                     }
                 }
                 continue;
-            }
-        };
-        for (row, slot) in pool.iter_mut().enumerate() {
-            let Some(active) = slot.as_mut() else {
-                continue;
-            };
-            active.salt += 1;
-            let Some(tok) = sample(
-                &all_logits[row],
-                &active.sampling,
-                (req_seed(&active.sampling), active.salt),
-            ) else {
-                if let Some(a) = slot.take() {
-                    let _ = a.tx.try_send(GenEvent::Error("empty logits".into()));
-                    release_slot(&mut batch, row, telemetry.as_ref());
-                }
-                continue;
-            };
-            active.last_token = tok;
-            active.history.push(tok);
-            if !emit(active, tok, eos, &all_logits[row]) {
-                *slot = None;
-                release_slot(&mut batch, row, telemetry.as_ref());
             }
         }
     }
@@ -2677,6 +2703,29 @@ mod tests {
         assert!(draft.kv.iter().all(|cache| cache.len == 0));
     }
 
+    #[test]
+    fn lockstep_facade_distinguishes_native_unavailability_from_cancellation() {
+        let Some(mut native) = crate::test_support::tiny_cuda_runner(16) else {
+            return;
+        };
+        let mut batch = native.new_batch(2).unwrap();
+        let mut host = tiny_runner(Arc::new(Mutex::new(Some(Box::new(|| {
+            panic!("controlled native facade must not run host projections")
+        })))));
+        assert!(matches!(
+            host.decode_batch_graph_cancellable(&mut batch, &[3, 6], &|| false),
+            Err(tritium_nn::ResidentOpError::Unavailable)
+        ));
+        assert!(
+            host.decode_batch_graph_cancellable(&mut batch, &[], &|| true)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(batch.positions(), &[0, 0]);
+        assert_eq!(batch.debug_decode_graphs(), (false, false));
+        assert!(host.kv.iter().all(|cache| cache.len == 0));
+    }
+
     fn group_active(id: u64, tx: mpsc::Sender<GenEvent>, history: Vec<u32>) -> Active {
         Active {
             tx,
@@ -2710,6 +2759,121 @@ mod tests {
         draining.store(false, Ordering::Release);
         drop(rx0);
         assert!(spec_group_cancelled(&pool, &[0], &|| draining.load(Ordering::Acquire)));
+    }
+
+    #[test]
+    fn lockstep_round_response_or_drain_cancels_without_peer_publication() {
+        use std::cell::{Cell, RefCell};
+        for drain in [false, true] {
+            for cancel_at in [1, 4, 5, 8] {
+                let Some(mut runner) = crate::test_support::tiny_cuda_runner(16) else {
+                    return;
+                };
+                let mut reference = crate::test_support::tiny_cuda_runner(16).unwrap();
+                let expected = reference.forward(&[0, 1, 2, 4], &[0, 1, 2, 3]).unwrap();
+                let expected_token = tritium_nn::sample_greedy(&expected).unwrap();
+                runner.forward(&[0, 1, 2], &[0, 1, 2]).unwrap();
+                let mut batch = runner.new_batch_paged(2, 2).unwrap();
+                let telemetry = WorkerTelemetry::default();
+                let capacity = kv_free_tokens(&batch);
+                telemetry.set_kv_pool(capacity, capacity);
+                for row in 0..2 {
+                    reserve_pages(&mut batch, row, 16, &telemetry).unwrap();
+                    runner.adopt_into_batch_row(&mut batch, row, 3).unwrap();
+                    batch.set_position(row, 3).unwrap();
+                }
+                let before = peer_bytes(&mut runner, &batch);
+                let pages: Vec<_> = (0..2).map(|row| batch.debug_page_table_row(row)).collect();
+                let (tx0, rx0) = mpsc::channel(8);
+                let receiver = RefCell::new(Some(rx0));
+                let (tx1, mut rx1) = mpsc::channel(8);
+                let histories = [vec![0, 1, 2, 3], vec![0, 1, 2, 4]];
+                let mut pool = vec![
+                    Some(group_active(0, tx0, histories[0].clone())),
+                    Some(group_active(1, tx1, histories[1].clone())),
+                ];
+                let draining = AtomicBool::new(false);
+                let polls = Cell::new(0);
+                assert!(
+                    !lockstep_round(&mut runner, &mut batch, &mut pool, 7, &telemetry, &|| {
+                        polls.set(polls.get() + 1);
+                        if polls.get() == cancel_at {
+                            if drain {
+                                draining.store(true, Ordering::Release);
+                            } else {
+                                drop(receiver.borrow_mut().take());
+                            }
+                        }
+                        draining.load(Ordering::Acquire)
+                    })
+                    .unwrap(),
+                    "cancel_at={cancel_at}, drain={drain}"
+                );
+                assert_eq!(polls.get(), cancel_at);
+                assert_eq!(
+                    telemetry.kv_pool_reservations_total.load(Ordering::Relaxed),
+                    2
+                );
+                assert_eq!(telemetry.kv_pool_releases_total.load(Ordering::Relaxed), 0);
+                assert_eq!(batch.positions(), &[3, 3]);
+                assert_eq!(peer_bytes(&mut runner, &batch), before);
+                assert_eq!(
+                    (0..2)
+                        .map(|row| batch.debug_page_table_row(row))
+                        .collect::<Vec<_>>(),
+                    pages
+                );
+                for (row, active) in pool.iter().enumerate() {
+                    let active = active.as_ref().unwrap();
+                    assert_eq!(active.history, histories[row]);
+                    assert_eq!(active.remaining, 16);
+                    assert_eq!(active.salt, 0);
+                }
+                assert!(matches!(
+                    rx1.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+                if drain {
+                    assert!(matches!(
+                        receiver.borrow_mut().as_mut().unwrap().try_recv(),
+                        Err(mpsc::error::TryRecvError::Empty)
+                    ));
+                    for (row, slot) in pool.iter_mut().enumerate() {
+                        drop(slot.take());
+                        release_slot(&mut batch, row, &telemetry);
+                    }
+                    assert_eq!(kv_free_tokens(&batch), capacity);
+                    assert_eq!(telemetry.kv_pool_releases_total.load(Ordering::Relaxed), 2);
+                } else {
+                    // The next worker iteration retires the disconnected row only.
+                    drop(pool[0].take());
+                    release_slot(&mut batch, 0, &telemetry);
+                    assert!(
+                        lockstep_round(&mut runner, &mut batch, &mut pool, 7, &telemetry, &|| {
+                            false
+                        })
+                        .unwrap()
+                    );
+                    assert_eq!(batch.positions(), &[3, 4]);
+                    let peer = pool[1].as_ref().unwrap();
+                    assert_eq!(peer.remaining, 15);
+                    assert_eq!(peer.salt, 1);
+                    assert_eq!(peer.last_token, expected_token);
+                    assert_eq!(peer.history, [0, 1, 2, 4, expected_token]);
+                    assert_eq!(telemetry.kv_pool_releases_total.load(Ordering::Relaxed), 1);
+                    assert!(
+                        matches!(rx1.try_recv(), Ok(GenEvent::Token(token, _)) if token == expected_token)
+                    );
+                }
+                assert_eq!(
+                    telemetry
+                        .kv_pool_release_failures_total
+                        .load(Ordering::Relaxed),
+                    0
+                );
+                assert!(runner.kv.iter().all(|cache| cache.len == 0));
+            }
+        }
     }
 
     #[test]

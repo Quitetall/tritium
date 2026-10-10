@@ -585,6 +585,24 @@ impl ModelRunner {
             .map_err(ResidentOpError::Op)
     }
 
+    /// (cuda) Cooperative native lockstep graph decode. `None` means cancelled
+    /// with no output or batch advancement; `Unavailable` is absent native
+    /// support, not cancellation. Graph dispatch and ordinary errors survive.
+    #[cfg(feature = "cuda")]
+    pub fn decode_batch_graph_cancellable(
+        &mut self,
+        batch: &mut tritium_cuda::BatchKv,
+        tokens: &[u32],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<Vec<f32>>>, ResidentOpError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
+        self.resident_for_op()?
+            .decode_batch_graph_cancellable(batch, tokens, is_cancelled)
+            .map_err(ResidentOpError::Op)
+    }
+
     /// (cuda) I1 batched greedy drafting (L3 batch-slot spec decode): for each
     /// LIVE batch slot, draft up to `k` tokens — truncated at the first EOS
     /// **inclusive**, the EOS drafted but never fed — via `k` lockstep batched

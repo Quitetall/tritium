@@ -104,6 +104,36 @@ fn bits(values: &[f32]) -> Vec<u32> {
 }
 
 #[test]
+fn lockstep_decode_cancels_after_entry_without_advancing_any_row() {
+    let Some(mut runner) = runner() else { return };
+    let model = runner.resident_cuda().unwrap().unwrap();
+    for path in 0..3 {
+        let mut batch = model.new_batch(2).unwrap();
+        let polls = Cell::new(0);
+        let query = || {
+            polls.set(polls.get() + 1);
+            polls.get() == 2
+        };
+        let cancelled = match path {
+            0 => model
+                .decode_batch_cancellable(&mut batch, &[3, 6], &query)
+                .unwrap()
+                .is_none(),
+            1 => model
+                .decode_batch_graph_cancellable(&mut batch, &[3, 6], &query)
+                .unwrap()
+                .is_none(),
+            _ => model
+                .decode_batch_graph_argmax_cancellable(&mut batch, &[3, 6], &query)
+                .unwrap()
+                .is_none(),
+        };
+        assert!(cancelled, "path {path} must poll after entry");
+        assert_eq!(batch.positions(), &[0, 0]);
+    }
+}
+
+#[test]
 fn independently_owned_resident_graphs_match_serial_references() {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -430,6 +460,242 @@ fn batch_prefix_bytes(
                 .unwrap()
         })
         .collect()
+}
+
+fn lockstep_fixture(
+    model: &mut tritium_cuda::CudaDecodeModel,
+    paged: bool,
+    prefix: usize,
+) -> tritium_cuda::BatchKv {
+    let mut batch = if paged {
+        model.new_batch_paged(3, 3).unwrap()
+    } else {
+        model.new_batch(3).unwrap()
+    };
+    for (row, seed) in [[0, 1, 2], [4, 5, 6], [6, 7, 0]].iter().enumerate() {
+        model.reset();
+        model.prefill(seed, &[0, 1, 2]).unwrap();
+        if paged {
+            batch.reserve_pages(row, 16).unwrap();
+        }
+        let p = if row == 0 {
+            prefix
+        } else if row == 1 {
+            2
+        } else {
+            3
+        };
+        model.copy_kv_into_batch_row(&mut batch, row, p).unwrap();
+        batch.set_position(row, p).unwrap();
+        batch.set_live(row, row != 2).unwrap();
+    }
+    batch
+}
+
+fn lockstep_output(
+    model: &mut tritium_cuda::CudaDecodeModel,
+    batch: &mut tritium_cuda::BatchKv,
+    path: usize,
+    tokens: &[u32],
+    query: Option<&dyn Fn() -> bool>,
+) -> Result<Option<Vec<Vec<u32>>>, tritium_spec::BackendError> {
+    match (path, query) {
+        (0, None) => model
+            .decode_batch(batch, tokens)
+            .map(|out| Some(out.iter().map(|row| bits(row)).collect())),
+        (1, None) => model
+            .decode_batch_graph(batch, tokens)
+            .map(|out| Some(out.iter().map(|row| bits(row)).collect())),
+        (_, None) => model
+            .decode_batch_graph_argmax(batch, tokens)
+            .map(|out| Some(out.into_iter().map(|id| vec![id]).collect())),
+        (0, Some(query)) => model
+            .decode_batch_cancellable(batch, tokens, query)
+            .map(|out| out.map(|out| out.iter().map(|row| bits(row)).collect())),
+        (1, Some(query)) => model
+            .decode_batch_graph_cancellable(batch, tokens, query)
+            .map(|out| out.map(|out| out.iter().map(|row| bits(row)).collect())),
+        (_, Some(query)) => model
+            .decode_batch_graph_argmax_cancellable(batch, tokens, query)
+            .map(|out| out.map(|out| out.into_iter().map(|id| vec![id]).collect())),
+    }
+}
+
+#[test]
+fn lockstep_decode_all_checkpoints_preserve_prefix_pages_and_live_peers() {
+    let Some(mut runner) = runner() else { return };
+    let model = runner.resident_cuda().unwrap().unwrap();
+    for path in 0..3 {
+        for paged in [false, true] {
+            for prefix in [0, 3] {
+                let tokens = [3, 6, 0];
+                let mut reference = lockstep_fixture(model, paged, prefix);
+                let positions = reference.positions().to_vec();
+                let before = batch_prefix_bytes(model, &reference);
+                let expected = lockstep_output(model, &mut reference, path, &tokens, None)
+                    .unwrap()
+                    .unwrap();
+                let expected_positions = reference.positions().to_vec();
+                let expected_kv = batch_prefix_bytes(model, &reference);
+                assert_eq!(expected_positions, [prefix + 1, 3, 3]); // dead row stays frozen
+                for warm in [false, true] {
+                    let prepare = |model: &mut tritium_cuda::CudaDecodeModel| {
+                        let mut batch = lockstep_fixture(model, paged, prefix);
+                        if warm {
+                            lockstep_output(model, &mut batch, path, &tokens, None).unwrap();
+                            for (row, &p) in positions.iter().enumerate() {
+                                batch.set_position(row, p).unwrap();
+                            }
+                        }
+                        batch
+                    };
+                    let mut batch = prepare(model);
+                    let polls = Cell::new(0);
+                    assert_eq!(
+                        lockstep_output(
+                            model,
+                            &mut batch,
+                            path,
+                            &tokens,
+                            Some(&|| {
+                                polls.set(polls.get() + 1);
+                                false
+                            })
+                        )
+                        .unwrap()
+                        .unwrap(),
+                        expected
+                    );
+                    assert!(polls.get() >= 5, "in-operation checkpoints on path {path}");
+                    for cancel_at in 1..=polls.get() {
+                        let mut batch = prepare(model);
+                        let free = batch.free_pages();
+                        let pages: Vec<_> =
+                            (0..3).map(|row| batch.debug_page_table_row(row)).collect();
+                        // Batch work must not invalidate independent single-sequence authority.
+                        model.tree_verify_logits(&[3], &[-1]).unwrap();
+                        let count = Cell::new(0);
+                        assert!(
+                            lockstep_output(
+                                model,
+                                &mut batch,
+                                path,
+                                &tokens,
+                                Some(&|| {
+                                    count.set(count.get() + 1);
+                                    count.get() == cancel_at
+                                })
+                            )
+                            .unwrap()
+                            .is_none()
+                        );
+                        assert_eq!(count.get(), cancel_at);
+                        assert_eq!(batch.positions(), positions);
+                        assert_eq!(batch_prefix_bytes(model, &batch), before);
+                        assert_eq!(batch.free_pages(), free);
+                        assert_eq!(
+                            (0..3)
+                                .map(|row| batch.debug_page_table_row(row))
+                                .collect::<Vec<_>>(),
+                            pages
+                        );
+                        let captured = batch.debug_decode_graphs();
+                        if path == 0 || (!warm && cancel_at == 1) {
+                            assert_eq!(captured, (false, false));
+                        } else {
+                            assert_eq!(captured, (path == 1, path == 2));
+                        }
+                        model.tree_commit(&[0]).unwrap();
+                        model.truncate_kv(3).unwrap();
+                        assert_eq!(
+                            lockstep_output(model, &mut batch, path, &tokens, None)
+                                .unwrap()
+                                .unwrap(),
+                            expected
+                        );
+                        assert_eq!(batch.positions(), expected_positions);
+                        assert_eq!(batch_prefix_bytes(model, &batch), expected_kv);
+                    }
+                }
+                for invalid in [&[3, 6][..], &[3, 6, 8][..]] {
+                    let mut batch = lockstep_fixture(model, paged, prefix);
+                    assert!(matches!(
+                        lockstep_output(model, &mut batch, path, invalid, Some(&|| false)),
+                        Err(tritium_spec::BackendError::InvalidInput(_))
+                    ));
+                    assert_eq!(batch.positions(), positions);
+                    assert!(
+                        lockstep_output(model, &mut batch, path, invalid, Some(&|| true))
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn lockstep_graph_facade_cancels_cold_capture_without_host_adoption() {
+    let Some(mut runner) = runner() else { return };
+    let mut batch = runner.new_batch_paged(2, 2).unwrap();
+    for row in 0..2 {
+        batch.reserve_pages(row, 16).unwrap();
+    }
+    assert_eq!(batch.debug_decode_graphs(), (false, false));
+    let polls = Cell::new(0);
+    assert!(
+        runner
+            .decode_batch_graph_cancellable(&mut batch, &[3, 6], &|| {
+                polls.set(polls.get() + 1);
+                polls.get() == 3 // facade entry, native entry, then post-capture
+            })
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(batch.debug_decode_graphs(), (true, false));
+    assert_eq!(batch.positions(), &[0, 0]);
+    assert!(runner.kv.iter().all(|cache| cache.len == 0));
+    let controlled = runner
+        .decode_batch_graph_cancellable(&mut batch, &[3, 6], &|| false)
+        .unwrap()
+        .unwrap();
+    for row in 0..2 {
+        batch.set_position(row, 0).unwrap();
+    }
+    let ordinary = runner.decode_batch_graph(&mut batch, &[3, 6]).unwrap();
+    assert_eq!(
+        controlled.iter().map(|row| bits(row)).collect::<Vec<_>>(),
+        ordinary.iter().map(|row| bits(row)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn lockstep_validation_errors_do_not_advance_or_capture() {
+    let Some(mut runner) = runner() else { return };
+    let model = runner.resident_cuda().unwrap().unwrap();
+    for path in 0..3 {
+        let mut unmapped = model.new_batch_paged(2, 2).unwrap();
+        assert!(matches!(
+            lockstep_output(model, &mut unmapped, path, &[3, 6], Some(&|| false)),
+            Err(tritium_spec::BackendError::InvalidInput(_))
+        ));
+        assert_eq!(unmapped.positions(), &[0, 0]);
+        assert_eq!(unmapped.debug_decode_graphs(), (false, false));
+        let mut overflow = model.new_batch(2).unwrap();
+        overflow.set_position(0, 16).unwrap();
+        assert!(matches!(
+            lockstep_output(model, &mut overflow, path, &[3, 6], Some(&|| false)),
+            Err(tritium_spec::BackendError::InvalidInput(_))
+        ));
+        assert_eq!(overflow.positions(), &[16, 0]);
+        assert_eq!(overflow.debug_decode_graphs(), (false, false));
+        overflow.set_live(0, false).unwrap();
+        lockstep_output(model, &mut overflow, path, &[3, 6], Some(&|| false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(overflow.positions(), &[16, 1]);
+    }
 }
 
 #[test]

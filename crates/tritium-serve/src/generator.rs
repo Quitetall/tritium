@@ -485,22 +485,20 @@ impl CancellationCapabilitiesV1 {
 
     #[cfg(feature = "cuda")]
     pub(crate) fn batched(has_draft: bool) -> Self {
-        use CancellationCheckpoint::{
-            CooperativeBoundaries, CooperativeIfAvailable, NotEnabled, WorkerIteration,
-        };
+        use CancellationCheckpoint::{CooperativeBoundaries, CooperativeIfAvailable, NotEnabled};
         let draft = if has_draft {
             CooperativeIfAvailable
         } else {
             NotEnabled
         };
         Self {
-            generation: WorkerIteration,
+            generation: CooperativeBoundaries,
             tree_session_open: CooperativeIfAvailable,
             tree_verify: CooperativeIfAvailable,
             model_draft: draft,
             batch_prompt: CooperativeBoundaries,
             batch_speculation: draft,
-            batch_decode: WorkerIteration,
+            batch_decode: CooperativeBoundaries,
         }
     }
 }
@@ -2430,8 +2428,8 @@ mod tests {
         assert!(generator.runner.kv.iter().all(|cache| cache.len == 0));
         for has_draft in [false, true] {
             let caps = CancellationCapabilitiesV1::batched(has_draft);
-            assert_eq!(caps.generation, WorkerIteration);
-            assert_eq!(caps.batch_decode, WorkerIteration);
+            assert_eq!(caps.generation, CooperativeBoundaries);
+            assert_eq!(caps.batch_decode, CooperativeBoundaries);
             assert_eq!(caps.batch_prompt, CooperativeBoundaries);
             assert_eq!(caps.tree_verify, CooperativeIfAvailable);
             assert_eq!(

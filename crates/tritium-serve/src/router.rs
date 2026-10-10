@@ -2772,7 +2772,7 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[tokio::test]
-    async fn cancellation_capabilities_batched_router_preserves_lockstep_limit() {
+    async fn cancellation_capabilities_batched_router_declares_cooperative_lockstep() {
         for has_draft in [false, true] {
             let Some(runner) = crate::test_support::tiny_cuda_runner(16) else {
                 return;
@@ -2823,11 +2823,11 @@ mod tests {
             );
             assert_eq!(
                 body["cancellation"]["checkpoints"]["generation"],
-                "worker_iteration"
+                "cooperative_boundaries"
             );
             assert_eq!(
                 body["cancellation"]["checkpoints"]["batch_decode"],
-                "worker_iteration"
+                "cooperative_boundaries"
             );
             assert_eq!(body["cancellation"]["qualification"], "not_assessed");
             draining.store(true, Ordering::Release);
