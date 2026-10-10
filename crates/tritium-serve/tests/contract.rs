@@ -1624,6 +1624,97 @@ async fn sse_disconnect_during_prefill_cancels_worker_and_recovers() {
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
+#[tokio::test]
+async fn queued_sse_disconnect_skips_prefill_and_recovers() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let prefill_entered = Arc::new(AtomicBool::new(false));
+    let release_prefill = Arc::new(AtomicBool::new(false));
+    let generator = CancelGateGen {
+        calls: calls.clone(),
+        prefill_entered: prefill_entered.clone(),
+        release_prefill: release_prefill.clone(),
+        cancellation_observed: Arc::new(AtomicBool::new(false)),
+    };
+    let (router, _) = build_router(Box::new(generator), shared_tok(), ServeConfig::default());
+
+    let first = router
+        .clone()
+        .oneshot(chat(json!({
+            "model": "tritium",
+            "messages": [{"role": "user", "content": "1"}],
+            "stream": true
+        })))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let mut first_body = first.into_body();
+    assert!(first_body.frame().await.transpose().unwrap().is_some());
+    wait_flag(&prefill_entered).await;
+
+    let queued = router
+        .clone()
+        .oneshot(chat(json!({
+            "model": "tritium",
+            "messages": [{"role": "user", "content": "2"}],
+            "stream": true
+        })))
+        .await
+        .unwrap();
+    assert_eq!(queued.status(), StatusCode::OK);
+    let mut queued_body = queued.into_body();
+    assert!(queued_body.frame().await.transpose().unwrap().is_some());
+    let (_, metrics) = send(
+        &router,
+        Request::get("/metrics").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert!(
+        String::from_utf8(metrics)
+            .unwrap()
+            .contains("tritium_queue_depth 1\n")
+    );
+    // The worker is still held in the first request, so receiver closure
+    // necessarily precedes dispatch of the queued request.
+    drop(queued_body);
+    release_prefill.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(2), first_body.collect())
+        .await
+        .expect("first request should retire")
+        .unwrap();
+
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(2),
+        send(
+            &router,
+            chat(json!({
+                "model": "tritium",
+                "messages": [{"role": "user", "content": "3"}],
+                "max_tokens": 1
+            })),
+        ),
+    )
+    .await
+    .expect("worker should recover after queued disconnect");
+    assert_eq!(status, StatusCode::OK);
+    let response: Value = serde_json::from_slice(&body).expect("OpenAI response JSON");
+    assert_eq!(response["choices"][0]["message"]["content"], "10");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "queued disconnect must skip model entry, not only token delivery"
+    );
+    let (_, metrics) = send(
+        &router,
+        Request::get("/metrics").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert!(
+        String::from_utf8(metrics)
+            .unwrap()
+            .contains("tritium_queue_depth 0\n")
+    );
+}
+
 /// Non-streaming requests are bounded by the request timeout: the handler
 /// awaits the full aggregation, so a generation slower than the deadline
 /// surfaces as 408.

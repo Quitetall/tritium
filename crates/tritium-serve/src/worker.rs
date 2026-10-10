@@ -299,6 +299,12 @@ pub(crate) fn spawn_worker(
                         accepted_at,
                         tx,
                     } => {
+                        // A client can disconnect while its job is queued. Do not
+                        // enter model prefill just to discover that at the first
+                        // token send.
+                        if tx.is_closed() {
+                            continue;
+                        }
                         if draining.load(Ordering::Acquire) {
                             let _ = tx.try_send(GenEvent::Error("server draining".to_owned()));
                             continue;
@@ -581,6 +587,90 @@ mod tests {
         assert_eq!(fault(Box::new(BackendFail), true), (true, 1));
         assert_eq!(fault(Box::new(PanicFail), true), (true, 1));
         assert_eq!(fault(Box::new(BackendFail), false), (false, 1));
+    }
+
+    #[test]
+    fn queued_disconnect_skips_generator_and_next_request_recovers() {
+        struct RecordRequests(Arc<std::sync::Mutex<Vec<u32>>>);
+
+        impl Generator for RecordRequests {
+            fn generate(
+                &mut self,
+                req: &GenRequest,
+                on_step: &mut dyn FnMut(Step) -> bool,
+            ) -> Result<(), GenError> {
+                self.0.lock().unwrap().push(req.prompt_tokens[0]);
+                let _ = on_step(Step {
+                    token: 10,
+                    finished: true,
+                    logprobs: None,
+                    finish_reason: Some(FinishReason::Stop),
+                });
+                Ok(())
+            }
+
+            fn n_ctx(&self) -> usize {
+                4096
+            }
+
+            fn vocab(&self) -> usize {
+                128_256
+            }
+        }
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let jobs = spawn_worker(
+            Box::new(RecordRequests(calls.clone())),
+            WorkerSignals {
+                draining: Arc::new(AtomicBool::new(false)),
+                worker_alive: Arc::new(AtomicBool::new(true)),
+                phase: Arc::new(AtomicU8::new(PHASE_IDLE)),
+                backend_faulted: Arc::new(AtomicBool::new(false)),
+                backend_faults: Arc::new(AtomicU64::new(0)),
+                telemetry: Arc::new(WorkerTelemetry::default()),
+                latch_backend_faults: true,
+            },
+            2,
+        );
+        let (cancelled_tx, cancelled_rx) = mpsc::channel(2);
+        let (live_tx, mut live_rx) = mpsc::channel(2);
+        // Close before enqueue so cancellation is causally before dispatch,
+        // independent of worker scheduling or token-delivery timing.
+        drop(cancelled_rx);
+        assert!(
+            cancelled_tx.is_closed(),
+            "queued sender must observe closure"
+        );
+        for (token, tx) in [(1, cancelled_tx), (2, live_tx)] {
+            jobs.try_send(Job::Generate {
+                req: GenRequest {
+                    prompt_tokens: vec![token],
+                    max_new: 1,
+                    logprobs: None,
+                    sampling: Sampling::Greedy,
+                    stop_eos: true,
+                },
+                request_span: tracing::Span::none(),
+                queue_span: tracing::Span::none(),
+                accepted_at: Some(Instant::now()),
+                tx,
+            })
+            .unwrap();
+        }
+
+        assert!(matches!(
+            live_rx.blocking_recv(),
+            Some(GenEvent::Token(10, _))
+        ));
+        assert!(matches!(
+            live_rx.blocking_recv(),
+            Some(GenEvent::Done(FinishReason::Stop))
+        ));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![2],
+            "a queued disconnect must not enter the generator or prefill"
+        );
     }
 
     #[test]
