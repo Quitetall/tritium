@@ -2,7 +2,7 @@
 
 use tritium_cuda::train::{CudaTrainBackendV1, CudaTrainBackendV2};
 use tritium_spec::{
-    TrainBackendV1, TrainingOpManifestV2, TrainingVectorSetV2, TrainingVectorSetV3,
+    TernaryBackend, TrainBackendV1, TrainingOpManifestV2, TrainingVectorSetV2, TrainingVectorSetV3,
 };
 use tritium_testkit::run_supported_training_conformance;
 
@@ -24,6 +24,46 @@ fn cuda_executes_every_v2_vector_for_its_advertised_operations() {
     assert_eq!(
         backend.capabilities().manifest_digest,
         TrainingOpManifestV2::digest()
+    );
+}
+
+#[test]
+fn cuda_training_receipts_bind_physical_uuid_not_only_ordinal() {
+    let device = tritium_cuda::CudaBackend::new(0).expect("open reference CUDA device 0");
+    let physical = device.physical_device_id();
+    assert_ne!(physical, device.device_id());
+    assert!(
+        physical.contains(":GPU-"),
+        "physical ID must carry driver UUID"
+    );
+    let expected_prefix = format!("{physical}:");
+    let vectors = TrainingVectorSetV2::parse_json(include_bytes!(
+        "../../../spec/training/v2/vectors/v2.json"
+    ))
+    .expect("parse canonical V2 training vectors");
+    let backend = CudaTrainBackendV2::new(0).expect("open CUDA training device 0");
+    let report = run_supported_training_conformance(&backend, &vectors);
+    assert!(report.is_ok(), "conformance failures: {:?}", report.failed);
+    assert_eq!(report.passed.len(), 117);
+    assert_eq!(
+        report
+            .passed
+            .iter()
+            .filter(|case| case.receipt.is_some())
+            .count(),
+        72,
+        "every successful V2 execution must provide a receipt"
+    );
+    assert!(
+        report
+            .passed
+            .iter()
+            .filter_map(|case| case.receipt.as_ref())
+            .all(|receipt| receipt
+                .physical_device
+                .as_deref()
+                .is_some_and(|id| id.starts_with(&expected_prefix))),
+        "CUDA training receipts omitted the physical driver UUID"
     );
 }
 
