@@ -7,9 +7,10 @@ from pathlib import Path
 import subprocess
 
 
-def run_git(repo: Path, *args: str, error_type=ValueError) -> str:
-    """Isolate each child, preserve parent/global context, and bound execution."""
-    environment = dict(os.environ)
+def git_result(repo: Path, *args: str, error_type=ValueError,
+               environment=None, text: bool = True):
+    """Isolated, bounded Git result; nonzero is data, not proof of absence."""
+    environment = dict(os.environ if environment is None else environment)
     try:
         # Ask Git itself for the supported local selectors. Discovery must not
         # inherit a malformed/foreign selector or config injection either.
@@ -34,10 +35,16 @@ def run_git(repo: Path, *args: str, error_type=ValueError) -> str:
         environment["GIT_NO_REPLACE_OBJECTS"] = "1"
         result = subprocess.run(
             ["git", *args], cwd=repo, env=environment,
-            text=True, capture_output=True, check=False, timeout=30,
+            text=text, capture_output=True, check=False, timeout=30,
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise error_type("cannot verify requested Git checkout context") from error
+    return result
+
+
+def run_git(repo: Path, *args: str, error_type=ValueError) -> str:
+    """Read text or reject, leaving the parent environment unchanged."""
+    result = git_result(repo, *args, error_type=error_type)
     if result.returncode:
         raise error_type(result.stderr.strip() or "git command failed")
     return result.stdout.strip()

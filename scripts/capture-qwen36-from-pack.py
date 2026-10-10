@@ -16,7 +16,6 @@ import math
 from pathlib import Path
 from pathlib import PurePosixPath
 import runpy
-import subprocess
 import sys
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -28,6 +27,7 @@ STAGE7 = runpy.run_path(
     Path(__file__).with_name("verify-stage7-qualification-receipt.py")
 )
 WHEEL_RUNTIME = runpy.run_path(Path(__file__).with_name("wheel-functional-smoke.py"))
+_run_git = runpy.run_path(Path(__file__).with_name("_qualification_git.py"))["run_git"]
 
 
 def _parse_max_memory(values: list[str]) -> dict[Any, str]:
@@ -224,30 +224,13 @@ def _validate_stage7_qualification(
         character not in "0123456789abcdef" for character in revision
     ):
         raise ValueError("release candidate manifest has an invalid source revision")
-    try:
-        checkout_revision = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=Path(__file__).resolve().parent.parent,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError) as error:
-        raise ValueError("cannot determine capture checkout revision") from error
+    checkout = Path(__file__).resolve().parent.parent
+    checkout_revision = _run_git(checkout, "rev-parse", "HEAD")
     if revision != checkout_revision:
         raise ValueError(
             "release candidate source_revision differs from capture checkout HEAD"
         )
-    try:
-        status = subprocess.run(
-            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
-            cwd=Path(__file__).resolve().parent.parent,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
-    except (OSError, subprocess.CalledProcessError) as error:
-        raise ValueError("cannot determine capture checkout cleanliness") from error
+    status = _run_git(checkout, "status", "--porcelain=v1", "--untracked-files=all")
     if status.strip():
         raise ValueError(
             "Qwen capture requires a clean checkout; use a clean candidate worktree"

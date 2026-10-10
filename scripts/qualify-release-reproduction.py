@@ -136,15 +136,20 @@ def clean_environment() -> dict[str, str]:
     return environment
 
 
+_git_result = runpy.run_path(Path(__file__).with_name("_qualification_git.py"))["git_result"]
+
+
 def require_clean_environment(work_dir: Path, environment: dict[str, str]) -> None:
     if not work_dir.is_dir() or work_dir.is_symlink():
         raise QualificationError("work directory must be an ordinary directory")
-    result = subprocess.run(
-        ["git", "-C", str(work_dir), "rev-parse", "--is-inside-work-tree"],
-        text=True, capture_output=True, check=False, env=environment,
+    result = _git_result(
+        work_dir, "rev-parse", "--is-inside-work-tree",
+        environment=dict(environment, LC_ALL="C"), error_type=QualificationError,
     )
     if result.returncode == 0:
         raise QualificationError("second-machine work directory is inside a repository")
+    if result.returncode != 128 or not result.stderr.startswith("fatal: not a git repository"):
+        raise QualificationError("cannot prove second-machine repository absence")
     present = [name for name in COMPILERS if shutil.which(name, path=environment.get("PATH"))]
     if present:
         raise QualificationError(

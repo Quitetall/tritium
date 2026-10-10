@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import runpy
 import sys
 from typing import Sequence
 
@@ -23,10 +24,11 @@ class ReleaseRefError(ValueError):
     """The requested release tag is invalid, absent, or not reviewed."""
 
 
+_git_result = runpy.run_path(Path(__file__).with_name("_qualification_git.py"))["git_result"]
+
+
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
-        ["git", *args], cwd=repo, text=True, capture_output=True, check=False
-    )
+    result = _git_result(repo, *args, error_type=ReleaseRefError)
     if check and result.returncode != 0:
         detail = result.stderr.strip() or "git command failed"
         raise ReleaseRefError(detail)
