@@ -104,3 +104,55 @@ No persistent per-run scratch was created for these checks. Test-managed
 temporary directories and child processes were cleaned up. The shared build
 cache, unrelated worktree edits and August campaign artifacts were preserved;
 the proposed August cleanup still has no owner approval.
+
+## Security scanner follow-up
+
+Parent source: `07879b5fe6b596f180d2d31f9a672215845a1b43`. This follow-up repairs
+the analogous diagnostic boundary in `scripts/qualify-oci-security.py` and
+rejects non-finite/nonpositive scan limits before input access or execution.
+
+The original scanner helper copied raw stderr and chained subprocess exceptions
+into failures. Its timeout and producer database-age checks also admitted NaN
+or infinite values through comparison-only validation. The six minimized
+regressions failed 16 assertions on two runs before repair. No scanner, network,
+image, real secret or GPU was used to construct that signal. The real child
+failure/timeout tests use synthetic markers; launch failures and invalid-limit
+preflight are exercised with injected failures at the actual helper seams.
+
+The repair keeps fixed scanner failure categories and numeric exit status,
+withholds raw subprocess diagnostics and suppresses rendered exception context.
+Both direct scanner execution and qualifier preflight require finite positive
+numeric timeout; database age remains finite, positive and at most 24 hours.
+Successful scanner metadata and report contents are unchanged. The final seven
+execution tests passed twenty repetitions (140 tests). No temporary debug
+instrumentation or separate redaction framework was added.
+
+Final command:
+
+```bash
+timeout 120 env PYTHONDONTWRITEBYTECODE=1 TMPDIR=/mnt/4tb/tmp \
+  python3 -m unittest scripts.tests.test_qualify_oci_security \
+  scripts.tests.test_qualify_oci_runtime scripts.tests.test_release_evidence_status \
+  scripts.tests.test_qualify_kubernetes_deployment scripts.tests.test_release_status \
+  scripts.tests.test_oci_contract scripts.tests.test_verify_oci_archive
+```
+
+Result: **PASS**, 192 tests in 5.258s. The intermediate run before adding the
+successful report-preservation test also passed (191 tests in 58.870s); neither
+duration is a model/scanner throughput measurement. Scoped `git diff --check`
+passed. AST comparison with the parent confirms unchanged receipt admission,
+finding counts, archive staging, atomic publication, schema/version/report-size
+constants and Trivy minimum version. No scanner command, zero-finding rule,
+database freshness gate or receipt acceptance threshold was weakened.
+
+| File | SHA-256 |
+| --- | --- |
+| `scripts/qualify-oci-security.py` | `251835475b50bd34531583e2a2f28895649eff601cc8443fb207abf7ffc72fd1` |
+| `scripts/tests/test_qualify_oci_security.py` | `dfed07dbca396c8a98502af1f9485aa49590d7dd8fac5e9aca4e37e0ac8f9da9` |
+
+This is execution-bound/diagnostic regression evidence, not an actual Trivy
+vulnerability or secret scan, trusted security clearance, or a release receipt.
+The earlier scope limitations and full-release obligations remain binding.
+Test-owned children and temporary report files were cleaned up. No campaign
+artifact, shared cache, unrelated WIP, running GPU workload or global install
+was changed.
