@@ -4798,6 +4798,7 @@ dependencies = [
  "proptest",
  "rayon",
  "tritium-core",
+ "tritium-evidence",
  "tritium-format",
  "tritium-runtime",
  "tritium-schema",

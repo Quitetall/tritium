@@ -40,11 +40,13 @@
 //!
 //! [`CpuBackend::upload_tensor`], [`CpuBackend::matmul`] and
 //! [`CpuBackend::embed_rows`] accept additive and dense semantic tensors. This
-//! path currently uses the scalar core implementation, including consumer-bound
-//! basis transforms. It owns decoded i8 trits/f32 scales or dense f32 values;
-//! buffer byte counts are decoded payload sizes, not packed artifact sizes.
+//! path retains canonical D2/B3/S34 plane bytes and exact f16/f32 scales, or dense
+//! f32 values. Additive matmul executes add/subtract/skip directly over packed
+//! coefficients, with independent output rows parallelized. Basis transforms
+//! use the shared core; gather applies the inverse transform. Buffer byte counts
+//! include owned packed coefficients and stored-precision scales, not container bytes.
 //! The ISA flags above describe legacy packed kernel availability, not SIMD
-//! acceleration or packed residency for these semantic operations.
+//! acceleration for these semantic operations; the packed arithmetic is scalar.
 //
 // `linkme`'s `distributed_slice` expands to a static with a custom
 // `#[link_section]`, and the AVX2 kernel needs hand-written `unsafe` for its
@@ -237,8 +239,8 @@ impl TernaryBackend for CpuBackend {
         semantic::CpuTensor::caps(tensor)
     }
 
-    // Unified semantic operations currently use the scalar core implementation,
-    // owning decoded trits/scales rather than packed-residency or SIMD claims.
+    // Unified additive operations retain canonical packed planes; dense and
+    // shared basis arithmetic remain exact scalar f32. No SIMD claim follows.
     fn upload_tensor(&self, tensor: TensorView<'_>) -> Result<Box<dyn DeviceBuffer>, BackendError> {
         semantic::CpuTensor::upload(tensor)
     }

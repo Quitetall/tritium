@@ -73,8 +73,8 @@ fn encoded_additive_tensors_execute_with_frozen_logical_weights() {
             let uploaded = cpu
                 .upload_tensor(TensorView::Additive(decoded.view()))
                 .unwrap();
-            // Decoded i8 trits and f32 scales, not packed payload size.
-            assert_eq!(uploaded.len_bytes(), 32);
+            // Two canonical packed planes plus four retained f32 scales.
+            assert_eq!(uploaded.len_bytes(), 20);
             let mut gathered = [0.; 12];
             cpu.embed_rows(&*uploaded, &[1, 0, 1], &mut gathered)
                 .unwrap();
