@@ -16,7 +16,7 @@ from ._installed_candidate import verify_installed_candidate
 from ._wheel_identity import file_sha256
 from .config import TernaryConfig
 from .conversion import prepare_qat
-from .estimators import AbsMeanSTE
+from .estimators import SaltSTE
 from .projection import ProjectionContext, validate_projection
 
 
@@ -38,16 +38,18 @@ def _measure_fixture(model, binding):
     for layer in (model.left, model.right):
         if (
             not isinstance(layer, TernaryLinear)
-            or type(layer.estimator) is not AbsMeanSTE
+            or type(layer.estimator) is not SaltSTE
             or layer.bias is not None
             or tuple(layer.weight.shape) != (2, 4)
             or layer.weight.device.type != "cpu"
             or layer.weight.dtype != torch.float32
             or layer.weight.detach().tolist() != witness.fixture_weights()
         ):
-            raise ValueError("draft measurements require the frozen CPU AbsMean fixture")
+            raise ValueError("draft measurements require the frozen CPU SALT fixture")
     if model.left.weight is not model.right.weight:
         raise ValueError("draft measurements require tied fixture weights")
+    if model.left.estimator is not model.right.estimator:
+        raise ValueError("draft measurements require tied fixture estimators")
 
     inputs = torch.tensor(witness.INPUTS, dtype=torch.float32, device="cpu")
     with torch.inference_mode():

@@ -1,8 +1,11 @@
 """Draft numerical/provenance tests, explicitly not release qualification."""
 
 import copy
+import importlib.metadata
 import math
+import os
 from pathlib import Path
+import re
 import runpy
 
 import pytest
@@ -157,4 +160,43 @@ def test_candidate_guard_precedes_model_and_measurement(monkeypatch, tmp_path):
         measurements.measure_installed_fixture(
             wheel_artifact=tmp_path / "missing.whl", source_revision="a" * 40,
             release="1.1.0-rc.2", run_id="negative-unit-only",
+        )
+
+
+@pytest.mark.parametrize("failure", ["source", "release", "wheel", "origin"])
+def test_actual_candidate_guard_rejects_before_model(monkeypatch, tmp_path, failure):
+    pytest.importorskip("torch")
+    from tritium import _tritium
+    from tritium.torch import _diagnostic_measurements as measurements
+
+    directory = os.environ.get("TRITIUM_TEST_CANDIDATE_WHEEL_DIR")
+    if directory is None:
+        pytest.skip("actual candidate rejection requires the executing wheel archive")
+    wheels = list(Path(directory).resolve(strict=True).glob("pytritium-*.whl"))
+    assert len(wheels) == 1
+    wheel = wheels[0]
+    source = _tritium.source_identity().removeprefix("source-git:")
+    release = re.sub(r"rc(\d+)$", r"-rc.\1", importlib.metadata.version("pytritium"))
+    if failure == "source":
+        source = "a" * 40 if source != "a" * 40 else "b" * 40
+    elif failure == "release":
+        release = "0.0.0"
+    elif failure == "wheel":
+        wheel = tmp_path / "opaque.whl"
+        wheel.write_bytes(b"not a candidate wheel")
+    else:
+        origin = tmp_path / "foreign.py"
+        origin.write_text("# outside the candidate\n")
+        monkeypatch.setattr(measurements, "__file__", str(origin))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("unbound candidate entered draft measurement")
+
+    monkeypatch.setattr(measurements, "_Fixture", forbidden)
+    with pytest.raises((ValueError, RuntimeError), match={
+        "source": "native source", "release": "release", "wheel": "wheel", "origin": "owned",
+    }[failure]):
+        measurements.measure_installed_fixture(
+            wheel_artifact=wheel, source_revision=source, release=release,
+            run_id="negative-candidate-draft",
         )

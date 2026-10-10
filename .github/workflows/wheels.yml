@@ -381,6 +381,7 @@ jobs:
           crates/tritium-py/tests/test_hf_export_lifecycle.py
           crates/tritium-py/tests/test_tutorial_candidate_provenance.py
           crates/tritium-py/tests/test_observability_candidate_provenance.py
+          crates/tritium-py/tests/test_diagnostic_witness.py
           crates/tritium-py/tests/test_estimator_candidate_provenance.py
           crates/tritium-py/tests/test_hf_distributed_candidate_provenance.py
           crates/tritium-py/tests/test_qualify_estimators.py
