@@ -34,6 +34,28 @@ curl http://127.0.0.1:8099/v1/chat/completions \
 same model-path setting. `--converted` cannot be combined with speculative
 decoding, batching, raw token mode, or a draft model.
 
+### Manual native-model serving checks
+
+These ignored tests use real converted SALT weights and their HF tokenizer:
+
+```bash
+TRITIUM_SERVE_E2E=1 TRITIUM_CONVERTED_PATH=/models/my-converted-model \
+  timeout 900 cargo test --locked -p tritium-serve --features e2e --test e2e \
+  serve_e2e_converted -- --ignored --nocapture --test-threads=1
+```
+
+The smoke check requires a completion. The lifecycle check compares greedy
+SSE text, finish reason and usage with a non-streaming reference, drops real
+responses during observed worker prefill and decode phases, then requires worker/queue
+recovery without backend faults and identical subsequent completions. Missing
+opt-in or model inputs fail an explicitly selected test; default CI keeps these
+tests ignored. The model must produce a content token for the declared prompt
+to exercise decode disconnect. Execution timeouts are test bounds, not release
+latency thresholds. The phase gauge does not pinpoint an individual native
+checkpoint. This is in-process compatibility-router coverage, not
+socket transport, strict schema-v3 readiness, paged-KV/memory qualification,
+model-quality or performance evidence.
+
 ## Deployment configuration
 
 Launch configuration is fail-closed and has one precedence order:
