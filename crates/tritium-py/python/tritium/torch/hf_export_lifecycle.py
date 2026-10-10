@@ -64,7 +64,8 @@ def _run(
     seed: int,
 ) -> dict[str, object]:
     version, module_path = _installed_distribution(
-        wheel_artifact=wheel_artifact, source_revision=source_revision, release=release
+        wheel_artifact=wheel_artifact, source_revision=source_revision, release=release,
+        executing_files=(Path(__file__),),
     )
     torch.manual_seed(seed)
     prepared = prepare(
@@ -206,7 +207,8 @@ def qualify_hf_export(
     if not release or not run_id:
         raise ValueError("release and run id must be non-empty")
     _installed_distribution(
-        wheel_artifact=wheel_artifact, source_revision=source_revision, release=release
+        wheel_artifact=wheel_artifact, source_revision=source_revision, release=release,
+        executing_files=(Path(__file__),),
     )
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}.", dir=output_dir.parent))
@@ -280,6 +282,7 @@ def validate_hf_export_receipt(
         wheel_artifact=expected_wheel,
         source_revision=receipt["source_revision"],
         release=receipt["release"],
+        executing_files=(Path(__file__),),
     )
     if receipt["distribution_version"] != version:
         raise ValueError("Hugging Face export distribution version mismatch")

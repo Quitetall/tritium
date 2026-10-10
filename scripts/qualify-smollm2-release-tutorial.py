@@ -5,14 +5,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.metadata
 import json
 import math
 import re
 from pathlib import Path
 from typing import Any
-
-from packaging.version import Version
 
 SMOLLM2_MODEL_ID = "HuggingFaceTB/SmolLM2-135M-Instruct"
 SMOLLM2_REVISION = "12fd25f77366fa6b3b4b768ec3050bf629380bac"
@@ -108,17 +105,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if not args.release or not args.run_id:
         raise ValueError("release and run ID must be non-empty")
 
-    import tritium
     from tritium.torch import run_smollm2_release_demo
+    from tritium.torch import tutorial
+    from tritium.torch._installed_candidate import verify_installed_candidate
 
-    distribution = importlib.metadata.distribution("pytritium")
-    module = Path(tritium.__file__).resolve(strict=True)
-    if distribution.files is None or module not in {
-        distribution.locate_file(item).resolve() for item in distribution.files
-    }:
-        raise RuntimeError("imported Tritium module is not owned by the installed wheel")
-    if Version(distribution.version) != Version(args.release):
-        raise RuntimeError("installed wheel version differs from the candidate release")
+    version, module = verify_installed_candidate(
+        wheel_artifact=wheel, source_revision=args.source_revision,
+        release=args.release, executing_files=(Path(tutorial.__file__),),
+    )
     if args.output_dir.exists() or args.output_dir.is_symlink():
         raise FileExistsError("tutorial output directory must not already exist")
 
@@ -138,7 +132,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "candidate_wheel": wheel.name,
         "candidate_wheel_sha256": sha256_file(wheel),
         "candidate_wheel_bytes": wheel.stat().st_size,
-        "installed_distribution_version": distribution.version,
+        "installed_distribution_version": version,
         "installed_module": str(module),
         "tutorial_receipt": str(args.output_dir / "receipt.json"),
         "tutorial_receipt_sha256": sha256_file(args.output_dir / "receipt.json"),

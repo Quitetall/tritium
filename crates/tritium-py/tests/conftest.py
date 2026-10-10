@@ -21,6 +21,7 @@ INSTALLED_WHEEL_ONLY = frozenset({
     "test_hf_lifecycle_receipt.py",
     "test_hf_candidate_provenance.py",
     "test_tutorial_qat.py",
+    "test_tutorial_candidate_provenance.py",
 })
 
 

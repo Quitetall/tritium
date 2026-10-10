@@ -13,8 +13,9 @@ import pytest
 pytest.importorskip("torch")
 pytest.importorskip("transformers")
 
+import tritium  # noqa: E402
 from tritium import _tritium  # noqa: E402
-from tritium.torch import hf_export_lifecycle, hf_lifecycle  # noqa: E402
+from tritium.torch import _installed_candidate, hf_export_lifecycle, hf_lifecycle  # noqa: E402
 
 
 def _installed_release():
@@ -64,7 +65,7 @@ def test_installed_replay_rejects_unbound_candidate(tmp_path, monkeypatch, modul
             module, "_installed_distribution",
             lambda **_kwargs: (
                 importlib.metadata.version("pytritium"),
-                Path(hf_lifecycle.tritium.__file__).resolve(),
+                Path(tritium.__file__).resolve(),
             ),
         )
         run = module.run_hf_lifecycle if module is hf_lifecycle else module.qualify_hf_export
@@ -95,6 +96,7 @@ def candidate_installation(tmp_path, monkeypatch):
         "tritium/__init__.py": b"package",
         "tritium/_tritium.abi3.so": b"native fixture",
         "tritium/torch/hf_lifecycle.py": b"qualification fixture",
+        "tritium/torch/_installed_candidate.py": b"candidate admission fixture",
         "tritium/torch/_telemetry_binary.py": b"telemetry",
         "tritium/torch/_wheel_identity.py": b"wheel identity",
         "tritium/torch/qualify_observability.py": b"observability",
@@ -130,10 +132,11 @@ def candidate_installation(tmp_path, monkeypatch):
         locate_file=lambda item: root / str(item),
     )
     monkeypatch.setattr(importlib.metadata, "distribution", lambda _name: distribution)
-    monkeypatch.setattr(hf_lifecycle.tritium, "__file__", str(root / "tritium/__init__.py"))
+    monkeypatch.setattr(tritium, "__file__", str(root / "tritium/__init__.py"))
     monkeypatch.setattr(_tritium, "__file__", str(root / "tritium/_tritium.abi3.so"))
     monkeypatch.setattr(_tritium, "source_identity", lambda: "source-git:" + "a" * 40)
     monkeypatch.setattr(hf_lifecycle, "__file__", str(root / "tritium/torch/hf_lifecycle.py"))
+    monkeypatch.setattr(_installed_candidate, "__file__", str(root / "tritium/torch/_installed_candidate.py"))
     return root, wheel, distribution
 
 
@@ -201,7 +204,19 @@ def test_candidate_rejects_symlink_and_unowned_origin(candidate_installation, mo
         _verify_candidate(wheel)
     target.unlink()
     alternate.rename(target)
-    monkeypatch.setattr(hf_lifecycle.tritium, "__file__", str(root / "outside.py"))
+    monkeypatch.setattr(tritium, "__file__", str(root / "outside.py"))
     (root / "outside.py").write_bytes(b"package")
     with pytest.raises(RuntimeError, match="not owned"):
         _verify_candidate(wheel)
+
+
+def test_installed_record_cannot_admit_an_extra_executing_origin(candidate_installation):
+    root, wheel, distribution = candidate_installation
+    extra = root / "tritium/torch/extra.py"
+    extra.write_bytes(b"outside the candidate wheel")
+    distribution.files.append(importlib.metadata.PackagePath("tritium/torch/extra.py"))
+    with pytest.raises(ValueError, match="does not own executing"):
+        _installed_candidate.verify_installed_candidate(
+            wheel_artifact=wheel, source_revision="a" * 40, release="1.1.0-rc.2",
+            executing_files=(extra,),
+        )

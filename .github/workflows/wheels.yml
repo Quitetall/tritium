@@ -378,6 +378,7 @@ jobs:
           crates/tritium-py/tests/test_hf_candidate_provenance.py
           crates/tritium-py/tests/test_hf_lifecycle_receipt.py
           crates/tritium-py/tests/test_hf_export_lifecycle.py
+          crates/tritium-py/tests/test_tutorial_candidate_provenance.py
       - name: test installed tutorial receipt admission
         run: >-
           python -m unittest discover

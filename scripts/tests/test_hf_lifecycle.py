@@ -38,7 +38,12 @@ class HuggingFaceLifecycleWorkflowTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertNotIn("sys.path", source)
         self.assertNotIn("PYTHONPATH", source)
-        self.assertIn('distribution("pytritium")', source)
+        self.assertIn("verify_installed_candidate", source)
+        candidate_source = (
+            ROOT / "crates/tritium-py/python/tritium/torch/_installed_candidate.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('distribution("pytritium")', candidate_source)
+        self.assertNotIn("import transformers", candidate_source)
         self.assertIn("AutoModelForCausalLM.from_pretrained", source)
         self.assertIn("safe_serialization=True", source)
 

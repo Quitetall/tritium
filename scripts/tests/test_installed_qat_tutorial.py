@@ -66,8 +66,14 @@ class InstalledQatTutorialTests(unittest.TestCase):
         self.assertIn("tritium.installed-qat-tutorial.v3", receipt_source)
         self.assertIn("--wheel-artifact", source)
         self.assertIn("--source-revision", source)
-        self.assertIn('distribution("pytritium")', source)
-        self.assertIn("not owned by pytritium", source)
+        self.assertIn("verify_installed_candidate", source)
+        candidate_source = (
+            ROOT / "crates/tritium-py/python/tritium/torch/_installed_candidate.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('distribution("pytritium")', candidate_source)
+        self.assertIn("not owned by pytritium", candidate_source)
+        self.assertNotIn("import transformers", candidate_source)
+        self.assertIn("test_tutorial_candidate_provenance.py", (ROOT / ".github/workflows/wheels.yml").read_text())
         self.assertIn("export_qat_hard", source)
         self.assertIn("load_qat_hard", source)
         wrapper = TUTORIAL.read_text(encoding="utf-8")
