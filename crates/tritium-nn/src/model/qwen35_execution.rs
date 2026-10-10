@@ -672,6 +672,7 @@ impl Qwen35SaltV2LanguageMtpModel {
     /// Returns [`Qwen35ExecutionVisitError::Runtime`] for invalid input, execution,
     /// identity, count, or transcript failures, and `Observer` if the caller
     /// rejects one block output.
+    /// In-place changed weights fail provenance before input or observer effects.
     pub fn try_visit_untrusted_block_outputs<'batch, I, E>(
         &self,
         batches: I,
@@ -698,6 +699,8 @@ impl Qwen35SaltV2LanguageMtpModel {
     where
         I: IntoIterator<Item = &'batch [u32]>,
     {
+        self.require_loaded_weight_state()
+            .map_err(Qwen35ExecutionVisitError::Runtime)?;
         let backend_before = BackendIdentity::capture(self.runner().execution_backend())
             .map_err(Qwen35ExecutionVisitError::Runtime)?;
         let mut token_hasher = blake3::Hasher::new_derive_key(TOKEN_STREAM_CONTEXT);
@@ -877,6 +880,7 @@ impl Qwen35SaltV2LanguageMtpModel {
     /// model/backend failure, identity drift, overflow, or allocation failure;
     /// returns [`Qwen35ExecutionVisitError::Observer`] without a transcript when the
     /// observer rejects a batch.
+    /// In-place changed weights fail provenance before input or observer effects.
     pub fn try_visit_untrusted_final_logits<'batch, I, E>(
         &self,
         batches: I,
@@ -885,6 +889,8 @@ impl Qwen35SaltV2LanguageMtpModel {
     where
         I: IntoIterator<Item = &'batch [u32]>,
     {
+        self.require_loaded_weight_state()
+            .map_err(Qwen35ExecutionVisitError::Runtime)?;
         let backend_before = BackendIdentity::capture(self.runner().execution_backend())
             .map_err(Qwen35ExecutionVisitError::Runtime)?;
         let mut token_hasher = blake3::Hasher::new_derive_key(TOKEN_STREAM_CONTEXT);

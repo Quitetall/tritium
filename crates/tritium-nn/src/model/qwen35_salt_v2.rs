@@ -24,6 +24,7 @@ use tritium_spec::TernaryBackend;
 use crate::NnError;
 use crate::QWEN36_27B_REVISION;
 use crate::layers::{HostSaltV2Linear, Projection, TokenEmbedding};
+use crate::model::qwen35::RunnerIdentity;
 use crate::model::qwen35_hf::{
     Qwen35HfTensorSource, TensorRole, TensorSpec, language_schema, load_language_weights,
     load_mtp_weights, mtp_schema,
@@ -529,6 +530,7 @@ impl Qwen35SaltV2BundleAdmission {
 pub struct Qwen35SaltV2LanguageMtpModel {
     config: Qwen35CheckpointConfig,
     runner: Qwen35TextRunner,
+    loaded_runner_identity: Arc<RunnerIdentity>,
     mtp: UnverifiedQwen35Mtp,
     receipt: Qwen35SaltV2LoadReceipt,
     tokenizer_json: Vec<u8>,
@@ -542,6 +544,8 @@ impl Qwen35SaltV2LanguageMtpModel {
     /// Success invalidates existing language caches/outputs and the previous MTP
     /// target binding. Reload an immutable child to reassemble target and MTP
     /// together; the load receipt does not qualify an in-place mutated candidate.
+    /// Package-bound execution transcripts are rejected after success; ordinary
+    /// fresh-cache inference and untrusted candidate scopes remain available.
     ///
     /// # Errors
     /// Returns an error if tensor identity is absent or ambiguous, resident
@@ -798,6 +802,7 @@ impl Qwen35SaltV2LanguageMtpModel {
             })?;
         Ok(Self {
             config,
+            loaded_runner_identity: Arc::clone(runner.identity()),
             runner,
             mtp,
             receipt: Qwen35SaltV2LoadReceipt {
@@ -846,12 +851,24 @@ impl Qwen35SaltV2LanguageMtpModel {
         &self.runner
     }
 
+    pub(crate) fn require_loaded_weight_state(&self) -> Result<(), NnError> {
+        if !Arc::ptr_eq(self.runner.identity(), &self.loaded_runner_identity) {
+            return Err(NnError::Provenance(
+                "Qwen execution weights no longer match the loaded package; reload an immutable child"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub const fn mtp(&self) -> &UnverifiedQwen35Mtp {
         &self.mtp
     }
 
     #[must_use]
+    /// Historical receipt for the package loaded at assembly, not a claim about
+    /// any later in-place mutation.
     pub const fn receipt(&self) -> &Qwen35SaltV2LoadReceipt {
         &self.receipt
     }
@@ -1945,6 +1962,14 @@ mod tests {
         assert_eq!(restored.last_logits(), output.last_logits());
 
         let batches = [&[1_u32, 2][..], &[3_u32][..]];
+        let child_execution = child_model
+            .try_visit_untrusted_final_logits(batches, |_| Ok::<_, core::convert::Infallible>(()))
+            .unwrap();
+        assert_eq!(
+            child_execution.package_id(),
+            child_model.receipt().package_id()
+        );
+        assert_ne!(child_execution.package_id(), model.receipt().package_id());
         let mut visited = 0_u64;
         let execution = model
             .try_visit_untrusted_final_logits(batches, |batch| {
@@ -2233,6 +2258,97 @@ mod tests {
         assert_eq!(
             relabeled_transcript.claimed_physical_device_id(),
             "cuda:0:GPU-forged"
+        );
+
+        let gate_index = probe_package
+            .tensor_names_encoded_order()
+            .position(|name| name == probe_name)
+            .unwrap();
+        let loaded_identity = Arc::clone(model.runner().identity());
+        assert!(model.apply_salt_v2_scale_updates(&[]).is_err());
+        let unchanged_execution = model
+            .try_visit_untrusted_final_logits(batches, |_| Ok::<_, core::convert::Infallible>(()))
+            .unwrap();
+        assert_eq!(unchanged_execution, execution);
+        model
+            .apply_salt_v2_scale_updates(&[SaltV2ScaleUpdate::new(
+                gate_index,
+                0,
+                0,
+                vec![f16::from_f32(0.875)],
+            )
+            .unwrap()])
+            .unwrap();
+        assert!(!Arc::ptr_eq(&loaded_identity, model.runner().identity()));
+        let mut mutated_observations = 0;
+        let mutated = model.try_visit_untrusted_final_logits(batches, |_| {
+            mutated_observations += 1;
+            Ok::<_, core::convert::Infallible>(())
+        });
+        assert!(
+            matches!(
+                mutated,
+                Err(crate::Qwen35ExecutionVisitError::Runtime(
+                    NnError::Provenance(_)
+                ))
+            ),
+            "changed weights must not emit a transcript naming the loaded package: {mutated:?}"
+        );
+        assert_eq!(mutated_observations, 0);
+
+        for result in [
+            model.try_visit_untrusted_block_outputs(
+                batches,
+                |_| -> Result<(), core::convert::Infallible> {
+                    panic!("stale package blocks must not reach observer")
+                },
+            ),
+            model.try_visit_untrusted_block_outputs_with_states(
+                batches,
+                &[0],
+                |_| Ok::<_, core::convert::Infallible>(()),
+                |_, _, _, _| panic!("stale package must not reach state observer"),
+            ),
+            model.reexecute_untrusted_block_outputs(batches, &block_canonical, |_| {
+                Ok::<_, core::convert::Infallible>(())
+            }),
+            model.reexecute_untrusted_final_logits(
+                batches,
+                &execution.canonical_bytes().unwrap(),
+                |_| Ok::<_, core::convert::Infallible>(()),
+            ),
+            model.try_visit_untrusted_final_logits(
+                core::iter::from_fn(|| -> Option<&[u32]> {
+                    panic!("stale package must be rejected before consuming batches")
+                }),
+                |_| Ok::<_, core::convert::Infallible>(()),
+            ),
+        ] {
+            assert!(matches!(
+                result,
+                Err(crate::Qwen35ExecutionVisitError::Runtime(
+                    NnError::Provenance(_)
+                ))
+            ));
+        }
+
+        // Mutable candidate measurements carry no loaded-package identity.
+        let candidate_scoped = model
+            .try_visit_untrusted_output_scopes(
+                &scope_identity.0,
+                &scope_identity.1,
+                scope_identity.2,
+                &scopes,
+                scoped_batches,
+            )
+            .unwrap();
+        assert_eq!(candidate_scoped.batch_count(), 2);
+        let mut candidate_cache = model.runner().new_cache(4).unwrap();
+        assert!(
+            model
+                .runner()
+                .forward(&[1, 2], &mut candidate_cache)
+                .is_ok()
         );
 
         #[cfg(feature = "cuda")]
