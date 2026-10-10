@@ -27,6 +27,16 @@
 
 set -u
 
+# Git exports repository-local selectors to hooks. They override `git -C` and
+# can make a scratch checkout detach/change the originating checkout instead.
+# Resolve the origin once, clear that inherited context, then anchor root calls.
+repo_root=$(git rev-parse --show-toplevel) || exit 1
+git_context_vars=$(git rev-parse --local-env-vars) || exit 1
+for git_context_var in $git_context_vars; do
+    unset "$git_context_var"
+done
+cd "$repo_root" || exit 1
+
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/tritium-prepush"
 WT="$CACHE/worktree"
 LOCK="$CACHE/lock"
