@@ -34,6 +34,12 @@ npm --prefix packages/tritium-web run check
 git diff --check
 ```
 
+The API comparison requires the external `cargo-semver-checks` contributor
+tool (`cargo install cargo-semver-checks --locked`); it is not a runtime
+dependency. Check availability with `cargo semver-checks --version` before
+starting the full comparison. A missing checker is an unavailable gate, not
+evidence of API compatibility: `check-semver.sh` fails even in report mode.
+
 Run only the applicable subset while iterating, then report every gate you ran,
 every skipped optional dependency or hardware lane, and every remaining blocker.
 GPU, browser, model, package, and deployment claims require receipts from the
