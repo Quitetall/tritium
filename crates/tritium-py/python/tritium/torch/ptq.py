@@ -1012,6 +1012,8 @@ def capture_qwen36_kronecker_evidence(
     exercises selected modules nested under ``language_model`` or ``mtp_model``;
     this is required when those modules are not reached by ``language_model``'s
     own forward. The source checkpoint is admitted before any task is exposed.
+    Every newly captured replay is hashed in canonical batch order and must
+    match ``token_stream_digest`` before its evidence record can be published.
     """
 
     if not isinstance(language_model, nn.Module):
@@ -1022,6 +1024,13 @@ def capture_qwen36_kronecker_evidence(
         raise TypeError("execution_model must be a torch.nn.Module")
     if not callable(data_factory):
         raise TypeError("data_factory must be callable")
+    if not isinstance(token_stream_digest, str):
+        raise ValueError("token_stream_digest must be a SHA-256 digest")
+    expected_token_digest = token_stream_digest.removeprefix("sha256:").lower()
+    if len(expected_token_digest) != 64 or any(
+        byte not in "0123456789abcdef" for byte in expected_token_digest
+    ):
+        raise ValueError("token_stream_digest must be a SHA-256 digest")
     if type(max_shared_modules) is not int or max_shared_modules <= 0:
         raise ValueError("max_shared_modules must be a positive integer")
     if curvature == "guided-fisher":
@@ -1055,16 +1064,32 @@ def capture_qwen36_kronecker_evidence(
         os.fspath(evidence_dir),
         curvature,
         bound_cache_digest,
-        token_stream_digest,
+        expected_token_digest,
         damping,
         max_evidence_bytes=max_evidence_bytes,
     )
+
+    def checked_data_factory(task: Any) -> Iterable[Any]:
+        def replay() -> Iterable[Any]:
+            digest = hashlib.sha256()
+            batches = 0
+            for batches, batch in enumerate(data_factory(task), 1):
+                _hash_value(digest, f"batch[{batches - 1}]", batch)
+                yield batch
+            if batches == 0:
+                raise ValueError("Qwen calibration replay must yield at least one batch")
+            if digest.hexdigest() != expected_token_digest:
+                raise ValueError(
+                    "Qwen calibration batches differ from token_stream_digest"
+                )
+
+        return replay()
 
     def validate_task(task: Any) -> None:
         if (
             task.curvature != curvature
             or task.activation_cache_digest != bound_cache_digest
-            or task.token_stream_digest != token_stream_digest.lower()
+            or task.token_stream_digest != expected_token_digest
             or task.damping != damping
         ):
             raise RuntimeError("native Qwen capture task drifted from the session contract")
@@ -1151,7 +1176,7 @@ def capture_qwen36_kronecker_evidence(
                 writers = [writer_for(item, indexed_output=False) for item, _, _ in grouped]
                 results = capture_kronecker_module_group(
                     target,
-                    data_factory(grouped[0][0]),
+                    checked_data_factory(grouped[0][0]),
                     modules=[path for _, path, _ in grouped],
                     writers=writers,
                     curvature=curvature,
@@ -1169,7 +1194,7 @@ def capture_qwen36_kronecker_evidence(
         capture = capture_kronecker_embedding if indexed_output else capture_kronecker_module
         result = capture(
             target,
-            data_factory(task),
+            checked_data_factory(task),
             module=module_path,
             writer=writer,
             curvature=curvature,
@@ -2277,16 +2302,17 @@ def _scale_group_size(columns: int) -> int:
     return columns
 
 
-def _diagonal_additive_projection(
+def _joint_additive_fit(
     master: torch.Tensor, curvature: torch.Tensor, planes: int
-) -> TernaryProjection:
+) -> tuple[tuple[TernaryPlane, ...], float]:
     if master.ndim != 2 or curvature.ndim != 1 or curvature.numel() != master.shape[1]:
         raise TritiumError(
             "calibration curvature does not match the selected weight",
             code="evidence_geometry_mismatch",
             stage="convert",
         )
-    master_f64 = master.detach().to(dtype=torch.float64, device="cpu")
+    master_cpu = master.detach().to(device="cpu")
+    master_f32 = master_cpu.to(dtype=torch.float32)
     diagonal = curvature.to(dtype=torch.float64, device="cpu")
     mean = diagonal.mean()
     if not bool(torch.isfinite(diagonal).all()) or bool((diagonal < 0).any()):
@@ -2295,105 +2321,107 @@ def _diagonal_additive_projection(
             code="invalid_evidence",
             stage="convert",
         )
-    diagonal = (
-        torch.ones_like(diagonal)
-        if float(mean) == 0.0
-        else diagonal + mean * 1e-4
-    )
+    if float(mean) == 0.0:
+        diagonal = torch.ones_like(diagonal)
     group_size = _scale_group_size(master.shape[1])
     groups = (master.shape[1] + group_size - 1) // group_size
-    grouped_master = master_f64.reshape(master.shape[0], groups, group_size)
+    grouped_master = master_f32.reshape(master.shape[0], groups, group_size)
     grouped_diagonal = diagonal.reshape(groups, group_size)
-    trit_values = []
-    scale_values = []
-    residual = grouped_master
-    for _ in range(planes):
-        initial_scale = (residual.abs() * grouped_diagonal).sum(dim=2)
-        initial_scale = initial_scale / grouped_diagonal.sum(dim=1).clamp_min(
-            torch.finfo(torch.float64).tiny
+    grouped_trits = [
+        torch.empty((master.shape[0], groups, group_size), dtype=torch.int8)
+        for _ in range(planes)
+    ]
+    grouped_scales = [
+        torch.empty((master.shape[0], groups), dtype=torch.float16)
+        for _ in range(planes)
+    ]
+    group_weights = grouped_master.permute(1, 0, 2).contiguous()
+    # Keep grouped coefficients binary across the private native bridge. The
+    # group-major layout lets Rayon schedule rows from every scale group in one
+    # call, while the solver inputs and deterministic per-row order stay fixed.
+    weight_bytes = group_weights.numpy().astype("<f4", copy=False).tobytes(order="C")
+    diagonal_values = grouped_diagonal.contiguous().reshape(-1).tolist()
+    fit_with_objective = getattr(
+        _tritium, "_fit_joint_ternary_diagonal_groups_with_objective", None
+    )
+    if fit_with_objective is None:
+        # Source checkouts can temporarily pair this Python module with the
+        # previously built extension. Keep that development path functional;
+        # freshly built wheels use the objective-returning native entrypoint.
+        scales_by_group, plane_trits = _tritium.fit_joint_ternary_diagonal_groups(
+            weight_bytes,
+            master.shape[0],
+            groups,
+            group_size,
+            diagonal_values,
+            planes,
+            16,
+            1e-8,
+            4,
+            1e6,
+            "f16",
+            True,
+            True,
         )
-        nonzero_scale = initial_scale.clamp_min(torch.finfo(torch.float64).tiny)
+        objective = None
+    else:
+        scales_by_group, plane_trits, objective = fit_with_objective(
+            weight_bytes,
+            master.shape[0],
+            groups,
+            group_size,
+            diagonal_values,
+            planes,
+            16,
+            1e-8,
+            4,
+            1e6,
+            "f16",
+            True,
+            True,
+        )
+    scale_values = torch.tensor(scales_by_group, dtype=torch.float16).permute(2, 1, 0)
+    for plane in range(planes):
         trits = (
-            (residual / nonzero_scale.unsqueeze(-1))
-            .round()
-            .clamp(-1, 1)
-            .to(torch.int8)
+            torch.frombuffer(bytearray(plane_trits[plane]), dtype=torch.int8)
+            .reshape(groups, master.shape[0], group_size)
+            .permute(1, 0, 2)
         )
-        trits_f64 = trits.to(torch.float64)
-        denominator = (trits_f64.square() * grouped_diagonal).sum(dim=2)
-        numerator = (residual * trits_f64 * grouped_diagonal).sum(dim=2)
-        scale = torch.where(
-            denominator > 0,
-            numerator / denominator.clamp_min(torch.finfo(torch.float64).tiny),
-            torch.zeros_like(numerator),
-        ).clamp_min(0)
-        trit_values.append(trits)
-        stored_scale = (
-            scale.to(torch.float16).to(torch.float64)
-            if group_size == master.shape[1]
-            else scale
-        )
-        scale_values.append(stored_scale)
-        residual = residual - trits_f64 * stored_scale.unsqueeze(-1)
-
-    # Greedy residual fitting is deterministic and cheap, but coordinate
-    # refinement closes much of its additive-plane error without changing the
-    # export contract. Keep all updates in FP64; round to stored FP16 only at
-    # the final receipt boundary.
-    if group_size < master.shape[1]:
-        for _ in range(20):
-            for index in range(planes):
-                decoded_without = torch.zeros_like(grouped_master)
-                for other, (other_trits, other_scale) in enumerate(
-                    zip(trit_values, scale_values)
-                ):
-                    if other != index:
-                        decoded_without = (
-                            decoded_without
-                            + other_trits.to(torch.float64) * other_scale.unsqueeze(-1)
-                        )
-                residual_without = grouped_master - decoded_without
-                current_scale = scale_values[index].clamp_min(
-                    torch.finfo(torch.float64).tiny
-                )
-                trits = (
-                    (residual_without / current_scale.unsqueeze(-1))
-                    .round()
-                    .clamp(-1, 1)
-                    .to(torch.int8)
-                )
-                trits_f64 = trits.to(torch.float64)
-                denominator = (trits_f64.square() * grouped_diagonal).sum(dim=2)
-                numerator = (residual_without * trits_f64 * grouped_diagonal).sum(
-                    dim=2
-                )
-                scale = torch.where(
-                    denominator > 0,
-                    numerator
-                    / denominator.clamp_min(torch.finfo(torch.float64).tiny),
-                    torch.zeros_like(numerator),
-                ).clamp_min(0)
-                trit_values[index] = trits
-                scale_values[index] = scale
+        grouped_trits[plane].copy_(trits)
+        grouped_scales[plane].copy_(scale_values[plane])
 
     fitted_planes = [
         TernaryPlane(
-            trits=trits.reshape_as(master),
-            scales=scale.to(torch.float16),
+            trits=trits.reshape_as(master_cpu),
+            scales=scales,
             group_size=group_size,
         )
-        for trits, scale in zip(trit_values, scale_values)
+        for trits, scales in zip(grouped_trits, grouped_scales)
     ]
-    decoded = torch.zeros_like(master_f64)
-    for plane in fitted_planes:
-        stored_scale_f64 = expand_plane_scales(
-            plane.scales,
-            rows=master.shape[0],
-            columns=master.shape[1],
-            group_size=group_size,
-        ).to(torch.float64)
-        decoded = decoded + plane.trits.to(torch.float64) * stored_scale_f64
-    dense = torch.zeros_like(master, device="cpu")
+    if objective is None:
+        dense = torch.zeros_like(master_cpu)
+        for plane in fitted_planes:
+            dense = dense + plane.trits.to(master.dtype) * expand_plane_scales(
+                plane.scales,
+                rows=master.shape[0],
+                columns=master.shape[1],
+                group_size=plane.group_size,
+            ).to(master.dtype)
+        error = (
+            master_cpu.to(torch.float64) - dense.to(torch.float64)
+        ).square()
+        objective = float(
+            (error * curvature.detach().to(device="cpu", dtype=torch.float64)).sum()
+        )
+    return tuple(fitted_planes), float(objective) if float(mean) > 0.0 else 0.0
+
+
+def _joint_additive_projection(
+    master: torch.Tensor, curvature: torch.Tensor, planes: int
+) -> TernaryProjection:
+    fitted_planes, _objective = _joint_additive_fit(master, curvature, planes)
+    master_cpu = master.detach().to(device="cpu")
+    dense = torch.zeros_like(master_cpu)
     for plane in fitted_planes:
         dense = dense + plane.trits.to(master.dtype) * expand_plane_scales(
             plane.scales,
@@ -2403,8 +2431,8 @@ def _diagonal_additive_projection(
         ).to(master.dtype)
     projection = TernaryProjection(
         dense=dense,
-        planes=tuple(fitted_planes),
-        algorithm_id=_diagonal_algorithm_id(planes),
+        planes=fitted_planes,
+        algorithm_id=_joint_algorithm_id(planes),
         schema_version=1,
     )
     validate_projection(
@@ -2416,14 +2444,14 @@ def _diagonal_additive_projection(
     return projection
 
 
-def _diagonal_algorithm_id(planes: int) -> str:
-    return f"tritium.diagonal-additive-{planes}@1"
+def _joint_algorithm_id(planes: int) -> str:
+    return f"tritium.salt-v2-joint-diagonal-catq-relays-{planes}@1"
 
 
-def _adaptive_diagonal_algorithm_id() -> str:
+def _adaptive_joint_algorithm_id() -> str:
     """Identity for measured weight-level rate-distortion allocation."""
 
-    return "tritium.diagonal-additive-adaptive@1"
+    return "tritium.salt-v2-joint-diagonal-catq-relays-adaptive@1"
 
 
 def _fit_module(
@@ -2520,9 +2548,9 @@ def _fit_module(
             )
     adaptive = prepared.config.target_bpw is not None
     algorithm_id = (
-        _adaptive_diagonal_algorithm_id()
+        _adaptive_joint_algorithm_id()
         if adaptive
-        else _diagonal_algorithm_id(prepared.config.planes)
+        else _joint_algorithm_id(prepared.config.planes)
     )
     recipe_id = module_recipe_id(
         source_digest,
@@ -2586,7 +2614,7 @@ def _fit_module(
                 (dense.square() * grouped_curvature).sum()
             )
             for planes in range(1, prepared.config.planes + 1):
-                projection = _diagonal_additive_projection(
+                projection = _joint_additive_projection(
                     master_chunk, objective_curvature, planes
                 )
                 error = (
@@ -2631,15 +2659,11 @@ def _fit_module(
         for start in range(0, master.shape[0], rows_per_chunk):
             stop = min(master.shape[0], start + rows_per_chunk)
             master_chunk = master[start:stop]
-            projection = _diagonal_additive_projection(
+            fitted_planes, chunk_objective = _joint_additive_fit(
                 master_chunk, curvature, writer.plane_count
             )
-            error = (
-                master_chunk.detach().cpu().to(torch.float64)
-                - projection.dense.to(torch.float64)
-            ).square()
-            weighted_error += float((error * curvature).sum())
-            writer.append(projection.planes)
+            weighted_error += chunk_objective
+            writer.append(fitted_planes)
         denominator = curvature.sum().clamp_min(1e-30) * master.shape[0]
         return weighted_error / float(denominator)
 
@@ -2887,6 +2911,8 @@ def convert(
     *,
     revision: Optional[str] = None,
     work_dir: Optional[Pathish] = None,
+    source_admission_receipt: Optional[Pathish] = None,
+    official_identity_receipt: Optional[Pathish] = None,
     output_dir: Optional[Pathish] = None,
     compact_max_bytes: Optional[int] = None,
     compact_max_resident_bytes: Optional[int] = None,
@@ -2905,6 +2931,8 @@ def convert(
         supplied = {
             "revision": revision,
             "work_dir": work_dir,
+            "source_admission_receipt": source_admission_receipt,
+            "official_identity_receipt": official_identity_receipt,
             "output_dir": output_dir,
             "compact_max_bytes": compact_max_bytes,
             "compact_max_resident_bytes": compact_max_resident_bytes,
@@ -2931,6 +2959,8 @@ def convert(
             raise TypeError("live-module convert requires work_dir")
         qwen_arguments = {
             "revision": revision,
+            "source_admission_receipt": source_admission_receipt,
+            "official_identity_receipt": official_identity_receipt,
             "output_dir": output_dir,
             "compact_max_bytes": compact_max_bytes,
             "compact_max_resident_bytes": compact_max_resident_bytes,
@@ -2969,6 +2999,8 @@ def convert(
     required = {
         "revision": revision,
         "work_dir": work_dir,
+        "source_admission_receipt": source_admission_receipt,
+        "official_identity_receipt": official_identity_receipt,
         "output_dir": output_dir,
         "compact_max_bytes": compact_max_bytes,
         "compact_max_resident_bytes": compact_max_resident_bytes,
@@ -2995,6 +3027,8 @@ def convert(
         prepared.model,
         revision=revision,
         work_dir=work_dir,
+        source_admission_receipt=source_admission_receipt,
+        official_identity_receipt=official_identity_receipt,
         evidence_dir=calibration.evidence_dir,
         output_dir=output_dir,
         compact_max_bytes=compact_max_bytes,
@@ -3013,6 +3047,8 @@ def quantize(
     *,
     revision: str,
     work_dir: Pathish,
+    source_admission_receipt: Pathish,
+    official_identity_receipt: Pathish,
     evidence_dir: Pathish,
     output_dir: Pathish,
     compact_max_bytes: int,
@@ -3035,6 +3071,8 @@ def quantize(
         calibration,
         revision=revision,
         work_dir=work_dir,
+        source_admission_receipt=source_admission_receipt,
+        official_identity_receipt=official_identity_receipt,
         output_dir=output_dir,
         compact_max_bytes=compact_max_bytes,
         compact_max_resident_bytes=compact_max_resident_bytes,

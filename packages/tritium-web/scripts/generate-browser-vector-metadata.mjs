@@ -15,9 +15,7 @@ const generated = `${JSON.stringify(metadata, null, 2)}\n`;
 if (process.argv.includes("--check")) {
   const current = await readFile(outputPath, "utf8").catch(() => "");
   if (current !== generated) {
-    throw new Error(
-      "browser vector metadata is stale; run npm run generate:browser-vectors",
-    );
+    throw new Error("browser vector metadata is stale; run npm run generate:browser-vectors");
   }
 } else {
   await writeFile(outputPath, generated);

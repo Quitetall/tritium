@@ -21,6 +21,7 @@ mod frontier_v3;
 mod pipeline;
 mod qwen36_preflight;
 mod qwen36_source_admission;
+mod qwen36_source_identity;
 mod qwen36_tensor_work;
 mod stage7_evidence;
 mod tensor_work_store;
@@ -56,6 +57,7 @@ pub use qwen36_source_admission::{
     Qwen36AdmissionError, Qwen36AdmissionReceipt, Qwen36AdmittedSource, Qwen36LanguageCoverage,
     Qwen36SourceProof, Qwen36SourceProofError,
 };
+pub use qwen36_source_identity::{Qwen36SourceIdentityAuthorization, Qwen36SourceIdentityError};
 // Admission/execution symbols are unix-only (see qwen36_tensor_work).
 pub use qwen36_tensor_work::{
     Qwen36AdditiveCampaignSpec, Qwen36AdditiveCampaignStore, Qwen36AdditiveInstallError,
@@ -78,10 +80,11 @@ pub use qwen36_tensor_work::{
     Qwen36AdmittedExecutionReceipt, Qwen36AdmittedExecutionSession, Qwen36ExecutionBackend,
     Qwen36ExecutionReplayError, Qwen36ExecutionSessionOpenError, Qwen36ExecutionVisitError,
     Qwen36FinalLogitsOutputBindingError, Qwen36FinalLogitsOutputBindingReceipt,
-    Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt, Qwen36PackageAdmittedCampaignStore,
-    Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger, Qwen36PackageScaleOnlyCampaignStore,
-    Qwen36PackageVisitError, Qwen36PtqPackageError, Qwen36PtqPackagesReceipt,
-    Qwen36PvParentContext, reconcile_qwen36_ptq_packages,
+    Qwen36OutputScopeBindingReceipt, Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt,
+    Qwen36PackageAdmittedCampaignStore, Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger,
+    Qwen36PackageScaleOnlyCampaignStore, Qwen36PackageVisitError, Qwen36PtqPackageError,
+    Qwen36PtqPackagesReceipt, Qwen36PvParentContext, Qwen36RefinedCandidateExecutionReceipt,
+    Qwen36RefinedCandidateReplay, Qwen36ScaleRefitWindowError, reconcile_qwen36_ptq_packages,
 };
 #[cfg(all(unix, feature = "cuda"))]
 pub use qwen36_tensor_work::{

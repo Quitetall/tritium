@@ -2,3 +2,7 @@
 # bytes of committed fixtures (oracle manifests, generator scripts, conformance
 # vectors); autocrlf checkouts on windows would silently change those bytes.
 * -text
+
+# Python's CSV writer emits CRLF. Preserve hash-bound experiment tables verbatim
+# while continuing to check actual trailing spaces and tabs.
+docs/experiments/eat-o/*/runs.csv whitespace=cr-at-eol

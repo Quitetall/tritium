@@ -15,13 +15,16 @@ use serde::Deserialize;
 use tritium_format::{
     PackageHasher, SafeTensorsReader,
     salt_v2::SaltV2Codec,
-    salt_v2_package::{SaltV2PackageReader, SaltV2Transform},
+    salt_v2_package::{
+        SaltV2PackageReader, SaltV2ScaleUpdate, SaltV2ScaleUpdateChild, SaltV2Transform,
+    },
 };
 use tritium_spec::TernaryBackend;
 
 use crate::NnError;
 use crate::QWEN36_27B_REVISION;
 use crate::layers::{HostSaltV2Linear, Projection, TokenEmbedding};
+use crate::model::qwen35::RunnerIdentity;
 use crate::model::qwen35_hf::{
     Qwen35HfTensorSource, TensorRole, TensorSpec, language_schema, load_language_weights,
     load_mtp_weights, mtp_schema,
@@ -118,6 +121,9 @@ pub struct Qwen35SaltV2LoadReceipt {
     declared_official_payload_authenticated: bool,
     config_package_id: String,
     package_id: String,
+    parent_package_id: Option<String>,
+    scale_update_set_digest: Option<[u8; 32]>,
+    scale_update_lineage_id: Option<[u8; 32]>,
     preserved_package_id: String,
     codec: SaltV2Codec,
     matrix_tensors: usize,
@@ -201,6 +207,24 @@ impl Qwen35SaltV2LoadReceipt {
     #[must_use]
     pub fn package_id(&self) -> &str {
         &self.package_id
+    }
+
+    /// Parent SALT package identity when this load executed an immutable child.
+    #[must_use]
+    pub fn parent_package_id(&self) -> Option<&str> {
+        self.parent_package_id.as_deref()
+    }
+
+    /// Canonical update-set identity for an immutable scale-update child.
+    #[must_use]
+    pub const fn scale_update_set_digest(&self) -> Option<&[u8; 32]> {
+        self.scale_update_set_digest.as_ref()
+    }
+
+    /// Lineage identity binding the parent, update set, and child package.
+    #[must_use]
+    pub const fn scale_update_lineage_id(&self) -> Option<&[u8; 32]> {
+        self.scale_update_lineage_id.as_ref()
     }
 
     /// Exact-byte identity of the preserved safetensors companion.
@@ -506,6 +530,7 @@ impl Qwen35SaltV2BundleAdmission {
 pub struct Qwen35SaltV2LanguageMtpModel {
     config: Qwen35CheckpointConfig,
     runner: Qwen35TextRunner,
+    loaded_runner_identity: Arc<RunnerIdentity>,
     mtp: UnverifiedQwen35Mtp,
     receipt: Qwen35SaltV2LoadReceipt,
     tokenizer_json: Vec<u8>,
@@ -513,6 +538,25 @@ pub struct Qwen35SaltV2LanguageMtpModel {
 }
 
 impl Qwen35SaltV2LanguageMtpModel {
+    /// Apply one fitted scale-only candidate to a uniquely identified host or
+    /// CUDA projection in the loaded language graph. MTP weights remain outside this
+    /// operation until their execution and update contract is verified.
+    /// Success invalidates existing language caches/outputs and the previous MTP
+    /// target binding. Reload an immutable child to reassemble target and MTP
+    /// together; the load receipt does not qualify an in-place mutated candidate.
+    /// Package-bound execution transcripts are rejected after success; ordinary
+    /// fresh-cache inference and untrusted candidate scopes remain available.
+    ///
+    /// # Errors
+    /// Returns an error if tensor identity is absent or ambiguous, resident
+    /// storage is shared, or candidate scales are invalid.
+    pub fn apply_salt_v2_scale_updates(
+        &mut self,
+        updates: &[SaltV2ScaleUpdate],
+    ) -> Result<(), NnError> {
+        self.runner.apply_salt_v2_scale_updates(updates)
+    }
+
     /// Load one profile package from an exported bundle directory.
     ///
     /// The caller selects `compact-v1` or `near-lossless-v1`; all filenames,
@@ -529,7 +573,31 @@ impl Qwen35SaltV2LanguageMtpModel {
         profile: &str,
         backend: Box<dyn TernaryBackend>,
     ) -> Result<Self, NnError> {
-        Self::load_bundle_profile_with_policy(bundle_dir, profile, backend, true)
+        Self::load_bundle_profile_with_policy(bundle_dir, profile, backend, true, None)
+    }
+
+    /// Load an immutable scale-update child package against the exact parent
+    /// profile named by the bundle manifest. The child must preserve the
+    /// parent's codec and physical-byte ledgers, and its lineage must bind the
+    /// parent and child package IDs.
+    ///
+    /// The bundle manifest remains the authority for model identity and
+    /// preserved tensors; the returned load receipt identifies the child as
+    /// the package actually used for execution.
+    pub fn load_bundle_scale_update_child(
+        bundle_dir: &Path,
+        profile: &str,
+        child_package_path: &Path,
+        lineage: SaltV2ScaleUpdateChild,
+        backend: Box<dyn TernaryBackend>,
+    ) -> Result<Self, NnError> {
+        Self::load_bundle_profile_with_policy(
+            bundle_dir,
+            profile,
+            backend,
+            true,
+            Some((child_package_path, lineage)),
+        )
     }
 
     /// Load a small non-pinned bundle for cross-crate integration tests.
@@ -540,14 +608,33 @@ impl Qwen35SaltV2LanguageMtpModel {
     /// # Errors
     /// Returns the same structural, provenance, geometry, and backend errors as
     /// [`Self::load_bundle_profile`].
-    #[cfg(feature = "test-fixtures")]
+    #[cfg(any(test, feature = "test-fixtures"))]
     #[doc(hidden)]
     pub fn load_bundle_profile_test_fixture(
         bundle_dir: &Path,
         profile: &str,
         backend: Box<dyn TernaryBackend>,
     ) -> Result<Self, NnError> {
-        Self::load_bundle_profile_with_policy(bundle_dir, profile, backend, false)
+        Self::load_bundle_profile_with_policy(bundle_dir, profile, backend, false, None)
+    }
+
+    /// Fixture-only counterpart of [`Self::load_bundle_scale_update_child`].
+    #[cfg(any(test, feature = "test-fixtures"))]
+    #[doc(hidden)]
+    pub fn load_bundle_scale_update_child_test_fixture(
+        bundle_dir: &Path,
+        profile: &str,
+        child_package_path: &Path,
+        lineage: SaltV2ScaleUpdateChild,
+        backend: Box<dyn TernaryBackend>,
+    ) -> Result<Self, NnError> {
+        Self::load_bundle_profile_with_policy(
+            bundle_dir,
+            profile,
+            backend,
+            false,
+            Some((child_package_path, lineage)),
+        )
     }
 
     fn load_bundle_profile_with_policy(
@@ -555,6 +642,7 @@ impl Qwen35SaltV2LanguageMtpModel {
         profile: &str,
         backend: Box<dyn TernaryBackend>,
         require_pinned_config: bool,
+        child: Option<(&Path, SaltV2ScaleUpdateChild)>,
     ) -> Result<Self, NnError> {
         if !matches!(profile, "compact-v1" | "near-lossless-v1") {
             return Err(NnError::InvalidArtifact(
@@ -583,8 +671,61 @@ impl Qwen35SaltV2LanguageMtpModel {
         if require_pinned_config {
             config.validate_pinned_qwen36_27b(&manifest.source_revision)?;
         }
-        let package_path = bundle_dir.join(&profile_manifest.file);
-        let package_file = open_regular(&package_path, "SALT V2 profile")?;
+        let parent_package_file =
+            open_regular(&bundle_dir.join(&profile_manifest.file), "SALT V2 profile")?;
+        let parent_package = SaltV2PackageReader::new_strict(parent_package_file)
+            .map_err(|error| NnError::InvalidArtifact(format!("open SALT V2 profile: {error}")))?;
+        if parent_package.package_id().to_string() != profile_manifest.package_id {
+            return Err(NnError::Provenance(
+                "SALT V2 parent profile identity differs from manifest".into(),
+            ));
+        }
+        let parent_ledger = parent_package.ledger();
+        let parent_runtime_ledger = parent_package
+            .indexed_runtime_ledger()
+            .map_err(|error| NnError::InvalidArtifact(error.to_string()))?;
+        if parent_ledger.total_bytes != profile_manifest.serialized_bytes
+            || parent_runtime_ledger.steady_resident_bytes() != profile_manifest.resident_bytes
+            || codec_name(parent_package.codec()) != manifest.packing
+        {
+            return Err(NnError::Provenance(
+                "SALT V2 profile codec or physical ledger differs from manifest".into(),
+            ));
+        }
+        let expected_loaded_package_id = child.map_or_else(
+            || profile_manifest.package_id.clone(),
+            |(_, lineage)| lineage.child_package_id().to_string(),
+        );
+        let child_lineage = child.map(|(_, lineage)| lineage);
+        let (package, package_ledger, runtime_ledger) = if let Some((child_path, lineage)) = child {
+            if lineage.parent_package_id().to_string() != profile_manifest.package_id {
+                return Err(NnError::Provenance(
+                    "scale-update child lineage names a different parent profile".into(),
+                ));
+            }
+            let child_file = open_regular(child_path, "SALT V2 scale-update child")?;
+            let child_package = SaltV2PackageReader::new_strict(child_file).map_err(|error| {
+                NnError::InvalidArtifact(format!("open SALT V2 scale-update child: {error}"))
+            })?;
+            let child_ledger = child_package.ledger();
+            let child_runtime_ledger = child_package
+                .indexed_runtime_ledger()
+                .map_err(|error| NnError::InvalidArtifact(error.to_string()))?;
+            if child_package.package_id() != lineage.child_package_id()
+                || child_package.package_id() == parent_package.package_id()
+                || child_ledger.total_bytes != parent_ledger.total_bytes
+                || child_runtime_ledger.steady_resident_bytes()
+                    != parent_runtime_ledger.steady_resident_bytes()
+                || codec_name(child_package.codec()) != manifest.packing
+            {
+                return Err(NnError::Provenance(
+                    "scale-update child identity, codec, or physical ledger is invalid".into(),
+                ));
+            }
+            (child_package, child_ledger, child_runtime_ledger)
+        } else {
+            (parent_package, parent_ledger, parent_runtime_ledger)
+        };
         let preserved_bytes = read_regular(
             &bundle_dir.join(&manifest.preserved.file),
             MAX_PRESERVED_BYTES,
@@ -602,13 +743,7 @@ impl Qwen35SaltV2LanguageMtpModel {
                 "preserved tensor identity differs from bundle manifest".into(),
             ));
         }
-        let package = SaltV2PackageReader::new_strict(package_file)
-            .map_err(|error| NnError::InvalidArtifact(format!("open SALT V2 profile: {error}")))?;
-        let package_ledger = package.ledger();
-        let runtime_ledger = package
-            .indexed_runtime_ledger()
-            .map_err(|error| NnError::InvalidArtifact(error.to_string()))?;
-        if package.package_id().to_string() != profile_manifest.package_id
+        if package.package_id().to_string() != expected_loaded_package_id
             || package_ledger.total_bytes != profile_manifest.serialized_bytes
             || runtime_ledger.steady_resident_bytes() != profile_manifest.resident_bytes
             || codec_name(package.codec()) != manifest.packing
@@ -667,6 +802,7 @@ impl Qwen35SaltV2LanguageMtpModel {
             })?;
         Ok(Self {
             config,
+            loaded_runner_identity: Arc::clone(runner.identity()),
             runner,
             mtp,
             receipt: Qwen35SaltV2LoadReceipt {
@@ -682,6 +818,10 @@ impl Qwen35SaltV2LanguageMtpModel {
                 declared_official_payload_authenticated: manifest.official_payload_authenticated,
                 config_package_id,
                 package_id,
+                parent_package_id: child_lineage
+                    .map(|lineage| lineage.parent_package_id().to_string()),
+                scale_update_set_digest: child_lineage.map(|lineage| lineage.update_set_digest()),
+                scale_update_lineage_id: child_lineage.map(|lineage| lineage.lineage_id()),
                 preserved_package_id,
                 codec,
                 matrix_tensors,
@@ -711,12 +851,24 @@ impl Qwen35SaltV2LanguageMtpModel {
         &self.runner
     }
 
+    pub(crate) fn require_loaded_weight_state(&self) -> Result<(), NnError> {
+        if !Arc::ptr_eq(self.runner.identity(), &self.loaded_runner_identity) {
+            return Err(NnError::Provenance(
+                "Qwen execution weights no longer match the loaded package; reload an immutable child"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub const fn mtp(&self) -> &UnverifiedQwen35Mtp {
         &self.mtp
     }
 
     #[must_use]
+    /// Historical receipt for the package loaded at assembly, not a claim about
+    /// any later in-place mutation.
     pub const fn receipt(&self) -> &Qwen35SaltV2LoadReceipt {
         &self.receipt
     }
@@ -1247,7 +1399,8 @@ mod tests {
     use tritium_format::{
         PackageId,
         salt_v2_package::{
-            SaltV2Package, SaltV2Plane, SaltV2Tensor, SaltV2Tile, write_salt_v2_package,
+            SaltV2Package, SaltV2Plane, SaltV2ScaleUpdate, SaltV2Tensor, SaltV2Tile,
+            write_salt_v2_package, write_salt_v2_scale_update_child,
         },
     };
     use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, GemmShape, MpGemm, TernaryFormat};
@@ -1424,7 +1577,16 @@ mod tests {
         let mut preserved = BTreeMap::new();
         for (name, spec) in &schema {
             match spec.role {
-                TensorRole::Matrix => matrices.push(zero_matrix(name, &spec.shape)),
+                TensorRole::Matrix => matrices.push(
+                    if matches!(
+                        name.as_str(),
+                        "mtp.fc.weight" | "model.language_model.embed_tokens.weight"
+                    ) {
+                        signal_matrix(name, &spec.shape)
+                    } else {
+                        zero_matrix(name, &spec.shape)
+                    },
+                ),
                 TensorRole::Preserved => {
                     preserved.insert(name.clone(), spec.shape.clone());
                 }
@@ -1436,7 +1598,7 @@ mod tests {
         let profile_id = PackageId::from_package_bytes(&encoded.bytes).to_string();
         fs::write(files.directory.join("compact.tsalt2"), &encoded.bytes).unwrap();
         fs::write(files.directory.join("near-lossless.tsalt2"), &encoded.bytes).unwrap();
-        let preserved_bytes = zero_bf16_safetensors(&preserved);
+        let preserved_bytes = signal_bf16_safetensors(&preserved);
         let preserved_id = PackageId::from_package_bytes(&preserved_bytes).to_string();
         let preserved_payload_bytes = safetensors_payload_bytes(&preserved_bytes).unwrap();
         let preserved_serialized_bytes = preserved_bytes.len() as u64;
@@ -1526,14 +1688,15 @@ mod tests {
         assert_eq!(admission.salt_resident_bytes(), package_resident_bytes);
         assert!(admission.preserved_fp32_bytes() > 0);
 
-        let model = Qwen35SaltV2LanguageMtpModel::load_bundle_profile_with_policy(
+        let mut model = Qwen35SaltV2LanguageMtpModel::load_bundle_profile_with_policy(
             &files.directory,
             "compact-v1",
             Box::new(tritium_cpu::CpuBackend::new()),
             false,
+            None,
         )
         .unwrap();
-        let receipt = model.receipt();
+        let receipt = model.receipt().clone();
         assert_eq!(receipt.profile(), "compact-v1");
         assert_eq!(receipt.declared_completion_id(), "test-completion");
         assert_eq!(receipt.declared_campaign_id(), "test-campaign");
@@ -1565,13 +1728,248 @@ mod tests {
                 + preserved_serialized_bytes
         );
 
+        let mut parent_package = SaltV2PackageReader::new_strict(
+            File::open(files.directory.join("compact.tsalt2")).unwrap(),
+        )
+        .unwrap();
+        let mtp_fc_index = parent_package
+            .tensor_names_encoded_order()
+            .position(|name| name == "mtp.fc.weight")
+            .expect("MTP fusion projection is in package order");
+        let child_update =
+            SaltV2ScaleUpdate::new(mtp_fc_index, 0, 0, vec![f16::from_f32(1.0)]).unwrap();
+        let (child_output, child_lineage) = write_salt_v2_scale_update_child(
+            &mut parent_package,
+            std::io::Cursor::new(Vec::new()),
+            std::slice::from_ref(&child_update),
+        )
+        .unwrap();
+        let child_path = files.directory.join("scale-child.tsalt2");
+        fs::write(&child_path, child_output.into_inner()).unwrap();
+        let child_model =
+            Qwen35SaltV2LanguageMtpModel::load_bundle_scale_update_child_test_fixture(
+                &files.directory,
+                "compact-v1",
+                &child_path,
+                child_lineage,
+                Box::new(tritium_cpu::CpuBackend::new()),
+            )
+            .unwrap();
+        let mut parent_target_cache = model.runner().new_cache(4).unwrap();
+        let parent_target = model
+            .runner()
+            .forward(&[1, 2], &mut parent_target_cache)
+            .unwrap();
+        let parent_draft = model.mtp().draft_only_runner();
+        let mut parent_draft_cache = parent_draft.new_cache(4).unwrap();
+        let parent_draft_output = parent_draft
+            .forward(model.runner(), &parent_target, 1, &mut parent_draft_cache)
+            .unwrap();
+        let mut child_target_cache = child_model.runner().new_cache(4).unwrap();
+        let child_target = child_model
+            .runner()
+            .forward(&[1, 2], &mut child_target_cache)
+            .unwrap();
+        let child_draft = child_model.mtp().draft_only_runner();
+        let mut child_draft_cache = child_draft.new_cache(4).unwrap();
+        let child_draft_output = child_draft
+            .forward(
+                child_model.runner(),
+                &child_target,
+                1,
+                &mut child_draft_cache,
+            )
+            .unwrap();
+        assert_ne!(
+            child_draft_output.final_hidden_states(),
+            parent_draft_output.final_hidden_states(),
+            "an immutable MTP scale-update child must affect draft-only output"
+        );
+        assert_eq!(
+            child_model.receipt().package_id(),
+            child_lineage.child_package_id().to_string()
+        );
+        let parent_package_id = child_lineage.parent_package_id().to_string();
+        assert_eq!(
+            child_model.receipt().parent_package_id(),
+            Some(parent_package_id.as_str())
+        );
+        assert_eq!(
+            child_model.receipt().scale_update_set_digest(),
+            Some(&child_lineage.update_set_digest())
+        );
+        assert_eq!(
+            child_model.receipt().scale_update_lineage_id(),
+            Some(&child_lineage.lineage_id())
+        );
+        assert_eq!(
+            child_model.receipt().manifest_package_id(),
+            receipt.manifest_package_id()
+        );
+        assert_eq!(
+            child_model.receipt().serialized_bytes(),
+            package_serialized_bytes
+        );
+        assert_eq!(
+            child_model.receipt().preserved_package_id(),
+            receipt.preserved_package_id()
+        );
+        let mut mutated_child = fs::read(&child_path).unwrap();
+        let mutation_index = mutated_child.len() / 2;
+        mutated_child[mutation_index] ^= 1;
+        let mutated_child_path = files.directory.join("mutated-scale-child.tsalt2");
+        fs::write(&mutated_child_path, mutated_child).unwrap();
+        assert!(
+            Qwen35SaltV2LanguageMtpModel::load_bundle_scale_update_child_test_fixture(
+                &files.directory,
+                "compact-v1",
+                &mutated_child_path,
+                child_lineage,
+                Box::new(tritium_cpu::CpuBackend::new()),
+            )
+            .is_err()
+        );
+
+        let mut original_parent = SaltV2PackageReader::new_strict(
+            File::open(files.directory.join("compact.tsalt2")).unwrap(),
+        )
+        .unwrap();
+        let (intermediate_child, _) = write_salt_v2_scale_update_child(
+            &mut original_parent,
+            std::io::Cursor::new(Vec::new()),
+            std::slice::from_ref(&child_update),
+        )
+        .unwrap();
+        let mut other_parent =
+            SaltV2PackageReader::new_strict(std::io::Cursor::new(intermediate_child.into_inner()))
+                .unwrap();
+        let (other_child, other_lineage) = write_salt_v2_scale_update_child(
+            &mut other_parent,
+            std::io::Cursor::new(Vec::new()),
+            &[SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::from_f32(0.875)]).unwrap()],
+        )
+        .unwrap();
+        let other_child_path = files.directory.join("other-parent-scale-child.tsalt2");
+        fs::write(&other_child_path, other_child.into_inner()).unwrap();
+        assert!(matches!(
+            Qwen35SaltV2LanguageMtpModel::load_bundle_scale_update_child_test_fixture(
+                &files.directory,
+                "compact-v1",
+                &other_child_path,
+                other_lineage,
+                Box::new(tritium_cpu::CpuBackend::new()),
+            ),
+            Err(NnError::Provenance(_))
+        ));
+
         let mut cache = model.runner().new_cache(4).unwrap();
         let output = model.runner().forward(&[1, 2], &mut cache).unwrap();
         assert_eq!(output.last_logits(), &[0.0; 7]);
         assert_eq!(cache.len(), 2);
         assert!(!model.mtp().status().reason().is_empty());
 
+        let probe_name = "model.language_model.layers.0.mlp.gate_proj.weight";
+        assert!(schema.contains_key(probe_name));
+        let mut projected_rows = 0;
+        let teacher = Projection::Dense(
+            crate::layers::DenseLinear::new_exact(
+                vec![
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                ],
+                6,
+                4,
+            )
+            .unwrap(),
+        );
+        model
+            .runner()
+            .visit_named_projection_output_pairs(
+                probe_name,
+                &teacher,
+                &[1.0, 2.0, 3.0, 4.0],
+                1,
+                |teacher, current| {
+                    assert_eq!(teacher, &[1.0, 2.0, 3.0, 4.0, 0.0, 0.0]);
+                    assert_eq!(current, &[0.0; 6]);
+                    projected_rows += 1;
+                },
+            )
+            .unwrap();
+        assert_eq!(projected_rows, 1);
+        let a8_teacher =
+            Projection::Dense(crate::layers::DenseLinear::new(vec![0.0; 24], 6, 4).unwrap());
+        assert!(matches!(
+            model.runner().visit_named_projection_output_pairs(
+                probe_name,
+                &a8_teacher,
+                &[1.0; 4],
+                1,
+                |_, _| panic!("mismatched arithmetic must not reach observer"),
+            ),
+            Err(NnError::Backend(_))
+        ));
+        let mut probe_package = SaltV2PackageReader::new_strict(
+            File::open(files.directory.join("compact.tsalt2")).unwrap(),
+        )
+        .unwrap();
+        let replacement =
+            Arc::new(HostSaltV2Linear::from_reader(&mut probe_package, probe_name).unwrap());
+        let mut paired_positions = Vec::new();
+        let paired_sequences = [&[1_u32, 2][..], &[3_u32, 4][..]];
+        let paired_count = model
+            .runner
+            .visit_projection_probe_pairs(
+                probe_name,
+                Projection::HostSaltV2(Arc::clone(&replacement)),
+                paired_sequences,
+                &[1, 2],
+                0,
+                |sample| {
+                    assert_eq!(sample.sequence_index, (paired_positions.len() / 2) as u64);
+                    assert_eq!(sample.token_position, paired_positions.len() % 2 + 1);
+                    assert_eq!(sample.reference_hidden, sample.candidate_hidden);
+                    assert_eq!(sample.reference_state, sample.candidate_state);
+                    paired_positions.push((sample.sequence_index, sample.token_position));
+                    Ok::<_, core::convert::Infallible>(())
+                },
+            )
+            .unwrap();
+        assert_eq!(paired_count, 2);
+        assert_eq!(paired_positions, [(0, 1), (0, 2), (1, 1), (1, 2)]);
+
+        let observer_error = model
+            .runner
+            .visit_projection_probe_pairs(
+                probe_name,
+                Projection::HostSaltV2(Arc::clone(&replacement)),
+                [&[1_u32, 2][..]],
+                &[1, 2],
+                0,
+                |_| Err("stop probe stream"),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            observer_error,
+            super::super::qwen35::Qwen35ProjectionProbeError::Observer("stop probe stream")
+        ));
+
+        let mut restored_cache = model.runner().new_cache(4).unwrap();
+        let restored = model
+            .runner()
+            .forward(&[1, 2], &mut restored_cache)
+            .unwrap();
+        assert_eq!(restored.last_logits(), output.last_logits());
+
         let batches = [&[1_u32, 2][..], &[3_u32][..]];
+        let child_execution = child_model
+            .try_visit_untrusted_final_logits(batches, |_| Ok::<_, core::convert::Infallible>(()))
+            .unwrap();
+        assert_eq!(
+            child_execution.package_id(),
+            child_model.receipt().package_id()
+        );
+        assert_ne!(child_execution.package_id(), model.receipt().package_id());
         let mut visited = 0_u64;
         let execution = model
             .try_visit_untrusted_final_logits(batches, |batch| {
@@ -1590,6 +1988,213 @@ mod tests {
         assert_eq!(execution.claimed_backend_id(), "cpu");
         assert!(execution.has_final_logits());
         assert!(!execution.has_block_outputs());
+
+        let mut observed_blocks = Vec::new();
+        let block_execution = model
+            .try_visit_untrusted_block_outputs(batches, |block| {
+                assert_eq!(block.batch_index(), (observed_blocks.len() / 2) as u64);
+                assert_eq!(block.block_index(), (observed_blocks.len() % 2) as u32);
+                assert_eq!(block.token_start(), 0);
+                assert_eq!(block.hidden_size(), model.runner().hidden_size());
+                assert_eq!(
+                    block.hidden_states().len(),
+                    block.tokens().len() * block.hidden_size()
+                );
+                assert!(block.hidden_states().iter().all(|value| value.is_finite()));
+                assert!(block.hidden_states().iter().any(|value| *value != 0.0));
+                observed_blocks.push((
+                    block.batch_index(),
+                    block.block_index(),
+                    block.hidden_states().to_vec(),
+                ));
+                Ok::<_, core::convert::Infallible>(())
+            })
+            .unwrap();
+        assert_eq!(
+            observed_blocks
+                .iter()
+                .map(|(batch, block, _)| (*batch, *block))
+                .collect::<Vec<_>>(),
+            [(0, 0), (0, 1), (1, 0), (1, 1)]
+        );
+        assert_eq!(block_execution.batch_count(), 2);
+        assert_eq!(block_execution.token_count(), 3);
+        assert_eq!(block_execution.block_observation_count(), 4);
+        assert_eq!(
+            block_execution.block_element_count(),
+            6 * model.runner().hidden_size() as u64
+        );
+        assert!(block_execution.has_block_outputs());
+        assert!(!block_execution.has_final_logits());
+        assert_ne!(block_execution.block_output_digest(), &[0; 32]);
+        assert_eq!(block_execution.logit_count(), 0);
+
+        let mut observed_states = Vec::new();
+        let state_observed_execution = model
+            .try_visit_untrusted_block_outputs_with_states(
+                batches,
+                &[0],
+                |_| Ok::<_, core::convert::Infallible>(()),
+                |batch_index, block_index, token_position, state| {
+                    observed_states.push((
+                        batch_index,
+                        block_index,
+                        token_position,
+                        state.to_vec(),
+                    ));
+                },
+            )
+            .unwrap();
+        assert_eq!(state_observed_execution, block_execution);
+        assert_eq!(observed_states.len(), 2);
+        assert_eq!(
+            observed_states
+                .iter()
+                .map(|(batch, block, token, state)| (*batch, *block, *token, state.len()))
+                .collect::<Vec<_>>(),
+            [(0, 0, 0, 8), (1, 0, 0, 8)]
+        );
+        assert!(observed_states.iter().all(|(_, _, _, state)| {
+            !state.is_empty() && state.iter().all(|value| value.is_finite())
+        }));
+
+        let scope_identity = ([31; 32], [32; 32], 41);
+        let scopes = [
+            tritium_format::RuntimeOutputScope::Block { start: 0, end: 1 },
+            tritium_format::RuntimeOutputScope::Block { start: 0, end: 2 },
+            tritium_format::RuntimeOutputScope::FinalLogits,
+        ];
+        let scoped_batches = [
+            (&[1_u32, 2][..], &[false, true][..]),
+            (&[3_u32][..], &[true][..]),
+        ];
+        let scoped = model
+            .try_visit_untrusted_output_scopes(
+                &scope_identity.0,
+                &scope_identity.1,
+                scope_identity.2,
+                &scopes,
+                scoped_batches,
+            )
+            .unwrap();
+        assert_eq!(scoped.batch_count(), 2);
+        assert_eq!(scoped.token_count(), 3);
+        assert!(scoped.backend_claims_are_untrusted());
+        assert_eq!(
+            scoped.token_stream_digest(),
+            block_execution.token_stream_digest()
+        );
+        let changed_mask = model
+            .try_visit_untrusted_output_scopes(
+                &scope_identity.0,
+                &scope_identity.1,
+                scope_identity.2,
+                &scopes,
+                [
+                    (&[1_u32, 2][..], &[true, true][..]),
+                    (&[3_u32][..], &[true][..]),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            changed_mask.token_stream_digest(),
+            scoped.token_stream_digest()
+        );
+        assert_ne!(changed_mask.scope_evidence(), scoped.scope_evidence());
+        assert!(matches!(
+            model.try_visit_untrusted_output_scopes(
+                &scope_identity.0,
+                &scope_identity.1,
+                scope_identity.2,
+                &[tritium_format::RuntimeOutputScope::FinalLogits],
+                [(&[1_u32][..], &[false][..])],
+            ),
+            Err(crate::Qwen35ExecutionVisitError::Runtime(_))
+        ));
+        assert!(matches!(
+            model.try_visit_untrusted_output_scopes(
+                &scope_identity.0,
+                &scope_identity.1,
+                scope_identity.2,
+                &[
+                    tritium_format::RuntimeOutputScope::Block { start: 0, end: 3 },
+                    tritium_format::RuntimeOutputScope::FinalLogits,
+                ],
+                scoped_batches,
+            ),
+            Err(crate::Qwen35ExecutionVisitError::Runtime(_))
+        ));
+        let expected = scopes
+            .iter()
+            .map(|scope| {
+                let mut accumulator = tritium_format::RuntimeOutputScopeAccumulator::new(
+                    &scope_identity.0,
+                    &scope_identity.1,
+                    scope_identity.2,
+                    *scope,
+                )
+                .unwrap();
+                match scope {
+                    tritium_format::RuntimeOutputScope::Block { .. } => {
+                        let tritium_format::RuntimeOutputScope::Block { end, .. } = scope else {
+                            unreachable!("matched block output scope")
+                        };
+                        let block_index = end - 1;
+                        for (batch_index, (tokens, mask)) in scoped_batches.iter().enumerate() {
+                            let (_, _, values) = observed_blocks
+                                .iter()
+                                .find(|(batch, block, _)| {
+                                    *batch == batch_index as u64 && *block == block_index
+                                })
+                                .expect("every requested block output was observed");
+                            accumulator
+                                .observe(
+                                    batch_index as u32,
+                                    tokens.len(),
+                                    model.runner().hidden_size(),
+                                    mask,
+                                    values,
+                                )
+                                .unwrap();
+                        }
+                    }
+                    tritium_format::RuntimeOutputScope::FinalLogits => {
+                        accumulator
+                            .observe(
+                                0,
+                                1,
+                                model.runner().vocab_size(),
+                                &[true],
+                                &vec![0.0; model.runner().vocab_size()],
+                            )
+                            .unwrap();
+                        accumulator
+                            .observe(
+                                1,
+                                1,
+                                model.runner().vocab_size(),
+                                &[true],
+                                &vec![0.0; model.runner().vocab_size()],
+                            )
+                            .unwrap();
+                    }
+                }
+                accumulator.finish().unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(scoped.scope_evidence(), expected);
+
+        let block_canonical = block_execution.canonical_bytes().unwrap();
+        let block_reopened = model
+            .reexecute_untrusted_block_outputs(batches, &block_canonical, |_| {
+                Ok::<_, core::convert::Infallible>(())
+            })
+            .unwrap();
+        assert_eq!(block_reopened, block_execution);
+        assert!(matches!(
+            model.try_visit_untrusted_block_outputs([&[1_u32][..]], |_| Err("stop")),
+            Err(crate::Qwen35ExecutionVisitError::Observer("stop"))
+        ));
 
         let canonical = execution.canonical_bytes().unwrap();
         let reopened = model
@@ -1640,6 +2245,7 @@ mod tests {
             "compact-v1",
             Box::new(RelabelingBackend(tritium_cpu::CpuBackend::new())),
             false,
+            None,
         )
         .unwrap();
         let relabeled_transcript = relabeled
@@ -1654,6 +2260,97 @@ mod tests {
             "cuda:0:GPU-forged"
         );
 
+        let gate_index = probe_package
+            .tensor_names_encoded_order()
+            .position(|name| name == probe_name)
+            .unwrap();
+        let loaded_identity = Arc::clone(model.runner().identity());
+        assert!(model.apply_salt_v2_scale_updates(&[]).is_err());
+        let unchanged_execution = model
+            .try_visit_untrusted_final_logits(batches, |_| Ok::<_, core::convert::Infallible>(()))
+            .unwrap();
+        assert_eq!(unchanged_execution, execution);
+        model
+            .apply_salt_v2_scale_updates(&[SaltV2ScaleUpdate::new(
+                gate_index,
+                0,
+                0,
+                vec![f16::from_f32(0.875)],
+            )
+            .unwrap()])
+            .unwrap();
+        assert!(!Arc::ptr_eq(&loaded_identity, model.runner().identity()));
+        let mut mutated_observations = 0;
+        let mutated = model.try_visit_untrusted_final_logits(batches, |_| {
+            mutated_observations += 1;
+            Ok::<_, core::convert::Infallible>(())
+        });
+        assert!(
+            matches!(
+                mutated,
+                Err(crate::Qwen35ExecutionVisitError::Runtime(
+                    NnError::Provenance(_)
+                ))
+            ),
+            "changed weights must not emit a transcript naming the loaded package: {mutated:?}"
+        );
+        assert_eq!(mutated_observations, 0);
+
+        for result in [
+            model.try_visit_untrusted_block_outputs(
+                batches,
+                |_| -> Result<(), core::convert::Infallible> {
+                    panic!("stale package blocks must not reach observer")
+                },
+            ),
+            model.try_visit_untrusted_block_outputs_with_states(
+                batches,
+                &[0],
+                |_| Ok::<_, core::convert::Infallible>(()),
+                |_, _, _, _| panic!("stale package must not reach state observer"),
+            ),
+            model.reexecute_untrusted_block_outputs(batches, &block_canonical, |_| {
+                Ok::<_, core::convert::Infallible>(())
+            }),
+            model.reexecute_untrusted_final_logits(
+                batches,
+                &execution.canonical_bytes().unwrap(),
+                |_| Ok::<_, core::convert::Infallible>(()),
+            ),
+            model.try_visit_untrusted_final_logits(
+                core::iter::from_fn(|| -> Option<&[u32]> {
+                    panic!("stale package must be rejected before consuming batches")
+                }),
+                |_| Ok::<_, core::convert::Infallible>(()),
+            ),
+        ] {
+            assert!(matches!(
+                result,
+                Err(crate::Qwen35ExecutionVisitError::Runtime(
+                    NnError::Provenance(_)
+                ))
+            ));
+        }
+
+        // Mutable candidate measurements carry no loaded-package identity.
+        let candidate_scoped = model
+            .try_visit_untrusted_output_scopes(
+                &scope_identity.0,
+                &scope_identity.1,
+                scope_identity.2,
+                &scopes,
+                scoped_batches,
+            )
+            .unwrap();
+        assert_eq!(candidate_scoped.batch_count(), 2);
+        let mut candidate_cache = model.runner().new_cache(4).unwrap();
+        assert!(
+            model
+                .runner()
+                .forward(&[1, 2], &mut candidate_cache)
+                .is_ok()
+        );
+
         #[cfg(feature = "cuda")]
         {
             let cuda = Box::new(tritium_cuda::CudaBackend::new(0).unwrap());
@@ -1662,6 +2359,7 @@ mod tests {
                 "compact-v1",
                 cuda,
                 false,
+                None,
             )
             .unwrap();
             assert!(model.receipt().device_resident_salt());
@@ -1730,7 +2428,29 @@ mod tests {
         .unwrap()
     }
 
-    fn zero_bf16_safetensors(tensors: &BTreeMap<String, Vec<usize>>) -> Vec<u8> {
+    fn signal_matrix(name: &str, shape: &[usize]) -> SaltV2Tensor {
+        let coefficients = shape.iter().product::<usize>();
+        let base = SaltV2Plane::new(
+            vec![1; coefficients],
+            vec![f16::from_f32(0.5); coefficients.div_ceil(128)],
+        )
+        .unwrap();
+        let mut relay_trits = vec![0; coefficients];
+        relay_trits[..shape[1]].fill(1);
+        let relay = SaltV2Plane::new(
+            relay_trits,
+            vec![f16::from_f32(0.25); coefficients.div_ceil(128)],
+        )
+        .unwrap();
+        SaltV2Tensor::new(
+            name,
+            shape.iter().map(|dimension| *dimension as u64).collect(),
+            vec![SaltV2Tile::new(vec![base, relay]).unwrap()],
+        )
+        .unwrap()
+    }
+
+    fn signal_bf16_safetensors(tensors: &BTreeMap<String, Vec<usize>>) -> Vec<u8> {
         let mut header = serde_json::Map::new();
         header.insert("__metadata__".into(), serde_json::json!({"format": "pt"}));
         let mut offset = 0usize;
@@ -1753,7 +2473,12 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&(encoded_header.len() as u64).to_le_bytes());
         bytes.extend_from_slice(&encoded_header);
-        bytes.resize(bytes.len() + offset, 0);
+        for (name, shape) in tensors {
+            let nonzero = shape.len() == 1 || name == "model.language_model.embed_tokens.weight";
+            for _ in 0..shape.iter().product::<usize>() {
+                bytes.extend_from_slice(&if nonzero { 0x3f80_u16 } else { 0_u16 }.to_le_bytes());
+            }
+        }
         bytes
     }
 

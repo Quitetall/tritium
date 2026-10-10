@@ -13,6 +13,7 @@ use tritium_format::ModelId;
 use super::qwen35::{Qwen35TextOutput, Qwen35TextRunner, RunnerIdentity};
 use super::qwen35_mtp_oracle::{AuthorizedQwen35MtpStep, AuthorizedQwen35MtpTrace, first_argmax};
 pub use super::qwen35_mtp_oracle::{Qwen35MtpOracleCoverageProfile, Qwen35MtpOracleEvidenceClass};
+use super::qwen35_reference::{Qwen35ReferenceState, ReferenceStateView, snapshot_states};
 use crate::error::NnError;
 use crate::layers::{
     Projection, Qwen35FullAttention, Qwen35FullAttentionCache, Qwen35FullAttentionWeights,
@@ -248,6 +249,8 @@ struct Qwen35MtpCore {
     mtp_identity: Arc<MtpRunnerIdentity>,
     hidden_size: usize,
     vocab_size: usize,
+    kv_heads: usize,
+    head_dim: usize,
     max_context: usize,
     rms_norm_eps: f32,
     pre_fc_norm_embedding: Vec<f32>,
@@ -368,6 +371,8 @@ impl UnverifiedQwen35Mtp {
                 mtp_identity: Arc::new(MtpRunnerIdentity),
                 hidden_size,
                 vocab_size,
+                kv_heads: axis(config.full_attention.num_key_value_heads, "KV heads")?,
+                head_dim: axis(config.full_attention.head_dim, "KV head dimension")?,
                 max_context: target.max_context(),
                 rms_norm_eps: target.rms_norm_eps(),
                 pre_fc_norm_embedding,
@@ -702,6 +707,50 @@ impl Qwen35MtpRunner {
             mtp_identity: Arc::clone(&self.core.mtp_identity),
             attention: self.core.attention.new_cache(max_context)?,
         })
+    }
+
+    /// Observe committed K/V values without changing execution authorization.
+    ///
+    /// Canonical names are `present_k.0` and `present_v.0`, with shape
+    /// `[sequence, kv_head, head_dim]`. Copies are bounded by `max_state_bytes`
+    /// (1..=256 MiB of values). Speculative draft-only observations do not
+    /// produce a parity receipt or promote the unverified graph.
+    ///
+    /// # Errors
+    /// Returns [`NnError::Provenance`] for a foreign cache, or
+    /// [`NnError::Backend`] for empty/non-finite state, invalid geometry,
+    /// budgets or allocation errors. No partial observation is returned.
+    pub fn reference_states(
+        &self,
+        cache: &Qwen35MtpCache,
+        max_state_bytes: usize,
+    ) -> Result<Vec<Qwen35ReferenceState>, NnError> {
+        if !Arc::ptr_eq(&self.core.mtp_identity, &cache.mtp_identity) {
+            return Err(NnError::Provenance(
+                "Qwen MTP observation received a foreign runner cache".to_owned(),
+            ));
+        }
+        if cache.is_empty() {
+            return Err(NnError::Backend(
+                "Qwen MTP observation requires a nonempty committed cache".to_owned(),
+            ));
+        }
+        let shape = vec![cache.len(), self.core.kv_heads, self.core.head_dim];
+        snapshot_states(
+            vec![
+                ReferenceStateView {
+                    name: "present_k.0".to_owned(),
+                    shape: shape.clone(),
+                    values: cache.keys(),
+                },
+                ReferenceStateView {
+                    name: "present_v.0".to_owned(),
+                    shape,
+                    values: cache.values(),
+                },
+            ],
+            max_state_bytes,
+        )
     }
 
     /// Execute one target-aligned prefill or cached continuation transaction.
@@ -1093,8 +1142,8 @@ mod tests {
     use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, MpGemm, TernaryBackend};
 
     use super::{
-        Qwen35MtpLayerWeights, Qwen35MtpParityReceipt, Qwen35MtpWeights, UnverifiedQwen35Mtp,
-        build_input_plan,
+        NnError, Qwen35MtpLayerWeights, Qwen35MtpParityReceipt, Qwen35MtpStatus, Qwen35MtpWeights,
+        UnverifiedQwen35Mtp, build_input_plan,
     };
     use crate::layers::{
         DenseLinear, Projection, Qwen35FullAttentionWeights, SwiGluMlp, TernaryLinear,
@@ -1278,6 +1327,127 @@ mod tests {
     }
 
     #[test]
+    fn projection_probe_isolates_parent_cache_outputs_and_mtp_alignment() {
+        let mut target = a8_runner(Arc::new(AtomicBool::new(false)));
+        let mtp = a8_mtp(&target);
+        let mut cache = target.new_cache(8).unwrap();
+        let parent = target.forward(&[1, 2], &mut cache).unwrap();
+        let (candidate, mut candidate_cache) = target
+            .with_projection_override(
+                "model.language_model.layers.0.mlp.gate_proj.weight",
+                a8_projection(I, H),
+                |runner| {
+                    assert!(matches!(
+                        runner.forward(&[3], &mut cache),
+                        Err(NnError::Backend(message)) if message.contains("different runner")
+                    ));
+                    assert_eq!(cache.len(), 2);
+                    assert!(matches!(
+                        runner.logits_for_row(&parent, 0),
+                        Err(NnError::Provenance(_))
+                    ));
+                    let mut candidate_cache = runner.new_cache(8)?;
+                    let candidate = runner.forward(&[1, 2], &mut candidate_cache)?;
+                    assert!(matches!(
+                        mtp.align_step(&candidate, 1),
+                        Err(NnError::Provenance(_))
+                    ));
+                    let draft = mtp.draft_only_runner();
+                    let mut draft_cache = draft.new_cache(8)?;
+                    assert!(matches!(
+                        draft.forward(runner, &parent, 1, &mut draft_cache),
+                        Err(NnError::Provenance(_))
+                    ));
+                    assert!(draft_cache.is_empty());
+                    Ok((candidate, candidate_cache))
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            target.logits_for_row(&candidate, 0),
+            Err(NnError::Provenance(_))
+        ));
+        assert!(matches!(
+            target.reference_states(&candidate_cache, 1024),
+            Err(NnError::Provenance(_))
+        ));
+        assert!(matches!(
+            target.forward(&[3], &mut candidate_cache),
+            Err(NnError::Backend(message)) if message.contains("different runner")
+        ));
+        assert_eq!(candidate_cache.len(), 2);
+        assert!(mtp.align_step(&parent, 1).is_ok());
+        assert!(target.logits_for_row(&parent, 0).is_ok());
+        target.forward(&[3], &mut cache).unwrap();
+    }
+
+    #[test]
+    fn invalid_projection_override_preserves_parent_weight_state() {
+        let mut target = a8_runner(Arc::new(AtomicBool::new(false)));
+        let identity = Arc::clone(target.identity());
+        let mut cache = target.new_cache(8).unwrap();
+        let output = target.forward(&[1, 2], &mut cache).unwrap();
+        for (name, replacement) in [
+            ("missing-projection", a8_projection(I, H)),
+            (
+                "model.language_model.layers.0.mlp.gate_proj.weight",
+                a8_projection(I - 1, H),
+            ),
+        ] {
+            assert!(
+                target
+                    .with_projection_override::<()>(name, replacement, |_| panic!(
+                        "invalid override must not execute"
+                    ))
+                    .is_err()
+            );
+            assert!(Arc::ptr_eq(&identity, target.identity()));
+            assert!(target.logits_for_row(&output, 0).is_ok());
+        }
+        target.forward(&[3], &mut cache).unwrap();
+    }
+
+    #[test]
+    fn projection_probe_restores_parent_identity_on_error_and_unwind() {
+        let mut target = a8_runner(Arc::new(AtomicBool::new(false)));
+        let mtp = a8_mtp(&target);
+        let mut cache = target.new_cache(8).unwrap();
+        let parent = target.forward(&[1, 2], &mut cache).unwrap();
+        let identity = Arc::clone(target.identity());
+        let mut candidate_identity = None;
+        let error = target.with_projection_override(
+            "model.language_model.layers.0.mlp.gate_proj.weight",
+            a8_projection(I, H),
+            |runner| {
+                candidate_identity = Some(Arc::clone(runner.identity()));
+                Err::<(), _>(NnError::Backend("stop probe".into()))
+            },
+        );
+        assert!(error.is_err());
+        assert!(!Arc::ptr_eq(
+            &identity,
+            candidate_identity.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(&identity, target.identity()));
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = target.with_projection_override(
+                "model.language_model.layers.0.mlp.gate_proj.weight",
+                a8_projection(I, H),
+                |runner| -> Result<(), NnError> {
+                    assert!(!Arc::ptr_eq(&identity, runner.identity()));
+                    panic!("intentional probe unwind")
+                },
+            );
+        }));
+        assert!(unwind.is_err());
+        assert!(Arc::ptr_eq(&identity, target.identity()));
+        assert!(mtp.align_step(&parent, 1).is_ok());
+        target.forward(&[3], &mut cache).unwrap();
+    }
+
+    #[test]
     fn only_production_checkpoint_receipt_qualifies_for_production() {
         let mut receipt = Qwen35MtpParityReceipt {
             source_model_id: tritium_format::ModelId::from_digest([1; 32]),
@@ -1325,5 +1495,39 @@ mod tests {
         mtp.forward(&target, &target_decode, 0, &mut mtp_cache)
             .unwrap();
         assert_eq!(mtp_cache.len(), 3);
+    }
+
+    #[test]
+    fn draft_only_observations_are_owned_budgeted_and_do_not_promote_mtp() {
+        let target = a8_runner(Arc::new(AtomicBool::new(false)));
+        let unverified = a8_mtp(&target);
+        let mtp = unverified.draft_only_runner();
+        let foreign = a8_mtp(&target).draft_only_runner();
+        let mut target_cache = target.new_cache(8).unwrap();
+        let mut cache = mtp.new_cache(8).unwrap();
+        assert!(mtp.reference_states(&cache, 32).is_err());
+        let prefill = target.forward(&[0, 0], &mut target_cache).unwrap();
+        mtp.forward(&target, &prefill, 0, &mut cache).unwrap();
+        let states = mtp.reference_states(&cache, 32).unwrap();
+        assert_eq!(states[0].name(), "present_k.0");
+        assert_eq!(states[1].name(), "present_v.0");
+        assert_eq!(states[0].shape(), [2, 1, 2]);
+        assert_eq!(states[0].values(), cache.keys());
+        assert_eq!(states[1].values(), cache.values());
+        assert!(mtp.reference_states(&cache, 31).is_err());
+        assert!(matches!(
+            foreign.reference_states(&cache, 32),
+            Err(NnError::Provenance(_))
+        ));
+        let decode = target.forward(&[0], &mut target_cache).unwrap();
+        mtp.forward(&target, &decode, 0, &mut cache).unwrap();
+        assert_eq!(
+            mtp.reference_states(&cache, 48).unwrap()[0].shape(),
+            [3, 1, 2]
+        );
+        cache.reset();
+        assert_eq!(states[0].shape(), [2, 1, 2]);
+        assert!(mtp.reference_states(&cache, 32).is_err());
+        assert_eq!(unverified.status(), Qwen35MtpStatus::Unverified);
     }
 }

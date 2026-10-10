@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Verdict",
+  "description": "Outcome attached to a measured or verified claim.",
+  "oneOf": [
+    {
+      "description": "The claim passed its declared check.",
+      "type": "string",
+      "const": "Pass"
+    },
+    {
+      "description": "The claim failed its declared check.",
+      "type": "string",
+      "const": "Fail"
+    },
+    {
+      "description": "No pass/fail conclusion can be drawn; never aggregates to pass.",
+      "type": "object",
+      "properties": {
+        "Unknown": {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "description": "Stable reason code; free-form details belong in the evidence event.",
+              "$ref": "#/$defs/UnknownReason"
+            }
+          },
+          "required": [
+            "reason"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Unknown"
+      ]
+    }
+  ],
+  "$defs": {
+    "UnknownReason": {
+      "description": "Standardized reason category for an unresolved claim.",
+      "oneOf": [
+        {
+          "description": "The claim has not yet been evaluated.",
+          "type": "string",
+          "const": "NotEvaluated"
+        },
+        {
+          "description": "Required evidence is unavailable.",
+          "type": "string",
+          "const": "MissingEvidence"
+        },
+        {
+          "description": "Required hardware or runtime is unavailable.",
+          "type": "string",
+          "const": "MissingCapability"
+        },
+        {
+          "description": "Independent review is still required.",
+          "type": "string",
+          "const": "AwaitingIndependentReview"
+        },
+        {
+          "description": "The producer supplied a reason not represented by a standard code.",
+          "type": "string",
+          "const": "Other"
+        }
+      ]
+    }
+  }
+}

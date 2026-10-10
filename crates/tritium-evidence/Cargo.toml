@@ -1,0 +1,22 @@
+[package]
+name = "tritium-evidence"
+description = "Typed deterministic evidence events and hash-chained JSONL logs for Tritium."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_json_canonicalizer = { workspace = true }
+tritium-schema = { workspace = true, features = ["serde", "std"] }
+
+[lints]
+workspace = true

@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use tritium_format::salt_v2_package::SaltV2ScaleUpdate;
 use tritium_spec::TernaryBackend;
 
 use crate::error::NnError;
@@ -32,6 +33,45 @@ struct DeltaNetSpec {
     conv_state_len: usize,
     recurrent_state_len: usize,
     rms_norm_eps_bits: u32,
+}
+
+type RecurrentStateCallback<'a> = dyn for<'state> FnMut(usize, &'state [f32]) + 'a;
+
+pub(crate) struct RecurrentStateObserver<'a> {
+    positions: &'a [usize],
+    callback: Option<&'a mut RecurrentStateCallback<'a>>,
+}
+
+impl RecurrentStateObserver<'_> {
+    pub(crate) fn new<'a, F>(
+        positions: &'a [usize],
+        callback: &'a mut F,
+    ) -> RecurrentStateObserver<'a>
+    where
+        F: for<'state> FnMut(usize, &'state [f32]) + 'a,
+    {
+        RecurrentStateObserver {
+            positions,
+            callback: Some(callback),
+        }
+    }
+
+    pub(crate) fn disabled() -> Self {
+        Self {
+            positions: &[],
+            callback: None,
+        }
+    }
+
+    fn observes(&self, position: usize) -> bool {
+        self.positions.binary_search(&position).is_ok()
+    }
+
+    fn report(&mut self, position: usize, state: &[f32]) {
+        if let Some(callback) = self.callback.as_deref_mut() {
+            callback(position, state);
+        }
+    }
 }
 
 impl DeltaNetSpec {
@@ -337,6 +377,42 @@ pub struct Qwen35DeltaNet {
 struct MixerIdentity;
 
 impl Qwen35DeltaNet {
+    #[allow(dead_code)] // Consumed by the B3 bounded projection-window adapter.
+    pub(crate) fn projection(&self, name: &str) -> Result<&Projection, NnError> {
+        match name {
+            "linear_attn.in_proj_qkv.weight" => Ok(&self.weights.qkv_proj),
+            "linear_attn.in_proj_z.weight" => Ok(&self.weights.z_proj),
+            "linear_attn.in_proj_b.weight" => Ok(&self.weights.b_proj),
+            "linear_attn.in_proj_a.weight" => Ok(&self.weights.a_proj),
+            "linear_attn.out_proj.weight" => Ok(&self.weights.out_proj),
+            _ => Err(NnError::MissingTensor(format!(
+                "unknown Qwen DeltaNet projection `{name}`"
+            ))),
+        }
+    }
+
+    /// Replace one named projection without changing this mixer's validated geometry.
+    #[allow(dead_code)] // Used by the crate-internal paired Qwen measurement path.
+    pub(crate) fn replace_projection(
+        &mut self,
+        name: &str,
+        replacement: Projection,
+    ) -> Result<Projection, NnError> {
+        let slot = match name {
+            "linear_attn.in_proj_qkv.weight" => &mut self.weights.qkv_proj,
+            "linear_attn.in_proj_z.weight" => &mut self.weights.z_proj,
+            "linear_attn.in_proj_b.weight" => &mut self.weights.b_proj,
+            "linear_attn.in_proj_a.weight" => &mut self.weights.a_proj,
+            "linear_attn.out_proj.weight" => &mut self.weights.out_proj,
+            _ => {
+                return Err(NnError::MissingTensor(format!(
+                    "unknown Qwen DeltaNet projection `{name}`"
+                )));
+            }
+        };
+        replace_projection(slot, replacement, "Qwen DeltaNet")
+    }
+
     /// Bind typed Qwen3.5 geometry and numeric semantics to exact weights.
     ///
     /// # Errors
@@ -401,6 +477,40 @@ impl Qwen35DeltaNet {
     #[must_use]
     pub const fn activation_mode(&self) -> ProjectionActivationMode {
         self.activation_mode
+    }
+
+    pub(crate) fn count_salt_v2_tensor_index(&self, tensor_index: usize) -> usize {
+        [
+            &self.weights.qkv_proj,
+            &self.weights.z_proj,
+            &self.weights.b_proj,
+            &self.weights.a_proj,
+            &self.weights.out_proj,
+        ]
+        .into_iter()
+        .filter(|projection| projection.salt_v2_tensor_index() == Some(tensor_index))
+        .count()
+    }
+
+    pub(crate) fn apply_salt_v2_scale_updates(
+        &mut self,
+        tensor_index: usize,
+        updates: &[SaltV2ScaleUpdate],
+    ) -> Result<bool, NnError> {
+        let projections = [
+            &mut self.weights.qkv_proj,
+            &mut self.weights.z_proj,
+            &mut self.weights.b_proj,
+            &mut self.weights.a_proj,
+            &mut self.weights.out_proj,
+        ];
+        for projection in projections {
+            if projection.salt_v2_tensor_index() == Some(tensor_index) {
+                projection.apply_salt_v2_scale_updates(tensor_index, updates)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Allocate zeroed fp32 current/staging state bound to this exact mixer.
@@ -483,7 +593,44 @@ impl Qwen35DeltaNet {
         cache: &mut Qwen35DeltaNetCache,
         out: &mut [f32],
     ) -> Result<(), NnError> {
+        let mut observer = RecurrentStateObserver::disabled();
+        self.stage_forward_with_state_observer(
+            backend,
+            normalized,
+            sequence,
+            cache,
+            out,
+            &mut observer,
+        )
+    }
+
+    /// Stage a segment and expose recurrent-state snapshots at selected token rows.
+    ///
+    /// The callback runs synchronously after the selected token updates the state;
+    /// its slice is borrowed only for the duration of the callback. Empty
+    /// `state_positions` takes the ordinary inference path without state readback.
+    /// Positions are zero-based within this segment, strictly increasing, and
+    /// must be less than `sequence`.
+    pub(crate) fn stage_forward_with_state_observer(
+        &self,
+        backend: &dyn TernaryBackend,
+        normalized: &[f32],
+        sequence: usize,
+        cache: &mut Qwen35DeltaNetCache,
+        out: &mut [f32],
+        observer: &mut RecurrentStateObserver<'_>,
+    ) -> Result<(), NnError> {
         self.validate_forward(normalized, sequence, cache, out)?;
+        let mut previous = None;
+        for &position in observer.positions {
+            if position >= sequence || previous.is_some_and(|prior| position <= prior) {
+                return Err(NnError::MissingConfig(
+                    "DeltaNet state-observation positions must be increasing and inside the segment"
+                        .to_owned(),
+                ));
+            }
+            previous = Some(position);
+        }
         let new_len = cache.len.checked_add(sequence).ok_or(NnError::Shape {
             expected: self.spec.max_context,
             got: usize::MAX,
@@ -532,6 +679,7 @@ impl Qwen35DeltaNet {
             cache,
             &mut core,
             &mut normalized_core,
+            observer,
         )?;
         #[cfg(not(feature = "cuda"))]
         let ran_on_device = false;
@@ -548,6 +696,7 @@ impl Qwen35DeltaNet {
                 &mut cache.recurrent_staging,
                 &mut core,
                 &mut normalized_core,
+                observer,
             );
         }
         self.weights
@@ -658,6 +807,7 @@ impl Qwen35DeltaNet {
         cache: &mut Qwen35DeltaNetCache,
         core: &mut [f32],
         normalized_core: &mut [f32],
+        observer: &mut RecurrentStateObserver<'_>,
     ) -> Result<bool, NnError> {
         if !deltanet_cuda_enabled() {
             return Ok(false);
@@ -692,6 +842,14 @@ impl Qwen35DeltaNet {
         let mut qq = zeroed_scratch(self.spec.key_width, "DeltaNet scaled query")?;
         let mut beta = zeroed_scratch(self.spec.num_value_heads, "DeltaNet beta")?;
         let mut decay = zeroed_scratch(self.spec.num_value_heads, "DeltaNet decay")?;
+        let mut observed_state = if observer.positions.is_empty() {
+            Vec::new()
+        } else {
+            zeroed_scratch(
+                self.spec.recurrent_state_len,
+                "observed DeltaNet recurrence",
+            )?
+        };
 
         for token in 0..sequence {
             let qkv = &convolved[token * self.spec.conv_width..(token + 1) * self.spec.conv_width];
@@ -736,6 +894,11 @@ impl Qwen35DeltaNet {
             .map_err(|error| NnError::Backend(error.to_string()))?;
 
             self.gated_rms_norm(z, value_base, core, normalized_core);
+            if !observer.positions.is_empty() && observer.observes(token) {
+                cuda.deltanet_read_staged(device, &mut observed_state)
+                    .map_err(|error| NnError::Backend(error.to_string()))?;
+                observer.report(token, &observed_state);
+            }
         }
         Ok(true)
     }
@@ -778,6 +941,7 @@ impl Qwen35DeltaNet {
         recurrent_state: &mut [f32],
         core: &mut [f32],
         normalized_core: &mut [f32],
+        observer: &mut RecurrentStateObserver<'_>,
     ) {
         let group_size = self.spec.num_value_heads / self.spec.num_key_heads;
         let query_scale = 1.0 / (self.spec.key_head_dim as f32).sqrt();
@@ -831,6 +995,9 @@ impl Qwen35DeltaNet {
                     core[value_base + value_head * dv + value_lane] = mixed;
                 }
             }
+            if !observer.positions.is_empty() && observer.observes(token) {
+                observer.report(token, recurrent_state);
+            }
 
             for value_head in 0..self.spec.num_value_heads {
                 let row_start = value_base + value_head * dv;
@@ -851,6 +1018,26 @@ impl Qwen35DeltaNet {
             }
         }
     }
+}
+
+#[allow(dead_code)] // Called only from the crate-internal measurement override.
+fn replace_projection(
+    slot: &mut Projection,
+    replacement: Projection,
+    owner: &str,
+) -> Result<Projection, NnError> {
+    if replacement.n_out() != slot.n_out() || replacement.k_in() != slot.k_in() {
+        return Err(NnError::Shape {
+            expected: slot.n_out().saturating_mul(slot.k_in()),
+            got: replacement.n_out().saturating_mul(replacement.k_in()),
+        });
+    }
+    if replacement.activation_mode() != slot.activation_mode() {
+        return Err(NnError::Backend(format!(
+            "replacement projection changes {owner} activation arithmetic"
+        )));
+    }
+    Ok(std::mem::replace(slot, replacement))
 }
 
 /// Whether the device recurrence is enabled. On by default when the backend is
@@ -1081,6 +1268,91 @@ mod tests {
         assert_eq!(cache.staged_len(), None);
         cache.commit_staged();
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn selected_recurrent_snapshots_match_incremental_state_without_changing_output() {
+        let layer = tiny_layer();
+        let backend = CpuBackend::new();
+        let inputs = [1.0, -0.5, -0.25, 0.75, 0.4, 0.2];
+        let mut observed_cache = layer.new_cache().unwrap();
+        let mut observed_output = [f32::NAN; 6];
+        let mut snapshots = Vec::new();
+        let mut callback = |position, state: &[f32]| snapshots.push((position, state.to_vec()));
+        let mut observer = RecurrentStateObserver::new(&[0, 2], &mut callback);
+        layer
+            .stage_forward_with_state_observer(
+                &backend,
+                &inputs,
+                3,
+                &mut observed_cache,
+                &mut observed_output,
+                &mut observer,
+            )
+            .unwrap();
+        observed_cache.commit_staged();
+
+        let mut incremental_cache = layer.new_cache().unwrap();
+        let mut incremental_output = [f32::NAN; 2];
+        let mut expected = Vec::new();
+        for position in 0..3 {
+            layer
+                .forward(
+                    &backend,
+                    &inputs[position * 2..(position + 1) * 2],
+                    1,
+                    &mut incremental_cache,
+                    &mut incremental_output,
+                )
+                .unwrap();
+            if position == 0 || position == 2 {
+                expected.push((position, incremental_cache.recurrent_state().to_vec()));
+            }
+        }
+
+        let mut ordinary_cache = layer.new_cache().unwrap();
+        let mut ordinary_output = [f32::NAN; 6];
+        layer
+            .forward(
+                &backend,
+                &inputs,
+                3,
+                &mut ordinary_cache,
+                &mut ordinary_output,
+            )
+            .unwrap();
+
+        assert_eq!(snapshots, expected);
+        assert_eq!(observed_output, ordinary_output);
+        assert_eq!(
+            observed_cache.recurrent_state(),
+            incremental_cache.recurrent_state()
+        );
+    }
+
+    #[test]
+    fn invalid_recurrent_observation_positions_are_rejected_before_staging() {
+        let layer = tiny_layer();
+        let backend = CpuBackend::new();
+        let mut cache = layer.new_cache().unwrap();
+        let mut output = [f32::NAN; 4];
+        for positions in [&[2][..], &[1, 0][..], &[0, 0][..]] {
+            let mut observer = RecurrentStateObserver::disabled();
+            observer.positions = positions;
+            let error = layer
+                .stage_forward_with_state_observer(
+                    &backend,
+                    &[1.0, -0.5, -0.25, 0.75],
+                    2,
+                    &mut cache,
+                    &mut output,
+                    &mut observer,
+                )
+                .unwrap_err();
+            assert!(matches!(error, NnError::MissingConfig(_)));
+            assert_eq!(cache.staged_len(), None);
+            assert!(cache.is_empty());
+        }
     }
 }
 

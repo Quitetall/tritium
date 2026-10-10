@@ -25,6 +25,112 @@ use tritium_serve::{
 
 /// A generator that always fails (for the backend-error / panic-resilience tests).
 struct ErrGen;
+
+#[tokio::test]
+async fn cancellation_capabilities_health_discloses_legacy_limits() {
+    let (router, draining) = build_router(
+        Box::new(ErrGen),
+        Arc::new(IdPassthroughTokenizer::default()),
+        ServeConfig::default(),
+    );
+    for drain in [false, true] {
+        draining.store(drain, Ordering::Release);
+        let response = router
+            .clone()
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(
+            body["cancellation"],
+            json!({
+                "schema": "tritium.cancellation-capabilities.v1",
+                "kernel_preemption": false,
+                "qualification": "not_assessed",
+                "checkpoints": {
+                    "generation": "entry_and_token_delivery",
+                    "tree_session_open": "entry_only",
+                    "tree_verify": "entry_only",
+                    "model_draft": "unknown",
+                    "batch_prompt": "not_enabled",
+                    "batch_speculation": "not_enabled",
+                    "batch_decode": "not_enabled",
+                },
+            })
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancellation_capabilities_snapshot_once_cannot_grant_readiness() {
+    struct Declared(Arc<AtomicUsize>);
+    impl Generator for Declared {
+        fn cancellation_capabilities(&self) -> tritium_serve::CancellationCapabilitiesV1 {
+            self.0.fetch_add(1, Ordering::SeqCst); // test-only snapshot observation
+            let mut caps = tritium_serve::CancellationCapabilitiesV1::default();
+            caps.generation = tritium_serve::CancellationCheckpoint::CooperativeBoundaries;
+            caps
+        }
+        fn generate(
+            &mut self,
+            _: &GenRequest,
+            _: &mut dyn FnMut(Step) -> bool,
+        ) -> Result<(), GenError> {
+            panic!("reporting must not run inference")
+        }
+        fn n_ctx(&self) -> usize {
+            16
+        }
+        fn vocab(&self) -> usize {
+            8
+        }
+    }
+    for governed in [false, true] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let generator = Box::new(Declared(calls.clone()));
+        let tok = Arc::new(IdPassthroughTokenizer::default());
+        let (router, draining) = if governed {
+            build_router_governed(
+                generator,
+                tok,
+                ServeConfig::default(),
+                RequestLimits::default(),
+                AdmissionPolicy::default(),
+            )
+            .unwrap()
+        } else {
+            build_router(generator, tok, ServeConfig::default())
+        };
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        draining.store(true, Ordering::Release);
+        for _ in 0..3 {
+            let response = router
+                .clone()
+                .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let body: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(
+                body["cancellation"]["checkpoints"]["generation"],
+                "cooperative_boundaries"
+            );
+            assert_eq!(body["cancellation"]["qualification"], "not_assessed");
+            assert_eq!(body["cancellation"]["kernel_preemption"], false);
+        }
+        let ready = router
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
+
 impl Generator for ErrGen {
     fn generate(
         &mut self,
@@ -65,6 +171,52 @@ struct PhaseGateGen {
     release_prefill: Arc<AtomicBool>,
     decode_entered: Arc<AtomicBool>,
     release_decode: Arc<AtomicBool>,
+}
+
+struct CancelGateGen {
+    calls: Arc<AtomicUsize>,
+    prefill_entered: Arc<AtomicBool>,
+    release_prefill: Arc<AtomicBool>,
+    cancellation_observed: Arc<AtomicBool>,
+}
+
+impl Generator for CancelGateGen {
+    fn generate(
+        &mut self,
+        _req: &GenRequest,
+        on_step: &mut dyn FnMut(Step) -> bool,
+    ) -> Result<(), GenError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.prefill_entered.store(true, Ordering::SeqCst);
+            while !self.release_prefill.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            let continued = on_step(Step {
+                token: 10,
+                finished: true,
+                logprobs: None,
+                finish_reason: Some(FinishReason::Stop),
+            });
+            self.cancellation_observed
+                .store(!continued, Ordering::SeqCst);
+        } else {
+            let _ = on_step(Step {
+                token: 10,
+                finished: true,
+                logprobs: None,
+                finish_reason: Some(FinishReason::Stop),
+            });
+        }
+        Ok(())
+    }
+
+    fn n_ctx(&self) -> usize {
+        4096
+    }
+
+    fn vocab(&self) -> usize {
+        128_256
+    }
 }
 
 impl Generator for PhaseGateGen {
@@ -1435,8 +1587,10 @@ async fn oversized_body_rejected() {
 
 #[tokio::test]
 async fn dropped_sse_body_records_client_disconnect() {
+    let emitted = Arc::new(AtomicUsize::new(0));
     let mock = MockGenerator {
         step_delay_ms: 100,
+        emitted: Some(emitted.clone()),
         ..MockGenerator::new(vec![1, 2, 3, 4, 5, 6, 7, 8])
     };
     let (router, _) = router_with(mock, ServeConfig::default());
@@ -1452,18 +1606,491 @@ async fn dropped_sse_body_records_client_disconnect() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body();
-    assert!(body.frame().await.transpose().unwrap().is_some());
+    // Wait for a content token, not merely the role-first SSE frame, before
+    // simulating a disconnect. This proves generation actually started.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut bytes = Vec::new();
+        loop {
+            let frame = body
+                .frame()
+                .await
+                .transpose()
+                .expect("SSE body frame")
+                .expect("stream should emit a token before disconnect");
+            if let Ok(data) = frame.into_data() {
+                bytes.extend_from_slice(&data);
+                if String::from_utf8_lossy(&bytes).contains("\"content\"") {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("first content token should arrive");
     drop(body);
-    tokio::task::yield_now().await;
 
-    let request = Request::get("/metrics").body(Body::empty()).unwrap();
-    let (status, body) = send(&router, request).await;
-    assert_eq!(status, StatusCode::OK);
-    let text = String::from_utf8(body).unwrap();
+    async fn metrics(router: &Router) -> String {
+        let request = Request::get("/metrics").body(Body::empty()).unwrap();
+        let (status, body) = send(router, request).await;
+        assert_eq!(status, StatusCode::OK);
+        String::from_utf8(body).unwrap()
+    }
+
+    // The stream-side active gauge drops before the synchronous worker sees
+    // the closed receiver, so one in-flight token may still be counted. Wait
+    // for the producer counter itself to stabilize after the disconnect.
+    let text = metrics(&router).await;
     assert!(
         text.contains("tritium_stream_disconnects_total 1\n"),
-        "{text}"
+        "disconnect was not recorded: {text}"
     );
+    let settled = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut previous = emitted.load(Ordering::SeqCst);
+        let mut stable_for = Duration::ZERO;
+        loop {
+            let current = emitted.load(Ordering::SeqCst);
+            if current == previous {
+                stable_for += Duration::from_millis(10);
+                if stable_for >= Duration::from_millis(150) {
+                    break current;
+                }
+            } else {
+                previous = current;
+                stable_for = Duration::ZERO;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let emitted_after_settle = settled.expect("worker did not settle after disconnect");
+    assert!(
+        emitted_after_settle < 8,
+        "worker emitted all tokens after disconnect"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        emitted.load(Ordering::SeqCst),
+        emitted_after_settle,
+        "worker kept generating after disconnect was settled"
+    );
+}
+
+#[tokio::test]
+async fn sse_disconnect_during_prefill_cancels_worker_and_recovers() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let prefill_entered = Arc::new(AtomicBool::new(false));
+    let release_prefill = Arc::new(AtomicBool::new(false));
+    let cancellation_observed = Arc::new(AtomicBool::new(false));
+    let generator = CancelGateGen {
+        calls: calls.clone(),
+        prefill_entered: prefill_entered.clone(),
+        release_prefill: release_prefill.clone(),
+        cancellation_observed: cancellation_observed.clone(),
+    };
+    let (router, _) = build_router(Box::new(generator), shared_tok(), ServeConfig::default());
+
+    let response = router
+        .clone()
+        .oneshot(chat(json!({
+            "model": "tritium",
+            "messages": [{"role": "user", "content": "1"}],
+            "stream": true
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    // The first SSE frame is the role chunk; wait until the worker is blocked
+    // in prefill before simulating a client disconnect.
+    assert!(body.frame().await.transpose().unwrap().is_some());
+    wait_flag(&prefill_entered).await;
+    drop(body);
+
+    release_prefill.store(true, Ordering::SeqCst);
+    wait_flag(&cancellation_observed).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // A new request must be serviced after the cancelled generation retires.
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(2),
+        send(
+            &router,
+            chat(json!({
+                "model": "tritium",
+                "messages": [{"role": "user", "content": "2"}],
+                "max_tokens": 1
+            })),
+        ),
+    )
+    .await
+    .expect("worker should recover after a prefill disconnect");
+    assert_eq!(status, StatusCode::OK);
+    let response: Value = serde_json::from_slice(&body).expect("OpenAI response JSON");
+    assert_eq!(response["choices"][0]["message"]["content"], "10");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn queued_sse_disconnect_skips_prefill_and_recovers() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let prefill_entered = Arc::new(AtomicBool::new(false));
+    let release_prefill = Arc::new(AtomicBool::new(false));
+    let generator = CancelGateGen {
+        calls: calls.clone(),
+        prefill_entered: prefill_entered.clone(),
+        release_prefill: release_prefill.clone(),
+        cancellation_observed: Arc::new(AtomicBool::new(false)),
+    };
+    let (router, _) = build_router(Box::new(generator), shared_tok(), ServeConfig::default());
+
+    let first = router
+        .clone()
+        .oneshot(chat(json!({
+            "model": "tritium",
+            "messages": [{"role": "user", "content": "1"}],
+            "stream": true
+        })))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let mut first_body = first.into_body();
+    assert!(first_body.frame().await.transpose().unwrap().is_some());
+    wait_flag(&prefill_entered).await;
+
+    let queued = router
+        .clone()
+        .oneshot(chat(json!({
+            "model": "tritium",
+            "messages": [{"role": "user", "content": "2"}],
+            "stream": true
+        })))
+        .await
+        .unwrap();
+    assert_eq!(queued.status(), StatusCode::OK);
+    let mut queued_body = queued.into_body();
+    assert!(queued_body.frame().await.transpose().unwrap().is_some());
+    let (_, metrics) = send(
+        &router,
+        Request::get("/metrics").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert!(
+        String::from_utf8(metrics)
+            .unwrap()
+            .contains("tritium_queue_depth 1\n")
+    );
+    // The worker is still held in the first request, so receiver closure
+    // necessarily precedes dispatch of the queued request.
+    drop(queued_body);
+    release_prefill.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(2), first_body.collect())
+        .await
+        .expect("first request should retire")
+        .unwrap();
+
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(2),
+        send(
+            &router,
+            chat(json!({
+                "model": "tritium",
+                "messages": [{"role": "user", "content": "3"}],
+                "max_tokens": 1
+            })),
+        ),
+    )
+    .await
+    .expect("worker should recover after queued disconnect");
+    assert_eq!(status, StatusCode::OK);
+    let response: Value = serde_json::from_slice(&body).expect("OpenAI response JSON");
+    assert_eq!(response["choices"][0]["message"]["content"], "10");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "queued disconnect must skip model entry, not only token delivery"
+    );
+    let (_, metrics) = send(
+        &router,
+        Request::get("/metrics").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert!(
+        String::from_utf8(metrics)
+            .unwrap()
+            .contains("tritium_queue_depth 0\n")
+    );
+}
+
+#[tokio::test]
+async fn inflight_cap_retains_unpolled_sse_until_body_drop() {
+    let (router, _) = router_with(MockGenerator::new(vec![10]), {
+        let mut config = ServeConfig::default();
+        config.max_concurrent_requests = 1;
+        config.request_timeout_secs = 0;
+        config
+    });
+    let request = || {
+        chat(json!({
+            "model": "tritium",
+            "messages": [{"role": "user", "content": "1"}],
+            "max_tokens": 1,
+            "stream": true
+        }))
+    };
+    let first = router.clone().oneshot(request()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    // Keep the body alive without polling it. Returning headers is not the
+    // end of this request's memory/FD ownership.
+    let first_body = first.into_body();
+    let second = tokio::time::timeout(Duration::from_secs(2), router.clone().oneshot(request()))
+        .await
+        .expect("an exhausted in-flight budget must reject without an unbounded wait")
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "SSE headers must not release the in-flight request slot"
+    );
+    assert_eq!(second.headers()["retry-after"], "1");
+    let error: Value =
+        serde_json::from_slice(&second.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(error["error"]["code"], "rate_limit_exceeded");
+    drop(first_body);
+    let third = tokio::time::timeout(Duration::from_secs(2), router.clone().oneshot(request()))
+        .await
+        .expect("dropping the body must release its slot")
+        .unwrap();
+    assert_eq!(third.status(), StatusCode::OK);
+    let events = parse_sse(&third.into_body().collect().await.unwrap().to_bytes());
+    assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
+}
+
+#[tokio::test]
+async fn inflight_cap_shared_by_model_listing_and_chat() {
+    let (router, _) = router_with(MockGenerator::new(vec![10]), {
+        let mut config = ServeConfig::default();
+        config.max_concurrent_requests = 1;
+        config.request_timeout_secs = 0;
+        config
+    });
+    let listing = router
+        .clone()
+        .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(listing.status(), StatusCode::OK);
+    // No generation has run: worker completion cannot explain this slot's
+    // lifetime. Different routes must share the configured request budget.
+    let response = router
+        .clone()
+        .oneshot(chat(json!({
+            "model": "tritium",
+            "messages": [{"role": "user", "content": "1"}],
+            "max_tokens": 1
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    drop(listing);
+}
+
+#[tokio::test]
+async fn inflight_cap_releases_consumed_sse_without_body_drop() {
+    let (router, _) = router_with(MockGenerator::new(vec![10]), {
+        let mut config = ServeConfig::default();
+        config.max_concurrent_requests = 1;
+        config
+    });
+    let request = || {
+        chat(json!({
+            "model": "tritium",
+            "messages": [{"role": "user", "content": "1"}],
+            "max_tokens": 1,
+            "stream": true
+        }))
+    };
+    let first = router.clone().oneshot(request()).await.unwrap();
+    let mut retained_body = first.into_body();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(frame) = retained_body.frame().await {
+            frame.unwrap();
+        }
+    })
+    .await
+    .expect("one-token stream must finish");
+    let next = router.clone().oneshot(request()).await.unwrap();
+    assert_eq!(next.status(), StatusCode::OK);
+    // EOF, not Rust body destruction, must have released the permit.
+    drop(retained_body);
+}
+
+#[tokio::test]
+async fn inflight_cap_keeps_authenticated_probes_bounded_and_available() {
+    let (router, _) = router_with(MockGenerator::new(vec![10]), {
+        let mut config = ServeConfig::default();
+        config.max_concurrent_requests = 1;
+        config.auth_token = Some("fixture-key".to_owned());
+        config
+    });
+    let get = |path: &str, token: &str| {
+        Request::get(path)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let ordinary = router
+        .clone()
+        .oneshot(get("/v1/models", "fixture-key"))
+        .await
+        .unwrap();
+    assert_eq!(ordinary.status(), StatusCode::OK);
+    for path in ["/healthz", "/readyz", "/metrics"] {
+        let (status, _) = send(&router, get(path, "fixture-key")).await;
+        assert_eq!(status, StatusCode::OK, "probe starved: {path}");
+    }
+    let probe = router
+        .clone()
+        .oneshot(get("/metrics", "fixture-key"))
+        .await
+        .unwrap();
+    assert_eq!(probe.status(), StatusCode::OK);
+    let (status, bytes) = send(&router, get("/healthz", "fixture-key")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let error: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(error["error"]["code"], "rate_limit_exceeded");
+    let (status, _) = send(&router, get("/healthz", "wrong-key")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    drop(probe);
+    let (status, _) = send(&router, get("/healthz", "fixture-key")).await;
+    assert_eq!(status, StatusCode::OK);
+    drop(ordinary);
+    let (status, _) = send(&router, get("/v1/models", "fixture-key")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn inflight_cap_releases_cancelled_body_extraction() {
+    let (router, _) = router_with(MockGenerator::new(vec![10]), {
+        let mut config = ServeConfig::default();
+        config.max_concurrent_requests = 1;
+        config.request_timeout_secs = 0;
+        config
+    });
+    let entered = Arc::new(AtomicBool::new(false));
+    let entered_body = entered.clone();
+    let body = Body::from_stream(async_stream::stream! {
+        entered_body.store(true, Ordering::SeqCst);
+        std::future::pending::<()>().await;
+        yield Ok::<_, std::io::Error>(axum::body::Bytes::new());
+    });
+    let request = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(body)
+        .unwrap();
+    let task = tokio::spawn(router.clone().oneshot(request));
+    wait_flag(&entered).await;
+    let (status, _) = send(
+        &router,
+        Request::get("/v1/models").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let (status, _) = send(
+        &router,
+        chat(json!({
+            "model": "tritium",
+            "messages": [{"role": "user", "content": "1"}],
+            "max_tokens": 1
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn inflight_cap_probes_use_idle_capacity_before_the_reserve() {
+    let (router, _) = router_with(MockGenerator::new(vec![10]), {
+        let mut config = ServeConfig::default();
+        config.max_concurrent_requests = 8;
+        config
+    });
+    let mut held = Vec::new();
+    // The frozen deployment matrix uses eight concurrent metric collectors.
+    // A one-slot probe reserve must not serialize ordinary idle capacity.
+    for _ in 0..9 {
+        let response = router
+            .clone()
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        held.push(response);
+    }
+    let (status, _) = send(
+        &router,
+        Request::get("/healthz").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    drop(held);
+    let (status, _) = send(
+        &router,
+        Request::get("/v1/models").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn inflight_cap_saturation_does_not_mask_drain() {
+    let (router, draining) = router_with(MockGenerator::new(vec![10]), {
+        let mut config = ServeConfig::default();
+        config.max_concurrent_requests = 1;
+        config
+    });
+    let held = router
+        .clone()
+        .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(held.status(), StatusCode::OK);
+    draining.store(true, Ordering::Release);
+    for path in [
+        "/v1/chat/completions",
+        "/v1/tree/session",
+        "/v1/tree/verify",
+    ] {
+        let request = Request::post(path)
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let (status, bytes) = send(&router, request).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        let error: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["error"]["message"], "server is draining");
+    }
+    drop(held);
+}
+
+#[tokio::test]
+async fn inflight_cap_zero_disables_ordinary_and_probe_budgets() {
+    let (router, _) = router_with(MockGenerator::new(vec![10]), {
+        let mut config = ServeConfig::default();
+        config.max_concurrent_requests = 0;
+        config
+    });
+    let mut held = Vec::new();
+    for path in ["/v1/models", "/v1/models", "/metrics", "/metrics"] {
+        let response = router
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        held.push(response);
+    }
 }
 
 /// Non-streaming requests are bounded by the request timeout: the handler
@@ -1539,6 +2166,121 @@ async fn sse_deadline_cancels_generation() {
     assert_eq!(status, StatusCode::OK);
     let text = String::from_utf8(body).unwrap();
     assert!(text.contains("tritium_stream_timeouts_total 1\n"), "{text}");
+}
+
+async fn exercise_sse_deadline_body_polling(poll_body: bool) {
+    struct TimedDecode {
+        entered: Arc<AtomicBool>,
+        cancelled: Arc<AtomicBool>,
+    }
+    impl Generator for TimedDecode {
+        fn generate(
+            &mut self,
+            req: &GenRequest,
+            on_step: &mut dyn FnMut(Step) -> bool,
+        ) -> Result<(), GenError> {
+            self.entered.store(true, Ordering::SeqCst);
+            for index in 0..req.max_new {
+                std::thread::sleep(Duration::from_millis(50));
+                if !on_step(Step {
+                    token: 10,
+                    finished: index + 1 == req.max_new,
+                    logprobs: None,
+                    finish_reason: (index + 1 == req.max_new).then_some(FinishReason::Length),
+                }) {
+                    self.cancelled.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+            Ok(())
+        }
+        fn n_ctx(&self) -> usize {
+            4096
+        }
+        fn vocab(&self) -> usize {
+            128_256
+        }
+    }
+    let entered = Arc::new(AtomicBool::new(false));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut config = ServeConfig::default();
+    config.request_timeout_secs = 1;
+    let (router, _) = build_router(
+        Box::new(TimedDecode {
+            entered: entered.clone(),
+            cancelled: cancelled.clone(),
+        }),
+        shared_tok(),
+        config,
+    );
+    let response = router
+        .clone()
+        .oneshot(chat(json!({
+            "model": "tritium",
+            "messages": [{"role": "user", "content": "1"}],
+            "max_tokens": 60,
+            "stream": true
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = Some(response.into_body());
+    let collected = if poll_body {
+        let body = body.take().unwrap();
+        Some(tokio::spawn(async move { body.collect().await }))
+    } else {
+        None
+    };
+    wait_flag(&entered).await;
+    // The unpolled variant retains the body. Sixty tokens fit in the existing
+    // 64-event channel, so backpressure cannot masquerade as the deadline.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !cancelled.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("stream deadline must cancel generation independently of body polling");
+    let (_, metrics) = send(
+        &router,
+        Request::get("/metrics").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert!(
+        String::from_utf8(metrics)
+            .unwrap()
+            .contains("tritium_stream_timeouts_total 1\n")
+    );
+    let bytes = match collected {
+        Some(task) => task.await.unwrap().unwrap().to_bytes(),
+        None => body.unwrap().collect().await.unwrap().to_bytes(),
+    };
+    let events = parse_sse(&bytes);
+    assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
+    let chunks = sse_chunks(&events);
+    assert_eq!(chunks.last().unwrap()["error"]["code"], "request_timeout");
+    let (status, bytes) = send(
+        &router,
+        chat(json!({
+            "model": "tritium",
+            "messages": [{"role": "user", "content": "2"}],
+            "max_tokens": 1
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let response: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(response["choices"][0]["message"]["content"], "10");
+}
+
+#[tokio::test]
+async fn sse_deadline_cancels_unpolled_body_and_worker_recovers() {
+    exercise_sse_deadline_body_polling(false).await;
+}
+
+#[tokio::test]
+async fn sse_deadline_cancels_polled_body_and_worker_recovers() {
+    exercise_sse_deadline_body_polling(true).await;
 }
 
 /// Chat-template rendering: the RoleEot template must reproduce the official

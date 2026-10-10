@@ -109,7 +109,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::generator::{
     DraftPolicy, FinishReason, GenRequest, SPEC_COMMITTED, SPEC_COST, SPEC_VERIFIES, Sampling,
-    SpecGovernor, draft_chain_from_env, draft_greedy_tokens,
+    SpecGovernor, draft_chain_from_env, draft_greedy_tokens_cancellable,
 };
 use crate::worker::{GenEvent, Job, PHASE_DECODE, PHASE_IDLE, PHASE_PREFILL, WorkerTelemetry};
 
@@ -186,6 +186,20 @@ enum PendingGoal {
 }
 
 impl Pending {
+    /// Run the next native chunk without publishing progress or adopting KV.
+    fn forward_chunk(
+        &self,
+        runner: &mut tritium_nn::ModelRunner,
+        chunk: usize,
+        draining: &AtomicBool,
+    ) -> Result<Option<Vec<f32>>, tritium_nn::NnError> {
+        let end = self.done.saturating_add(chunk).min(self.prompt().len());
+        let positions: Vec<usize> = (self.done..end).collect();
+        runner.forward_cancellable(&self.prompt()[self.done..end], &positions, &|| {
+            draining.load(Ordering::Acquire) || self.client_gone()
+        })
+    }
+
     fn prompt(&self) -> &[u32] {
         match &self.goal {
             PendingGoal::Admit { req, .. } | PendingGoal::SpecAdmit { req, .. } => {
@@ -319,6 +333,109 @@ fn release_slot(batch: &mut tritium_cuda::BatchKv, row: usize, telemetry: &Worke
             }
         }
     }
+}
+
+// The worker's ordinary lockstep round. Keep sampling/publication behind the
+// native whole-batch commit; tests cross this same borrowed-query seam.
+fn lockstep_round(
+    runner: &mut tritium_nn::ModelRunner,
+    batch: &mut tritium_cuda::BatchKv,
+    pool: &mut [Option<Active>],
+    eos: u32,
+    telemetry: &WorkerTelemetry,
+    is_draining: &dyn Fn() -> bool,
+) -> Result<bool, tritium_nn::ResidentOpError> {
+    let tokens: Vec<u32> = pool
+        .iter()
+        .map(|slot| slot.as_ref().map_or(0, |active| active.last_token))
+        .collect();
+    for (row, slot) in pool.iter().enumerate() {
+        let _ = batch.set_live(row, slot.is_some());
+    }
+    let started = Instant::now();
+    let step = runner.decode_batch_graph_cancellable(batch, &tokens, &|| {
+        is_draining() || pool.iter().flatten().any(|active| active.tx.is_closed())
+    });
+    telemetry.observe_decode(started.elapsed());
+    let Some(all_logits) = step? else {
+        return Ok(false);
+    };
+    SPEC_COST
+        .lockstep
+        .record(started.elapsed().as_secs_f64() * 1e6);
+    for (row, slot) in pool.iter_mut().enumerate() {
+        let Some(active) = slot.as_mut() else {
+            continue;
+        };
+        active.salt += 1;
+        let Some(token) = sample(
+            &all_logits[row],
+            &active.sampling,
+            (req_seed(&active.sampling), active.salt),
+        ) else {
+            if let Some(active) = slot.take() {
+                let _ = active.tx.try_send(GenEvent::Error("empty logits".into()));
+                release_slot(batch, row, telemetry);
+            }
+            continue;
+        };
+        active.last_token = token;
+        active.history.push(token);
+        if !emit(active, token, eos, &all_logits[row]) {
+            *slot = None;
+            release_slot(batch, row, telemetry);
+        }
+    }
+    Ok(true)
+}
+
+/// Consume a cancelled admission once. Its staging KV is not any live batch
+/// row's KV; resetting it must not retire peers or invalidate their pages.
+fn retire_pending_prefill(
+    pending: &mut Option<Pending>,
+    runner: &mut tritium_nn::ModelRunner,
+    batch: &mut tritium_cuda::BatchKv,
+    telemetry: &WorkerTelemetry,
+    draining: bool,
+) {
+    let Some(pending) = pending.take() else {
+        return;
+    };
+    let row = pending.row();
+    if draining {
+        pending.fail_draining();
+    }
+    runner.reset();
+    if let Some(row) = row {
+        release_slot(batch, row, telemetry);
+    }
+}
+
+/// Keep the worker-owned FIFO wait visible alongside jobs still in the
+/// bounded channel. There is at most one parked admission in this worker.
+fn park_job(parked: &mut Option<Job>, job: Job, telemetry: &WorkerTelemetry) {
+    assert!(
+        parked.is_none(),
+        "batch worker supports one parked queue job"
+    );
+    *parked = Some(job);
+    telemetry.set_parked_queue_job(true);
+}
+
+fn job_client_gone(job: &Job) -> bool {
+    match job {
+        Job::Generate { tx, .. } => tx.is_closed(),
+        Job::OpenTreeSession { resp, .. } => resp.is_closed(),
+        Job::TreeVerify { resp, .. } => resp.is_closed(),
+    }
+}
+
+fn take_parked_job(parked: &mut Option<Job>, telemetry: &WorkerTelemetry) -> Option<Job> {
+    let job = parked.take();
+    if job.is_some() {
+        telemetry.set_parked_queue_job(false);
+    }
+    job
 }
 
 /// Return shared paged-KV free capacity in logical tokens. Dense batches have
@@ -472,7 +589,11 @@ fn spec_cycle(
     s: &mut SpecSeq,
     eos: u32,
     n_ctx: usize,
+    draining: &AtomicBool,
 ) -> Result<SpecOutcome, String> {
+    if s.tx.is_closed() || draining.load(Ordering::Acquire) {
+        return Ok(SpecOutcome::Cancelled);
+    }
     let pending = *s.history.last().expect("spec history holds the prompt");
     // Budget-clamped draft: total tree rows must fit the KV arena
     // (cache_len = history.len() - 1, the verifier needs
@@ -495,7 +616,7 @@ fn spec_cycle(
     let drafts = if max_draft == 0 {
         Vec::new() // suppressed (or clamped): no drafter work at all
     } else {
-        draft_greedy_tokens(
+        let Some(drafts) = draft_greedy_tokens_cancellable(
             draft,
             &mut s.draft_fed,
             &mut s.draft_pos,
@@ -503,8 +624,15 @@ fn spec_cycle(
             &s.history,
             max_draft,
             s.chain,
-        )
+            &|| s.tx.is_closed() || draining.load(Ordering::Acquire),
+        ) else {
+            return Ok(SpecOutcome::Cancelled);
+        };
+        drafts
     };
+    if s.tx.is_closed() || draining.load(Ordering::Acquire) {
+        return Ok(SpecOutcome::Cancelled);
+    }
     // Cost-model d: drafter wall per drafted token (empty results — bails —
     // carry no per-token denominator; skipped). Probe cycles feed
     // draft_resync (telemetry), steady-state cycles the floor's draft_tok.
@@ -519,9 +647,14 @@ fn spec_cycle(
         // Plain M=1 graph step (faster than a 1-node tree).
         let t0 = std::time::Instant::now();
         let pos = s.history.len() - 1;
-        let logits = runner
-            .forward(&[pending], &[pos])
-            .map_err(|e| e.to_string())?;
+        let Some(logits) = runner
+            .forward_cancellable(&[pending], &[pos], &|| {
+                s.tx.is_closed() || draining.load(Ordering::Acquire)
+            })
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(SpecOutcome::Cancelled);
+        };
         s.n_plain += 1;
         let el = t0.elapsed();
         s.t_plain += el;
@@ -539,9 +672,14 @@ fn spec_cycle(
     tokens.extend(&drafts);
     let parents: Vec<i32> = (0..tokens.len() as i32).map(|i| i - 1).collect();
     let t0 = std::time::Instant::now();
-    let committed = runner
-        .tree_verify_greedy(&tokens, &parents)
-        .map_err(|e| e.to_string())?;
+    let Some(committed) = runner
+        .tree_verify_greedy_cancellable(&tokens, &parents, &|| {
+            s.tx.is_closed() || draining.load(Ordering::Acquire)
+        })
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(SpecOutcome::Cancelled);
+    };
     s.n_verify += 1;
     s.n_committed += committed.len();
     SPEC_VERIFIES.fetch_add(1, Ordering::Relaxed);
@@ -690,6 +828,10 @@ struct MultiFallbackLog {
 enum MultiOutcome {
     /// The round ran: drafts verified, committed tokens emitted.
     Ran,
+    /// A grouped verify observed drain or a closed response before any
+    /// promotion. Drop drafter enrollment and re-enter retirement/admission;
+    /// do not fall through to an uncancellable lockstep step in this tick.
+    Cancelled,
     /// Machinery unavailable this round (capacity edge, page exhaustion, or
     /// a device error — logged when it is an error): the caller drops the
     /// pool state and falls through to a lockstep step. Streams unaffected —
@@ -706,6 +848,69 @@ enum MultiOutcome {
     /// watermarks go stale on purpose; a probe re-syncs via the enrollment
     /// prefill.
     Lockstep,
+}
+
+fn spec_group_cancelled(
+    pool: &[Option<Active>],
+    rows: &[usize],
+    is_cancelled: &dyn Fn() -> bool,
+) -> bool {
+    is_cancelled()
+        || rows
+            .iter()
+            .any(|&row| pool[row].as_ref().is_none_or(|a| a.tx.is_closed()))
+}
+
+fn cancel_spec_rows(
+    batch: &mut tritium_cuda::BatchKv,
+    pool: &mut [Option<Active>],
+    rows: &[usize],
+    telemetry: &WorkerTelemetry,
+) -> MultiOutcome {
+    for &row in rows {
+        if pool[row].as_ref().is_some_and(|a| a.tx.is_closed()) {
+            pool[row] = None;
+            release_slot(batch, row, telemetry);
+        }
+    }
+    MultiOutcome::Cancelled
+}
+
+// Full and delta enrollment share a controlled prefill + pre-adoption seam.
+// `Some(())` grants enrollment; cancelled work cannot publish adoption.
+fn enroll_draft_row(
+    draft: &mut tritium_nn::ModelRunner,
+    batch: &mut tritium_cuda::BatchKv,
+    row: usize,
+    history: &[u32],
+    prefix: Option<usize>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Option<()>, String> {
+    if is_cancelled() {
+        return Ok(None);
+    }
+    let start = prefix.unwrap_or(0);
+    let p = history.len() - 1;
+    if prefix.is_some() {
+        draft
+            .adopt_from_batch_row(batch, row, start)
+            .map_err(|e| e.to_string())?;
+    } else {
+        draft.reset();
+    }
+    let positions: Vec<usize> = (start..p).collect();
+    let output = draft
+        .forward_cancellable(&history[start..p], &positions, is_cancelled)
+        .map_err(|e| e.to_string())?;
+    if output.is_none() || is_cancelled() {
+        draft.reset();
+        return Ok(None);
+    }
+    draft
+        .adopt_into_batch_row(batch, row, p)
+        .map_err(|e| e.to_string())?;
+    batch.set_position(row, p).map_err(|e| e.to_string())?;
+    Ok(Some(()))
 }
 
 /// One multi-slot spec round (module docs, "Multi-slot speculative
@@ -730,12 +935,16 @@ fn multi_spec_round(
     n_ctx: usize,
     log: &mut MultiFallbackLog,
     telemetry: &WorkerTelemetry,
+    is_cancelled: &dyn Fn() -> bool,
 ) -> MultiOutcome {
     let slots = pool.len();
     let rows: Vec<usize> = (0..slots).filter(|&r| pool[r].is_some()).collect();
     let n_live = rows.len();
     if n_live == 0 {
         return MultiOutcome::Fallback;
+    }
+    if spec_group_cancelled(pool, &rows, is_cancelled) {
+        return cancel_spec_rows(batch, pool, &rows, telemetry);
     }
     // Even k=1 chains cost 2 nodes per slot; past the cap the one-bucket
     // verify cannot hold everyone. (Realistic pools are far smaller; a
@@ -880,28 +1089,17 @@ fn multi_spec_round(
             let dpos = mp.dbatch.positions()[r];
             let gap = p.saturating_sub(dpos);
             if gap < dpos {
-                let delta = draft
-                    .adopt_from_batch_row(&mp.dbatch, r, dpos)
-                    .map_err(|e| e.to_string())
-                    .and_then(|()| {
-                        let positions: Vec<usize> = (dpos..p).collect();
-                        draft
-                            .forward(&a.history[dpos..p], &positions)
-                            .map(|_| ())
-                            .map_err(|e| e.to_string())
-                    })
-                    .and_then(|()| {
-                        draft
-                            .adopt_into_batch_row(&mut mp.dbatch, r, p)
-                            .map_err(|e| e.to_string())
-                    })
-                    .and_then(|()| mp.dbatch.set_position(r, p).map_err(|e| e.to_string()));
+                let delta =
+                    enroll_draft_row(draft, &mut mp.dbatch, r, &a.history, Some(dpos), &|| {
+                        spec_group_cancelled(pool, &rows, is_cancelled)
+                    });
                 match delta {
-                    Ok(()) => {
+                    Ok(Some(())) => {
                         crate::generator::SPEC_DELTA_RESYNCS
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         continue;
                     }
+                    Ok(None) => return cancel_spec_rows(batch, pool, &rows, telemetry),
                     Err(e) => eprintln!(
                         "tritium-serve: multi-slot spec delta re-sync (row {r}): {e} — \
                          falling back to the full re-prefill"
@@ -909,20 +1107,15 @@ fn multi_spec_round(
                 }
             }
         }
-        draft.reset();
-        let positions: Vec<usize> = (0..p).collect();
-        let enrolled = draft
-            .forward(&a.history[..p], &positions)
-            .map_err(|e| e.to_string())
-            .and_then(|_| {
-                draft
-                    .adopt_into_batch_row(&mut mp.dbatch, r, p)
-                    .map_err(|e| e.to_string())
-            })
-            .and_then(|()| mp.dbatch.set_position(r, p).map_err(|e| e.to_string()));
-        if let Err(e) = enrolled {
-            eprintln!("tritium-serve: multi-slot spec enrollment (row {r}): {e}");
-            return MultiOutcome::Fallback;
+        match enroll_draft_row(draft, &mut mp.dbatch, r, &a.history, None, &|| {
+            spec_group_cancelled(pool, &rows, is_cancelled)
+        }) {
+            Ok(Some(())) => {}
+            Ok(None) => return cancel_spec_rows(batch, pool, &rows, telemetry),
+            Err(e) => {
+                eprintln!("tritium-serve: multi-slot spec enrollment (row {r}): {e}");
+                return MultiOutcome::Fallback;
+            }
         }
         if !keep {
             let (policy, governor) = match (DraftPolicy::from_env(), SpecGovernor::from_env()) {
@@ -979,9 +1172,15 @@ fn multi_spec_round(
             eprintln!("tritium-serve: multi-slot spec gap did not close; lockstep round");
             return MultiOutcome::Fallback;
         }
-        if let Err(e) = draft.draft_batch(&mut mp.dbatch, &feeds, 1, eos) {
-            eprintln!("tritium-serve: multi-slot spec gap feed: {e}");
-            return MultiOutcome::Fallback;
+        match draft.draft_batch_cancellable(&mut mp.dbatch, &feeds, 1, eos, &|| {
+            spec_group_cancelled(pool, &rows, is_cancelled)
+        }) {
+            Ok(Some(_)) => {}
+            Ok(None) => return cancel_spec_rows(batch, pool, &rows, telemetry),
+            Err(e) => {
+                eprintln!("tritium-serve: multi-slot spec gap feed: {e}");
+                return MultiOutcome::Fallback;
+            }
         }
     }
 
@@ -1094,8 +1293,11 @@ fn multi_spec_round(
         }
     }
     let chains: Vec<Vec<u32>> = if any_draft {
-        match draft.draft_batch(&mut mp.dbatch, &feeds, k, eos) {
-            Ok(c) => c,
+        match draft.draft_batch_cancellable(&mut mp.dbatch, &feeds, k, eos, &|| {
+            spec_group_cancelled(pool, &rows, is_cancelled)
+        }) {
+            Ok(Some(c)) => c,
+            Ok(None) => return cancel_spec_rows(batch, pool, &rows, telemetry),
             Err(e) => {
                 // Mid-draft device errors leave the drafter unreconcilable
                 // (fed tokens the host never saw); dropping the pool forces
@@ -1172,8 +1374,13 @@ fn multi_spec_round(
             .map(|(_, t, p)| (t.as_slice(), p.as_slice()))
             .collect();
         let t_v = std::time::Instant::now();
-        let outs = match runner.tree_verify_greedy_slots(batch, &group_rows, &group_trees) {
-            Ok(o) => {
+        let outs = match runner.tree_verify_greedy_slots_cancellable(
+            batch,
+            &group_rows,
+            &group_trees,
+            &|| spec_group_cancelled(pool, &group_rows, is_cancelled),
+        ) {
+            Ok(Some(o)) => {
                 // Cost-model V_round: one grouped verify's wall (with the
                 // equal-split k clamp there is one group per round). The
                 // RAW group wall is recorded at whatever group size is live
@@ -1185,6 +1392,14 @@ fn multi_spec_round(
                     .verify_round
                     .record(t_v.elapsed().as_secs_f64() * 1e6);
                 o
+            }
+            Ok(None) => {
+                // Every selected target prefix is unchanged. The drafter
+                // already fed chains, so the caller drops all enrollment and
+                // live peers re-enroll from their unmodified host histories.
+                // Release only disconnected rows here; drain framing and
+                // release for still-connected rows belong to the outer loop.
+                return cancel_spec_rows(batch, pool, &group_rows, telemetry);
             }
             // An InvalidInput refusal is ATOMIC — every target and tree is
             // host-validated before any device work, so no listed slot
@@ -1327,6 +1542,7 @@ pub(crate) fn run_batched(
     pool_tokens: Option<usize>,
     mut job_rx: mpsc::Receiver<Job>,
     draining: Arc<AtomicBool>,
+    worker_ready: Arc<AtomicBool>,
     phase: Arc<AtomicU8>,
     telemetry: Arc<WorkerTelemetry>,
 ) {
@@ -1337,6 +1553,13 @@ pub(crate) fn run_batched(
         }
     }
     let _phase_guard = PhaseGuard(phase.clone());
+    struct WorkerReadyGuard(Arc<AtomicBool>);
+    impl Drop for WorkerReadyGuard {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    let _ready_guard = WorkerReadyGuard(worker_ready.clone());
     if slots == 0 {
         eprintln!("tritium-serve: --batch-slots must be >= 1");
         return;
@@ -1382,6 +1605,9 @@ pub(crate) fn run_batched(
         return;
     };
     telemetry.set_kv_pool(pool_cap_tokens, pool_cap_tokens);
+    // The thread is alive from spawn, but it must not admit user work until
+    // resident decoder and KV-pool initialization have succeeded.
+    worker_ready.store(true, Ordering::Release);
     // A job that validated but found the page pool exhausted: retried before
     // pulling new work (FIFO), admitted once retirements free pages.
     let mut parked: Option<Job> = None;
@@ -1425,20 +1651,20 @@ pub(crate) fn run_batched(
                     release_slot(&mut batch, row, telemetry.as_ref());
                 }
             }
-            if let Some(p) = pending.take() {
-                let row = p.row();
-                p.fail_draining();
-                if let Some(row) = row {
-                    release_slot(&mut batch, row, telemetry.as_ref());
-                }
-            }
+            retire_pending_prefill(
+                &mut pending,
+                &mut runner,
+                &mut batch,
+                telemetry.as_ref(),
+                true,
+            );
             // Draining fails the solo spec sequence like an active slot.
             if let Some(s) = spec.take() {
                 let _ = s.tx.try_send(GenEvent::Error("server draining".into()));
             }
             multi = None; // drained slots take their enrollments with them
             tree_open = false;
-            match parked.take() {
+            match take_parked_job(&mut parked, telemetry.as_ref()) {
                 None => {}
                 Some(Job::Generate { tx, .. }) => {
                     let _ = tx.try_send(GenEvent::Error("server draining".into()));
@@ -1455,6 +1681,12 @@ pub(crate) fn run_batched(
                 // drain arm rather than silently dropping a responder.
                 Some(other) => unreachable!("non-admission job parked: {other:?}"),
             }
+        }
+        // A seat-starved job has already left the channel. Do not let a
+        // disconnected client occupy the worker's FIFO parked slot until an
+        // unrelated active generation finishes and a row becomes free.
+        if parked.as_ref().is_some_and(job_client_gone) {
+            let _ = take_parked_job(&mut parked, telemetry.as_ref());
         }
         // Admit into free slots: drain waiting jobs, block only when idle.
         // Cap admissions per pass: instantly-retiring jobs (errors, dead
@@ -1483,7 +1715,7 @@ pub(crate) fn run_batched(
                 if needs_seat && free.is_none() {
                     break; // still no seat; wait for a retirement
                 }
-                parked.take().expect("checked is_some")
+                take_parked_job(&mut parked, telemetry.as_ref()).expect("checked is_some")
             } else if any_live || spec.is_some() {
                 // C4: pull even when the pool is FULL — tree ops need no
                 // seat, and a seatless Generate parks below instead of
@@ -1572,13 +1804,17 @@ pub(crate) fn run_batched(
                             telemetry.as_ref(),
                         );
                         if pending.is_some() {
-                            parked = Some(Job::Generate {
-                                req,
-                                request_span,
-                                queue_span: tracing::Span::none(),
-                                accepted_at,
-                                tx,
-                            });
+                            park_job(
+                                &mut parked,
+                                Job::Generate {
+                                    req,
+                                    request_span,
+                                    queue_span: tracing::Span::none(),
+                                    accepted_at,
+                                    tx,
+                                },
+                                telemetry.as_ref(),
+                            );
                             continue; // pending set: the continuation prefills first
                         }
                         // Defensive migration failure (stream already
@@ -1643,13 +1879,17 @@ pub(crate) fn run_batched(
                     // is pulled past a parked job; it is retried as soon as a
                     // retirement frees a slot).
                     let Some(row) = pool.iter().position(Option::is_none) else {
-                        parked = Some(Job::Generate {
-                            req,
-                            request_span,
-                            queue_span: tracing::Span::none(),
-                            accepted_at,
-                            tx,
-                        });
+                        park_job(
+                            &mut parked,
+                            Job::Generate {
+                                req,
+                                request_span,
+                                queue_span: tracing::Span::none(),
+                                accepted_at,
+                                tx,
+                            },
+                            telemetry.as_ref(),
+                        );
                         break;
                     };
                     // Paged KV (C3): reserve the request's whole footprint up
@@ -1680,13 +1920,17 @@ pub(crate) fn run_batched(
                         // reserve_pages ever grows another error kind, match
                         // on it — a permanent error would park-loop.
                         if reserve_pages(&mut batch, row, needed, telemetry.as_ref()).is_err() {
-                            parked = Some(Job::Generate {
-                                req,
-                                request_span,
-                                queue_span: tracing::Span::none(),
-                                accepted_at,
-                                tx,
-                            });
+                            park_job(
+                                &mut parked,
+                                Job::Generate {
+                                    req,
+                                    request_span,
+                                    queue_span: tracing::Span::none(),
+                                    accepted_at,
+                                    tx,
+                                },
+                                telemetry.as_ref(),
+                            );
                             break;
                         }
                     }
@@ -1713,6 +1957,9 @@ pub(crate) fn run_batched(
                 // admissions use, so it interleaves with live slots instead
                 // of stalling them.
                 Job::OpenTreeSession { prompt, resp } => {
+                    if resp.is_closed() {
+                        continue;
+                    }
                     if prompt.is_empty() || prompt.len() >= n_ctx {
                         let _ = resp.send(Err(crate::generator::TreeOpError::BadRequest(
                             "prompt is empty or exceeds the model context window".into(),
@@ -1740,7 +1987,11 @@ pub(crate) fn run_batched(
                             telemetry.as_ref(),
                         );
                         if pending.is_some() {
-                            parked = Some(Job::OpenTreeSession { prompt, resp });
+                            park_job(
+                                &mut parked,
+                                Job::OpenTreeSession { prompt, resp },
+                                telemetry.as_ref(),
+                            );
                             continue;
                         }
                     }
@@ -1763,6 +2014,9 @@ pub(crate) fn run_batched(
                     parents,
                     resp,
                 } => {
+                    if resp.is_closed() {
+                        continue;
+                    }
                     if !tree_open {
                         let _ = resp.send(Err(crate::generator::TreeOpError::Conflict(
                             "no open tree session (open one with /v1/tree/session; a chat \
@@ -1773,7 +2027,9 @@ pub(crate) fn run_batched(
                     }
                     let prior_phase = phase.swap(PHASE_DECODE, Ordering::AcqRel);
                     let out = runner
-                        .tree_verify_greedy(&tokens, &parents)
+                        .tree_verify_greedy_cancellable(&tokens, &parents, &|| {
+                            resp.is_closed() || draining.load(Ordering::Acquire)
+                        })
                         .map_err(|e| match e {
                             tritium_nn::ResidentOpError::Unavailable => {
                                 crate::generator::TreeOpError::Unsupported(
@@ -1786,7 +2042,21 @@ pub(crate) fn run_batched(
                             other => crate::generator::TreeOpError::Internal(other.to_string()),
                         });
                     phase.store(prior_phase, Ordering::Release);
-                    let _ = resp.send(out);
+                    match out {
+                        Ok(Some(tokens)) => {
+                            let _ = resp.send(Ok(tokens));
+                        }
+                        Ok(None) => {
+                            if draining.load(Ordering::Acquire) {
+                                let _ = resp.send(Err(crate::generator::TreeOpError::Draining(
+                                    "server draining".into(),
+                                )));
+                            }
+                        }
+                        Err(error) => {
+                            let _ = resp.send(Err(error));
+                        }
+                    }
                 }
             }
         }
@@ -1798,26 +2068,23 @@ pub(crate) fn run_batched(
         // the pool is empty).
         if let Some(p) = pending.as_mut() {
             if p.client_gone() {
-                // Client gone mid-prefill: abandon the remaining chunks (and
-                // free any reserved pages). The partial single-sequence KV is
-                // dead weight until the next admission's reset.
-                let row = p.row();
-                pending = None;
-                if let Some(row) = row {
-                    release_slot(&mut batch, row, telemetry.as_ref());
-                }
+                retire_pending_prefill(
+                    &mut pending,
+                    &mut runner,
+                    &mut batch,
+                    telemetry.as_ref(),
+                    draining.load(Ordering::Acquire),
+                );
             } else {
                 phase.store(PHASE_PREFILL, Ordering::Release);
                 let len = p.prompt().len();
                 let end = p.done.saturating_add(chunk).min(len);
-                let positions: Vec<usize> = (p.done..end).collect();
                 let prefill_span = tracing::info_span!(
                     parent: &p.request_span,
                     "model.prefill.chunk",
                     chunk_tokens = end - p.done,
                 );
-                match prefill_span.in_scope(|| runner.forward(&p.prompt()[p.done..end], &positions))
-                {
+                match prefill_span.in_scope(|| p.forward_chunk(&mut runner, chunk, &draining)) {
                     Err(e) => {
                         let p = pending.take().expect("pending checked above");
                         let row = p.row();
@@ -1826,7 +2093,21 @@ pub(crate) fn run_batched(
                             release_slot(&mut batch, row, telemetry.as_ref());
                         }
                     }
-                    Ok(logits) => {
+                    Ok(None) => {
+                        let draining_now = draining.load(Ordering::Acquire);
+                        retire_pending_prefill(
+                            &mut pending,
+                            &mut runner,
+                            &mut batch,
+                            telemetry.as_ref(),
+                            draining_now,
+                        );
+                        if draining_now {
+                            // Drain all peers before doing another decode.
+                            continue;
+                        }
+                    }
+                    Ok(Some(logits)) => {
                         p.done = end;
                         if p.done == len {
                             let prefill_elapsed = p.started_at.elapsed();
@@ -2010,9 +2291,17 @@ pub(crate) fn run_batched(
             let decode_started = Instant::now();
             let spec_span =
                 tracing::info_span!(parent: &s.request_span, "model.speculative_decode");
-            match spec_span.in_scope(|| spec_cycle(&mut runner, d, &mut s, eos, n_ctx)) {
+            match spec_span.in_scope(|| spec_cycle(&mut runner, d, &mut s, eos, n_ctx, &draining)) {
                 Ok(SpecOutcome::Continue) => spec = Some(s),
-                Ok(SpecOutcome::Done | SpecOutcome::Cancelled) => s.print_stats(),
+                Ok(SpecOutcome::Done) => s.print_stats(),
+                Ok(SpecOutcome::Cancelled) => {
+                    if draining.load(Ordering::Acquire) {
+                        let _ = s.tx.try_send(GenEvent::Error("server draining".into()));
+                    }
+                    runner.reset();
+                    d.reset();
+                    s.print_stats();
+                }
                 Err(msg) => {
                     let _ = s.tx.try_send(GenEvent::Error(msg));
                 }
@@ -2069,11 +2358,16 @@ pub(crate) fn run_batched(
                     n_ctx,
                     &mut multi_log,
                     telemetry.as_ref(),
+                    &|| draining.load(Ordering::Acquire),
                 )
             });
             telemetry.observe_decode(decode_started.elapsed());
             match outcome {
                 MultiOutcome::Ran => continue,
+                MultiOutcome::Cancelled => {
+                    multi = None;
+                    continue;
+                }
                 MultiOutcome::Fallback => multi = None,
                 MultiOutcome::Disable => {
                     multi = None;
@@ -2094,15 +2388,6 @@ pub(crate) fn run_batched(
         // their pad-token outputs are ignored. Liveness is re-derived from
         // the pool every step (self-healing; adoption/retirement need no
         // separate bookkeeping).
-        let tokens: Vec<u32> = pool
-            .iter()
-            .map(|s| s.as_ref().map_or(0, |a| a.last_token))
-            .collect();
-        for (row, slot) in pool.iter().enumerate() {
-            let _ = batch.set_live(row, slot.is_some());
-        }
-        let t_p = std::time::Instant::now();
-        let decode_started = Instant::now();
         let batch_span = tracing::info_span!(
             parent: None,
             "model.batch.decode",
@@ -2114,15 +2399,19 @@ pub(crate) fn run_batched(
                 batch_span.add_link(context);
             }
         }
-        let step = batch_span.in_scope(|| runner.decode_batch_graph(&mut batch, &tokens));
-        telemetry.observe_decode(decode_started.elapsed());
-        let all_logits = match step {
-            Ok(l) => {
-                // Cost-model P_lockstep: one lockstep step's wall (the
-                // batched floor's plain-step denominator).
-                SPEC_COST.lockstep.record(t_p.elapsed().as_secs_f64() * 1e6);
-                l
-            }
+        let step = batch_span.in_scope(|| {
+            lockstep_round(
+                &mut runner,
+                &mut batch,
+                &mut pool,
+                eos,
+                telemetry.as_ref(),
+                &|| draining.load(Ordering::Acquire),
+            )
+        });
+        match step {
+            Ok(false) => continue, // no same-tick fallback or host publication
+            Ok(true) => {}
             Err(e) => {
                 for (row, slot) in pool.iter_mut().enumerate() {
                     if let Some(a) = slot.take() {
@@ -2132,29 +2421,1418 @@ pub(crate) fn run_batched(
                 }
                 continue;
             }
-        };
-        for (row, slot) in pool.iter_mut().enumerate() {
-            let Some(active) = slot.as_mut() else {
-                continue;
-            };
-            active.salt += 1;
-            let Some(tok) = sample(
-                &all_logits[row],
-                &active.sampling,
-                (req_seed(&active.sampling), active.salt),
-            ) else {
-                if let Some(a) = slot.take() {
-                    let _ = a.tx.try_send(GenEvent::Error("empty logits".into()));
-                    release_slot(&mut batch, row, telemetry.as_ref());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::generator::draft_greedy_tokens;
+    #[test]
+    fn drafter_query_cancels_inside_reconcile_and_host_fallback() {
+        for reconcile in [false, true] {
+            for chain in [false, true] {
+                let trigger: ArmedTrigger = Arc::new(Mutex::new(None));
+                let mut draft = tiny_runner(trigger.clone());
+                let mut reference = tiny_runner(Arc::new(Mutex::new(None)));
+                let history = if reconcile { vec![0, 1, 2, 3] } else { vec![3] };
+                let mut fed = if reconcile { vec![6] } else { vec![] };
+                let mut pos = usize::from(reconcile);
+                if reconcile {
+                    draft.forward(&[0, 6], &[0, 1]).unwrap();
                 }
-                continue;
-            };
-            active.last_token = tok;
-            active.history.push(tok);
-            if !emit(active, tok, eos, &all_logits[row]) {
-                *slot = None;
-                release_slot(&mut batch, row, telemetry.as_ref());
+                let (tx, rx) = mpsc::channel::<GenEvent>(8);
+                *trigger.lock().unwrap() = Some(Box::new(move || drop(rx)));
+                assert!(
+                    crate::generator::draft_greedy_tokens_cancellable(
+                        &mut draft,
+                        &mut fed,
+                        &mut pos,
+                        7,
+                        &history,
+                        3,
+                        chain,
+                        &|| tx.is_closed()
+                    )
+                    .is_none()
+                );
+                assert!(fed.is_empty());
+                assert_eq!(pos, 0);
+                assert!(draft.kv.iter().all(|cache| cache.len == 0));
+                let mut reference_fed = Vec::new();
+                let mut reference_pos = 0;
+                let expected = draft_greedy_tokens(
+                    &mut reference,
+                    &mut reference_fed,
+                    &mut reference_pos,
+                    7,
+                    &history,
+                    3,
+                    chain,
+                );
+                let recovered = crate::generator::draft_greedy_tokens_cancellable(
+                    &mut draft,
+                    &mut fed,
+                    &mut pos,
+                    7,
+                    &history,
+                    3,
+                    chain,
+                    &|| false,
+                )
+                .unwrap();
+                assert_eq!(recovered, expected);
+                assert_eq!(fed, reference_fed);
+                assert_eq!(pos, reference_pos);
+                assert_eq!(cache_bits(&draft), cache_bits(&reference));
             }
         }
+    }
+
+    #[test]
+    fn drafter_native_queries_cancel_and_recover_every_checkpoint() {
+        use std::cell::{Cell, RefCell};
+
+        for chain in [false, true] {
+            let Some(mut draft) = crate::test_support::tiny_cuda_runner(16) else {
+                return;
+            };
+            let mut reference = crate::test_support::tiny_cuda_runner(16).unwrap();
+            let history = [0, 1, 2, 3];
+            reference.forward(&history[..3], &[0, 1, 2]).unwrap();
+            let mut expected = Vec::new();
+            let mut token = 3;
+            for position in 3..6 {
+                let logits = reference.forward(&[token], &[position]).unwrap();
+                token = tritium_nn::sample_greedy(&logits).unwrap();
+                expected.push(token);
+            }
+            let prepare = |draft: &mut ModelRunner| {
+                draft.reset();
+                draft.forward(&[0, 6], &[0, 1]).unwrap();
+            };
+            prepare(&mut draft);
+            let mut fed = vec![6];
+            let mut pos = 1;
+            let polls = Cell::new(0);
+            assert_eq!(
+                draft_greedy_tokens_cancellable(
+                    &mut draft,
+                    &mut fed,
+                    &mut pos,
+                    u32::MAX,
+                    &history,
+                    3,
+                    chain,
+                    &|| {
+                        polls.set(polls.get() + 1);
+                        false
+                    }
+                )
+                .unwrap(),
+                expected
+            );
+            assert_eq!(
+                crate::test_support::prefix_bytes(&mut draft),
+                crate::test_support::prefix_bytes(&mut reference)
+            );
+            assert!(polls.get() > 10);
+            for drain in [false, true] {
+                for cancel_at in 1..=polls.get() {
+                    prepare(&mut draft);
+                    fed = vec![6];
+                    pos = 1;
+                    let before = crate::test_support::prefix_bytes(&mut draft);
+                    let (tx, rx) = mpsc::channel::<GenEvent>(8);
+                    let receiver = RefCell::new(Some(rx));
+                    let draining = AtomicBool::new(false);
+                    let count = Cell::new(0);
+                    assert!(
+                        draft_greedy_tokens_cancellable(
+                            &mut draft,
+                            &mut fed,
+                            &mut pos,
+                            u32::MAX,
+                            &history,
+                            3,
+                            chain,
+                            &|| {
+                                count.set(count.get() + 1);
+                                if count.get() == cancel_at {
+                                    if drain {
+                                        draining.store(true, Ordering::Release);
+                                    } else {
+                                        drop(receiver.borrow_mut().take());
+                                    }
+                                }
+                                tx.is_closed() || draining.load(Ordering::Acquire)
+                            }
+                        )
+                        .is_none()
+                    );
+                    assert_eq!(count.get(), cancel_at);
+                    if cancel_at == 1 {
+                        assert_eq!(pos, 1);
+                        assert_eq!(fed, [6]);
+                        assert_eq!(crate::test_support::prefix_bytes(&mut draft), before);
+                    } else {
+                        assert_eq!(pos, 0);
+                        assert!(fed.is_empty());
+                        assert_eq!(draft.resident_cuda().unwrap().unwrap().cache_len(), 0);
+                    }
+                    assert_eq!(
+                        draft_greedy_tokens_cancellable(
+                            &mut draft,
+                            &mut fed,
+                            &mut pos,
+                            u32::MAX,
+                            &history,
+                            3,
+                            chain,
+                            &|| false
+                        )
+                        .unwrap(),
+                        expected
+                    );
+                    assert_eq!(
+                        crate::test_support::prefix_bytes(&mut draft),
+                        crate::test_support::prefix_bytes(&mut reference)
+                    );
+                    assert!(draft.kv.iter().all(|cache| cache.len == 0));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn drafter_enrollment_cancellation_cannot_adopt_and_preserves_peer() {
+        use std::cell::Cell;
+
+        for delta in [false, true] {
+            let Some(mut draft) = crate::test_support::tiny_cuda_runner(16) else {
+                return;
+            };
+            let mut batch = draft.new_batch(2).unwrap();
+            draft.forward(&[0, 1, 2], &[0, 1, 2]).unwrap();
+            for row in 0..2 {
+                let p = if row == 0 { 1 } else { 3 };
+                draft.adopt_into_batch_row(&mut batch, row, p).unwrap();
+                batch.set_position(row, p).unwrap();
+            }
+            let history = [0, 1, 2, 3];
+            let prefix = delta.then_some(1);
+            let peer = peer_bytes(&mut draft, &batch);
+            let polls = Cell::new(0);
+            assert_eq!(
+                enroll_draft_row(&mut draft, &mut batch, 0, &history, prefix, &|| {
+                    polls.set(polls.get() + 1);
+                    false
+                })
+                .unwrap(),
+                Some(())
+            );
+            assert!(polls.get() >= 5);
+            for cancel_at in 1..=polls.get() {
+                batch.set_position(0, 1).unwrap();
+                let model = draft.resident_cuda().unwrap().unwrap();
+                let before: Vec<_> = (0..2)
+                    .flat_map(|layer| [false, true].map(move |v| (layer, v)))
+                    .map(|(layer, value)| {
+                        model
+                            .debug_batch_kv_row(&batch, layer, 0, 0, value)
+                            .unwrap()
+                    })
+                    .collect();
+                let count = Cell::new(0);
+                assert!(
+                    enroll_draft_row(&mut draft, &mut batch, 0, &history, prefix, &|| {
+                        count.set(count.get() + 1);
+                        count.get() == cancel_at
+                    })
+                    .unwrap()
+                    .is_none()
+                );
+                assert_eq!(batch.positions(), &[1, 3]);
+                assert_eq!(peer_bytes(&mut draft, &batch), peer);
+                let model = draft.resident_cuda().unwrap().unwrap();
+                let after: Vec<_> = (0..2)
+                    .flat_map(|layer| [false, true].map(move |v| (layer, v)))
+                    .map(|(layer, value)| {
+                        model
+                            .debug_batch_kv_row(&batch, layer, 0, 0, value)
+                            .unwrap()
+                    })
+                    .collect();
+                assert_eq!(before, after);
+                assert_eq!(
+                    enroll_draft_row(&mut draft, &mut batch, 0, &history, prefix, &|| false)
+                        .unwrap(),
+                    Some(())
+                );
+                assert_eq!(batch.positions(), &[3, 3]);
+                assert_eq!(peer_bytes(&mut draft, &batch), peer);
+            }
+        }
+    }
+
+    #[test]
+    fn controlled_native_drafter_facade_distinguishes_unavailability() {
+        let mut draft = tiny_runner(Arc::new(Mutex::new(Some(Box::new(|| {
+            panic!("native facade must not start host work")
+        })))));
+        assert!(matches!(
+            draft.decode_greedy_chain_cancellable(3, 0, 3, 7, &|| false),
+            Err(tritium_nn::ResidentOpError::Unavailable)
+        ));
+        assert!(matches!(
+            draft.decode_greedy_step_cancellable(3, 0, &|| false),
+            Err(tritium_nn::ResidentOpError::Unavailable)
+        ));
+        assert!(
+            draft
+                .decode_greedy_chain_cancellable(8, 0, 0, 7, &|| true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            draft
+                .decode_greedy_step_cancellable(8, 0, &|| true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(draft.kv.iter().all(|cache| cache.len == 0));
+    }
+
+    #[test]
+    fn lockstep_facade_distinguishes_native_unavailability_from_cancellation() {
+        let Some(mut native) = crate::test_support::tiny_cuda_runner(16) else {
+            return;
+        };
+        let mut batch = native.new_batch(2).unwrap();
+        let mut host = tiny_runner(Arc::new(Mutex::new(Some(Box::new(|| {
+            panic!("controlled native facade must not run host projections")
+        })))));
+        assert!(matches!(
+            host.decode_batch_graph_cancellable(&mut batch, &[3, 6], &|| false),
+            Err(tritium_nn::ResidentOpError::Unavailable)
+        ));
+        assert!(
+            host.decode_batch_graph_cancellable(&mut batch, &[], &|| true)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(batch.positions(), &[0, 0]);
+        assert_eq!(batch.debug_decode_graphs(), (false, false));
+        assert!(host.kv.iter().all(|cache| cache.len == 0));
+    }
+
+    fn group_active(id: u64, tx: mpsc::Sender<GenEvent>, history: Vec<u32>) -> Active {
+        Active {
+            tx,
+            request_span: tracing::Span::none(),
+            id,
+            sampling: Sampling::Greedy,
+            logprobs: None,
+            stop_eos: false,
+            remaining: 16,
+            last_token: *history.last().unwrap(),
+            history,
+            salt: 0,
+        }
+    }
+
+    #[test]
+    fn grouped_query_observes_only_selected_responses_and_drain() {
+        let (tx0, rx0) = mpsc::channel(8);
+        let (tx1, rx1) = mpsc::channel(8);
+        let pool = vec![
+            Some(group_active(0, tx0, vec![0])),
+            Some(group_active(1, tx1, vec![1])),
+        ];
+        let draining = AtomicBool::new(false);
+        assert!(!spec_group_cancelled(&pool, &[0, 1], &|| draining.load(Ordering::Acquire)));
+        drop(rx1);
+        assert!(!spec_group_cancelled(&pool, &[0], &|| draining.load(Ordering::Acquire)));
+        assert!(spec_group_cancelled(&pool, &[0, 1], &|| draining.load(Ordering::Acquire)));
+        draining.store(true, Ordering::Release);
+        assert!(spec_group_cancelled(&pool, &[0], &|| draining.load(Ordering::Acquire)));
+        draining.store(false, Ordering::Release);
+        drop(rx0);
+        assert!(spec_group_cancelled(&pool, &[0], &|| draining.load(Ordering::Acquire)));
+    }
+
+    #[test]
+    fn lockstep_round_response_or_drain_cancels_without_peer_publication() {
+        use std::cell::{Cell, RefCell};
+        for drain in [false, true] {
+            for cancel_at in [1, 4, 5, 8] {
+                let Some(mut runner) = crate::test_support::tiny_cuda_runner(16) else {
+                    return;
+                };
+                let mut reference = crate::test_support::tiny_cuda_runner(16).unwrap();
+                let expected = reference.forward(&[0, 1, 2, 4], &[0, 1, 2, 3]).unwrap();
+                let expected_token = tritium_nn::sample_greedy(&expected).unwrap();
+                runner.forward(&[0, 1, 2], &[0, 1, 2]).unwrap();
+                let mut batch = runner.new_batch_paged(2, 2).unwrap();
+                let telemetry = WorkerTelemetry::default();
+                let capacity = kv_free_tokens(&batch);
+                telemetry.set_kv_pool(capacity, capacity);
+                for row in 0..2 {
+                    reserve_pages(&mut batch, row, 16, &telemetry).unwrap();
+                    runner.adopt_into_batch_row(&mut batch, row, 3).unwrap();
+                    batch.set_position(row, 3).unwrap();
+                }
+                let before = peer_bytes(&mut runner, &batch);
+                let pages: Vec<_> = (0..2).map(|row| batch.debug_page_table_row(row)).collect();
+                let (tx0, rx0) = mpsc::channel(8);
+                let receiver = RefCell::new(Some(rx0));
+                let (tx1, mut rx1) = mpsc::channel(8);
+                let histories = [vec![0, 1, 2, 3], vec![0, 1, 2, 4]];
+                let mut pool = vec![
+                    Some(group_active(0, tx0, histories[0].clone())),
+                    Some(group_active(1, tx1, histories[1].clone())),
+                ];
+                let draining = AtomicBool::new(false);
+                let polls = Cell::new(0);
+                assert!(
+                    !lockstep_round(&mut runner, &mut batch, &mut pool, 7, &telemetry, &|| {
+                        polls.set(polls.get() + 1);
+                        if polls.get() == cancel_at {
+                            if drain {
+                                draining.store(true, Ordering::Release);
+                            } else {
+                                drop(receiver.borrow_mut().take());
+                            }
+                        }
+                        draining.load(Ordering::Acquire)
+                    })
+                    .unwrap(),
+                    "cancel_at={cancel_at}, drain={drain}"
+                );
+                assert_eq!(polls.get(), cancel_at);
+                assert_eq!(
+                    telemetry.kv_pool_reservations_total.load(Ordering::Relaxed),
+                    2
+                );
+                assert_eq!(telemetry.kv_pool_releases_total.load(Ordering::Relaxed), 0);
+                assert_eq!(batch.positions(), &[3, 3]);
+                assert_eq!(peer_bytes(&mut runner, &batch), before);
+                assert_eq!(
+                    (0..2)
+                        .map(|row| batch.debug_page_table_row(row))
+                        .collect::<Vec<_>>(),
+                    pages
+                );
+                for (row, active) in pool.iter().enumerate() {
+                    let active = active.as_ref().unwrap();
+                    assert_eq!(active.history, histories[row]);
+                    assert_eq!(active.remaining, 16);
+                    assert_eq!(active.salt, 0);
+                }
+                assert!(matches!(
+                    rx1.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+                if drain {
+                    assert!(matches!(
+                        receiver.borrow_mut().as_mut().unwrap().try_recv(),
+                        Err(mpsc::error::TryRecvError::Empty)
+                    ));
+                    for (row, slot) in pool.iter_mut().enumerate() {
+                        drop(slot.take());
+                        release_slot(&mut batch, row, &telemetry);
+                    }
+                    assert_eq!(kv_free_tokens(&batch), capacity);
+                    assert_eq!(telemetry.kv_pool_releases_total.load(Ordering::Relaxed), 2);
+                } else {
+                    // The next worker iteration retires the disconnected row only.
+                    drop(pool[0].take());
+                    release_slot(&mut batch, 0, &telemetry);
+                    assert!(
+                        lockstep_round(&mut runner, &mut batch, &mut pool, 7, &telemetry, &|| {
+                            false
+                        })
+                        .unwrap()
+                    );
+                    assert_eq!(batch.positions(), &[3, 4]);
+                    let peer = pool[1].as_ref().unwrap();
+                    assert_eq!(peer.remaining, 15);
+                    assert_eq!(peer.salt, 1);
+                    assert_eq!(peer.last_token, expected_token);
+                    assert_eq!(peer.history, [0, 1, 2, 4, expected_token]);
+                    assert_eq!(telemetry.kv_pool_releases_total.load(Ordering::Relaxed), 1);
+                    assert!(
+                        matches!(rx1.try_recv(), Ok(GenEvent::Token(token, _)) if token == expected_token)
+                    );
+                }
+                assert_eq!(
+                    telemetry
+                        .kv_pool_release_failures_total
+                        .load(Ordering::Relaxed),
+                    0
+                );
+                assert!(runner.kv.iter().all(|cache| cache.len == 0));
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_response_query_cancels_submitted_native_work() {
+        use std::cell::{Cell, RefCell};
+
+        for context in [16, 12289] {
+            for drain in [false, true] {
+                let Some(mut runner) = crate::test_support::tiny_cuda_runner(context) else {
+                    return;
+                };
+                runner.forward(&[0, 1, 2], &[0, 1, 2]).unwrap();
+                let mut batch = runner.new_batch_paged(2, 2).unwrap();
+                for row in 0..2 {
+                    batch.reserve_pages(row, 16).unwrap();
+                    runner.adopt_into_batch_row(&mut batch, row, 3).unwrap();
+                    batch.set_position(row, 3).unwrap();
+                }
+                let before = peer_bytes(&mut runner, &batch);
+                let free = batch.free_pages();
+                let (tx0, rx0) = mpsc::channel(8);
+                let receiver = RefCell::new(Some(rx0));
+                let (tx1, mut rx1) = mpsc::channel(8);
+                let pool = vec![
+                    Some(group_active(0, tx0, vec![0, 1, 2, 3])),
+                    Some(group_active(1, tx1, vec![0, 1, 2, 4])),
+                ];
+                let draining = AtomicBool::new(false);
+                let polls = Cell::new(0);
+                let trees = [(&[3, 4][..], &[-1, 0][..]), (&[4, 5][..], &[-1, 0][..])];
+                assert!(
+                    runner
+                        .tree_verify_greedy_slots_cancellable(&mut batch, &[0, 1], &trees, &|| {
+                            polls.set(polls.get() + 1);
+                            // Fixture injection after device uploads, not entry-only.
+                            // Invocation count remains intentionally non-contractual.
+                            if polls.get() == 5 {
+                                if drain {
+                                    draining.store(true, Ordering::Release);
+                                } else {
+                                    drop(receiver.borrow_mut().take());
+                                }
+                            }
+                            spec_group_cancelled(&pool, &[0, 1], &|| {
+                                draining.load(Ordering::Acquire)
+                            })
+                        })
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(polls.get(), 5);
+                assert_eq!(batch.positions(), &[3, 3]);
+                assert_eq!(peer_bytes(&mut runner, &batch), before);
+                assert_eq!(batch.free_pages(), free);
+                assert!(matches!(
+                    rx1.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+                assert_eq!(pool[1].as_ref().unwrap().remaining, 16);
+                assert!(runner.kv.iter().all(|cache| cache.len == 0));
+                assert!(
+                    runner
+                        .tree_verify_greedy_slots(&mut batch, &[0, 1], &trees)
+                        .is_ok()
+                );
+                assert_eq!(
+                    batch.debug_tree_slots_graph_bucket_count() > 0,
+                    context == 16
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_spec_cancellation_preserves_live_peer_and_recovers() {
+        for context in [16, 12289] {
+            for drain in [false, true] {
+                let Some(mut runner) = crate::test_support::tiny_cuda_runner(context) else {
+                    return;
+                };
+                let mut draft = crate::test_support::tiny_cuda_runner(16).unwrap();
+                let mut reference = crate::test_support::tiny_cuda_runner(context).unwrap();
+                let mut batch = runner.new_batch_paged(2, 2).unwrap();
+                let telemetry = WorkerTelemetry::default();
+                let histories = [vec![0, 1, 2, 3], vec![4, 5, 6, 7]];
+                for (row, history) in histories.iter().enumerate() {
+                    reserve_pages(&mut batch, row, 16, &telemetry).unwrap();
+                    runner.reset();
+                    runner.forward(&history[..3], &[0, 1, 2]).unwrap();
+                    runner.adopt_into_batch_row(&mut batch, row, 3).unwrap();
+                    batch.set_position(row, 3).unwrap();
+                }
+                let before = peer_bytes(&mut runner, &batch);
+                let free = batch.free_pages();
+                let pages = batch.debug_page_table_row(1);
+                let (tx0, rx0) = mpsc::channel(64);
+                let (tx1, mut rx1) = mpsc::channel(64);
+                let mut rx0 = Some(rx0);
+                let mut pool = vec![
+                    Some(group_active(0, tx0, histories[0].clone())),
+                    Some(group_active(1, tx1, histories[1].clone())),
+                ];
+                if !drain {
+                    drop(rx0.take());
+                }
+                let draining = AtomicBool::new(drain);
+                let mut multi = None;
+                let mut log = MultiFallbackLog::default();
+                assert!(matches!(
+                    multi_spec_round(
+                        &mut runner,
+                        &mut draft,
+                        &mut batch,
+                        &mut multi,
+                        &mut pool,
+                        7,
+                        context as usize,
+                        &mut log,
+                        &telemetry,
+                        &|| draining.load(Ordering::Acquire)
+                    ),
+                    MultiOutcome::Cancelled
+                ));
+                // Known cancellation now avoids drafter enrollment entirely.
+                // In-operation queries have separate checkpoint sweeps.
+                assert!(multi.is_none());
+                assert!(matches!(
+                    rx1.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+                assert_eq!(pool[1].as_ref().unwrap().history, histories[1]);
+                assert_eq!(pool[1].as_ref().unwrap().remaining, 16);
+                assert_eq!(batch.positions()[1], 3);
+                assert_eq!(peer_bytes(&mut runner, &batch), before);
+                assert_eq!(batch.debug_page_table_row(1), pages);
+                assert_eq!(batch.free_pages(), free + usize::from(!drain));
+                assert_eq!(
+                    telemetry.kv_pool_releases_total.load(Ordering::Relaxed),
+                    u64::from(!drain)
+                );
+                assert_eq!(pool[0].is_none(), !drain);
+                // Mirror the caller's cancellation arm: discard overfed draft
+                // enrollment and start the next tick, never same-tick lockstep.
+                multi = None;
+                draining.store(false, Ordering::Release);
+                assert!(matches!(
+                    multi_spec_round(
+                        &mut runner,
+                        &mut draft,
+                        &mut batch,
+                        &mut multi,
+                        &mut pool,
+                        7,
+                        context as usize,
+                        &mut log,
+                        &telemetry,
+                        &|| draining.load(Ordering::Acquire)
+                    ),
+                    MultiOutcome::Ran
+                ));
+                let mut emitted = Vec::new();
+                while let Ok(event) = rx1.try_recv() {
+                    match event {
+                        GenEvent::Token(token, _) => emitted.push(token),
+                        other => panic!("unexpected grouped event: {other:?}"),
+                    }
+                }
+                assert!(!emitted.is_empty());
+                reference.forward(&histories[1][..3], &[0, 1, 2]).unwrap();
+                let mut pending = 7;
+                for (offset, &token) in emitted.iter().enumerate() {
+                    let logits = reference.forward(&[pending], &[3 + offset]).unwrap();
+                    assert_eq!(token, sample(&logits, &Sampling::Greedy, (0, 0)).unwrap());
+                    pending = token;
+                }
+                assert_eq!(
+                    batch.debug_tree_slots_graph_bucket_count() > 0,
+                    context == 16
+                );
+                assert_eq!(
+                    telemetry
+                        .kv_pool_release_failures_total
+                        .load(Ordering::Relaxed),
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn drafter_group_round_cancels_every_checkpoint_and_recovers_peer() {
+        use std::cell::{Cell, RefCell};
+
+        let histories = [vec![0, 1, 2, 3], vec![4, 5, 6, 7]];
+        let Some(mut runner) = crate::test_support::tiny_cuda_runner(16) else {
+            return;
+        };
+        let mut draft = crate::test_support::tiny_cuda_runner(16).unwrap();
+        let target_prefix = |runner: &mut ModelRunner, batch: &tritium_cuda::BatchKv| {
+            let model = runner.resident_cuda().unwrap().unwrap();
+            (0..2)
+                .flat_map(|slot| {
+                    (0..2).flat_map(move |layer| {
+                        (0..3).flat_map(move |pos| {
+                            [false, true].map(move |value| (slot, layer, pos, value))
+                        })
+                    })
+                })
+                .map(|(slot, layer, pos, value)| {
+                    model
+                        .debug_batch_kv_row(batch, layer, slot, pos, value)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        let prepare = |runner: &mut ModelRunner, telemetry: &WorkerTelemetry| {
+            let mut batch = runner.new_batch_paged(2, 2).unwrap();
+            for (row, history) in histories.iter().enumerate() {
+                reserve_pages(&mut batch, row, 16, telemetry).unwrap();
+                runner.reset();
+                runner.forward(&history[..3], &[0, 1, 2]).unwrap();
+                runner.adopt_into_batch_row(&mut batch, row, 3).unwrap();
+                batch.set_position(row, 3).unwrap();
+            }
+            batch
+        };
+        let telemetry = WorkerTelemetry::default();
+        let mut batch = prepare(&mut runner, &telemetry);
+        let (tx0, _rx0) = mpsc::channel(64);
+        let (tx1, _rx1) = mpsc::channel(64);
+        let mut pool = vec![
+            Some(group_active(0, tx0, histories[0].clone())),
+            Some(group_active(1, tx1, histories[1].clone())),
+        ];
+        let polls = Cell::new(0);
+        assert!(matches!(
+            multi_spec_round(
+                &mut runner,
+                &mut draft,
+                &mut batch,
+                &mut None,
+                &mut pool,
+                7,
+                16,
+                &mut MultiFallbackLog::default(),
+                &telemetry,
+                &|| {
+                    polls.set(polls.get() + 1);
+                    false
+                },
+            ),
+            MultiOutcome::Ran
+        ));
+        assert!(
+            polls.get() > 20,
+            "must reach enrollment, drafting and verification"
+        );
+        for drain in [false, true] {
+            for cancel_at in 1..=polls.get() {
+                let telemetry = WorkerTelemetry::default();
+                let mut batch = prepare(&mut runner, &telemetry);
+                let before = peer_bytes(&mut runner, &batch);
+                let both_before = target_prefix(&mut runner, &batch);
+                let free = batch.free_pages();
+                let pages = batch.debug_page_table_row(1);
+                let (tx0, rx0) = mpsc::channel(64);
+                let receiver = RefCell::new(Some(rx0));
+                let (tx1, mut rx1) = mpsc::channel(64);
+                let mut pool = vec![
+                    Some(group_active(0, tx0, histories[0].clone())),
+                    Some(group_active(1, tx1, histories[1].clone())),
+                ];
+                let draining = AtomicBool::new(false);
+                let count = Cell::new(0);
+                let mut multi = None;
+                let mut log = MultiFallbackLog::default();
+                assert!(
+                    matches!(
+                        multi_spec_round(
+                            &mut runner,
+                            &mut draft,
+                            &mut batch,
+                            &mut multi,
+                            &mut pool,
+                            7,
+                            16,
+                            &mut log,
+                            &telemetry,
+                            &|| {
+                                count.set(count.get() + 1);
+                                if count.get() == cancel_at {
+                                    if drain {
+                                        draining.store(true, Ordering::Release);
+                                    } else {
+                                        drop(receiver.borrow_mut().take());
+                                    }
+                                }
+                                draining.load(Ordering::Acquire)
+                            },
+                        ),
+                        MultiOutcome::Cancelled
+                    ),
+                    "checkpoint {cancel_at}, drain={drain}"
+                );
+                assert_eq!(count.get(), cancel_at);
+                assert_eq!(peer_bytes(&mut runner, &batch), before);
+                if drain {
+                    assert_eq!(target_prefix(&mut runner, &batch), both_before);
+                    assert_eq!(batch.positions(), &[3, 3]);
+                    assert_eq!(pool[0].as_ref().unwrap().history, histories[0]);
+                    assert_eq!(pool[0].as_ref().unwrap().remaining, 16);
+                }
+                assert_eq!(batch.positions()[1], 3);
+                assert_eq!(batch.debug_page_table_row(1), pages);
+                assert_eq!(batch.free_pages(), free + usize::from(!drain));
+                assert_eq!(pool[0].is_none(), !drain);
+                assert_eq!(pool[1].as_ref().unwrap().history, histories[1]);
+                assert_eq!(pool[1].as_ref().unwrap().remaining, 16);
+                assert!(matches!(
+                    rx1.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+                assert_eq!(
+                    telemetry.kv_pool_releases_total.load(Ordering::Relaxed),
+                    u64::from(!drain)
+                );
+                // The real worker discards the overfed draft pool and returns
+                // to retirement; recovery is a new tick, not same-tick fallback.
+                multi = None;
+                draining.store(false, Ordering::Release);
+                assert!(matches!(
+                    multi_spec_round(
+                        &mut runner,
+                        &mut draft,
+                        &mut batch,
+                        &mut multi,
+                        &mut pool,
+                        7,
+                        16,
+                        &mut log,
+                        &telemetry,
+                        &|| false,
+                    ),
+                    MultiOutcome::Ran
+                ));
+                let mut reference = crate::test_support::tiny_cuda_runner(16).unwrap();
+                reference.forward(&histories[1][..3], &[0, 1, 2]).unwrap();
+                let mut pending = 7;
+                let mut emitted = 0;
+                while let Ok(event) = rx1.try_recv() {
+                    let GenEvent::Token(token, _) = event else {
+                        panic!("unexpected recovery event: {event:?}");
+                    };
+                    let logits = reference.forward(&[pending], &[3 + emitted]).unwrap();
+                    assert_eq!(token, sample(&logits, &Sampling::Greedy, (0, 0)).unwrap());
+                    pending = token;
+                    emitted += 1;
+                }
+                assert!(emitted > 0);
+                assert!(batch.debug_tree_slots_graph_bucket_count() > 0);
+                assert_eq!(
+                    telemetry
+                        .kv_pool_release_failures_total
+                        .load(Ordering::Relaxed),
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn drafter_solo_cycle_cancels_before_target_work() {
+        for drain in [false, true] {
+            for chain in [false, true] {
+                let target_trigger: ArmedTrigger = Arc::new(Mutex::new(None));
+                let draft_trigger: ArmedTrigger = Arc::new(Mutex::new(None));
+                let mut runner = tiny_runner(target_trigger.clone());
+                let mut draft = tiny_runner(draft_trigger.clone());
+                runner.forward(&[0, 1, 2], &[0, 1, 2]).unwrap();
+                let before = cache_bits(&runner);
+                *target_trigger.lock().unwrap() = Some(Box::new(|| {
+                    panic!("cancelled drafter must not enter target fallback/verify");
+                }));
+                let (tx, rx) = mpsc::channel(16);
+                let mut receiver = Some(rx);
+                let draining = Arc::new(AtomicBool::new(false));
+                *draft_trigger.lock().unwrap() = Some(if drain {
+                    let flag = draining.clone();
+                    Box::new(move || flag.store(true, Ordering::Release))
+                } else {
+                    let receiver = receiver.take().unwrap();
+                    Box::new(move || drop(receiver))
+                });
+                let history = vec![0, 1, 2, 3];
+                let mut state = SpecSeq {
+                    tx,
+                    request_span: tracing::Span::none(),
+                    history: history.clone(),
+                    emitted: 0,
+                    max_new: 8,
+                    req: GenRequest {
+                        prompt_tokens: vec![0],
+                        max_new: 8,
+                        logprobs: None,
+                        sampling: Sampling::Greedy,
+                        stop_eos: false,
+                    },
+                    policy: DraftPolicy::Adaptive { acc: 0.75 },
+                    governor: SpecGovernor::Off,
+                    chain,
+                    draft_fed: Vec::new(),
+                    draft_pos: 0,
+                    stats: false,
+                    n_verify: 0,
+                    n_committed: 0,
+                    n_plain: 0,
+                    t_verify: std::time::Duration::ZERO,
+                    t_plain: std::time::Duration::ZERO,
+                };
+                assert!(matches!(
+                    spec_cycle(&mut runner, &mut draft, &mut state, 7, 16, &draining).unwrap(),
+                    SpecOutcome::Cancelled
+                ));
+                assert!(
+                    draft_trigger.lock().unwrap().is_none(),
+                    "drafter work must enter"
+                );
+                assert!(
+                    target_trigger.lock().unwrap().is_some(),
+                    "target work must not enter"
+                );
+                assert_eq!(cache_bits(&runner), before);
+                assert_eq!(state.history, history);
+                assert_eq!(state.emitted, 0);
+                assert_eq!(
+                    (state.n_verify, state.n_plain, state.n_committed),
+                    (0, 0, 0)
+                );
+                assert!(state.draft_fed.is_empty());
+                assert_eq!(state.draft_pos, 0);
+                assert!(draft.kv.iter().all(|cache| cache.len == 0));
+                if let Some(receiver) = receiver.as_mut() {
+                    assert!(matches!(
+                        receiver.try_recv(),
+                        Err(mpsc::error::TryRecvError::Empty)
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn solo_spec_cycle_cancels_inside_target_forward_without_publication() {
+        for drain in [false, true] {
+            for prefix in [0, 1] {
+                let trigger: ArmedTrigger = Arc::new(Mutex::new(None));
+                let mut runner = tiny_runner(trigger.clone());
+                let mut reference = tiny_runner(Arc::new(Mutex::new(None)));
+                let mut draft = tiny_runner(Arc::new(Mutex::new(Some(Box::new(|| {
+                    panic!("budget-clamped cycle must not enter the drafter")
+                })))));
+                if prefix != 0 {
+                    runner.forward(&[0], &[0]).unwrap();
+                    reference.forward(&[0], &[0]).unwrap();
+                }
+                let before = cache_bits(&runner);
+                let (tx, rx) = mpsc::channel(4);
+                let mut receiver = Some(rx);
+                let draining = Arc::new(AtomicBool::new(false));
+                *trigger.lock().unwrap() = Some(if drain {
+                    let flag = draining.clone();
+                    Box::new(move || flag.store(true, Ordering::Release))
+                } else {
+                    let receiver = receiver.take().unwrap();
+                    Box::new(move || drop(receiver))
+                });
+                let history = if prefix == 0 { vec![1] } else { vec![0, 1] };
+                let mut state = SpecSeq {
+                    tx,
+                    request_span: tracing::Span::none(),
+                    history: history.clone(),
+                    emitted: 3,
+                    max_new: 4,
+                    req: GenRequest {
+                        prompt_tokens: vec![0],
+                        max_new: 4,
+                        logprobs: None,
+                        sampling: Sampling::Greedy,
+                        stop_eos: false,
+                    },
+                    policy: DraftPolicy::Adaptive { acc: 0.75 },
+                    governor: SpecGovernor::Off,
+                    chain: true,
+                    draft_fed: Vec::new(),
+                    draft_pos: 0,
+                    stats: false,
+                    n_verify: 0,
+                    n_committed: 0,
+                    n_plain: 0,
+                    t_verify: std::time::Duration::ZERO,
+                    t_plain: std::time::Duration::ZERO,
+                };
+                assert!(matches!(
+                    spec_cycle(&mut runner, &mut draft, &mut state, 7, 16, &draining).unwrap(),
+                    SpecOutcome::Cancelled
+                ));
+                assert!(
+                    trigger.lock().unwrap().is_none(),
+                    "target projection must enter"
+                );
+                assert_eq!(cache_bits(&runner), before);
+                assert_eq!(state.history, history);
+                assert_eq!(state.emitted, 3);
+                assert_eq!(
+                    (state.n_plain, state.n_verify, state.n_committed),
+                    (0, 0, 0)
+                );
+                assert_eq!(state.tx.is_closed(), !drain);
+                if let Some(receiver) = receiver.as_mut() {
+                    assert!(matches!(
+                        receiver.try_recv(),
+                        Err(mpsc::error::TryRecvError::Empty)
+                    ));
+                }
+                let recovered = runner.forward(&[1], &[prefix]).unwrap();
+                let expected = reference.forward(&[1], &[prefix]).unwrap();
+                assert_eq!(
+                    recovered
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    expected
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(cache_bits(&runner), cache_bits(&reference));
+            }
+        }
+    }
+
+    #[test]
+    fn solo_spec_cycle_skips_closed_or_draining_target_work() {
+        for drain in [false, true] {
+            let trigger = || -> ArmedTrigger {
+                Arc::new(Mutex::new(Some(Box::new(|| {
+                    panic!("cancelled solo cycle entered a projection")
+                }))))
+            };
+            let mut runner = tiny_runner(trigger());
+            let mut draft = tiny_runner(trigger());
+            let (tx, rx) = mpsc::channel(4);
+            let mut rx = Some(rx);
+            if !drain {
+                rx.take();
+            }
+            let req = GenRequest {
+                prompt_tokens: vec![0],
+                max_new: 4,
+                logprobs: None,
+                sampling: Sampling::Greedy,
+                stop_eos: false,
+            };
+            let mut state = SpecSeq {
+                tx,
+                request_span: tracing::Span::none(),
+                history: vec![0],
+                emitted: 1,
+                max_new: 4,
+                req,
+                policy: DraftPolicy::from_env().unwrap(),
+                governor: SpecGovernor::from_env().unwrap(),
+                chain: true,
+                draft_fed: Vec::new(),
+                draft_pos: 0,
+                stats: false,
+                n_verify: 0,
+                n_committed: 0,
+                n_plain: 0,
+                t_verify: std::time::Duration::ZERO,
+                t_plain: std::time::Duration::ZERO,
+            };
+            assert_eq!(state.tx.is_closed(), !drain);
+            assert!(matches!(
+                spec_cycle(
+                    &mut runner,
+                    &mut draft,
+                    &mut state,
+                    7,
+                    16,
+                    &AtomicBool::new(drain)
+                )
+                .unwrap(),
+                SpecOutcome::Cancelled
+            ));
+            assert_eq!(state.history, vec![0]);
+            assert_eq!(
+                (state.n_verify, state.n_plain, state.n_committed),
+                (0, 0, 0)
+            );
+            assert!(
+                runner
+                    .kv
+                    .iter()
+                    .chain(&draft.kv)
+                    .all(|cache| cache.len == 0)
+            );
+        }
+    }
+
+    use super::*;
+    use std::sync::Mutex;
+    use tritium_nn::{
+        DenseLinear, Mlp, ModelConfig, ModelRunner, ModelWeights, Projection, SwiGluMlp,
+        TernaryLinear, TokenEmbedding, TransformerBlock,
+    };
+    use tritium_spec::{
+        BackendError, DeviceBuffer, DeviceCaps, GemmShape, MpGemm, TernaryBackend, TernaryFormat,
+    };
+
+    type Trigger = Box<dyn FnOnce() + Send>;
+    type ArmedTrigger = Arc<Mutex<Option<Trigger>>>;
+
+    // Invoke the client-close/drain action inside the first real projection,
+    // not from a mocked cancellation result or a timing-dependent sleep.
+    struct ProjectionTrigger {
+        cpu: tritium_cpu::CpuBackend,
+        trigger: ArmedTrigger,
+    }
+
+    impl TernaryBackend for ProjectionTrigger {
+        fn device_id(&self) -> &str {
+            "pending-chunk-cpu-trigger"
+        }
+
+        fn capabilities(&self) -> DeviceCaps {
+            self.cpu.capabilities()
+        }
+
+        fn upload_weights(
+            &self,
+            packed: &[u8],
+            shape: GemmShape,
+            format: TernaryFormat,
+        ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+            self.cpu.upload_weights(packed, shape, format)
+        }
+
+        fn mpgemm(&self, parameters: MpGemm<'_>) -> Result<(), BackendError> {
+            self.cpu.mpgemm(parameters)?;
+            let trigger = self.trigger.lock().unwrap().take();
+            if let Some(trigger) = trigger {
+                trigger();
+            }
+            Ok(())
+        }
+    }
+
+    fn tiny_runner(trigger: ArmedTrigger) -> ModelRunner {
+        let backend = ProjectionTrigger {
+            cpu: tritium_cpu::CpuBackend::new(),
+            trigger,
+        };
+        let dense = || Projection::Dense(DenseLinear::new_exact(vec![0.03125; 16], 4, 4).unwrap());
+        let config = ModelConfig {
+            arch: "llama".into(),
+            n_layers: 2,
+            n_embd: 4,
+            n_head: 1,
+            n_head_kv: 1,
+            head_dim: 4,
+            n_ff: 4,
+            n_ctx: 16,
+            rope_theta: 10_000.0,
+            rms_eps: 1e-5,
+        };
+        let weights = ModelWeights {
+            token_embd: TokenEmbedding::from_dense(
+                (0..32).map(|i| (i as f32 - 16.0) / 64.0).collect(),
+                8,
+                4,
+            )
+            .unwrap(),
+            vocab: 8,
+            n_embd: 4,
+            layers: (0..2)
+                .map(|_| TransformerBlock {
+                    attn_norm: vec![1.0; 4],
+                    q_proj: Projection::Ternary(
+                        TernaryLinear::new(&backend, &[tritium_core::Trit::ZERO; 16], 4, 4, 1.0)
+                            .unwrap(),
+                    ),
+                    k_proj: dense(),
+                    v_proj: dense(),
+                    o_proj: dense(),
+                    attn_sub_norm: Vec::new(),
+                    q_bias: Vec::new(),
+                    k_bias: Vec::new(),
+                    v_bias: Vec::new(),
+                    q_norm: Vec::new(),
+                    k_norm: Vec::new(),
+                    ffn_norm: vec![1.0; 4],
+                    mlp: Mlp::SwiGlu(SwiGluMlp {
+                        gate: dense(),
+                        up: dense(),
+                        down: dense(),
+                    }),
+                })
+                .collect(),
+            output_norm: vec![1.0; 4],
+            lm_head: None,
+        };
+        ModelRunner::from_weights(config, weights, Box::new(backend))
+    }
+
+    fn pending(kind: usize, done: usize) -> (Pending, Trigger) {
+        let req = GenRequest {
+            prompt_tokens: vec![0, 1, 2, 3],
+            max_new: 2,
+            sampling: Sampling::Greedy,
+            stop_eos: false,
+            logprobs: None,
+        };
+        let (goal, close): (PendingGoal, Trigger) = if kind == 2 {
+            let (resp, receiver) = tokio::sync::oneshot::channel();
+            (
+                PendingGoal::TreeOpen {
+                    prompt: req.prompt_tokens,
+                    resp,
+                },
+                Box::new(move || drop(receiver)),
+            )
+        } else {
+            let (tx, receiver) = mpsc::channel(8);
+            let goal = if kind == 0 {
+                PendingGoal::Admit {
+                    tx,
+                    req,
+                    max_new: 2,
+                    row: 0,
+                }
+            } else {
+                PendingGoal::SpecAdmit {
+                    tx,
+                    req,
+                    max_new: 2,
+                    policy: DraftPolicy::Adaptive { acc: 0.75 },
+                    governor: SpecGovernor::Off,
+                    chain: false,
+                }
+            };
+            (goal, Box::new(move || drop(receiver)))
+        };
+        (
+            Pending {
+                done,
+                started_at: Instant::now(),
+                request_span: tracing::Span::none(),
+                goal,
+            },
+            close,
+        )
+    }
+
+    fn cache_bits(runner: &ModelRunner) -> Vec<(usize, Vec<u32>, Vec<u32>)> {
+        runner
+            .kv
+            .iter()
+            .map(|cache| {
+                (
+                    cache.len,
+                    cache.k.iter().map(|value| value.to_bits()).collect(),
+                    cache.v.iter().map(|value| value.to_bits()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pending_chunk_cancels_inside_native_forward() {
+        for kind in 0..3 {
+            for drain in [false, true] {
+                for done in [0, 2] {
+                    let trigger: ArmedTrigger = Arc::new(Mutex::new(None));
+                    let mut runner = tiny_runner(trigger.clone());
+                    if done != 0 {
+                        runner.forward(&[0, 1], &[0, 1]).unwrap();
+                    }
+                    let before = cache_bits(&runner);
+                    let (pending, close) = pending(kind, done);
+                    let mut keep_client = Some(close);
+                    let draining = Arc::new(AtomicBool::new(false));
+                    *trigger.lock().unwrap() = Some(if drain {
+                        let flag = draining.clone();
+                        Box::new(move || flag.store(true, Ordering::Release))
+                    } else {
+                        keep_client.take().unwrap()
+                    });
+                    assert!(
+                        pending
+                            .forward_chunk(&mut runner, 2, &draining)
+                            .unwrap()
+                            .is_none(),
+                        "pending chunk must cancel inside native forward (goal={kind}, drain={drain}, prefix={done})"
+                    );
+                    assert_eq!(pending.client_gone(), !drain);
+                    assert_eq!(pending.done, done);
+                    assert_eq!(cache_bits(&runner), before);
+                    let mut reference = tiny_runner(Arc::new(Mutex::new(None)));
+                    if done != 0 {
+                        reference.forward(&[0, 1], &[0, 1]).unwrap();
+                    }
+                    let tokens = &pending.prompt()[done..done + 2];
+                    let positions = [done, done + 1];
+                    let recovered = runner.forward(tokens, &positions).unwrap();
+                    let expected = reference.forward(tokens, &positions).unwrap();
+                    assert_eq!(
+                        recovered
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>(),
+                        expected
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>()
+                    );
+                    assert_eq!(cache_bits(&runner), cache_bits(&reference));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pending_chunk_preserves_uncancelled_output_and_runtime_errors() {
+        for kind in 0..3 {
+            let mut runner = tiny_runner(Arc::new(Mutex::new(None)));
+            let mut reference = tiny_runner(Arc::new(Mutex::new(None)));
+            let (pending, _keep_client) = pending(kind, 0);
+            let actual = pending
+                .forward_chunk(&mut runner, 2, &AtomicBool::new(false))
+                .unwrap()
+                .unwrap();
+            let expected = reference.forward(&[0, 1], &[0, 1]).unwrap();
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(cache_bits(&runner), cache_bits(&reference));
+            assert_eq!(
+                pending.done, 0,
+                "only scheduler publication advances progress"
+            );
+        }
+        let mut runner = tiny_runner(Arc::new(Mutex::new(None)));
+        let (mut pending, _keep_client) = pending(0, 0);
+        if let PendingGoal::Admit { req, .. } = &mut pending.goal {
+            req.prompt_tokens[0] = 8;
+        }
+        assert!(
+            pending
+                .forward_chunk(&mut runner, 2, &AtomicBool::new(false))
+                .is_err()
+        );
+        assert_eq!(pending.done, 0);
+        assert!(runner.kv.iter().all(|cache| cache.len == 0));
+    }
+
+    #[test]
+    fn pending_chunk_skips_closed_or_draining_work() {
+        for kind in 0..3 {
+            for drain in [false, true] {
+                let trigger: ArmedTrigger = Arc::new(Mutex::new(Some(Box::new(|| {
+                    panic!("already-cancelled chunk must not execute projections");
+                }))));
+                let mut runner = tiny_runner(trigger);
+                let (pending, close) = pending(kind, 0);
+                if !drain {
+                    close();
+                }
+                assert_eq!(pending.client_gone(), !drain);
+                assert!(
+                    pending
+                        .forward_chunk(&mut runner, 2, &AtomicBool::new(drain))
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(runner.kv.iter().all(|cache| cache.len == 0));
+            }
+        }
+    }
+
+    fn peer_bytes(runner: &mut ModelRunner, batch: &tritium_cuda::BatchKv) -> Vec<Vec<u8>> {
+        let model = runner.resident_cuda().unwrap().unwrap();
+        (0..2)
+            .flat_map(|layer| {
+                (0..3).flat_map(move |row| {
+                    [false, true]
+                        .into_iter()
+                        .map(move |value| (layer, row, value))
+                })
+            })
+            .map(|(layer, row, value)| {
+                model
+                    .debug_batch_kv_row(batch, layer, 1, row, value)
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pending_retirement_releases_once_and_preserves_live_cuda_peer() {
+        let Some(mut runner) = crate::test_support::tiny_cuda_runner(16) else {
+            return;
+        };
+        let mut batch = runner.new_batch_paged(2, 2).unwrap();
+        let telemetry = WorkerTelemetry::default();
+        let capacity = kv_free_tokens(&batch);
+        telemetry.set_kv_pool(capacity, capacity);
+        reserve_pages(&mut batch, 0, 4, &telemetry).unwrap();
+        reserve_pages(&mut batch, 1, 4, &telemetry).unwrap();
+        runner.forward(&[0, 1, 2], &[0, 1, 2]).unwrap();
+        runner.adopt_into_batch_row(&mut batch, 1, 3).unwrap();
+        batch.set_position(1, 3).unwrap();
+        batch.set_live(1, true).unwrap();
+        let before = peer_bytes(&mut runner, &batch);
+        let free_before = batch.free_pages();
+        runner.reset();
+        runner.forward(&[3, 4], &[0, 1]).unwrap();
+        let (pending, _keep_client) = pending(0, 2);
+        let mut pending = Some(pending);
+        retire_pending_prefill(&mut pending, &mut runner, &mut batch, &telemetry, false);
+        assert!(pending.is_none());
+        assert_eq!(runner.resident_cuda().unwrap().unwrap().cache_len(), 0);
+        assert_eq!(batch.free_pages(), free_before + 1);
+        assert_eq!(batch.positions()[1], 3);
+        assert_eq!(peer_bytes(&mut runner, &batch), before);
+        assert_eq!(
+            telemetry.kv_pool_reservations_total.load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(telemetry.kv_pool_releases_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            telemetry
+                .kv_pool_release_failures_total
+                .load(Ordering::Relaxed),
+            0
+        );
+        // Repeating retirement must not release again or reset newer staging.
+        runner.forward(&[6, 7], &[0, 1]).unwrap();
+        retire_pending_prefill(&mut pending, &mut runner, &mut batch, &telemetry, true);
+        assert_eq!(runner.resident_cuda().unwrap().unwrap().cache_len(), 2);
+        assert_eq!(batch.free_pages(), free_before + 1);
+        assert_eq!(peer_bytes(&mut runner, &batch), before);
+        assert_eq!(telemetry.kv_pool_releases_total.load(Ordering::Relaxed), 1);
     }
 }

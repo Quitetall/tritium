@@ -8,6 +8,7 @@ modules or a different native extension.
 from __future__ import annotations
 
 import importlib.metadata
+import os
 from pathlib import Path
 import sys
 
@@ -18,7 +19,12 @@ SOURCE_ROOT = (Path(__file__).resolve().parents[1] / "python").resolve()
 PACKAGE_ROOT = (SOURCE_ROOT / "tritium").resolve()
 INSTALLED_WHEEL_ONLY = frozenset({
     "test_hf_lifecycle_receipt.py",
+    "test_hf_candidate_provenance.py",
     "test_tutorial_qat.py",
+    "test_tutorial_candidate_provenance.py",
+    "test_observability_candidate_provenance.py",
+    "test_estimator_candidate_provenance.py",
+    "test_hf_distributed_candidate_provenance.py",
 })
 
 
@@ -30,6 +36,13 @@ def _bind_source_package() -> None:
 
 def pytest_sessionstart(session) -> None:  # type: ignore[no-untyped-def]
     del session
+    if os.environ.get("TRITIUM_TEST_INSTALLED_WHEEL") == "1":
+        if not _installed_distribution_owns_source():
+            raise RuntimeError(
+                "installed-wheel pytest mode requires tritium to be owned by the "
+                "installed pytritium distribution"
+            )
+        return
     _bind_source_package()
     import tritium
 

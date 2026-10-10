@@ -1,11 +1,14 @@
 //! Autograd-op bindings: the `tritium-train` tape ops (ternary Conv1d, FSQ, STE) exposed as flat-buffer
 //! forward/vjp `#[pyfunction]`s. The Python side ([`tritium.autograd`]) wraps each pair in a
 //! `torch.autograd.Function`, so LamQuant drops ternary conv/FSQ layers into their PyTorch encoder in
-//! place. Tensors cross the boundary as flat `f32`/`u32` lists plus explicit shape args (a numpy/dlpack
-//! zero-copy bridge is a perf follow-on); every shape error is a `ValueError`, never a panic.
+//! place. Most tensors cross the boundary as flat `f32`/`u32` lists plus explicit shape args. The
+//! hot joint-PTQ adapter uses binary buffers to avoid boxing every model coefficient as a Python
+//! scalar; a fully zero-copy numpy/dlpack bridge remains a separate optimization. Shape errors are
+//! always a `ValueError`, never a panic.
 
 use pyo3::exceptions::PyValueError;
-use pyo3::prelude::*;
+use pyo3::{prelude::*, types::PyBytes};
+use rayon::prelude::*;
 
 use tritium_quantize::{
     AllocConfig, DensePsdMetric, GroupCurve, JointFitConfig, JointFitMetric, RelayBasins,
@@ -16,6 +19,16 @@ use tritium_train::ops::fsq::{self, FsqBound, FsqCfg, FsqSte};
 use tritium_train::ops::ste;
 
 type DenseJointFitResult = (Vec<f32>, Vec<Vec<i8>>, Vec<f32>, f64);
+type DiagonalJointFitBatchResult = (Vec<Vec<f32>>, Vec<Py<PyBytes>>);
+type GroupedDiagonalJointFitBatchResult = (Vec<Vec<Vec<f32>>>, Vec<Py<PyBytes>>);
+type GroupedDiagonalJointFitBatchObjectiveResult = (Vec<Vec<Vec<f32>>>, Vec<Py<PyBytes>>, f64);
+type CompactJointFit = (Vec<f32>, Vec<Vec<i8>>, f64);
+
+// Keep the compact row results retained while Rayon completes a batch bounded.
+// The source byte buffer and final output planes are required; these limits cap
+// only avoidable decoded weights and per-fit trit vectors.
+const MAX_COMPACT_FIT_BATCH_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_COMPACT_FIT_BATCH_ROWS: usize = 4096;
 
 /// Allocate additive ternary planes from measured group error curves.
 ///
@@ -160,6 +173,315 @@ pub(crate) fn fit_joint_ternary_dense(
     )
     .map_err(|error| PyValueError::new_err(error.to_string()))?;
     Ok((fit.scales, fit.trits, fit.reconstruction, fit.objective))
+}
+
+/// Fit a row batch with shared diagonal curvature and the canonical native SALT solver.
+///
+/// Receives weights as little-endian row-major f32 bytes and returns row-major
+/// scales plus one byte buffer per plane of row-major i8 trits. The private
+/// Python PTQ adapter uses bytes rather than boxed Python numbers, and does not
+/// transfer reconstructions/objectives that it does not consume.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fit_joint_ternary_diagonal(
+    py: Python<'_>,
+    weights: &Bound<'_, PyBytes>,
+    rows: usize,
+    columns: usize,
+    diagonal: Vec<f64>,
+    planes: usize,
+    max_iterations: usize,
+    ridge: f64,
+    em_restarts: usize,
+    ridge_condition_limit: f64,
+    scale_precision: &str,
+    softened_relay: bool,
+    modulated_relay: bool,
+) -> PyResult<DiagonalJointFitBatchResult> {
+    if rows == 0 || columns == 0 {
+        return Err(PyValueError::new_err(
+            "rows and columns must both be positive",
+        ));
+    }
+    let expected_weights = rows
+        .checked_mul(columns)
+        .ok_or_else(|| PyValueError::new_err("weight dimensions overflow platform usize"))?;
+    let expected_weight_bytes = expected_weights
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| PyValueError::new_err("weight byte length overflows platform usize"))?;
+    let weight_bytes = weights.as_bytes();
+    if weight_bytes.len() != expected_weight_bytes {
+        return Err(PyValueError::new_err(format!(
+            "weights must contain {expected_weight_bytes} little-endian bytes for {rows}x{columns} f32 values, got {}",
+            weight_bytes.len()
+        )));
+    }
+    let (weight_chunks, remainder) = weight_bytes.as_chunks::<{ std::mem::size_of::<f32>() }>();
+    debug_assert!(remainder.is_empty());
+    let weights = weight_chunks
+        .iter()
+        .map(|bytes| f32::from_le_bytes(*bytes))
+        .collect::<Vec<_>>();
+    if diagonal.len() != columns {
+        return Err(PyValueError::new_err(format!(
+            "diagonal must contain {columns} values, got {}",
+            diagonal.len()
+        )));
+    }
+    let scale_precision = match scale_precision {
+        "f32" => ScalePrecision::F32,
+        "f16" => ScalePrecision::F16,
+        _ => {
+            return Err(PyValueError::new_err(
+                "scale_precision must be 'f32' or 'f16'",
+            ));
+        }
+    };
+    let config = JointFitConfig {
+        planes,
+        max_iterations,
+        ridge,
+        em_restarts,
+        ridge_condition_limit,
+        scale_precision,
+        relay_basins: RelayBasins {
+            softened: softened_relay,
+            modulated: modulated_relay,
+        },
+    };
+    let (scales_by_row, trits_by_plane) = py
+        .detach(move || {
+            // Output rows are independent, and production matrices can contain
+            // tens of thousands of them. Preserve indexed order while fitting rows
+            // concurrently; collect errors in row order below so diagnostics stay
+            // deterministic. The solver/configuration and each row's objective are
+            // unchanged.
+            let fits: Vec<Result<_, String>> = weights
+                .par_chunks_exact(columns)
+                .map(|row_weights| {
+                    fit_joint_ternary(row_weights, JointFitMetric::DiagonalF64(&diagonal), config)
+                        .map_err(|error| error.to_string())
+                })
+                .collect();
+
+            let mut scales_by_row = Vec::with_capacity(rows);
+            let mut trits_by_plane = (0..planes)
+                .map(|_| Vec::with_capacity(expected_weights))
+                .collect::<Vec<_>>();
+            for fit in fits {
+                let fit = fit?;
+                scales_by_row.push(fit.scales);
+                for (plane, row_trits) in fit.trits.into_iter().enumerate() {
+                    trits_by_plane[plane].extend(row_trits.into_iter().map(|trit| trit as u8));
+                }
+            }
+            Ok::<_, String>((scales_by_row, trits_by_plane))
+        })
+        .map_err(PyValueError::new_err)?;
+    let trits_by_plane = trits_by_plane
+        .iter()
+        .map(|trits| PyBytes::new(py, trits).unbind())
+        .collect();
+    Ok((scales_by_row, trits_by_plane))
+}
+
+/// Fit multiple scale groups in one native call.
+///
+/// Weights are little-endian f32 values in group-major, then row-major order:
+/// `[groups, rows, columns]`. Curvature is flattened group-major. The private
+/// PTQ adapter uses this to keep the solver and its deterministic row order
+/// unchanged while avoiding one Python/native crossing per scale group.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fit_joint_ternary_diagonal_groups(
+    py: Python<'_>,
+    weights: &Bound<'_, PyBytes>,
+    rows: usize,
+    groups: usize,
+    columns: usize,
+    diagonal: Vec<f64>,
+    planes: usize,
+    max_iterations: usize,
+    ridge: f64,
+    em_restarts: usize,
+    ridge_condition_limit: f64,
+    scale_precision: &str,
+    softened_relay: bool,
+    modulated_relay: bool,
+) -> PyResult<GroupedDiagonalJointFitBatchResult> {
+    let (scales, trits, _objective) = fit_joint_ternary_diagonal_groups_with_objective(
+        py,
+        weights,
+        rows,
+        groups,
+        columns,
+        diagonal,
+        planes,
+        max_iterations,
+        ridge,
+        em_restarts,
+        ridge_condition_limit,
+        scale_precision,
+        softened_relay,
+        modulated_relay,
+    )?;
+    Ok((scales, trits))
+}
+
+/// Private PTQ bridge returning the already-scored objective as well as the fit planes.
+///
+/// Keep `fit_joint_ternary_diagonal_groups`'s public two-value result stable; the
+/// underscore-prefixed entrypoint avoids rebuilding a dense matrix only to score it.
+#[pyfunction(name = "_fit_joint_ternary_diagonal_groups_with_objective")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fit_joint_ternary_diagonal_groups_with_objective(
+    py: Python<'_>,
+    weights: &Bound<'_, PyBytes>,
+    rows: usize,
+    groups: usize,
+    columns: usize,
+    diagonal: Vec<f64>,
+    planes: usize,
+    max_iterations: usize,
+    ridge: f64,
+    em_restarts: usize,
+    ridge_condition_limit: f64,
+    scale_precision: &str,
+    softened_relay: bool,
+    modulated_relay: bool,
+) -> PyResult<GroupedDiagonalJointFitBatchObjectiveResult> {
+    if rows == 0 || groups == 0 || columns == 0 {
+        return Err(PyValueError::new_err(
+            "rows, groups, and columns must all be positive",
+        ));
+    }
+    let expected_group_values = groups
+        .checked_mul(columns)
+        .ok_or_else(|| PyValueError::new_err("group dimensions overflow platform usize"))?;
+    if diagonal.len() != expected_group_values {
+        return Err(PyValueError::new_err(format!(
+            "diagonal must contain {expected_group_values} values for {groups} groups of {columns}, got {}",
+            diagonal.len()
+        )));
+    }
+    let expected_rows = groups
+        .checked_mul(rows)
+        .ok_or_else(|| PyValueError::new_err("row dimensions overflow platform usize"))?;
+    let expected_weights = expected_rows
+        .checked_mul(columns)
+        .ok_or_else(|| PyValueError::new_err("weight dimensions overflow platform usize"))?;
+    let expected_weight_bytes = expected_weights
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| PyValueError::new_err("weight byte length overflows platform usize"))?;
+    let weight_bytes = weights.as_bytes();
+    if weight_bytes.len() != expected_weight_bytes {
+        return Err(PyValueError::new_err(format!(
+            "weights must contain {expected_weight_bytes} little-endian bytes for {groups}x{rows}x{columns} f32 values, got {}",
+            weight_bytes.len()
+        )));
+    }
+    let scale_precision = match scale_precision {
+        "f32" => ScalePrecision::F32,
+        "f16" => ScalePrecision::F16,
+        _ => {
+            return Err(PyValueError::new_err(
+                "scale_precision must be 'f32' or 'f16'",
+            ));
+        }
+    };
+    let config = JointFitConfig {
+        planes,
+        max_iterations,
+        ridge,
+        em_restarts,
+        ridge_condition_limit,
+        scale_precision,
+        relay_basins: RelayBasins {
+            softened: softened_relay,
+            modulated: modulated_relay,
+        },
+    };
+    let (scales_by_group, trits_by_plane, objective) = (|| {
+        // Fit a bounded batch of adjacent groups at once. This preserves a
+        // single indexed Rayon collection for many rows while avoiding both
+        // full-matrix fit retention and repeated one-group scheduling barriers.
+        let mut scales_by_group = Vec::with_capacity(groups);
+        let mut trits_by_plane = (0..planes)
+            .map(|_| Vec::with_capacity(expected_weights))
+            .collect::<Vec<_>>();
+        let mut objective = 0.0;
+        let group_weight_bytes = expected_weight_bytes / groups;
+        let group_output_bytes = (expected_weights / groups)
+            .checked_mul(planes)
+            .ok_or_else(|| "per-group trit output size overflows platform usize".to_owned())?;
+        // Leave invalid plane counts for the canonical solver to reject below;
+        // keeping the budget divisor nonzero ensures malformed input is an
+        // ordinary PyValueError rather than a divide-by-zero panic.
+        let groups_by_output = MAX_COMPACT_FIT_BATCH_OUTPUT_BYTES / group_output_bytes.max(1);
+        let groups_by_rows = MAX_COMPACT_FIT_BATCH_ROWS / rows;
+        let groups_per_batch = groups_by_output
+            .max(1)
+            .min(groups_by_rows.max(1))
+            .min(groups);
+        for first_group in (0..groups).step_by(groups_per_batch) {
+            let batch_groups = (groups - first_group).min(groups_per_batch);
+            let byte_start = first_group * group_weight_bytes;
+            let byte_end = byte_start + batch_groups * group_weight_bytes;
+            let batch_weight_bytes = &weight_bytes[byte_start..byte_end];
+            // Decode only this bounded batch. The source is immutable Python
+            // bytes, so it remains safe while the GIL is released for fits.
+            let (group_weight_chunks, remainder) =
+                batch_weight_bytes.as_chunks::<{ std::mem::size_of::<f32>() }>();
+            debug_assert!(remainder.is_empty());
+            let batch_weights = group_weight_chunks
+                .iter()
+                .map(|bytes| f32::from_le_bytes(*bytes))
+                .collect::<Vec<_>>();
+            let fits: Vec<Result<CompactJointFit, String>> = py.detach(|| {
+                batch_weights
+                    .par_chunks_exact(columns)
+                    .enumerate()
+                    // Narrow row fits are cheap enough that thousands of
+                    // single-row tasks spend avoidable time in Rayon scheduling.
+                    .with_min_len(16)
+                    .map(|(batch_row, row_weights)| {
+                        let group = first_group + batch_row / rows;
+                        let start = group * columns;
+                        let group_diagonal = &diagonal[start..start + columns];
+                        fit_joint_ternary(
+                            row_weights,
+                            JointFitMetric::DiagonalF64(group_diagonal),
+                            config,
+                        )
+                        .map(|fit| (fit.scales, fit.trits, fit.objective))
+                        .map_err(|error| error.to_string())
+                    })
+                    .collect()
+            });
+            let mut fits = fits.into_iter();
+            for _ in first_group..first_group + batch_groups {
+                let mut scales_by_row = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    let (scales, trits, row_objective) = fits
+                        .next()
+                        .ok_or_else(|| "internal grouped-fit row count mismatch".to_owned())??;
+                    objective += row_objective;
+                    scales_by_row.push(scales);
+                    for (plane, row_trits) in trits.into_iter().enumerate() {
+                        trits_by_plane[plane].extend(row_trits.into_iter().map(|trit| trit as u8));
+                    }
+                }
+                scales_by_group.push(scales_by_row);
+            }
+        }
+        Ok::<_, String>((scales_by_group, trits_by_plane, objective))
+    })()
+    .map_err(PyValueError::new_err)?;
+    let trits_by_plane = trits_by_plane
+        .iter()
+        .map(|trits| PyBytes::new(py, trits).unbind())
+        .collect();
+    Ok((scales_by_group, trits_by_plane, objective))
 }
 
 #[allow(clippy::too_many_arguments)]

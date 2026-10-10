@@ -26,8 +26,20 @@ const model = {
       { id: "loss", dtype: "f32", shape: [], role: "result", aliasOf: null },
     ],
     operations: [
-      { id: "add", operation: "graph.add", inputs: ["x", "tied-weight"], outputs: ["sum"], attributes: [] },
-      { id: "mse", operation: "loss.mse", inputs: ["sum", "target"], outputs: ["loss"], attributes: [] },
+      {
+        id: "add",
+        operation: "graph.add",
+        inputs: ["x", "tied-weight"],
+        outputs: ["sum"],
+        attributes: [],
+      },
+      {
+        id: "mse",
+        operation: "loss.mse",
+        inputs: ["sum", "target"],
+        outputs: ["loss"],
+        attributes: [],
+      },
       {
         id: "sgd",
         operation: "optimizer.sgd",
@@ -64,9 +76,7 @@ test("canonical payload materializes exact owned training buffers", () => {
   assert.deepEqual([...new Uint32Array(store.weight.buffer)], [...bits]);
   assert.equal(store["tied-weight"], undefined, "aliases never receive separate storage");
   assert.deepEqual([...store.grad], [0, 0]);
-  const lossSeed = plan.buffers.find(
-    (buffer) => buffer.backwardInitialization === "one",
-  );
+  const lossSeed = plan.buffers.find((buffer) => buffer.backwardInitialization === "one");
   assert.deepEqual([...store[lossSeed.ownerId]], [1]);
   assert.deepEqual(
     Object.keys(store).sort(),
@@ -88,10 +98,10 @@ test("payload wire is deterministic and fails closed on corruption or drift", ()
   const first = encodeWebTrainingPayload({ weight });
   const second = encodeWebTrainingPayload({ weight: Float32Array.from(weight) });
   assert.deepEqual(first, second);
-  assert.deepEqual([...first.subarray(0, 12)], [
-    0x54, 0x52, 0x57, 0x45, 0x42, 0x50, 0x31, 0,
-    1, 0, 0, 0,
-  ]);
+  assert.deepEqual(
+    [...first.subarray(0, 12)],
+    [0x54, 0x52, 0x57, 0x45, 0x42, 0x50, 0x31, 0, 1, 0, 0, 0],
+  );
 
   weight[0] = 99;
   assert.deepEqual([...decodeWebTrainingPayload(plan, first).weight], [1, -0]);
@@ -108,7 +118,11 @@ test("payload wire is deterministic and fails closed on corruption or drift", ()
     "buffer_mismatch",
   );
   throwsPayloadCode(
-    () => decodeWebTrainingPayload(plan, encodeWebTrainingPayload({ weight: new Float32Array(2), extra: Uint8Array.of(1) })),
+    () =>
+      decodeWebTrainingPayload(
+        plan,
+        encodeWebTrainingPayload({ weight: new Float32Array(2), extra: Uint8Array.of(1) }),
+      ),
     "buffer_mismatch",
   );
 });
@@ -173,14 +187,11 @@ test("bundled adapter exposes stable session errors", async () => {
   });
   const corruptPayload = Uint8Array.from(validPayload);
   corruptPayload[corruptPayload.length - 1] ^= 1;
-  await assert.rejects(
-    prepareTraining({ ...model, payload: corruptPayload }, config),
-    (error) => {
-      assert.ok(error instanceof WebTrainingError);
-      assert.equal(error.code, "invalid_schema");
-      return true;
-    },
-  );
+  await assert.rejects(prepareTraining({ ...model, payload: corruptPayload }, config), (error) => {
+    assert.ok(error instanceof WebTrainingError);
+    assert.equal(error.code, "invalid_schema");
+    return true;
+  });
 
   const session = await prepareTraining({ ...model, payload: validPayload }, config);
   await assert.rejects(session.export(), (error) => {
@@ -237,10 +248,7 @@ function saltTrainingModel(width, planes = 3, weights = undefined) {
       ],
     },
     payload: encodeWebTrainingPayload({
-      weight: weights ?? Float32Array.from(
-        { length: width },
-        (_, index) => (index % 7 - 3) / 4,
-      ),
+      weight: weights ?? Float32Array.from({ length: width }, (_, index) => ((index % 7) - 3) / 4),
     }),
   };
 }
@@ -267,11 +275,7 @@ test("bundled adapter exports live additive parameters as strict canonical B3 SA
   assert.ok(compiled.exportPeakBytes > compiled.forwardPeakBytes);
   assert.equal(
     compiled.peakBytes,
-    Math.max(
-      compiled.preparePeakBytes,
-      compiled.forwardPeakBytes,
-      compiled.exportPeakBytes,
-    ),
+    Math.max(compiled.preparePeakBytes, compiled.forwardPeakBytes, compiled.exportPeakBytes),
   );
   const session = await prepareTraining(saltModel, saltConfig);
   const first = await session.export();
@@ -353,10 +357,7 @@ test("B3 export matches additive trits and f16 round-to-nearest-even scale oracl
     },
   ];
   for (const oracle of cases) {
-    const session = await prepareTraining(
-      saltTrainingModel(5, 1, oracle.weights),
-      saltConfig,
-    );
+    const session = await prepareTraining(saltTrainingModel(5, 1, oracle.weights), saltConfig);
     const layout = singleSaltTensorLayout((await session.export()).bytes);
     assert.deepEqual([...layout.payload], [oracle.payload], `${oracle.name} trits`);
     assert.deepEqual([...layout.scales], oracle.scale, `${oracle.name} scale`);
@@ -394,9 +395,7 @@ test("built-in preflight rejects portable buffer and aggregate JSON capacity", a
     recipe: {
       ...model.recipe,
       tensors: model.recipe.tensors.map((tensor) =>
-        tensor.id !== "loss"
-          ? { ...tensor, shape: [2_097_153] }
-          : tensor,
+        tensor.id !== "loss" ? { ...tensor, shape: [2_097_153] } : tensor,
       ),
     },
   };
@@ -408,9 +407,7 @@ test("built-in preflight rejects portable buffer and aggregate JSON capacity", a
     recipe: {
       ...oversized.recipe,
       tensors: oversized.recipe.tensors.map((tensor) =>
-        tensor.id !== "loss"
-          ? { ...tensor, shape: [1_000_000] }
-          : tensor,
+        tensor.id !== "loss" ? { ...tensor, shape: [1_000_000] } : tensor,
       ),
     },
   };

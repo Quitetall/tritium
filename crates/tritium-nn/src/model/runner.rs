@@ -70,6 +70,13 @@ pub struct ModelRunner {
     resident_probed: bool,
 }
 
+#[cfg(feature = "cuda")]
+enum ResidentForward {
+    Unavailable,
+    Cancelled,
+    Complete(Vec<f32>),
+}
+
 impl ModelRunner {
     /// Load a runner from a parsed GGUF `file` (+ its raw `bytes`) onto `backend`.
     ///
@@ -295,6 +302,27 @@ impl ModelRunner {
             .map_err(ResidentOpError::Op)
     }
 
+    /// (cuda) Cooperative greedy tree verification. `None` means cancelled
+    /// before promotion, with the committed prefix unchanged. The query must
+    /// be cheap, nonblocking and non-panicking; graph replay is not preempted.
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] as for [`Self::tree_verify_greedy`].
+    #[cfg(feature = "cuda")]
+    pub fn tree_verify_greedy_cancellable(
+        &mut self,
+        tokens: &[u32],
+        parents: &[i32],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<u32>>, ResidentOpError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
+        self.resident_for_op()?
+            .tree_verify_greedy_cancellable(tokens, parents, is_cancelled)
+            .map_err(ResidentOpError::Op)
+    }
+
     /// (cuda) I2/I3 batch-slot tree-verify (L3 batch-slot spec decode): the
     /// same greedy tree verify as
     /// [`tree_verify_greedy`](Self::tree_verify_greedy), run against batch
@@ -322,6 +350,29 @@ impl ModelRunner {
             .map_err(ResidentOpError::Op)
     }
 
+    /// (cuda) Cooperative single-row tree verification, preserving other
+    /// rows and unrelated single-sequence pending-tree authorization.
+    /// Reservation and query requirements match the native tree interfaces.
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] as for [`Self::tree_verify_greedy_slot`].
+    #[cfg(feature = "cuda")]
+    pub fn tree_verify_greedy_slot_cancellable(
+        &mut self,
+        batch: &mut tritium_cuda::BatchKv,
+        row: usize,
+        tokens: &[u32],
+        parents: &[i32],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<u32>>, ResidentOpError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
+        self.resident_for_op()?
+            .tree_verify_greedy_slot_cancellable(batch, row, tokens, parents, is_cancelled)
+            .map_err(ResidentOpError::Op)
+    }
+
     /// (cuda) I4 batched-slots tree-verify (L3 batch-slot spec decode): the
     /// same greedy verify as
     /// [`tree_verify_greedy_slot`](Self::tree_verify_greedy_slot), run for
@@ -329,7 +380,7 @@ impl ModelRunner {
     /// `(tokens, parents)` draft tree, and `out[k]` its accepted tokens
     /// (bit-identical to verifying the slots sequentially). The LM head +
     /// argmax run once over the concatenated rows, amortizing the dominant
-    /// per-verify cost (ADR 0032) across the batch. Requires the f32 KV
+    /// per-verify cost (ADR 0032) across the batch. Requires the f32 or f16 KV
     /// rung, `head_dim % 4 == 0`, live non-duplicate rows and
     /// `Σ tokensₖ.len() <= 48`; paged slots need reservations covering each
     /// slot's `positions[r] + tokens.len()` tokens
@@ -348,6 +399,28 @@ impl ModelRunner {
     ) -> Result<Vec<Vec<u32>>, ResidentOpError> {
         self.resident_for_op()?
             .tree_verify_greedy_slots(batch, rows, trees)
+            .map_err(ResidentOpError::Op)
+    }
+
+    /// (cuda) Cooperative grouped verification. Cancellation returns no output
+    /// or row promotion; all selected and unrelated committed prefixes survive.
+    /// Query and reservation requirements match the native tree interfaces.
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] as for [`Self::tree_verify_greedy_slots`].
+    #[cfg(feature = "cuda")]
+    pub fn tree_verify_greedy_slots_cancellable(
+        &mut self,
+        batch: &mut tritium_cuda::BatchKv,
+        rows: &[usize],
+        trees: &[(&[u32], &[i32])],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<Vec<u32>>>, ResidentOpError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
+        self.resident_for_op()?
+            .tree_verify_greedy_slots_cancellable(batch, rows, trees, is_cancelled)
             .map_err(ResidentOpError::Op)
     }
 
@@ -384,6 +457,27 @@ impl ModelRunner {
     ) -> Result<Vec<f32>, ResidentOpError> {
         self.resident_for_op()?
             .tree_verify_logits(tokens, parents)
+            .map_err(ResidentOpError::Op)
+    }
+
+    /// (cuda) Cooperative host-logit verification. Cancelled entered work
+    /// grants no pending-tree commit; entry cancellation leaves state intact.
+    /// The query must be cheap, nonblocking and non-panicking.
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] as for [`Self::tree_verify_logits`].
+    #[cfg(feature = "cuda")]
+    pub fn tree_verify_logits_cancellable(
+        &mut self,
+        tokens: &[u32],
+        parents: &[i32],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<f32>>, ResidentOpError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
+        self.resident_for_op()?
+            .tree_verify_logits_cancellable(tokens, parents, is_cancelled)
             .map_err(ResidentOpError::Op)
     }
 
@@ -491,6 +585,24 @@ impl ModelRunner {
             .map_err(ResidentOpError::Op)
     }
 
+    /// (cuda) Cooperative native lockstep graph decode. `None` means cancelled
+    /// with no output or batch advancement; `Unavailable` is absent native
+    /// support, not cancellation. Graph dispatch and ordinary errors survive.
+    #[cfg(feature = "cuda")]
+    pub fn decode_batch_graph_cancellable(
+        &mut self,
+        batch: &mut tritium_cuda::BatchKv,
+        tokens: &[u32],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<Vec<f32>>>, ResidentOpError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
+        self.resident_for_op()?
+            .decode_batch_graph_cancellable(batch, tokens, is_cancelled)
+            .map_err(ResidentOpError::Op)
+    }
+
     /// (cuda) I1 batched greedy drafting (L3 batch-slot spec decode): for each
     /// LIVE batch slot, draft up to `k` tokens — truncated at the first EOS
     /// **inclusive**, the EOS drafted but never fed — via `k` lockstep batched
@@ -513,6 +625,28 @@ impl ModelRunner {
     ) -> Result<Vec<Vec<u32>>, ResidentOpError> {
         self.resident_for_op()?
             .draft_batch(batch, last_tokens, k, eos)
+            .map_err(ResidentOpError::Op)
+    }
+
+    /// (cuda) Cooperative batched drafting. `None` means cancellation with
+    /// entry positions/liveness retained, never native unavailability.
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] as for [`Self::draft_batch`].
+    #[cfg(feature = "cuda")]
+    pub fn draft_batch_cancellable(
+        &mut self,
+        batch: &mut tritium_cuda::BatchKv,
+        last_tokens: &[u32],
+        k: usize,
+        eos: u32,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<Vec<u32>>>, ResidentOpError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
+        self.resident_for_op()?
+            .draft_batch_cancellable(batch, last_tokens, k, eos, is_cancelled)
             .map_err(ResidentOpError::Op)
     }
 
@@ -602,6 +736,28 @@ impl ModelRunner {
         self.forward_inner(tokens, positions, None)
     }
 
+    /// Run a forward with cooperative cancellation (ADR 0051).
+    ///
+    /// `None` means cancellation without a published output. The query must be
+    /// cheap, nonblocking and non-panicking; already-running work is not
+    /// preempted. Host checkpoints run after embedding, around each block and
+    /// before/after the head. Cancellation restores entry KV lengths and
+    /// committed prefix values. The resident prefill uses native checkpoints;
+    /// M=1 graph replay is checked before/after, not interrupted. Callback count
+    /// is unspecified and cancellation after the final check can race with
+    /// completion. Runtime errors remain distinct from cancellation.
+    ///
+    /// # Errors
+    /// Same runtime and shape errors as [`Self::forward`].
+    pub fn forward_cancellable(
+        &mut self,
+        tokens: &[u32],
+        positions: &[usize],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<f32>>, NnError> {
+        self.forward_controlled(tokens, positions, None, is_cancelled)
+    }
+
     /// Like [`forward`](Self::forward), but captures per-stage activations into
     /// `dump` for the fidelity ladder.
     ///
@@ -620,8 +776,22 @@ impl ModelRunner {
         &mut self,
         tokens: &[u32],
         positions: &[usize],
-        mut dump: Option<&mut ForwardDump>,
+        dump: Option<&mut ForwardDump>,
     ) -> Result<Vec<f32>, NnError> {
+        self.forward_controlled(tokens, positions, dump, &|| false)?
+            .ok_or_else(|| NnError::Backend("uncancelled forward returned no output".into()))
+    }
+
+    fn forward_controlled(
+        &mut self,
+        tokens: &[u32],
+        positions: &[usize],
+        mut dump: Option<&mut ForwardDump>,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<f32>>, NnError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
         let n_embd = self.config.n_embd as usize;
         let seq = tokens.len();
         if seq == 0 || positions.len() != seq {
@@ -636,10 +806,12 @@ impl ModelRunner {
         // stream + KV stay in VRAM). The dump path keeps the host orchestration so the
         // fidelity ladder can still inspect each stage.
         #[cfg(feature = "cuda")]
-        if dump.is_none()
-            && let Some(logits) = self.forward_resident(tokens, positions)?
-        {
-            return Ok(logits);
+        if dump.is_none() {
+            match self.forward_resident(tokens, positions, is_cancelled)? {
+                ResidentForward::Complete(logits) => return Ok(Some(logits)),
+                ResidentForward::Cancelled => return Ok(None),
+                ResidentForward::Unavailable => {}
+            }
         }
 
         // Embedding gather: hidden = token_embd[token] for each token.
@@ -647,6 +819,9 @@ impl ModelRunner {
         self.weights
             .token_embd
             .gather_with_backend(self.backend.as_ref(), tokens, &mut hidden)?;
+        if is_cancelled() {
+            return Ok(None);
+        }
         if let Some(d) = dump.as_deref_mut() {
             d.embedding = hidden.clone();
             d.hidden_states.clear();
@@ -667,8 +842,11 @@ impl ModelRunner {
             .map_err(|error| NnError::Backend(format!("allocate KV checkpoints: {error}")))?;
         kv_checkpoints.extend(self.kv.iter().map(|cache| cache.len));
 
-        let result = (|| -> Result<Vec<f32>, NnError> {
+        let result = (|| -> Result<Option<Vec<f32>>, NnError> {
             for li in 0..n_layers {
+                if is_cancelled() {
+                    return Ok(None);
+                }
                 // Borrow the block and its KV cache disjointly.
                 let block = &self.weights.layers[li];
                 let kv = &mut self.kv[li];
@@ -702,6 +880,13 @@ impl ModelRunner {
                 if let Some(d) = dump.as_deref_mut() {
                     d.hidden_states.push(hidden.clone());
                 }
+                if is_cancelled() {
+                    return Ok(None);
+                }
+            }
+
+            if is_cancelled() {
+                return Ok(None);
             }
 
             // Final RMSNorm: compute only the last token's norm (we only need its
@@ -729,6 +914,9 @@ impl ModelRunner {
 
             // LM head. Untied ⇒ a dedicated `lm_head` projection; tied ⇒ the dot-product
             // against the token embedding (BitNet). Both map `last_norm` ([n_embd]) → logits.
+            if is_cancelled() {
+                return Ok(None);
+            }
             let logits = if let Some(head) = &self.weights.lm_head {
                 let mut logits = vec![0.0f32; head.n_out()];
                 head.forward(self.backend.as_ref(), &last_norm, 1, &mut logits)?;
@@ -744,13 +932,16 @@ impl ModelRunner {
                 )?;
                 logits
             };
+            if is_cancelled() {
+                return Ok(None);
+            }
             if let Some(d) = dump {
                 d.logits = logits.clone();
             }
 
-            Ok(logits)
+            Ok(Some(logits))
         })();
-        if result.is_err() {
+        if !matches!(result, Ok(Some(_))) {
             for (cache, checkpoint) in self.kv.iter_mut().zip(kv_checkpoints) {
                 cache.rollback_to(checkpoint);
             }
@@ -759,46 +950,53 @@ impl ModelRunner {
     }
 
     /// (cuda) Run the forward through the device-resident decoder if the backend is
-    /// CUDA, returning `Some(last-token logits)`; `None` means the backend has no
-    /// resident path and the caller should fall back to the host orchestration.
-    ///
-    /// Each of the `seq` tokens is driven through one device `step` (so a multi-token
-    /// prefill is processed as a sequential causal decode — numerically identical to
-    /// the batched host prefill, since each token's reductions are unchanged). Only
-    /// the last token's logits are returned, matching [`forward`](Self::forward).
-    ///
-    /// Cost note: sequential prefill is O(seq) device forwards rather than one batched
-    /// pass, so a long prompt prefills more slowly than the host's batched GEMMs. v0.3.1
-    /// targets the *decode* gate (where this path is the win); a batched device prefill
-    /// is the deferred IMMA prefill work (ADR 0013, follow-up). For the short prompts the
-    /// decode gate uses this is immaterial.
+    /// CUDA. Unavailable means ordinary host dispatch, not cancellation or
+    /// device failure. Multi-token prefill remains one batched M=P forward;
+    /// single-token decode retains the M=1 CUDA graph. Cancellation does not
+    /// change backend selection or numerical operations.
     #[cfg(feature = "cuda")]
     fn forward_resident(
         &mut self,
         tokens: &[u32],
         positions: &[usize],
-    ) -> Result<Option<Vec<f32>>, NnError> {
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<ResidentForward, NnError> {
         if !self.ensure_resident()? {
-            return Ok(None);
+            return Ok(ResidentForward::Unavailable);
         }
         let model = self
             .resident
             .as_mut()
             .expect("ensure_resident returned true so resident is built");
+        if is_cancelled() {
+            return Ok(ResidentForward::Cancelled);
+        }
         // v0.3.6: a multi-token forward (the prompt) is a single **batched M=P prefill** —
         // one device-resident forward over all tokens — instead of P sequential decode
         // steps (the TTFT cliff). A single token (decode) replays the M=1 CUDA graph. Both
         // are bit-identical to the per-token loop (the batch kernels share the M=1 order).
         let logits = if tokens.len() > 1 {
-            model
-                .prefill(tokens, positions)
+            let Some(logits) = model
+                .prefill_cancellable(tokens, positions, is_cancelled)
                 .map_err(|e| NnError::Backend(e.to_string()))?
+            else {
+                return Ok(ResidentForward::Cancelled);
+            };
+            logits
         } else {
-            model
+            let base = model.cache_len();
+            let logits = model
                 .step_graph(tokens[0], positions[0])
-                .map_err(|e| NnError::Backend(e.to_string()))?
+                .map_err(|e| NnError::Backend(e.to_string()))?;
+            if is_cancelled() {
+                model
+                    .truncate_kv(base)
+                    .map_err(|e| NnError::Backend(e.to_string()))?;
+                return Ok(ResidentForward::Cancelled);
+            }
+            logits
         };
-        Ok(Some(logits))
+        Ok(ResidentForward::Complete(logits))
     }
 
     /// (cuda) One greedy decode step returning just the **argmax token id**:
@@ -861,6 +1059,49 @@ impl ModelRunner {
             .draft_chain(token, position, k, eos)
             .map(Some)
             .map_err(|e| NnError::Backend(e.to_string()))
+    }
+
+    /// (cuda) Cooperative native graph argmax. `None` means cancellation;
+    /// absent native support is [`ResidentOpError::Unavailable`], not fallback.
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] on unavailable/build/device or input failures.
+    #[cfg(feature = "cuda")]
+    pub fn decode_greedy_step_cancellable(
+        &mut self,
+        token: u32,
+        position: usize,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<u32>, ResidentOpError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
+        self.resident_for_op()?
+            .step_graph_argmax_cancellable(token, position, is_cancelled)
+            .map_err(ResidentOpError::Op)
+    }
+
+    /// (cuda) Cooperative native device-feedback chain. `None` means cancelled,
+    /// while [`ResidentOpError::Unavailable`] permits a caller's normal ladder.
+    /// Existing [`Self::decode_greedy_chain`] retains its fallback contract.
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] on unavailable/build/device or input failures.
+    #[cfg(feature = "cuda")]
+    pub fn decode_greedy_chain_cancellable(
+        &mut self,
+        token: u32,
+        position: usize,
+        k: usize,
+        eos: u32,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<u32>>, ResidentOpError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
+        self.resident_for_op()?
+            .draft_chain_cancellable(token, position, k, eos, is_cancelled)
+            .map_err(ResidentOpError::Op)
     }
 
     /// (cuda) Build the device-resident decoder on first use. Returns `true` if a

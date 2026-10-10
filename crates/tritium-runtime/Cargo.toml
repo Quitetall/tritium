@@ -13,6 +13,7 @@ categories.workspace = true
 
 [dependencies]
 tritium-spec = { workspace = true }
+tritium-evidence = { workspace = true }
 linkme = { workspace = true }
 
 [dev-dependencies]

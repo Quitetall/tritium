@@ -5,15 +5,19 @@
 //! semantics are deliberately kept out of the homogeneous [`ModelRunner`]
 //! (`super::ModelRunner`).
 
+use core::convert::Infallible;
 use std::sync::Arc;
 
+use tritium_format::salt_v2_package::SaltV2ScaleUpdate;
 use tritium_spec::TernaryBackend;
+
+use super::qwen35_reference::{Qwen35ReferenceState, ReferenceStateView, snapshot_states};
 
 use crate::error::NnError;
 use crate::layers::{
     Projection, ProjectionActivationMode, Qwen35DeltaNet, Qwen35DeltaNetCache,
     Qwen35DeltaNetWeights, Qwen35FullAttention, Qwen35FullAttentionCache,
-    Qwen35FullAttentionWeights, SwiGluMlp, TokenEmbedding,
+    Qwen35FullAttentionWeights, RecurrentStateObserver, SwiGluMlp, TokenEmbedding,
 };
 use crate::ops::rmsnorm_zero_centered;
 use crate::qwen35_config::{Qwen35LayerType, Qwen35NormWeightSemantics, Qwen35TextConfig};
@@ -104,6 +108,14 @@ enum Qwen35TextMixer {
 }
 
 impl Qwen35TextMixer {
+    #[allow(dead_code)] // Consumed by the B3 bounded projection-window adapter.
+    fn projection(&self, name: &str) -> Result<&Projection, NnError> {
+        match self {
+            Self::DeltaNet(layer) => layer.projection(name),
+            Self::FullAttention(layer) => layer.projection(name),
+        }
+    }
+
     const fn kind(&self) -> Qwen35LayerType {
         match self {
             Self::DeltaNet(_) => Qwen35LayerType::DeltaNet,
@@ -115,6 +127,36 @@ impl Qwen35TextMixer {
         match self {
             Self::DeltaNet(layer) => layer.activation_mode(),
             Self::FullAttention(layer) => layer.activation_mode(),
+        }
+    }
+
+    fn count_salt_v2_tensor_index(&self, tensor_index: usize) -> usize {
+        match self {
+            Self::DeltaNet(layer) => layer.count_salt_v2_tensor_index(tensor_index),
+            Self::FullAttention(layer) => layer.count_salt_v2_tensor_index(tensor_index),
+        }
+    }
+
+    fn apply_salt_v2_scale_updates(
+        &mut self,
+        tensor_index: usize,
+        updates: &[SaltV2ScaleUpdate],
+    ) -> Result<bool, NnError> {
+        match self {
+            Self::DeltaNet(layer) => layer.apply_salt_v2_scale_updates(tensor_index, updates),
+            Self::FullAttention(layer) => layer.apply_salt_v2_scale_updates(tensor_index, updates),
+        }
+    }
+
+    #[allow(dead_code)] // Used by the crate-internal paired Qwen measurement path.
+    fn replace_projection(
+        &mut self,
+        name: &str,
+        replacement: Projection,
+    ) -> Result<Projection, NnError> {
+        match self {
+            Self::DeltaNet(layer) => layer.replace_projection(name, replacement),
+            Self::FullAttention(layer) => layer.replace_projection(name, replacement),
         }
     }
 }
@@ -284,7 +326,594 @@ pub struct Qwen35TextRunner {
     lm_head: Projection,
 }
 
+pub(crate) enum Qwen35TextForwardError<E> {
+    Runtime(NnError),
+    Observer(E),
+}
+
+/// Paired raw vectors at one sampled token position for an internal PTQ probe.
+#[allow(dead_code)] // Consumed by the receipt-producing Stage-7 probe driver.
+pub(crate) struct Qwen35ProjectionProbeDepth<'a> {
+    /// Zero-based calibration-sequence ordinal.
+    pub(crate) sequence_index: u64,
+    /// One-based token position within that calibration sequence.
+    pub(crate) token_position: usize,
+    /// Dense reference's final-normalized hidden row.
+    pub(crate) reference_hidden: &'a [f32],
+    /// Single-matrix candidate's final-normalized hidden row.
+    pub(crate) candidate_hidden: &'a [f32],
+    /// Dense reference recurrent state at the selected DeltaNet layer.
+    pub(crate) reference_state: &'a [f32],
+    /// Candidate recurrent state at the same DeltaNet layer.
+    pub(crate) candidate_state: &'a [f32],
+}
+
+/// Failure while collecting one-matrix paired Qwen probe vectors.
+#[allow(dead_code)] // Consumed by the receipt-producing Stage-7 probe driver.
+#[derive(Debug)]
+pub(crate) enum Qwen35ProjectionProbeError<E> {
+    Runtime(NnError),
+    Observer(E),
+}
+
+struct Qwen35ProbeDepthOwned {
+    token_position: usize,
+    final_hidden: Vec<f32>,
+    recurrent_state: Vec<f32>,
+}
+
+fn probe_forward_sample(
+    runner: &Qwen35TextRunner,
+    tokens: &[u32],
+    positions: &[usize],
+    state_layer: usize,
+) -> Result<Vec<Qwen35ProbeDepthOwned>, NnError> {
+    let zero_based = positions
+        .iter()
+        .map(|position| position - 1)
+        .collect::<Vec<_>>();
+    let mut recurrent = (0..positions.len())
+        .map(|_| None)
+        .collect::<Vec<Option<Vec<f32>>>>();
+    let mut cache = runner.new_cache(tokens.len())?;
+    let output = match runner.forward_with_block_and_state_observer(
+        tokens,
+        &mut cache,
+        &zero_based,
+        |_, _, _, _| Ok::<_, Infallible>(()),
+        |block, token_position, state| {
+            if usize::try_from(block).ok() == Some(state_layer)
+                && let Ok(sample_index) = zero_based.binary_search(&token_position)
+            {
+                recurrent[sample_index] = Some(state.to_vec());
+            }
+        },
+    ) {
+        Ok(output) => output,
+        Err(Qwen35TextForwardError::Runtime(error)) => return Err(error),
+        Err(Qwen35TextForwardError::Observer(never)) => match never {},
+    };
+
+    let hidden_size = output.hidden_size();
+    let hidden = output.final_hidden_states();
+    let mut samples = Vec::new();
+    samples
+        .try_reserve_exact(positions.len())
+        .map_err(|error| NnError::Backend(format!("allocate Qwen probe samples: {error}")))?;
+    for (sample_index, &token_position) in positions.iter().enumerate() {
+        let row_start = (token_position - 1)
+            .checked_mul(hidden_size)
+            .ok_or(NnError::Shape {
+                expected: usize::MAX,
+                got: hidden.len(),
+            })?;
+        let row_end = row_start.checked_add(hidden_size).ok_or(NnError::Shape {
+            expected: usize::MAX,
+            got: hidden.len(),
+        })?;
+        let hidden_row = hidden.get(row_start..row_end).ok_or(NnError::Shape {
+            expected: row_end,
+            got: hidden.len(),
+        })?;
+        let recurrent_state = recurrent[sample_index].take().ok_or_else(|| {
+            NnError::MissingTensor(format!(
+                "Qwen probe did not observe recurrent state at layer {state_layer}, token {token_position}"
+            ))
+        })?;
+        if hidden_row
+            .iter()
+            .chain(&recurrent_state)
+            .any(|value| !value.is_finite())
+        {
+            return Err(NnError::Backend(
+                "Qwen probe sample contains a non-finite value".to_owned(),
+            ));
+        }
+        samples.push(Qwen35ProbeDepthOwned {
+            token_position,
+            final_hidden: hidden_row.to_vec(),
+            recurrent_state,
+        });
+    }
+    Ok(samples)
+}
+
+impl<E> From<NnError> for Qwen35TextForwardError<E> {
+    fn from(error: NnError) -> Self {
+        Self::Runtime(error)
+    }
+}
+
+#[allow(dead_code)] // Used by the crate-internal paired Qwen measurement path.
+struct ProjectionRestoreGuard<'a> {
+    runner: &'a mut Qwen35TextRunner,
+    tensor_name: String,
+    original: Option<Projection>,
+    original_identity: Arc<RunnerIdentity>,
+}
+
+impl Drop for ProjectionRestoreGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(original) = self.original.take() {
+            // The slot was resolved before guard creation and cannot be
+            // structurally removed while the callback holds the runner.
+            if self
+                .runner
+                .replace_named_projection(&self.tensor_name, original)
+                .is_ok()
+            {
+                self.runner.identity = Arc::clone(&self.original_identity);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)] // Used by the crate-internal paired Qwen measurement path.
+fn replace_projection_slot(
+    slot: &mut Projection,
+    replacement: Projection,
+    tensor_name: &str,
+) -> Result<Projection, NnError> {
+    if replacement.n_out() != slot.n_out() || replacement.k_in() != slot.k_in() {
+        return Err(NnError::Shape {
+            expected: slot.n_out().saturating_mul(slot.k_in()),
+            got: replacement.n_out().saturating_mul(replacement.k_in()),
+        });
+    }
+    if replacement.activation_mode() != slot.activation_mode() {
+        return Err(NnError::Backend(format!(
+            "replacement projection `{tensor_name}` changes activation arithmetic"
+        )));
+    }
+    Ok(std::mem::replace(slot, replacement))
+}
+
 impl Qwen35TextRunner {
+    /// Recompute one named projection over a bounded row-major activation window.
+    ///
+    /// This measurement seam lets PTQ compare the exact deployed projection
+    /// against teacher outputs computed from the original dense checkpoint,
+    /// without retaining a full-model activation history. `observer` runs
+    /// synchronously with one owned output window; it must not treat this local
+    /// projection result as model-quality or release evidence by itself.
+    #[allow(dead_code)] // Consumed by the B3 candidate-builder adapter.
+    pub(crate) fn visit_named_projection_outputs(
+        &self,
+        tensor_name: &str,
+        activations: &[f32],
+        rows: usize,
+        mut observer: impl FnMut(&[f32]),
+    ) -> Result<(), NnError> {
+        if rows == 0 {
+            return Err(NnError::Shape {
+                expected: 1,
+                got: 0,
+            });
+        }
+        let projection = self.named_projection(tensor_name)?;
+        let input_count = rows.checked_mul(projection.k_in()).ok_or(NnError::Shape {
+            expected: usize::MAX,
+            got: activations.len(),
+        })?;
+        let output_count = rows.checked_mul(projection.n_out()).ok_or(NnError::Shape {
+            expected: usize::MAX,
+            got: rows,
+        })?;
+        if activations.len() != input_count {
+            return Err(NnError::Shape {
+                expected: input_count,
+                got: activations.len(),
+            });
+        }
+        if activations.iter().any(|value| !value.is_finite()) {
+            return Err(NnError::Backend(
+                "Qwen projection input contains a non-finite value".to_owned(),
+            ));
+        }
+        let mut outputs = Vec::new();
+        outputs.try_reserve_exact(output_count).map_err(|error| {
+            NnError::Backend(format!("allocate Qwen projection output window: {error}"))
+        })?;
+        outputs.resize(output_count, 0.0);
+        projection.forward(self.backend.as_ref(), activations, rows, &mut outputs)?;
+        if outputs.iter().any(|value| !value.is_finite()) {
+            return Err(NnError::Backend(
+                "Qwen projection output contains a non-finite value".to_owned(),
+            ));
+        }
+        observer(&outputs);
+        Ok(())
+    }
+
+    /// Recompute aligned teacher and current-package outputs for one bounded
+    /// projection activation window. The teacher must preserve the package's
+    /// activation arithmetic (for example, an exact-fp32 dense projection for
+    /// SALT V2); callers bind the activation source and teacher identity in
+    /// their campaign receipt. Outputs are borrowed only for the synchronous
+    /// callback and are not retained by the runner.
+    ///
+    /// # Errors
+    /// Rejects unknown projection names, incompatible teacher geometry or
+    /// activation arithmetic, mismatched input shape, non-finite inputs or
+    /// outputs, and allocation/backend failures.
+    pub fn visit_named_projection_output_pairs(
+        &self,
+        tensor_name: &str,
+        teacher: &Projection,
+        activations: &[f32],
+        rows: usize,
+        mut observer: impl FnMut(&[f32], &[f32]),
+    ) -> Result<(), NnError> {
+        if rows == 0 {
+            return Err(NnError::Shape {
+                expected: 1,
+                got: 0,
+            });
+        }
+        let current = self.named_projection(tensor_name)?;
+        if teacher.k_in() != current.k_in() || teacher.n_out() != current.n_out() {
+            return Err(NnError::Shape {
+                expected: current.n_out().saturating_mul(current.k_in()),
+                got: teacher.n_out().saturating_mul(teacher.k_in()),
+            });
+        }
+        if teacher.activation_mode() != current.activation_mode() {
+            return Err(NnError::Backend(
+                "Qwen teacher and package projection use different activation arithmetic"
+                    .to_owned(),
+            ));
+        }
+        let input_count = rows.checked_mul(current.k_in()).ok_or(NnError::Shape {
+            expected: usize::MAX,
+            got: activations.len(),
+        })?;
+        if activations.len() != input_count {
+            return Err(NnError::Shape {
+                expected: input_count,
+                got: activations.len(),
+            });
+        }
+        if activations.iter().any(|value| !value.is_finite()) {
+            return Err(NnError::Backend(
+                "Qwen projection input contains a non-finite value".to_owned(),
+            ));
+        }
+        let output_count = rows.checked_mul(current.n_out()).ok_or(NnError::Shape {
+            expected: usize::MAX,
+            got: rows,
+        })?;
+        let mut teacher_outputs = Vec::new();
+        teacher_outputs
+            .try_reserve_exact(output_count)
+            .map_err(|error| {
+                NnError::Backend(format!("allocate Qwen teacher output window: {error}"))
+            })?;
+        teacher_outputs.resize(output_count, 0.0);
+        let mut current_outputs = Vec::new();
+        current_outputs
+            .try_reserve_exact(output_count)
+            .map_err(|error| {
+                NnError::Backend(format!("allocate Qwen package output window: {error}"))
+            })?;
+        current_outputs.resize(output_count, 0.0);
+        teacher.forward(
+            self.backend.as_ref(),
+            activations,
+            rows,
+            &mut teacher_outputs,
+        )?;
+        current.forward(
+            self.backend.as_ref(),
+            activations,
+            rows,
+            &mut current_outputs,
+        )?;
+        if teacher_outputs
+            .iter()
+            .chain(&current_outputs)
+            .any(|value| !value.is_finite())
+        {
+            return Err(NnError::Backend(
+                "Qwen paired projection output contains a non-finite value".to_owned(),
+            ));
+        }
+        observer(&teacher_outputs, &current_outputs);
+        Ok(())
+    }
+
+    #[allow(dead_code)] // Consumed by the B3 candidate-builder adapter.
+    fn named_projection(&self, tensor_name: &str) -> Result<&Projection, NnError> {
+        let layer_path = tensor_name
+            .strip_prefix("model.language_model.layers.")
+            .ok_or_else(|| NnError::MissingTensor(tensor_name.to_owned()))?;
+        let (index_text, projection_name) = layer_path
+            .split_once('.')
+            .ok_or_else(|| NnError::MissingTensor(tensor_name.to_owned()))?;
+        let index = index_text
+            .parse::<usize>()
+            .map_err(|_| NnError::MissingTensor(tensor_name.to_owned()))?;
+        if index.to_string() != index_text {
+            return Err(NnError::MissingTensor(tensor_name.to_owned()));
+        }
+        let layer = self
+            .layers
+            .get(index)
+            .ok_or_else(|| NnError::MissingTensor(tensor_name.to_owned()))?;
+        match projection_name {
+            "mlp.gate_proj.weight" => Ok(&layer.mlp.gate),
+            "mlp.up_proj.weight" => Ok(&layer.mlp.up),
+            "mlp.down_proj.weight" => Ok(&layer.mlp.down),
+            _ if projection_name.starts_with("linear_attn.")
+                || projection_name.starts_with("self_attn.") =>
+            {
+                layer.mixer.projection(projection_name)
+            }
+            _ => Err(NnError::MissingTensor(tensor_name.to_owned())),
+        }
+    }
+
+    /// Temporarily replace one canonical language projection while executing a
+    /// paired measurement. The dense projection is restored on normal return,
+    /// error, and panic unwind. The model is single-threaded during the callback.
+    /// The candidate uses a separate identity: parent caches and outputs cannot
+    /// cross into it, and candidate objects cannot be used after restoration.
+    #[allow(dead_code)] // The GDN probe producer is the next consumer of this seam.
+    pub(crate) fn with_projection_override<T>(
+        &mut self,
+        tensor_name: &str,
+        replacement: Projection,
+        execute: impl FnOnce(&Self) -> Result<T, NnError>,
+    ) -> Result<T, NnError> {
+        let original = self.replace_named_projection(tensor_name, replacement)?;
+        let original_identity = std::mem::replace(&mut self.identity, Arc::new(RunnerIdentity));
+        let guard = ProjectionRestoreGuard {
+            runner: self,
+            tensor_name: tensor_name.to_owned(),
+            original: Some(original),
+            original_identity,
+        };
+        let result = execute(&*guard.runner)?;
+        drop(guard);
+        Ok(result)
+    }
+
+    /// Stream paired reference/candidate vectors for one projection without
+    /// retaining sequence histories. Each reference and candidate forward gets
+    /// a fresh cache; the candidate projection is restored before observations
+    /// are delivered to the caller. This collects raw samples only and does not
+    /// define a divergence metric or produce campaign evidence.
+    #[allow(dead_code)] // The receipt-producing Stage-7 probe driver will call this.
+    pub(crate) fn visit_projection_probe_pairs<'tokens, I, E>(
+        &mut self,
+        tensor_name: &str,
+        replacement: Projection,
+        sequences: I,
+        one_based_positions: &[usize],
+        state_layer: usize,
+        mut observer: impl FnMut(Qwen35ProjectionProbeDepth<'_>) -> Result<(), E>,
+    ) -> Result<u64, Qwen35ProjectionProbeError<E>>
+    where
+        I: IntoIterator<Item = &'tokens [u32]>,
+    {
+        if one_based_positions.is_empty()
+            || one_based_positions[0] == 0
+            || one_based_positions
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(Qwen35ProjectionProbeError::Runtime(NnError::MissingConfig(
+                "Qwen probe positions must be nonempty, one-based, and strictly increasing".into(),
+            )));
+        }
+        if self.config.layer_types.get(state_layer) != Some(&Qwen35LayerType::DeltaNet) {
+            return Err(Qwen35ProjectionProbeError::Runtime(NnError::MissingConfig(
+                "Qwen probe recurrent-state layer must be DeltaNet".into(),
+            )));
+        }
+        if replacement.clone_salt_v2_resident().is_none() {
+            return Err(Qwen35ProjectionProbeError::Runtime(NnError::MissingConfig(
+                "Qwen probe candidate must use a resident SALT V2 projection".into(),
+            )));
+        }
+
+        let mut sequence_index = 0_u64;
+        for tokens in sequences {
+            if tokens.is_empty()
+                || one_based_positions
+                    .iter()
+                    .any(|position| *position > tokens.len())
+            {
+                return Err(Qwen35ProjectionProbeError::Runtime(NnError::Shape {
+                    expected: one_based_positions.last().copied().unwrap_or(1),
+                    got: tokens.len(),
+                }));
+            }
+            let reference = probe_forward_sample(self, tokens, one_based_positions, state_layer)
+                .map_err(Qwen35ProjectionProbeError::Runtime)?;
+            let candidate_projection = replacement.clone_salt_v2_resident().ok_or_else(|| {
+                Qwen35ProjectionProbeError::Runtime(NnError::MissingConfig(
+                    "Qwen probe SALT V2 resident could not be shared".into(),
+                ))
+            })?;
+            let candidate = self
+                .with_projection_override(tensor_name, candidate_projection, |runner| {
+                    probe_forward_sample(runner, tokens, one_based_positions, state_layer)
+                })
+                .map_err(Qwen35ProjectionProbeError::Runtime)?;
+            if reference.len() != candidate.len() {
+                return Err(Qwen35ProjectionProbeError::Runtime(NnError::Shape {
+                    expected: reference.len(),
+                    got: candidate.len(),
+                }));
+            }
+            for (reference, candidate) in reference.iter().zip(&candidate) {
+                if reference.token_position != candidate.token_position
+                    || reference.final_hidden.len() != candidate.final_hidden.len()
+                    || reference.recurrent_state.len() != candidate.recurrent_state.len()
+                {
+                    return Err(Qwen35ProjectionProbeError::Runtime(NnError::Provenance(
+                        "paired Qwen probe sample coordinates or shapes differ".to_owned(),
+                    )));
+                }
+                observer(Qwen35ProjectionProbeDepth {
+                    sequence_index,
+                    token_position: reference.token_position,
+                    reference_hidden: &reference.final_hidden,
+                    candidate_hidden: &candidate.final_hidden,
+                    reference_state: &reference.recurrent_state,
+                    candidate_state: &candidate.recurrent_state,
+                })
+                .map_err(Qwen35ProjectionProbeError::Observer)?;
+            }
+            sequence_index = sequence_index.checked_add(1).ok_or_else(|| {
+                Qwen35ProjectionProbeError::Runtime(NnError::ResourceExhausted(
+                    "Qwen probe sequence count exceeds u64".into(),
+                ))
+            })?;
+        }
+        Ok(sequence_index)
+    }
+
+    #[allow(dead_code)] // Used by the crate-internal paired Qwen measurement path.
+    fn replace_named_projection(
+        &mut self,
+        tensor_name: &str,
+        replacement: Projection,
+    ) -> Result<Projection, NnError> {
+        let layer_path = tensor_name
+            .strip_prefix("model.language_model.layers.")
+            .ok_or_else(|| NnError::MissingTensor(tensor_name.to_owned()))?;
+        let (index_text, projection_name) = layer_path
+            .split_once('.')
+            .ok_or_else(|| NnError::MissingTensor(tensor_name.to_owned()))?;
+        let index = index_text
+            .parse::<usize>()
+            .map_err(|_| NnError::MissingTensor(tensor_name.to_owned()))?;
+        if index.to_string() != index_text {
+            return Err(NnError::MissingTensor(tensor_name.to_owned()));
+        }
+        let layer = self
+            .layers
+            .get_mut(index)
+            .ok_or_else(|| NnError::MissingTensor(tensor_name.to_owned()))?;
+
+        match projection_name {
+            "mlp.gate_proj.weight" => {
+                replace_projection_slot(&mut layer.mlp.gate, replacement, tensor_name)
+            }
+            "mlp.up_proj.weight" => {
+                replace_projection_slot(&mut layer.mlp.up, replacement, tensor_name)
+            }
+            "mlp.down_proj.weight" => {
+                replace_projection_slot(&mut layer.mlp.down, replacement, tensor_name)
+            }
+            _ if projection_name.starts_with("linear_attn.")
+                || projection_name.starts_with("self_attn.") =>
+            {
+                layer.mixer.replace_projection(projection_name, replacement)
+            }
+            _ => Err(NnError::MissingTensor(tensor_name.to_owned())),
+        }
+    }
+
+    /// Apply one tensor's scale-only candidate to its uniquely identified SALT V2
+    /// projection. The full model graph is scanned before mutation; host and CUDA
+    /// residents validate the complete update before publishing changed scales.
+    /// Success starts a new weight-state identity, invalidating all existing
+    /// caches and outputs. Create a fresh cache; resetting an old one does not
+    /// rebind it. Rejected updates preserve the previous identity.
+    ///
+    /// # Errors
+    /// Rejects empty or mixed-tensor updates, missing or ambiguous tensor
+    /// identity, shared resident storage, and malformed scale candidates.
+    pub fn apply_salt_v2_scale_updates(
+        &mut self,
+        updates: &[SaltV2ScaleUpdate],
+    ) -> Result<(), NnError> {
+        self.apply_scale_updates_to_projection(updates)?;
+        self.identity = Arc::new(RunnerIdentity);
+        Ok(())
+    }
+
+    fn apply_scale_updates_to_projection(
+        &mut self,
+        updates: &[SaltV2ScaleUpdate],
+    ) -> Result<(), NnError> {
+        let tensor_index = updates
+            .first()
+            .map(SaltV2ScaleUpdate::tensor_index)
+            .ok_or_else(|| NnError::Backend("SALT V2 scale update set is empty".into()))?;
+        if updates
+            .iter()
+            .any(|update| update.tensor_index() != tensor_index)
+        {
+            return Err(NnError::Backend(
+                "one model scale-update call must target exactly one package tensor".into(),
+            ));
+        }
+
+        let mut matches = usize::from(self.embedding.salt_v2_tensor_index() == Some(tensor_index))
+            + usize::from(self.lm_head.salt_v2_tensor_index() == Some(tensor_index));
+        for layer in &self.layers {
+            matches += layer.mixer.count_salt_v2_tensor_index(tensor_index);
+            matches += usize::from(layer.mlp.gate.salt_v2_tensor_index() == Some(tensor_index));
+            matches += usize::from(layer.mlp.up.salt_v2_tensor_index() == Some(tensor_index));
+            matches += usize::from(layer.mlp.down.salt_v2_tensor_index() == Some(tensor_index));
+        }
+        if matches != 1 {
+            return Err(NnError::Backend(format!(
+                "Qwen model has {matches} SALT V2 projections for package tensor {tensor_index}; expected exactly one"
+            )));
+        }
+
+        if self.embedding.salt_v2_tensor_index() == Some(tensor_index) {
+            self.embedding
+                .apply_salt_v2_scale_updates(tensor_index, updates)?;
+            return Ok(());
+        }
+        if self.lm_head.salt_v2_tensor_index() == Some(tensor_index) {
+            return self
+                .lm_head
+                .apply_salt_v2_scale_updates(tensor_index, updates);
+        }
+        for layer in &mut self.layers {
+            if layer.mixer.count_salt_v2_tensor_index(tensor_index) > 0 {
+                layer
+                    .mixer
+                    .apply_salt_v2_scale_updates(tensor_index, updates)?;
+                return Ok(());
+            }
+            for projection in [&mut layer.mlp.gate, &mut layer.mlp.up, &mut layer.mlp.down] {
+                if projection.salt_v2_tensor_index() == Some(tensor_index) {
+                    return projection.apply_salt_v2_scale_updates(tensor_index, updates);
+                }
+            }
+        }
+        Err(NnError::Backend(
+            "Qwen SALT V2 tensor identity disappeared during update".into(),
+        ))
+    }
+
     /// Bind the exact mixed schedule and all raw weights to one private runner.
     ///
     /// # Errors
@@ -551,6 +1180,91 @@ impl Qwen35TextRunner {
         })
     }
 
+    /// Observe committed hybrid state in canonical ONNX graph output order.
+    ///
+    /// Owns immutable FP32 copies, bounded by `max_state_bytes` (1..=256 MiB
+    /// of values). Never advances or lends out mutable cache state. Device-owned
+    /// DeltaNet recurrence is rejected, not read from stale host buffers.
+    /// Observations are numeric evidence, not qualification receipts.
+    ///
+    /// # Errors
+    /// Returns [`NnError::Provenance`] for a foreign cache, or
+    /// [`NnError::Backend`] for empty/inconsistent/device-owned/non-finite state,
+    /// invalid budgets or allocation errors. No partial observation is returned.
+    pub fn reference_states(
+        &self,
+        cache: &Qwen35TextCache,
+        max_state_bytes: usize,
+    ) -> Result<Vec<Qwen35ReferenceState>, NnError> {
+        if !Arc::ptr_eq(&cache.runner_identity, &self.identity) {
+            return Err(NnError::Provenance(
+                "Qwen cache observation received a foreign runner cache".to_owned(),
+            ));
+        }
+        self.validate_cache_layers(cache)?;
+        if cache.is_empty()
+            || cache.len() > cache.max_context
+            || cache.max_context > self.max_context
+        {
+            return Err(NnError::Backend(
+                "Qwen cache observation requires a nonempty committed cursor".to_owned(),
+            ));
+        }
+        let mut views = Vec::new();
+        views
+            .try_reserve_exact(checked_mul(
+                cache.layers.len(),
+                2,
+                "cache observation table",
+            )?)
+            .map_err(|error| {
+                NnError::Backend(format!("allocate Qwen cache observation table: {error}"))
+            })?;
+        for (index, layer) in cache.layers.iter().enumerate() {
+            match layer {
+                Qwen35TextLayerCache::DeltaNet(state) => {
+                    if state.is_device_resident() {
+                        return Err(NnError::Backend(format!(
+                            "Qwen cache observation layer {index} is device-owned; host state is not authoritative"
+                        )));
+                    }
+                    views.push(ReferenceStateView {
+                        name: format!("next_conv.{index}"),
+                        shape: vec![state.conv_width(), state.conv_kernel_dim()],
+                        values: state.conv_state(),
+                    });
+                    views.push(ReferenceStateView {
+                        name: format!("next_recurrent.{index}"),
+                        shape: vec![
+                            state.num_value_heads(),
+                            state.key_head_dim(),
+                            state.value_head_dim(),
+                        ],
+                        values: state.recurrent_state(),
+                    });
+                }
+                Qwen35TextLayerCache::FullAttention(state) => {
+                    let shape = vec![
+                        cache.len(),
+                        axis(self.config.full_attention.num_key_value_heads, "KV heads")?,
+                        axis(self.config.full_attention.head_dim, "KV head dimension")?,
+                    ];
+                    views.push(ReferenceStateView {
+                        name: format!("present_k.{index}"),
+                        shape: shape.clone(),
+                        values: state.keys(),
+                    });
+                    views.push(ReferenceStateView {
+                        name: format!("present_v.{index}"),
+                        shape,
+                        values: state.values(),
+                    });
+                }
+            }
+        }
+        snapshot_states(views, max_state_bytes)
+    }
+
     /// Run one initial prefill or one-token cached continuation transaction.
     ///
     /// Positions are derived as the contiguous interval beginning at
@@ -572,6 +1286,94 @@ impl Qwen35TextRunner {
         tokens: &[u32],
         cache: &mut Qwen35TextCache,
     ) -> Result<Qwen35TextOutput, NnError> {
+        match self.forward_with_block_observer(tokens, cache, |_, _, _, _| Ok::<_, Infallible>(()))
+        {
+            Ok(output) => Ok(output),
+            Err(Qwen35TextForwardError::Runtime(error)) => Err(error),
+            Err(Qwen35TextForwardError::Observer(never)) => match never {},
+        }
+    }
+
+    /// Run a forward with cooperative cancellation between native operations.
+    ///
+    /// Returns `Some` only after committing the ordinary forward transaction.
+    /// `None` means cancellation: no output is published and committed DeltaNet
+    /// and full-attention cache state/cursors are unchanged. A subsequent
+    /// forward can reuse the same cache. Checkpoints include entry, embedding,
+    /// mixer/MLP boundaries, language-head entry and pre-commit completion.
+    /// Already-running operations cannot be preempted; callback count is not
+    /// contractual. The query must be cheap, nonblocking and non-panicking.
+    /// A cancellation arriving after the final checkpoint can race with commit.
+    ///
+    /// # Errors
+    /// Runtime errors remain the same as [`Self::forward`], distinct from
+    /// cancellation. Pre-cancelled calls skip validation/work without mutation.
+    pub fn forward_cancellable(
+        &self,
+        tokens: &[u32],
+        cache: &mut Qwen35TextCache,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Qwen35TextOutput>, NnError> {
+        match self.forward_controlled(
+            tokens,
+            cache,
+            &[],
+            |_, _, _, _| Ok(()),
+            |_, _, _| {},
+            || if is_cancelled() { Err(()) } else { Ok(()) },
+        ) {
+            Ok(output) => Ok(Some(output)),
+            Err(Qwen35TextForwardError::Runtime(error)) => Err(error),
+            Err(Qwen35TextForwardError::Observer(())) => Ok(None),
+        }
+    }
+
+    /// Execute one forward while borrowing each post-block residual matrix to an observer.
+    ///
+    /// Outputs are emitted in layer order and are valid only for the observer call. No
+    /// per-layer activation history is retained by the runner.
+    pub(crate) fn forward_with_block_observer<E>(
+        &self,
+        tokens: &[u32],
+        cache: &mut Qwen35TextCache,
+        observer: impl FnMut(u32, usize, &[u32], &[f32]) -> Result<(), E>,
+    ) -> Result<Qwen35TextOutput, Qwen35TextForwardError<E>> {
+        self.forward_with_block_and_state_observer(tokens, cache, &[], observer, |_, _, _| {})
+    }
+
+    /// Execute one forward while borrowing block outputs and selected DeltaNet states.
+    ///
+    /// State callbacks occur only at the requested zero-based token rows and only
+    /// for DeltaNet layers. No state or activation history is retained by the runner.
+    pub(crate) fn forward_with_block_and_state_observer<E>(
+        &self,
+        tokens: &[u32],
+        cache: &mut Qwen35TextCache,
+        state_positions: &[usize],
+        observer: impl FnMut(u32, usize, &[u32], &[f32]) -> Result<(), E>,
+        state_observer: impl FnMut(u32, usize, &[f32]),
+    ) -> Result<Qwen35TextOutput, Qwen35TextForwardError<E>> {
+        self.forward_controlled(
+            tokens,
+            cache,
+            state_positions,
+            observer,
+            state_observer,
+            || Ok(()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_controlled<E>(
+        &self,
+        tokens: &[u32],
+        cache: &mut Qwen35TextCache,
+        state_positions: &[usize],
+        mut observer: impl FnMut(u32, usize, &[u32], &[f32]) -> Result<(), E>,
+        mut state_observer: impl FnMut(u32, usize, &[f32]),
+        mut checkpoint: impl FnMut() -> Result<(), E>,
+    ) -> Result<Qwen35TextOutput, Qwen35TextForwardError<E>> {
+        checkpoint().map_err(Qwen35TextForwardError::Observer)?;
         let (base, new_len) = self.preflight_forward(tokens, cache)?;
         let sequence = tokens.len();
         let hidden_len = checked_mul(sequence, self.hidden_size, "hidden-state buffer")?;
@@ -596,6 +1398,7 @@ impl Qwen35TextRunner {
         input_token_ids.extend_from_slice(tokens);
         self.embedding
             .gather_with_backend(self.backend.as_ref(), tokens, &mut residual)?;
+        checkpoint().map_err(Qwen35TextForwardError::Observer)?;
 
         let result = self.forward_provisional(
             self.backend.as_ref(),
@@ -606,6 +1409,10 @@ impl Qwen35TextRunner {
             &mut residual,
             &mut normalized,
             &mut branch,
+            state_positions,
+            &mut observer,
+            &mut state_observer,
+            &mut checkpoint,
         );
         let output = match result {
             Ok(output) => output,
@@ -617,7 +1424,7 @@ impl Qwen35TextRunner {
 
         if let Err(error) = self.preflight_commit(cache, new_len) {
             self.abort_and_rollback(cache, base);
-            return Err(error);
+            return Err(error.into());
         }
         for layer in &mut cache.layers {
             if let Qwen35TextLayerCache::DeltaNet(cache) = layer {
@@ -629,7 +1436,7 @@ impl Qwen35TextRunner {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn forward_provisional(
+    fn forward_provisional<E>(
         &self,
         backend: &dyn TernaryBackend,
         position_start: usize,
@@ -639,9 +1446,21 @@ impl Qwen35TextRunner {
         residual: &mut [f32],
         normalized: &mut [f32],
         branch: &mut [f32],
-    ) -> Result<Qwen35TextOutput, NnError> {
+        state_positions: &[usize],
+        observer: &mut impl FnMut(u32, usize, &[u32], &[f32]) -> Result<(), E>,
+        state_observer: &mut impl FnMut(u32, usize, &[f32]),
+        checkpoint: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<Qwen35TextOutput, Qwen35TextForwardError<E>> {
         let sequence = input_token_ids.len();
-        for (layer, layer_cache) in self.layers.iter().zip(&mut cache.layers) {
+        for (block_index, (layer, layer_cache)) in
+            self.layers.iter().zip(&mut cache.layers).enumerate()
+        {
+            checkpoint().map_err(Qwen35TextForwardError::Observer)?;
+            let block_index = u32::try_from(block_index).map_err(|_| {
+                Qwen35TextForwardError::Runtime(NnError::ResourceExhausted(
+                    "Qwen3.5 block index exceeds u32".to_owned(),
+                ))
+            })?;
             normalize_rows(
                 residual,
                 &layer.input_norm,
@@ -649,9 +1468,22 @@ impl Qwen35TextRunner {
                 self.hidden_size,
                 normalized,
             )?;
+            checkpoint().map_err(Qwen35TextForwardError::Observer)?;
             match (&layer.mixer, layer_cache) {
                 (Qwen35TextMixer::DeltaNet(mixer), Qwen35TextLayerCache::DeltaNet(cache)) => {
-                    mixer.stage_forward(backend, normalized, sequence, cache, branch)?
+                    let mut report_state = |position: usize, state: &[f32]| {
+                        state_observer(block_index, position, state);
+                    };
+                    let mut recurrent_observer =
+                        RecurrentStateObserver::new(state_positions, &mut report_state);
+                    mixer.stage_forward_with_state_observer(
+                        backend,
+                        normalized,
+                        sequence,
+                        cache,
+                        branch,
+                        &mut recurrent_observer,
+                    )?
                 }
                 (
                     Qwen35TextMixer::FullAttention(mixer),
@@ -660,9 +1492,11 @@ impl Qwen35TextRunner {
                 _ => {
                     return Err(NnError::Backend(
                         "Qwen3.5 cache layer kind changed after preflight".to_owned(),
-                    ));
+                    )
+                    .into());
                 }
             }
+            checkpoint().map_err(Qwen35TextForwardError::Observer)?;
             add_in_place(residual, branch);
 
             normalize_rows(
@@ -672,10 +1506,15 @@ impl Qwen35TextRunner {
                 self.hidden_size,
                 normalized,
             )?;
+            checkpoint().map_err(Qwen35TextForwardError::Observer)?;
             layer.mlp.forward(backend, normalized, sequence, branch)?;
+            checkpoint().map_err(Qwen35TextForwardError::Observer)?;
             add_in_place(residual, branch);
+            observer(block_index, position_start, &input_token_ids, residual)
+                .map_err(Qwen35TextForwardError::Observer)?;
         }
 
+        checkpoint().map_err(Qwen35TextForwardError::Observer)?;
         let mut final_hidden_states = zeroed_scratch(residual.len(), "final hidden states")?;
         normalize_rows(
             residual,
@@ -686,6 +1525,7 @@ impl Qwen35TextRunner {
         )?;
         let mut last_logits = zeroed_scratch(self.vocab_size, "last-token logits")?;
         let last_start = checked_mul(sequence - 1, self.hidden_size, "last hidden row")?;
+        checkpoint().map_err(Qwen35TextForwardError::Observer)?;
         self.lm_head.forward(
             backend,
             &final_hidden_states[last_start..last_start + self.hidden_size],
@@ -699,8 +1539,10 @@ impl Qwen35TextRunner {
         {
             return Err(NnError::Backend(
                 "Qwen3.5 text forward produced a non-finite value".to_owned(),
-            ));
+            )
+            .into());
         }
+        checkpoint().map_err(Qwen35TextForwardError::Observer)?;
         Ok(Qwen35TextOutput {
             runner_identity: Arc::clone(&self.identity),
             position_start,
@@ -727,24 +1569,7 @@ impl Qwen35TextRunner {
                 got: 0,
             });
         }
-        if cache.layers.len() != self.layers.len() {
-            return Err(NnError::Backend(
-                "Qwen3.5 text cache layer count is inconsistent".to_owned(),
-            ));
-        }
-        for (index, (layer, layer_cache)) in self.layers.iter().zip(&cache.layers).enumerate() {
-            if layer.mixer.kind() != layer_cache.kind()
-                || layer_cache.committed_len() != cache.committed_len
-                || matches!(
-                    layer_cache,
-                    Qwen35TextLayerCache::DeltaNet(cache) if cache.staged_len().is_some()
-                )
-            {
-                return Err(NnError::Backend(format!(
-                    "Qwen3.5 text cache layer {index} is inconsistent with the global cursor"
-                )));
-            }
-        }
+        self.validate_cache_layers(cache)?;
         if cache.committed_len != 0 && self.has_delta_net && tokens.len() != 1 {
             return Err(invalid_config(
                 "Qwen3.5 cached DeltaNet continuation must contain exactly one token",
@@ -770,6 +1595,28 @@ impl Qwen35TextRunner {
             });
         }
         Ok((cache.committed_len, new_len))
+    }
+
+    fn validate_cache_layers(&self, cache: &Qwen35TextCache) -> Result<(), NnError> {
+        if cache.layers.len() != self.layers.len() {
+            return Err(NnError::Backend(
+                "Qwen3.5 text cache layer count is inconsistent".to_owned(),
+            ));
+        }
+        for (index, (layer, layer_cache)) in self.layers.iter().zip(&cache.layers).enumerate() {
+            if layer.mixer.kind() != layer_cache.kind()
+                || layer_cache.committed_len() != cache.committed_len
+                || matches!(
+                    layer_cache,
+                    Qwen35TextLayerCache::DeltaNet(cache) if cache.staged_len().is_some()
+                )
+            {
+                return Err(NnError::Backend(format!(
+                    "Qwen3.5 text cache layer {index} is inconsistent with the global cursor"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn preflight_commit(&self, cache: &Qwen35TextCache, new_len: usize) -> Result<(), NnError> {

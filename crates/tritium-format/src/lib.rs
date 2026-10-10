@@ -40,6 +40,7 @@ use core::fmt;
 use half::f16;
 use tritium_core::TritError;
 
+mod additive_tensor;
 mod artifact;
 mod codec_bundle;
 mod entropy_transport;
@@ -71,7 +72,9 @@ mod tq2;
 mod tqbin;
 mod tqidx;
 mod training_salt;
+mod trit_package;
 
+pub use additive_tensor::{AdditiveTensor, AdditiveTensorError};
 pub use artifact::{
     ArtifactError, ModelId, PackageHasher, PackageId, SemanticModelManifest, SemanticTensor,
     SemanticTensorHasher,
@@ -84,9 +87,10 @@ pub use codec_bundle::{
 pub use entropy_transport::{
     ENTROPY_TRANSPORT_DEFAULT_CHUNK_BYTES, ENTROPY_TRANSPORT_MAGIC,
     ENTROPY_TRANSPORT_MAX_CHUNK_BYTES, ENTROPY_TRANSPORT_MIN_CHUNK_BYTES,
-    ENTROPY_TRANSPORT_VERSION, EntropyChunkInfo, EntropyTransport, EntropyTransportError,
-    SeekableEntropyTransport, read_entropy_transport, read_entropy_transport_seekable,
-    write_entropy_transport, write_entropy_transport_with_chunk_size,
+    ENTROPY_TRANSPORT_VERSION, EntropyChunkInfo, EntropyTransport, EntropyTransportChunkCodec,
+    EntropyTransportError, SeekableEntropyTransport, read_entropy_transport,
+    read_entropy_transport_seekable, write_entropy_transport,
+    write_entropy_transport_with_chunk_size,
 };
 pub use gguf::{
     DEFAULT_ALIGNMENT, GGML_TYPE_Q2_0, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, GgufError, GgufFile,
@@ -106,7 +110,10 @@ pub use q2_0::{
 };
 pub use rows::{num_blocks, pack_tq1_0_row, pack_tq2_0_row, unpack_tq1_0_row, unpack_tq2_0_row};
 pub use runtime_evidence::{
-    RuntimeEvidenceError, RuntimeFinalLogitsAccumulator, RuntimeFinalLogitsEvidence,
+    RuntimeBlockOutputsAccumulator, RuntimeBlockOutputsEvidence, RuntimeEvidenceError,
+    RuntimeFinalLogitsAccumulator, RuntimeFinalLogitsEvidence,
+    RuntimeOutputReconstructionAccumulator, RuntimeOutputReconstructionEvidence,
+    RuntimeOutputScope, RuntimeOutputScopeAccumulator, RuntimeOutputScopeEvidence,
 };
 pub use safetensors::{
     SafeTensors, SafeTensorsError, SafeTensorsReader, VisitTensorBytesError, read_safetensors,
@@ -151,6 +158,10 @@ pub use tq2::{compute_zero_bitmap, compute_zero_bitmaps, pack_tq2_0_block, unpac
 pub use tqbin::{TQBIN_HEADER_BYTES, TQBIN_MAGIC, TQBIN_VERSION, read_tqbin, write_tqbin};
 pub use tqidx::{ShardEntry, TQIDX_MAGIC, TQIDX_VERSION, TqIndex, read_tqidx, write_tqidx};
 pub use training_salt::{PackedTrainingSaltSnapshot, TernaryStructure, TrainingSaltPlane};
+pub use trit_package::{
+    TRIT_BLOB_ALIGNMENT, TRIT_HEADER_BYTES, TRIT_MAGIC, TRIT_PACKAGE_MAJOR, TritBlob, TritBlobInfo,
+    TritBlobKind, TritPackage, TritPackageError, read_trit_package, write_trit_package,
+};
 
 /// Weights per quantization block (ggml `QK_K`).
 pub const QK_K: usize = 256;

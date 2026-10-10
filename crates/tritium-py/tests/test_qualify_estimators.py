@@ -12,6 +12,8 @@ from tritium.torch import qualify_estimators as worker  # noqa: E402
 def test_worker_executes_complete_catalog_and_plugin_contract(tmp_path, monkeypatch):
     wheel = tmp_path / "pytritium-1.1.0rc0-py3-none-any.whl"
     wheel.write_bytes(b"candidate-wheel")
+    # Algorithm fixture only: opaque wheel bytes are not qualification evidence.
+    monkeypatch.setattr(worker, "verify_installed_candidate", lambda **_kwargs: None)
     monkeypatch.setattr(
         worker.importlib.metadata,
         "version",

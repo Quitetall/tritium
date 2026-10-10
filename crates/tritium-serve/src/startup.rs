@@ -115,17 +115,20 @@ impl AdmittedArtifactV1 {
             SaltV2Codec::S34 => "s34",
             _ => return Err(StartupError::InvalidAdmission("unsupported SALT V2 codec")),
         };
+        // These identities have different, frozen encodings: the manifest is
+        // the raw BLAKE3 digest of tritium.json, while artifact packages use
+        // Tritium's domain-separated `trp1_` PackageId representation.
+        validate_hex(
+            receipt.manifest_package_id(),
+            IDENTITY_HEX_CHARS,
+            "manifest package",
+        )?;
         for (label, value) in [
-            ("manifest package", receipt.manifest_package_id()),
             ("SALT package", receipt.package_id()),
             ("preserved package", receipt.preserved_package_id()),
             ("config package", receipt.config_package_id()),
         ] {
-            if provisional {
-                validate_package_id(value, label)?;
-            } else {
-                validate_hex(value, IDENTITY_HEX_CHARS, label)?;
-            }
+            validate_package_id(value, label)?;
         }
         validate_hex(
             server_source_revision,
@@ -455,6 +458,21 @@ mod tests {
     use super::*;
     use crate::generator::{FinishReason, MockGenerator};
 
+    #[test]
+    fn manifest_and_package_id_encodings_are_distinct() {
+        assert!(validate_hex(&"a".repeat(64), IDENTITY_HEX_CHARS, "manifest").is_ok());
+        assert!(validate_package_id(&format!("trp1_{}", "b".repeat(64)), "package").is_ok());
+        assert!(
+            validate_hex(
+                &format!("trp1_{}", "a".repeat(64)),
+                IDENTITY_HEX_CHARS,
+                "manifest"
+            )
+            .is_err()
+        );
+        assert!(validate_package_id(&"b".repeat(64), "package").is_err());
+    }
+
     fn artifact() -> AdmittedArtifactV1 {
         AdmittedArtifactV1 {
             provisional: false,
@@ -462,9 +480,9 @@ mod tests {
             server_build_id: "tritium-serve@1.1.0-rc.0".into(),
             model_source_revision: "b".repeat(40),
             manifest_package_id: "c".repeat(64),
-            salt_package_id: "d".repeat(64),
-            preserved_package_id: "e".repeat(64),
-            config_package_id: "f".repeat(64),
+            salt_package_id: format!("trp1_{}", "d".repeat(64)),
+            preserved_package_id: format!("trp1_{}", "e".repeat(64)),
+            config_package_id: format!("trp1_{}", "f".repeat(64)),
             profile: "compact-v1".into(),
             codec: "b3".into(),
             backend_policy: "cpu".into(),

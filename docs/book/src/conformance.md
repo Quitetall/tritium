@@ -4,8 +4,9 @@ A backend is "correct" in Tritium iff it reproduces the **frozen, versioned
 conformance vector set** within tolerance. This is the mechanism that makes
 cross-backend parity structural — see the
 [Architecture](./architecture.md#the-frozen-vector-conformance-model) chapter for
-the rationale and the backend-breadth ADR (see the [research repository](https://github.com/Quitetall/tritium-research))
-for why freezing came first.
+the rationale and the internal backend-breadth ADR; see the
+[research-record access policy](./research-records.md) for requesting internal
+decisions.
 
 ## The vector set
 

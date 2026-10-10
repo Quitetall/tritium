@@ -145,3 +145,122 @@ fn failed_host_forward_rolls_back_every_layer_cache() {
     assert!(runner.kv.iter().all(|cache| cache.k.is_empty()));
     assert!(runner.kv.iter().all(|cache| cache.v.is_empty()));
 }
+
+#[test]
+fn legacy_cancellable_forward_stops_inside_prefill() {
+    let mut runner = ModelRunner::from_weights(config(), weights(true), cpu());
+    let checks = std::cell::Cell::new(0);
+    let output = runner
+        .forward_cancellable(&[0, 1], &[0, 1], &|| {
+            checks.set(checks.get() + 1);
+            checks.get() == 2
+        })
+        .unwrap();
+    assert!(
+        output.is_none(),
+        "native prefill must poll after model entry"
+    );
+    assert!(runner.kv.iter().all(|cache| cache.len == 0));
+}
+
+fn cache_bits(runner: &ModelRunner) -> Vec<(usize, Vec<u32>, Vec<u32>)> {
+    runner
+        .kv
+        .iter()
+        .map(|cache| {
+            (
+                cache.len,
+                cache.k.iter().map(|value| value.to_bits()).collect(),
+                cache.v.iter().map(|value| value.to_bits()).collect(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn legacy_cancellable_forward_rolls_back_every_host_checkpoint() {
+    for tied in [true, false] {
+        for continuation in [false, true] {
+            let seed: &[u32] = if continuation { &[0, 3, 6] } else { &[] };
+            let seed_positions: Vec<usize> = (0..seed.len()).collect();
+            let tokens = [2, 1];
+            let positions = [seed.len(), seed.len() + 1];
+            let make_runner = || {
+                let mut runner = ModelRunner::from_weights(config(), weights(tied), cpu());
+                if !seed.is_empty() {
+                    runner.forward(seed, &seed_positions).unwrap();
+                }
+                runner
+            };
+            let mut ordinary = make_runner();
+            let expected: Vec<u32> = ordinary
+                .forward(&tokens, &positions)
+                .unwrap()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect();
+            let checks = std::cell::Cell::new(0);
+            let mut controlled = make_runner();
+            let actual = controlled
+                .forward_cancellable(&tokens, &positions, &|| {
+                    checks.set(checks.get() + 1);
+                    false
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(cache_bits(&controlled), cache_bits(&ordinary));
+            assert!(checks.get() >= 5, "native layers need checkpoints");
+            for cancel_at in 1..=checks.get() {
+                let mut runner = make_runner();
+                let before = cache_bits(&runner);
+                let count = std::cell::Cell::new(0);
+                let output = runner
+                    .forward_cancellable(&tokens, &positions, &|| {
+                        count.set(count.get() + 1);
+                        count.get() == cancel_at
+                    })
+                    .unwrap();
+                assert!(output.is_none(), "checkpoint {cancel_at} published logits");
+                assert_eq!(
+                    cache_bits(&runner),
+                    before,
+                    "checkpoint {cancel_at} changed KV"
+                );
+                let recovered = runner.forward(&tokens, &positions).unwrap();
+                assert_eq!(
+                    recovered
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    expected,
+                    "checkpoint {cancel_at} changed recovered logits"
+                );
+                assert_eq!(cache_bits(&runner), cache_bits(&ordinary));
+            }
+        }
+    }
+}
+
+#[test]
+fn legacy_cancellable_forward_preserves_runtime_errors() {
+    let mut runner = ModelRunner::from_weights(config(), weights(true), cpu());
+    assert!(matches!(
+        runner.forward_cancellable(&[1], &[], &|| false),
+        Err(tritium_nn::NnError::Shape { .. })
+    ));
+    assert!(runner.forward_cancellable(&[99], &[0], &|| false).is_err());
+    assert!(
+        runner
+            .forward_cancellable(&[], &[], &|| true)
+            .unwrap()
+            .is_none()
+    );
+    assert!(runner.kv.iter().all(|cache| cache.len == 0));
+}

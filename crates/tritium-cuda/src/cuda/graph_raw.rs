@@ -878,6 +878,23 @@ impl BatchKv {
         self.pages.as_ref().map_or(0, |p| p.free.len())
     }
 
+    /// Debug/test access: captured grouped-tree bucket count for this batch.
+    /// Zero means no grouped graph has been captured (e.g. the eager route).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn debug_tree_slots_graph_bucket_count(&self) -> usize {
+        self.tree_slots_graphs
+            .as_ref()
+            .map_or(0, |tg| tg.graphs.len())
+    }
+
+    /// Debug/test access: ordinary logit and argmax decode graphs are captured.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn debug_decode_graphs(&self) -> (bool, bool) {
+        (self.graph.is_some(), self.graph_argmax.is_some())
+    }
+
     /// Debug/test access: `row`'s page-table row (logical page index →
     /// physical page id, `-1` = unmapped); `None` for a dense batch. Lets
     /// gates assert a mapping is genuinely non-identity (a scrambled-pool

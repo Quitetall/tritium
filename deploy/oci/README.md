@@ -32,10 +32,12 @@ archive, admit its attached attestations, load it by digest, then run it with an
 arbitrary UID, `--read-only`, `--cap-drop=ALL`, `no-new-privileges`, a bounded
 `/tmp` tmpfs, and a read-only model mount. The Compose files encode those runtime
 controls. Launch them through `scripts/run-oci-compose`, which rejects mutable
-image tags. They remain compatibility profiles—not smoke evidence—until an
-external harness proves readiness, requests, drain, write rejection and receipt
-parity, and until the strict schema-v3 serving loader replaces the legacy GGUF
-binary path.
+image tags. Both Compose profiles invoke the strict schema-v3 `--bundle`
+serving path; the explicit `--model` GGUF and `--converted` paths remain
+compatibility paths, not production-admitted alternatives. The images are still
+build artifacts—not smoke evidence—until an external harness proves readiness,
+requests, drain, write rejection and startup-receipt parity against the exact
+archive and candidate.
 
 No image is pushed by this workflow. CUDA qualification additionally requires
 an NVIDIA host and must record driver, runtime, toolkit, GPU, and image identities.

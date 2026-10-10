@@ -2,10 +2,13 @@
 //! `/healthz` liveness and `/readyz` traffic readiness, with backpressure and a
 //! drain flag for graceful shutdown.
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::http::{HeaderValue, Method, StatusCode, header};
@@ -15,7 +18,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use opentelemetry::Context;
 use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing_futures::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tritium_nn::Tokenizer;
@@ -26,7 +29,7 @@ use crate::dto::{
     StopField, Usage,
 };
 use crate::generator::TreeOpError;
-use crate::generator::{FinishReason, GenRequest, Generator, Sampling};
+use crate::generator::{CancellationCapabilitiesV1, FinishReason, GenRequest, Generator, Sampling};
 use crate::sse::{
     IncrementalDetok, StopMatcher, content_chunk, error_chunk, role_chunk, terminal_chunk,
 };
@@ -112,12 +115,14 @@ pub struct ServeConfig {
     pub max_new_default: usize,
     /// Per-request lifetime budget. For non-streaming requests the service
     /// timeout bounds body handling, queue wait and generation. Streaming
-    /// responses additionally enforce the same budget inside the lazy SSE
-    /// body, starting at queue admission; expiry emits a typed error event and
+    /// responses additionally enforce the same budget independently of lazy SSE
+    /// body polling, starting at queue admission; expiry emits a typed error event and
     /// cancels generation. `0` disables both deadlines.
     pub request_timeout_secs: u64,
-    /// Global in-flight request cap (DoS bound on handler memory/FDs).
-    /// 0 disables.
+    /// Router-wide ordinary-request cap, held through response-body completion
+    /// or drop. Authenticated GET health/readiness/metrics share one additional
+    /// reserved slot so generation saturation cannot starve probes (ADR 0050).
+    /// This is not an accepted-socket limit. `0` disables both budgets.
     pub max_concurrent_requests: usize,
     /// When set, every request must carry `Authorization: Bearer <token>`.
     /// Required by `main` when binding beyond loopback.
@@ -387,15 +392,141 @@ impl Drop for GenerationMetricsGuard {
 struct StreamDisconnectGuard {
     metrics: Arc<Metrics>,
     completed: bool,
+    deadline_state: Arc<AtomicU8>,
 }
 
 impl Drop for StreamDisconnectGuard {
     fn drop(&mut self) {
         if !self.completed {
+            // Claim retirement before accounting. A read followed by an
+            // increment lets the watchdog claim timeout between the two.
+            let previous = self
+                .deadline_state
+                .compare_exchange(
+                    STREAM_RUNNING,
+                    STREAM_FINISHED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .unwrap_or_else(|state| state);
+            if previous == STREAM_EXPIRED {
+                return;
+            }
             self.metrics
                 .stream_disconnects
                 .fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+const STREAM_RUNNING: u8 = 0;
+const STREAM_EXPIRED: u8 = 1;
+const STREAM_FINISHED: u8 = 2;
+
+/// Keep the existing bounded event channel, but allow its deadline watchdog to
+/// close it even when the HTTP body is not being polled. No relay buffer or
+/// model-side timer is added. The receiver lock is never retained across yields.
+struct StreamEventReceiver {
+    receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<GenEvent>>>,
+    deadline: Option<tokio::time::Instant>,
+    state: Arc<AtomicU8>,
+    metrics: Arc<Metrics>,
+    watchdog: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl StreamEventReceiver {
+    fn new(
+        receiver: mpsc::Receiver<GenEvent>,
+        started: Instant,
+        timeout: Option<Duration>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        let started = tokio::time::Instant::from_std(started);
+        let deadline = timeout.map(|budget| started.checked_add(budget).unwrap_or(started));
+        let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
+        let state = Arc::new(AtomicU8::new(STREAM_RUNNING));
+        let watchdog = deadline.map(|deadline| {
+            let receiver = Arc::downgrade(&receiver);
+            let state = state.clone();
+            let metrics = metrics.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep_until(deadline).await;
+                if let Some(receiver) = receiver.upgrade() {
+                    let mut receiver = receiver.lock().await;
+                    if Self::expire(&state, &metrics) {
+                        receiver.close();
+                    }
+                }
+            })
+        });
+        Self {
+            receiver,
+            deadline,
+            state,
+            metrics,
+            watchdog,
+        }
+    }
+
+    fn expire(state: &AtomicU8, metrics: &Metrics) -> bool {
+        if state
+            .compare_exchange(
+                STREAM_RUNNING,
+                STREAM_EXPIRED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            metrics.stream_timeouts.fetch_add(1, Ordering::Relaxed);
+        }
+        state.load(Ordering::Acquire) == STREAM_EXPIRED
+    }
+
+    async fn recv(&mut self) -> Result<Option<GenEvent>, ()> {
+        let mut receiver = self.receiver.lock().await;
+        if let Some(deadline) = self.deadline {
+            // Check before reading: timeout_at can otherwise accept an already
+            // buffered event even when its deadline has elapsed.
+            if tokio::time::Instant::now() >= deadline {
+                Self::expire(&self.state, &self.metrics);
+                receiver.close();
+                return Err(());
+            }
+            match tokio::time::timeout_at(deadline, receiver.recv()).await {
+                Ok(event) => Ok(event),
+                Err(_) => {
+                    Self::expire(&self.state, &self.metrics);
+                    receiver.close();
+                    Err(())
+                }
+            }
+        } else {
+            Ok(receiver.recv().await)
+        }
+    }
+
+    fn stop_watchdog(&mut self) {
+        let _ = self.state.compare_exchange(
+            STREAM_RUNNING,
+            STREAM_FINISHED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        if let Some(watchdog) = self.watchdog.take() {
+            watchdog.abort();
+        }
+    }
+
+    async fn finish(&mut self) {
+        self.stop_watchdog();
+        self.receiver.lock().await.close();
+    }
+}
+
+impl Drop for StreamEventReceiver {
+    fn drop(&mut self) {
+        self.stop_watchdog();
     }
 }
 
@@ -418,8 +549,10 @@ struct AppState {
 
 #[derive(Clone)]
 struct RuntimeState {
+    cancellation: CancellationCapabilitiesV1,
     draining: Arc<AtomicBool>,
     worker_alive: Arc<AtomicBool>,
+    worker_ready: Arc<AtomicBool>,
     phase: Arc<AtomicU8>,
     backend_faulted: Arc<AtomicBool>,
     backend_faults: Arc<AtomicU64>,
@@ -469,6 +602,7 @@ pub fn build_router_with_limits(
     let backend_faulted = Arc::new(AtomicBool::new(false));
     let backend_faults = Arc::new(AtomicU64::new(0));
     let telemetry = Arc::new(WorkerTelemetry::default());
+    let cancellation = generator.cancellation_capabilities();
     let jobs = spawn_worker(
         generator,
         WorkerSignals {
@@ -492,10 +626,12 @@ pub fn build_router_with_limits(
         RuntimeState {
             draining,
             worker_alive,
+            worker_ready: Arc::new(AtomicBool::new(true)),
             phase,
             backend_faulted,
             backend_faults,
             telemetry,
+            cancellation,
             production: None,
         },
     )
@@ -520,6 +656,7 @@ pub fn build_router_governed(
     let backend_faulted = Arc::new(AtomicBool::new(false));
     let backend_faults = Arc::new(AtomicU64::new(0));
     let telemetry = Arc::new(WorkerTelemetry::default());
+    let cancellation = generator.cancellation_capabilities();
     let jobs = spawn_worker(
         generator,
         WorkerSignals {
@@ -542,10 +679,12 @@ pub fn build_router_governed(
         RuntimeState {
             draining,
             worker_alive,
+            worker_ready: Arc::new(AtomicBool::new(true)),
             phase,
             backend_faulted,
             backend_faults,
             telemetry,
+            cancellation,
             production: None,
         },
     ))
@@ -599,6 +738,7 @@ fn build_router_production_mode(
     let backend_faulted = Arc::new(AtomicBool::new(false));
     let backend_faults = Arc::new(AtomicU64::new(0));
     let telemetry = Arc::new(WorkerTelemetry::default());
+    let cancellation = generator.cancellation_capabilities();
     let jobs = spawn_worker(
         generator,
         WorkerSignals {
@@ -621,10 +761,12 @@ fn build_router_production_mode(
         RuntimeState {
             draining: draining.clone(),
             worker_alive,
+            worker_ready: Arc::new(AtomicBool::new(true)),
             phase,
             backend_faulted,
             backend_faults,
             telemetry,
+            cancellation,
             production: Some(production.clone()),
         },
     );
@@ -658,6 +800,7 @@ pub fn build_router_batched_with_limits(
 ) -> std::io::Result<(Router, Arc<AtomicBool>)> {
     let admission = Arc::new(Admission::legacy(cfg.auth_token.as_deref()));
     build_router_batched_inner(runner, None, eos, slots, tok, cfg, limits, admission)
+        .map(|(router, draining, _worker_alive)| (router, draining))
 }
 
 /// Build the continuous-batching router with an attached ADR 0021 draft
@@ -684,6 +827,7 @@ pub fn build_router_batched_with_draft(
         RequestLimits::default(),
         admission,
     )
+    .map(|(router, draining, _worker_alive)| (router, draining))
 }
 
 /// Build the continuous-batching router with rotating bearer keys and
@@ -703,6 +847,7 @@ pub fn build_router_batched_governed(
 ) -> std::io::Result<(Router, Arc<AtomicBool>)> {
     let admission = Arc::new(Admission::new(cfg.auth_token.as_deref(), policy)?);
     build_router_batched_inner(runner, draft, eos, slots, tok, cfg, limits, admission)
+        .map(|(router, draining, _worker_alive)| (router, draining))
 }
 
 #[cfg(feature = "cuda")]
@@ -716,7 +861,7 @@ fn build_router_batched_inner(
     cfg: ServeConfig,
     limits: RequestLimits,
     admission: Arc<Admission>,
-) -> std::io::Result<(Router, Arc<AtomicBool>)> {
+) -> std::io::Result<(Router, Arc<AtomicBool>, Arc<AtomicBool>)> {
     use std::sync::atomic::Ordering;
     if slots == 0 {
         return Err(std::io::Error::new(
@@ -724,14 +869,18 @@ fn build_router_batched_inner(
             "--batch-slots must be >= 1",
         ));
     }
+    let cancellation = CancellationCapabilitiesV1::batched(draft.is_some());
     let (jobs_tx, jobs_rx) = tokio::sync::mpsc::channel(cfg.queue_cap);
     let worker_alive = Arc::new(AtomicBool::new(true));
+    let worker_lifecycle = worker_alive.clone();
+    let worker_ready = Arc::new(AtomicBool::new(false));
     let draining = Arc::new(AtomicBool::new(false));
     let phase = Arc::new(AtomicU8::new(PHASE_IDLE));
     let backend_faulted = Arc::new(AtomicBool::new(false));
     let backend_faults = Arc::new(AtomicU64::new(0));
     let telemetry = Arc::new(WorkerTelemetry::default());
     let alive = worker_alive.clone();
+    let ready = worker_ready.clone();
     let drain_flag = draining.clone();
     let worker_phase = phase.clone();
     let worker_telemetry = telemetry.clone();
@@ -756,11 +905,12 @@ fn build_router_batched_inner(
                 pool_tokens,
                 jobs_rx,
                 drain_flag,
+                ready,
                 worker_phase,
                 worker_telemetry,
             );
         })?;
-    Ok(build_router_inner(
+    let (router, draining) = build_router_inner(
         jobs_tx,
         tok,
         cfg,
@@ -769,13 +919,98 @@ fn build_router_batched_inner(
         RuntimeState {
             draining,
             worker_alive,
+            worker_ready,
             phase,
             backend_faulted,
             backend_faults,
             telemetry,
+            cancellation,
             production: None,
         },
-    ))
+    );
+    Ok((router, draining, worker_lifecycle))
+}
+
+/// Shared across routes and router clones, unlike a per-route service layer.
+struct RequestBudget {
+    ordinary: Arc<Semaphore>,
+    probes: Arc<Semaphore>,
+}
+
+impl RequestBudget {
+    fn new(cap: usize) -> Self {
+        Self {
+            ordinary: Arc::new(Semaphore::new(cap)),
+            probes: Arc::new(Semaphore::new(1)),
+        }
+    }
+
+    fn try_acquire(
+        &self,
+        method: &Method,
+        path: &str,
+    ) -> Result<OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
+        let probe = method == Method::GET && matches!(path, "/healthz" | "/readyz" | "/metrics");
+        // Normal scrape concurrency uses the shared budget. Only exhausted
+        // ordinary capacity invokes the one-slot reserve; otherwise routine
+        // concurrent collectors would be unnecessarily serialized.
+        self.ordinary.clone().try_acquire_owned().or_else(|error| {
+            if probe {
+                self.probes.clone().try_acquire_owned()
+            } else {
+                Err(error)
+            }
+        })
+    }
+}
+
+/// Retain admission ownership without a relay, body copy or trailer loss.
+struct AdmissionBody {
+    inner: Body,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl HttpBody for AdmissionBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let frame = Pin::new(&mut self.inner).poll_frame(cx);
+        let finished = match &frame {
+            Poll::Ready(None | Some(Err(_))) => true,
+            Poll::Ready(Some(Ok(_))) => self.inner.is_end_stream(),
+            Poll::Pending => false,
+        };
+        if finished {
+            self.permit.take();
+        }
+        frame
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+fn hold_request_permit(response: Response, permit: OwnedSemaphorePermit) -> Response {
+    if response.body().is_end_stream() {
+        return response; // `permit` is dropped for an already-empty body.
+    }
+    let (parts, inner) = response.into_parts();
+    Response::from_parts(
+        parts,
+        Body::new(AdmissionBody {
+            inner,
+            permit: Some(permit),
+        }),
+    )
 }
 
 fn build_router_inner(
@@ -811,7 +1046,7 @@ fn build_router_inner(
         .route("/metrics", get(metrics))
         .route("/v1/tree/session", post(tree_session))
         .route("/v1/tree/verify", post(tree_verify))
-        .with_state(state)
+        .with_state(state.clone())
         // Explicit request-body cap (axum's default, stated rather than
         // implied — threat-model DoS bound).
         .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024));
@@ -833,11 +1068,58 @@ fn build_router_inner(
         ));
     }
     if cfg.max_concurrent_requests > 0 {
-        // Global in-flight cap: bounds handler memory/FD growth under
-        // connection floods (threat-model slowloris item; the accept loop
-        // itself remains unbounded — documented residual).
-        router = router.layer(tower::limit::ConcurrencyLimitLayer::new(
-            cfg.max_concurrent_requests,
+        let budget = Arc::new(RequestBudget::new(cfg.max_concurrent_requests));
+        let request_state = Arc::new(state);
+        router = router.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let budget = budget.clone();
+                let request_state = request_state.clone();
+                async move {
+                    // Preserve fail-closed readiness/drain classification even
+                    // when retained responses exhaust ordinary capacity.
+                    if is_model_work(req.method(), req.uri().path()) {
+                        if request_state.runtime.draining.load(Ordering::Acquire) {
+                            let kind = if req.uri().path() == "/v1/chat/completions" {
+                                "server_error"
+                            } else {
+                                "draining"
+                            };
+                            return api_error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                kind,
+                                "server is draining",
+                                None,
+                            );
+                        }
+                        if !request_ready(&request_state) {
+                            return api_error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "server_error",
+                                "server is not ready",
+                                None,
+                            );
+                        }
+                    }
+                    let permit = match budget.try_acquire(req.method(), req.uri().path()) {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            let mut error = ApiError::new(
+                                "rate_limit_exceeded",
+                                "in-flight request capacity exceeded; retry later",
+                                None,
+                            );
+                            error.error.code = Some("rate_limit_exceeded".to_owned());
+                            let mut response =
+                                (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response();
+                            response
+                                .headers_mut()
+                                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                            return response;
+                        }
+                    };
+                    hold_request_permit(next.run(req).await, permit)
+                }
+            },
         ));
     }
     // Authentication and admission share one bounded principal resolution.
@@ -898,11 +1180,7 @@ fn build_router_inner(
                             response
                         }
                         Some(principal) => {
-                            let governed = req.method() == axum::http::Method::POST
-                                && matches!(
-                                    req.uri().path(),
-                                    "/v1/chat/completions" | "/v1/tree/session" | "/v1/tree/verify"
-                                );
+                            let governed = is_model_work(req.method(), req.uri().path());
                             if governed
                                 && let AdmissionDecision::Reject { retry_after_secs } =
                                     admission.admit(principal)
@@ -1087,6 +1365,14 @@ fn method_class(method: &Method) -> &'static str {
     }
 }
 
+fn is_model_work(method: &Method, path: &str) -> bool {
+    method == Method::POST
+        && matches!(
+            path,
+            "/v1/chat/completions" | "/v1/tree/session" | "/v1/tree/verify"
+        )
+}
+
 fn route_class(method: &Method, path: &str) -> &'static str {
     match (method, path) {
         (&Method::POST, "/v1/chat/completions") => "chat_completions",
@@ -1194,6 +1480,7 @@ fn request_timeout_error() -> ApiError {
 
 fn request_ready(state: &AppState) -> bool {
     state.runtime.worker_alive.load(Ordering::Relaxed)
+        && state.runtime.worker_ready.load(Ordering::Acquire)
         && !state.runtime.backend_faulted.load(Ordering::Acquire)
         && state
             .runtime
@@ -1649,7 +1936,7 @@ fn sse_data(chunk: &ChatChunk) -> Event {
 
 #[allow(clippy::too_many_arguments)] // wire contract keeps stream controls explicit
 fn stream_response(
-    mut rx: mpsc::Receiver<GenEvent>,
+    rx: mpsc::Receiver<GenEvent>,
     tok: Arc<dyn Tokenizer + Send + Sync>,
     model: String,
     stops: Vec<String>,
@@ -1666,12 +1953,12 @@ fn stream_response(
     let created = now_secs();
     let detok_eos = tok.eos();
     let stream_tok = tok.clone();
-    let deadline = timeout.map(|budget| {
-        let now = tokio::time::Instant::now();
-        // A pathological public config must fail closed rather than turning
-        // an overflowing lifetime into an unbounded stream.
-        now.checked_add(budget).unwrap_or(now)
-    });
+    let mut rx = StreamEventReceiver::new(rx, generation_started, timeout, metrics.clone());
+    let disconnect = StreamDisconnectGuard {
+        metrics: metrics.clone(),
+        completed: false,
+        deadline_state: rx.state.clone(),
+    };
     let generation_metrics =
         GenerationMetricsGuard::with_start(metrics.clone(), generation_started);
     let request_span = tracing::Span::current();
@@ -1686,10 +1973,7 @@ fn stream_response(
         // than closing the root when only response headers have been sent.
         let _request_span_lifetime = request_span;
         let mut generation_metrics = generation_metrics;
-        let mut disconnect = StreamDisconnectGuard {
-            metrics: metrics.clone(),
-            completed: false,
-        };
+        let mut disconnect = disconnect;
         // 1. role-first chunk
         yield Ok::<Event, std::convert::Infallible>(sse_data(&role_chunk(&id, created, &model)));
 
@@ -1703,16 +1987,12 @@ fn stream_response(
         let mut timed_out = false;
 
         loop {
-            let next = match deadline {
-                Some(deadline) => match tokio::time::timeout_at(deadline, rx.recv()).await {
-                    Ok(event) => event,
-                    Err(_) => {
-                        timed_out = true;
-                        metrics.stream_timeouts.fetch_add(1, Ordering::Relaxed);
-                        break;
-                    }
-                },
-                None => rx.recv().await,
+            let next = match rx.recv().await {
+                Ok(event) => event,
+                Err(()) => {
+                    timed_out = true;
+                    break;
+                }
             };
             let Some(ev) = next else { break };
             match ev {
@@ -1759,6 +2039,9 @@ fn stream_response(
             }
         }
 
+        // Retire cancellation and close model delivery before terminal yields;
+        // a client retaining a completed body must not leave a timer alive.
+        rx.finish().await;
         if timed_out {
             let error = request_timeout_error();
             yield Ok(Event::default().data(serde_json::to_string(&error).unwrap_or_default()));
@@ -1823,14 +2106,35 @@ async fn models(State(st): State<AppState>) -> Response {
     .into_response()
 }
 
+fn effective_queue_depth(channel_depth: usize, parked_jobs: u64) -> usize {
+    channel_depth.saturating_add(usize::try_from(parked_jobs).unwrap_or(usize::MAX))
+}
+
+fn queue_depth(st: &AppState) -> usize {
+    effective_queue_depth(
+        st.jobs.max_capacity() - st.jobs.capacity(),
+        st.runtime
+            .telemetry
+            .parked_queue_jobs
+            .load(Ordering::Acquire),
+    )
+}
+
 async fn health(State(st): State<AppState>) -> Response {
-    let queue_depth = st.jobs.max_capacity() - st.jobs.capacity();
+    let queue_depth = queue_depth(&st);
+    let cancellation = serde_json::json!({
+        "schema": CancellationCapabilitiesV1::SCHEMA,
+        "checkpoints": st.runtime.cancellation,
+        "kernel_preemption": false,
+        "qualification": "not_assessed",
+    });
     if !st.runtime.worker_alive.load(Ordering::Relaxed) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
                 "status": "unhealthy",
                 "detail": "decode worker stopped",
+                "cancellation": cancellation,
                 "model": &*st.model_id,
             })),
         )
@@ -1842,6 +2146,7 @@ async fn health(State(st): State<AppState>) -> Response {
             Json(serde_json::json!({
                 "status": "unhealthy",
                 "detail": "backend fault latched",
+                "cancellation": cancellation,
                 "model": &*st.model_id,
                 "worker_alive": true,
             })),
@@ -1860,6 +2165,7 @@ async fn health(State(st): State<AppState>) -> Response {
             Json(serde_json::json!({
                 "status": "unhealthy",
                 "detail": "paged KV reclamation fault latched",
+                "cancellation": cancellation,
                 "model": &*st.model_id,
                 "worker_alive": true,
             })),
@@ -1868,6 +2174,7 @@ async fn health(State(st): State<AppState>) -> Response {
     }
     Json(serde_json::json!({
         "status": "ok",
+        "cancellation": cancellation,
         "model": &*st.model_id,
         "worker_alive": true,
         "draining": st.runtime.draining.load(Ordering::Relaxed),
@@ -1902,6 +2209,7 @@ async fn health(State(st): State<AppState>) -> Response {
 
 async fn readiness(State(st): State<AppState>) -> Response {
     let worker_alive = st.runtime.worker_alive.load(Ordering::Relaxed);
+    let worker_ready = st.runtime.worker_ready.load(Ordering::Acquire);
     let draining = st.runtime.draining.load(Ordering::Relaxed);
     let backend_faulted = st.runtime.backend_faulted.load(Ordering::Acquire);
     let kv_pool_reclamation_faulted = st
@@ -1910,13 +2218,14 @@ async fn readiness(State(st): State<AppState>) -> Response {
         .kv_pool_release_failures_total
         .load(Ordering::Acquire)
         > 0;
-    let queue_depth = st.jobs.max_capacity() - st.jobs.capacity();
+    let queue_depth = queue_depth(&st);
     let artifact_ready = st
         .runtime
         .production
         .as_ref()
         .is_none_or(|state| state.is_serving());
     let ready = worker_alive
+        && worker_ready
         && !draining
         && !backend_faulted
         && !kv_pool_reclamation_faulted
@@ -1952,7 +2261,7 @@ async fn readiness(State(st): State<AppState>) -> Response {
 /// Prometheus text exposition (behind the same auth as everything else).
 /// Gauges are scrape-time reads; counters live in [`Metrics`].
 async fn metrics(State(st): State<AppState>) -> Response {
-    let queue_depth = st.jobs.max_capacity() - st.jobs.capacity();
+    let queue_depth = queue_depth(&st);
     let phase = st.runtime.phase.load(Ordering::Acquire);
     let request_buckets = st
         .metrics
@@ -2091,7 +2400,7 @@ async fn metrics(State(st): State<AppState>) -> Response {
          tritium_time_to_first_token_seconds_sum {}\n\
          tritium_time_to_first_token_seconds_count {}\n\
          {}{}{}\n\
-         # HELP tritium_queue_depth Jobs waiting in the decode queue.\n\
+         # HELP tritium_queue_depth Jobs waiting in the channel or worker parked slot.\n\
          # TYPE tritium_queue_depth gauge\n\
          tritium_queue_depth {}\n\
          # HELP tritium_worker_alive Decode worker liveness (1 = alive).\n\
@@ -2409,7 +2718,238 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn cancellation_capabilities_survive_every_unhealthy_diagnostic() {
+        for fault in 0..3 {
+            let (jobs, _receiver) = mpsc::channel(1);
+            let telemetry = Arc::new(WorkerTelemetry::default());
+            if fault == 2 {
+                telemetry
+                    .kv_pool_release_failures_total
+                    .store(1, Ordering::Release);
+            }
+            let (router, _) = build_router_inner(
+                jobs,
+                Arc::new(crate::IdPassthroughTokenizer::default()),
+                ServeConfig::default(),
+                RequestLimits::default(),
+                Arc::new(Admission::legacy(None)),
+                RuntimeState {
+                    cancellation: CancellationCapabilitiesV1::default(),
+                    draining: Arc::new(AtomicBool::new(false)),
+                    worker_alive: Arc::new(AtomicBool::new(fault != 0)),
+                    worker_ready: Arc::new(AtomicBool::new(true)),
+                    phase: Arc::new(AtomicU8::new(PHASE_IDLE)),
+                    backend_faulted: Arc::new(AtomicBool::new(fault == 1)),
+                    backend_faults: Arc::new(AtomicU64::new(u64::from(fault == 1))),
+                    telemetry,
+                    production: None,
+                },
+            );
+            let response = router
+                .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(
+                body["cancellation"]["schema"],
+                CancellationCapabilitiesV1::SCHEMA
+            );
+            assert_eq!(
+                body["cancellation"]["checkpoints"],
+                serde_json::to_value(CancellationCapabilitiesV1::default()).unwrap()
+            );
+            assert_eq!(body["cancellation"]["qualification"], "not_assessed");
+            assert_eq!(body["cancellation"]["kernel_preemption"], false);
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[tokio::test]
+    async fn cancellation_capabilities_batched_router_declares_cooperative_lockstep() {
+        for has_draft in [false, true] {
+            let Some(runner) = crate::test_support::tiny_cuda_runner(16) else {
+                return;
+            };
+            let tok = Arc::new(crate::IdPassthroughTokenizer::default());
+            let draft = has_draft.then(|| crate::test_support::tiny_cuda_runner(16).unwrap());
+            // Cross the actual worker constructor seam and retain its existing
+            // liveness signal. Public router builders still return the old pair.
+            let (router, draining, alive) = build_router_batched_inner(
+                runner,
+                draft,
+                7,
+                2,
+                tok,
+                ServeConfig::default(),
+                RequestLimits::default(),
+                Arc::new(Admission::legacy(None)),
+            )
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let ready = router
+                        .clone()
+                        .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                    if ready.status() == StatusCode::OK {
+                        break;
+                    }
+                    assert!(alive.load(Ordering::Acquire), "batch initialization failed");
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("bounded batch startup");
+            let response = router
+                .clone()
+                .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(
+                body["cancellation"]["checkpoints"],
+                serde_json::to_value(CancellationCapabilitiesV1::batched(has_draft)).unwrap()
+            );
+            assert_eq!(
+                body["cancellation"]["checkpoints"]["generation"],
+                "cooperative_boundaries"
+            );
+            assert_eq!(
+                body["cancellation"]["checkpoints"]["batch_decode"],
+                "cooperative_boundaries"
+            );
+            assert_eq!(body["cancellation"]["qualification"], "not_assessed");
+            draining.store(true, Ordering::Release);
+            drop(router);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while alive.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("worker must retire its models before CUDA process teardown");
+        }
+    }
+
+    #[test]
+    fn request_budget_reserves_only_exact_get_probe_routes() {
+        let budget = RequestBudget::new(1);
+        let ordinary = budget.try_acquire(&Method::GET, "/v1/models").unwrap();
+        assert!(budget.try_acquire(&Method::POST, "/healthz").is_err());
+        assert!(budget.try_acquire(&Method::GET, "/metrics/extra").is_err());
+        let probe = budget.try_acquire(&Method::GET, "/readyz").unwrap();
+        assert!(budget.try_acquire(&Method::GET, "/healthz").is_err());
+        assert!(
+            budget
+                .try_acquire(&Method::POST, "/v1/tree/verify")
+                .is_err()
+        );
+        drop(probe);
+        assert!(budget.try_acquire(&Method::GET, "/metrics").is_ok());
+        drop(ordinary);
+        assert!(
+            budget
+                .try_acquire(&Method::POST, "/v1/tree/session")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn request_budget_probes_use_idle_capacity_before_the_reserve() {
+        let budget = RequestBudget::new(8);
+        let mut held = Vec::new();
+        for _ in 0..8 {
+            held.push(budget.try_acquire(&Method::GET, "/metrics").unwrap());
+        }
+        assert_eq!(budget.ordinary.available_permits(), 0);
+        assert_eq!(budget.probes.available_permits(), 1);
+        held.push(budget.try_acquire(&Method::GET, "/healthz").unwrap());
+        assert_eq!(budget.probes.available_permits(), 0);
+        assert!(budget.try_acquire(&Method::GET, "/readyz").is_err());
+        assert!(budget.try_acquire(&Method::GET, "/v1/models").is_err());
+        drop(held);
+        assert_eq!(budget.ordinary.available_permits(), 8);
+        assert_eq!(budget.probes.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn admission_body_preserves_trailers_and_releases_at_eof() {
+        let budget = RequestBudget::new(1);
+        let permit = budget.try_acquire(&Method::GET, "/v1/models").unwrap();
+        let frames = async_stream::stream! {
+            yield Ok::<_, std::io::Error>(http_body::Frame::data(Bytes::from_static(b"fixture")));
+            let mut trailers = axum::http::HeaderMap::new();
+            trailers.insert("x-fixture-trailer", HeaderValue::from_static("preserved"));
+            yield Ok(http_body::Frame::trailers(trailers));
+        };
+        let inner = Body::new(http_body_util::StreamBody::new(frames));
+        let mut body = hold_request_permit(Response::new(inner), permit).into_body();
+        assert_eq!(budget.ordinary.available_permits(), 0);
+        let data = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(data, Bytes::from_static(b"fixture"));
+        assert_eq!(budget.ordinary.available_permits(), 0);
+        let trailers = body
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_trailers()
+            .unwrap();
+        assert_eq!(trailers["x-fixture-trailer"], "preserved");
+        assert!(body.frame().await.is_none());
+        assert_eq!(budget.ordinary.available_permits(), 1);
+        drop(body);
+        assert_eq!(budget.ordinary.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn admission_body_releases_on_error_without_waiting_for_drop() {
+        let budget = RequestBudget::new(1);
+        let permit = budget.try_acquire(&Method::GET, "/v1/models").unwrap();
+        let inner = Body::from_stream(async_stream::stream! {
+            yield Err::<Bytes, _>(std::io::Error::other("fixture body failure"));
+        });
+        let mut body = hold_request_permit(Response::new(inner), permit).into_body();
+        assert_eq!(budget.ordinary.available_permits(), 0);
+        assert!(body.frame().await.unwrap().is_err());
+        assert_eq!(budget.ordinary.available_permits(), 1);
+        drop(body);
+        assert_eq!(budget.ordinary.available_permits(), 1);
+    }
+
+    #[test]
+    fn admission_body_empty_and_unpolled_drop_release_exactly_once() {
+        let budget = RequestBudget::new(1);
+        let permit = budget.try_acquire(&Method::GET, "/v1/models").unwrap();
+        let empty = hold_request_permit(Response::new(Body::empty()), permit);
+        assert_eq!(budget.ordinary.available_permits(), 1);
+        drop(empty);
+        let permit = budget.try_acquire(&Method::GET, "/v1/models").unwrap();
+        let unpolled = hold_request_permit(Response::new(Body::from("fixture")), permit);
+        assert_eq!(budget.ordinary.available_permits(), 0);
+        drop(unpolled);
+        assert_eq!(budget.ordinary.available_permits(), 1);
+    }
+
+    #[test]
+    fn queue_depth_includes_the_worker_owned_parked_job() {
+        assert_eq!(effective_queue_depth(0, 0), 0);
+        assert_eq!(effective_queue_depth(0, 1), 1);
+        assert_eq!(effective_queue_depth(3, 1), 4);
+        assert_eq!(effective_queue_depth(usize::MAX, 1), usize::MAX);
+    }
+
     #[test]
     fn request_identity_rejects_an_exhausted_zero_entropy_source() {
         let headers = axum::http::HeaderMap::new();
@@ -2484,10 +3024,12 @@ mod tests {
             RuntimeState {
                 draining,
                 worker_alive,
+                worker_ready: Arc::new(AtomicBool::new(true)),
                 phase,
                 backend_faulted,
                 backend_faults,
                 telemetry: telemetry.clone(),
+                cancellation: CancellationCapabilitiesV1::default(),
                 production: None,
             },
         )
@@ -2535,6 +3077,107 @@ mod tests {
             .map(|value| value.load(Ordering::Relaxed))
             .collect();
         assert_eq!(observed, vec![1; ADMISSION_OUTCOME_LABELS.len()]);
+    }
+
+    #[tokio::test]
+    async fn stream_event_receiver_finish_stops_watchdog() {
+        let metrics = Arc::new(Metrics::default());
+        let (tx, rx) = mpsc::channel(64);
+        let mut receiver = StreamEventReceiver::new(
+            rx,
+            Instant::now(),
+            Some(Duration::from_millis(10)),
+            metrics.clone(),
+        );
+        receiver.finish().await;
+        assert!(receiver.watchdog.is_none());
+        assert!(tx.is_closed());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(receiver.state.load(Ordering::Acquire), STREAM_FINISHED);
+        assert_eq!(metrics.stream_timeouts.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn stream_disconnect_and_timeout_claim_one_outcome() {
+        for timeout_first in [false, true] {
+            let metrics = Arc::new(Metrics::default());
+            let state = Arc::new(AtomicU8::new(STREAM_RUNNING));
+            let disconnect = StreamDisconnectGuard {
+                metrics: metrics.clone(),
+                completed: false,
+                deadline_state: state.clone(),
+            };
+            if timeout_first {
+                assert!(StreamEventReceiver::expire(&state, &metrics));
+            }
+            drop(disconnect);
+            if !timeout_first {
+                assert!(
+                    !StreamEventReceiver::expire(&state, &metrics),
+                    "disconnect must retire the deadline before it can claim a second outcome"
+                );
+            }
+            assert_eq!(
+                metrics.stream_timeouts.load(Ordering::Relaxed)
+                    + metrics.stream_disconnects.load(Ordering::Relaxed),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_event_receiver_drop_closes_without_late_timeout() {
+        let metrics = Arc::new(Metrics::default());
+        let (tx, rx) = mpsc::channel(64);
+        let receiver = StreamEventReceiver::new(
+            rx,
+            Instant::now(),
+            Some(Duration::from_millis(10)),
+            metrics.clone(),
+        );
+        let weak_receiver = Arc::downgrade(&receiver.receiver);
+        let state = receiver.state.clone();
+        drop(receiver);
+        assert!(weak_receiver.upgrade().is_none());
+        assert!(tx.is_closed());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(state.load(Ordering::Acquire), STREAM_FINISHED);
+        assert_eq!(metrics.stream_timeouts.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn stream_event_receiver_expiry_is_counted_once() {
+        let metrics = Arc::new(Metrics::default());
+        let (tx, rx) = mpsc::channel(64);
+        let mut receiver = StreamEventReceiver::new(
+            rx,
+            Instant::now(),
+            Some(Duration::from_millis(10)),
+            metrics.clone(),
+        );
+        tokio::time::timeout(Duration::from_secs(2), tx.closed())
+            .await
+            .expect("watchdog must close an unpolled receiver");
+        assert_eq!(metrics.stream_timeouts.load(Ordering::Relaxed), 1);
+        assert!(receiver.recv().await.is_err());
+        receiver.finish().await;
+        assert_eq!(receiver.state.load(Ordering::Acquire), STREAM_EXPIRED);
+        assert_eq!(metrics.stream_timeouts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_event_receiver_disabled_deadline_preserves_events() {
+        let metrics = Arc::new(Metrics::default());
+        let (tx, rx) = mpsc::channel(64);
+        let mut receiver = StreamEventReceiver::new(rx, Instant::now(), None, metrics.clone());
+        assert!(receiver.watchdog.is_none());
+        tx.try_send(GenEvent::Done(FinishReason::Length)).unwrap();
+        assert!(matches!(
+            receiver.recv().await,
+            Ok(Some(GenEvent::Done(FinishReason::Length)))
+        ));
+        receiver.finish().await;
+        assert_eq!(metrics.stream_timeouts.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

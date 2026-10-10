@@ -55,19 +55,38 @@ on:
       - "rust-toolchain.toml"
       - "scripts/verify-wheel.py"
       - "scripts/tests/test_verify_wheel.py"
+      - "scripts/verify-workflow-source.py"
+      - "scripts/tests/test_verify_workflow_source.py"
+      - "scripts/_qualification_git.py"
+      - "scripts/tests/test_qualification_git_context.py"
+      - "scripts/tests/test_release_source_git_context.py"
       - "scripts/aggregate-wheel-smoke.py"
       - "scripts/tests/test_aggregate_wheel_smoke.py"
       - "scripts/wheel-functional-smoke.py"
       - "scripts/tests/test_wheel_functional_smoke.py"
+      - "crates/tritium-py/python/tritium/torch/qualify_dispatch_overhead.py"
+      - "scripts/qualify-torch-dispatch-overhead.py"
+      - "scripts/verify-torch-dispatch-overhead-receipt.py"
+      - "scripts/tests/test_qualify_torch_dispatch_overhead.py"
+      - "scripts/tests/test_verify_torch_dispatch_overhead_receipt.py"
+      - "scripts/tests/test_torch_dispatch_overhead_workflow.py"
       - "scripts/build-cuda-manylinux-wheel.sh"
       - "scripts/tests/test_build_cuda_manylinux_wheel.py"
       - "scripts/build-cpu-manylinux-wheel.sh"
       - "scripts/tests/test_build_cpu_manylinux_wheel.py"
+      - "scripts/tests/test_manylinux_build_resources.py"
+      - "scripts/tests/test_manylinux_source_context.py"
       - "scripts/generate-wheel-sbom.py"
       - "scripts/tests/test_generate_wheel_sbom.py"
       - "scripts/generate-colab-notebook.py"
       - "scripts/tests/test_generate_colab_notebook.py"
       - "examples/colab/tritium-smollm2-v11.ipynb"
+      - "scripts/qualify-smollm2-release-tutorial.py"
+      - "scripts/tests/test_qualify_smollm2_release_tutorial.py"
+      - "scripts/qualify-onnx-inference.py"
+      - "scripts/verify-onnx-inference-receipt.py"
+      - "scripts/tests/test_qualify_onnx_inference.py"
+      - "scripts/tests/test_verify_onnx_inference_receipt.py"
       - "examples/python/installed_qat.py"
       - "scripts/tests/test_installed_qat_tutorial.py"
       - "scripts/tests/test_hf_lifecycle.py"
@@ -80,6 +99,16 @@ on:
       - ".github/workflows/wheels.yml"
   workflow_dispatch:
     inputs:
+      source_ref:
+        description: Exact commit or ref to build; empty uses the dispatch ref.
+        required: false
+        type: string
+        default: ""
+      source_revision:
+        description: Exact checked-out Git object ID to bind into receipts; empty uses the dispatch SHA.
+        required: false
+        type: string
+        default: ""
       build_cuda:
         description: Build and execute the CUDA 13 wheel on a qualified GPU runner
         required: false
@@ -93,6 +122,15 @@ concurrency:
 
 permissions:
   contents: read
+
+env:
+  # Keep caller-controlled revisions in the environment, never inline them
+  # into shell source. PR wheel artifacts bind to the PR head (rather than
+  # GitHub's synthetic merge SHA) so their receipts match the candidate commit.
+  # Other event types use the caller/dispatch SHA unless an exact revision was
+  # explicitly supplied.
+  TRITIUM_SOURCE_REF: ${{ inputs.source_ref || github.event.pull_request.head.sha || github.ref }}
+  TRITIUM_SOURCE_REVISION: ${{ inputs.source_revision || github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   # One abi3 wheel per (os, target). `maturin-action` runs manylinux builds in a
@@ -112,7 +150,7 @@ jobs:
       matrix:
         platform:
           # Linux (manylinux, built in the maturin container).
-          - { os: linux, runner: ubuntu-latest, target: x86_64, target_id: linux-x86_64-cpu, smoke: true }
+          - { os: linux, runner: ubuntu-24.04, target: x86_64, target_id: linux-x86_64-cpu, smoke: true }
           # macOS arm64. The ONNX Runtime dependency has no prebuilt
           # x86_64-apple-darwin binary, so universal2 would claim a slice that
           # cannot be built. The qualified compatibility cell is arm64.
@@ -122,7 +160,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.source_ref || github.ref }}
+          ref: ${{ env.TRITIUM_SOURCE_REF }}
+      - name: verify checked-out source revision
+        shell: bash
+        run: python scripts/verify-workflow-source.py --expected-revision "$TRITIUM_SOURCE_REVISION"
+      - name: test exact source identity contract
+        run: python -m unittest scripts.tests.test_verify_workflow_source -v
       - name: resolve release version
         id: release
         shell: bash
@@ -150,7 +193,7 @@ jobs:
         env:
           # Build metadata must remain authenticated even when maturin's
           # manylinux container does not receive the checkout's .git directory.
-          TRITIUM_SOURCE_ID: source-git:${{ inputs.source_revision || github.sha }}
+          TRITIUM_SOURCE_ID: source-git:${{ env.TRITIUM_SOURCE_REVISION }}
         with:
           # The crate lives in the workspace; point maturin at its manifest.
           # --release for distributable artifacts; the abi3 feature comes from
@@ -171,7 +214,7 @@ jobs:
         run: >-
           python scripts/verify-wheel.py dist --install-smoke
           --target-id ${{ matrix.platform.target_id }}
-          --source-revision ${{ inputs.source_revision || github.sha }}
+          --source-revision "$TRITIUM_SOURCE_REVISION"
           --receipt dist/${{ matrix.platform.target_id }}.json
       - name: generate exact-wheel CycloneDX SBOM
         shell: bash
@@ -198,12 +241,15 @@ jobs:
       matrix:
         python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
         platform:
-          - { os: linux, runner: ubuntu-latest, target: x86_64, target_id: linux-x86_64-cpu }
+          - { os: linux, runner: ubuntu-24.04, target: x86_64, target_id: linux-x86_64-cpu }
           - { os: windows, runner: windows-latest, target: x64, target_id: windows-x86_64-cpu }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.source_ref || github.ref }}
+          ref: ${{ env.TRITIUM_SOURCE_REF }}
+      - name: verify checked-out source revision
+        shell: bash
+        run: python scripts/verify-workflow-source.py --expected-revision "$TRITIUM_SOURCE_REVISION"
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: ${{ matrix.python }}
@@ -216,7 +262,7 @@ jobs:
         run: >-
           python scripts/verify-wheel.py dist --install-smoke
           --target-id ${{ matrix.platform.target_id }}
-          --source-revision ${{ inputs.source_revision || github.sha }}
+          --source-revision "$TRITIUM_SOURCE_REVISION"
           --smoke-evidence evidence/${{ matrix.platform.target_id }}-cp${{ matrix.python }}.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -236,7 +282,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.source_ref || github.ref }}
+          ref: ${{ env.TRITIUM_SOURCE_REF }}
+      - name: verify checked-out source revision
+        shell: bash
+        run: python scripts/verify-workflow-source.py --expected-revision "$TRITIUM_SOURCE_REVISION"
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: ${{ matrix.python }}
@@ -249,7 +298,7 @@ jobs:
         run: >-
           python scripts/verify-wheel.py dist --install-smoke
           --target-id macos-arm64-cpu
-          --source-revision ${{ inputs.source_revision || github.sha }}
+          --source-revision "$TRITIUM_SOURCE_REVISION"
           --smoke-evidence evidence/macos-arm64-cpu-cp${{ matrix.python }}.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -262,11 +311,14 @@ jobs:
     # `wheels` is listed directly, not just transitively: job outputs are only
     # exposed to jobs that name the producer in their own `needs`.
     needs: [wheels, abi3-smoke, abi3-smoke-macos-arm64]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.source_ref || github.ref }}
+          ref: ${{ env.TRITIUM_SOURCE_REF }}
+      - name: verify checked-out source revision
+        shell: bash
+        run: python scripts/verify-workflow-source.py --expected-revision "$TRITIUM_SOURCE_REVISION"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           pattern: abi3-*
@@ -275,7 +327,7 @@ jobs:
       - name: aggregate exact interpreter matrix
         run: >-
           python scripts/aggregate-wheel-smoke.py evidence
-          --source-revision ${{ inputs.source_revision || github.sha }}
+          --source-revision "$TRITIUM_SOURCE_REVISION"
           --release "${{ needs.wheels.outputs.release }}"
           --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-abi3-matrix
           --output receipts/python-abi3-39-plus.json
@@ -288,11 +340,14 @@ jobs:
   torch-functional-smoke:
     name: installed wheel · Torch 2.11 · Python 3.13
     needs: wheels
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.source_ref || github.ref }}
+          ref: ${{ env.TRITIUM_SOURCE_REF }}
+      - name: verify checked-out source revision
+        shell: bash
+        run: python scripts/verify-workflow-source.py --expected-revision "$TRITIUM_SOURCE_REVISION"
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: "3.13"
@@ -309,12 +364,32 @@ jobs:
       - name: install pinned Hugging Face dependencies
         run: >-
           python -m pip install --disable-pip-version-check --only-binary=:all:
-          transformers==5.5.3 safetensors==0.8.0
+          transformers==5.5.3 safetensors==0.8.0 accelerate==1.10.0 pytest==9.0.2 zstandard==0.25.0
       - name: install exact Tritium wheel without dependency resolution
         shell: bash
         run: >-
           python -m pip install --isolated --disable-pip-version-check
-          --no-index --no-deps --only-binary=:all: dist/*.whl
+          --no-index --no-deps --only-binary=:all: --no-compile dist/*.whl
+      - name: qualify public PTQ row-fitting parallelism
+        run: python -m unittest scripts.tests.test_ptq_parallelism -v
+      - name: test exact-wheel public PTQ artifacts and ONNX custody
+        env:
+          TRITIUM_TEST_INSTALLED_WHEEL: "1"
+          TRITIUM_TEST_CANDIDATE_WHEEL_DIR: dist
+        run: >-
+          python -I -m pytest -q
+          crates/tritium-py/tests/test_ptq_artifacts.py
+          crates/tritium-py/tests/test_bundle_binding.py
+          crates/tritium-py/tests/test_qualify_onnx_worker.py
+          crates/tritium-py/tests/test_hf_candidate_provenance.py
+          crates/tritium-py/tests/test_hf_lifecycle_receipt.py
+          crates/tritium-py/tests/test_hf_export_lifecycle.py
+          crates/tritium-py/tests/test_tutorial_candidate_provenance.py
+          crates/tritium-py/tests/test_observability_candidate_provenance.py
+          crates/tritium-py/tests/test_diagnostic_witness.py
+          crates/tritium-py/tests/test_estimator_candidate_provenance.py
+          crates/tritium-py/tests/test_hf_distributed_candidate_provenance.py
+          crates/tritium-py/tests/test_qualify_estimators.py
       - name: test installed tutorial receipt admission
         run: >-
           python -m unittest discover
@@ -332,7 +407,7 @@ jobs:
           python -I ${{ github.workspace }}/scripts/wheel-functional-smoke.py
           --wheel dist
           --forbidden-root ${{ github.workspace }}
-          --source-revision ${{ inputs.source_revision || github.sha }}
+          --source-revision "$TRITIUM_SOURCE_REVISION"
           --release "${{ needs.wheels.outputs.release }}"
           --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-cpu-functional
           --output evidence/torch-2.11-python-3.13.json
@@ -344,14 +419,14 @@ jobs:
             --output-dir evidence/tutorial-cpu \
             --device cpu \
             --wheel-artifact dist/*.whl \
-            --source-revision ${{ inputs.source_revision || github.sha }} \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "${{ needs.wheels.outputs.release }}" \
             --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-tutorial-cpu
           python -I -m tritium.torch.tutorial_qat \
             --check-receipt evidence/tutorial-cpu/receipt.json \
             --device cpu \
             --wheel-artifact dist/*.whl \
-            --source-revision ${{ inputs.source_revision || github.sha }} \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "${{ needs.wheels.outputs.release }}"
       - name: qualify installed-wheel API signature
         shell: bash
@@ -362,10 +437,41 @@ jobs:
             --python "$(command -v python)" \
             --wheel dist/*.whl \
             --api-report docs/generated/api-diff-v1.0-v1.1.json \
-            --source-revision "${{ inputs.source_revision || github.sha }}" \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "${{ needs.wheels.outputs.release }}" \
             --run-id "github-${{ github.run_id }}-${{ github.run_attempt }}-api-signature" \
             --output-dir evidence/api-signature
+      - name: qualify installed-wheel CPU dispatcher overhead
+        shell: bash
+        env:
+          RAYON_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+        run: |
+          set -euo pipefail
+          wheels=(dist/*.whl)
+          test "${#wheels[@]}" -eq 1
+          wheel="$GITHUB_WORKSPACE/${wheels[0]}"
+          cpu="$(python -c 'import os; print(min(os.sched_getaffinity(0)))')"
+          trace="$GITHUB_WORKSPACE/evidence/torch-dispatch-overhead-trace.json"
+          mkdir -p "$GITHUB_WORKSPACE/evidence"
+          cd "$RUNNER_TEMP"
+          python -I -B -m tritium.torch.qualify_dispatch_overhead \
+            --output "$trace" \
+            --wheel "$wheel" \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
+            --release "${{ needs.wheels.outputs.release }}" \
+            --run-id "github-${{ github.run_id }}-${{ github.run_attempt }}-torch-dispatch-overhead" \
+            --cpu "$cpu"
+          cd "$GITHUB_WORKSPACE"
+          python scripts/qualify-torch-dispatch-overhead.py \
+            --repo "$GITHUB_WORKSPACE" \
+            --wheel "$wheel" \
+            --trace "$trace" \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
+            --release "${{ needs.wheels.outputs.release }}" \
+            --run-id "github-${{ github.run_id }}-${{ github.run_attempt }}-torch-dispatch-overhead" \
+            --output-dir evidence/torch-dispatch-overhead
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: wheel-functional-torch-2.11-python-3.13
@@ -374,13 +480,18 @@ jobs:
             evidence/tutorial-cpu/**
             evidence/tutorial-cpu/receipt.json
             evidence/api-signature/**
+            evidence/torch-dispatch-overhead-trace.json
+            evidence/torch-dispatch-overhead/**
           if-no-files-found: error
 
   tutorial-clean-wheel:
     name: source-free wheel tutorial · Python 3.13 slim
     needs: wheels
-    runs-on: ubuntu-latest
-    container: python:3.13-slim
+    runs-on: ubuntu-24.04
+    # Official Python 3.13 slim linux/amd64 manifest, byte-identical on Docker
+    # Hub and ECR Public. Avoid shared-runner Docker Hub anonymous pull quotas;
+    # keep the source-free/compiler-free qualification environment immutable.
+    container: public.ecr.aws/docker/library/python@sha256:8fb4cfa1a2616d7b8e0c2175cc6ad68f5729c34ea8488c0b360d2934b7be9024
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
@@ -418,14 +529,14 @@ jobs:
             --output-dir evidence/tutorial-clean \
             --device cpu \
             --wheel-artifact dist/*.whl \
-            --source-revision ${{ inputs.source_revision || github.sha }} \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "${{ needs.wheels.outputs.release }}" \
             --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-tutorial-clean
           python -I -m tritium.torch.tutorial_qat \
             --check-receipt evidence/tutorial-clean/receipt.json \
             --device cpu \
             --wheel-artifact dist/*.whl \
-            --source-revision ${{ inputs.source_revision || github.sha }} \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "${{ needs.wheels.outputs.release }}"
       - name: execute and validate installed Hugging Face lifecycle
         shell: bash
@@ -434,13 +545,13 @@ jobs:
           python -I -m tritium.torch.hf_lifecycle \
             --output-dir evidence/hf-lifecycle-clean \
             --wheel-artifact dist/*.whl \
-            --source-revision ${{ inputs.source_revision || github.sha }} \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "${{ needs.wheels.outputs.release }}" \
             --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-hf-lifecycle-clean
           python -I -m tritium.torch.hf_lifecycle \
             --check-receipt evidence/hf-lifecycle-clean/receipt.json \
             --wheel-artifact dist/*.whl \
-            --source-revision ${{ inputs.source_revision || github.sha }} \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "${{ needs.wheels.outputs.release }}"
       - name: execute and validate whole-model hard export
         shell: bash
@@ -449,14 +560,24 @@ jobs:
           python -I -m tritium.torch.hf_export_lifecycle \
             --output-dir evidence/hf-export-clean \
             --wheel-artifact dist/*.whl \
-            --source-revision ${{ inputs.source_revision || github.sha }} \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "${{ needs.wheels.outputs.release }}" \
             --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-hf-export-clean
           python -I -m tritium.torch.hf_export_lifecycle \
             --check-receipt evidence/hf-export-clean/receipt.json \
             --wheel-artifact dist/*.whl \
-            --source-revision ${{ inputs.source_revision || github.sha }} \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "${{ needs.wheels.outputs.release }}"
+      - name: execute installed estimator catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -I -m tritium.torch.qualify_estimators \
+            --wheel dist/*.whl \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
+            --release "${{ needs.wheels.outputs.release }}" \
+            --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-estimator-clean \
+            --output evidence/estimator-clean/trace.json
       - name: execute and validate installed observability adapters
         shell: bash
         run: |
@@ -464,13 +585,13 @@ jobs:
           python -B -I -m tritium.torch.qualify_observability \
             --output-dir evidence/observability-clean \
             --wheel-artifact dist/*.whl \
-            --source-revision ${{ inputs.source_revision || github.sha }} \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "${{ needs.wheels.outputs.release }}" \
             --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-observability-clean
           python -B -I -m tritium.torch.qualify_observability \
             --check-receipt evidence/observability-clean/receipt.json \
             --wheel-artifact dist/*.whl \
-            --source-revision ${{ inputs.source_revision || github.sha }} \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "${{ needs.wheels.outputs.release }}"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -480,6 +601,121 @@ jobs:
             evidence/hf-lifecycle-clean/**
             evidence/hf-export-clean/**
             evidence/observability-clean/**
+            evidence/estimator-clean/**
+          if-no-files-found: error
+
+  smollm2-cpu-tutorial:
+    name: pinned SmolLM2 PTQ/QAT tutorial · CPU
+    needs: wheels
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.TRITIUM_SOURCE_REF }}
+      - name: verify checked-out source revision
+        shell: bash
+        run: python scripts/verify-workflow-source.py --expected-revision "$TRITIUM_SOURCE_REVISION"
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: wheel-linux-x86_64
+          path: dist
+      - name: install pinned CPU model runtime
+        run: >-
+          python -m pip install --disable-pip-version-check --only-binary=:all:
+          torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+      - name: install pinned model and ONNX dependencies
+        run: >-
+          python -m pip install --disable-pip-version-check --only-binary=:all:
+          transformers==5.5.3 safetensors==0.8.0 onnx==1.22.0
+          onnxruntime==1.27.0 onnxscript==0.7.1
+      - name: install the exact candidate wheel
+        shell: bash
+        run: >-
+          python -m pip install --isolated --disable-pip-version-check
+          --no-index --no-deps --only-binary=:all: dist/*.whl
+      - name: run and validate pinned SmolLM2 CPU tutorial
+        shell: bash
+        env:
+          TRITIUM_ONNX_PARITY_FAILURE_DIR: ${{ runner.temp }}/tritium-onnx-parity-failure
+          TRITIUM_ONNX_PARITY_CAPTURE_TERMINAL: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p "$TRITIUM_ONNX_PARITY_FAILURE_DIR"
+          python -m unittest scripts.tests.test_qualify_smollm2_release_tutorial -v
+          python -u -I scripts/qualify-smollm2-release-tutorial.py \
+            --wheel dist/*.whl \
+            --output-dir evidence/smollm2-cpu \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
+            --release "${{ needs.wheels.outputs.release }}" \
+            --run-id "github-${{ github.run_id }}-${{ github.run_attempt }}-smollm2-cpu" &
+          tutorial_pid=$!
+          while kill -0 "$tutorial_pid" 2>/dev/null; do
+            printf '[SMOLLM2_RESOURCE] utc=%s ' "$(date -u +%FT%TZ)"
+            awk '/MemAvailable:/ { printf "mem_available_kib=%s ", $2 }' /proc/meminfo
+            printf 'runner_temp_disk='
+            df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { printf "available_kib=%s ", $4 }'
+            printf 'runner_online_cpus='
+            getconf _NPROCESSORS_ONLN | tr -d '\n'
+            printf ' runner_total_logical_cpus='
+            nproc --all | tr -d '\n'
+            printf ' runner_cpu_model='
+            awk -F: '/model name/ { gsub(/^[[:space:]]+/, "", $2); printf "%s", $2; exit }' /proc/cpuinfo
+            printf ' omp_num_threads=%s mkl_num_threads=%s' "${OMP_NUM_THREADS:-unset}" "${MKL_NUM_THREADS:-unset}"
+            printf ' load_average='
+            awk '{ printf "1m=%s,5m=%s,15m=%s ", $1, $2, $3 }' /proc/loadavg
+            if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+              printf 'cgroup_cpu_max='
+              tr ' ' '/' < /sys/fs/cgroup/cpu.max | tr -d '\n'
+              printf ' '
+            fi
+            if [[ -r /sys/fs/cgroup/cpu.stat ]]; then
+              printf 'cgroup_cpu_stat='
+              tr '\n' ',' < /sys/fs/cgroup/cpu.stat
+              printf ' '
+            fi
+            if [[ -r /sys/fs/cgroup/memory.current ]]; then
+              printf 'cgroup_memory_current_bytes=%s ' "$(< /sys/fs/cgroup/memory.current)"
+            fi
+            if [[ -r /sys/fs/cgroup/memory.events ]]; then
+              printf 'cgroup_memory_events='
+              tr '\n' ',' < /sys/fs/cgroup/memory.events
+              printf ' '
+            fi
+            printf 'top_processes_rss_kib_comm='
+            ps -eo rss=,comm= --sort=-rss | sed -n '1,5p' | tr '\n' ';'
+            printf '\n'
+            sleep 15
+          done
+          set +e
+          wait "$tutorial_pid"
+          tutorial_status=$?
+          set -e
+          exit "$tutorial_status"
+      - name: retain opt-in ONNX parity diagnostic
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: smollm2-onnx-parity-diagnostic
+          path: ${{ runner.temp }}/tritium-onnx-parity-failure/**
+          if-no-files-found: ignore
+          retention-days: 7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: smollm2-cpu-tutorial
+          path: evidence/smollm2-cpu/**
+          if-no-files-found: error
+      # Receipt consumers should not need to download model/optimizer payloads
+      # just to inspect the measured tutorial gate. Keep the full replay archive
+      # above and publish its unchanged receipt separately.
+      - name: retain lightweight SmolLM2 tutorial receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: smollm2-cpu-tutorial-receipt
+          path: evidence/smollm2-cpu/receipt.json
           if-no-files-found: error
 
   cuda-wheel-smoke:
@@ -495,7 +731,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.source_ref || github.ref }}
+          ref: ${{ env.TRITIUM_SOURCE_REF }}
+      - name: verify checked-out source revision
+        shell: bash
+        run: python scripts/verify-workflow-source.py --expected-revision "$TRITIUM_SOURCE_REVISION"
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           toolchain: "1.98.0"
@@ -553,14 +792,14 @@ jobs:
             --python "$(command -v python)" \
             --wheel "${wheels[0]}" \
             --compute-sanitizer "$(command -v compute-sanitizer)" \
-            --source-revision "${{ inputs.source_revision || github.sha }}" \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')" \
             --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-dispatch-cuda \
             --output-dir evidence/torch-dispatch-cuda
           python scripts/verify-torch-dispatch-cuda-receipt.py \
             evidence/torch-dispatch-cuda/receipt.json \
             --repo "$PWD" \
-            --source-revision "${{ inputs.source_revision || github.sha }}" \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')" \
             --wheel "${wheels[0]}"
       - name: execute installed-wheel CUDA kernel and lifecycle
@@ -569,7 +808,7 @@ jobs:
           python -I ${{ github.workspace }}/scripts/wheel-functional-smoke.py
           --wheel dist-cuda
           --forbidden-root ${{ github.workspace }}
-          --source-revision ${{ inputs.source_revision || github.sha }}
+          --source-revision "$TRITIUM_SOURCE_REVISION"
           --device cuda:0
           --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
           --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-cuda-functional
@@ -582,21 +821,21 @@ jobs:
             --output-dir evidence/tutorial-cuda \
             --device cuda:0 \
             --wheel-artifact dist-cuda/*.whl \
-            --source-revision ${{ inputs.source_revision || github.sha }} \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')" \
             --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-tutorial-cuda
           python -I -m tritium.torch.tutorial_qat \
             --check-receipt evidence/tutorial-cuda/receipt.json \
             --device cuda:0 \
             --wheel-artifact dist-cuda/*.whl \
-            --source-revision ${{ inputs.source_revision || github.sha }} \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
       - name: qualify installed-wheel CUDA fp16 training
         shell: bash
         env:
           TRITIUM_CUDA_CHECKPOINT: ${{ runner.temp }}/tritium-cuda-training-state
           TRITIUM_CUDA_RECEIPT: ${{ github.workspace }}/evidence/cuda13-fp16-training.json
-          TRITIUM_SOURCE_REVISION: ${{ inputs.source_revision || github.sha }}
+          TRITIUM_SOURCE_REVISION: ${{ env.TRITIUM_SOURCE_REVISION }}
           TRITIUM_RUN_ID: github-${{ github.run_id }}-${{ github.run_attempt }}-cuda-training
         run: |
           set -euo pipefail
@@ -611,7 +850,7 @@ jobs:
           python -I crates/tritium-py/tests/hf_cuda_worker.py
           python scripts/verify-cuda-training-receipt.py \
             evidence/cuda13-fp16-training.json \
-            --source-revision "${{ inputs.source_revision || github.sha }}" \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')" \
             --artifact "$TRITIUM_QUALIFIED_ARTIFACT"
       - name: execute generated five-minute SmolLM2 notebook

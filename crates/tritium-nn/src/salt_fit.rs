@@ -57,6 +57,15 @@ pub struct ActivationAwareConfig {
     pub decay_ramp: bool,
 }
 
+/// Placement of the optional one-scalar-per-group ladder scale refit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScaleRefitMode {
+    /// Keep the existing coordinate-search refit after GPTQ propagation.
+    PostPass,
+    /// Refit each completed group before later columns are propagated.
+    InLoop,
+}
+
 impl Default for ActivationAwareConfig {
     fn default() -> Self {
         Self {
@@ -93,14 +102,7 @@ impl Default for ActivationAwareConfig {
 /// on one model, not a derivation; a wider sweep should replace the constants, not the shape.
 #[must_use]
 pub fn auto_decay(calibration_tokens: usize, cols: usize) -> f64 {
-    const LOW: (f64, f64) = (2.7, 0.5);
-    const HIGH: (f64, f64) = (10.7, 0.75);
-    if calibration_tokens == 0 || cols == 0 {
-        return LOW.1;
-    }
-    let ratio = calibration_tokens as f64 / cols as f64;
-    let t = ((ratio.ln() - LOW.0.ln()) / (HIGH.0.ln() - LOW.0.ln())).clamp(0.0, 1.0);
-    LOW.1 + t * (HIGH.1 - LOW.1)
+    tritium_core::auto_feedback_decay(calibration_tokens, cols)
 }
 
 /// Input Gram `E[x·xᵀ]` at each of the four projection inputs, per layer.
@@ -338,6 +340,24 @@ pub fn fit_tensor(
     gram: &[f64],
     cfg: &ActivationAwareConfig,
 ) -> Option<Vec<(f32, Vec<Vec<i8>>)>> {
+    fit_tensor_with_scale_refit_mode(w, rows, cols, gram, cfg, ScaleRefitMode::PostPass)
+}
+
+/// Fit a tensor with an explicit placement for the group-scale refit.
+///
+/// `InLoop` refits one completed group at a time and pushes the scale change through the same
+/// inverse-Cholesky compensation used by GPTQ. The public [`ActivationAwareConfig`] and the
+/// behavior of [`fit_tensor`] remain source-compatible and unchanged.
+#[must_use]
+pub fn fit_tensor_with_scale_refit_mode(
+    w: &[f32],
+    rows: usize,
+    cols: usize,
+    gram: &[f64],
+    cfg: &ActivationAwareConfig,
+    refit_mode: ScaleRefitMode,
+) -> Option<Vec<(f32, Vec<Vec<i8>>)>> {
+    let decay = tritium_core::FeedbackDecay::new(cfg.decay, cfg.decay_ramp).ok()?;
     let group = cfg.group.max(1);
     let per_row = cols.div_ceil(group);
     let kmax = (3i64.pow(cfg.planes as u32) - 1) / 2;
@@ -362,10 +382,17 @@ pub fn fit_tensor(
     // ── GPTQ: quantize each column, push its residual into the columns still to come.
     let mut quantized = vec![0.0f32; rows * cols];
     let mut steps = vec![0.0f32; rows * per_row];
+    let mut group_targets = vec![vec![0.0f32; group]; rows];
     for j in 0..cols {
         let block = j / group;
         if j % group == 0 {
             let end = ((block + 1) * group).min(cols);
+            if cfg.refit_scale && refit_mode == ScaleRefitMode::InLoop {
+                group_targets
+                    .par_iter_mut()
+                    .zip(work.par_chunks(cols))
+                    .for_each(|(target, wr)| target[..end - j].copy_from_slice(&wr[j..end]));
+            }
             steps
                 .par_chunks_mut(per_row)
                 .zip(work.par_chunks(cols))
@@ -377,11 +404,7 @@ pub fn fit_tensor(
         }
         // Decay on the propagated error: a multiplier on `err`, so `lambda == 1.0` is plain GPTQ
         // to the bit. Under the ramp it runs from 1 at the first column to `cfg.decay` at the last.
-        let lambda = if cfg.decay_ramp && cols > 1 {
-            1.0 - (1.0 - cfg.decay) * j as f64 / (cols - 1) as f64
-        } else {
-            cfg.decay
-        };
+        let lambda = decay.coefficient(j, cols).ok()?;
         quantized
             .par_chunks_mut(cols)
             .zip(work.par_chunks_mut(cols))
@@ -394,6 +417,27 @@ pub fn fit_tensor(
                     wr[j2] -= (err * chol[j2 * cols + j]) as f32;
                 }
             });
+        let end = ((block + 1) * group).min(cols);
+        if cfg.refit_scale && refit_mode == ScaleRefitMode::InLoop && j + 1 == end {
+            work.par_chunks_mut(cols)
+                .zip(quantized.par_chunks_mut(cols))
+                .zip(steps.par_chunks_mut(per_row))
+                .zip(group_targets.par_iter())
+                .for_each(|(((wr, qr), d), target)| {
+                    refit_completed_group(
+                        wr,
+                        qr,
+                        d,
+                        target,
+                        block * group,
+                        end,
+                        block,
+                        cols,
+                        &h_damped,
+                        &chol,
+                    );
+                });
+        }
     }
 
     // ── Codes, and the optional discrete search over them.
@@ -411,7 +455,7 @@ pub fn fit_tensor(
     }
     let planes = cfg.planes;
     let sweeps = cfg.search_sweeps;
-    let refit = cfg.refit_scale;
+    let refit = cfg.refit_scale && refit_mode == ScaleRefitMode::PostPass;
     let out: Vec<Vec<(f32, Vec<Vec<i8>>)>> = w_rot
         .par_chunks(cols)
         .zip(quantized.par_chunks(cols))
@@ -453,6 +497,67 @@ pub fn fit_tensor(
         })
         .collect();
     Some(out.into_iter().flatten().collect())
+}
+
+#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+fn refit_completed_group(
+    work: &mut [f32],
+    quantized: &mut [f32],
+    steps: &mut [f32],
+    target: &[f32],
+    start: usize,
+    end: usize,
+    block: usize,
+    cols: usize,
+    h: &[f64],
+    chol: &[f64],
+) {
+    let old_step = f64::from(steps[block]);
+    if old_step <= 0.0 || !old_step.is_finite() {
+        return;
+    }
+    let codes: Vec<i64> = (start..end)
+        .map(|j| (f64::from(quantized[j]) / old_step).round() as i64)
+        .collect();
+    let mut numerator = 0.0;
+    let mut denominator = 0.0;
+    for a in start..end {
+        let ca = codes[a - start] as f64;
+        let hrow = &h[a * cols..(a + 1) * cols];
+        for b in start..end {
+            let cb = codes[b - start] as f64;
+            numerator += ca * hrow[b] * f64::from(target[b - start]);
+            denominator += ca * hrow[b] * cb;
+        }
+    }
+    if denominator <= 0.0 || !denominator.is_finite() {
+        return;
+    }
+    let new_step = (numerator / denominator).max(0.0);
+    if !new_step.is_finite() {
+        return;
+    }
+    let delta = new_step - old_step;
+    if delta.abs() <= f64::EPSILON * old_step.max(1.0) {
+        return;
+    }
+    steps[block] = new_step as f32;
+    for j in start..end {
+        let new_value = new_step * codes[j - start] as f64;
+        let change = new_value - f64::from(quantized[j]);
+        quantized[j] = new_value as f32;
+        let diagonal = chol[j * cols + j];
+        if diagonal <= 0.0 || !diagonal.is_finite() {
+            continue;
+        }
+        let error = change / diagonal;
+        for j2 in end..cols {
+            // GPTQ applies `work -= (weight - quantized) / diagonal * chol`. Increasing the
+            // quantized value lowers that error, so the corresponding future-work correction is
+            // an addition.
+            work[j2] += (error * chol[j2 * cols + j]) as f32;
+        }
+    }
 }
 
 /// Coordinate descent over one row's codes, priced exactly from `g = H·r`.
@@ -724,6 +829,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn in_loop_scale_refit_changes_the_sequential_candidate_and_keeps_ladder_codes() {
+        let weights = [0.91, -0.34, 0.72, -0.58];
+        let gram = [
+            1.0, 0.72, 0.11, -0.08, 0.72, 1.0, 0.19, -0.04, 0.11, 0.19, 1.0, 0.61, -0.08, -0.04,
+            0.61, 1.0,
+        ];
+        let base = ActivationAwareConfig {
+            planes: 2,
+            group: 2,
+            grid: 16,
+            damp: 0.01,
+            search_sweeps: 0,
+            refit_scale: true,
+            rotate: false,
+            decay: 1.0,
+            decay_ramp: false,
+        };
+        let post_pass = fit_tensor_with_scale_refit_mode(
+            &weights,
+            1,
+            4,
+            &gram,
+            &base,
+            ScaleRefitMode::PostPass,
+        )
+        .expect("post-pass control");
+        let in_loop =
+            fit_tensor_with_scale_refit_mode(&weights, 1, 4, &gram, &base, ScaleRefitMode::InLoop)
+                .expect("in-loop fit");
+
+        assert_ne!(
+            in_loop, post_pass,
+            "the in-loop arm must execute scale refits"
+        );
+        assert_eq!(in_loop.len(), 2);
+        for (anchor, planes) in &in_loop {
+            assert!(anchor.is_finite() && *anchor >= 0.0);
+            assert_eq!(planes.len(), 2);
+            for (&high, &low) in planes[0].iter().zip(&planes[1]) {
+                let code = high as i32 * 3 + low as i32;
+                assert!((-4..=4).contains(&code), "invalid two-trit code {code}");
+            }
+        }
+    }
+
     /// A tap that saw no signal must degrade to the plain ladder, not to a wrong fit: with an
     /// all-zero Gram the damping leaves a multiple of the identity, whose compensation term is zero.
     /// A Gram with non-finite entries is a different matter and must be refused.
@@ -838,25 +989,5 @@ mod decay_tests {
             plain, decayed,
             "decay 0.5 must alter the codes GPTQ produces"
         );
-    }
-
-    #[test]
-    fn auto_decay_follows_the_measured_ends_and_clamps_outside_them() {
-        // The two measured ends, on down_proj's 1,536-wide input.
-        assert!((auto_decay(4_096, 1_536) - 0.5).abs() < 0.01);
-        assert!((auto_decay(16_384, 1_536) - 0.75).abs() < 0.01);
-        // Clamped past them.
-        assert_eq!(auto_decay(1_024, 1_536), 0.5);
-        assert_eq!(auto_decay(1 << 20, 1_536), 0.75);
-        // Monotone non-decreasing in tokens at fixed width.
-        let mut last = 0.0;
-        for tokens in [512, 1_024, 2_048, 4_096, 8_192, 16_384, 32_768] {
-            let d = auto_decay(tokens, 576);
-            assert!(d >= last, "auto_decay must not fall as tokens grow");
-            last = d;
-        }
-        // Degenerate inputs pick the cautious end rather than NaN.
-        assert_eq!(auto_decay(0, 576), 0.5);
-        assert_eq!(auto_decay(4_096, 0), 0.5);
     }
 }

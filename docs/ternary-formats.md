@@ -49,8 +49,9 @@ the cost of dp4a-only prefill. Pick tq1 for VRAM, tq2 for prefill speed.
 `tritium-format` exposes `write_entropy_transport` and
 `read_entropy_transport` for an outer `TRNS` container. It splits any canonical
 fixed-codec artifact into deterministic power-of-two chunks (64 KiB by default),
-chooses raw bytes or a canonical byte-Huffman payload per chunk, and records a
-content digest plus physical offset in a fixed index. `read_range` decodes only
+chooses the smallest raw, canonical byte-Huffman, or byte-rANS payload per
+chunk, and records a content digest plus physical offset in a fixed index.
+`read_range` decodes only
 chunks intersecting requested logical bytes, so package inspection, HTTP range
 fetch, and resumable transfer do not require whole-artifact materialization.
 `read_entropy_transport_seekable` accepts any `Read + Seek` source and reads
@@ -61,8 +62,11 @@ avoiding eager materialization of the full `.trns` file.
 This is transport/interchange compression, not a new runtime codec. Expanded
 TQ/SALT bytes remain the resident and physical-runtime denominator; no bpw,
 VRAM, or kernel-throughput claim may use `TRNS` bytes. Raw fallback keeps
-incompressible chunks from growing, while per-chunk digests and canonical
-metadata make mutation and non-deterministic encoders fail closed.
+incompressible chunks from growing. TRNS v2 adds rANS while readers retain v1
+raw/Huffman compatibility. The v2 rANS model is 256 little-endian `u16`
+frequencies normalized to 4096, followed by a little-endian 32-bit state and
+the renormalization stream. Per-chunk digests and canonical metadata make
+mutation and non-deterministic encoders fail closed.
 
 ## TB1 bitmap+signs: measured, refuted, kept
 
@@ -103,6 +107,33 @@ a row are rejected loudly rather than silently mis-scaled. Standard Q2_0 is
 different: its G64 scales may vary within a row and remain packed in `Q2Linear`;
 code 3 (`+2`) and non-finite scales fail before the projection is published.
 `tritium report sparsity` applies the same scale semantics before counting zeros.
+
+## Output-reconstruction receipt: `TSV2OUT` v3 scope commitments
+
+Version 3 extends each candidate record with one digest and count pair for
+every ordered block/window and final-logit scope. The v3 candidate content
+identity commits both the historical aggregate student-output digest and these
+scope digests, so they cannot be attached later as an unrelated sidecar.
+Version 2 remains byte-stable and strictly readable, but does not carry block
+scope commitments and cannot satisfy block-output runtime admission.
+
+Each scope record encodes its scope tag and inclusive/exclusive block range (or
+the final-logit tag with a zero range), batch observation count, value count,
+and digest. Strict reopen checks the full scope order, candidate/spec/seed
+binding, expected batch coverage, objective and receipt identities. The scope
+digests are candidate-produced claims until an admitted runtime independently
+executes the exact selected package and matches every scope. Neither v2 nor v3
+alone establishes model quality or release qualification.
+
+The SALT-owned `TSQ36OB` v1 bridge currently binds exact final logits to a
+campaign execution receipt. `TSQ36SB` v1 supplements it with the ordered digest
+and counts of every v3 block/window and final-logit scope. It is minted only by
+a live sealed execution session after replaying the same token batches and row
+masks, and strict reopen repeats that execution and comparison. A scope-binding
+receipt does not replace checkpoint-scale quality, runtime, or reproduction
+gates. Its canonical envelope contains the magic, version, zero reserved bits,
+embedded `TSQ36OB` byte length, scope and batch/observation/value counts, the
+scope-set digest, the complete `TSQ36OB` bytes, and a domain-separated checksum.
 
 ## TL1 / TL2: a non-goal, deliberately
 

@@ -149,34 +149,15 @@ impl ModelWeights {
     ) -> Result<Self, NnError> {
         // GGUF-specific integrity check the generic builder (vocab =
         // len/n_embd) can't express: the file's declared embedding dims must
-        // agree with the CONFIG's n_embd. Dims-vs-payload consistency is
-        // already enforced by the reader (n_bytes is computed FROM dims and
-        // bounds-checked), so element_count suffices — no decode needed
+        // agree with the CONFIG's n_embd. GGUF stores matrix dimensions
+        // fastest-first as [hidden, vocab], so compare both axes rather than
+        // only the element count (which cannot distinguish a transposed table).
+        // Dims-vs-payload consistency is already enforced by the reader
+        // (n_bytes is computed FROM dims and bounds-checked), so no decode is needed
         // (review: the old full F16->f32 decode here was information-free,
         // ~657MB read + ~1.3GB transient per load).
         let n_embd = checked_usize(u64::from(config.n_embd), "model hidden size")?;
-        let embd_info = require(file, "token_embd.weight")?;
-        let vocab = checked_usize(
-            *embd_info
-                .dims
-                .last()
-                .ok_or_else(|| NnError::MissingTensor("token_embd.weight (no dims)".to_owned()))?,
-            "token_embd.weight vocabulary",
-        )?;
-        let embd_len = embd_info
-            .element_count()
-            .map_err(|e| NnError::Backend(format!("token_embd.weight dims: {e}")))?
-            .try_into()
-            .map_err(|_| {
-                NnError::Backend("token_embd.weight element count exceeds usize".into())
-            })?;
-        let expected_embd_len = checked_product(vocab, n_embd, "token_embd.weight shape")?;
-        if embd_len != expected_embd_len {
-            return Err(NnError::Shape {
-                expected: expected_embd_len,
-                got: embd_len,
-            });
-        }
+        validate_embedding_shape(file, n_embd)?;
 
         // P2e: one config-driven skeleton for every loading path — the GGUF
         // dialect supplies the name schema, `load_dense` the norms/embedding,
@@ -195,13 +176,68 @@ impl ModelWeights {
             &arch,
             crate::model::hf::NameSchema::Gguf,
             |name, _expected_len| load_dense(file, bytes, name),
-            // Shape hints unused: load_ternary derives [N, K] from the
-            // file's own dims (pre-existing behavior). TODO(non-BitNet GGUF):
-            // check them against the config-derived n_out/k_in so a
-            // config/file head_dim disagreement fails at load, not runtime.
-            |name, _n_out, _k_in| load_projection(file, bytes, backend, name),
+            // GGUF stores matrix dimensions fastest-first as [K, N]. Check
+            // those against the config-derived projection shape before any
+            // packed weights are decoded or uploaded.
+            |name, n_out, k_in| {
+                validate_projection_shape(file, name, n_out, k_in)?;
+                load_projection(file, bytes, backend, name)
+            },
         )
     }
+}
+
+/// Reject a GGUF projection whose declared `[K, N]` shape disagrees with the
+/// model configuration. Without this check, a malformed file can be accepted
+/// and fail later during inference with a less useful backend shape error.
+fn validate_projection_shape(
+    file: &GgufFile,
+    name: &str,
+    n_out: usize,
+    k_in: usize,
+) -> Result<(), NnError> {
+    let info = require(file, name)?;
+    if info.dims.len() != 2 {
+        return Err(NnError::Backend(format!(
+            "{name}: expected GGUF projection dims [K={k_in}, N={n_out}], got {:?}",
+            info.dims
+        )));
+    }
+    let expected = [
+        u64::try_from(k_in)
+            .map_err(|_| NnError::Backend(format!("{name}: K dimension exceeds u64")))?,
+        u64::try_from(n_out)
+            .map_err(|_| NnError::Backend(format!("{name}: N dimension exceeds u64")))?,
+    ];
+    if info.dims != expected {
+        return Err(NnError::Backend(format!(
+            "{name}: expected GGUF projection dims [K={k_in}, N={n_out}], got {:?}",
+            info.dims
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a GGUF token embedding's fastest-first `[hidden, vocab]` axes and
+/// return its vocabulary row count before loading or widening the payload.
+fn validate_embedding_shape(file: &GgufFile, n_embd: usize) -> Result<(), NnError> {
+    let name = "token_embd.weight";
+    let info = require(file, name)?;
+    if info.dims.len() != 2 {
+        return Err(NnError::Backend(format!(
+            "{name}: expected GGUF embedding dims [hidden={n_embd}, vocab], got {:?}",
+            info.dims
+        )));
+    }
+    let hidden = checked_usize(info.dims[0], "token_embd.weight hidden dimension")?;
+    if hidden != n_embd {
+        return Err(NnError::Backend(format!(
+            "{name}: expected GGUF embedding dims [hidden={n_embd}, vocab], got {:?}",
+            info.dims
+        )));
+    }
+    checked_usize(info.dims[1], "token_embd.weight vocabulary")?;
+    Ok(())
 }
 
 /// Look up a tensor or return [`NnError::MissingTensor`].
@@ -254,6 +290,13 @@ fn checked_product(lhs: usize, rhs: usize, label: &str) -> Result<usize, NnError
 /// Load a dense (F32 or F16) tensor as fp32, in ggml memory order.
 fn load_dense(file: &GgufFile, bytes: &[u8], name: &str) -> Result<Vec<f32>, NnError> {
     let info = require(file, name)?;
+    let expected_rank = if name == "token_embd.weight" { 2 } else { 1 };
+    if info.dims.len() != expected_rank {
+        return Err(NnError::Backend(format!(
+            "{name}: expected rank-{expected_rank} GGUF dense tensor, got dims {:?}",
+            info.dims
+        )));
+    }
     let p = payload(file, bytes, info)?;
     match info.ggml_type {
         GGML_TYPE_F32 => Ok(p
@@ -486,6 +529,72 @@ fn load_ternary(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projection_shape_must_match_model_geometry_in_gguf_dimension_order() {
+        let blob = gguf_with_q2("output.weight", 3, 256, &[1.0, 1.0, 1.0]);
+        let file = tritium_format::read_gguf(&blob).expect("parse Q2_0 GGUF");
+
+        validate_projection_shape(&file, "output.weight", 3, 256)
+            .expect("config geometry matches GGUF [K, N]");
+
+        let error = validate_projection_shape(&file, "output.weight", 256, 3)
+            .expect_err("equal element count with swapped axes is still malformed");
+        assert!(
+            error
+                .to_string()
+                .contains("expected GGUF projection dims [K=3, N=256]")
+        );
+        assert!(error.to_string().contains("[256, 3]"));
+    }
+
+    #[test]
+    fn embedding_shape_must_match_hidden_width_not_only_element_count() {
+        let info = TensorInfo::new(
+            "token_embd.weight".to_owned(),
+            vec![4, 3], // GGUF fastest-first: [hidden, vocab]
+            GGML_TYPE_F16,
+            12,
+            24,
+        );
+        let file = GgufFile::new(3, Default::default(), vec![info], 0);
+        validate_embedding_shape(&file, 4).expect("config geometry matches GGUF [hidden, vocab]");
+
+        let transposed_info = TensorInfo::new(
+            "token_embd.weight".to_owned(),
+            vec![3, 4], // same element count, wrong hidden width
+            GGML_TYPE_F16,
+            12,
+            24,
+        );
+        let transposed_file = GgufFile::new(3, Default::default(), vec![transposed_info], 0);
+        let error = validate_embedding_shape(&transposed_file, 4)
+            .expect_err("same element count must not hide a transposed embedding");
+        assert!(
+            error
+                .to_string()
+                .contains("expected GGUF embedding dims [hidden=4, vocab]")
+        );
+    }
+
+    #[test]
+    fn dense_vector_loader_rejects_same_size_rank_mismatch() {
+        let info = TensorInfo::new(
+            "output_norm.weight".to_owned(),
+            vec![1, 4],
+            GGML_TYPE_F32,
+            4,
+            16,
+        );
+        let file = GgufFile::new(3, Default::default(), vec![info], 0);
+        let error = load_dense(&file, &[], "output_norm.weight")
+            .expect_err("vector-like norm must not accept a rank-2 tensor");
+        assert!(
+            error
+                .to_string()
+                .contains("expected rank-1 GGUF dense tensor")
+        );
+    }
 
     /// Minimal single-tensor GGUF v3 blob: one TQ2_0 tensor `name`,
     /// `n_out` rows × `k_in` cols, per-ROW scales (uniform within each row).

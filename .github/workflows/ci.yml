@@ -12,6 +12,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Release evidence must describe the source branch, not GitHub's synthetic
+  # pull-request merge commit. General CI still validates the merge result;
+  # only evidence-producing jobs check out and attest this source revision.
+  TRITIUM_SOURCE_REF: ${{ github.event.pull_request.head.sha || github.ref }}
+  TRITIUM_SOURCE_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
 
 permissions:
   contents: read
@@ -32,13 +37,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-24.04, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
+      - run: cargo run --locked -p tritium-schema --features schema-gen --bin tritium-schema-projections -- --check
+      # A host no_std check cannot detect a dependency that silently enables std.
+      # Compile only: this is not physical MCU execution or qualification.
+      - run: cargo check --locked -p tritium-schema -p tritium-core --no-default-features --lib --target thumbv7em-none-eabihf
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       # tritium-py is a PyO3 extension module (cdylib) with no cargo tests — it is
       # exercised via maturin + pytest, not `cargo test`. Excluded here so its
@@ -57,12 +66,12 @@ jobs:
   # built here is ever run; the self-hosted lanes remain the execution gates.
   gpu-feature-check:
     name: clippy · gpu-feature code (no toolkit)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       RUSTFLAGS: "-D warnings"
       TRITIUM_CHECK_ONLY: "1"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           components: clippy
@@ -87,11 +96,11 @@ jobs:
   # cannot become supported without a digest-bound, revision-bound pass receipt.
   compatibility-matrix:
     name: compatibility matrix (receipt-backed)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       # fetch-depth 0: the api-diff tests resolve the v1.0.0 baseline tag,
       # which a shallow checkout does not have.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
@@ -120,15 +129,31 @@ jobs:
       - run: python scripts/generate-compatibility.py --check
       - run: python scripts/check-community-contract.py --json
 
+  deployment-manifests:
+    name: Helm deployment manifests (pinned chart contract)
+    runs-on: ubuntu-24.04
+    env:
+      # The checker pulls this immutable image before invoking Helm; its lint
+      # and render calls then run with --network none and --pull=never.
+      TRITIUM_PULL_HELM_IMAGE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: qualify CPU/CUDA chart renders
+        run: ./scripts/check-deployment-manifests
+
   # Exact browser-package lane. The local RC stays private, but the candidate
   # tarball and its digest-bound clean-install receipt are retained as CI
   # evidence. Consumers need no Rust toolchain or lifecycle scripts.
   web-package:
     name: web package (Node 22, source-free archive)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TRITIUM_SOURCE_REF }}
+      - name: verify checked-out source revision
+        run: python scripts/verify-workflow-source.py --expected-revision "$TRITIUM_SOURCE_REVISION"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
           cache: npm
@@ -148,31 +173,37 @@ jobs:
           TRITIUM_NPM_RUN_ID: github-${{ github.run_id }}-${{ github.run_attempt }}-npm-archive
         run: npm run check
       - name: retain local-RC archive and receipt
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: tritium-web-${{ github.sha }}
+          name: tritium-web-${{ env.TRITIUM_SOURCE_REVISION }}
           path: ${{ runner.temp }}/tritium-npm-evidence
           if-no-files-found: error
 
   # Supply-chain gate (ADR 0011 hardening): licenses (allow-list + NOTICE
   # attribution), RustSec advisories, bans (no external wildcard versions /
   # disallowed crates), and source registries. Fast + CPU-only, on every push +
-  # PR. The action pins a recent cargo-deny that parses CVSS-4.0 advisories (the
-  # locally-installed 0.16.x cannot), so this is the authoritative advisory gate.
+  # PR. Pin cargo-deny 0.20.2 (the former Docker action's version) with verified
+  # release checksums. The composite installer avoids Docker Hub anonymous pull
+  # quotas without changing feature coverage or any of the four check classes.
   cargo-deny:
     name: supply-chain (cargo-deny)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833
         with:
-          command: check licenses bans sources advisories
+          tool: cargo-deny@0.20.2
+          checksum: "true"
+          fallback: none
+      - name: check complete locked dependency policy
+        run: cargo deny --locked --all-features check licenses bans sources advisories
 
   workflow-lint:
     name: workflow lint (actionlint)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Download the pinned release binary directly. `taiki-e/install-action` does not carry
       # actionlint, so it falls back to cargo-binstall, which cannot find it either (actionlint
       # is not published as a crate) and the job dies with exit 76. The checksum keeps this as
@@ -197,7 +228,7 @@ jobs:
   # baseline tag + history are available to `git describe` in the script.
   semver:
     name: API stability (cargo-semver-checks)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       # Belt-and-braces. check-semver.sh now passes --default-features, so the
       # cuda / rocm build scripts are not reached at all -- that is the fix. The
@@ -207,7 +238,7 @@ jobs:
       # into the build-script failure this lane died on for its whole life.
       TRITIUM_CHECK_ONLY: "1"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
@@ -219,10 +250,10 @@ jobs:
   # Scheduled fuzz lane (U5): every tritium-format parser, zero crashes.
   fuzz:
     name: fuzz parsers
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.event_name == 'schedule'
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
       - run: cargo install cargo-fuzz --locked
       # ~85 min split across EVERY tritium-format untrusted-byte parser (U5:
@@ -247,7 +278,7 @@ jobs:
     runs-on: [self-hosted, gpu]
     if: ${{ github.event_name == 'workflow_dispatch' }} # dispatch manually once a self-hosted nvcc+GPU runner is registered
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
       - run: cargo test --locked -p tritium-cuda --features cuda
       - run: compute-sanitizer --tool memcheck cargo test --locked -p tritium-cuda --features cuda
@@ -264,7 +295,7 @@ jobs:
     runs-on: macos-14 # GitHub-hosted Apple-Silicon (free) — Metal device may be paravirtual; the conformance test self-skips if MTLCreateSystemDefaultDevice() is nil, so the lane stays green either way
     if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }} # free Metal CI on main pushes + on-demand
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           components: clippy
@@ -283,7 +314,7 @@ jobs:
     runs-on: [self-hosted, rocm]
     if: ${{ github.event_name == 'workflow_dispatch' }} # dispatch manually once a self-hosted AMD-GPU + ROCm (hipcc) runner is registered
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           components: clippy
@@ -304,7 +335,7 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' }} # dispatch manually on the pinned 4090 runner (nvcc + the model)
     needs: gpu
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
       # The bench fixtures + baseline/regression logic are unit-tested on every lane;
       # this asserts they hold under -D warnings on the GPU toolchain too.
@@ -325,11 +356,11 @@ jobs:
   # self-hosted `perf-regression` lane above, which needs the 4090 + the model.
   cpu-bench-smoke:
     name: cpu bench smoke (divan mpgemm)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       RUSTFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
       - run: cargo build --locked -p tritium-benches --benches
       - run: cargo bench --locked -p tritium-benches --bench mpgemm
@@ -341,18 +372,46 @@ jobs:
   # transparently execute the test harness under wasmtime. Green on every push.
   wasm:
     name: wasm conformance (wasm32-wasip1)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       RUSTFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TRITIUM_SOURCE_REF }}
+      - name: verify checked-out source revision
+        run: python scripts/verify-workflow-source.py --expected-revision "$TRITIUM_SOURCE_REVISION"
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           targets: wasm32-wasip1
       - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833
         with:
           tool: wasmtime
-      - run: cargo test --locked --target wasm32-wasip1 -p tritium-wasm
+      - run: |
+          cargo test --locked --target wasm32-wasip1 -p tritium-wasm --all-targets
+          cargo test --locked --target wasm32-wasip1 -p tritium-wasm --doc
+      - name: Seal portable-training receipts inside WASI guest
+        shell: bash
+        run: |
+          version="$(wasmtime --version | awk '{print $2}')"
+          arch="$(uname -m)"
+          test -n "$version"
+          TRITIUM_WASM_PHYSICAL_DEVICE="wasmtime:${version}:${arch}" \
+            cargo run --locked --release --target wasm32-wasip1 -p tritium-wasm \
+            --example seal_wasi_training_receipts -- release/v1.1/ci-wasi-training-receipts
+          mapfile -t bundles < <(find release/v1.1/ci-wasi-training-receipts \
+            -maxdepth 1 -type f -name '*.json' -print)
+          test "${#bundles[@]}" -eq 1
+          receipt="${bundles[0]}"
+          digest="$(basename "$receipt" .json)"
+          cargo run --locked --release -p tritium-testkit \
+            --example training_capability_table -- --schema v2 "${digest}=${receipt}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wasi-training-receipts-${{ env.TRITIUM_SOURCE_REVISION }}
+          path: release/v1.1/ci-wasi-training-receipts/*.json
+          if-no-files-found: error
+          retention-days: 90
 
   # wgpu lane (v0.70 backend breadth). Self-hosted, manual — runs only where a
   # Vulkan adapter + driver are present (the 4090 box). Mirrors the disabled `gpu`
@@ -365,7 +424,7 @@ jobs:
     runs-on: [self-hosted, gpu]
     if: ${{ github.event_name == 'workflow_dispatch' }} # dispatch manually once a self-hosted Vulkan-adapter runner is registered
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
       - name: vulkan runtime
         run: sudo apt-get update && sudo apt-get install -y libvulkan1 vulkan-tools
@@ -377,11 +436,11 @@ jobs:
   # via MockGenerator. No GPU, no model.
   serve-contract:
     name: serve contract (cpu, mock)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       RUSTFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           components: clippy
@@ -394,7 +453,7 @@ jobs:
     runs-on: [self-hosted, gpu]
     if: ${{ github.event_name == 'workflow_dispatch' }} # dispatch manually with TRITIUM_SERVE_E2E=1 + TRITIUM_MODEL_PATH set
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
       - run: cargo test --locked -p tritium-serve --features e2e -- --ignored serve_e2e_token_id_roundtrip
 
@@ -406,11 +465,11 @@ jobs:
   # candle-free), mirroring the serve-contract lane.
   candle-conformance:
     name: candle interop (cpu)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       RUSTFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           components: clippy
@@ -425,11 +484,11 @@ jobs:
   # candle-conformance.
   burn-conformance:
     name: burn interop (cpu)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       RUSTFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           components: clippy
@@ -446,11 +505,11 @@ jobs:
   # `#[ignore]`d; the registration + bit-exact kernel tests run here.
   onnx-op:
     name: onnx custom op (cpu)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       RUSTFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           components: clippy
@@ -463,9 +522,13 @@ jobs:
   # per-crate `cargo publish --dry-run`.
   publish-check:
     name: publish readiness (cargo package)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TRITIUM_SOURCE_REF }}
+      - name: verify checked-out source revision
+        run: python scripts/verify-workflow-source.py --expected-revision "$TRITIUM_SOURCE_REVISION"
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
       - run: cargo install cargo-cyclonedx --locked
       # check-publish packages with --frozen (offline) and patches unpublished
@@ -477,19 +540,19 @@ jobs:
           python scripts/generate-crate-sboms.py
           --archives target/package
           --output crate-evidence
-          --source-revision ${{ github.sha }}
+          --source-revision "$TRITIUM_SOURCE_REVISION"
           --source-date-epoch 0
       - name: qualify exact crate archives in offline consumer
         run: >-
           python scripts/qualify-crate-archives.py
           --archives target/package
-          --source-revision ${{ github.sha }}
+          --source-revision "$TRITIUM_SOURCE_REVISION"
           --release "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
           --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-crate-archives
           --output crate-evidence/crate-archive-qualification.json
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: crate-candidates-${{ github.sha }}
+          name: crate-candidates-${{ env.TRITIUM_SOURCE_REVISION }}
           path: |
             target/package/*.crate
             crate-evidence/*.json
@@ -499,13 +562,13 @@ jobs:
   # whole workspace and upload it as a build artifact.
   sbom:
     name: SBOM (CycloneDX)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
       - run: cargo install cargo-cyclonedx --locked
       - run: cargo cyclonedx --all --format json
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom-cyclonedx
           path: "**/*.cdx.json"
@@ -523,9 +586,9 @@ jobs:
   # silently in a downstream user's build.
   msrv:
     name: MSRV floor (rust-version)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: read the floor from Cargo.toml
         id: floor
         run: |
@@ -568,7 +631,7 @@ jobs:
       - onnx-op
       - publish-check
       - sbom
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: fail closed on dependency result
         env:

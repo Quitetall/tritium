@@ -27,7 +27,10 @@ use core::fmt;
 
 // Re-export the core vocabulary types the contract speaks so a backend author
 // needs only depend on `tritium-spec` to implement [`TernaryBackend`].
-pub use tritium_core::{DType, GemmShape, TernaryFormat, TritError};
+pub use tritium_core::{AdditiveView, DType, GemmShape, TernaryFormat, TritError};
+pub use tritium_schema::{
+    Basis, TensorCaps, TensorExecution, TensorUploadPolicy, admitted_execution_group,
+};
 
 mod caps;
 pub use caps::DeviceCaps;
@@ -139,6 +142,72 @@ impl fmt::Debug for MpGemmProjectedVjp<'_> {
     }
 }
 
+/// Host-side tensor input for the unified tensor upload contract.
+#[derive(Clone, Copy, Debug)]
+pub enum TensorView<'a> {
+    /// Validated additive-ternary tensor with its scale law and basis.
+    Additive(AdditiveView<'a>),
+    /// Dense row-major f32 matrix. `rows` are output channels, `cols` inputs.
+    Dense {
+        /// Number of output rows.
+        rows: usize,
+        /// Number of input columns.
+        cols: usize,
+        /// Row-major dense values, exactly `rows * cols` elements.
+        values: &'a [f32],
+    },
+}
+
+impl TensorView<'_> {
+    /// Checked size of the decoded scalar payload, without allocating.
+    ///
+    /// This is not packed residency, full memory admission or backend support.
+    /// Additive storage uses decoded i8 trits and f32 scales; dense uses f32.
+    pub fn decoded_payload_bytes(self) -> Result<u64, BackendError> {
+        let bytes = match self {
+            Self::Additive(view) => view
+                .trits()
+                .len()
+                .checked_add(core::mem::size_of_val(view.scales())),
+            Self::Dense { rows, cols, values } => {
+                tritium_core::DenseView::new(rows, cols, values).map_err(|e| {
+                    BackendError::InvalidInput(format!("invalid dense tensor: {e:?}"))
+                })?;
+                values.len().checked_mul(core::mem::size_of::<f32>())
+            }
+        }
+        .ok_or_else(|| BackendError::InvalidInput("tensor payload size overflows".into()))?;
+        u64::try_from(bytes)
+            .map_err(|_| BackendError::InvalidInput("tensor payload size exceeds u64".into()))
+    }
+}
+
+/// Inputs for unified tensor-level matrix multiplication.
+pub struct TensorMatmul<'a> {
+    /// `[batch, K]` row-major activations.
+    pub act: &'a [f32],
+    /// Tensor returned by [`TernaryBackend::upload_tensor`].
+    pub tensor: &'a dyn DeviceBuffer,
+    /// Number of activation rows (`M`).
+    pub batch: usize,
+    /// `[batch, K]` scratch for basis-transformed activations.
+    pub transformed_act: &'a mut [f32],
+    /// `[batch, N]` output, overwritten.
+    pub out: &'a mut [f32],
+}
+
+impl fmt::Debug for TensorMatmul<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TensorMatmul")
+            .field("act_len", &self.act.len())
+            .field("tensor_bytes", &self.tensor.len_bytes())
+            .field("batch", &self.batch)
+            .field("transformed_act_len", &self.transformed_act.len())
+            .field("out_len", &self.out.len())
+            .finish()
+    }
+}
+
 /// Opaque handle to device-resident memory owned by a backend.
 ///
 /// The runtime treats this as an opaque token; the owning backend downcasts it
@@ -177,6 +246,97 @@ pub trait TernaryBackend: Send + Sync {
 
     /// What this device can do — used by the runtime to pick a backend.
     fn capabilities(&self) -> DeviceCaps;
+
+    /// Query support for this exact law/basis/plane/group combination.
+    ///
+    /// `None` means no declared semantic support, never a native fallback.
+    /// Defaults fail closed independently of legacy packed kernels or ISA
+    /// flags. A declaration must be backed by frozen conformance vectors.
+    fn tensor_caps(&self, _tensor: TensorView<'_>) -> Result<Option<TensorCaps>, BackendError> {
+        Ok(None)
+    }
+
+    /// Enforce capability, native-only and payload-budget policy before upload.
+    ///
+    /// Returns the declared execution tier explicitly with the buffer.
+    /// Production emulation additionally needs evidence events and aggregate
+    /// physical-memory admission (ADR 0044
+    /// D9); this per-payload guard alone does not satisfy those obligations.
+    /// Legacy/raw [`Self::upload_tensor`] remains policy-unchecked during
+    /// migration. The returned payload size must match the declaration.
+    fn upload_tensor_checked(
+        &self,
+        tensor: TensorView<'_>,
+        policy: TensorUploadPolicy,
+    ) -> Result<(Box<dyn DeviceBuffer>, TensorCaps), BackendError> {
+        let caps = self
+            .tensor_caps(tensor)?
+            .ok_or(BackendError::UnsupportedTensor)?;
+        if policy.native_only && caps.execution != TensorExecution::Native {
+            return Err(BackendError::NativeTensorRequired);
+        }
+        if let Some(limit) = policy.max_payload_bytes
+            && caps.payload_bytes > limit
+        {
+            return Err(BackendError::TensorPayloadBudgetExceeded {
+                requested: caps.payload_bytes,
+                limit,
+            });
+        }
+        let buffer = self.upload_tensor(tensor)?;
+        let actual = u64::try_from(buffer.len_bytes())
+            .map_err(|_| BackendError::InvalidInput("uploaded payload size exceeds u64".into()))?;
+        if actual != caps.payload_bytes {
+            return Err(BackendError::TensorPayloadMismatch {
+                advertised: caps.payload_bytes,
+                actual,
+            });
+        }
+        Ok((buffer, caps))
+    }
+
+    /// Upload a semantic tensor without exposing its wire-format encoding.
+    ///
+    /// Compatibility default fails closed; backend implementations opt into
+    /// the tensor contract explicitly while the legacy packed path remains.
+    fn upload_tensor(
+        &self,
+        _tensor: TensorView<'_>,
+    ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        Err(BackendError::Backend(format!(
+            "backend `{}` does not implement semantic tensor upload",
+            self.device_id()
+        )))
+    }
+
+    /// Multiply activations by a tensor uploaded through [`Self::upload_tensor`].
+    ///
+    /// Compatibility default fails closed. A backend must not silently route
+    /// an unsupported tensor through an unrelated packed format.
+    fn matmul(&self, _p: TensorMatmul<'_>) -> Result<(), BackendError> {
+        Err(BackendError::Backend(format!(
+            "backend `{}` does not implement semantic tensor matmul",
+            self.device_id()
+        )))
+    }
+
+    /// Gather `[ids.len(), K]` original-coordinate rows from an uploaded tensor.
+    ///
+    /// Additive tensors undo their declared input-axis basis after decoding;
+    /// dense tensors copy rows directly. Preserve ID order and duplicates,
+    /// and reject invalid IDs/output lengths before writing. Empty gathers
+    /// are valid. Compatibility defaults fail closed, never return rotated rows.
+    fn embed_rows(
+        &self,
+        _tensor: &dyn DeviceBuffer,
+        _ids: &[usize],
+        _out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        Err(BackendError::Backend(format!(
+            "backend `{}` does not implement semantic tensor gather",
+            self.device_id()
+        )))
+    }
 
     /// Upload host-side packed weight bytes (`format`, shape `[N, K]`) to device
     /// memory, returning an opaque handle for reuse across `mpgemm` calls.
@@ -391,6 +551,24 @@ pub enum BackendError {
     },
     /// The backend cannot consume this packing format.
     UnsupportedFormat(TernaryFormat),
+    /// No support was declared for this semantic tensor combination.
+    UnsupportedTensor,
+    /// Native-only upload refused a declared non-native execution tier.
+    NativeTensorRequired,
+    /// Declared payload exceeds the caller's per-tensor budget.
+    TensorPayloadBudgetExceeded {
+        /// Declared payload bytes, checked before allocation.
+        requested: u64,
+        /// Caller-supplied maximum payload bytes.
+        limit: u64,
+    },
+    /// Uploaded buffer contradicts its pre-upload capability declaration.
+    TensorPayloadMismatch {
+        /// Payload size declared by the backend.
+        advertised: u64,
+        /// Actual payload size reported by the buffer.
+        actual: u64,
+    },
     /// Device allocation failed for the requested byte count.
     OutOfMemory {
         /// Bytes requested.
@@ -413,6 +591,16 @@ impl fmt::Display for BackendError {
             BackendError::UnsupportedFormat(fmt_) => {
                 write!(f, "unsupported ternary format: {fmt_:?}")
             }
+            BackendError::UnsupportedTensor => write!(f, "unsupported semantic tensor combination"),
+            BackendError::NativeTensorRequired => write!(f, "native tensor execution required"),
+            BackendError::TensorPayloadBudgetExceeded { requested, limit } => write!(
+                f,
+                "tensor payload budget exceeded: requested {requested}, limit {limit} bytes"
+            ),
+            BackendError::TensorPayloadMismatch { advertised, actual } => write!(
+                f,
+                "tensor payload declaration mismatch: advertised {advertised}, actual {actual} bytes"
+            ),
             BackendError::OutOfMemory { requested } => {
                 write!(f, "out of device memory: requested {requested} bytes")
             }
@@ -449,6 +637,140 @@ fn _assert_object_safe(backend: &dyn TernaryBackend, buffer: &dyn DeviceBuffer) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct AdmissionBackend {
+        caps: Option<TensorCaps>,
+        actual_bytes: usize,
+        uploads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TernaryBackend for AdmissionBackend {
+        fn device_id(&self) -> &str {
+            "admission-control"
+        }
+        fn capabilities(&self) -> DeviceCaps {
+            DeviceCaps::new("test", "policy negative control")
+        }
+        fn tensor_caps(&self, _: TensorView<'_>) -> Result<Option<TensorCaps>, BackendError> {
+            Ok(self.caps)
+        }
+        fn upload_tensor(&self, _: TensorView<'_>) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+            self.uploads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Box::new(MockBuffer {
+                trits: vec![0; self.actual_bytes],
+            }))
+        }
+        fn upload_weights(
+            &self,
+            _: &[u8],
+            _: GemmShape,
+            _: TernaryFormat,
+        ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+            Err(BackendError::InvalidInput("unused policy control".into()))
+        }
+        fn mpgemm(&self, _: MpGemm<'_>) -> Result<(), BackendError> {
+            Err(BackendError::InvalidInput("unused policy control".into()))
+        }
+    }
+
+    #[test]
+    fn checked_upload_rejects_unknown_emulation_and_budget_before_upload() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tensor = TensorView::Dense {
+            rows: 1,
+            cols: 2,
+            values: &[1., 2.],
+        };
+        for (caps, policy, expected) in [
+            (
+                None,
+                TensorUploadPolicy::default(),
+                BackendError::UnsupportedTensor,
+            ),
+            (
+                Some(TensorCaps {
+                    execution: TensorExecution::Emulated,
+                    payload_bytes: 8,
+                }),
+                TensorUploadPolicy {
+                    native_only: true,
+                    max_payload_bytes: None,
+                },
+                BackendError::NativeTensorRequired,
+            ),
+            (
+                Some(TensorCaps {
+                    execution: TensorExecution::Native,
+                    payload_bytes: 8,
+                }),
+                TensorUploadPolicy {
+                    native_only: false,
+                    max_payload_bytes: Some(7),
+                },
+                BackendError::TensorPayloadBudgetExceeded {
+                    requested: 8,
+                    limit: 7,
+                },
+            ),
+        ] {
+            let backend = AdmissionBackend {
+                caps,
+                actual_bytes: 8,
+                uploads: AtomicUsize::new(0),
+            };
+            let object: &dyn TernaryBackend = &backend;
+            assert_eq!(
+                object.upload_tensor_checked(tensor, policy).err().unwrap(),
+                expected
+            );
+            assert_eq!(backend.uploads.load(Ordering::Relaxed), 0);
+        }
+        // An inference-only backend does not inherit native tensor support.
+        assert_eq!(MockBackend.tensor_caps(tensor).unwrap(), None);
+    }
+
+    #[test]
+    fn checked_upload_retains_tier_and_rejects_inaccurate_size_declarations() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tensor = TensorView::Dense {
+            rows: 1,
+            cols: 2,
+            values: &[1., 2.],
+        };
+        let caps = TensorCaps {
+            execution: TensorExecution::Emulated,
+            payload_bytes: 8,
+        };
+        let backend = AdmissionBackend {
+            caps: Some(caps),
+            actual_bytes: 8,
+            uploads: AtomicUsize::new(0),
+        };
+        let (buffer, reported) = backend
+            .upload_tensor_checked(tensor, TensorUploadPolicy::default())
+            .unwrap();
+        assert_eq!(reported, caps);
+        assert_eq!(buffer.len_bytes(), 8);
+        assert_eq!(backend.uploads.load(Ordering::Relaxed), 1);
+        for actual_bytes in [7, 9] {
+            let backend = AdmissionBackend {
+                caps: Some(caps),
+                actual_bytes,
+                uploads: AtomicUsize::new(0),
+            };
+            assert_eq!(
+                backend
+                    .upload_tensor_checked(tensor, TensorUploadPolicy::default())
+                    .err()
+                    .unwrap(),
+                BackendError::TensorPayloadMismatch {
+                    advertised: 8,
+                    actual: actual_bytes as u64
+                }
+            );
+        }
+    }
 
     /// The host-quant default must match `transformers` `ActQuant` on the same
     /// golden row `tritium-nn::ops::act_quant` pins, so the two copies cannot

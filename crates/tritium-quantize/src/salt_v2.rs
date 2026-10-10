@@ -1,5 +1,7 @@
 //! Joint additive-ternary fitting for SALT V2.
 
+use std::borrow::Cow;
+
 use half::f16;
 
 /// Precision used when scoring fitted scales.
@@ -576,34 +578,157 @@ pub fn exact_ternary_assignment(
         return Err(JointFitError::InvalidScale { index });
     }
 
+    let mut trits = (0..scales.len())
+        .map(|_| vec![0_i8; weights.len()])
+        .collect::<Vec<_>>();
+    exact_ternary_assignment_into_validated(weights, scales, &mut trits);
+    Ok(trits)
+}
+
+/// Refill a correctly shaped assignment buffer after the caller has validated inputs.
+///
+/// Joint fitting validates weights and configuration once per row, then reassigns after
+/// accepted scale updates. Reusing these plane buffers avoids allocating `P * len` trits for
+/// every alternating-descent pass.
+fn exact_ternary_assignment_into_validated(weights: &[f32], scales: &[f32], trits: &mut [Vec<i8>]) {
+    exact_ternary_assignment_into_validated_with_reconstruction(weights, scales, trits, None);
+}
+
+/// Assign exact ternary codes and optionally retain each winning codebook value.
+///
+/// The initial solver state immediately needs both the selected trits and their additive
+/// reconstruction. Returning the winning codebook value avoids repeating the plane sum in a
+/// second full pass; the value is accumulated in the same plane order as `reconstruct_planes`.
+fn exact_ternary_assignment_into_validated_with_reconstruction(
+    weights: &[f32],
+    scales: &[f32],
+    trits: &mut [Vec<i8>],
+    mut reconstruction: Option<&mut [f32]>,
+) {
+    debug_assert!(!weights.is_empty());
+    debug_assert!((1..=3).contains(&scales.len()));
+    debug_assert_eq!(trits.len(), scales.len());
+    debug_assert!(trits.iter().all(|plane| plane.len() == weights.len()));
+    debug_assert!(
+        reconstruction
+            .as_ref()
+            .is_none_or(|values| values.len() == weights.len())
+    );
+
     const CODES: [i8; 3] = [0, -1, 1];
     let states = 3_usize.pow(scales.len() as u32);
-    let mut trits = vec![vec![0_i8; weights.len()]; scales.len()];
-    for (weight_index, &weight) in weights.iter().enumerate() {
-        let mut best_error = f64::INFINITY;
-        let mut best_codes = [0_i8; 3];
-        for state in 0..states {
-            let mut encoded = state;
-            let mut reconstruction = 0.0_f32;
-            let mut candidate = [0_i8; 3];
-            for plane in 0..scales.len() {
-                let trit = CODES[encoded % 3];
-                encoded /= 3;
-                candidate[plane] = trit;
-                reconstruction += scales[plane] * f32::from(trit);
-            }
-            let error = f64::from(weight) - f64::from(reconstruction);
-            let squared = error * error;
-            if squared < best_error {
-                best_error = squared;
-                best_codes = candidate;
-            }
+    let mut codebook = [(0.0_f32, [0_i8; 3], 0_usize); 27];
+    for (state, entry) in codebook.iter_mut().take(states).enumerate() {
+        let mut encoded = state;
+        let mut reconstruction = 0.0_f32;
+        let mut candidate = [0_i8; 3];
+        for plane in 0..scales.len() {
+            let trit = CODES[encoded % 3];
+            encoded /= 3;
+            candidate[plane] = trit;
+            reconstruction += scales[plane] * f32::from(trit);
         }
+        *entry = (reconstruction, candidate, state);
+    }
+    let codebook = &mut codebook[..states];
+    // State is unique, making this a deterministic total order without a heap-backed sort buffer.
+    codebook.sort_unstable_by(|left, right| {
+        left.0
+            .total_cmp(&right.0)
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    // Equal reconstructions have identical error for every weight. Retain only
+    // the lowest state for each total-ordered value so the assignment loop does
+    // not need a second binary search to find the first lower duplicate.
+    let mut unique_states = 0;
+    for index in 0..states {
+        let entry = codebook[index];
+        if unique_states == 0 || codebook[unique_states - 1].0.total_cmp(&entry.0).is_ne() {
+            codebook[unique_states] = entry;
+            unique_states += 1;
+        }
+    }
+    let codebook = &codebook[..unique_states];
+    // Adjacent-codebook midpoints partition the real line into nearest-code
+    // regions. Compute them in f64 so they are exact for the f32 endpoints.
+    // The codebook has at most 27 entries, so keep its at most 26 boundaries on
+    // the stack. This path runs once per fitted row; a heap allocation here
+    // compounds across every row and accepted solver iteration.
+    let mut midpoint_storage = [0.0_f64; 26];
+    for (index, pair) in codebook.windows(2).enumerate() {
+        midpoint_storage[index] = (f64::from(pair[0].0) + f64::from(pair[1].0)) * 0.5;
+    }
+    let midpoints = &midpoint_storage[..unique_states.saturating_sub(1)];
+    let max_reconstruction = codebook
+        .iter()
+        .map(|entry| entry.0.abs())
+        .fold(0.0_f32, f32::max);
+    let min_reconstruction_gap = codebook
+        .windows(2)
+        .filter_map(|pair| {
+            let gap = f64::from(pair[1].0) - f64::from(pair[0].0);
+            (gap > 0.0).then_some(gap)
+        })
+        .fold(f64::INFINITY, f64::min);
+
+    for (weight_index, &weight) in weights.iter().enumerate() {
+        let mut best_codes = [0_i8; 3];
+        // At extreme dynamic ranges, distinct f32 reconstructions can collapse
+        // to the same f64 squared error. Preserve the original first-state tie
+        // behavior there; ordinary values use the exact nearest-code fast path.
+        let ill_conditioned = !weight.is_finite()
+            || !max_reconstruction.is_finite()
+            || f64::from(weight.abs()) > f64::from(max_reconstruction.max(1.0)) * 67_108_864.0
+            || min_reconstruction_gap
+                <= (f64::from(weight.abs()) + f64::from(max_reconstruction)) * (1.0 / 67_108_864.0);
+        if ill_conditioned {
+            let mut best_error = f64::INFINITY;
+            let mut best_state = usize::MAX;
+            let mut best_reconstruction = 0.0_f32;
+            for &(reconstruction, candidate, state) in codebook.iter() {
+                let error = f64::from(weight) - f64::from(reconstruction);
+                let squared = error * error;
+                if squared < best_error || (squared == best_error && state < best_state) {
+                    best_error = squared;
+                    best_codes = candidate;
+                    best_state = state;
+                    best_reconstruction = reconstruction;
+                }
+            }
+            for plane in 0..scales.len() {
+                trits[plane][weight_index] = best_codes[plane];
+            }
+            if let Some(values) = reconstruction.as_deref_mut() {
+                values[weight_index] = best_reconstruction;
+            }
+            continue;
+        }
+        let value = f64::from(weight);
+        let upper = midpoints.partition_point(|midpoint| *midpoint < value);
+        let candidate_index = if upper < midpoints.len() && midpoints[upper] == value {
+            // At an exact midpoint, retain the original exhaustive oracle's
+            // deterministic lower-state tie break.
+            if codebook[upper].2 < codebook[upper + 1].2 {
+                upper
+            } else {
+                upper + 1
+            }
+        } else if upper == 0 {
+            0
+        } else if upper == midpoints.len() {
+            codebook.len() - 1
+        } else {
+            upper
+        };
+        let (fitted, candidate, _) = codebook[candidate_index];
+        best_codes = candidate;
         for plane in 0..scales.len() {
             trits[plane][weight_index] = best_codes[plane];
         }
+        if let Some(values) = reconstruction.as_deref_mut() {
+            values[weight_index] = fitted;
+        }
     }
-    Ok(trits)
 }
 
 /// Jointly fit up to three zero-point-free additive ternary planes.
@@ -619,6 +744,8 @@ pub fn fit_joint_ternary(
     fit_metric: JointFitMetric<'_>,
     config: JointFitConfig,
 ) -> Result<JointTernaryFit, JointFitError> {
+    #[cfg(test)]
+    let validation_started = std::time::Instant::now();
     if !(1..=3).contains(&config.planes) {
         return Err(JointFitError::InvalidPlaneCount { got: config.planes });
     }
@@ -640,8 +767,8 @@ pub fn fit_joint_ternary(
     if let Some(index) = weights.iter().position(|weight| !weight.is_finite()) {
         return Err(JointFitError::NonFiniteWeight { index });
     }
-    let metric_diagonal: Vec<f64> = match fit_metric {
-        JointFitMetric::Identity => vec![1.0; weights.len()],
+    let metric_diagonal: Cow<'_, [f64]> = match fit_metric {
+        JointFitMetric::Identity => Cow::Owned(vec![1.0; weights.len()]),
         JointFitMetric::Diagonal(values) => {
             if values.len() != weights.len() {
                 return Err(JointFitError::MetricLengthMismatch {
@@ -658,7 +785,7 @@ pub fn fit_joint_ternary(
             if !values.iter().any(|value| *value > 0.0) {
                 return Err(JointFitError::ZeroMetric);
             }
-            values.iter().map(|value| f64::from(*value)).collect()
+            Cow::Owned(values.iter().map(|value| f64::from(*value)).collect())
         }
         JointFitMetric::DiagonalF64(values) => {
             if values.len() != weights.len() {
@@ -676,7 +803,7 @@ pub fn fit_joint_ternary(
             if !values.iter().any(|value| *value > 0.0) {
                 return Err(JointFitError::ZeroMetric);
             }
-            values.to_vec()
+            Cow::Borrowed(values)
         }
         JointFitMetric::DiagonalAffine {
             values,
@@ -703,7 +830,7 @@ pub fn fit_joint_ternary(
             if !diagonal.iter().any(|value| *value > 0.0) {
                 return Err(JointFitError::ZeroMetric);
             }
-            diagonal
+            Cow::Owned(diagonal)
         }
         JointFitMetric::Dense(dense) => {
             if dense.dimension != weights.len() {
@@ -712,9 +839,11 @@ pub fn fit_joint_ternary(
                     got: dense.dimension,
                 });
             }
-            (0..dense.dimension)
-                .map(|index| dense.values[index * dense.dimension + index].max(0.0))
-                .collect()
+            Cow::Owned(
+                (0..dense.dimension)
+                    .map(|index| dense.values[index * dense.dimension + index].max(0.0))
+                    .collect(),
+            )
         }
     };
     let metric_sum: f64 = metric_diagonal.iter().sum();
@@ -724,12 +853,72 @@ pub fn fit_joint_ternary(
     if !metric_sum.is_finite() {
         return Err(JointFitError::ScaleSolveFailed);
     }
+    #[cfg(test)]
+    record_solver_phase(3, validation_started);
+    #[cfg(test)]
+    let order_started = std::time::Instant::now();
+    let weighted_abs_order = if config.em_restarts > 1 {
+        weighted_abs_order(weights, &metric_diagonal)
+    } else {
+        WeightedAbsOrder::default()
+    };
+    #[cfg(test)]
+    record_solver_phase(4, order_started);
+    let mut relay_scale_prefixes: [Option<Vec<relay::ScalePrefix>>; 2] = [None, None];
+    for (index, enabled, modulated) in [
+        (0, config.relay_basins.softened, false),
+        (1, config.relay_basins.modulated, true),
+    ] {
+        if enabled {
+            #[cfg(test)]
+            let relay_started = std::time::Instant::now();
+            relay_scale_prefixes[index] = Some(relay::basin_scale_prefixes(
+                weights,
+                config.planes,
+                modulated,
+                config.scale_precision,
+            )?);
+            #[cfg(test)]
+            record_solver_phase(6, relay_started);
+        }
+    }
+    fit_joint_ternary_prepared(
+        weights,
+        fit_metric,
+        config,
+        &metric_diagonal,
+        metric_sum,
+        &weighted_abs_order,
+        &relay_scale_prefixes,
+    )
+}
+
+fn fit_joint_ternary_prepared(
+    weights: &[f32],
+    fit_metric: JointFitMetric<'_>,
+    config: JointFitConfig,
+    metric_diagonal: &[f64],
+    metric_sum: f64,
+    weighted_abs_order: &WeightedAbsOrder,
+    relay_scale_prefixes: &[Option<Vec<relay::ScalePrefix>>; 2],
+) -> Result<JointTernaryFit, JointFitError> {
     let relay_starts =
         usize::from(config.relay_basins.softened) + usize::from(config.relay_basins.modulated);
     let mut starts =
         Vec::with_capacity(config.em_restarts + relay_starts + usize::from(config.planes > 1));
     for restart in 0..config.em_restarts {
-        let scales = deterministic_initial_scales(weights, &metric_diagonal, config, restart)?;
+        #[cfg(test)]
+        let initialization_started = std::time::Instant::now();
+        let scales = deterministic_initial_scales(
+            weights,
+            metric_diagonal,
+            metric_sum,
+            weighted_abs_order,
+            config,
+            restart,
+        )?;
+        #[cfg(test)]
+        record_solver_phase(5, initialization_started);
         starts.push(optimize_start(
             weights,
             fit_metric,
@@ -741,12 +930,14 @@ pub fn fit_joint_ternary(
 
     // Relay basins are extra candidates appended after the configured OA-EM restarts, so the
     // deterministic restart indices and receipts are byte-identical when both basins are off.
-    for (enabled, kind) in [
+    for (index, enabled, kind) in [
         (
+            0,
             config.relay_basins.softened,
             JointFitStartKind::SoftenedRelayBasin,
         ),
         (
+            1,
             config.relay_basins.modulated,
             JointFitStartKind::ModulatedRelayBasin,
         ),
@@ -754,28 +945,30 @@ pub fn fit_joint_ternary(
         if !enabled {
             continue;
         }
-        let scales = relay::basin_scales(
-            weights,
-            config.planes,
-            kind == JointFitStartKind::ModulatedRelayBasin,
-            config.scale_precision,
-        )?;
+        let scales = relay_scale_prefixes[index]
+            .as_ref()
+            .and_then(|prefixes| prefixes.get(config.planes - 1))
+            .map(|prefix| prefix.to_vec())
+            .expect("enabled relay basin has cached scales for every plane prefix");
         starts.push(optimize_start(weights, fit_metric, config, scales, kind)?);
     }
 
     // A lower-plane embedding is an additional basin, not one of the configured OA-EM restarts.
     // It guarantees P-monotonicity without pretending the non-convex solver is globally optimal.
     if config.planes > 1 {
-        let lower = fit_joint_ternary(
+        let lower = fit_joint_ternary_prepared(
             weights,
             fit_metric,
             JointFitConfig {
                 planes: config.planes - 1,
                 ..config
             },
+            metric_diagonal,
+            metric_sum,
+            weighted_abs_order,
+            relay_scale_prefixes,
         )?;
         let lower_receipt = lower.restart_receipts[lower.selected_start].clone();
-        let lower_accepted_objectives = lower.accepted_objectives;
         let mut scales = lower.scales;
         scales.push(0.0);
         let mut trits = lower.trits;
@@ -785,14 +978,13 @@ pub fn fit_joint_ternary(
             trits,
             reconstruction: lower.reconstruction,
             objective: lower.objective,
-            accepted_objectives: lower_accepted_objectives,
-            receipt: JointFitRestartReceipt {
+            receipt: Some(JointFitRestartReceipt {
                 kind: JointFitStartKind::LowerPlaneFallback,
                 initial_objective: lower_receipt.initial_objective,
                 final_objective: lower_receipt.final_objective,
                 accepted_updates: lower_receipt.accepted_updates,
                 scale_solves: lower_receipt.scale_solves,
-            },
+            }),
         });
     }
 
@@ -802,14 +994,25 @@ pub fn fit_joint_ternary(
         .min_by(|(_, left), (_, right)| left.objective.total_cmp(&right.objective))
         .map(|(index, _)| index)
         .expect("validated positive restart count");
-    let restart_receipts = starts.iter().map(|state| state.receipt.clone()).collect();
+    // These receipts are returned once; cloning their nested vectors only to
+    // drop the originals needlessly doubles per-fit allocations and copies.
+    let restart_receipts: Vec<JointFitRestartReceipt> = starts
+        .iter_mut()
+        .map(|state| {
+            state
+                .receipt
+                .take()
+                .expect("fit-state receipt is present before result assembly")
+        })
+        .collect();
+    let accepted_objectives = fit_receipt_objectives(&restart_receipts[selected_start]);
     let selected = starts.swap_remove(selected_start);
     Ok(JointTernaryFit {
         scales: selected.scales,
         trits: selected.trits,
         reconstruction: selected.reconstruction,
         objective: selected.objective,
-        accepted_objectives: selected.accepted_objectives,
+        accepted_objectives,
         restart_receipts,
         selected_start,
     })
@@ -821,8 +1024,34 @@ struct FitState {
     trits: Vec<Vec<i8>>,
     reconstruction: Vec<f32>,
     objective: f64,
-    accepted_objectives: Vec<f64>,
-    receipt: JointFitRestartReceipt,
+    receipt: Option<JointFitRestartReceipt>,
+}
+
+fn fit_receipt_objectives(receipt: &JointFitRestartReceipt) -> Vec<f64> {
+    let mut objectives = Vec::with_capacity(receipt.accepted_updates.len() + 1);
+    objectives.push(receipt.initial_objective);
+    objectives.extend(
+        receipt
+            .accepted_updates
+            .iter()
+            .map(|update| update.objective_after),
+    );
+    objectives
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static ASSIGNMENT_FOR_METRIC_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SOLVER_PHASE_NANOS: std::cell::Cell<[u128; 7]> = const { std::cell::Cell::new([0; 7]) };
+}
+
+#[cfg(test)]
+fn record_solver_phase(phase: usize, started: std::time::Instant) {
+    SOLVER_PHASE_NANOS.with(|elapsed| {
+        let mut totals = elapsed.get();
+        totals[phase] = totals[phase].saturating_add(started.elapsed().as_nanos());
+        elapsed.set(totals);
+    });
 }
 
 fn optimize_start(
@@ -832,26 +1061,62 @@ fn optimize_start(
     scales: Vec<f32>,
     kind: JointFitStartKind,
 ) -> Result<FitState, JointFitError> {
-    let trits = assignment_for_metric(weights, &scales, metric)?;
-    let reconstruction = reconstruct_planes(&scales, &trits, weights.len());
-    let objective = metric_objective(weights, &reconstruction, metric)?;
+    let mut trits = (0..config.planes)
+        .map(|_| vec![0_i8; weights.len()])
+        .collect::<Vec<_>>();
+    let (reconstruction, objective) = if matches!(metric, JointFitMetric::Dense(_)) {
+        #[cfg(test)]
+        let assignment_started = std::time::Instant::now();
+        assignment_for_metric_into_validated(weights, &scales, metric, &mut trits)?;
+        #[cfg(test)]
+        record_solver_phase(0, assignment_started);
+        #[cfg(test)]
+        let reconstruction_started = std::time::Instant::now();
+        let fitted = reconstruct_planes_and_objective(weights, &scales, &trits, metric)?;
+        #[cfg(test)]
+        record_solver_phase(2, reconstruction_started);
+        fitted
+    } else {
+        let mut reconstruction = vec![0.0_f32; weights.len()];
+        #[cfg(test)]
+        let assignment_started = std::time::Instant::now();
+        assignment_for_metric_into_validated_with_reconstruction(
+            weights,
+            &scales,
+            metric,
+            &mut trits,
+            Some(&mut reconstruction),
+        )?;
+        #[cfg(test)]
+        record_solver_phase(0, assignment_started);
+        #[cfg(test)]
+        let reconstruction_started = std::time::Instant::now();
+        let objective = metric_objective(weights, &reconstruction, metric)?;
+        #[cfg(test)]
+        record_solver_phase(2, reconstruction_started);
+        (reconstruction, objective)
+    };
     let mut state = FitState {
         scales,
         trits,
         reconstruction,
         objective,
-        accepted_objectives: vec![objective],
-        receipt: JointFitRestartReceipt {
+        receipt: Some(JointFitRestartReceipt {
             kind,
             initial_objective: objective,
             final_objective: objective,
             accepted_updates: Vec::new(),
             scale_solves: Vec::new(),
-        },
+        }),
     };
 
+    // The initial trits came from assignment_for_metric at the initial scales.
+    let mut assignment_checked_for_current_scales = true;
+    let mut assignment_scratch: Option<Vec<Vec<i8>>> = None;
     for iteration in 0..config.max_iterations {
         let mut improved = false;
+        #[cfg(test)]
+        let scale_solve_started = std::time::Instant::now();
         let scale_outcome = solve_scales(
             weights,
             &state.trits,
@@ -860,64 +1125,118 @@ fn optimize_start(
             config.ridge_condition_limit,
             config.scale_precision,
         )?;
-        let scale_reconstruction =
-            reconstruct_planes(&scale_outcome.scales, &scale_outcome.trits, weights.len());
-        let scale_objective = metric_objective(weights, &scale_reconstruction, metric)?;
+        #[cfg(test)]
+        record_solver_phase(1, scale_solve_started);
+
+        #[cfg(test)]
+        let reconstruction_started = std::time::Instant::now();
+        let (scale_reconstruction, scale_objective) =
+            reconstruct_planes_and_objective_with_transform(
+                weights,
+                &scale_outcome.scales,
+                &state.trits,
+                metric,
+                &scale_outcome.transform,
+            )?;
+        #[cfg(test)]
+        record_solver_phase(2, reconstruction_started);
         let scale_accepted = scale_objective < state.objective;
-        state.receipt.scale_solves.push(ScaleSolveReceipt {
-            iteration,
-            telemetry: scale_outcome.telemetry,
-            accepted: scale_accepted,
-        });
+        state
+            .receipt
+            .as_mut()
+            .expect("fit-state receipt is present during optimization")
+            .scale_solves
+            .push(ScaleSolveReceipt {
+                iteration,
+                telemetry: scale_outcome.telemetry,
+                accepted: scale_accepted,
+            });
         if scale_accepted {
             let objective_before = state.objective;
+            apply_scale_solve_transform(&mut state.trits, &scale_outcome.transform);
             state.scales = scale_outcome.scales;
-            state.trits = scale_outcome.trits;
             state.reconstruction = scale_reconstruction;
             state.objective = scale_objective;
-            state.accepted_objectives.push(scale_objective);
-            state.receipt.accepted_updates.push(JointFitUpdateReceipt {
-                iteration,
-                phase: JointFitUpdatePhase::Scale,
-                objective_before,
-                objective_after: scale_objective,
-            });
+            state
+                .receipt
+                .as_mut()
+                .expect("fit-state receipt is present during optimization")
+                .accepted_updates
+                .push(JointFitUpdateReceipt {
+                    iteration,
+                    phase: JointFitUpdatePhase::Scale,
+                    objective_before,
+                    objective_after: scale_objective,
+                });
             improved = true;
+            assignment_checked_for_current_scales = false;
         }
 
-        let assignment = assignment_for_metric(weights, &state.scales, metric)?;
-        let assignment_reconstruction =
-            reconstruct_planes(&state.scales, &assignment, weights.len());
-        let assignment_objective = metric_objective(weights, &assignment_reconstruction, metric)?;
-        if assignment_objective < state.objective {
-            let objective_before = state.objective;
-            state.trits = assignment;
-            state.reconstruction = assignment_reconstruction;
-            state.objective = assignment_objective;
-            state.accepted_objectives.push(assignment_objective);
-            state.receipt.accepted_updates.push(JointFitUpdateReceipt {
-                iteration,
-                phase: JointFitUpdatePhase::Assignment,
-                objective_before,
-                objective_after: assignment_objective,
+        // Re-evaluate assignments only after an accepted scale change. A rejected
+        // scale candidate leaves the current scales unchanged, and the assignment
+        // step for those scales was already evaluated in the prior iteration.
+        if !assignment_checked_for_current_scales {
+            #[cfg(test)]
+            let assignment_started = std::time::Instant::now();
+            let scratch = assignment_scratch.get_or_insert_with(|| {
+                (0..config.planes)
+                    .map(|_| vec![0_i8; weights.len()])
+                    .collect()
             });
-            improved = true;
+            assignment_for_metric_into_validated(weights, &state.scales, metric, scratch)?;
+            #[cfg(test)]
+            record_solver_phase(0, assignment_started);
+            assignment_checked_for_current_scales = true;
+            // The current reconstruction/objective already correspond to these exact
+            // scales and trits. Avoid rebuilding and rescoring the row when the
+            // assignment step rediscovers the same state.
+            if *scratch != state.trits {
+                #[cfg(test)]
+                let reconstruction_started = std::time::Instant::now();
+                let (assignment_reconstruction, assignment_objective) =
+                    reconstruct_planes_and_objective(weights, &state.scales, scratch, metric)?;
+                #[cfg(test)]
+                record_solver_phase(2, reconstruction_started);
+                if assignment_objective < state.objective {
+                    let objective_before = state.objective;
+                    std::mem::swap(&mut state.trits, scratch);
+                    state.reconstruction = assignment_reconstruction;
+                    state.objective = assignment_objective;
+                    state
+                        .receipt
+                        .as_mut()
+                        .expect("fit-state receipt is present during optimization")
+                        .accepted_updates
+                        .push(JointFitUpdateReceipt {
+                            iteration,
+                            phase: JointFitUpdatePhase::Assignment,
+                            objective_before,
+                            objective_after: assignment_objective,
+                        });
+                    improved = true;
+                }
+            }
         }
         if !improved {
             break;
         }
     }
-    state.receipt.final_objective = state.objective;
+    state
+        .receipt
+        .as_mut()
+        .expect("fit-state receipt is present during optimization")
+        .final_objective = state.objective;
     Ok(state)
 }
 
 fn deterministic_initial_scales(
     weights: &[f32],
     metric_diagonal: &[f64],
+    metric_sum: f64,
+    weighted_abs_order: &WeightedAbsOrder,
     config: JointFitConfig,
     restart: usize,
 ) -> Result<Vec<f32>, JointFitError> {
-    let metric_sum: f64 = metric_diagonal.iter().sum();
     let mut scales = Vec::with_capacity(config.planes);
     if config.planes == 2 && restart + 1 == config.em_restarts {
         // Reserve one deterministic P2 basin for a max-minus-min decomposition. This exactly
@@ -966,7 +1285,7 @@ fn deterministic_initial_scales(
         }
     } else {
         let quantile = 0.5 + 0.45 * (restart as f64 / config.em_restarts as f64);
-        let anchor = weighted_abs_quantile(weights, metric_diagonal, quantile);
+        let anchor = weighted_abs_quantile(weighted_abs_order, quantile);
         for plane in 0..config.planes {
             let divisor = 2_f64.powi(plane as i32);
             let modulation = 1.0 + 0.125 * (((restart + plane) % 3) as f64 - 1.0);
@@ -981,35 +1300,61 @@ fn deterministic_initial_scales(
     Ok(scales)
 }
 
-fn weighted_abs_quantile(weights: &[f32], metric_diagonal: &[f64], quantile: f64) -> f64 {
-    let mut values: Vec<(f32, f64, usize)> = weights
+type WeightedAbsEntry = (f32, f64, usize);
+
+#[derive(Default)]
+struct WeightedAbsOrder {
+    entries: Vec<WeightedAbsEntry>,
+    total_weight: f64,
+}
+
+fn weighted_abs_order(weights: &[f32], metric_diagonal: &[f64]) -> WeightedAbsOrder {
+    let mut values: Vec<WeightedAbsEntry> = weights
         .iter()
         .zip(metric_diagonal)
         .enumerate()
         .map(|(index, (value, weight))| (value.abs(), *weight, index))
         .collect();
-    values.sort_by(|left, right| {
+    // The original index is a unique tiebreaker, so this total order is identical
+    // to stable sorting while avoiding a temporary allocation for every fitted row.
+    values.sort_unstable_by(|left, right| {
         left.0
             .total_cmp(&right.0)
             .then_with(|| left.2.cmp(&right.2))
     });
-    let total: f64 = values.iter().map(|value| value.1).sum();
-    let target = total * quantile.clamp(0.0, 1.0);
+    // The scale-start schedule asks several weighted quantiles from this same
+    // order. Cache the exact sorted-order total so every restart avoids
+    // re-summing the same group; keep each prefix scan allocation-free.
+    let total_weight = values.iter().map(|value| value.1).sum();
+    WeightedAbsOrder {
+        entries: values,
+        total_weight,
+    }
+}
+
+fn weighted_abs_quantile(order: &WeightedAbsOrder, quantile: f64) -> f64 {
+    let target = order.total_weight * quantile.clamp(0.0, 1.0);
     let mut cumulative = 0.0;
-    for (value, weight, _) in &values {
+    for (value, weight, _) in &order.entries {
         cumulative += weight;
         if cumulative >= target {
             return f64::from(*value);
         }
     }
-    values.last().map_or(0.0, |value| f64::from(value.0))
+    order.entries.last().map_or(0.0, |value| f64::from(value.0))
 }
 
 #[derive(Clone, Debug)]
 struct ScaleSolveOutcome {
     scales: Vec<f32>,
-    trits: Vec<Vec<i8>>,
+    transform: ScaleSolveTransform,
     telemetry: ScaleSolveTelemetry,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScaleSolveTransform {
+    trit_order: [usize; 3],
+    trit_signs: [i8; 3],
 }
 
 fn solve_scales(
@@ -1063,25 +1408,30 @@ fn solve_scales(
             }
         }
         JointFitMetric::DiagonalF64(diagonal) => {
-            for plane in 0..planes {
-                for other in 0..planes {
-                    normal[plane][other] = trits[plane]
-                        .iter()
-                        .zip(&trits[other])
-                        .zip(diagonal)
-                        .map(|((left, right), weight)| {
-                            f64::from(*left) * f64::from(*right) * *weight
-                        })
-                        .sum();
+            // Each normal-matrix entry and rhs component must still accumulate in row order,
+            // but all of them can share one pass over the weights and curvature. The previous
+            // plane-major implementation traversed this same data P² + P times per scale solve.
+            for index in 0..weights.len() {
+                let curvature = diagonal[index];
+                let weight = f64::from(weights[index]);
+                for plane in 0..planes {
+                    let left = f64::from(trits[plane][index]);
+                    rhs[plane] += left * weight * curvature;
+                    // The normal matrix is a weighted Gram matrix. Accumulate
+                    // only one triangle, then mirror it; each mirrored entry
+                    // sees the same row order and the same commutative trit
+                    // product as the former full-matrix loop.
+                    for other in plane..planes {
+                        normal[plane][other] += left * f64::from(trits[other][index]) * curvature;
+                    }
                 }
-                rhs[plane] = trits[plane]
-                    .iter()
-                    .zip(weights)
-                    .zip(diagonal)
-                    .map(|((left, weight), curvature)| {
-                        f64::from(*left) * f64::from(*weight) * *curvature
-                    })
-                    .sum();
+            }
+            for plane in 0..planes {
+                let (previous_rows, current_and_after) = normal.split_at_mut(plane);
+                let current_row = &mut current_and_after[0];
+                for (lower, previous_row) in current_row[..plane].iter_mut().zip(previous_rows) {
+                    *lower = previous_row[plane];
+                }
             }
         }
         JointFitMetric::DiagonalAffine {
@@ -1204,37 +1554,39 @@ fn solve_scales(
         return Err(JointFitError::ScaleSolveFailed);
     }
 
-    // Plane signs are a representation symmetry. Canonicalize each negative solved coefficient
-    // by flipping that plane's trits, then sort scales and trit planes with the same permutation.
-    let mut canonical_trits = trits.to_vec();
-    let mut signed_scales = rhs[..planes].to_vec();
-    for (scale, plane_trits) in signed_scales.iter_mut().zip(&mut canonical_trits) {
-        if *scale < 0.0 {
-            *scale = -*scale;
-            for trit in plane_trits {
-                *trit = -*trit;
-            }
+    // Plane signs are a representation symmetry. Record the sign and permutation
+    // rather than cloning each trit vector; the caller applies the transform only
+    // if this scale candidate is accepted.
+    let mut signed_planes = Vec::with_capacity(planes);
+    for (source, scale) in rhs[..planes].iter().enumerate() {
+        let mut scale = *scale;
+        let mut sign = 1_i8;
+        if scale < 0.0 {
+            scale = -scale;
+            sign = -1;
         }
+        signed_planes.push((scale, source, sign));
     }
-    let mut order: Vec<usize> = (0..planes).collect();
-    order.sort_by(|left, right| {
-        signed_scales[*right]
-            .total_cmp(&signed_scales[*left])
-            .then_with(|| left.cmp(right))
+    signed_planes.sort_unstable_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
     });
     let mut scales = Vec::with_capacity(planes);
-    let mut ordered_trits = Vec::with_capacity(planes);
-    for (plane, source) in order.into_iter().enumerate() {
-        scales.push(deployment_scale(
-            signed_scales[source] as f32,
-            precision,
-            plane,
-        )?);
-        ordered_trits.push(canonical_trits[source].clone());
+    let mut trit_order = [0_usize; 3];
+    let mut trit_signs = [1_i8; 3];
+    for (plane, (scale, source, sign)) in signed_planes.into_iter().enumerate() {
+        scales.push(deployment_scale(scale as f32, precision, plane)?);
+        trit_order[plane] = source;
+        trit_signs[plane] = sign;
     }
     Ok(ScaleSolveOutcome {
         scales,
-        trits: ordered_trits,
+        transform: ScaleSolveTransform {
+            trit_order,
+            trit_signs,
+        },
         telemetry: ScaleSolveTelemetry {
             condition_before,
             condition_after,
@@ -1325,19 +1677,45 @@ fn deployment_scale(
     }
 }
 
-fn assignment_for_metric(
+fn assignment_for_metric_into_validated(
     weights: &[f32],
     scales: &[f32],
     metric: JointFitMetric<'_>,
-) -> Result<Vec<Vec<i8>>, JointFitError> {
-    let mut trits = exact_ternary_assignment(weights, scales)?;
+    trits: &mut [Vec<i8>],
+) -> Result<(), JointFitError> {
+    assignment_for_metric_into_validated_with_reconstruction(weights, scales, metric, trits, None)
+}
+
+fn assignment_for_metric_into_validated_with_reconstruction(
+    weights: &[f32],
+    scales: &[f32],
+    metric: JointFitMetric<'_>,
+    trits: &mut [Vec<i8>],
+    mut reconstruction_out: Option<&mut [f32]>,
+) -> Result<(), JointFitError> {
+    debug_assert_eq!(trits.len(), scales.len());
+    debug_assert!(trits.iter().all(|plane| plane.len() == weights.len()));
+    debug_assert!(
+        reconstruction_out
+            .as_ref()
+            .is_none_or(|values| values.len() == weights.len())
+    );
+    #[cfg(test)]
+    ASSIGNMENT_FOR_METRIC_CALLS.with(|calls| calls.set(calls.get() + 1));
+
+    exact_ternary_assignment_into_validated_with_reconstruction(
+        weights,
+        scales,
+        trits,
+        reconstruction_out.as_deref_mut(),
+    );
     let JointFitMetric::Dense(dense) = metric else {
-        return Ok(trits);
+        return Ok(());
     };
 
     const CODES: [i8; 3] = [0, -1, 1];
     let states = 3_usize.pow(scales.len() as u32);
-    let mut reconstruction = reconstruct_planes(scales, &trits, weights.len());
+    let mut reconstruction = reconstruct_planes(scales, trits, weights.len());
     let mut error: Vec<f64> = weights
         .iter()
         .zip(&reconstruction)
@@ -1395,7 +1773,10 @@ fn assignment_for_metric(
             break;
         }
     }
-    Ok(trits)
+    if let Some(values) = reconstruction_out {
+        values.copy_from_slice(&reconstruction);
+    }
+    Ok(())
 }
 
 fn reconstruct_planes(scales: &[f32], trits: &[Vec<i8>], len: usize) -> Vec<f32> {
@@ -1408,33 +1789,144 @@ fn reconstruct_planes(scales: &[f32], trits: &[Vec<i8>], len: usize) -> Vec<f32>
     reconstruction
 }
 
+/// Reconstruct additive planes and evaluate diagonal objectives in one ordered pass.
+///
+/// The reconstructed f32 values are accumulated in exactly the same plane order as
+/// [`reconstruct_planes`]. For diagonal metrics, this avoids writing then rereading
+/// the full reconstruction solely to compute the objective. Dense metrics retain the
+/// existing quadratic evaluator because their objective depends on off-diagonal terms.
+fn reconstruct_planes_and_objective(
+    weights: &[f32],
+    scales: &[f32],
+    trits: &[Vec<i8>],
+    metric: JointFitMetric<'_>,
+) -> Result<(Vec<f32>, f64), JointFitError> {
+    if matches!(metric, JointFitMetric::Dense(_)) {
+        let reconstruction = reconstruct_planes(scales, trits, weights.len());
+        let objective = metric_objective(weights, &reconstruction, metric)?;
+        return Ok((reconstruction, objective));
+    }
+
+    let mut reconstruction = vec![0.0_f32; weights.len()];
+    let mut objective = 0.0_f64;
+    for index in 0..weights.len() {
+        let mut fitted = 0.0_f32;
+        for (scale, plane) in scales.iter().zip(trits) {
+            fitted += *scale * f32::from(plane[index]);
+        }
+        reconstruction[index] = fitted;
+        let error = f64::from(weights[index]) - f64::from(fitted);
+        let curvature = match metric {
+            JointFitMetric::Identity => 1.0,
+            JointFitMetric::Diagonal(values) => f64::from(values[index]),
+            JointFitMetric::DiagonalF64(values) => values[index],
+            JointFitMetric::DiagonalAffine {
+                values,
+                scale,
+                shift,
+            } => values[index] * scale + shift,
+            JointFitMetric::Dense(_) => unreachable!("dense metric returned above"),
+        };
+        accumulate_objective_term(&mut objective, error * error * curvature)?;
+    }
+    Ok((reconstruction, objective.max(0.0)))
+}
+
+fn reconstruct_planes_and_objective_with_transform(
+    weights: &[f32],
+    scales: &[f32],
+    trits: &[Vec<i8>],
+    metric: JointFitMetric<'_>,
+    transform: &ScaleSolveTransform,
+) -> Result<(Vec<f32>, f64), JointFitError> {
+    if matches!(metric, JointFitMetric::Dense(_)) {
+        let mut reconstruction = vec![0.0_f32; weights.len()];
+        for index in 0..weights.len() {
+            for (plane, scale) in scales.iter().enumerate() {
+                let source = transform.trit_order[plane];
+                let trit = trits[source][index] * transform.trit_signs[plane];
+                reconstruction[index] += *scale * f32::from(trit);
+            }
+        }
+        let objective = metric_objective(weights, &reconstruction, metric)?;
+        return Ok((reconstruction, objective));
+    }
+
+    let mut reconstruction = vec![0.0_f32; weights.len()];
+    let mut objective = 0.0_f64;
+    for index in 0..weights.len() {
+        let mut fitted = 0.0_f32;
+        for (plane, scale) in scales.iter().enumerate() {
+            let source = transform.trit_order[plane];
+            let trit = trits[source][index] * transform.trit_signs[plane];
+            fitted += *scale * f32::from(trit);
+        }
+        reconstruction[index] = fitted;
+        let error = f64::from(weights[index]) - f64::from(fitted);
+        let curvature = match metric {
+            JointFitMetric::Identity => 1.0,
+            JointFitMetric::Diagonal(values) => f64::from(values[index]),
+            JointFitMetric::DiagonalF64(values) => values[index],
+            JointFitMetric::DiagonalAffine {
+                values,
+                scale,
+                shift,
+            } => values[index] * scale + shift,
+            JointFitMetric::Dense(_) => unreachable!("dense metric returned above"),
+        };
+        accumulate_objective_term(&mut objective, error * error * curvature)?;
+    }
+    Ok((reconstruction, objective.max(0.0)))
+}
+
+fn apply_scale_solve_transform(trits: &mut Vec<Vec<i8>>, transform: &ScaleSolveTransform) {
+    let planes = trits.len();
+    let mut sources: [Option<Vec<i8>>; 3] = std::array::from_fn(|_| None);
+    for (slot, plane) in sources.iter_mut().zip(std::mem::take(trits)) {
+        *slot = Some(plane);
+    }
+    let mut ordered = Vec::with_capacity(planes);
+    for plane in 0..planes {
+        let mut values = sources[transform.trit_order[plane]]
+            .take()
+            .expect("scale-solve permutation selects each source plane once");
+        if transform.trit_signs[plane] < 0 {
+            for trit in &mut values {
+                *trit = -*trit;
+            }
+        }
+        ordered.push(values);
+    }
+    *trits = ordered;
+}
+
 fn metric_objective(
     weights: &[f32],
     reconstruction: &[f32],
     metric: JointFitMetric<'_>,
 ) -> Result<f64, JointFitError> {
-    let error: Vec<f64> = weights
-        .iter()
-        .zip(reconstruction)
-        .map(|(weight, fitted)| f64::from(*weight) - f64::from(*fitted))
-        .collect();
     let mut objective = 0.0_f64;
     match metric {
         JointFitMetric::Identity => {
-            for value in error {
+            for (&weight, &fitted) in weights.iter().zip(reconstruction) {
+                let value = f64::from(weight) - f64::from(fitted);
                 accumulate_objective_term(&mut objective, value * value)?;
             }
         }
         JointFitMetric::Diagonal(diagonal) => {
-            for (value, weight) in error.iter().zip(diagonal) {
+            for ((&weight, &fitted), curvature) in weights.iter().zip(reconstruction).zip(diagonal)
+            {
+                let value = f64::from(weight) - f64::from(fitted);
                 let squared = value * value;
-                accumulate_objective_term(&mut objective, squared * f64::from(*weight))?;
+                accumulate_objective_term(&mut objective, squared * f64::from(*curvature))?;
             }
         }
         JointFitMetric::DiagonalF64(diagonal) => {
-            for (value, weight) in error.iter().zip(diagonal) {
+            for ((&weight, &fitted), curvature) in weights.iter().zip(reconstruction).zip(diagonal)
+            {
+                let value = f64::from(weight) - f64::from(fitted);
                 let squared = value * value;
-                accumulate_objective_term(&mut objective, squared * *weight)?;
+                accumulate_objective_term(&mut objective, squared * *curvature)?;
             }
         }
         JointFitMetric::DiagonalAffine {
@@ -1442,12 +1934,19 @@ fn metric_objective(
             scale,
             shift,
         } => {
-            for (value, weight) in error.iter().zip(diagonal) {
+            for ((&weight, &fitted), curvature) in weights.iter().zip(reconstruction).zip(diagonal)
+            {
+                let value = f64::from(weight) - f64::from(fitted);
                 let squared = value * value;
-                accumulate_objective_term(&mut objective, squared * (*weight * scale + shift))?;
+                accumulate_objective_term(&mut objective, squared * (*curvature * scale + shift))?;
             }
         }
         JointFitMetric::Dense(dense) => {
+            let error: Vec<f64> = weights
+                .iter()
+                .zip(reconstruction)
+                .map(|(weight, fitted)| f64::from(*weight) - f64::from(*fitted))
+                .collect();
             for row in 0..dense.dimension {
                 for col in 0..dense.dimension {
                     let weighted = error[row] * dense.values[row * dense.dimension + col];
@@ -1499,6 +1998,8 @@ mod relay {
     const THRESHOLD_BOUNDS: (f64, f64) = (0.05, 0.95);
     /// Normalized shift bounds for the modulated variant.
     const SHIFT_BOUNDS: (f64, f64) = (-2.0, 2.0);
+    /// `tanh(±20)` rounds exactly to `±1` in binary64, so the shortcut preserves bits.
+    const TANH_SATURATION: f64 = 20.0;
 
     /// Deployment-signature wrapper over the f64 relay core, exercised by the property tests;
     /// the descent evaluates the core directly.
@@ -1513,6 +2014,7 @@ mod relay {
     /// Odd-symmetric with `f(0) = 0`, bounded by `|f| <= 1` on `|v| <= 1` for
     /// `delta` in `[0, 1]`, and approaching the hard ternary indicator with
     /// threshold `delta` as `sharpness -> inf`.
+    #[cfg(test)]
     fn relay(v: f64, sharpness: f64, delta: f64) -> f64 {
         (((v - delta) * sharpness).tanh() + ((v + delta) * sharpness).tanh())
             / (2.0 * sharpness.tanh())
@@ -1520,6 +2022,7 @@ mod relay {
 
     // `1 - tanh^2` saturates to exactly zero for large inputs instead of overflowing like
     // `cosh`-based forms, which keeps every descent step finite.
+    #[cfg(test)]
     fn sech_squared(x: f64) -> f64 {
         let tanh = x.tanh();
         1.0 - tanh * tanh
@@ -1536,20 +2039,55 @@ mod relay {
         shift: f64,
     }
 
+    /// One descending scale prefix. At most three planes are supported, so a fixed array avoids
+    /// allocating a separate `Vec<f32>` for every prefix of every fitted row.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub(super) struct ScalePrefix {
+        values: [f32; 3],
+        len: usize,
+    }
+
+    impl ScalePrefix {
+        pub(super) fn to_vec(self) -> Vec<f32> {
+            self.values[..self.len].to_vec()
+        }
+    }
+
     /// Sequential per-plane residual soft fit returning `planes` deployment-rounded scale
     /// magnitudes, canonicalized descending like every other deterministic basin.
     ///
     /// After each plane the HARD projection of the soft fit — the exact ternary assignment of
     /// the shift-centered residual at the fitted scale and threshold — is subtracted, so only
     /// the `scale * trit` contribution ever leaves the basin.
+    #[cfg(test)]
     pub(super) fn basin_scales(
         weights: &[f32],
         planes: usize,
         modulated: bool,
         precision: ScalePrecision,
     ) -> Result<Vec<f32>, JointFitError> {
+        Ok(basin_scale_prefixes(weights, planes, modulated, precision)?
+            .pop()
+            .map(ScalePrefix::to_vec)
+            .unwrap_or_default())
+    }
+
+    /// Fit all sequential relay planes once and retain each independently sorted prefix.
+    /// Recursive P3 → P2 → P1 fitting consumes these prefixes, avoiding repeated descent for
+    /// earlier planes while preserving the exact restart scales at every recursion depth.
+    pub(super) fn basin_scale_prefixes(
+        weights: &[f32],
+        planes: usize,
+        modulated: bool,
+        precision: ScalePrecision,
+    ) -> Result<Vec<ScalePrefix>, JointFitError> {
         let mut residual = weights.to_vec();
-        let mut scales = Vec::with_capacity(planes);
+        let mut scales = [0.0_f32; 3];
+        let mut prefixes = Vec::with_capacity(planes);
+        // Every plane's descent needs the residual normalized by that plane's
+        // absmean. Reuse one buffer instead of allocating a new f64 vector for
+        // each of the three deterministic relay basins.
+        let mut normalized = Vec::with_capacity(residual.len());
         for plane in 0..planes {
             let absmean = residual
                 .iter()
@@ -1557,16 +2095,15 @@ mod relay {
                 .sum::<f64>()
                 / residual.len() as f64;
             if absmean <= 0.0 {
-                scales.push(deployment_scale(0.0, precision, plane)?);
+                scales[plane] = deployment_scale(0.0, precision, plane)?;
+                prefixes.push(scale_prefix(&scales[..=plane]));
                 continue;
             }
-            let normalized: Vec<f64> = residual
-                .iter()
-                .map(|value| f64::from(*value) / absmean)
-                .collect();
+            normalized.clear();
+            normalized.extend(residual.iter().map(|value| f64::from(*value) / absmean));
             let fit = descend(&normalized, modulated);
             let scale = deployment_scale((fit.scale * absmean) as f32, precision, plane)?;
-            scales.push(scale);
+            scales[plane] = scale;
             if scale > 0.0 {
                 let shift = (fit.shift * absmean) as f32;
                 let threshold = scale * fit.threshold as f32;
@@ -1582,9 +2119,20 @@ mod relay {
                     *value -= scale * trit;
                 }
             }
+            prefixes.push(scale_prefix(&scales[..=plane]));
         }
-        scales.sort_by(|left, right| right.total_cmp(left));
-        Ok(scales)
+        Ok(prefixes)
+    }
+
+    fn scale_prefix(scales: &[f32]) -> ScalePrefix {
+        debug_assert!(!scales.is_empty() && scales.len() <= 3);
+        let mut values = [0.0_f32; 3];
+        values[..scales.len()].copy_from_slice(scales);
+        values[..scales.len()].sort_by(|left, right| right.total_cmp(left));
+        ScalePrefix {
+            values,
+            len: scales.len(),
+        }
     }
 
     /// Minimize `L = mean_i (c_i - a * relay(c_i / a, s_k, delta))^2` with `c_i = w_i - mu` by
@@ -1602,7 +2150,8 @@ mod relay {
         };
         for step in 0..STEPS {
             let sharpness = sharpness_at(step);
-            let norm = 2.0 * sharpness.tanh();
+            // Every scheduled sharpness is >= 30, where binary64 tanh is exactly one.
+            let norm = 2.0;
             let mut grad_scale = 0.0_f64;
             let mut grad_threshold = 0.0_f64;
             let mut grad_shift = 0.0_f64;
@@ -1611,10 +2160,15 @@ mod relay {
                 let u = centered / scale;
                 let lower = (u - threshold) * sharpness;
                 let upper = (u + threshold) * sharpness;
-                let soft = relay(u, sharpness, threshold);
-                let soft_du = sharpness * (sech_squared(lower) + sech_squared(upper)) / norm;
-                let soft_dthreshold =
-                    sharpness * (sech_squared(upper) - sech_squared(lower)) / norm;
+                let tanh_lower = relay_tanh(lower);
+                let tanh_upper = relay_tanh(upper);
+                let soft = (tanh_lower + tanh_upper) / norm;
+                let soft_du = sharpness
+                    * ((1.0 - tanh_lower * tanh_lower) + (1.0 - tanh_upper * tanh_upper))
+                    / norm;
+                let soft_dthreshold = sharpness
+                    * ((1.0 - tanh_upper * tanh_upper) - (1.0 - tanh_lower * tanh_lower))
+                    / norm;
                 let error = centered - scale * soft;
                 grad_scale += error * (u * soft_du - soft);
                 grad_threshold -= error * scale * soft_dthreshold;
@@ -1632,6 +2186,202 @@ mod relay {
             scale,
             threshold,
             shift,
+        }
+    }
+
+    #[inline]
+    fn relay_tanh(value: f64) -> f64 {
+        if value >= TANH_SATURATION {
+            1.0
+        } else if value <= -TANH_SATURATION {
+            -1.0
+        } else {
+            value.tanh()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn saturation_shortcut_matches_binary64_tanh_at_boundary_and_extremes() {
+            let positive_boundary = TANH_SATURATION.to_bits();
+            let negative_boundary = (-TANH_SATURATION).to_bits();
+            let values = [
+                f64::from_bits(positive_boundary - 1),
+                TANH_SATURATION,
+                f64::from_bits(positive_boundary + 1),
+                f64::from_bits(negative_boundary - 1),
+                -TANH_SATURATION,
+                f64::from_bits(negative_boundary + 1),
+                -100.0,
+                100.0,
+            ];
+            for value in values {
+                assert_eq!(
+                    relay_tanh(value).to_bits(),
+                    value.tanh().to_bits(),
+                    "{value}"
+                );
+            }
+        }
+
+        fn descend_reference(normalized: &[f64], modulated: bool) -> PlaneFit {
+            let count = normalized.len() as f64;
+            let mut scale = 1.0_f64;
+            let mut threshold = 0.5_f64;
+            let mut shift = if modulated {
+                (normalized.iter().sum::<f64>() / count).clamp(SHIFT_BOUNDS.0, SHIFT_BOUNDS.1)
+            } else {
+                0.0
+            };
+            for step in 0..STEPS {
+                let sharpness = sharpness_at(step);
+                let norm = 2.0 * sharpness.tanh();
+                let mut grad_scale = 0.0_f64;
+                let mut grad_threshold = 0.0_f64;
+                let mut grad_shift = 0.0_f64;
+                for &value in normalized {
+                    let centered = value - shift;
+                    let u = centered / scale;
+                    let lower = (u - threshold) * sharpness;
+                    let upper = (u + threshold) * sharpness;
+                    let soft = relay(u, sharpness, threshold);
+                    let soft_du = sharpness * (sech_squared(lower) + sech_squared(upper)) / norm;
+                    let soft_dthreshold =
+                        sharpness * (sech_squared(upper) - sech_squared(lower)) / norm;
+                    let error = centered - scale * soft;
+                    grad_scale += error * (u * soft_du - soft);
+                    grad_threshold -= error * scale * soft_dthreshold;
+                    grad_shift += error * (soft_du - 1.0);
+                }
+                let step_factor = 2.0 * STEP_SIZE / count;
+                scale = (scale - step_factor * grad_scale).clamp(SCALE_BOUNDS.0, SCALE_BOUNDS.1);
+                if modulated {
+                    threshold = (threshold - step_factor * grad_threshold)
+                        .clamp(THRESHOLD_BOUNDS.0, THRESHOLD_BOUNDS.1);
+                    shift =
+                        (shift - step_factor * grad_shift).clamp(SHIFT_BOUNDS.0, SHIFT_BOUNDS.1);
+                }
+            }
+            PlaneFit {
+                scale,
+                threshold,
+                shift,
+            }
+        }
+
+        fn basin_scale_prefixes_reference(
+            weights: &[f32],
+            planes: usize,
+            modulated: bool,
+            precision: ScalePrecision,
+        ) -> Result<Vec<Vec<f32>>, JointFitError> {
+            let mut residual = weights.to_vec();
+            let mut scales = Vec::with_capacity(planes);
+            let mut prefixes = Vec::with_capacity(planes);
+            for plane in 0..planes {
+                let absmean = residual
+                    .iter()
+                    .map(|value| f64::from(value.abs()))
+                    .sum::<f64>()
+                    / residual.len() as f64;
+                if absmean <= 0.0 {
+                    scales.push(deployment_scale(0.0, precision, plane)?);
+                } else {
+                    let normalized = residual
+                        .iter()
+                        .map(|value| f64::from(*value) / absmean)
+                        .collect::<Vec<_>>();
+                    let fit = descend_reference(&normalized, modulated);
+                    let scale = deployment_scale((fit.scale * absmean) as f32, precision, plane)?;
+                    scales.push(scale);
+                    if scale > 0.0 {
+                        let shift = (fit.shift * absmean) as f32;
+                        let threshold = scale * fit.threshold as f32;
+                        for value in &mut residual {
+                            let centered = *value - shift;
+                            let trit = if centered > threshold {
+                                1.0
+                            } else if centered < -threshold {
+                                -1.0
+                            } else {
+                                0.0
+                            };
+                            *value -= scale * trit;
+                        }
+                    }
+                }
+                let mut prefix = scales.clone();
+                prefix.sort_by(|left, right| right.total_cmp(left));
+                prefixes.push(prefix);
+            }
+            Ok(prefixes)
+        }
+
+        #[test]
+        fn fixed_scale_prefixes_preserve_zero_planes_and_prefix_lengths() {
+            let prefixes = basin_scale_prefixes(&[0.0; 64], 3, true, ScalePrecision::F16)
+                .expect("zero-weight prefixes");
+            assert_eq!(prefixes.len(), 3);
+            assert_eq!(prefixes[0].to_vec(), [0.0]);
+            assert_eq!(prefixes[1].to_vec(), [0.0, 0.0]);
+            assert_eq!(prefixes[2].to_vec(), [0.0, 0.0, 0.0]);
+        }
+
+        #[test]
+        fn cached_scale_prefixes_match_independent_legacy_fits() {
+            for length in [1, 3, 16, 64, 128] {
+                for seed in 0..8 {
+                    let weights = (0..length)
+                        .map(|index| {
+                            let value = (index * 37 + seed * 19) % 101;
+                            (value as f32 - 50.0) / 13.0
+                        })
+                        .collect::<Vec<_>>();
+                    for modulated in [false, true] {
+                        let expected = basin_scale_prefixes_reference(
+                            &weights,
+                            3,
+                            modulated,
+                            ScalePrecision::F16,
+                        )
+                        .expect("reference prefixes");
+                        let actual =
+                            basin_scale_prefixes(&weights, 3, modulated, ScalePrecision::F16)
+                                .expect("cached prefixes");
+                        assert_eq!(
+                            actual
+                                .iter()
+                                .map(|prefix| prefix.to_vec())
+                                .collect::<Vec<_>>(),
+                            expected
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn fused_relay_descent_matches_reference_bits() {
+            for length in [1, 3, 16, 64, 128] {
+                for seed in 0..8 {
+                    let normalized = (0..length)
+                        .map(|index| {
+                            let value = (index * 37 + seed * 19) % 101;
+                            (value as f64 - 50.0) / 13.0
+                        })
+                        .collect::<Vec<_>>();
+                    for modulated in [false, true] {
+                        let expected = descend_reference(&normalized, modulated);
+                        let actual = descend(&normalized, modulated);
+                        assert_eq!(actual.scale.to_bits(), expected.scale.to_bits());
+                        assert_eq!(actual.threshold.to_bits(), expected.threshold.to_bits());
+                        assert_eq!(actual.shift.to_bits(), expected.shift.to_bits());
+                    }
+                }
+            }
         }
     }
 }
@@ -1659,6 +2409,352 @@ mod tests {
                 error * error
             })
             .sum()
+    }
+
+    #[test]
+    fn fused_reconstruction_objective_is_bit_identical_to_reference_paths() {
+        let weights = [0.75, -0.5, 0.25, -1.25];
+        let scales = [0.625, 0.1875];
+        let trits = [vec![1, -1, 0, 1], vec![-1, 0, 1, -1]];
+        let diagonal_f32 = [0.5, 1.25, 2.0, 0.75];
+        let diagonal_f64 = [0.5, 1.25, 2.0, 0.75];
+
+        let assert_same = |metric| {
+            let expected_reconstruction = reconstruct_planes(&scales, &trits, weights.len());
+            let expected_objective =
+                metric_objective(&weights, &expected_reconstruction, metric).unwrap();
+            let (actual_reconstruction, actual_objective) =
+                reconstruct_planes_and_objective(&weights, &scales, &trits, metric).unwrap();
+            assert_eq!(actual_reconstruction, expected_reconstruction);
+            assert_eq!(actual_objective.to_bits(), expected_objective.to_bits());
+        };
+
+        assert_same(JointFitMetric::Identity);
+        assert_same(JointFitMetric::Diagonal(&diagonal_f32));
+        assert_same(JointFitMetric::DiagonalF64(&diagonal_f64));
+        assert_same(JointFitMetric::DiagonalAffine {
+            values: &diagonal_f64,
+            scale: 0.75,
+            shift: 0.125,
+        });
+        let dense = DensePsdMetric::new(
+            weights.len(),
+            &[
+                2.0, 0.25, 0.0, 0.0, 0.25, 1.5, 0.0, 0.0, 0.0, 0.0, 0.75, 0.125, 0.0, 0.0, 0.125,
+                1.0,
+            ],
+        )
+        .unwrap();
+        assert_same(JointFitMetric::Dense(&dense));
+    }
+
+    #[test]
+    fn cached_weighted_abs_order_preserves_quantile_bits() {
+        let weights = [0.0, -2.0, 0.5, 1.5, -2.0, 0.25, 8.0, -0.75];
+        let diagonal = [3.0, 0.25, 1.0, 4.0, 2.0, 0.5, 0.0, 7.0];
+        let cached = weighted_abs_order(&weights, &diagonal);
+        for quantile in [0.0_f64, 0.25, 0.5, 0.75, 0.95, 1.0] {
+            let mut reference: Vec<WeightedAbsEntry> = weights
+                .iter()
+                .zip(&diagonal)
+                .enumerate()
+                .map(|(index, (value, weight))| (value.abs(), *weight, index))
+                .collect();
+            reference.sort_by(|left, right| {
+                left.0
+                    .total_cmp(&right.0)
+                    .then_with(|| left.2.cmp(&right.2))
+            });
+            assert_eq!(
+                cached.entries, reference,
+                "quantile ordering must remain canonical"
+            );
+            let total: f64 = reference.iter().map(|value| value.1).sum();
+            assert_eq!(cached.total_weight.to_bits(), total.to_bits());
+            let target = total * quantile.clamp(0.0, 1.0);
+            let mut cumulative = 0.0;
+            let expected = reference
+                .iter()
+                .find_map(|value| {
+                    cumulative += value.1;
+                    (cumulative >= target).then_some(f64::from(value.0))
+                })
+                .or_else(|| reference.last().map(|value| f64::from(value.0)))
+                .unwrap_or(0.0);
+            assert_eq!(
+                weighted_abs_quantile(&cached, quantile).to_bits(),
+                expected.to_bits(),
+                "quantile {quantile}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual G64/P3 solver phase profile"]
+    fn profile_g64_p3_solver_phases() {
+        let rows: Vec<Vec<f32>> = (0..256)
+            .map(|row| {
+                (0..64)
+                    .map(|column| {
+                        let value = (row * 64 + column) * 37 % 101;
+                        (value as f32 - 50.0) / 37.0
+                    })
+                    .collect()
+            })
+            .collect();
+        let diagonal: Vec<f64> = (0..64)
+            .map(|column| 0.25 + ((column * 17 % 31) as f64 / 31.0))
+            .collect();
+        let config = JointFitConfig {
+            planes: 3,
+            max_iterations: 16,
+            ridge: 1e-8,
+            em_restarts: 4,
+            ridge_condition_limit: 1e6,
+            scale_precision: ScalePrecision::F16,
+            relay_basins: RelayBasins {
+                softened: true,
+                modulated: true,
+            },
+        };
+
+        SOLVER_PHASE_NANOS.with(|elapsed| elapsed.set([0; 7]));
+        let started = std::time::Instant::now();
+        for weights in &rows {
+            fit_joint_ternary(weights, JointFitMetric::DiagonalF64(&diagonal), config)
+                .expect("profile G64/P3 row fit");
+        }
+        let total = started.elapsed().as_nanos();
+        let phases = SOLVER_PHASE_NANOS.with(std::cell::Cell::get);
+        assert!(phases.iter().sum::<u128>() <= total);
+        eprintln!(
+            "G64/P3 256-row profile: total={:.3}ms assignment={:.3}ms scale_solve={:.3}ms reconstruction={:.3}ms validate_metric={:.3}ms weighted_order={:.3}ms init_scales={:.3}ms relay_scales={:.3}ms other={:.3}ms",
+            total as f64 / 1_000_000.0,
+            phases[0] as f64 / 1_000_000.0,
+            phases[1] as f64 / 1_000_000.0,
+            phases[2] as f64 / 1_000_000.0,
+            phases[3] as f64 / 1_000_000.0,
+            phases[4] as f64 / 1_000_000.0,
+            phases[5] as f64 / 1_000_000.0,
+            phases[6] as f64 / 1_000_000.0,
+            (total - phases.iter().sum::<u128>()) as f64 / 1_000_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "manual G64/P2 compact PTQ solver phase profile"]
+    fn profile_g64_p2_compact_solver_phases() {
+        let rows: Vec<Vec<f32>> = (0..256)
+            .map(|row| {
+                (0..64)
+                    .map(|column| {
+                        let value = (row * 64 + column) * 37 % 101;
+                        (value as f32 - 50.0) / 37.0
+                    })
+                    .collect()
+            })
+            .collect();
+        let diagonal: Vec<f64> = (0..64)
+            .map(|column| 0.25 + ((column * 17 % 31) as f64 / 31.0))
+            .collect();
+        report_compact_g64_phase_profile(
+            &rows,
+            &diagonal,
+            "synthetic relay-on",
+            2,
+            RelayBasins {
+                softened: true,
+                modulated: true,
+            },
+        );
+    }
+
+    #[test]
+    #[ignore = "requires fixture from scripts/profile-smollm2-ptq-solver.py"]
+    fn profile_smollm2_g64_p2_solver_phases() {
+        let (weights, diagonal) = load_smollm2_profile_fixture();
+        let baseline_objective = report_compact_g64_phase_profile(
+            &weights,
+            &diagonal,
+            "pinned SmolLM2 relay-off",
+            2,
+            RelayBasins::default(),
+        );
+        let softened_objective = report_compact_g64_phase_profile(
+            &weights,
+            &diagonal,
+            "pinned SmolLM2 softened-only",
+            2,
+            RelayBasins {
+                softened: true,
+                modulated: false,
+            },
+        );
+        let modulated_objective = report_compact_g64_phase_profile(
+            &weights,
+            &diagonal,
+            "pinned SmolLM2 modulated-only",
+            2,
+            RelayBasins {
+                softened: false,
+                modulated: true,
+            },
+        );
+        let dual_objective = report_compact_g64_phase_profile(
+            &weights,
+            &diagonal,
+            "pinned SmolLM2 dual-relay",
+            2,
+            RelayBasins {
+                softened: true,
+                modulated: true,
+            },
+        );
+        assert!(softened_objective <= baseline_objective);
+        assert!(modulated_objective <= baseline_objective);
+        assert!(dual_objective <= softened_objective);
+        assert!(dual_objective <= modulated_objective);
+    }
+
+    #[test]
+    #[ignore = "requires fixture from scripts/profile-smollm2-ptq-solver.py"]
+    fn profile_smollm2_g64_p3_solver_phases() {
+        let (weights, diagonal) = load_smollm2_profile_fixture();
+        report_compact_g64_phase_profile(
+            &weights,
+            &diagonal,
+            "pinned SmolLM2 P3 dual-relay",
+            3,
+            RelayBasins {
+                softened: true,
+                modulated: true,
+            },
+        );
+    }
+
+    fn load_smollm2_profile_fixture() -> (Vec<Vec<f32>>, Vec<f64>) {
+        const HEADER_BYTES: usize = 16;
+        let fixture_path = std::env::var_os("TRITIUM_SMOLLM2_PROFILE_FIXTURE")
+            .expect("set TRITIUM_SMOLLM2_PROFILE_FIXTURE to a generated fixture path");
+        let bytes = std::fs::read(fixture_path).expect("read SmolLM2 profile fixture");
+        assert!(
+            bytes.len() >= HEADER_BYTES,
+            "fixture is shorter than its header"
+        );
+        assert_eq!(&bytes[..8], b"TRIPRF01", "unknown fixture format");
+        let rows = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let columns = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        assert_eq!(rows, 256, "fixture row count must be 256");
+        assert_eq!(columns, 64, "fixture group width must be 64");
+        let weight_bytes = rows.checked_mul(columns).unwrap().checked_mul(4).unwrap();
+        let expected_bytes = HEADER_BYTES + weight_bytes + columns * 8;
+        assert_eq!(
+            bytes.len(),
+            expected_bytes,
+            "fixture has an invalid byte length"
+        );
+        let weight_data = &bytes[HEADER_BYTES..HEADER_BYTES + weight_bytes];
+        let weights = weight_data
+            .chunks(4)
+            .map(|value| f32::from_le_bytes(value.try_into().expect("validated f32 chunk")))
+            .collect::<Vec<_>>()
+            .chunks_exact(columns)
+            .map(<[f32]>::to_vec)
+            .collect::<Vec<_>>();
+        let diagonal_data = &bytes[HEADER_BYTES + weight_bytes..];
+        let diagonal = diagonal_data
+            .chunks(8)
+            .map(|value| f64::from_le_bytes(value.try_into().expect("validated f64 chunk")))
+            .collect::<Vec<_>>();
+        (weights, diagonal)
+    }
+
+    fn report_compact_g64_phase_profile(
+        rows: &[Vec<f32>],
+        diagonal: &[f64],
+        fixture_kind: &str,
+        planes: usize,
+        relay_basins: RelayBasins,
+    ) -> f64 {
+        assert_eq!(rows.len(), 256);
+        assert!(rows.iter().all(|row| row.len() == 64));
+        assert_eq!(diagonal.len(), 64);
+        let config = JointFitConfig {
+            planes,
+            max_iterations: 16,
+            ridge: 1e-8,
+            em_restarts: 4,
+            ridge_condition_limit: 1e6,
+            scale_precision: ScalePrecision::F16,
+            relay_basins,
+        };
+
+        const REPEATS: usize = 5;
+        SOLVER_PHASE_NANOS.with(|elapsed| elapsed.set([0; 7]));
+        let started = std::time::Instant::now();
+        let mut objective_sum = 0.0;
+        for _ in 0..REPEATS {
+            for row in rows {
+                let fit = fit_joint_ternary(row, JointFitMetric::DiagonalF64(diagonal), config)
+                    .expect("profile compact G64/P2 row fit");
+                objective_sum += fit.objective;
+            }
+        }
+        let total = started.elapsed().as_nanos();
+        let phases = SOLVER_PHASE_NANOS.with(std::cell::Cell::get);
+        assert!(phases.iter().sum::<u128>() <= total);
+        let divisor = REPEATS as f64 * 1_000_000.0;
+        eprintln!(
+            "G64/P{planes} compact {fixture_kind} 256-row profile over {REPEATS} repeats: total={:.3}ms assignment={:.3}ms scale_solve={:.3}ms reconstruction={:.3}ms validate_metric={:.3}ms weighted_order={:.3}ms init_scales={:.3}ms relay_scales={:.3}ms other={:.3}ms objective_sum={:.9}",
+            total as f64 / divisor,
+            phases[0] as f64 / divisor,
+            phases[1] as f64 / divisor,
+            phases[2] as f64 / divisor,
+            phases[3] as f64 / divisor,
+            phases[4] as f64 / divisor,
+            phases[5] as f64 / divisor,
+            phases[6] as f64 / divisor,
+            (total - phases.iter().sum::<u128>()) as f64 / divisor,
+            objective_sum / REPEATS as f64,
+        );
+        objective_sum / REPEATS as f64
+    }
+
+    #[test]
+    fn cached_start_context_preserves_existing_three_plane_output() {
+        let weights: Vec<f32> = (0..128)
+            .map(|index| ((index * 37 % 101) as f32 - 50.0) / 37.0)
+            .collect();
+        let diagonal = [1.0_f64; 128];
+        let fit = fit_joint_ternary(
+            &weights,
+            JointFitMetric::DiagonalF64(&diagonal),
+            JointFitConfig {
+                planes: 3,
+                max_iterations: 16,
+                ridge: 1e-8,
+                em_restarts: 4,
+                ridge_condition_limit: 1e6,
+                scale_precision: ScalePrecision::F16,
+                relay_basins: RelayBasins {
+                    softened: true,
+                    modulated: true,
+                },
+            },
+        )
+        .expect("three-plane row fit");
+        let mut fingerprint = 0xcbf2_9ce4_8422_2325_u64;
+        for &scale in &fit.scales {
+            for byte in scale.to_bits().to_le_bytes() {
+                fingerprint = (fingerprint ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        for plane in &fit.trits {
+            for &trit in plane {
+                fingerprint = (fingerprint ^ u64::from(trit as u8)).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        assert_eq!(fingerprint, 0xd20d_9b32_8141_ebad);
     }
 
     #[test]
@@ -1897,6 +2993,174 @@ mod tests {
     }
 
     #[test]
+    fn assigned_codebook_reconstruction_matches_plane_sum_bitwise() {
+        let weights = [0.3, -1.4, 2.1, 0.0, 1.0e20, -1.0e20];
+        for scales in [&[1.0][..], &[1.0, 0.4], &[1.0, 0.4, 0.2]] {
+            let expected_trits = exact_ternary_assignment(&weights, scales).unwrap();
+            let expected_reconstruction =
+                reconstruct_planes(scales, &expected_trits, weights.len());
+            let mut actual_trits = (0..scales.len())
+                .map(|_| vec![0_i8; weights.len()])
+                .collect::<Vec<_>>();
+            let mut actual_reconstruction = vec![0.0_f32; weights.len()];
+
+            exact_ternary_assignment_into_validated_with_reconstruction(
+                &weights,
+                scales,
+                &mut actual_trits,
+                Some(&mut actual_reconstruction),
+            );
+
+            assert_eq!(actual_trits, expected_trits);
+            assert_eq!(actual_reconstruction, expected_reconstruction);
+        }
+    }
+
+    #[test]
+    fn exact_assignment_preserves_exhaustive_codes_and_tie_order() {
+        fn reference(weights: &[f32], scales: &[f32]) -> Vec<Vec<i8>> {
+            const CODES: [i8; 3] = [0, -1, 1];
+            let states = 3_usize.pow(scales.len() as u32);
+            let mut trits = vec![vec![0_i8; weights.len()]; scales.len()];
+            for (weight_index, &weight) in weights.iter().enumerate() {
+                let mut best_error = f64::INFINITY;
+                let mut best_codes = [0_i8; 3];
+                for state in 0..states {
+                    let mut encoded = state;
+                    let mut reconstruction = 0.0_f32;
+                    let mut candidate = [0_i8; 3];
+                    for plane in 0..scales.len() {
+                        let trit = CODES[encoded % 3];
+                        encoded /= 3;
+                        candidate[plane] = trit;
+                        reconstruction += scales[plane] * f32::from(trit);
+                    }
+                    let error = f64::from(weight) - f64::from(reconstruction);
+                    let squared = error * error;
+                    if squared < best_error {
+                        best_error = squared;
+                        best_codes = candidate;
+                    }
+                }
+                for plane in 0..scales.len() {
+                    trits[plane][weight_index] = best_codes[plane];
+                }
+            }
+            trits
+        }
+
+        let weights = [-3.0_f32, -1.0, -0.5, 0.0, 0.5, 1.0, 3.0, f32::MAX];
+        let cases: &[&[f32]] = &[
+            &[1.0],
+            &[1.0, 0.5],
+            &[1.0, 1.0],
+            &[1.0, 0.5, 0.25],
+            &[0.0, 0.0, 0.0],
+            &[f32::MAX, f32::MAX, f32::MAX],
+            &[1.0e30, 1.0e30, f32::from_bits(1)],
+        ];
+        for scales in cases {
+            assert_eq!(
+                exact_ternary_assignment(&weights, scales).expect("valid assignment"),
+                reference(&weights, scales),
+                "scale set {scales:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn exact_assignment_matches_exhaustive_oracle_around_every_codebook_midpoint() {
+        fn reference(weights: &[f32], scales: &[f32]) -> Vec<Vec<i8>> {
+            const CODES: [i8; 3] = [0, -1, 1];
+            let states = 3_usize.pow(scales.len() as u32);
+            let mut trits = vec![vec![0_i8; weights.len()]; scales.len()];
+            for (weight_index, &weight) in weights.iter().enumerate() {
+                let mut best_error = f64::INFINITY;
+                let mut best_state = usize::MAX;
+                let mut best_codes = [0_i8; 3];
+                for state in 0..states {
+                    let mut encoded = state;
+                    let mut reconstruction = 0.0_f32;
+                    let mut codes = [0_i8; 3];
+                    for plane in 0..scales.len() {
+                        let code = CODES[encoded % 3];
+                        encoded /= 3;
+                        codes[plane] = code;
+                        reconstruction += scales[plane] * f32::from(code);
+                    }
+                    let error = f64::from(weight) - f64::from(reconstruction);
+                    let squared = error * error;
+                    if squared < best_error || (squared == best_error && state < best_state) {
+                        best_error = squared;
+                        best_state = state;
+                        best_codes = codes;
+                    }
+                }
+                for plane in 0..scales.len() {
+                    trits[plane][weight_index] = best_codes[plane];
+                }
+            }
+            trits
+        }
+
+        fn next_up(value: f32) -> f32 {
+            if value == 0.0 {
+                return f32::from_bits(1);
+            }
+            if value.is_sign_positive() {
+                f32::from_bits(value.to_bits() + 1)
+            } else {
+                f32::from_bits(value.to_bits() - 1)
+            }
+        }
+
+        fn next_down(value: f32) -> f32 {
+            if value == 0.0 {
+                return -f32::from_bits(1);
+            }
+            if value.is_sign_positive() {
+                f32::from_bits(value.to_bits() - 1)
+            } else {
+                f32::from_bits(value.to_bits() + 1)
+            }
+        }
+
+        for scales in [
+            &[0.75][..],
+            &[1.0, 0.5],
+            &[1.0, 1.0],
+            &[1.0, 0.5, 0.25],
+            &[0.125, 0.0625, 0.03125],
+        ] {
+            const CODES: [i8; 3] = [0, -1, 1];
+            let mut reconstructions = (0..3_usize.pow(scales.len() as u32))
+                .map(|mut state| {
+                    let mut reconstruction = 0.0_f32;
+                    for scale in scales {
+                        let code = CODES[state % 3];
+                        state /= 3;
+                        reconstruction += *scale * f32::from(code);
+                    }
+                    reconstruction
+                })
+                .collect::<Vec<_>>();
+            reconstructions.sort_by(f32::total_cmp);
+            reconstructions.dedup_by(|left, right| left.total_cmp(right).is_eq());
+
+            let mut weights = reconstructions.clone();
+            for pair in reconstructions.windows(2) {
+                let midpoint = ((f64::from(pair[0]) + f64::from(pair[1])) * 0.5) as f32;
+                weights.extend([next_down(midpoint), midpoint, next_up(midpoint)]);
+            }
+            assert_eq!(
+                exact_ternary_assignment(&weights, scales).unwrap(),
+                reference(&weights, scales),
+                "scale set {scales:?}",
+            );
+        }
+    }
+
+    #[test]
     fn fitting_is_bitwise_deterministic() {
         let weights = [-2.4, -1.1, -0.2, 0.0, 0.35, 0.9, 1.8, 3.2];
         let metric = [1.0, 4.0, 0.5, 2.0, 1.0, 3.0, 0.25, 5.0];
@@ -2025,6 +3289,29 @@ mod tests {
     }
 
     #[test]
+    fn converged_scale_candidate_does_not_recompute_current_assignment() {
+        ASSIGNMENT_FOR_METRIC_CALLS.with(|calls| calls.set(0));
+
+        let state = optimize_start(
+            &[1.0, -1.0],
+            JointFitMetric::Identity,
+            JointFitConfig::default(),
+            vec![1.0],
+            JointFitStartKind::DeterministicRestart(0),
+        )
+        .expect("exact one-plane fit");
+
+        assert_eq!(state.objective, 0.0);
+        ASSIGNMENT_FOR_METRIC_CALLS.with(|calls| {
+            assert_eq!(
+                calls.get(),
+                1,
+                "initial assignment remains valid because the scale candidate was not accepted"
+            );
+        });
+    }
+
+    #[test]
     fn scale_sign_and_plane_order_canonicalization_preserve_reconstruction() {
         let weights = [-1.75, 1.75, -1.25, 1.25];
         let trits = vec![vec![1, -1, 1, -1], vec![-1, 1, 1, -1]];
@@ -2040,10 +3327,28 @@ mod tests {
 
         assert!(outcome.scales.windows(2).all(|pair| pair[0] >= pair[1]));
         assert!(outcome.scales.iter().all(|scale| *scale >= 0.0));
-        assert_eq!(outcome.trits[0], vec![-1, 1, -1, 1]);
-        assert_eq!(outcome.trits[1], vec![-1, 1, 1, -1]);
-        let fitted = reconstruct(&outcome.scales, &outcome.trits, weights.len());
+        let mut canonical_trits = trits.clone();
+        apply_scale_solve_transform(&mut canonical_trits, &outcome.transform);
+        assert_eq!(canonical_trits[0], vec![-1, 1, -1, 1]);
+        assert_eq!(canonical_trits[1], vec![-1, 1, 1, -1]);
+        let fitted = reconstruct(&outcome.scales, &canonical_trits, weights.len());
         assert!(squared_error(&weights, &fitted) < 1e-20);
+        let reference = reconstruct_planes_and_objective(
+            &weights,
+            &outcome.scales,
+            &canonical_trits,
+            JointFitMetric::Identity,
+        )
+        .expect("canonical reference objective");
+        let mapped = reconstruct_planes_and_objective_with_transform(
+            &weights,
+            &outcome.scales,
+            &trits,
+            JointFitMetric::Identity,
+            &outcome.transform,
+        )
+        .expect("mapped candidate objective");
+        assert_eq!(mapped, reference);
     }
 
     #[test]
@@ -2372,6 +3677,14 @@ mod tests {
                     .expect("second basin fit");
                 let first_bits: Vec<u32> = first.iter().map(|scale| scale.to_bits()).collect();
                 let second_bits: Vec<u32> = second.iter().map(|scale| scale.to_bits()).collect();
+                if seed == 1 {
+                    let expected = if modulated {
+                        [0x3fd5_81fe, 0x3f2f_4664, 0x3e81_d4e6]
+                    } else {
+                        [0x3fd8_decd, 0x3f1b_3413, 0x3e66_d7aa]
+                    };
+                    assert_eq!(first_bits, expected);
+                }
                 assert_eq!(first_bits, second_bits);
                 assert_eq!(first.len(), 3);
                 assert!(first.iter().all(|scale| *scale >= 0.0));

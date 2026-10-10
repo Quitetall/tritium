@@ -5,7 +5,7 @@ use core::mem::size_of;
 use std::sync::Arc;
 
 use rayon::prelude::*;
-use tritium_format::PackedSaltRow;
+use tritium_format::{PackedSaltRow, salt_v2_package::SaltV2ScaleUpdate};
 use tritium_spec::TernaryBackend;
 use tritium_train::ops::ste::{fast_hadamard, group_is_rotatable};
 
@@ -58,6 +58,53 @@ fn rotate_row(row: &mut [f32], group: usize) {
 }
 
 impl TokenEmbedding {
+    pub(crate) fn salt_v2_tensor_index(&self) -> Option<usize> {
+        match &self.storage {
+            Storage::HostSaltV2(matrix) => Some(matrix.tensor_index()),
+            #[cfg(feature = "cuda")]
+            Storage::SaltV2(matrix) => matrix.tensor_index(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn apply_salt_v2_scale_updates(
+        &mut self,
+        tensor_index: usize,
+        updates: &[SaltV2ScaleUpdate],
+    ) -> Result<bool, NnError> {
+        match &mut self.storage {
+            Storage::HostSaltV2(matrix) => {
+                if matrix.tensor_index() != tensor_index {
+                    return Ok(false);
+                }
+                Arc::get_mut(matrix)
+                    .ok_or_else(|| {
+                        NnError::Backend(
+                            "cannot update shared host SALT V2 embedding scales in place".into(),
+                        )
+                    })?
+                    .apply_scale_updates(tensor_index, updates)?;
+                Ok(true)
+            }
+            #[cfg(feature = "cuda")]
+            Storage::SaltV2(matrix) => {
+                if matrix.tensor_index() != Some(tensor_index) {
+                    return Ok(false);
+                }
+                Arc::get_mut(matrix)
+                    .ok_or_else(|| {
+                        NnError::Backend(
+                            "cannot update shared CUDA SALT V2 embedding scales in place".into(),
+                        )
+                    })?
+                    .apply_scale_updates(tensor_index, updates)
+                    .map_err(|error| NnError::Backend(error.to_string()))?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// Build a token table around compact host SALT V2 storage.
     ///
     /// # Errors

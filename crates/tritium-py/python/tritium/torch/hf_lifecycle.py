@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.metadata
 import json
 import math
 import os
@@ -14,8 +13,7 @@ from pathlib import Path
 import torch
 import transformers
 
-import tritium
-
+from ._installed_candidate import verify_installed_candidate
 from .config import TernaryConfig
 from .conversion import inspect, prepare_qat
 from .tutorial_receipt import (
@@ -27,18 +25,19 @@ from .tutorial_receipt import (
 )
 
 
-def _installed_distribution() -> tuple[str, Path]:
-    try:
-        distribution = importlib.metadata.distribution("pytritium")
-    except importlib.metadata.PackageNotFoundError as error:
-        raise RuntimeError("qualification requires installed pytritium") from error
-    module = Path(tritium.__file__).resolve(strict=True)
-    if distribution.files is None:
-        raise RuntimeError("installed pytritium has no file inventory")
-    owned = {distribution.locate_file(item).resolve() for item in distribution.files}
-    if module not in owned:
-        raise RuntimeError("imported tritium package is not owned by pytritium")
-    return distribution.version, module
+def _installed_distribution(
+    *,
+    wheel_artifact: Path | None,
+    source_revision: str,
+    release: str,
+    executing_files: tuple[Path, ...] = (),
+) -> tuple[str, Path]:
+    return verify_installed_candidate(
+        wheel_artifact=wheel_artifact,
+        source_revision=source_revision,
+        release=release,
+        executing_files=(Path(__file__), *executing_files),
+    )
 
 
 def _sha256_file(path: Path) -> str:
@@ -104,7 +103,9 @@ def run_hf_lifecycle(
         raise ValueError("source revision must be 40 lowercase hexadecimal characters")
     if not release or not run_id:
         raise ValueError("release and run id must be non-empty")
-    version, module_path = _installed_distribution()
+    version, module_path = _installed_distribution(
+        wheel_artifact=wheel_artifact, source_revision=source_revision, release=release
+    )
 
     torch.manual_seed(seed)
     model = prepare_qat(
@@ -210,7 +211,11 @@ def validate_hf_lifecycle_receipt(
         expected_source_revision=expected_source_revision,
         expected_release=expected_release,
     )
-    version, module_path = _installed_distribution()
+    version, module_path = _installed_distribution(
+        wheel_artifact=expected_wheel,
+        source_revision=receipt["source_revision"],
+        release=receipt["release"],
+    )
     if receipt["distribution_version"] != version:
         raise ValueError("Hugging Face lifecycle distribution version mismatch")
     if receipt["tritium_module"] != str(module_path):

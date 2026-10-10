@@ -6,6 +6,21 @@
 use super::*;
 
 impl CudaDecodeModel {
+    // Wait only on cancellation, never at an ordinary checkpoint. Both owned
+    // streams may produce batch data; driver errors cannot become `None`.
+    fn batch_decode_cancelled(&self, query: &dyn Fn() -> bool) -> Result<bool, BackendError> {
+        if !query() {
+            return Ok(false);
+        }
+        self.stream
+            .synchronize()
+            .map_err(|e| driver_err("batch decode cancel working sync", &e))?;
+        self.cap_stream
+            .synchronize()
+            .map_err(|e| driver_err("batch decode cancel capture sync", &e))?;
+        Ok(true)
+    }
+
     /// Debug/test access: dtoh one K row of a batch slot (raw element bytes —
     /// f32 or, on the f16 rung, __half).
     #[doc(hidden)]
@@ -388,6 +403,31 @@ impl CudaDecodeModel {
         batch: &mut BatchKv,
         tokens: &[u32],
     ) -> Result<Vec<Vec<f32>>, BackendError> {
+        self.decode_batch_cancellable(batch, tokens, &|| false)
+            .map(|output| output.expect("never-cancelled eager batch decode"))
+    }
+
+    /// Cooperative eager lockstep decode (ADR 0051). `None` settles submitted
+    /// work and preserves all entry positions/liveness and committed prefixes.
+    /// No row output is published; provisional writes are overwritten on retry.
+    /// Queries must be cheap, nonblocking and non-panicking. Driver/validation
+    /// errors retain ordinary semantics, not successful cancellation.
+    pub fn decode_batch_cancellable(
+        &mut self,
+        batch: &mut BatchKv,
+        tokens: &[u32],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<Vec<f32>>>, BackendError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
+        macro_rules! checkpoint {
+            () => {
+                if self.batch_decode_cancelled(is_cancelled)? {
+                    return Ok(None);
+                }
+            };
+        }
         let n = batch.n;
         if tokens.len() != n {
             return Err(BackendError::InvalidInput(format!(
@@ -439,6 +479,7 @@ impl CudaDecodeModel {
             s.memcpy_htod(&pg.table, &mut pg.d_table)
                 .map_err(|e| driver_err("batch table htod", &e))?;
         }
+        checkpoint!();
 
         Self::bl_embed(
             s,
@@ -449,8 +490,10 @@ impl CudaDecodeModel {
             n,
             &mut batch.d_x,
         )?;
+        checkpoint!();
 
         for li in 0..self.layers.len() {
+            checkpoint!();
             // q/k/v share one fused rmsnorm+quant of d_x (ADR 0036 L5).
             Self::bl_rmsnorm_quant(
                 s,
@@ -607,6 +650,7 @@ impl CudaDecodeModel {
                 n * n_embd,
             )?;
 
+            checkpoint!();
             // Fused rmsnorm+quant (ADR 0036 L5).
             Self::bl_rmsnorm_quant(
                 s,
@@ -683,6 +727,7 @@ impl CudaDecodeModel {
             )?;
         }
 
+        checkpoint!();
         // Final norm (all n rows) then per-row LM head.
         Self::bl_rmsnorm(
             s,
@@ -696,6 +741,7 @@ impl CudaDecodeModel {
         )?;
         let mut out = Vec::with_capacity(n);
         for r in 0..n {
+            checkpoint!();
             {
                 let row = batch.d_normed.slice(r * n_embd..(r + 1) * n_embd);
                 s.memcpy_dtod(&row, &mut batch.d_h)
@@ -707,8 +753,9 @@ impl CudaDecodeModel {
                 .map_err(|e| driver_err("batch logits dtoh", &e))?;
             out.push(logits);
         }
+        checkpoint!();
         batch.advance_live();
-        Ok(out)
+        Ok(Some(out))
     }
 
     /// `paged`: `(d_table, tstride)` selects the ADR 0025 paged twin (then
@@ -861,6 +908,31 @@ impl CudaDecodeModel {
         batch: &mut BatchKv,
         tokens: &[u32],
     ) -> Result<Vec<Vec<f32>>, BackendError> {
+        self.decode_batch_graph_cancellable(batch, tokens, &|| false)
+            .map(|output| output.expect("never-cancelled graph batch decode"))
+    }
+
+    /// Cooperative graph-logit lockstep decode. Capture/replay remain enabled
+    /// and queries run only outside them, plus between eager head rows and
+    /// before the single batch commit. `None` settles streams, preserves entry
+    /// positions/liveness, pages and committed prefixes, and publishes no rows.
+    /// Queries must not block or panic; driver errors retain ordinary semantics.
+    pub fn decode_batch_graph_cancellable(
+        &mut self,
+        batch: &mut BatchKv,
+        tokens: &[u32],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<Vec<f32>>>, BackendError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
+        macro_rules! checkpoint {
+            () => {
+                if self.batch_decode_cancelled(is_cancelled)? {
+                    return Ok(None);
+                }
+            };
+        }
         let n = batch.n;
         if tokens.len() != n {
             return Err(BackendError::InvalidInput(format!(
@@ -910,6 +982,7 @@ impl CudaDecodeModel {
             batch.raw_keepalive = self.batch_raw.clone();
         }
 
+        checkpoint!();
         // Drain any pending default-stream work before the graph (on `cap_stream`) touches
         // the shared batch buffers, exactly as `step_graph` does for the M=1 path.
         self.stream
@@ -932,6 +1005,7 @@ impl CudaDecodeModel {
                 .memcpy_htod(&pg.table, &mut pg.d_table)
                 .map_err(|e| driver_err("batch graph table htod", &e))?;
         }
+        checkpoint!();
         batch
             .graph
             .as_ref()
@@ -941,6 +1015,7 @@ impl CudaDecodeModel {
         self.cap_stream
             .synchronize()
             .map_err(|e| driver_err("batch graph sync", &e))?;
+        checkpoint!();
 
         // Final norm landed in `d_normed`; run the per-row LM head eagerly (one warp head
         // per row over the f16 token table), mirroring `decode_batch`'s tail bit-for-bit.
@@ -952,6 +1027,7 @@ impl CudaDecodeModel {
         let n_embd = self.n_embd;
         let mut out = Vec::with_capacity(n);
         for r in 0..n {
+            checkpoint!();
             {
                 let row = batch.d_normed.slice(r * n_embd..(r + 1) * n_embd);
                 s.memcpy_dtod(&row, &mut batch.d_h)
@@ -963,8 +1039,9 @@ impl CudaDecodeModel {
                 .map_err(|e| driver_err("batch graph logits dtoh", &e))?;
             out.push(logits);
         }
+        checkpoint!();
         batch.advance_live();
-        Ok(out)
+        Ok(Some(out))
     }
 
     /// **On-device-sampling batched decode** — the serving fast path. Same M=N forward as
@@ -982,6 +1059,30 @@ impl CudaDecodeModel {
         batch: &mut BatchKv,
         tokens: &[u32],
     ) -> Result<Vec<u32>, BackendError> {
+        self.decode_batch_graph_argmax_cancellable(batch, tokens, &|| false)
+            .map(|output| output.expect("never-cancelled argmax batch decode"))
+    }
+
+    /// Cooperative graph-argmax lockstep decode. No query executes inside
+    /// capture/replay. Successful cancellation settles submitted work and
+    /// preserves entry positions/liveness, pages and committed prefixes without
+    /// publishing any ids. Queries must not block or panic; errors stay errors.
+    pub fn decode_batch_graph_argmax_cancellable(
+        &mut self,
+        batch: &mut BatchKv,
+        tokens: &[u32],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<u32>>, BackendError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
+        macro_rules! checkpoint {
+            () => {
+                if self.batch_decode_cancelled(is_cancelled)? {
+                    return Ok(None);
+                }
+            };
+        }
         let n = batch.n;
         if tokens.len() != n {
             return Err(BackendError::InvalidInput(format!(
@@ -1027,7 +1128,7 @@ impl CudaDecodeModel {
             batch.graph_argmax = Some(g);
             batch.raw_keepalive = self.batch_raw.clone();
         }
-
+        checkpoint!();
         self.stream
             .synchronize()
             .map_err(|e| driver_err("batch argmax pre default sync", &e))?;
@@ -1045,6 +1146,7 @@ impl CudaDecodeModel {
                 .memcpy_htod(&pg.table, &mut pg.d_table)
                 .map_err(|e| driver_err("batch argmax table htod", &e))?;
         }
+        checkpoint!();
         batch
             .graph_argmax
             .as_ref()
@@ -1054,14 +1156,16 @@ impl CudaDecodeModel {
         self.cap_stream
             .synchronize()
             .map_err(|e| driver_err("batch argmax graph sync", &e))?;
+        checkpoint!();
 
         // The graph wrote the n greedy token ids into d_argmax; copy back just those.
         let mut ids = vec![0i32; n];
         self.cap_stream
             .memcpy_dtoh(&batch.d_argmax, &mut ids)
             .map_err(|e| driver_err("batch argmax dtoh", &e))?;
+        checkpoint!();
         batch.advance_live();
-        Ok(ids.into_iter().map(|t| t as u32).collect())
+        Ok(Some(ids.into_iter().map(|t| t as u32).collect()))
     }
 
     /// **I1 batched greedy drafting** (L3 batch-slot spec decode): for each
@@ -1121,6 +1225,25 @@ impl CudaDecodeModel {
         k: usize,
         eos: u32,
     ) -> Result<Vec<Vec<u32>>, BackendError> {
+        self.draft_batch_cancellable(batch, last_tokens, k, eos, &|| false)
+            .map(|output| output.expect("never-cancelled batch draft"))
+    }
+
+    /// Cooperative batched drafting. A cancelled call settles stream work,
+    /// restores entry positions/liveness and publishes no draft output.
+    /// Committed prefix bytes/pages and unrelated solo authority survive.
+    /// Driver errors retain the ordinary partial-state error semantics.
+    pub fn draft_batch_cancellable(
+        &mut self,
+        batch: &mut BatchKv,
+        last_tokens: &[u32],
+        k: usize,
+        eos: u32,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<Vec<u32>>>, BackendError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
         let n = batch.n;
         if last_tokens.len() != n {
             return Err(BackendError::InvalidInput(format!(
@@ -1158,6 +1281,20 @@ impl CudaDecodeModel {
         }
 
         let entry_live = batch.live.clone();
+        let entry_positions = batch.positions.clone();
+        macro_rules! checkpoint {
+            () => {
+                if is_cancelled() {
+                    let settled = self.settle_cancelled_draft();
+                    // As on ordinary device errors, restore liveness even if
+                    // settling fails. Only a successful wait permits rollback.
+                    batch.live.clone_from(&entry_live);
+                    settled?;
+                    batch.positions.clone_from(&entry_positions);
+                    return Ok(None);
+                }
+            };
+        }
         let mut out: Vec<Vec<u32>> = vec![Vec::new(); n];
         // Step-0 feeds. Dead rows' tokens are ignored but still embed-gathered
         // on device (the unconditional vocab guard in
@@ -1170,6 +1307,7 @@ impl CudaDecodeModel {
 
         let mut result = Ok(());
         for _ in 0..k {
+            checkpoint!();
             if batch.live.iter().all(|&l| !l) {
                 break; // every row dead or halted: the draft is complete
             }
@@ -1197,11 +1335,15 @@ impl CudaDecodeModel {
                     feed[r] = ids[r];
                 }
             }
+            checkpoint!();
+        }
+        if result.is_ok() {
+            checkpoint!();
         }
         // Restore entry liveness: rows dead at entry stay dead; halted rows
         // come back live with their frozen (= post-last-feed) position.
         batch.live = entry_live;
-        result.map(|()| out)
+        result.map(|()| Some(out))
     }
 
     /// Extract every batch + weight buffer's stable device pointer (guards dropped here,

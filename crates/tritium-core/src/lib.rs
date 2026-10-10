@@ -1,7 +1,7 @@
 //! # tritium-core
 //!
-//! Foundation crate for Tritium. Pure, dependency-free, `no_std`-able. Holds the
-//! shared *vocabulary* and the *correctness ground truth* that every backend is
+//! Foundation crate for Tritium. `no_std`-able and free of OS/runtime services.
+//! It consumes the shared schema vocabulary and holds the *correctness ground truth* that every backend is
 //! measured against:
 //!
 //! - [`Trit`] — a value constrained to `{-1, 0, +1}` (~1.585 bits).
@@ -14,7 +14,8 @@
 //!   every backend kernel must match within tolerance.
 //!
 //! Nothing here touches a GPU, a thread pool, or `std` (unless the `std` feature
-//! is on). Backends depend on this crate; this crate depends on nothing.
+//! is on). Backends depend on this crate; its only workspace dependency is
+//! `tritium-schema`.
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 // v0.90 hardening: every public item must carry a doc comment.
@@ -23,15 +24,26 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+mod additive;
+mod dense;
 mod dtype;
 mod error;
+mod feedback;
 mod reference;
 mod scale;
 mod shape;
 mod trit;
 
+pub use additive::{
+    AdditiveError, AdditiveView, BasisBound, Gather, Matmul, apply_basis, apply_inverse_basis,
+    reference_embed, reference_ternary_matmul,
+};
+pub use dense::{DenseError, DenseView};
 pub use dtype::{DType, TernaryFormat};
 pub use error::TritError;
+#[cfg(feature = "std")]
+pub use feedback::auto_feedback_decay;
+pub use feedback::{FeedbackDecay, FeedbackDecayError};
 pub use reference::{reference_conv1d, reference_fsq, reference_mpgemm};
 pub use scale::{ScaleGranularity, absmean};
 pub use shape::{ConvShape, GemmShape};

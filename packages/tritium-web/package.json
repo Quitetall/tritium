@@ -22,6 +22,9 @@
   },
   "types": "./dist/index.d.ts",
   "scripts": {
+    "format": "biome format --write .",
+    "format:check": "biome format .",
+    "lint": "biome lint --error-on-warnings .",
     "build": "node scripts/build.mjs",
     "build:wasm": "node scripts/build-wasm.mjs",
     "generate:browser-vectors": "node scripts/generate-browser-vector-metadata.mjs",
@@ -30,10 +33,11 @@
     "check:generated": "node scripts/generate-browser-vector-metadata.mjs --check && node scripts/generate-operation-bindings.mjs --check && node scripts/generate-webgpu-kernels.mjs --check",
     "typecheck": "npm run check:generated && npm run build:wasm && tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test tests/*.test.mjs",
-    "check": "npm run typecheck && npm test && npm run verify:pack",
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run verify:pack",
     "verify:pack": "node scripts/verify-pack.mjs"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.5.15",
     "@noble/hashes": "2.4.0",
     "esbuild": "0.28.2",
     "typescript": "7.0.2"

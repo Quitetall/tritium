@@ -19,6 +19,18 @@ class HuggingFaceLifecycleWorkflowTests(unittest.TestCase):
         self.assertEqual(job.count("python -I -m tritium.torch.hf_lifecycle"), 2)
         self.assertIn("evidence/hf-lifecycle-clean/receipt.json", job)
         self.assertIn("evidence/hf-lifecycle-clean/**", job)
+    def test_installed_wheel_job_runs_candidate_provenance_regressions(self):
+        workflow = (ROOT / ".github/workflows/wheels.yml").read_text(encoding="utf-8")
+        job = workflow.split("  torch-functional-smoke:", 1)[1].split(
+            "  tutorial-clean-wheel:", 1
+        )[0]
+        self.assertIn('TRITIUM_TEST_INSTALLED_WHEEL: "1"', job)
+        for test in (
+            "test_hf_candidate_provenance.py",
+            "test_hf_lifecycle_receipt.py",
+            "test_hf_export_lifecycle.py",
+        ):
+            self.assertIn("crates/tritium-py/tests/" + test, job)
 
     def test_hf_receipt_has_no_source_checkout_escape_hatch(self):
         source = (
@@ -26,7 +38,12 @@ class HuggingFaceLifecycleWorkflowTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertNotIn("sys.path", source)
         self.assertNotIn("PYTHONPATH", source)
-        self.assertIn('distribution("pytritium")', source)
+        self.assertIn("verify_installed_candidate", source)
+        candidate_source = (
+            ROOT / "crates/tritium-py/python/tritium/torch/_installed_candidate.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('distribution("pytritium")', candidate_source)
+        self.assertNotIn("import transformers", candidate_source)
         self.assertIn("AutoModelForCausalLM.from_pretrained", source)
         self.assertIn("safe_serialization=True", source)
 

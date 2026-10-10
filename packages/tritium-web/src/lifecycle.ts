@@ -36,20 +36,14 @@ export class PortableLifecyclePlanError extends Error {
   }
 }
 
-function fail(
-  code: "invalid_schema" | "capacity",
-  message: string,
-): never {
+function fail(code: "invalid_schema" | "capacity", message: string): never {
   throw new PortableLifecyclePlanError(code, message);
 }
 
 function exactKeys(value: object, expected: readonly string[], name: string): void {
   const actual = Object.keys(value).sort();
   const wanted = [...expected].sort();
-  if (
-    actual.length !== wanted.length ||
-    actual.some((key, index) => key !== wanted[index])
-  ) {
+  if (actual.length !== wanted.length || actual.some((key, index) => key !== wanted[index])) {
     fail("invalid_schema", `${name} fields do not match its optimizer schema`);
   }
 }
@@ -85,9 +79,7 @@ function f32Buffer(
   name: string,
   bits: readonly number[] | Uint8Array | Uint32Array,
 ): PortableBufferV1 {
-  const values = Array.from(
-    checkedArray(bits, 0xffff_ffff, name, MAX_BUFFER_BYTES / 4),
-  );
+  const values = Array.from(checkedArray(bits, 0xffff_ffff, name, MAX_BUFFER_BYTES / 4));
   return { name, shape: [values.length], data: { dtype: "f32", bits: values } };
 }
 
@@ -104,9 +96,7 @@ function optimizerAttributes(
   leafLengths: readonly number[],
   step?: number,
 ): PortableAttributeV1[] {
-  const attributes: PortableAttributeV1[] = [
-    { kind: "text", name: "optimizer", value: optimizer },
-  ];
+  const attributes: PortableAttributeV1[] = [{ kind: "text", name: "optimizer", value: optimizer }];
   if (step !== undefined) attributes.push({ kind: "u64", name: "step", value: step });
   attributes.push({ kind: "u64-list", name: "leaf_lens", values: [...leafLengths] });
   return attributes;
@@ -150,13 +140,7 @@ export function preflightPortableLifecycleLayout(
   optimizer: PortableCheckpointOptimizerV1,
   leafLengths: readonly number[],
 ): void {
-  if (![
-    "sgd",
-    "adamw",
-    "cautious_adamw",
-    "int8_adamw",
-    "muon",
-  ].includes(optimizer)) {
+  if (!["sgd", "adamw", "cautious_adamw", "int8_adamw", "muon"].includes(optimizer)) {
     fail("invalid_schema", "optimizer is not supported by portable checkpoints");
   }
   validateLeafLengths(leafLengths);
@@ -177,9 +161,7 @@ export function preflightPortableLifecycleLayout(
   const encodedBytes = checkpointSize(optimizer, leafLengths);
   let callerBytes = encodedBytes + 8;
   let checkpointJsonBytes =
-    4096 +
-    leafLengths.length * 12 +
-    boundedLifecyclePlaneJsonBytes(encodedBytes, "bytes", false);
+    4096 + leafLengths.length * 12 + boundedLifecyclePlaneJsonBytes(encodedBytes, "bytes", false);
   let resumeJsonBytes =
     4096 +
     leafLengths.length * 12 +
@@ -275,13 +257,7 @@ export function compilePortableCheckpointRequest(
     fail("invalid_schema", "checkpoint state must be an object");
   }
   exactKeys(state, ["leaves", "optimizer", "step"], "checkpoint state");
-  if (![
-    "sgd",
-    "adamw",
-    "cautious_adamw",
-    "int8_adamw",
-    "muon",
-  ].includes(state.optimizer)) {
+  if (!["sgd", "adamw", "cautious_adamw", "int8_adamw", "muon"].includes(state.optimizer)) {
     fail("invalid_schema", "optimizer is not supported by portable checkpoints");
   }
   if (!Number.isSafeInteger(state.step) || state.step < 0) {
@@ -293,8 +269,7 @@ export function compilePortableCheckpointRequest(
   const buffersPerLeaf =
     state.optimizer === "sgd"
       ? 1
-      : state.optimizer === "adamw" ||
-          state.optimizer === "cautious_adamw"
+      : state.optimizer === "adamw" || state.optimizer === "cautious_adamw"
         ? 3
         : state.optimizer === "int8_adamw"
           ? 5
@@ -348,18 +323,8 @@ export function compilePortableCheckpointRequest(
         ["moment1Q8", "moment1Scale", "moment2Q8", "moment2Scale", "parameter"],
         `leaf ${index}`,
       );
-      const moment1Q8 = checkedArray(
-        adam.moment1Q8,
-        0xff,
-        `moment1Q8.${index}`,
-        MAX_BUFFER_BYTES,
-      );
-      const moment2Q8 = checkedArray(
-        adam.moment2Q8,
-        0xff,
-        `moment2Q8.${index}`,
-        MAX_BUFFER_BYTES,
-      );
+      const moment1Q8 = checkedArray(adam.moment1Q8, 0xff, `moment1Q8.${index}`, MAX_BUFFER_BYTES);
+      const moment2Q8 = checkedArray(adam.moment2Q8, 0xff, `moment2Q8.${index}`, MAX_BUFFER_BYTES);
       const moment1Scale = checkedArray(
         adam.moment1Scale,
         0xffff_ffff,
@@ -425,13 +390,7 @@ export function compilePortableResumeRequest(
   checkpoint: Uint8Array,
   physicalDevice = "wasm32:browser",
 ): PortableTrainingRequestV1 {
-  if (![
-    "sgd",
-    "adamw",
-    "cautious_adamw",
-    "int8_adamw",
-    "muon",
-  ].includes(optimizer)) {
+  if (!["sgd", "adamw", "cautious_adamw", "int8_adamw", "muon"].includes(optimizer)) {
     fail("invalid_schema", "optimizer is not supported by portable checkpoints");
   }
   validateLeafLengths(leafLengths);

@@ -96,7 +96,9 @@ nccl = ["cuda", "cudarc/nccl"]
 # are referenced solely from `#[cfg(feature = "cuda")]` test code. `tritium-cpu`
 # is the reference for the CPU↔CUDA parity gate (ADR 0002 U2).
 [dev-dependencies]
+anyhow = { workspace = true }
 tritium-testkit = { workspace = true }
+tritium-evidence = { workspace = true }
 tritium-format = { workspace = true }
 tritium-cpu = { workspace = true }
 # `half::f16` is the block-scale type the TQ2_0 packer takes; used only by the
@@ -107,6 +109,16 @@ half = { workspace = true }
 
 [build-dependencies]
 tritium-build-info = { workspace = true }
+
+[[example]]
+name = "seal_cuda_training_receipts"
+path = "examples/seal_cuda_training_receipts.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "stage7_native_matrix"
+path = "examples/stage7_native_matrix.rs"
+required-features = ["cuda"]
 
 [lints]
 workspace = true

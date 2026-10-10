@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import importlib.metadata
 import json
@@ -12,11 +13,12 @@ from pathlib import Path
 import platform
 import shutil
 import tempfile
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 import torch
 
 from .. import QwenModel
+from .bundle_binding import BoundBundle, BundleBindingError
 from .config import TernaryConfig
 from .conversion import prepare_qat
 from .onnx import export_onnx, load_onnx
@@ -57,7 +59,7 @@ def _ordinary(path: Path, label: str) -> Path:
 def _directory(path: Path, label: str) -> Path:
     if path.is_symlink() or not path.is_dir():
         raise OnnxQualificationError(f"{label} must be an ordinary directory")
-    return path.resolve(strict=True)
+    return Path(os.path.abspath(path))
 
 
 def _artifact(value: Mapping[str, Any], kind: str, label: str) -> dict[str, Any]:
@@ -97,11 +99,61 @@ def _maximum_error(left: Sequence[float], right: Sequence[float]) -> float:
     return float(torch.max(torch.abs(left_tensor - right_tensor)).item())
 
 
+def _valid_state(state: Any) -> bool:
+    return (
+        isinstance(state, torch.Tensor)
+        and state.device.type == "cpu"
+        and state.dtype == torch.float32
+        and state.ndim > 0
+        and state.numel() > 0
+        and bool(torch.isfinite(state).all())
+    )
+
+
 def _states_equal(left: Sequence[torch.Tensor], right: Sequence[torch.Tensor]) -> bool:
-    return len(left) == len(right) and all(
-        tuple(a.shape) == tuple(b.shape) and torch.equal(a, b)
+    return bool(left) and len(left) == len(right) and all(
+        _valid_state(a) and _valid_state(b)
+        and tuple(a.shape) == tuple(b.shape) and torch.equal(a, b)
         for a, b in zip(left, right, strict=True)
     )
+
+
+def _native_state_error(
+    reference: Any, observed: Any, *, expected_names: tuple[str, ...] | None = None
+) -> float:
+    """Compare executed native observations with the actual ONNX cache outputs."""
+    names = getattr(reference, "state_names", None)
+    shapes = getattr(reference, "state_shapes", None)
+    values = getattr(reference, "states", None)
+    observed_names = getattr(observed, "state_names", None)
+    observed_states = getattr(observed, "past_key_values", None)
+    inventories = (names, shapes, values, observed_names, observed_states)
+    if any(not isinstance(value, (list, tuple)) or not value for value in inventories):
+        raise OnnxQualificationError("native/ONNX cache observations are missing")
+    if (
+        len({len(value) for value in inventories}) != 1
+        or any(type(name) is not str or not name for name in names)
+        or len(set(names)) != len(names)
+        or tuple(names) != tuple(observed_names)
+        or (expected_names is not None and tuple(names) != expected_names)
+    ):
+        raise OnnxQualificationError("native/ONNX cache inventory differs")
+    errors: list[float] = []
+    for shape, payload, state in zip(shapes, values, observed_states, strict=True):
+        if (
+            not _valid_state(state)
+            or not isinstance(shape, (list, tuple))
+            or not shape
+            or any(type(axis) is not int or axis <= 0 for axis in shape)
+            or tuple(shape) != tuple(state.shape)
+            or not isinstance(payload, (list, tuple))
+            or len(payload) != state.numel()
+            or any(type(value) not in (int, float) or not math.isfinite(value)
+                   for value in payload)
+        ):
+            raise OnnxQualificationError("native/ONNX cache geometry or values are invalid")
+        errors.append(_maximum_error(payload, state.flatten().tolist()))
+    return max(errors)
 
 
 def _greedy(values: Sequence[float]) -> int:
@@ -145,11 +197,18 @@ def _language_cases(native: Any, ort_model: Any) -> list[dict[str, Any]]:
     cases: list[dict[str, Any]] = []
     for ordinal, raw_prompt in enumerate(PROMPTS):
         prompt = list(raw_prompt)
-        reference = native.reference_language([prompt], len(prompt) + 8)[0]
+        reference = native.reference_language(
+            [prompt], len(prompt) + 8, include_states=True
+        )[0]
         observed = ort_model(torch.tensor([prompt], dtype=torch.int64))
         replay = ort_model(torch.tensor([prompt], dtype=torch.int64))
         logits = observed.logits[0, -1].tolist()
-        error = _maximum_error(reference.last_logits, logits)
+        error = max(
+            _maximum_error(reference.last_logits, logits),
+            _maximum_error(reference.last_logits, replay.logits[0, -1].tolist()),
+            _native_state_error(reference, observed),
+            _native_state_error(reference, replay),
+        )
         tokens_exact = list(reference.token_ids) == prompt
         states_exact = _states_equal(observed.past_key_values, replay.past_key_values)
         output_exact = _greedy(reference.last_logits) == _greedy(logits)
@@ -166,7 +225,8 @@ def _language_cases(native: Any, ort_model: Any) -> list[dict[str, Any]]:
 
         next_token = _greedy(reference.last_logits)
         native_steps = native.reference_language(
-            [prompt, [next_token]], len(prompt) + 8
+            [prompt, [next_token]], len(prompt) + 8, include_states=True,
+            state_steps=[1],
         )
         continuation = ort_model(
             torch.tensor([[next_token]], dtype=torch.int64),
@@ -178,7 +238,14 @@ def _language_cases(native: Any, ort_model: Any) -> list[dict[str, Any]]:
             past_key_values=replay_prompt.past_key_values,
         )
         continued_logits = continuation.logits[0, -1].tolist()
-        continued_error = _maximum_error(native_steps[-1].last_logits, continued_logits)
+        continued_error = max(
+            _maximum_error(native_steps[-1].last_logits, continued_logits),
+            _maximum_error(native_steps[-1].last_logits,
+                           replay_continuation.logits[0, -1].tolist()),
+            _native_state_error(native_steps[-1], continuation),
+            _native_state_error(native_steps[-1], replay_continuation),
+            _native_state_error(reference, replay_prompt),
+        )
         cases.append(
             _case(
                 "cached-decode",
@@ -213,43 +280,102 @@ def _language_cases(native: Any, ort_model: Any) -> list[dict[str, Any]]:
     return cases
 
 
+def _mtp_inputs(
+    reference: Any, language: Any, tokens: list[int], sampled: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Bind shifted IDs and hidden rows to the independently executed target."""
+    shifted = list(reference.shifted_input_ids)
+    hidden = list(reference.target_hidden_states)
+    width = reference.hidden_size
+    if (
+        shifted != tokens[1:] + [sampled]
+        or any(type(token) is not int for token in shifted)
+        or list(language.token_ids) != tokens
+        or type(width) is not int
+        or width <= 0
+        or width != language.hidden_size
+        or len(hidden) != len(tokens) * width
+        or hidden != list(language.final_hidden_states)
+        or len(reference.final_hidden_states) != len(hidden)
+    ):
+        raise OnnxQualificationError("native MTP target/token alignment differs")
+    hidden_tensor = torch.tensor(hidden, dtype=torch.float32).view(len(tokens), width)
+    if not bool(torch.isfinite(hidden_tensor).all()):
+        raise OnnxQualificationError("native MTP target alignment contains non-finite rows")
+    return torch.tensor([shifted], dtype=torch.int64), hidden_tensor
+
+
+def _mtp_cache(states: Any) -> tuple[torch.Tensor, ...]:
+    if not isinstance(states, tuple) or not states or any(
+        not _valid_state(state) for state in states
+    ):
+        raise OnnxQualificationError("MTP cache must contain finite nonempty CPU float32 states")
+    return states
+
+
 def _mtp_cases(native: Any, ort_model: Any) -> list[dict[str, Any]]:
     oracle = _require_mtp_oracle(native)
     cases: list[dict[str, Any]] = []
     for ordinal, raw_prompt in enumerate(PROMPTS):
         prompt = list(raw_prompt)
-        language = native.reference_language([prompt], len(prompt) + 8)[0]
-        sampled = _greedy(language.last_logits)
-        references = oracle([prompt], [sampled], len(prompt) + 8)
-        if len(references) != 1:
-            raise OnnxQualificationError(
-                "native MTP oracle returned the wrong transaction count"
-            )
-        reference = references[0]
-        shifted = torch.tensor([list(reference.shifted_input_ids)], dtype=torch.int64)
-        hidden = torch.tensor(reference.target_hidden_states, dtype=torch.float32).view(
-            len(reference.shifted_input_ids), reference.hidden_size
-        )
-        observed = ort_model.draft(shifted, hidden)
-        replay = ort_model.draft(shifted, hidden)
-        logits = observed.logits[0, -1].tolist()
-        final_hidden = observed.final_hidden.reshape(-1).tolist()
-        error = max(
-            _maximum_error(reference.last_logits, logits),
-            _maximum_error(reference.final_hidden_states, final_hidden),
-        )
-        cases.append(
-            _case(
-                "mtp",
-                f"mtp-{ordinal}",
-                error,
-                tokens_exact=list(reference.shifted_input_ids) == shifted[0].tolist(),
-                states_exact=_states_equal(
-                    observed.past_key_values, replay.past_key_values
+        context = len(prompt) + 8
+        prefills = native.reference_language([prompt], context)
+        if len(prefills) != 1:
+            raise OnnxQualificationError("native language oracle returned the wrong transaction count")
+        sampled = _greedy(prefills[0].last_logits)
+        transactions = [prompt, [sampled]]
+        language = native.reference_language(transactions, context)
+        if len(language) != 2:
+            raise OnnxQualificationError("native language oracle returned the wrong transaction count")
+        if _greedy(language[0].last_logits) != sampled:
+            raise OnnxQualificationError("native MTP target sampling alignment differs")
+        samples = [sampled, _greedy(language[1].last_logits)]
+        references = oracle(transactions, samples, context)
+        if len(references) != 2:
+            raise OnnxQualificationError("native MTP oracle returned the wrong transaction count")
+
+        observed_cache = replay_cache = None
+        for step, (tokens, next_token, target, reference) in enumerate(
+            zip(transactions, samples, language, references, strict=True)
+        ):
+            shifted, hidden = _mtp_inputs(reference, target, tokens, next_token)
+            if step == 0:
+                observed = ort_model.draft(shifted, hidden)
+                replay = ort_model.draft(shifted, hidden)
+            else:
+                # Continue each actual prefill cache independently. Re-running
+                # a fresh draft would leave cache/position bugs unexercised.
+                observed = ort_model.draft(shifted, hidden, past_key_values=observed_cache)
+                replay = ort_model.draft(shifted, hidden, past_key_values=replay_cache)
+            observed_cache = _mtp_cache(observed.past_key_values)
+            replay_cache = _mtp_cache(replay.past_key_values)
+            logits = observed.logits[0, -1].tolist()
+            error = max(
+                _maximum_error(reference.last_logits, logits),
+                _maximum_error(reference.final_hidden_states, observed.final_hidden.reshape(-1).tolist()),
+                _maximum_error(reference.last_logits, replay.logits[0, -1].tolist()),
+                _maximum_error(reference.final_hidden_states, replay.final_hidden.reshape(-1).tolist()),
+                _native_state_error(
+                    reference, observed, expected_names=("present_k.0", "present_v.0")
                 ),
-                output_exact=_greedy(reference.last_logits) == _greedy(logits),
+                _native_state_error(
+                    reference, replay, expected_names=("present_k.0", "present_v.0")
+                ),
             )
-        )
+            phase = "prefill" if step == 0 else "cached-decode"
+            cases.append(
+                _case(
+                    "mtp", f"mtp-{phase}-{ordinal}", error,
+                    tokens_exact=shifted[0].tolist() == tokens[1:] + [next_token],
+                    # Exact replay is an additional determinism check; native
+                    # KV parity is independently covered by the numeric error.
+                    states_exact=_states_equal(observed_cache, replay_cache),
+                    output_exact=(
+                        _greedy(reference.last_logits) == _greedy(logits)
+                        == _greedy(replay.logits[0, -1].tolist())
+                    ),
+                )
+            )
     return cases
 
 
@@ -366,7 +492,8 @@ def _unknown_operator_fault() -> None:
     )
 
 
-def _faults(bundle: Path) -> list[dict[str, Any]]:
+@contextmanager
+def _fault_workspace(bundle: Path) -> Iterator[Path]:
     # Keep the fault workspace on the bundle filesystem so the potentially
     # tens-of-gigabytes external arena can be hard-linked, never copied.
     with tempfile.TemporaryDirectory(
@@ -375,64 +502,78 @@ def _faults(bundle: Path) -> list[dict[str, Any]]:
         root = Path(raw)
         graph = root / "graph"
         _copy_bundle(bundle, graph)
-        language = graph / "language.onnx"
-        with language.open("r+b") as stream:
-            stream.seek(-1, os.SEEK_END)
-            value = stream.read(1)
-            stream.seek(-1, os.SEEK_END)
-            stream.write(bytes([value[0] ^ 0x01]))
-
         weights = root / "weights"
         _copy_bundle(bundle, weights, weights=b"corrupt")
-
         traversal = root / "traversal"
         _copy_bundle(bundle, traversal)
-        manifest = json.loads((traversal / "tritium-onnx-manifest.json").read_bytes())
-        manifest["language"]["file"] = "../language.onnx"
-        (traversal / "tritium-onnx-manifest.json").write_text(
-            json.dumps(manifest, sort_keys=True, separators=(",", ":")),
-            encoding="utf-8",
-        )
-
         checkpoint = root / "trainable-import"
         checkpoint.mkdir()
         (checkpoint / "optimizer.pt").write_bytes(b"training state")
+        yield root
 
-        return [
-            _rejected(
-                "graph-corruption",
-                lambda: load_onnx(graph),
-                message_tokens=("digest", "hash"),
+
+def _faults(bundle: Path, root: Path) -> list[dict[str, Any]]:
+    graph, weights, traversal = (root / name for name in ("graph", "weights", "traversal"))
+    checkpoint = root / "trainable-import"
+    # The small copied graph/manifest files must still match the admitted
+    # source before intentional faults. Weight links retain the same inode.
+    for destination in (graph, weights, traversal):
+        for name in ("language.onnx", "mtp.onnx", "tritium-onnx-manifest.json"):
+            if _sha256(destination / name) != _sha256(bundle / name):
+                raise OnnxQualificationError("fault workspace differs from bound candidate")
+    original = (bundle / "weights.bin").stat()
+    for destination in (graph, traversal):
+        linked = (destination / "weights.bin").stat()
+        if (linked.st_dev, linked.st_ino) != (original.st_dev, original.st_ino):
+            raise OnnxQualificationError("fault weights are not the bound candidate inode")
+    language = graph / "language.onnx"
+    with language.open("r+b") as stream:
+        stream.seek(-1, os.SEEK_END)
+        value = stream.read(1)
+        stream.seek(-1, os.SEEK_END)
+        stream.write(bytes([value[0] ^ 0x01]))
+    manifest = json.loads((traversal / "tritium-onnx-manifest.json").read_bytes())
+    manifest["language"]["file"] = "../language.onnx"
+    (traversal / "tritium-onnx-manifest.json").write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    return [
+        _rejected(
+            "graph-corruption",
+            lambda: load_onnx(graph),
+            message_tokens=("digest", "hash"),
+        ),
+        _rejected(
+            "weights-corruption",
+            lambda: load_onnx(weights),
+            message_tokens=("digest", "hash", "length", "bytes"),
+        ),
+        _rejected(
+            "path-traversal",
+            lambda: load_onnx(traversal),
+            message_tokens=("path", "unsafe", "canonical", "file"),
+        ),
+        _rejected(
+            "unknown-operator",
+            _unknown_operator_fault,
+            message_tokens=("unknownqualificationop",),
+        ),
+        _rejected(
+            "trainable-export",
+            lambda: export_onnx(
+                prepare_qat(torch.nn.Linear(4, 4), TernaryConfig.qat()),
+                root / "trainable-export",
             ),
-            _rejected(
-                "weights-corruption",
-                lambda: load_onnx(weights),
-                message_tokens=("digest", "hash", "length", "bytes"),
-            ),
-            _rejected(
-                "path-traversal",
-                lambda: load_onnx(traversal),
-                message_tokens=("path", "unsafe", "canonical", "file"),
-            ),
-            _rejected(
-                "unknown-operator",
-                _unknown_operator_fault,
-                message_tokens=("unknownqualificationop",),
-            ),
-            _rejected(
-                "trainable-export",
-                lambda: export_onnx(
-                    prepare_qat(torch.nn.Linear(4, 4), TernaryConfig.qat()),
-                    root / "trainable-export",
-                ),
-                codes=("trainable_onnx_requires_v1_3",),
-            ),
-            _rejected(
-                "trainable-import",
-                lambda: load_onnx(checkpoint),
-                codes=("trainable_onnx_requires_v1_3",),
-            ),
-        ]
+            codes=("trainable_onnx_requires_v1_3",),
+        ),
+        _rejected(
+            "trainable-import",
+            lambda: load_onnx(checkpoint),
+            codes=("trainable_onnx_requires_v1_3",),
+        ),
+    ]
 
 
 def _source_free_environment() -> tuple[bool, bool]:
@@ -454,6 +595,8 @@ def run(
     model_artifact_id: str,
     onnx_bundle: Path,
     native_bundle: Path,
+    onnx_archive: Path,
+    native_archive: Path,
     profile: str,
     conversion_mode: str,
     source_revision: str,
@@ -490,6 +633,41 @@ def run(
     ):
         raise OnnxQualificationError("candidate manifest digest is malformed")
 
+    try:
+        # Create/remove hardlinks outside the custody lifetime: link operations
+        # change ctime even though the authenticated payload bytes stay intact.
+        with _fault_workspace(onnx_bundle) as faults, BoundBundle(
+            onnx_archive, onnx_bundle, artifact_identity
+        ) as onnx_bound, BoundBundle(native_archive, native_bundle, model_identity) as native_bound:
+            return _execute(
+                onnx_bundle=onnx_bound.bundle, native_bundle=native_bound.bundle,
+                wheel_identity=wheel_identity, artifact_identity=artifact_identity,
+                model_identity=model_identity, model_artifact_id=model_artifact_id,
+                profile=profile, conversion_mode=conversion_mode,
+                source_revision=source_revision, release=release, run_id=run_id,
+                candidate_manifest_sha256=candidate_manifest_sha256,
+                fault_workspace=faults,
+            )
+    except (BundleBindingError, OSError) as error:
+        raise OnnxQualificationError(str(error)) from error
+
+
+def _execute(
+    *,
+    onnx_bundle: Path,
+    native_bundle: Path,
+    wheel_identity: dict[str, Any],
+    artifact_identity: dict[str, Any],
+    model_identity: dict[str, Any],
+    model_artifact_id: str,
+    profile: str,
+    conversion_mode: str,
+    source_revision: str,
+    release: str,
+    run_id: str,
+    candidate_manifest_sha256: str,
+    fault_workspace: Path,
+) -> dict[str, Any]:
     native = QwenModel.load(str(native_bundle), profile=profile, device="cpu")
     _require_mtp_oracle(native)
     ort_model = load_onnx(onnx_bundle, device="cpu")
@@ -581,7 +759,7 @@ def run(
             "persistent_dense_shadows": 0,
         },
         "cases": cases,
-        "faults": _faults(onnx_bundle),
+        "faults": _faults(onnx_bundle, fault_workspace),
     }
 
 
@@ -609,6 +787,8 @@ def main() -> int:
     parser.add_argument("--model-artifact-id", required=True)
     parser.add_argument("--onnx-bundle", type=Path, required=True)
     parser.add_argument("--native-bundle", type=Path, required=True)
+    parser.add_argument("--onnx-archive", type=Path, required=True)
+    parser.add_argument("--native-archive", type=Path, required=True)
     parser.add_argument("--profile", required=True)
     parser.add_argument("--conversion-mode", required=True)
     parser.add_argument("--source-revision", required=True)
@@ -625,6 +805,8 @@ def main() -> int:
         model_artifact_id=args.model_artifact_id,
         onnx_bundle=args.onnx_bundle,
         native_bundle=args.native_bundle,
+        onnx_archive=args.onnx_archive,
+        native_archive=args.native_archive,
         profile=args.profile,
         conversion_mode=args.conversion_mode,
         source_revision=args.source_revision,

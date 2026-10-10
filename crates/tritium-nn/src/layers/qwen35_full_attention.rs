@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use tritium_format::salt_v2_package::SaltV2ScaleUpdate;
 use tritium_spec::TernaryBackend;
 
 use crate::error::NnError;
@@ -306,6 +307,52 @@ pub struct Qwen35FullAttention {
 struct MixerIdentity;
 
 impl Qwen35FullAttention {
+    #[allow(dead_code)] // Consumed by the B3 bounded projection-window adapter.
+    pub(crate) fn projection(&self, name: &str) -> Result<&Projection, NnError> {
+        match name {
+            "self_attn.q_proj.weight" => Ok(&self.weights.q_proj),
+            "self_attn.k_proj.weight" => Ok(&self.weights.k_proj),
+            "self_attn.v_proj.weight" => Ok(&self.weights.v_proj),
+            "self_attn.o_proj.weight" => Ok(&self.weights.o_proj),
+            _ => Err(NnError::MissingTensor(format!(
+                "unknown Qwen full-attention projection `{name}`"
+            ))),
+        }
+    }
+
+    /// Replace one named projection without changing this mixer's validated geometry.
+    #[allow(dead_code)] // Used by the crate-internal paired Qwen measurement path.
+    pub(crate) fn replace_projection(
+        &mut self,
+        name: &str,
+        replacement: Projection,
+    ) -> Result<Projection, NnError> {
+        let slot = match name {
+            "self_attn.q_proj.weight" => &mut self.weights.q_proj,
+            "self_attn.k_proj.weight" => &mut self.weights.k_proj,
+            "self_attn.v_proj.weight" => &mut self.weights.v_proj,
+            "self_attn.o_proj.weight" => &mut self.weights.o_proj,
+            _ => {
+                return Err(NnError::MissingTensor(format!(
+                    "unknown Qwen full-attention projection `{name}`"
+                )));
+            }
+        };
+        if replacement.n_out() != slot.n_out() || replacement.k_in() != slot.k_in() {
+            return Err(NnError::Shape {
+                expected: slot.n_out().saturating_mul(slot.k_in()),
+                got: replacement.n_out().saturating_mul(replacement.k_in()),
+            });
+        }
+        if replacement.activation_mode() != slot.activation_mode() {
+            return Err(NnError::Backend(
+                "replacement projection changes Qwen full-attention activation arithmetic"
+                    .to_owned(),
+            ));
+        }
+        Ok(std::mem::replace(slot, replacement))
+    }
+
     /// Bind a typed Qwen3.5 text geometry to an exact full-attention weight set.
     ///
     /// # Errors
@@ -331,6 +378,38 @@ impl Qwen35FullAttention {
     #[must_use]
     pub const fn activation_mode(&self) -> ProjectionActivationMode {
         self.activation_mode
+    }
+
+    pub(crate) fn count_salt_v2_tensor_index(&self, tensor_index: usize) -> usize {
+        [
+            &self.weights.q_proj,
+            &self.weights.k_proj,
+            &self.weights.v_proj,
+            &self.weights.o_proj,
+        ]
+        .into_iter()
+        .filter(|projection| projection.salt_v2_tensor_index() == Some(tensor_index))
+        .count()
+    }
+
+    pub(crate) fn apply_salt_v2_scale_updates(
+        &mut self,
+        tensor_index: usize,
+        updates: &[SaltV2ScaleUpdate],
+    ) -> Result<bool, NnError> {
+        let projections = [
+            &mut self.weights.q_proj,
+            &mut self.weights.k_proj,
+            &mut self.weights.v_proj,
+            &mut self.weights.o_proj,
+        ];
+        for projection in projections {
+            if projection.salt_v2_tensor_index() == Some(tensor_index) {
+                projection.apply_salt_v2_scale_updates(tensor_index, updates)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Create a cache that retains this mixer's exact head factorization.
