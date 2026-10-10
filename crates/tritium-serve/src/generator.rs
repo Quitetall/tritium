@@ -654,6 +654,16 @@ pub(crate) fn top_logprobs(logits: &[f32], sampled: u32, k: usize) -> Vec<(u32, 
 }
 
 impl RunnerGenerator {
+    fn reset_cancelled_generation(&mut self) {
+        self.runner.reset();
+        if let Some(draft) = self.draft.as_mut() {
+            draft.reset();
+        }
+        self.draft_pos = 0;
+        self.draft_fed.clear();
+        self.tree_session_open = false;
+    }
+
     /// Wrap a loaded runner, using `eos` as the stop token.
     #[must_use]
     pub fn new(runner: tritium_nn::ModelRunner, eos: u32) -> Self {
@@ -1744,6 +1754,18 @@ impl Generator for RunnerGenerator {
         req: &GenRequest,
         on_step: &mut dyn FnMut(Step) -> bool,
     ) -> Result<(), GenError> {
+        self.generate_cancellable(req, on_step, &|| false)
+    }
+
+    fn generate_cancellable(
+        &mut self,
+        req: &GenRequest,
+        on_step: &mut dyn FnMut(Step) -> bool,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), GenError> {
+        if is_cancelled() {
+            return Ok(());
+        }
         let n_ctx = self.runner.config.n_ctx as usize;
         let prompt_len = req.prompt_tokens.len();
         if prompt_len == 0 || prompt_len > n_ctx {
@@ -1756,10 +1778,14 @@ impl Generator for RunnerGenerator {
         self.tree_session_open = false;
         self.runner.reset();
         let positions: Vec<usize> = (0..prompt_len).collect();
-        let mut logits = self
+        let Some(mut logits) = self
             .runner
-            .forward(&req.prompt_tokens, &positions)
-            .map_err(|e| GenError::Backend(e.to_string()))?;
+            .forward_cancellable(&req.prompt_tokens, &positions, is_cancelled)
+            .map_err(|e| GenError::Backend(e.to_string()))?
+        else {
+            self.reset_cancelled_generation();
+            return Ok(());
+        };
 
         // Prompt-lookup speculative decoding (greedy only): verified chains
         // commit several tokens per forward. Falls back to plain stepping when
@@ -1780,22 +1806,45 @@ impl Generator for RunnerGenerator {
                 && req.logprobs.is_none()
                 && self.runner.has_resident_decoder()
             {
-                return match req.sampling {
-                    Sampling::Greedy => {
-                        self.generate_spec_lookup(req, prompt_len, max_new, logits, on_step)
-                    }
+                let mut stopped = false;
+                let mut controlled_step = |step| {
+                    let keep_going = !is_cancelled() && on_step(step);
+                    stopped |= !keep_going;
+                    keep_going
+                };
+                let result = match req.sampling {
+                    Sampling::Greedy => self.generate_spec_lookup(
+                        req,
+                        prompt_len,
+                        max_new,
+                        logits,
+                        &mut controlled_step,
+                    ),
                     // Stochastic sampling uses the speculative accept rule
                     // (lossless IN DISTRIBUTION, not stream-equal to the plain
                     // loop — the plain loop and this one consume randomness
                     // differently by construction).
-                    Sampling::TopK { .. } | Sampling::TopP { .. } => {
-                        self.generate_spec_lookup_sampled(req, prompt_len, max_new, logits, on_step)
-                    }
+                    Sampling::TopK { .. } | Sampling::TopP { .. } => self
+                        .generate_spec_lookup_sampled(
+                            req,
+                            prompt_len,
+                            max_new,
+                            logits,
+                            &mut controlled_step,
+                        ),
                 };
+                if result.is_ok() && (stopped || is_cancelled()) {
+                    self.reset_cancelled_generation();
+                }
+                return result;
             }
         }
 
         for i in 0..max_new {
+            if is_cancelled() {
+                self.reset_cancelled_generation();
+                return Ok(());
+            }
             let next = Self::sample(&logits, &req.sampling, i as u64)
                 .ok_or_else(|| GenError::Backend("sampler produced no token".into()))?;
             let is_eos = req.stop_eos && next == self.eos;
@@ -1814,13 +1863,21 @@ impl Generator for RunnerGenerator {
                 logprobs: req.logprobs.map(|k| top_logprobs(&logits, next, k)),
             });
             if last || !cont {
+                if !cont {
+                    self.reset_cancelled_generation();
+                }
                 break;
             }
             let pos = prompt_len + i;
-            logits = self
+            let next = self
                 .runner
-                .forward(&[next], &[pos])
+                .forward_cancellable(&[next], &[pos], is_cancelled)
                 .map_err(|e| GenError::Backend(e.to_string()))?;
+            let Some(next) = next else {
+                self.reset_cancelled_generation();
+                return Ok(());
+            };
+            logits = next;
         }
         Ok(())
     }
@@ -2573,6 +2630,114 @@ mod tests {
                 },
                 &|| false,
             )
+            .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(feature = "serve")]
+    fn tiny_legacy_runner() -> tritium_nn::ModelRunner {
+        use tritium_nn::{
+            DenseLinear, Mlp, ModelConfig, ModelWeights, Projection, SwiGluMlp, TokenEmbedding,
+            TransformerBlock,
+        };
+        let projection =
+            || Projection::Dense(DenseLinear::new_exact(vec![0.03125; 16], 4, 4).unwrap());
+        let config = ModelConfig {
+            arch: "llama".into(),
+            n_layers: 2,
+            n_embd: 4,
+            n_head: 1,
+            n_head_kv: 1,
+            head_dim: 4,
+            n_ff: 4,
+            n_ctx: 16,
+            rope_theta: 10_000.0,
+            rms_eps: 1e-5,
+        };
+        let weights = ModelWeights {
+            token_embd: TokenEmbedding::from_dense(
+                (0..32).map(|i| (i as f32 - 16.0) / 64.0).collect(),
+                8,
+                4,
+            )
+            .unwrap(),
+            vocab: 8,
+            n_embd: 4,
+            layers: (0..2)
+                .map(|_| TransformerBlock {
+                    attn_norm: vec![1.0; 4],
+                    q_proj: projection(),
+                    k_proj: projection(),
+                    v_proj: projection(),
+                    o_proj: projection(),
+                    attn_sub_norm: Vec::new(),
+                    q_bias: Vec::new(),
+                    k_bias: Vec::new(),
+                    v_bias: Vec::new(),
+                    q_norm: Vec::new(),
+                    k_norm: Vec::new(),
+                    ffn_norm: vec![1.0; 4],
+                    mlp: Mlp::SwiGlu(SwiGluMlp {
+                        gate: projection(),
+                        up: projection(),
+                        down: projection(),
+                    }),
+                })
+                .collect(),
+            output_norm: vec![1.0; 4],
+            lm_head: None,
+        };
+        tritium_nn::ModelRunner::from_weights(
+            config,
+            weights,
+            Box::new(tritium_cpu::CpuBackend::new()),
+        )
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn legacy_runner_generator_cancels_native_prefill_and_recovers() {
+        let mut generator = RunnerGenerator::new(tiny_legacy_runner(), 7);
+        let request = GenRequest {
+            prompt_tokens: vec![0, 1],
+            max_new: 2,
+            sampling: Sampling::Greedy,
+            stop_eos: false,
+            logprobs: None,
+        };
+        let checks = std::cell::Cell::new(0);
+        let mut delivered = 0;
+        generator
+            .generate_cancellable(
+                &request,
+                &mut |_| {
+                    delivered += 1;
+                    true
+                },
+                &|| {
+                    checks.set(checks.get() + 1);
+                    checks.get() == 5
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            delivered, 0,
+            "legacy adapter must cancel during native prefill"
+        );
+        assert!(generator.runner.kv.iter().all(|cache| cache.len == 0));
+        let mut actual = Vec::new();
+        generator
+            .generate(&request, &mut |step| {
+                actual.push(step.token);
+                true
+            })
+            .unwrap();
+        let mut expected = Vec::new();
+        RunnerGenerator::new(tiny_legacy_runner(), 7)
+            .generate(&request, &mut |step| {
+                expected.push(step.token);
+                true
+            })
             .unwrap();
         assert_eq!(actual, expected);
     }

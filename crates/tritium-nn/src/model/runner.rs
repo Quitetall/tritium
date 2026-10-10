@@ -70,6 +70,13 @@ pub struct ModelRunner {
     resident_probed: bool,
 }
 
+#[cfg(feature = "cuda")]
+enum ResidentForward {
+    Unavailable,
+    Cancelled,
+    Complete(Vec<f32>),
+}
+
 impl ModelRunner {
     /// Load a runner from a parsed GGUF `file` (+ its raw `bytes`) onto `backend`.
     ///
@@ -602,6 +609,28 @@ impl ModelRunner {
         self.forward_inner(tokens, positions, None)
     }
 
+    /// Run a forward with cooperative cancellation (ADR 0051).
+    ///
+    /// `None` means cancellation without a published output. The query must be
+    /// cheap, nonblocking and non-panicking; already-running work is not
+    /// preempted. Host checkpoints run after embedding, around each block and
+    /// before/after the head. Cancellation restores entry KV lengths and
+    /// committed prefix values. The resident prefill uses native checkpoints;
+    /// M=1 graph replay is checked before/after, not interrupted. Callback count
+    /// is unspecified and cancellation after the final check can race with
+    /// completion. Runtime errors remain distinct from cancellation.
+    ///
+    /// # Errors
+    /// Same runtime and shape errors as [`Self::forward`].
+    pub fn forward_cancellable(
+        &mut self,
+        tokens: &[u32],
+        positions: &[usize],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<f32>>, NnError> {
+        self.forward_controlled(tokens, positions, None, is_cancelled)
+    }
+
     /// Like [`forward`](Self::forward), but captures per-stage activations into
     /// `dump` for the fidelity ladder.
     ///
@@ -620,8 +649,22 @@ impl ModelRunner {
         &mut self,
         tokens: &[u32],
         positions: &[usize],
-        mut dump: Option<&mut ForwardDump>,
+        dump: Option<&mut ForwardDump>,
     ) -> Result<Vec<f32>, NnError> {
+        self.forward_controlled(tokens, positions, dump, &|| false)?
+            .ok_or_else(|| NnError::Backend("uncancelled forward returned no output".into()))
+    }
+
+    fn forward_controlled(
+        &mut self,
+        tokens: &[u32],
+        positions: &[usize],
+        mut dump: Option<&mut ForwardDump>,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<f32>>, NnError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
         let n_embd = self.config.n_embd as usize;
         let seq = tokens.len();
         if seq == 0 || positions.len() != seq {
@@ -636,10 +679,12 @@ impl ModelRunner {
         // stream + KV stay in VRAM). The dump path keeps the host orchestration so the
         // fidelity ladder can still inspect each stage.
         #[cfg(feature = "cuda")]
-        if dump.is_none()
-            && let Some(logits) = self.forward_resident(tokens, positions)?
-        {
-            return Ok(logits);
+        if dump.is_none() {
+            match self.forward_resident(tokens, positions, is_cancelled)? {
+                ResidentForward::Complete(logits) => return Ok(Some(logits)),
+                ResidentForward::Cancelled => return Ok(None),
+                ResidentForward::Unavailable => {}
+            }
         }
 
         // Embedding gather: hidden = token_embd[token] for each token.
@@ -647,6 +692,9 @@ impl ModelRunner {
         self.weights
             .token_embd
             .gather_with_backend(self.backend.as_ref(), tokens, &mut hidden)?;
+        if is_cancelled() {
+            return Ok(None);
+        }
         if let Some(d) = dump.as_deref_mut() {
             d.embedding = hidden.clone();
             d.hidden_states.clear();
@@ -667,8 +715,11 @@ impl ModelRunner {
             .map_err(|error| NnError::Backend(format!("allocate KV checkpoints: {error}")))?;
         kv_checkpoints.extend(self.kv.iter().map(|cache| cache.len));
 
-        let result = (|| -> Result<Vec<f32>, NnError> {
+        let result = (|| -> Result<Option<Vec<f32>>, NnError> {
             for li in 0..n_layers {
+                if is_cancelled() {
+                    return Ok(None);
+                }
                 // Borrow the block and its KV cache disjointly.
                 let block = &self.weights.layers[li];
                 let kv = &mut self.kv[li];
@@ -702,6 +753,13 @@ impl ModelRunner {
                 if let Some(d) = dump.as_deref_mut() {
                     d.hidden_states.push(hidden.clone());
                 }
+                if is_cancelled() {
+                    return Ok(None);
+                }
+            }
+
+            if is_cancelled() {
+                return Ok(None);
             }
 
             // Final RMSNorm: compute only the last token's norm (we only need its
@@ -729,6 +787,9 @@ impl ModelRunner {
 
             // LM head. Untied ⇒ a dedicated `lm_head` projection; tied ⇒ the dot-product
             // against the token embedding (BitNet). Both map `last_norm` ([n_embd]) → logits.
+            if is_cancelled() {
+                return Ok(None);
+            }
             let logits = if let Some(head) = &self.weights.lm_head {
                 let mut logits = vec![0.0f32; head.n_out()];
                 head.forward(self.backend.as_ref(), &last_norm, 1, &mut logits)?;
@@ -744,13 +805,16 @@ impl ModelRunner {
                 )?;
                 logits
             };
+            if is_cancelled() {
+                return Ok(None);
+            }
             if let Some(d) = dump {
                 d.logits = logits.clone();
             }
 
-            Ok(logits)
+            Ok(Some(logits))
         })();
-        if result.is_err() {
+        if !matches!(result, Ok(Some(_))) {
             for (cache, checkpoint) in self.kv.iter_mut().zip(kv_checkpoints) {
                 cache.rollback_to(checkpoint);
             }
@@ -759,46 +823,53 @@ impl ModelRunner {
     }
 
     /// (cuda) Run the forward through the device-resident decoder if the backend is
-    /// CUDA, returning `Some(last-token logits)`; `None` means the backend has no
-    /// resident path and the caller should fall back to the host orchestration.
-    ///
-    /// Each of the `seq` tokens is driven through one device `step` (so a multi-token
-    /// prefill is processed as a sequential causal decode — numerically identical to
-    /// the batched host prefill, since each token's reductions are unchanged). Only
-    /// the last token's logits are returned, matching [`forward`](Self::forward).
-    ///
-    /// Cost note: sequential prefill is O(seq) device forwards rather than one batched
-    /// pass, so a long prompt prefills more slowly than the host's batched GEMMs. v0.3.1
-    /// targets the *decode* gate (where this path is the win); a batched device prefill
-    /// is the deferred IMMA prefill work (ADR 0013, follow-up). For the short prompts the
-    /// decode gate uses this is immaterial.
+    /// CUDA. Unavailable means ordinary host dispatch, not cancellation or
+    /// device failure. Multi-token prefill remains one batched M=P forward;
+    /// single-token decode retains the M=1 CUDA graph. Cancellation does not
+    /// change backend selection or numerical operations.
     #[cfg(feature = "cuda")]
     fn forward_resident(
         &mut self,
         tokens: &[u32],
         positions: &[usize],
-    ) -> Result<Option<Vec<f32>>, NnError> {
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<ResidentForward, NnError> {
         if !self.ensure_resident()? {
-            return Ok(None);
+            return Ok(ResidentForward::Unavailable);
         }
         let model = self
             .resident
             .as_mut()
             .expect("ensure_resident returned true so resident is built");
+        if is_cancelled() {
+            return Ok(ResidentForward::Cancelled);
+        }
         // v0.3.6: a multi-token forward (the prompt) is a single **batched M=P prefill** —
         // one device-resident forward over all tokens — instead of P sequential decode
         // steps (the TTFT cliff). A single token (decode) replays the M=1 CUDA graph. Both
         // are bit-identical to the per-token loop (the batch kernels share the M=1 order).
         let logits = if tokens.len() > 1 {
-            model
-                .prefill(tokens, positions)
+            let Some(logits) = model
+                .prefill_cancellable(tokens, positions, is_cancelled)
                 .map_err(|e| NnError::Backend(e.to_string()))?
+            else {
+                return Ok(ResidentForward::Cancelled);
+            };
+            logits
         } else {
-            model
+            let base = model.cache_len();
+            let logits = model
                 .step_graph(tokens[0], positions[0])
-                .map_err(|e| NnError::Backend(e.to_string()))?
+                .map_err(|e| NnError::Backend(e.to_string()))?;
+            if is_cancelled() {
+                model
+                    .truncate_kv(base)
+                    .map_err(|e| NnError::Backend(e.to_string()))?;
+                return Ok(ResidentForward::Cancelled);
+            }
+            logits
         };
-        Ok(Some(logits))
+        Ok(ResidentForward::Complete(logits))
     }
 
     /// (cuda) One greedy decode step returning just the **argmax token id**:

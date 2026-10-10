@@ -2074,6 +2074,32 @@ impl CudaDecodeModel {
         tokens: &[u32],
         positions: &[usize],
     ) -> Result<Vec<f32>, BackendError> {
+        self.prefill_cancellable(tokens, positions, &|| false)?
+            .ok_or_else(|| BackendError::Backend("uncancelled prefill returned no output".into()))
+    }
+
+    /// Run native batched prefill with cooperative cancellation (ADR 0051).
+    ///
+    /// `None` means no output or cache-watermark advance. Already-submitted
+    /// work is synchronized before a successful cancellation returns; scratch
+    /// and provisional rows can then be safely reused. Driver errors during
+    /// that wait remain errors. Entry cancellation skips validation/allocation.
+    /// The query must be cheap, nonblocking and non-panicking. Checkpoints run
+    /// between embedding, attention/MLP launch groups and head completion; count
+    /// is unspecified. No running kernel is preempted or backend substituted.
+    /// Cancellation after the final check can race with watermark commit.
+    ///
+    /// # Errors
+    /// Same input/device errors as [`Self::prefill`], never cancellation errors.
+    pub fn prefill_cancellable(
+        &mut self,
+        tokens: &[u32],
+        positions: &[usize],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<f32>>, BackendError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
         // A cache-advancing op invalidates any uncommitted tree.
         self.pending_tree = None;
         let m = tokens.len();
@@ -2108,6 +2134,14 @@ impl CudaDecodeModel {
         }
 
         let s = &self.stream;
+        let cancelled = || -> Result<bool, BackendError> {
+            if !is_cancelled() {
+                return Ok(false);
+            }
+            s.synchronize()
+                .map_err(|error| driver_err("cancelled prefill synchronization", &error))?;
+            Ok(true)
+        };
         let (n_embd, q_width, kv_width, n_ff) =
             (self.n_embd, self.q_width, self.kv_width, self.n_ff);
         let (n_head, n_head_kv, head_dim) = (self.n_head, self.n_head_kv, self.head_dim);
@@ -2175,7 +2209,14 @@ impl CudaDecodeModel {
             &mut d_x,
         )?;
 
+        if cancelled()? {
+            return Ok(None);
+        }
+
         for li in 0..self.layers.len() {
+            if cancelled()? {
+                return Ok(None);
+            }
             // --- attention ---
             // q/k/v share one fused rmsnorm+quant of d_x (ADR 0036 L5).
             Self::bl_rmsnorm_quant(
@@ -2332,6 +2373,10 @@ impl CudaDecodeModel {
             self.matmul_m(s, &d_qact, &self.layers[li].o, &d_act_scale, m, &mut d_proj)?;
             Self::bl_residual(s, &self.f_residual, &mut d_x, &d_proj, m * n_embd)?;
 
+            if cancelled()? {
+                return Ok(None);
+            }
+
             // --- ReLU² MLP ---
             // Fused rmsnorm+quant (ADR 0036 L5).
             Self::bl_rmsnorm_quant(
@@ -2388,6 +2433,13 @@ impl CudaDecodeModel {
                 &mut d_proj,
             )?;
             Self::bl_residual(s, &self.f_residual, &mut d_x, &d_proj, m * n_embd)?;
+            if cancelled()? {
+                return Ok(None);
+            }
+        }
+
+        if cancelled()? {
+            return Ok(None);
         }
 
         // Final norm over the LAST token only, then the tied LM head (f16 table).
@@ -2421,8 +2473,11 @@ impl CudaDecodeModel {
         let mut logits = vec![0.0f32; self.vocab];
         s.memcpy_dtoh(&d_logits, &mut logits)
             .map_err(|e| driver_err("prefill logits dtoh", &e))?;
+        if cancelled()? {
+            return Ok(None);
+        }
         self.cache_len += m;
-        Ok(logits)
+        Ok(Some(logits))
     }
 
     /// Debug/test access: start a capture on the capture stream and fail it
