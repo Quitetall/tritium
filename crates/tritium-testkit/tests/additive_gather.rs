@@ -82,7 +82,7 @@ fn frozen_gather_vectors_unrotate_before_returning_rows() {
             &mut multiplied,
         )
         .unwrap();
-        for (batch, activation) in activations.chunks_exact(4).enumerate() {
+        for (batch, activation) in activations.as_chunks::<4>().0.iter().enumerate() {
             for (row, logical) in [first, second].iter().enumerate() {
                 let expected: f32 = activation.iter().zip(logical).map(|(x, w)| x * w).sum();
                 assert_eq!(multiplied[batch * 2 + row], expected);
