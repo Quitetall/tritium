@@ -77,9 +77,66 @@ def _native_probe_installation(expected_revision=None):
     }
 
 
+def _cpu_quota_diagnostics(root="/sys/fs/cgroup", membership="/proc/self/cgroup"):
+    """Bounded cgroup-v2 observations, not a capacity guarantee or admission gate."""
+    from pathlib import Path
+
+    result = {"complete": False, "observed_quota_cores": None, "scopes_read": 0}
+
+    def read(path):
+        try:
+            with path.open("rb") as stream:
+                value = stream.read(4097)
+            return value.decode("ascii") if len(value) <= 4096 else None
+        except (OSError, UnicodeError):
+            return None
+
+    content = read(Path(membership))
+    if content is None:
+        return result
+    groups = [line[3:] for line in content.splitlines() if line.startswith("0::")]
+    if len(groups) != 1 or not groups[0].startswith("/"):
+        return result
+    components = groups[0].split("/")[1:]
+    if groups[0] == "/":
+        components = []
+    if len(components) > 64 or any(part in ("", ".", "..") for part in components):
+        return result
+    try:
+        root = Path(root).resolve()
+        current = root.joinpath(*components)
+        if current.resolve() != current:
+            return result
+    except (OSError, RuntimeError):
+        return result
+
+    complete = True
+    while True:
+        value = read(current / "cpu.max")
+        fields = value.split() if value is not None else []
+        valid = len(fields) == 2 and fields[1].isascii() and fields[1].isdigit()
+        valid = valid and 0 < int(fields[1]) <= 2**64 - 1
+        if valid and fields[0] != "max":
+            valid = fields[0].isascii() and fields[0].isdigit()
+            valid = valid and 0 < int(fields[0]) <= 2**64 - 1
+        if not valid:
+            complete = False
+        else:
+            result["scopes_read"] += 1
+            if fields[0] != "max":
+                quota = int(fields[0]) / int(fields[1])
+                previous = result["observed_quota_cores"]
+                result["observed_quota_cores"] = quota if previous is None else min(previous, quota)
+        if current == root:
+            break
+        current = current.parent
+    result["complete"] = complete
+    return result
+
+
 # Embed the exact guard in the standalone installed-wheel child, without
 # importing scripts or adding the source checkout to that child's sys.path.
-_PROBE = inspect.getsource(_native_probe_installation) + r"""
+_PROBE = inspect.getsource(_native_probe_installation) + inspect.getsource(_cpu_quota_diagnostics) + r"""
 import hashlib
 import json
 import os
@@ -93,11 +150,18 @@ from tritium.torch import TernaryConfig, calibrate, convert, prepare
 installation = _native_probe_installation(os.environ.get("TRITIUM_SOURCE_REVISION"))
 native_fit = _tritium._fit_joint_ternary_diagonal_groups_with_objective
 native_work = {"calls": 0, "rows": 0}
+native_timing = {"wall_seconds": 0.0, "cpu_seconds": 0.0}
 
 def record_native_fit(*args, **kwargs):
     native_work["calls"] += 1
     native_work["rows"] += args[1]
-    return native_fit(*args, **kwargs)
+    wall_started = time.perf_counter()
+    cpu_started = time.process_time()
+    try:
+        return native_fit(*args, **kwargs)
+    finally:
+        native_timing["cpu_seconds"] += time.process_time() - cpu_started
+        native_timing["wall_seconds"] += time.perf_counter() - wall_started
 
 _tritium._fit_joint_ternary_diagonal_groups_with_objective = record_native_fit
 torch.manual_seed(31)
@@ -113,13 +177,18 @@ with tempfile.TemporaryDirectory(prefix="tritium-ptq-parallelism-") as root:
         [torch.randn(1, 256)],
         evidence_dir=f"{root}/evidence",
     )
+    # Count only work inside the measured public convert call, not preparation.
+    native_work.update(calls=0, rows=0)
+    native_timing.update(wall_seconds=0.0, cpu_seconds=0.0)
     started = time.perf_counter()
+    cpu_started = time.process_time()
     artifact = convert(
         prepared,
         evidence,
         work_dir=f"{root}/conversion",
         max_working_bytes=256 * 1024 * 1024,
     )
+    cpu_elapsed = time.process_time() - cpu_started
     elapsed = time.perf_counter() - started
     fitted = artifact.weight("weight")
     digest = hashlib.sha256()
@@ -131,12 +200,21 @@ with tempfile.TemporaryDirectory(prefix="tritium-ptq-parallelism-") as root:
         benchmark_environment["affinity_cpus"] = len(os.sched_getaffinity(0))
     if hasattr(os, "getloadavg"):
         benchmark_environment["load_average_1m"] = os.getloadavg()[0]
+    benchmark_environment["cgroup_v2"] = _cpu_quota_diagnostics()
+    benchmark_environment["python_version"] = __import__("platform").python_version()
+    benchmark_environment["torch_version"] = str(torch.__version__)
     print(json.dumps({
         "algorithm_id": artifact.algorithm_id,
         "installation": installation,
         "native_work": native_work,
         "benchmark_environment": benchmark_environment,
         "elapsed_seconds": elapsed,
+        "timing": {
+            "native_wall_seconds": native_timing["wall_seconds"],
+            "native_cpu_seconds": native_timing["cpu_seconds"],
+            "convert_cpu_seconds": cpu_elapsed,
+            "other_wall_seconds": max(0.0, elapsed - native_timing["wall_seconds"]),
+        },
         "fit_digest": digest.hexdigest(),
         "weighted_mse": fitted.weighted_mse,
     }, sort_keys=True))
@@ -191,6 +269,7 @@ class PublicPtqParallelismTests(unittest.TestCase):
             f"speedup={speedup:.2f}x "
             f"source_identity={serial['installation']['source_identity']} "
             f"fit_digest={serial['fit_digest']} native_work={serial['native_work']} "
+            f"serial_timing={serial['timing']} parallel_timing={parallel['timing']} "
             f"serial_environment={serial['benchmark_environment']} "
             f"parallel_environment={parallel['benchmark_environment']}"
         )

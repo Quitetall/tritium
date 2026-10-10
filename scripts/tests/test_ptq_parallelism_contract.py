@@ -175,5 +175,82 @@ class PtqParallelismContractTests(unittest.TestCase):
                 case.test_public_convert_parallelizes_rows_without_changing_fitted_artifact()
 
 
+class PtqPerformanceDiagnosticsTests(unittest.TestCase):
+    def test_inherited_cpu_quota_is_observed_without_reporting_private_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            group = root / "private-owner" / "worker"
+            group.mkdir(parents=True)
+            (root / "cpu.max").write_text("max 100000\n")
+            (group.parent / "cpu.max").write_text("150000 100000\n")
+            (group / "cpu.max").write_text("400000 100000\n")
+            membership = root / "membership"
+            membership.write_text("0::/private-owner/worker\n")
+            result = MODULE._cpu_quota_diagnostics(root, membership)
+            self.assertTrue(result["complete"])
+            self.assertEqual(result["observed_quota_cores"], 1.5)
+            self.assertEqual(result["scopes_read"], 3)
+            self.assertNotIn("private-owner", str(result))
+
+    def test_missing_and_malformed_quota_are_unknown_not_unlimited(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            membership = root / "membership"
+            membership.write_text("0::/\n")
+            for index, value in enumerate((None, "max 0", "-1 100000", "4", "4 2 extra", "x" * 4097)):
+                with self.subTest(index=index):
+                    path = root / "cpu.max"
+                    if value is None:
+                        path.unlink(missing_ok=True)
+                    else:
+                        path.write_text(value)
+                    result = MODULE._cpu_quota_diagnostics(root, membership)
+                    self.assertFalse(result["complete"])
+                    self.assertIsNone(result["observed_quota_cores"])
+
+    def test_unlimited_and_partial_ancestry_are_distinct(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            membership = root / "membership"
+            membership.write_text("0::/worker\n")
+            (root / "worker").mkdir()
+            (root / "worker" / "cpu.max").write_text("max 100000\n")
+            partial = MODULE._cpu_quota_diagnostics(root, membership)
+            self.assertFalse(partial["complete"])
+            self.assertEqual(partial["scopes_read"], 1)
+            (root / "cpu.max").write_text("max 100000\n")
+            complete = MODULE._cpu_quota_diagnostics(root, membership)
+            self.assertTrue(complete["complete"])
+            self.assertIsNone(complete["observed_quota_cores"])
+
+    def test_unsafe_or_overdeep_membership_is_not_followed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            membership = root / "membership"
+            for index, value in enumerate(("0::/../outside", "0::relative", "0::/" + "/".join(["x"] * 65),
+                                           "0::/\n0::/second", "x" * 4097)):
+                with self.subTest(index=index):
+                    membership.write_text(value)
+                    self.assertEqual(MODULE._cpu_quota_diagnostics(root, membership), {
+                        "complete": False, "observed_quota_cores": None, "scopes_read": 0,
+                    })
+
+    def test_failed_speedup_remains_a_failure_with_diagnostics(self):
+        case = MODULE.PublicPtqParallelismTests(
+            "test_public_convert_parallelizes_rows_without_changing_fitted_artifact"
+        )
+        common = {
+            "algorithm_id": "fixture", "fit_digest": "fixture", "weighted_mse": 0,
+            "installation": {"source_identity": "fixture"},
+            "native_work": {"calls": 1, "rows": 2048},
+            "benchmark_environment": {}, "timing": {},
+        }
+        serial = {**common, "elapsed_seconds": 1.39}
+        parallel = {**common, "elapsed_seconds": 1.0}
+        with mock.patch.object(case, "_convert", side_effect=(serial, parallel)):
+            with self.assertRaisesRegex(AssertionError, "not greater than or equal to 1.5"):
+                case.test_public_convert_parallelizes_rows_without_changing_fitted_artifact()
+
+
 if __name__ == "__main__":
     unittest.main()
