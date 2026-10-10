@@ -206,6 +206,12 @@ verify_no_std_foundations() {
     # proves compilation only, never physical MCU conformance/performance.
     run cargo check --locked -p tritium-schema -p tritium-core \
         --no-default-features --lib --target thumbv7em-none-eabihf
+    # Optional serialization must remain no_std too; a host-only feature-unified
+    # build can hide a serde dependency that incorrectly enables std.
+    run cargo check --locked -p tritium-core --no-default-features \
+        --features serde --lib --target thumbv7em-none-eabihf
+    run cargo check --locked -p tritium-core --no-default-features \
+        --features alloc,serde --lib --target thumbv7em-none-eabihf
 }
 
 case "$tier" in
