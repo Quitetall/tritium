@@ -2,10 +2,13 @@
 //! `/healthz` liveness and `/readyz` traffic readiness, with backpressure and a
 //! drain flag for graceful shutdown.
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::http::{HeaderValue, Method, StatusCode, header};
@@ -15,7 +18,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use opentelemetry::Context;
 use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing_futures::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tritium_nn::Tokenizer;
@@ -116,8 +119,10 @@ pub struct ServeConfig {
     /// body polling, starting at queue admission; expiry emits a typed error event and
     /// cancels generation. `0` disables both deadlines.
     pub request_timeout_secs: u64,
-    /// Global in-flight request cap (DoS bound on handler memory/FDs).
-    /// 0 disables.
+    /// Router-wide ordinary-request cap, held through response-body completion
+    /// or drop. Authenticated GET health/readiness/metrics share one additional
+    /// reserved slot so generation saturation cannot starve probes (ADR 0050).
+    /// This is not an accepted-socket limit. `0` disables both budgets.
     pub max_concurrent_requests: usize,
     /// When set, every request must carry `Authorization: Bearer <token>`.
     /// Required by `main` when binding beyond loopback.
@@ -912,6 +917,88 @@ fn build_router_batched_inner(
     ))
 }
 
+/// Shared across routes and router clones, unlike a per-route service layer.
+struct RequestBudget {
+    ordinary: Arc<Semaphore>,
+    probes: Arc<Semaphore>,
+}
+
+impl RequestBudget {
+    fn new(cap: usize) -> Self {
+        Self {
+            ordinary: Arc::new(Semaphore::new(cap)),
+            probes: Arc::new(Semaphore::new(1)),
+        }
+    }
+
+    fn try_acquire(
+        &self,
+        method: &Method,
+        path: &str,
+    ) -> Result<OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
+        let probe = method == Method::GET && matches!(path, "/healthz" | "/readyz" | "/metrics");
+        // Normal scrape concurrency uses the shared budget. Only exhausted
+        // ordinary capacity invokes the one-slot reserve; otherwise routine
+        // concurrent collectors would be unnecessarily serialized.
+        self.ordinary.clone().try_acquire_owned().or_else(|error| {
+            if probe {
+                self.probes.clone().try_acquire_owned()
+            } else {
+                Err(error)
+            }
+        })
+    }
+}
+
+/// Retain admission ownership without a relay, body copy or trailer loss.
+struct AdmissionBody {
+    inner: Body,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl HttpBody for AdmissionBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let frame = Pin::new(&mut self.inner).poll_frame(cx);
+        let finished = match &frame {
+            Poll::Ready(None | Some(Err(_))) => true,
+            Poll::Ready(Some(Ok(_))) => self.inner.is_end_stream(),
+            Poll::Pending => false,
+        };
+        if finished {
+            self.permit.take();
+        }
+        frame
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+fn hold_request_permit(response: Response, permit: OwnedSemaphorePermit) -> Response {
+    if response.body().is_end_stream() {
+        return response; // `permit` is dropped for an already-empty body.
+    }
+    let (parts, inner) = response.into_parts();
+    Response::from_parts(
+        parts,
+        Body::new(AdmissionBody {
+            inner,
+            permit: Some(permit),
+        }),
+    )
+}
+
 fn build_router_inner(
     jobs: tokio::sync::mpsc::Sender<crate::worker::Job>,
     tok: Arc<dyn Tokenizer + Send + Sync>,
@@ -945,7 +1032,7 @@ fn build_router_inner(
         .route("/metrics", get(metrics))
         .route("/v1/tree/session", post(tree_session))
         .route("/v1/tree/verify", post(tree_verify))
-        .with_state(state)
+        .with_state(state.clone())
         // Explicit request-body cap (axum's default, stated rather than
         // implied — threat-model DoS bound).
         .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024));
@@ -967,11 +1054,58 @@ fn build_router_inner(
         ));
     }
     if cfg.max_concurrent_requests > 0 {
-        // Global in-flight cap: bounds handler memory/FD growth under
-        // connection floods (threat-model slowloris item; the accept loop
-        // itself remains unbounded — documented residual).
-        router = router.layer(tower::limit::ConcurrencyLimitLayer::new(
-            cfg.max_concurrent_requests,
+        let budget = Arc::new(RequestBudget::new(cfg.max_concurrent_requests));
+        let request_state = Arc::new(state);
+        router = router.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let budget = budget.clone();
+                let request_state = request_state.clone();
+                async move {
+                    // Preserve fail-closed readiness/drain classification even
+                    // when retained responses exhaust ordinary capacity.
+                    if is_model_work(req.method(), req.uri().path()) {
+                        if request_state.runtime.draining.load(Ordering::Acquire) {
+                            let kind = if req.uri().path() == "/v1/chat/completions" {
+                                "server_error"
+                            } else {
+                                "draining"
+                            };
+                            return api_error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                kind,
+                                "server is draining",
+                                None,
+                            );
+                        }
+                        if !request_ready(&request_state) {
+                            return api_error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "server_error",
+                                "server is not ready",
+                                None,
+                            );
+                        }
+                    }
+                    let permit = match budget.try_acquire(req.method(), req.uri().path()) {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            let mut error = ApiError::new(
+                                "rate_limit_exceeded",
+                                "in-flight request capacity exceeded; retry later",
+                                None,
+                            );
+                            error.error.code = Some("rate_limit_exceeded".to_owned());
+                            let mut response =
+                                (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response();
+                            response
+                                .headers_mut()
+                                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                            return response;
+                        }
+                    };
+                    hold_request_permit(next.run(req).await, permit)
+                }
+            },
         ));
     }
     // Authentication and admission share one bounded principal resolution.
@@ -1032,11 +1166,7 @@ fn build_router_inner(
                             response
                         }
                         Some(principal) => {
-                            let governed = req.method() == axum::http::Method::POST
-                                && matches!(
-                                    req.uri().path(),
-                                    "/v1/chat/completions" | "/v1/tree/session" | "/v1/tree/verify"
-                                );
+                            let governed = is_model_work(req.method(), req.uri().path());
                             if governed
                                 && let AdmissionDecision::Reject { retry_after_secs } =
                                     admission.admit(principal)
@@ -1219,6 +1349,14 @@ fn method_class(method: &Method) -> &'static str {
         Method::POST => "POST",
         _ => "OTHER",
     }
+}
+
+fn is_model_work(method: &Method, path: &str) -> bool {
+    method == Method::POST
+        && matches!(
+            path,
+            "/v1/chat/completions" | "/v1/tree/session" | "/v1/tree/verify"
+        )
 }
 
 fn route_class(method: &Method, path: &str) -> &'static str {
@@ -2556,7 +2694,108 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    #[test]
+    fn request_budget_reserves_only_exact_get_probe_routes() {
+        let budget = RequestBudget::new(1);
+        let ordinary = budget.try_acquire(&Method::GET, "/v1/models").unwrap();
+        assert!(budget.try_acquire(&Method::POST, "/healthz").is_err());
+        assert!(budget.try_acquire(&Method::GET, "/metrics/extra").is_err());
+        let probe = budget.try_acquire(&Method::GET, "/readyz").unwrap();
+        assert!(budget.try_acquire(&Method::GET, "/healthz").is_err());
+        assert!(
+            budget
+                .try_acquire(&Method::POST, "/v1/tree/verify")
+                .is_err()
+        );
+        drop(probe);
+        assert!(budget.try_acquire(&Method::GET, "/metrics").is_ok());
+        drop(ordinary);
+        assert!(
+            budget
+                .try_acquire(&Method::POST, "/v1/tree/session")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn request_budget_probes_use_idle_capacity_before_the_reserve() {
+        let budget = RequestBudget::new(8);
+        let mut held = Vec::new();
+        for _ in 0..8 {
+            held.push(budget.try_acquire(&Method::GET, "/metrics").unwrap());
+        }
+        assert_eq!(budget.ordinary.available_permits(), 0);
+        assert_eq!(budget.probes.available_permits(), 1);
+        held.push(budget.try_acquire(&Method::GET, "/healthz").unwrap());
+        assert_eq!(budget.probes.available_permits(), 0);
+        assert!(budget.try_acquire(&Method::GET, "/readyz").is_err());
+        assert!(budget.try_acquire(&Method::GET, "/v1/models").is_err());
+        drop(held);
+        assert_eq!(budget.ordinary.available_permits(), 8);
+        assert_eq!(budget.probes.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn admission_body_preserves_trailers_and_releases_at_eof() {
+        let budget = RequestBudget::new(1);
+        let permit = budget.try_acquire(&Method::GET, "/v1/models").unwrap();
+        let frames = async_stream::stream! {
+            yield Ok::<_, std::io::Error>(http_body::Frame::data(Bytes::from_static(b"fixture")));
+            let mut trailers = axum::http::HeaderMap::new();
+            trailers.insert("x-fixture-trailer", HeaderValue::from_static("preserved"));
+            yield Ok(http_body::Frame::trailers(trailers));
+        };
+        let inner = Body::new(http_body_util::StreamBody::new(frames));
+        let mut body = hold_request_permit(Response::new(inner), permit).into_body();
+        assert_eq!(budget.ordinary.available_permits(), 0);
+        let data = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(data, Bytes::from_static(b"fixture"));
+        assert_eq!(budget.ordinary.available_permits(), 0);
+        let trailers = body
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_trailers()
+            .unwrap();
+        assert_eq!(trailers["x-fixture-trailer"], "preserved");
+        assert!(body.frame().await.is_none());
+        assert_eq!(budget.ordinary.available_permits(), 1);
+        drop(body);
+        assert_eq!(budget.ordinary.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn admission_body_releases_on_error_without_waiting_for_drop() {
+        let budget = RequestBudget::new(1);
+        let permit = budget.try_acquire(&Method::GET, "/v1/models").unwrap();
+        let inner = Body::from_stream(async_stream::stream! {
+            yield Err::<Bytes, _>(std::io::Error::other("fixture body failure"));
+        });
+        let mut body = hold_request_permit(Response::new(inner), permit).into_body();
+        assert_eq!(budget.ordinary.available_permits(), 0);
+        assert!(body.frame().await.unwrap().is_err());
+        assert_eq!(budget.ordinary.available_permits(), 1);
+        drop(body);
+        assert_eq!(budget.ordinary.available_permits(), 1);
+    }
+
+    #[test]
+    fn admission_body_empty_and_unpolled_drop_release_exactly_once() {
+        let budget = RequestBudget::new(1);
+        let permit = budget.try_acquire(&Method::GET, "/v1/models").unwrap();
+        let empty = hold_request_permit(Response::new(Body::empty()), permit);
+        assert_eq!(budget.ordinary.available_permits(), 1);
+        drop(empty);
+        let permit = budget.try_acquire(&Method::GET, "/v1/models").unwrap();
+        let unpolled = hold_request_permit(Response::new(Body::from("fixture")), permit);
+        assert_eq!(budget.ordinary.available_permits(), 0);
+        drop(unpolled);
+        assert_eq!(budget.ordinary.available_permits(), 1);
+    }
 
     #[test]
     fn queue_depth_includes_the_worker_owned_parked_job() {

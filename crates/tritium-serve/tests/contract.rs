@@ -1715,6 +1715,278 @@ async fn queued_sse_disconnect_skips_prefill_and_recovers() {
     );
 }
 
+#[tokio::test]
+async fn inflight_cap_retains_unpolled_sse_until_body_drop() {
+    let (router, _) = router_with(MockGenerator::new(vec![10]), {
+        let mut config = ServeConfig::default();
+        config.max_concurrent_requests = 1;
+        config.request_timeout_secs = 0;
+        config
+    });
+    let request = || {
+        chat(json!({
+            "model": "tritium",
+            "messages": [{"role": "user", "content": "1"}],
+            "max_tokens": 1,
+            "stream": true
+        }))
+    };
+    let first = router.clone().oneshot(request()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    // Keep the body alive without polling it. Returning headers is not the
+    // end of this request's memory/FD ownership.
+    let first_body = first.into_body();
+    let second = tokio::time::timeout(Duration::from_secs(2), router.clone().oneshot(request()))
+        .await
+        .expect("an exhausted in-flight budget must reject without an unbounded wait")
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "SSE headers must not release the in-flight request slot"
+    );
+    assert_eq!(second.headers()["retry-after"], "1");
+    let error: Value =
+        serde_json::from_slice(&second.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(error["error"]["code"], "rate_limit_exceeded");
+    drop(first_body);
+    let third = tokio::time::timeout(Duration::from_secs(2), router.clone().oneshot(request()))
+        .await
+        .expect("dropping the body must release its slot")
+        .unwrap();
+    assert_eq!(third.status(), StatusCode::OK);
+    let events = parse_sse(&third.into_body().collect().await.unwrap().to_bytes());
+    assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
+}
+
+#[tokio::test]
+async fn inflight_cap_shared_by_model_listing_and_chat() {
+    let (router, _) = router_with(MockGenerator::new(vec![10]), {
+        let mut config = ServeConfig::default();
+        config.max_concurrent_requests = 1;
+        config.request_timeout_secs = 0;
+        config
+    });
+    let listing = router
+        .clone()
+        .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(listing.status(), StatusCode::OK);
+    // No generation has run: worker completion cannot explain this slot's
+    // lifetime. Different routes must share the configured request budget.
+    let response = router
+        .clone()
+        .oneshot(chat(json!({
+            "model": "tritium",
+            "messages": [{"role": "user", "content": "1"}],
+            "max_tokens": 1
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    drop(listing);
+}
+
+#[tokio::test]
+async fn inflight_cap_releases_consumed_sse_without_body_drop() {
+    let (router, _) = router_with(MockGenerator::new(vec![10]), {
+        let mut config = ServeConfig::default();
+        config.max_concurrent_requests = 1;
+        config
+    });
+    let request = || {
+        chat(json!({
+            "model": "tritium",
+            "messages": [{"role": "user", "content": "1"}],
+            "max_tokens": 1,
+            "stream": true
+        }))
+    };
+    let first = router.clone().oneshot(request()).await.unwrap();
+    let mut retained_body = first.into_body();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(frame) = retained_body.frame().await {
+            frame.unwrap();
+        }
+    })
+    .await
+    .expect("one-token stream must finish");
+    let next = router.clone().oneshot(request()).await.unwrap();
+    assert_eq!(next.status(), StatusCode::OK);
+    // EOF, not Rust body destruction, must have released the permit.
+    drop(retained_body);
+}
+
+#[tokio::test]
+async fn inflight_cap_keeps_authenticated_probes_bounded_and_available() {
+    let (router, _) = router_with(MockGenerator::new(vec![10]), {
+        let mut config = ServeConfig::default();
+        config.max_concurrent_requests = 1;
+        config.auth_token = Some("fixture-key".to_owned());
+        config
+    });
+    let get = |path: &str, token: &str| {
+        Request::get(path)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let ordinary = router
+        .clone()
+        .oneshot(get("/v1/models", "fixture-key"))
+        .await
+        .unwrap();
+    assert_eq!(ordinary.status(), StatusCode::OK);
+    for path in ["/healthz", "/readyz", "/metrics"] {
+        let (status, _) = send(&router, get(path, "fixture-key")).await;
+        assert_eq!(status, StatusCode::OK, "probe starved: {path}");
+    }
+    let probe = router
+        .clone()
+        .oneshot(get("/metrics", "fixture-key"))
+        .await
+        .unwrap();
+    assert_eq!(probe.status(), StatusCode::OK);
+    let (status, bytes) = send(&router, get("/healthz", "fixture-key")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let error: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(error["error"]["code"], "rate_limit_exceeded");
+    let (status, _) = send(&router, get("/healthz", "wrong-key")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    drop(probe);
+    let (status, _) = send(&router, get("/healthz", "fixture-key")).await;
+    assert_eq!(status, StatusCode::OK);
+    drop(ordinary);
+    let (status, _) = send(&router, get("/v1/models", "fixture-key")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn inflight_cap_releases_cancelled_body_extraction() {
+    let (router, _) = router_with(MockGenerator::new(vec![10]), {
+        let mut config = ServeConfig::default();
+        config.max_concurrent_requests = 1;
+        config.request_timeout_secs = 0;
+        config
+    });
+    let entered = Arc::new(AtomicBool::new(false));
+    let entered_body = entered.clone();
+    let body = Body::from_stream(async_stream::stream! {
+        entered_body.store(true, Ordering::SeqCst);
+        std::future::pending::<()>().await;
+        yield Ok::<_, std::io::Error>(axum::body::Bytes::new());
+    });
+    let request = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(body)
+        .unwrap();
+    let task = tokio::spawn(router.clone().oneshot(request));
+    wait_flag(&entered).await;
+    let (status, _) = send(
+        &router,
+        Request::get("/v1/models").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let (status, _) = send(
+        &router,
+        chat(json!({
+            "model": "tritium",
+            "messages": [{"role": "user", "content": "1"}],
+            "max_tokens": 1
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn inflight_cap_probes_use_idle_capacity_before_the_reserve() {
+    let (router, _) = router_with(MockGenerator::new(vec![10]), {
+        let mut config = ServeConfig::default();
+        config.max_concurrent_requests = 8;
+        config
+    });
+    let mut held = Vec::new();
+    // The frozen deployment matrix uses eight concurrent metric collectors.
+    // A one-slot probe reserve must not serialize ordinary idle capacity.
+    for _ in 0..9 {
+        let response = router
+            .clone()
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        held.push(response);
+    }
+    let (status, _) = send(
+        &router,
+        Request::get("/healthz").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    drop(held);
+    let (status, _) = send(
+        &router,
+        Request::get("/v1/models").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn inflight_cap_saturation_does_not_mask_drain() {
+    let (router, draining) = router_with(MockGenerator::new(vec![10]), {
+        let mut config = ServeConfig::default();
+        config.max_concurrent_requests = 1;
+        config
+    });
+    let held = router
+        .clone()
+        .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(held.status(), StatusCode::OK);
+    draining.store(true, Ordering::Release);
+    for path in [
+        "/v1/chat/completions",
+        "/v1/tree/session",
+        "/v1/tree/verify",
+    ] {
+        let request = Request::post(path)
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let (status, bytes) = send(&router, request).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        let error: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["error"]["message"], "server is draining");
+    }
+    drop(held);
+}
+
+#[tokio::test]
+async fn inflight_cap_zero_disables_ordinary_and_probe_budgets() {
+    let (router, _) = router_with(MockGenerator::new(vec![10]), {
+        let mut config = ServeConfig::default();
+        config.max_concurrent_requests = 0;
+        config
+    });
+    let mut held = Vec::new();
+    for path in ["/v1/models", "/v1/models", "/metrics", "/metrics"] {
+        let response = router
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        held.push(response);
+    }
+}
+
 /// Non-streaming requests are bounded by the request timeout: the handler
 /// awaits the full aggregation, so a generation slower than the deadline
 /// surfaces as 408.

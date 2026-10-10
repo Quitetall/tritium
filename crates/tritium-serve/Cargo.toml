@@ -35,6 +35,7 @@ axum = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 async-stream = { workspace = true, optional = true }
 futures-core = { workspace = true, optional = true }
+http-body = { workspace = true, optional = true }
 # A backend must be linked for the binary to actually serve a model.
 tritium-cpu = { workspace = true, optional = true }
 tritium-cuda = { workspace = true, optional = true, features = ["cuda"] }
@@ -43,7 +44,7 @@ tritium-format = { workspace = true, optional = true }
 
 [features]
 default = []
-serve = ["dep:tokio", "dep:axum", "dep:tower", "dep:async-stream", "dep:futures-core", "dep:blake3", "dep:getrandom", "dep:opentelemetry", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk", "dep:tracing", "dep:tracing-futures", "dep:tracing-opentelemetry", "dep:tracing-subscriber", "dep:tritium-cpu", "dep:tritium-runtime", "dep:tritium-format", "tritium-nn/tokenizer"]
+serve = ["dep:tokio", "dep:axum", "dep:tower", "dep:async-stream", "dep:futures-core", "dep:http-body", "dep:blake3", "dep:getrandom", "dep:opentelemetry", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk", "dep:tracing", "dep:tracing-futures", "dep:tracing-opentelemetry", "dep:tracing-subscriber", "dep:tritium-cpu", "dep:tritium-runtime", "dep:tritium-format", "tritium-nn/tokenizer"]
 # Link the CUDA backend so `--backend cuda` can resolve (needs nvcc at build time).
 cuda = ["serve", "dep:tritium-cuda", "tritium-nn/cuda"]
 # CUDA release-image-only fault gate; omitted from normal library/server builds.

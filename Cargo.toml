@@ -144,6 +144,7 @@ tokio = { version = "1", default-features = false, features = ["rt-multi-thread"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 async-stream = "0.3"
 futures-core = "0.3"
+http-body = "1"
 http-body-util = "0.1"
 tower = { version = "0.5", default-features = false, features = ["util", "limit"] }
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }

@@ -4914,6 +4914,7 @@ dependencies = [
  "blake3",
  "futures-core",
  "getrandom 0.3.4",
+ "http-body",
  "http-body-util",
  "opentelemetry",
  "opentelemetry-otlp",
