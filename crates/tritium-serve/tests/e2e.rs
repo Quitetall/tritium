@@ -1,6 +1,7 @@
 //! Real-model end-to-end smoke test (manual, gated). Mirrors tritium-nn's
 //! acceptance gating: compile with `--features e2e` AND set `TRITIUM_SERVE_E2E=1`
 //! + `TRITIUM_MODEL_PATH=<gguf>` or `TRITIUM_CONVERTED_PATH=<directory>`.
+//!
 //! Explicit selection without opt-in fails; default CI leaves these ignored.
 #![cfg(feature = "e2e")]
 
