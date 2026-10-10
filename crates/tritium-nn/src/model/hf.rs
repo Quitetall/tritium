@@ -2,11 +2,13 @@
 //!
 //! - [`ModelWeights::load_hf`] (plan 0035): fp model from `config.json` + safetensors —
 //!   exact-fp dense projections ([`DenseLinear::new_exact`]).
+//! - [`ModelWeights::load_hf_admitted`] (ADR 0044): the same model skeleton with
+//!   backend-owned tensors, shared payload admission and registered upload evidence.
 //! - [`ModelWeights::load_salt`] (plan 0036): a **SALT-quantized** model — ternary 2D weights
 //!   retained as packed additive planes, including one shared packed embedding/tied-head table,
 //!   with 1D norms + config from the original model dir.
 //!
-//! All loading paths — these two AND the BitNet GGUF path
+//! All loading paths — these AND the BitNet GGUF path
 //! ([`ModelWeights::load`], P2e) — share [`build_standard_model`], the one
 //! config-driven skeleton, each supplying its [`NameSchema`] dialect and
 //! projection provider.
@@ -27,12 +29,84 @@ use crate::config::{ArchSpec, MlpKind, ModelConfig};
 use crate::error::NnError;
 use crate::layers::{
     DenseLinear, Mlp, PackedSaltMatrix, PackedSaltMatrixBuilder, Projection, Relu2Mlp, SaltLinear,
-    SwiGluMlp, TokenEmbedding, TransformerBlock,
+    SwiGluMlp, TensorLoader, TokenEmbedding, TransformerBlock,
 };
 use crate::model::ModelWeights;
 use crate::model::hf_shards::HfShardSet;
 
 impl ModelWeights {
+    /// Load HF weights into shared admitted backend tensors (ADR 0044 D8-D10).
+    ///
+    /// Every 2D weight is seek-read, validated, uploaded and then released on the
+    /// host. Embedding and a tied head share one handle. Norms and optional bias
+    /// remain host vectors. The weight budget excludes these vectors, source
+    /// decoding, scratch, KV caches and driver overhead. Upload events are
+    /// observations, not whole-model load or release verdicts.
+    ///
+    /// This opt-in migration path leaves [`Self::load_hf`] available as an
+    /// inspectable dense master for fitting/training and parity checks.
+    ///
+    /// # Errors
+    /// Configuration, shard, geometry, capability, budget or evidence errors.
+    /// A failed assembly drops all unpublished handles and their budget leases.
+    pub fn load_hf_admitted(
+        dir: &Path,
+        loader: &mut TensorLoader<'_>,
+    ) -> Result<(ModelConfig, ArchSpec, ModelWeights), NnError> {
+        let (config, spec, shards, declared_vocab) = open_hf_standard(dir)?;
+        if config.n_embd == 0 {
+            return Err(NnError::MissingConfig("hidden size must be nonzero".into()));
+        }
+        let values = shards.tensor_f32_matrix(
+            NameSchema::Hf.top("token_embd"),
+            declared_vocab,
+            config.n_embd as usize,
+        )?;
+        let rows = values.len() / config.n_embd as usize;
+        let embedding = loader.upload(
+            NameSchema::Hf.top("token_embd"),
+            tritium_spec::TensorView::Dense {
+                rows,
+                cols: config.n_embd as usize,
+                values: &values,
+            },
+        )?;
+        drop(values);
+        let get = |name: &str, request: DenseTensorRequest| match request {
+            DenseTensorRequest::Vector { len } => {
+                let values = shards.tensor_f32_exact(name, &[len])?;
+                if values.iter().any(|value| !value.is_finite()) {
+                    return Err(NnError::Backend(format!("{name}: non-finite model vector")));
+                }
+                Ok(values)
+            }
+            DenseTensorRequest::TokenEmbedding { .. } => Err(NnError::Backend(
+                "embedding is already bound to its admitted tensor".into(),
+            )),
+        };
+        let weights = build_standard_model_with_embedding(
+            &config,
+            &spec,
+            NameSchema::Hf,
+            TokenEmbedding::from_linear(embedding),
+            get,
+            |name, rows, cols| {
+                let values = shards.tensor_f32_exact(name, &[rows, cols])?;
+                loader
+                    .upload(
+                        name,
+                        tritium_spec::TensorView::Dense {
+                            rows,
+                            cols,
+                            values: &values,
+                        },
+                    )
+                    .map(Projection::Tensor)
+            },
+        )?;
+        Ok((config, spec, weights))
+    }
+
     /// Load a standard-transformer fp model from a directory holding `config.json` and
     /// (possibly sharded) `*.safetensors`. Returns the parsed [`ModelConfig`] + [`ArchSpec`]
     /// alongside the weights.
@@ -42,18 +116,7 @@ impl ModelWeights {
     /// schema tensor absent, malformed, or unreadable), or [`NnError::Shape`] (a projection shape
     /// mismatch).
     pub fn load_hf(dir: &Path) -> Result<(ModelConfig, ArchSpec, ModelWeights), NnError> {
-        let cfg_path = dir.join("config.json");
-        let cfg_json = read_config_json(&cfg_path)?;
-        let (config, mut spec) = ModelConfig::from_hf_config(&cfg_json)?;
-        let config_value: serde_json::Value = serde_json::from_str(&cfg_json)
-            .map_err(|error| NnError::MissingConfig(format!("invalid config.json: {error}")))?;
-        let declared_vocab = declared_vocab_size(&config_value)?;
-
-        let shards = HfShardSet::open(dir)?;
-        // Detect Qwen-family features from the actual weights (config flags don't always
-        // advertise them) and enable them: Qwen2/2.5 QKV bias, Qwen3 per-head QK-norm.
-        (spec.qkv_bias, spec.qk_norm) =
-            resolve_optional_attention_weights(&config, &config_value, &shards)?;
+        let (config, spec, shards, declared_vocab) = open_hf_standard(dir)?;
         let get = |name: &str, request: DenseTensorRequest| -> Result<Vec<f32>, NnError> {
             match request {
                 DenseTensorRequest::Vector { len } => shards.tensor_f32_exact(name, &[len]),
@@ -617,6 +680,20 @@ pub(crate) fn build_standard_model_with_embedding(
     })
 }
 
+fn open_hf_standard(
+    dir: &Path,
+) -> Result<(ModelConfig, ArchSpec, HfShardSet, Option<usize>), NnError> {
+    let cfg_json = read_config_json(&dir.join("config.json"))?;
+    let (config, mut spec) = ModelConfig::from_hf_config(&cfg_json)?;
+    let config_value: serde_json::Value = serde_json::from_str(&cfg_json)
+        .map_err(|error| NnError::MissingConfig(format!("invalid config.json: {error}")))?;
+    let declared_vocab = declared_vocab_size(&config_value)?;
+    let shards = HfShardSet::open(dir)?;
+    (spec.qkv_bias, spec.qk_norm) =
+        resolve_optional_attention_weights(&config, &config_value, &shards)?;
+    Ok((config, spec, shards, declared_vocab))
+}
+
 pub(super) fn declared_vocab_size(config: &serde_json::Value) -> Result<Option<usize>, NnError> {
     let Some(value) = config.get("vocab_size") else {
         return Ok(None);
@@ -1024,6 +1101,7 @@ mod tests {
                 assert!(linear.packed_bytes() > 0);
             }
             Projection::Dense(_)
+            | Projection::Tensor(_)
             | Projection::Ternary(_)
             | Projection::Q2(_)
             | Projection::HostSaltV2(_) => {

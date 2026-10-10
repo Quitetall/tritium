@@ -12,14 +12,15 @@
 
 use std::path::Path;
 
-use tritium_spec::TernaryBackend;
+use tritium_runtime::{TensorPayloadBudget, TensorUploadContext};
+use tritium_spec::{TensorUploadPolicy, TernaryBackend};
 
 use crate::config::ModelConfig;
 use crate::error::NnError;
 #[cfg(feature = "cuda")]
 use crate::error::ResidentOpError;
 use crate::kv_cache::KvCache;
-use crate::layers::{BlockDump, BlockScratch};
+use crate::layers::{BlockDump, BlockScratch, TensorLoader};
 #[cfg(feature = "cuda")]
 use crate::model::SaltV2ModelAllocationReceipt;
 use crate::model::weights::ModelWeights;
@@ -165,6 +166,28 @@ impl ModelRunner {
     /// unsupported arch, shape mismatch).
     pub fn from_hf(dir: &Path, backend: Box<dyn TernaryBackend>) -> Result<Self, NnError> {
         let (config, _spec, weights) = ModelWeights::load_hf(dir)?;
+        Self::try_from_weights(config, weights, backend)
+    }
+
+    /// Load and execute HF weights through the shared admitted tensor interface.
+    ///
+    /// See [`ModelWeights::load_hf_admitted`] for scope and memory accounting.
+    /// This opt-in host-orchestrated path does not change the resident CUDA
+    /// decoder or promise its performance. A tied head shares the embedding.
+    ///
+    /// # Errors
+    /// HF loading, upload admission/evidence or KV metadata construction errors.
+    pub fn from_hf_admitted(
+        dir: &Path,
+        backend: Box<dyn TernaryBackend>,
+        policy: TensorUploadPolicy,
+        budget: &TensorPayloadBudget,
+        context: TensorUploadContext<'_>,
+    ) -> Result<Self, NnError> {
+        let (config, _spec, weights) = {
+            let mut loader = TensorLoader::new(backend.as_ref(), policy, budget, context);
+            ModelWeights::load_hf_admitted(dir, &mut loader)?
+        };
         Self::try_from_weights(config, weights, backend)
     }
 

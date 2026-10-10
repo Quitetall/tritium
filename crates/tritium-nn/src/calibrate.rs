@@ -48,12 +48,13 @@ pub struct Arch {
     pub n_layers: usize,
 }
 
-/// Unwrap a `Dense` projection to `(weights, n_out, k_in)`. Panics on any compact projection:
+/// Unwrap a `Dense` projection to `(weights, n_out, k_in)`. Panics on compact or backend-owned weights:
 /// calibration reads the fp master, so a quantized model is a caller error, not a runtime case.
 pub fn dense(p: &Projection) -> (Vec<f32>, usize, usize) {
     match p {
         Projection::Dense(d) => (d.weights.clone(), d.n_out, d.k_in),
         Projection::Salt(_)
+        | Projection::Tensor(_)
         | Projection::HostSaltV2(_)
         | Projection::Ternary(_)
         | Projection::Q2(_) => {
