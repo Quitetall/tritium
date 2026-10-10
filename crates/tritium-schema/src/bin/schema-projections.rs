@@ -9,10 +9,10 @@ use schemars::JsonSchema;
 use tritium_schema::{
     AdditiveLayout, AdmittedLaw, Basis, BlobId, BlobReference, EvidenceEnvelope, EvidenceReference,
     LayoutError, LegacyModelIdentity, Level, LevelFit, ManifestAsset, ModelId, ModelManifest,
-    ModelShard, PackageId, PlaneAllocation, PlaneCodec, PlaneCounts, PlaneRelation, ScaleAnchor,
-    ScaleLaw, ScalePrecision, SchemaId, SemanticTensorDigest, TensorCaps, TensorExecution,
-    TensorMeta, TensorStorage, TensorUploadPolicy, TensorUploaded, Transport, UnknownReason,
-    Verdict,
+    ModelSemanticMeta, ModelShard, NamedAssetDigest, NamedTensorDigest, PackageId, PlaneAllocation,
+    PlaneCodec, PlaneCounts, PlaneRelation, ScaleAnchor, ScaleLaw, ScalePrecision, SchemaId,
+    SemanticTensorDigest, TensorCaps, TensorExecution, TensorMeta, TensorSemanticMeta,
+    TensorStorage, TensorUploadPolicy, TensorUploaded, Transport, UnknownReason, Verdict,
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -71,6 +71,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     project!(PlaneCounts, "plane-counts");
     project!(TensorMeta, "tensor-meta");
     project!(TensorStorage, "tensor-storage");
+    project!(TensorSemanticMeta, "tensor-semantic-meta");
+    project!(ModelSemanticMeta, "model-semantic-meta");
+    project!(NamedAssetDigest, "named-asset-digest");
+    project!(NamedTensorDigest, "named-tensor-digest");
 
     Ok(())
 }

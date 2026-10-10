@@ -16,6 +16,11 @@ mod model;
 #[cfg(feature = "alloc")]
 pub use model::*;
 
+#[cfg(feature = "alloc")]
+mod semantic;
+#[cfg(feature = "alloc")]
+pub use semantic::*;
+
 /// Precision used to store additive plane scales.
 #[non_exhaustive]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
@@ -401,7 +406,10 @@ macro_rules! digest_id {
     };
 }
 
-digest_id!(ModelId, "Content identity for a Tritium model manifest.");
+digest_id!(
+    ModelId,
+    "Content identity for one Tritium model level, not its package or provenance."
+);
 digest_id!(PackageId, "Content identity for a Tritium package.");
 digest_id!(BlobId, "Content identity for stored tensor or asset bytes.");
 digest_id!(

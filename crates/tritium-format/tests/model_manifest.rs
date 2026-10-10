@@ -20,6 +20,342 @@ use tritium_schema::{
 const TENSOR: &str = "model.embed_tokens.weight";
 const ASSET: &[u8] = b"{}"; // Structural fixture, not an executable model config/tokenizer.
 
+#[test]
+fn candidate_semantic_ids_ignore_physical_codec_and_level_aliases() {
+    let mut expected = None;
+    let mut physical = Vec::new();
+    for codec in [PlaneCodec::D2, PlaneCodec::B3, PlaneCodec::S34] {
+        let (tensor, payload) = additive(codec, ScalePrecision::F32, Basis::Identity, 2);
+        let mut manifest = fixture();
+        manifest.levels[0].tensors = vec![tensor];
+        let bytes = package(
+            &manifest,
+            &[TritBlob {
+                kind: TritBlobKind::AdditiveTensor,
+                bytes: &payload,
+            }],
+        );
+        let model = read_trit_model(&bytes).unwrap();
+        let identity = (
+            model.tensor_digest("imported", TENSOR).unwrap(),
+            model.model_id("imported").unwrap(),
+        );
+        assert_eq!(
+            blake3::Hash::from_bytes(*identity.0.as_bytes())
+                .to_hex()
+                .as_str(),
+            "fc19a72d5206c01988147cd77700b8d6a7f1ae8977c0321d16763220e89b69cd"
+        );
+        assert_eq!(
+            blake3::Hash::from_bytes(*identity.1.as_bytes())
+                .to_hex()
+                .as_str(),
+            "a396a7331dadad1cf59f96df549cf551784ca5a19f5c6e9990c1f66d6fcbaf5f"
+        );
+        assert_eq!(*expected.get_or_insert(identity), identity);
+        physical.push(model.package_id());
+        let mut alias = manifest.levels[0].clone();
+        alias.name = "same-content".into();
+        alias.fit = LevelFit::Direct {
+            evidence: vec![EvidenceReference {
+                run: "candidate".into(),
+                span: "fit".into(),
+                root: [3; 32],
+            }],
+        };
+        manifest.levels.push(alias);
+        let aliased_bytes = package(
+            &manifest,
+            &[TritBlob {
+                kind: TritBlobKind::AdditiveTensor,
+                bytes: &payload,
+            }],
+        );
+        let aliased = read_trit_model(&aliased_bytes).unwrap();
+        assert_eq!(aliased.model_id("same-content").unwrap(), identity.1);
+        assert_eq!(aliased.model_id("imported").unwrap(), identity.1);
+        assert!(aliased.tensor_digest("missing", TENSOR).is_err());
+        assert!(aliased.model_id("missing").is_err());
+    }
+    assert_ne!(physical[0], physical[1]);
+    assert_ne!(physical[1], physical[2]);
+}
+
+#[test]
+fn candidate_additive_digest_binds_content_not_capacity_or_transport() {
+    use tritium_format::trit_model::additive_semantic_digest;
+    let (meta, bytes) = additive(PlaneCodec::D2, ScalePrecision::F32, Basis::Identity, 2);
+    let TensorStorage::Additive { layout, .. } = meta.storage else {
+        unreachable!()
+    };
+    let base = AdditiveTensor::decode_payload(layout, 2, &bytes).unwrap();
+    let expected = additive_semantic_digest(&base).unwrap();
+    for change in [
+        "trit",
+        "scale",
+        "basis",
+        "seed",
+        "precision",
+        "group",
+        "shape",
+        "planes",
+        "capacity",
+        "transport",
+    ] {
+        let mut layout = layout;
+        let mut trits = base.trits().to_vec();
+        let mut scales = base.scales().to_vec();
+        let mut planes = 2;
+        match change {
+            "trit" => trits[0] = Trit::NEG,
+            "scale" => scales[0] = f32::from_bits(scales[0].to_bits() + 1),
+            "basis" => layout.basis = Basis::Hadamard { block: 4 },
+            "seed" => {
+                layout.basis = Basis::SignedRht {
+                    block: 4,
+                    seed: 7,
+                    domain: 9,
+                }
+            }
+            "precision" => layout.law.precision = ScalePrecision::F16,
+            "group" => layout.group = 128,
+            "shape" => {
+                layout.rows = 4;
+                layout.cols = 2;
+                scales = vec![0.5; 8];
+            }
+            "planes" => {
+                planes = 1;
+                trits.truncate(8);
+                scales.truncate(2);
+            }
+            "capacity" => layout.max_planes = 3,
+            "transport" => layout.transport = Transport::JointHuffman { block: 64 },
+            _ => unreachable!(),
+        }
+        let changed = AdditiveTensor::new(layout, planes, trits, scales).unwrap();
+        let actual = additive_semantic_digest(&changed).unwrap();
+        if matches!(change, "capacity" | "transport") {
+            assert_eq!(actual, expected, "{change}");
+        } else {
+            assert_ne!(actual, expected, "{change}");
+        }
+    }
+    let mut rotated_layout = layout;
+    rotated_layout.basis = Basis::SignedRht {
+        block: 4,
+        seed: 7,
+        domain: 9,
+    };
+    let rotated = AdditiveTensor::new(
+        rotated_layout,
+        2,
+        base.trits().to_vec(),
+        base.scales().to_vec(),
+    )
+    .unwrap();
+    let rotated_id = additive_semantic_digest(&rotated).unwrap();
+    for basis in [
+        Basis::SignedRht {
+            block: 2,
+            seed: 7,
+            domain: 9,
+        },
+        Basis::SignedRht {
+            block: 4,
+            seed: 8,
+            domain: 9,
+        },
+        Basis::SignedRht {
+            block: 4,
+            seed: 7,
+            domain: 10,
+        },
+    ] {
+        rotated_layout.basis = basis;
+        let changed = AdditiveTensor::new(
+            rotated_layout,
+            2,
+            base.trits().to_vec(),
+            base.scales().to_vec(),
+        )
+        .unwrap();
+        assert_ne!(additive_semantic_digest(&changed).unwrap(), rotated_id);
+    }
+}
+
+#[test]
+fn candidate_model_digest_binds_architecture_assets_and_logical_names() {
+    let base = fixture();
+    let payload = [0; 32];
+    let packed = package(
+        &base,
+        &[TritBlob {
+            kind: TritBlobKind::DenseTensor(DType::F32),
+            bytes: &payload,
+        }],
+    );
+    let expected = read_trit_model(&packed)
+        .unwrap()
+        .model_id("imported")
+        .unwrap();
+    for change in [
+        "architecture",
+        "tensor-name",
+        "asset-bytes",
+        "asset-name",
+        "shape",
+        "dense-bits",
+        "legacy-alias",
+        "physical-order",
+    ] {
+        let mut manifest = base.clone();
+        let mut payload = payload;
+        let mut config = ASSET.to_vec();
+        match change {
+            "architecture" => manifest.architecture = "qwen3".into(),
+            "tensor-name" => manifest.levels[0].tensors[0].name = "different.weight".into(),
+            "asset-bytes" => {
+                config = b"{ }".to_vec();
+                manifest.assets[0].blob = reference(&config);
+            }
+            "asset-name" => manifest.assets.push(ManifestAsset {
+                name: "template.json".into(),
+                blob: reference(ASSET),
+            }),
+            "shape" => {
+                manifest.levels[0].tensors[0].storage = TensorStorage::Dense {
+                    shape: vec![4, 2],
+                    precision: ScalePrecision::F32,
+                }
+            }
+            "dense-bits" => {
+                payload[3] = 0x80;
+                manifest.levels[0].tensors[0].blob = reference(&payload);
+            } // exact negative zero
+            "legacy-alias" => manifest.legacy_ids.push(LegacyModelIdentity {
+                id: "legacy:fixture".into(),
+                level: "imported".into(),
+            }),
+            _ => {}
+        }
+        let mut blobs = vec![
+            TritBlob {
+                kind: TritBlobKind::Asset("config.json".into()),
+                bytes: &config,
+            },
+            TritBlob {
+                kind: TritBlobKind::Asset("tokenizer.json".into()),
+                bytes: ASSET,
+            },
+            TritBlob {
+                kind: TritBlobKind::DenseTensor(DType::F32),
+                bytes: &payload,
+            },
+        ];
+        if change == "asset-name" {
+            blobs.push(TritBlob {
+                kind: TritBlobKind::Asset("template.json".into()),
+                bytes: ASSET,
+            });
+        }
+        if change == "physical-order" {
+            blobs.reverse();
+        }
+        let packed =
+            write_trit_package(&encode_model_manifest(&manifest).unwrap(), &blobs).unwrap();
+        let actual = read_trit_model(&packed)
+            .unwrap()
+            .model_id("imported")
+            .unwrap();
+        if matches!(change, "legacy-alias" | "physical-order") {
+            assert_eq!(actual, expected, "{change}");
+        } else {
+            assert_ne!(actual, expected, "{change}");
+        }
+    }
+}
+
+#[test]
+fn candidate_dense_and_tied_scale_vectors_match_independent_preimages() {
+    let bytes = package(
+        &fixture(),
+        &[TritBlob {
+            kind: TritBlobKind::DenseTensor(DType::F32),
+            bytes: &[0; 32],
+        }],
+    );
+    let model = read_trit_model(&bytes).unwrap();
+    assert_eq!(
+        blake3::Hash::from_bytes(*model.tensor_digest("imported", TENSOR).unwrap().as_bytes())
+            .to_hex()
+            .as_str(),
+        "b19646f6931fcd0dab8b73d14f624cdc542865cddd9a6a40d9c798727fa7a568"
+    );
+    let (meta, raw) = additive(PlaneCodec::D2, ScalePrecision::F32, Basis::Identity, 3);
+    let TensorStorage::Additive { mut layout, .. } = meta.storage else {
+        unreachable!()
+    };
+    let original = AdditiveTensor::decode_payload(layout, 3, &raw).unwrap();
+    layout.law.precision = ScalePrecision::F16;
+    layout.law.relation = PlaneRelation::Tied { num: 1, den: 3 };
+    layout.basis = Basis::SignedRht {
+        block: 4,
+        seed: 7,
+        domain: 9,
+    };
+    let tied = AdditiveTensor::new(layout, 3, original.trits().to_vec(), vec![0.5, 1.]).unwrap();
+    assert_eq!(
+        blake3::Hash::from_bytes(
+            *tritium_format::trit_model::additive_semantic_digest(&tied)
+                .unwrap()
+                .as_bytes()
+        )
+        .to_hex()
+        .as_str(),
+        "54b0d7099eb3e68572e14a45160b666e70e9d945a827d685f0d331bbe599bdf4"
+    );
+}
+
+#[test]
+fn candidate_model_identity_is_per_level_not_a_whole_package_digest() {
+    let base = fixture();
+    let payload = [0; 32];
+    let base_bytes = package(
+        &base,
+        &[TritBlob {
+            kind: TritBlobKind::DenseTensor(DType::F32),
+            bytes: &payload,
+        }],
+    );
+    let expected = read_trit_model(&base_bytes)
+        .unwrap()
+        .model_id("imported")
+        .unwrap();
+    let mut expanded = base;
+    let mut other = expanded.levels[0].clone();
+    other.name = "different-content".into();
+    let other_payload = [0.5f32.to_le_bytes(); 8].concat();
+    other.tensors[0].blob = reference(&other_payload);
+    expanded.levels.push(other);
+    let bytes = package(
+        &expanded,
+        &[
+            TritBlob {
+                kind: TritBlobKind::DenseTensor(DType::F32),
+                bytes: &payload,
+            },
+            TritBlob {
+                kind: TritBlobKind::DenseTensor(DType::F32),
+                bytes: &other_payload,
+            },
+        ],
+    );
+    let model = read_trit_model(&bytes).unwrap();
+    assert_eq!(model.model_id("imported").unwrap(), expected);
+    assert_ne!(model.model_id("different-content").unwrap(), expected);
+}
+
 fn reference(bytes: &[u8]) -> BlobReference {
     BlobReference {
         id: BlobId::from_bytes(*blake3::hash(bytes).as_bytes()),

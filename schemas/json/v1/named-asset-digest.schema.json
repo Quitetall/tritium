@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NamedAssetDigest",
+  "description": "Exact named asset-content binding in the candidate model preimage.",
+  "type": "object",
+  "properties": {
+    "content": {
+      "description": "Exact stored asset-content digest, not a shard/package identity.",
+      "$ref": "#/$defs/BlobId"
+    },
+    "name": {
+      "description": "Asset basename; names affect model semantics.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "content"
+  ],
+  "$defs": {
+    "BlobId": {
+      "description": "Content identity for stored tensor or asset bytes.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    }
+  }
+}
