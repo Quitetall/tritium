@@ -1,8 +1,10 @@
 //! Checked upload plus registered evidence, shared by model-loading surfaces.
 
+use crate::TensorPayloadBudget;
 use tritium_evidence::{EvidenceError, EvidenceRecorder, TensorUploaded};
 use tritium_spec::{
     BackendError, DeviceBuffer, TensorCaps, TensorUploadPolicy, TensorView, TernaryBackend,
+    validate_tensor_upload_policy,
 };
 
 /// Run/span context for one typed successful-upload observation.
@@ -63,15 +65,66 @@ pub fn upload_tensor_logged(
     name: &str,
     context: TensorUploadContext<'_>,
 ) -> Result<(Box<dyn DeviceBuffer>, TensorCaps), TensorUploadError> {
+    upload_logged(backend, view, policy, name, context, None)
+}
+
+/// Logged upload with shared lifetime-bound owned-payload admission.
+///
+/// Native-only and per-tensor policy remain unchanged. The shared ledger is
+/// reserved before backend upload and retained by the returned buffer; every
+/// error drops the reservation and any uploaded buffer before returning. If
+/// capabilities change during upload, no successful event is emitted. Already
+/// recorded observations of earlier uploads are not model-load success claims.
+///
+/// This bounds declared/checked owned payloads only. A backend that misreports
+/// its allocation is rejected after upload, not physically prevented from
+/// allocating. Model preflight, KV/scratch/driver admission and production loader
+/// adoption remain separate obligations (ADR 0044 D9/D10).
+pub fn upload_tensor_logged_admitted(
+    backend: &dyn TernaryBackend,
+    view: TensorView<'_>,
+    policy: TensorUploadPolicy,
+    name: &str,
+    context: TensorUploadContext<'_>,
+    budget: &TensorPayloadBudget,
+) -> Result<(Box<dyn DeviceBuffer>, TensorCaps), TensorUploadError> {
+    upload_logged(backend, view, policy, name, context, Some(budget))
+}
+
+fn upload_logged(
+    backend: &dyn TernaryBackend,
+    view: TensorView<'_>,
+    policy: TensorUploadPolicy,
+    name: &str,
+    context: TensorUploadContext<'_>,
+    budget: Option<&TensorPayloadBudget>,
+) -> Result<(Box<dyn DeviceBuffer>, TensorCaps), TensorUploadError> {
     if name.is_empty() {
         return Err(TensorUploadError::EmptyTensorName);
     }
     let decoded_source_bytes = view
         .decoded_payload_bytes()
         .map_err(TensorUploadError::Backend)?;
+    let reserved = budget
+        .map(|budget| {
+            let caps = backend
+                .tensor_caps(view)?
+                .ok_or(BackendError::UnsupportedTensor)?;
+            validate_tensor_upload_policy(caps, policy)?;
+            Ok::<_, BackendError>((caps, budget.reserve(caps.payload_bytes)?))
+        })
+        .transpose()
+        .map_err(TensorUploadError::Backend)?;
     let (buffer, caps) = backend
         .upload_tensor_checked(view, policy)
         .map_err(TensorUploadError::Backend)?;
+    if let Some((expected, _)) = &reserved
+        && *expected != caps
+    {
+        return Err(TensorUploadError::Backend(BackendError::InvalidInput(
+            "tensor capabilities changed during admitted upload".into(),
+        )));
+    }
     context
         .recorder
         .emit(
@@ -87,6 +140,10 @@ pub fn upload_tensor_logged(
             },
         )
         .map_err(TensorUploadError::Evidence)?;
+    let buffer = match reserved {
+        Some((_, reservation)) => reservation.attach(buffer),
+        None => buffer,
+    };
     Ok((buffer, caps))
 }
 

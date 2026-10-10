@@ -427,3 +427,83 @@ fn shared_device_handles_support_concurrent_matmul_and_gather() {
         }
     });
 }
+
+#[test]
+fn aggregate_payload_admission_preserves_gpu_execution_and_tied_ownership() {
+    use std::sync::Arc;
+    use tritium_runtime::{TensorPayloadBudget, upload_tensor_logged_admitted};
+    use tritium_spec::DeviceBuffer;
+
+    let backend = gpu();
+    let fixture = tritium_testkit::additive_upload_fixture();
+    let view = TensorView::Additive(fixture.view());
+    let budget = TensorPayloadBudget::new(64);
+    let mut recorder =
+        EvidenceRecorder::new("wgpu-aggregate-fixture", [TENSOR_UPLOADED_REGISTRATION]).unwrap();
+    let mut upload = |view, name| {
+        upload_tensor_logged_admitted(
+            &backend,
+            view,
+            TensorUploadPolicy::default(),
+            name,
+            TensorUploadContext {
+                recorder: &mut recorder,
+                span: "load",
+                parent: None,
+                logical_time: 0,
+            },
+            &budget,
+        )
+    };
+    let (first, _) = upload(view, "embedding").unwrap();
+    let (second, _) = upload(view, "projection").unwrap();
+    let dense = TensorView::Dense {
+        rows: 1,
+        cols: 2,
+        values: &[1., 2.],
+    };
+    assert_eq!(budget.used_bytes(), 64);
+    assert!(matches!(
+        upload(dense, "dense"),
+        Err(TensorUploadError::Backend(
+            BackendError::TensorPayloadBudgetExceeded {
+                requested: 72,
+                limit: 64
+            }
+        ))
+    ));
+    let first: Arc<dyn DeviceBuffer> = Arc::from(first);
+    let tied_head = Arc::clone(&first);
+    drop(first);
+    assert_eq!(budget.used_bytes(), 64);
+    let mut out = [99.; 2];
+    let mut scratch = [99.; 4];
+    backend
+        .matmul(TensorMatmul {
+            act: &[1.; 4],
+            tensor: &*tied_head,
+            batch: 1,
+            transformed_act: &mut scratch,
+            out: &mut out,
+        })
+        .unwrap();
+    assert_eq!(out, [-1., -2.]);
+    let mut row = [99.; 4];
+    backend.embed_rows(&*tied_head, &[0], &mut row).unwrap();
+    assert_eq!(row, [0.5, -0.5, 0.5, -1.5]);
+    drop(second);
+    assert_eq!(budget.used_bytes(), 32);
+    let (dense, _) = upload(dense, "dense").unwrap();
+    assert_eq!(budget.used_bytes(), 40);
+    drop(tied_head);
+    assert_eq!(budget.used_bytes(), 8);
+    drop(dense);
+    assert_eq!(budget.used_bytes(), 0);
+    assert_eq!(recorder.events().len(), 3);
+    let verified = verify_jsonl_with_registry(
+        &recorder.to_jsonl().unwrap(),
+        [TENSOR_UPLOADED_REGISTRATION],
+    )
+    .unwrap();
+    assert_eq!(verified.root_digest, recorder.root_digest().unwrap());
+}

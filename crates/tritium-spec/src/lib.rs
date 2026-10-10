@@ -56,6 +56,31 @@ pub use training_vectors::{
     TrainingVectorSetV2, TrainingVectorSetV3,
 };
 
+/// Validate declared execution tier and per-tensor owned-payload policy.
+///
+/// Shared by checked backend upload and aggregate-budget preflight. This does
+/// not allocate, measure physical memory or approve a model load.
+///
+/// # Errors
+/// Returns native-only or per-tensor payload-budget rejection.
+pub fn validate_tensor_upload_policy(
+    caps: TensorCaps,
+    policy: TensorUploadPolicy,
+) -> Result<(), BackendError> {
+    if policy.native_only && caps.execution != TensorExecution::Native {
+        return Err(BackendError::NativeTensorRequired);
+    }
+    if let Some(limit) = policy.max_payload_bytes
+        && caps.payload_bytes > limit
+    {
+        return Err(BackendError::TensorPayloadBudgetExceeded {
+            requested: caps.payload_bytes,
+            limit,
+        });
+    }
+    Ok(())
+}
+
 /// Parameters for a ternary mixed-precision GEMM call.
 ///
 /// Groups the operands of [`TernaryBackend::mpgemm`] (and
@@ -272,17 +297,7 @@ pub trait TernaryBackend: Send + Sync {
         let caps = self
             .tensor_caps(tensor)?
             .ok_or(BackendError::UnsupportedTensor)?;
-        if policy.native_only && caps.execution != TensorExecution::Native {
-            return Err(BackendError::NativeTensorRequired);
-        }
-        if let Some(limit) = policy.max_payload_bytes
-            && caps.payload_bytes > limit
-        {
-            return Err(BackendError::TensorPayloadBudgetExceeded {
-                requested: caps.payload_bytes,
-                limit,
-            });
-        }
+        validate_tensor_upload_policy(caps, policy)?;
         let buffer = self.upload_tensor(tensor)?;
         let actual = u64::try_from(buffer.len_bytes())
             .map_err(|_| BackendError::InvalidInput("uploaded payload size exceeds u64".into()))?;
