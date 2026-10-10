@@ -249,6 +249,7 @@ def run_qualification(args: argparse.Namespace) -> dict[str, Any]:
                 "--disable-pip-version-check",
                 "--no-index",
                 "--no-deps",
+                "--force-reinstall",
                 "--only-binary=:all:",
                 str(artifact),
             ],
@@ -280,6 +281,12 @@ def run_qualification(args: argparse.Namespace) -> dict[str, Any]:
                 str(fragment_path),
                 "--checkpoint",
                 str(checkpoint),
+                "--wheel",
+                str(artifact),
+                "--source-revision",
+                args.source_revision,
+                "--release",
+                args.release,
             ]
             completed = subprocess.run(
                 command,

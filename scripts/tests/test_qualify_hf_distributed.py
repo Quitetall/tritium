@@ -4,7 +4,9 @@ import json
 from pathlib import Path
 import runpy
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -80,6 +82,44 @@ def fragments() -> list[dict]:
 
 
 class QualifyHfDistributedTests(unittest.TestCase):
+    def test_launch_forwards_candidate_and_reinstalls_exact_wheel(self):
+        # This intercepts real launcher argv, not distributed qualification.
+        run = MODULE["run_qualification"]
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            artifact = root / "pytritium.whl"
+            artifact.write_bytes(b"launcher-only fixture")
+            args = SimpleNamespace(
+                artifact=artifact, source_revision="a" * 40,
+                release="1.1.0-rc.2", run_id="launcher-preflight",
+                output_dir=root / "output", timeout=30,
+            )
+
+            def subprocess_run(command, **_kwargs):
+                if "pip" in command:
+                    self.assertIn("--force-reinstall", command)
+                    self.assertEqual(command[-1], str(artifact.resolve()))
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                for flag, expected in (
+                    ("--wheel", str(artifact.resolve())),
+                    ("--source-revision", args.source_revision),
+                    ("--release", args.release),
+                ):
+                    self.assertIn(flag, command)
+                    self.assertEqual(command[command.index(flag) + 1], expected)
+                return SimpleNamespace(
+                    returncode=1, stdout="", stderr="intentional preflight dispatch stop"
+                )
+
+            with (
+                patch.dict(run.__globals__, {"require_clean_revision": lambda *_args: None}),
+                patch.object(run.__globals__["venv"], "EnvBuilder"),
+                patch.object(run.__globals__["subprocess"], "run", subprocess_run),
+                self.assertRaisesRegex(QualificationError, "intentional preflight dispatch stop"),
+            ):
+                run(args)
+            self.assertFalse(args.output_dir.exists())
+
     def test_assembly_copies_and_validates_all_rank_checkpoint_bytes(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -178,6 +218,8 @@ class QualifyHfDistributedTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/wheels.yml").read_text(encoding="utf-8")
         self.assertIn("scripts.tests.test_qualify_hf_distributed", workflow)
         self.assertIn("scripts.tests.test_verify_hf_distributed_receipt", workflow)
+        self.assertIn("test_hf_distributed_candidate_provenance.py", workflow)
+        self.assertIn("accelerate==1.10.0", workflow)
 
 
 if __name__ == "__main__":

@@ -359,7 +359,7 @@ jobs:
       - name: install pinned Hugging Face dependencies
         run: >-
           python -m pip install --disable-pip-version-check --only-binary=:all:
-          transformers==5.5.3 safetensors==0.8.0 pytest==9.0.2 zstandard==0.25.0
+          transformers==5.5.3 safetensors==0.8.0 accelerate==1.10.0 pytest==9.0.2 zstandard==0.25.0
       - name: install exact Tritium wheel without dependency resolution
         shell: bash
         run: >-
@@ -382,6 +382,7 @@ jobs:
           crates/tritium-py/tests/test_tutorial_candidate_provenance.py
           crates/tritium-py/tests/test_observability_candidate_provenance.py
           crates/tritium-py/tests/test_estimator_candidate_provenance.py
+          crates/tritium-py/tests/test_hf_distributed_candidate_provenance.py
           crates/tritium-py/tests/test_qualify_estimators.py
       - name: test installed tutorial receipt admission
         run: >-
