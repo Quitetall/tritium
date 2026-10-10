@@ -20,7 +20,22 @@ class PrePushCacheTests(unittest.TestCase):
             (cache / "tritium-prepush" / "worktree").mkdir(parents=True)
             log = root / "cargo-calls"
             git = bins / "git"
-            git.write_text("#!/bin/sh\nexit 0\n")
+            git.write_text('''#!/bin/sh
+set -eu
+case "$1" in
+  rev-parse)
+    case "$2" in
+      --show-toplevel) printf '%s\\n' "$FIXTURE_REPO_ROOT" ;;
+      --local-env-vars) printf '%s\\n' GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE ;;
+      *) exit 2 ;;
+    esac ;;
+  -C)
+    [ "$2" = "$FIXTURE_WORKTREE" ] || exit 2
+    case "$3" in checkout|clean|status) exit 0 ;; *) exit 2 ;; esac ;;
+  cat-file|diff) exit 0 ;;
+  *) exit 2 ;;
+esac
+''')
             cargo = bins / "cargo"
             cargo.write_text(
                 '#!/bin/sh\nprintf "%s|%s\\n" "$CARGO_TARGET_DIR" "$*" >> "$CALL_LOG"\n'
@@ -29,6 +44,8 @@ class PrePushCacheTests(unittest.TestCase):
             cargo.chmod(0o700)
             env = dict(os.environ)
             env.update(PATH=f"{bins}:{env['PATH']}", XDG_CACHE_HOME=str(cache), CALL_LOG=str(log))
+            env.update(FIXTURE_REPO_ROOT=str(root),
+                       FIXTURE_WORKTREE=str(cache / "tritium-prepush" / "worktree"))
             env.pop("TRITIUM_PREPUSH_FMT_ONLY", None)
             env.pop("CARGO_TARGET_DIR", None)
             if target is not None:
