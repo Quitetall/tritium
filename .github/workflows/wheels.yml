@@ -381,6 +381,8 @@ jobs:
           crates/tritium-py/tests/test_hf_export_lifecycle.py
           crates/tritium-py/tests/test_tutorial_candidate_provenance.py
           crates/tritium-py/tests/test_observability_candidate_provenance.py
+          crates/tritium-py/tests/test_estimator_candidate_provenance.py
+          crates/tritium-py/tests/test_qualify_estimators.py
       - name: test installed tutorial receipt admission
         run: >-
           python -m unittest discover
@@ -559,6 +561,16 @@ jobs:
             --wheel-artifact dist/*.whl \
             --source-revision "$TRITIUM_SOURCE_REVISION" \
             --release "${{ needs.wheels.outputs.release }}"
+      - name: execute installed estimator catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -I -m tritium.torch.qualify_estimators \
+            --wheel dist/*.whl \
+            --source-revision "$TRITIUM_SOURCE_REVISION" \
+            --release "${{ needs.wheels.outputs.release }}" \
+            --run-id github-${{ github.run_id }}-${{ github.run_attempt }}-estimator-clean \
+            --output evidence/estimator-clean/trace.json
       - name: execute and validate installed observability adapters
         shell: bash
         run: |
@@ -582,6 +594,7 @@ jobs:
             evidence/hf-lifecycle-clean/**
             evidence/hf-export-clean/**
             evidence/observability-clean/**
+            evidence/estimator-clean/**
           if-no-files-found: error
 
   smollm2-cpu-tutorial:
