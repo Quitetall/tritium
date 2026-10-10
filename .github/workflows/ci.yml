@@ -383,7 +383,9 @@ jobs:
       - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833
         with:
           tool: wasmtime
-      - run: cargo test --locked --target wasm32-wasip1 -p tritium-wasm
+      - run: |
+          cargo test --locked --target wasm32-wasip1 -p tritium-wasm --all-targets
+          cargo test --locked --target wasm32-wasip1 -p tritium-wasm --doc
       - name: Seal portable-training receipts inside WASI guest
         shell: bash
         run: |

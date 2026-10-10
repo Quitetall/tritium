@@ -25,7 +25,9 @@ TRITIUM_WASM_PHYSICAL_DEVICE="wasmtime:${WASMTIME_VERSION}:$(uname -m)" \
   --example seal_wasi_training_receipts -- release/v1.1/wasi-training-receipts
 ```
 
-The example requires a non-placeholder `wasmtime:` identity. This is an
+The example requires a non-placeholder `wasmtime:<version>:<architecture>`
+identity with both components nonempty and no whitespace, control characters
+or additional colon-delimited fields. This is an
 operator-supplied identity, not cryptographic runtime attestation. Run it only
 from the clean candidate revision intended for evidence; the receipt embeds
 the build identity, and the release verifier rejects dirty or mismatched

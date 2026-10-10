@@ -15,6 +15,25 @@ use tritium_wasm::WasmTrainBackendV1;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+fn observed_runtime_identity(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| {
+        let Some((version, architecture)) = value
+            .strip_prefix("wasmtime:")
+            .and_then(|identity| identity.split_once(':'))
+        else {
+            return false;
+        };
+        !version.is_empty()
+            && !architecture.is_empty()
+            && !version
+                .chars()
+                .chain(architecture.chars())
+                .any(|character| {
+                    character == ':' || character.is_whitespace() || character.is_control()
+                })
+    })
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args_os().skip(1);
     let output_dir = arguments
@@ -24,8 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("unexpected arguments".into());
     }
 
-    let physical_device = option_env!("TRITIUM_WASM_PHYSICAL_DEVICE")
-        .filter(|value| value.starts_with("wasmtime:") && value.len() > "wasmtime:".len())
+    let physical_device = observed_runtime_identity(option_env!("TRITIUM_WASM_PHYSICAL_DEVICE"))
         .ok_or("host runner must compile with an observed wasmtime identity")?;
     let vectors = TrainingVectorSetV2::parse_json(include_bytes!(
         "../../../spec/training/v2/vectors/v2.json"
@@ -72,4 +90,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("{}={}", sealed.digest_hex(), destination.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::observed_runtime_identity;
+
+    #[test]
+    fn retains_complete_observed_runtime_identity() {
+        for identity in [
+            "wasmtime:48.0.1:x86_64",
+            "wasmtime:46.0.0:aarch64",
+            "wasmtime:49.0.0-dev+custom:riscv64",
+        ] {
+            assert_eq!(observed_runtime_identity(Some(identity)), Some(identity));
+        }
+    }
+
+    #[test]
+    fn rejects_missing_or_malformed_runtime_identity() {
+        assert_eq!(observed_runtime_identity(None), None);
+        for identity in [
+            "",
+            "wasmtime:",
+            "wasmtime::",
+            "wasmtime:48.0.1",
+            "wasmtime:48.0.1:",
+            "wasmtime::x86_64",
+            "wasmtime:48.0.1:x86_64:extra",
+            "wasmtime: 48.0.1:x86_64",
+            "wasmtime:48.0.1:x86_64 ",
+            "wasmtime:48.0.1:\tx86_64",
+            "wasmtime:48.0.1:x86_64\n",
+            "wasmtime:48.0.1:x86_64\0",
+            "wasmtime:48.0.1:\u{a0}x86_64",
+            "other:48.0.1:x86_64",
+        ] {
+            assert_eq!(
+                observed_runtime_identity(Some(identity)),
+                None,
+                "{identity:?}"
+            );
+        }
+    }
 }
