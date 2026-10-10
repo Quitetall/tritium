@@ -136,6 +136,50 @@ pub fn admitted_law(law: ScaleLaw) -> Option<&'static AdmittedLaw> {
     ADMITTED_LAWS.iter().find(|admitted| admitted.law == law)
 }
 
+/// Execution groups supported by the initial admitted laws.
+///
+/// G64/G256 remain serializable geometry, not execution admission. Adding a
+/// group requires frozen vectors and backend parity under ADR 0044 D4/D9.
+#[must_use]
+pub fn admitted_execution_group(law: ScaleLaw, group: u16) -> bool {
+    admitted_law(law).is_some() && matches!(group, 32 | 128)
+}
+
+/// How a backend executes one semantic tensor combination (ADR 0044 D8/D9).
+#[non_exhaustive]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum TensorExecution {
+    /// Executes additive coefficients directly, or an originally dense tensor.
+    /// This does not assert SIMD, accelerator speed, or empirical qualification.
+    Native,
+    /// Materializes an additive tensor as dense weights for plain GEMM.
+    /// Requires explicit evidence and memory admission before production use.
+    Emulated,
+}
+
+/// Declared execution and owned payload size for a specific semantic tensor.
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct TensorCaps {
+    /// Direct execution or dense emulation; never inferred from ISA flags.
+    pub execution: TensorExecution,
+    /// Bytes reported by the uploaded buffer, excluding allocator/handle
+    /// overhead, scratch, KV, other tensors, and total model residency.
+    pub payload_bytes: u64,
+}
+
+/// Pre-upload policy for a single semantic tensor payload.
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub struct TensorUploadPolicy {
+    /// Reject dense emulation before any upload takes place.
+    pub native_only: bool,
+    /// Maximum owned payload bytes; `None` leaves this per-tensor limit unset.
+    /// This is not complete physical/model-memory admission.
+    pub max_payload_bytes: Option<u64>,
+}
+
 /// Input-axis transform associated with an additive tensor.
 #[non_exhaustive]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
@@ -423,6 +467,21 @@ mod tests {
         ADDITIVE_TILE_SIZE, ADMITTED_LAWS, AdditiveLayout, Basis, LayoutError, PlaneAllocation,
         PlaneCodec, PlaneRelation, ScaleAnchor, ScaleLaw, ScalePrecision, Transport, admitted_law,
     };
+
+    #[test]
+    fn execution_group_admission_is_not_serializable_geometry() {
+        for admitted in ADMITTED_LAWS {
+            for group in [32, 128] {
+                assert!(super::admitted_execution_group(admitted.law, group));
+            }
+            for group in [0, 64, 256, 512] {
+                assert!(!super::admitted_execution_group(admitted.law, group));
+            }
+        }
+        let mut unadmitted = ADMITTED_LAWS[0].law;
+        unadmitted.anchor = ScaleAnchor::Row;
+        assert!(!super::admitted_execution_group(unadmitted, 32));
+    }
 
     fn valid_layout() -> AdditiveLayout {
         AdditiveLayout {

@@ -3,7 +3,10 @@
 use core::any::Any;
 use tritium_core::{DenseView, reference_embed, reference_ternary_matmul};
 use tritium_format::{AdditiveTensor, AdditiveTensorError};
-use tritium_spec::{BackendError, DeviceBuffer, TensorMatmul, TensorView};
+use tritium_spec::{
+    BackendError, DeviceBuffer, TensorCaps, TensorExecution, TensorMatmul, TensorView,
+    admitted_execution_group,
+};
 
 #[derive(Debug)]
 pub(crate) enum CpuTensor {
@@ -30,6 +33,22 @@ impl DeviceBuffer for CpuTensor {
 }
 
 impl CpuTensor {
+    pub(crate) fn caps(view: TensorView<'_>) -> Result<Option<TensorCaps>, BackendError> {
+        if let TensorView::Additive(additive) = view {
+            let layout = additive.layout();
+            if !admitted_execution_group(layout.law, layout.group) {
+                return Ok(None);
+            }
+            AdditiveTensor::validate_view(additive).map_err(|e| {
+                BackendError::InvalidInput(format!("CPU additive capability input failed: {e:?}"))
+            })?;
+        }
+        Ok(Some(TensorCaps {
+            execution: TensorExecution::Native,
+            payload_bytes: view.decoded_payload_bytes()?,
+        }))
+    }
+
     pub(crate) fn upload(view: TensorView<'_>) -> Result<Box<dyn DeviceBuffer>, BackendError> {
         let tensor = match view {
             TensorView::Additive(view) => {

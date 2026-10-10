@@ -54,6 +54,7 @@ impl AdditiveTensor {
     /// The owned constructor additionally enforces exact stored scale precision.
     /// Coefficients remain ternary; this does not materialize dense weights.
     pub fn from_view(view: AdditiveView<'_>) -> Result<Self, AdditiveTensorError> {
+        Self::validate_view(view)?;
         let planes =
             u8::try_from(view.plane_count()).map_err(|_| AdditiveTensorError::LengthOverflow)?;
         let scale_bytes = core::mem::size_of_val(view.scales());
@@ -61,12 +62,12 @@ impl AdditiveTensor {
             .len()
             .checked_add(scale_bytes)
             .ok_or(AdditiveTensorError::LengthOverflow)?;
-        Self::new(
-            view.layout(),
-            planes,
-            copy_payload(view.trits())?,
-            copy_payload(view.scales())?,
-        )
+        Ok(Self {
+            layout: view.layout(),
+            plane_count: planes,
+            trits: copy_payload(view.trits())?,
+            scales: copy_payload(view.scales())?,
+        })
     }
 
     /// Validate and own a decoded additive tensor.
@@ -76,15 +77,28 @@ impl AdditiveTensor {
         trits: Vec<Trit>,
         scales: Vec<f32>,
     ) -> Result<Self, AdditiveTensorError> {
-        AdditiveView::new(layout, plane_count, &trits, &scales)
+        let view = AdditiveView::new(layout, plane_count, &trits, &scales)
             .map_err(AdditiveTensorError::InvalidView)?;
-        for (index, scale) in scales.iter().copied().enumerate() {
+        Self::validate_view(view)?;
+        Ok(Self {
+            layout,
+            plane_count,
+            trits,
+            scales,
+        })
+    }
+
+    /// Validate exact stored-scale precision without allocating or copying.
+    ///
+    /// Used by capability queries and before reservations in [`Self::from_view`].
+    pub fn validate_view(view: AdditiveView<'_>) -> Result<(), AdditiveTensorError> {
+        for (index, scale) in view.scales().iter().copied().enumerate() {
             if scale.to_bits() & 0x8000_0000 != 0 {
                 return Err(AdditiveTensorError::InvalidView(
                     AdditiveError::InvalidScale,
                 ));
             }
-            let roundtrip = match layout.law.precision {
+            let roundtrip = match view.layout().law.precision {
                 ScalePrecision::F16 => f16::from_f32(scale).to_f32(),
                 ScalePrecision::Bf16 => bf16::from_f32(scale).to_f32(),
                 ScalePrecision::F32 => scale,
@@ -98,12 +112,7 @@ impl AdditiveTensor {
                 return Err(AdditiveTensorError::ScalePrecisionMismatch { index });
             }
         }
-        Ok(Self {
-            layout,
-            plane_count,
-            trits,
-            scales,
-        })
+        Ok(())
     }
 
     /// Encode canonical tensor payload bytes (plane payloads followed by scales).

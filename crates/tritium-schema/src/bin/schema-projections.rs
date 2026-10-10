@@ -9,7 +9,8 @@ use schemars::JsonSchema;
 use tritium_schema::{
     AdditiveLayout, AdmittedLaw, Basis, BlobId, EvidenceEnvelope, LayoutError, ModelId, PackageId,
     PlaneAllocation, PlaneCodec, PlaneRelation, ScaleAnchor, ScaleLaw, ScalePrecision, SchemaId,
-    SemanticTensorDigest, Transport, UnknownReason, Verdict,
+    SemanticTensorDigest, TensorCaps, TensorExecution, TensorUploadPolicy, Transport,
+    UnknownReason, Verdict,
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -50,6 +51,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     project!(ScalePrecision, "scale-precision");
     project!(SchemaId, "schema-id");
     project!(SemanticTensorDigest, "semantic-tensor-digest");
+    project!(TensorCaps, "tensor-caps");
+    project!(TensorExecution, "tensor-execution");
+    project!(TensorUploadPolicy, "tensor-upload-policy");
     project!(Transport, "transport");
     project!(UnknownReason, "unknown-reason");
     project!(Verdict, "verdict");

@@ -230,6 +230,13 @@ impl CpuBackend {
 }
 
 impl TernaryBackend for CpuBackend {
+    fn tensor_caps(
+        &self,
+        tensor: TensorView<'_>,
+    ) -> Result<Option<tritium_spec::TensorCaps>, BackendError> {
+        semantic::CpuTensor::caps(tensor)
+    }
+
     // Unified semantic operations currently use the scalar core implementation,
     // owning decoded trits/scales rather than packed-residency or SIMD claims.
     fn upload_tensor(&self, tensor: TensorView<'_>) -> Result<Box<dyn DeviceBuffer>, BackendError> {

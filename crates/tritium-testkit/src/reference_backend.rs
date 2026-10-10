@@ -18,7 +18,8 @@ use tritium_format::{
     TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row, unpack_tq2_0_row,
 };
 use tritium_spec::{
-    BackendError, DeviceBuffer, DeviceCaps, MpGemm, TensorMatmul, TensorView, TernaryBackend,
+    BackendError, DeviceBuffer, DeviceCaps, MpGemm, TensorCaps, TensorExecution, TensorMatmul,
+    TensorView, TernaryBackend, admitted_execution_group,
 };
 
 /// Device buffer for [`ReferenceBackend`]: the unpacked trits plus the shape they
@@ -94,6 +95,24 @@ impl TernaryBackend for ReferenceBackend {
 
     fn capabilities(&self) -> DeviceCaps {
         DeviceCaps::new("reference", "tritium-testkit reference backend")
+    }
+
+    fn tensor_caps(&self, tensor: TensorView<'_>) -> Result<Option<TensorCaps>, BackendError> {
+        if let TensorView::Additive(view) = tensor {
+            let layout = view.layout();
+            if !admitted_execution_group(layout.law, layout.group) {
+                return Ok(None);
+            }
+            AdditiveTensor::validate_view(view).map_err(|e| {
+                BackendError::InvalidInput(format!(
+                    "reference additive capability input failed: {e:?}"
+                ))
+            })?;
+        }
+        Ok(Some(TensorCaps {
+            execution: TensorExecution::Native,
+            payload_bytes: tensor.decoded_payload_bytes()?,
+        }))
     }
 
     fn upload_tensor(&self, tensor: TensorView<'_>) -> Result<Box<dyn DeviceBuffer>, BackendError> {
