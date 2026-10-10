@@ -1,0 +1,325 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AdditiveLayout",
+  "description": "Semantic layout parameters for an additive tensor.",
+  "type": "object",
+  "properties": {
+    "allocation": {
+      "description": "Plane count allocation mode.",
+      "$ref": "#/$defs/PlaneAllocation"
+    },
+    "basis": {
+      "description": "Input-axis basis.",
+      "$ref": "#/$defs/Basis"
+    },
+    "codec": {
+      "description": "Per-plane codec.",
+      "$ref": "#/$defs/PlaneCodec"
+    },
+    "cols": {
+      "description": "Number of coefficients per row.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "group": {
+      "description": "Scale group width.",
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    },
+    "law": {
+      "description": "Scale law.",
+      "$ref": "#/$defs/ScaleLaw"
+    },
+    "max_planes": {
+      "description": "Maximum plane count represented by this tensor.",
+      "type": "integer",
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0
+    },
+    "rows": {
+      "description": "Number of matrix rows.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "tile": {
+      "description": "Canonical tile width. Currently fixed at [`ADDITIVE_TILE_SIZE`].",
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    },
+    "transport": {
+      "description": "Outer entropy transport.",
+      "$ref": "#/$defs/Transport"
+    }
+  },
+  "required": [
+    "rows",
+    "cols",
+    "tile",
+    "group",
+    "max_planes",
+    "allocation",
+    "codec",
+    "law",
+    "basis",
+    "transport"
+  ],
+  "$defs": {
+    "Basis": {
+      "description": "Input-axis transform associated with an additive tensor.",
+      "oneOf": [
+        {
+          "description": "No transform.",
+          "type": "string",
+          "const": "Identity"
+        },
+        {
+          "description": "Normalized, self-inverse Walsh–Hadamard transform.",
+          "type": "object",
+          "properties": {
+            "Hadamard": {
+              "type": "object",
+              "properties": {
+                "block": {
+                  "description": "Power-of-two transform block width.",
+                  "type": "integer",
+                  "format": "uint32",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "block"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Hadamard"
+          ]
+        },
+        {
+          "description": "Deterministic signed Walsh–Hadamard transform.",
+          "type": "object",
+          "properties": {
+            "SignedRht": {
+              "type": "object",
+              "properties": {
+                "block": {
+                  "description": "Power-of-two transform block width.",
+                  "type": "integer",
+                  "format": "uint32",
+                  "minimum": 0
+                },
+                "domain": {
+                  "description": "Stable domain identifier for sign derivation.",
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "seed": {
+                  "description": "Seed used to derive signs.",
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "block",
+                "seed",
+                "domain"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "SignedRht"
+          ]
+        }
+      ]
+    },
+    "PlaneAllocation": {
+      "description": "Uniform or per-tile plane-count allocation policy.",
+      "oneOf": [
+        {
+          "description": "Every tile uses the tensor's maximum plane count.",
+          "type": "string",
+          "const": "Uniform"
+        },
+        {
+          "description": "Each tile records its own plane count.",
+          "type": "string",
+          "const": "PerTile"
+        }
+      ]
+    },
+    "PlaneCodec": {
+      "description": "Compact code used for each additive ternary plane.",
+      "oneOf": [
+        {
+          "description": "Two-bit ternary packing.",
+          "type": "string",
+          "const": "D2"
+        },
+        {
+          "description": "Base-3 packing of five ternary coefficients per byte.",
+          "type": "string",
+          "const": "B3"
+        },
+        {
+          "description": "Structured sparse 3-of-4 encoding.",
+          "type": "string",
+          "const": "S34"
+        }
+      ]
+    },
+    "PlaneRelation": {
+      "description": "Relationship between scales of successive additive planes.",
+      "oneOf": [
+        {
+          "description": "Every plane has an independently fitted scale.",
+          "type": "string",
+          "const": "Free"
+        },
+        {
+          "description": "Plane `p` has scale `s0 * (num / den)^p`.",
+          "type": "object",
+          "properties": {
+            "Tied": {
+              "type": "object",
+              "properties": {
+                "den": {
+                  "description": "Denominator of the positive scale ratio.",
+                  "type": "integer",
+                  "format": "uint32",
+                  "minimum": 0
+                },
+                "num": {
+                  "description": "Numerator of the positive scale ratio.",
+                  "type": "integer",
+                  "format": "uint32",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "num",
+                "den"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Tied"
+          ]
+        }
+      ]
+    },
+    "ScaleAnchor": {
+      "description": "Grouping axis to which an additive scale is anchored.",
+      "oneOf": [
+        {
+          "description": "One scale per declared group.",
+          "type": "string",
+          "const": "Group"
+        },
+        {
+          "description": "One scale per matrix row.",
+          "type": "string",
+          "const": "Row"
+        },
+        {
+          "description": "One scale for the complete tensor.",
+          "type": "string",
+          "const": "Tensor"
+        },
+        {
+          "description": "One scale per output channel.",
+          "type": "string",
+          "const": "Channel"
+        }
+      ]
+    },
+    "ScaleLaw": {
+      "description": "Scale law represented as orthogonal anchor, relation, and storage precision.",
+      "type": "object",
+      "properties": {
+        "anchor": {
+          "description": "Scale grouping axis.",
+          "$ref": "#/$defs/ScaleAnchor"
+        },
+        "precision": {
+          "description": "Scale storage precision.",
+          "$ref": "#/$defs/ScalePrecision"
+        },
+        "relation": {
+          "description": "Cross-plane scale relationship.",
+          "$ref": "#/$defs/PlaneRelation"
+        }
+      },
+      "required": [
+        "anchor",
+        "relation",
+        "precision"
+      ]
+    },
+    "ScalePrecision": {
+      "description": "Precision used to store additive plane scales.",
+      "oneOf": [
+        {
+          "description": "IEEE binary16.",
+          "type": "string",
+          "const": "F16"
+        },
+        {
+          "description": "Brain floating-point 16-bit.",
+          "type": "string",
+          "const": "Bf16"
+        },
+        {
+          "description": "IEEE binary32.",
+          "type": "string",
+          "const": "F32"
+        }
+      ]
+    },
+    "Transport": {
+      "description": "Optional entropy transport applied outside the tensor's plane codec.",
+      "oneOf": [
+        {
+          "description": "Store codec bytes directly.",
+          "type": "string",
+          "const": "Raw"
+        },
+        {
+          "description": "Joint Huffman coding with the specified block width.",
+          "type": "object",
+          "properties": {
+            "JointHuffman": {
+              "type": "object",
+              "properties": {
+                "block": {
+                  "description": "Number of symbols grouped into one entropy-coding block.",
+                  "type": "integer",
+                  "format": "uint32",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "block"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "JointHuffman"
+          ]
+        }
+      ]
+    }
+  }
+}

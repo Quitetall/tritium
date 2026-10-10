@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SchemaId",
+  "description": "Stable identifier for a schema family and its version.",
+  "type": "object",
+  "properties": {
+    "major": {
+      "description": "Major version; incompatible schemas require a new major version.",
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    },
+    "minor": {
+      "description": "Minor version; additive compatible schema evolution increments this.",
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    }
+  },
+  "required": [
+    "major",
+    "minor"
+  ]
+}

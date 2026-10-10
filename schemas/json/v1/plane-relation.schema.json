@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlaneRelation",
+  "description": "Relationship between scales of successive additive planes.",
+  "oneOf": [
+    {
+      "description": "Every plane has an independently fitted scale.",
+      "type": "string",
+      "const": "Free"
+    },
+    {
+      "description": "Plane `p` has scale `s0 * (num / den)^p`.",
+      "type": "object",
+      "properties": {
+        "Tied": {
+          "type": "object",
+          "properties": {
+            "den": {
+              "description": "Denominator of the positive scale ratio.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "num": {
+              "description": "Numerator of the positive scale ratio.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "num",
+            "den"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Tied"
+      ]
+    }
+  ]
+}

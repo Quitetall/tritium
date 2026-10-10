@@ -43,7 +43,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           components: rustfmt, clippy
+          targets: thumbv7em-none-eabihf
       - run: cargo fmt --all --check
+      - run: cargo run --locked -p tritium-schema --features schema-gen --bin tritium-schema-projections -- --check
+      # A host no_std check cannot detect a dependency that silently enables std.
+      # Compile only: this is not physical MCU execution or qualification.
+      - run: cargo check --locked -p tritium-schema -p tritium-core --no-default-features --lib --target thumbv7em-none-eabihf
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       # tritium-py is a PyO3 extension module (cdylib) with no cargo tests — it is
       # exercised via maturin + pytest, not `cargo test`. Excluded here so its
