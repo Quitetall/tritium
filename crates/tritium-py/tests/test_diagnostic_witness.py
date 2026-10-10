@@ -76,6 +76,7 @@ def test_resigned_copied_counters_rejected(name, fixed):
     (("timing", "warmups"), True),
     (("timing", "samples"), []),
     (("timing", "samples", 0, "start_ns"), 0),
+    (("timing", "samples", 0, "start_ns"), 2**63),
     (("timing", "samples", 0, "end_ns"), 100000),
     (("timing", "samples", 1, "start_ns"), 100001),
     (("timing", "samples", 0, "student_logits", 0, 0), 1.0),
@@ -100,7 +101,7 @@ def test_resigned_inconsistent_evidence_rejected(path, replacement):
 
 
 def test_nonfinite_and_identity_rejected():
-    for invalid in (float("nan"), float("inf"), -float("inf")):
+    for invalid in (float("nan"), float("inf"), -float("inf"), 10**1000):
         value = _synthetic()
         value["metrics"]["teacher_kl"] = invalid
         with pytest.raises(ValueError, match="finite"):

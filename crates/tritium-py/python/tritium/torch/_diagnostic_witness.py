@@ -33,15 +33,20 @@ def _object(value, fields, label):
 
 
 def _integer(value, label):
-    if type(value) is not int or value <= 0:
-        raise ValueError(f"diagnostic witness {label} must be a positive integer")
+    if type(value) is not int or not 0 < value < 2**63:
+        raise ValueError(f"diagnostic witness {label} must be a positive int64")
     return value
 
 
 def _number(value, label):
-    if type(value) not in (int, float) or not math.isfinite(value):
+    try:
+        valid = type(value) in (int, float) and math.isfinite(value)
+        result = float(value) if valid else None
+    except (OverflowError, ValueError):
+        valid = False
+    if not valid:
         raise ValueError(f"diagnostic witness {label} must be finite numeric")
-    return float(value)
+    return result
 
 
 def f32(value):
