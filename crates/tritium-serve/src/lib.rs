@@ -44,8 +44,8 @@ mod startup;
 mod worker;
 
 pub use generator::{
-    FinishReason, GenError, GenRequest, Generator, MockGenerator, RunnerGenerator, Sampling, Step,
-    TreeOpError,
+    CancellationCapabilitiesV1, CancellationCheckpoint, FinishReason, GenError, GenRequest,
+    Generator, MockGenerator, RunnerGenerator, Sampling, Step, TreeOpError,
 };
 pub use qwen_generator::QwenGenerator;
 pub use tokenizer_passthrough::IdPassthroughTokenizer;

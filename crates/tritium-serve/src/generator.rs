@@ -415,12 +415,112 @@ impl fmt::Display for TreeOpError {
 
 impl std::error::Error for TreeOpError {}
 
+/// Declared cancellation checkpoints, not measured latency or readiness.
+///
+/// Running kernels/graphs are never preempted by these modes. Optional routes
+/// can reject an operation or select a different route for a request (ADR 0051).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CancellationCheckpoint {
+    /// The adapter has not declared this implementation's behavior.
+    Unknown,
+    /// This route is not configured in this adapter/worker.
+    NotEnabled,
+    /// Avoids work already cancelled at entry, without interrupting entered work.
+    EntryOnly,
+    /// Checks entry and token delivery, not arbitrary legacy prefill.
+    EntryAndTokenDelivery,
+    /// Polls inside work at operation boundaries and before publication.
+    CooperativeBoundaries,
+    /// The optional native route polls cooperatively when available/selected.
+    CooperativeIfAvailable,
+    /// Checks between worker iterations; an entered lockstep step runs to completion.
+    WorkerIteration,
+}
+
+/// Source-declared cancellation routes for one configured adapter/worker.
+///
+/// This is not an operation-availability, rollback, performance or qualification
+/// receipt. Snapshots must not probe/build models, run inference or select a new
+/// backend. The HTTP envelope fixes kernel preemption to false and qualification
+/// to `not_assessed`, independently of these descriptive declarations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[non_exhaustive]
+pub struct CancellationCapabilitiesV1 {
+    /// Overall generation route; a batched worker reports its weakest ordinary route.
+    pub generation: CancellationCheckpoint,
+    /// Optional external tree-session prefill route.
+    pub tree_session_open: CancellationCheckpoint,
+    /// Optional external tree-verification route.
+    pub tree_verify: CancellationCheckpoint,
+    /// Configured model-drafter route (not prompt lookup).
+    pub model_draft: CancellationCheckpoint,
+    /// Continuous-batch prompt admission/chunk route.
+    pub batch_prompt: CancellationCheckpoint,
+    /// Continuous-batch speculative round route, conditional on request eligibility.
+    pub batch_speculation: CancellationCheckpoint,
+    /// Ordinary continuous-batch lockstep decode route.
+    pub batch_decode: CancellationCheckpoint,
+}
+
+impl Default for CancellationCapabilitiesV1 {
+    fn default() -> Self {
+        use CancellationCheckpoint::{EntryAndTokenDelivery, EntryOnly, NotEnabled, Unknown};
+        Self {
+            generation: EntryAndTokenDelivery,
+            tree_session_open: EntryOnly,
+            tree_verify: EntryOnly,
+            model_draft: Unknown,
+            batch_prompt: NotEnabled,
+            batch_speculation: NotEnabled,
+            batch_decode: NotEnabled,
+        }
+    }
+}
+
+impl CancellationCapabilitiesV1 {
+    /// Stable wire envelope identity; this is not a qualification schema.
+    pub const SCHEMA: &'static str = "tritium.cancellation-capabilities.v1";
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn batched(has_draft: bool) -> Self {
+        use CancellationCheckpoint::{
+            CooperativeBoundaries, CooperativeIfAvailable, NotEnabled, WorkerIteration,
+        };
+        let draft = if has_draft {
+            CooperativeIfAvailable
+        } else {
+            NotEnabled
+        };
+        Self {
+            generation: WorkerIteration,
+            tree_session_open: CooperativeIfAvailable,
+            tree_verify: CooperativeIfAvailable,
+            model_draft: draft,
+            batch_prompt: CooperativeBoundaries,
+            batch_speculation: draft,
+            batch_decode: WorkerIteration,
+        }
+    }
+}
+
 /// The inference seam: prefill a prompt and stream decode steps.
 ///
 /// Synchronous and runtime-free by design — the serve-gated worker drives it on a
 /// dedicated thread (the runner is `Send` but `&mut`-exclusive). `on_step`
 /// returning `false` cancels generation (client disconnect / shutdown).
 pub trait Generator: Send {
+    /// Declare configured cancellation routes without probing/building models.
+    ///
+    /// Must be cheap, side-effect-free, nonblocking and non-panicking. The
+    /// conservative default describes compatibility wrappers only; it cannot
+    /// infer a third-party implementation's native or hidden drafting behavior.
+    /// Declarations are descriptive, never independent qualification evidence.
+    fn cancellation_capabilities(&self) -> CancellationCapabilitiesV1 {
+        CancellationCapabilitiesV1::default()
+    }
+
     /// Prefill `req.prompt_tokens` then decode up to `req.max_new` tokens, calling
     /// `on_step` once per decoded token. Stops early when `on_step` returns `false`.
     ///
@@ -559,6 +659,15 @@ impl MockGenerator {
 }
 
 impl Generator for MockGenerator {
+    fn cancellation_capabilities(&self) -> CancellationCapabilitiesV1 {
+        CancellationCapabilitiesV1 {
+            tree_session_open: CancellationCheckpoint::NotEnabled,
+            tree_verify: CancellationCheckpoint::NotEnabled,
+            model_draft: CancellationCheckpoint::NotEnabled,
+            ..CancellationCapabilitiesV1::default()
+        }
+    }
+
     fn generate(
         &mut self,
         req: &GenRequest,
@@ -1923,6 +2032,34 @@ impl RunnerGenerator {
 }
 
 impl Generator for RunnerGenerator {
+    fn cancellation_capabilities(&self) -> CancellationCapabilitiesV1 {
+        use CancellationCheckpoint::{CooperativeBoundaries, CooperativeIfAvailable, NotEnabled};
+        #[cfg(feature = "cuda")]
+        let native = self
+            .runner
+            .backend
+            .as_concrete()
+            .is_some_and(|backend| backend.is::<tritium_cuda::CudaBackend>());
+        #[cfg(not(feature = "cuda"))]
+        let native = false;
+        let tree = if native {
+            CooperativeIfAvailable
+        } else {
+            NotEnabled
+        };
+        CancellationCapabilitiesV1 {
+            generation: CooperativeBoundaries,
+            tree_session_open: tree,
+            tree_verify: tree,
+            model_draft: if native && self.draft.is_some() {
+                CooperativeIfAvailable
+            } else {
+                NotEnabled
+            },
+            ..CancellationCapabilitiesV1::default()
+        }
+    }
+
     fn generate(
         &mut self,
         req: &GenRequest,
@@ -2173,6 +2310,142 @@ impl Generator for RunnerGenerator {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cancellation_capabilities_default_is_conservative_and_runtime_free() {
+        use super::*;
+        struct Legacy;
+        impl Generator for Legacy {
+            fn generate(
+                &mut self,
+                _: &GenRequest,
+                _: &mut dyn FnMut(Step) -> bool,
+            ) -> Result<(), GenError> {
+                panic!("metadata must not run inference")
+            }
+            fn n_ctx(&self) -> usize {
+                panic!("metadata must not probe context")
+            }
+            fn vocab(&self) -> usize {
+                panic!("metadata must not probe vocabulary")
+            }
+        }
+        let caps = Legacy.cancellation_capabilities();
+        assert_eq!(
+            serde_json::to_value(caps).unwrap(),
+            serde_json::json!({
+                "generation": "entry_and_token_delivery",
+                "tree_session_open": "entry_only",
+                "tree_verify": "entry_only",
+                "model_draft": "unknown",
+                "batch_prompt": "not_enabled",
+                "batch_speculation": "not_enabled",
+                "batch_decode": "not_enabled",
+            })
+        );
+        assert_eq!(
+            CancellationCapabilitiesV1::SCHEMA,
+            "tritium.cancellation-capabilities.v1"
+        );
+        let known = MockGenerator::new(vec![1]).cancellation_capabilities();
+        assert_eq!(
+            known.generation,
+            CancellationCheckpoint::EntryAndTokenDelivery
+        );
+        assert_eq!(known.tree_verify, CancellationCheckpoint::NotEnabled);
+        assert_eq!(known.model_draft, CancellationCheckpoint::NotEnabled);
+    }
+
+    #[test]
+    fn cancellation_capabilities_wire_modes_are_frozen() {
+        use super::CancellationCheckpoint::*;
+        assert_eq!(
+            serde_json::to_value([
+                Unknown,
+                NotEnabled,
+                EntryOnly,
+                EntryAndTokenDelivery,
+                CooperativeBoundaries,
+                CooperativeIfAvailable,
+                WorkerIteration,
+            ])
+            .unwrap(),
+            serde_json::json!([
+                "unknown",
+                "not_enabled",
+                "entry_only",
+                "entry_and_token_delivery",
+                "cooperative_boundaries",
+                "cooperative_if_available",
+                "worker_iteration",
+            ])
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn cancellation_capabilities_cpu_runner_does_not_claim_native_routes() {
+        use super::*;
+        let generator =
+            RunnerGenerator::new(tiny_legacy_runner(), 3).with_draft_model(tiny_legacy_runner());
+        let before: Vec<_> = generator.runner.kv.iter().map(|cache| cache.len).collect();
+        let caps = generator.cancellation_capabilities();
+        assert_eq!(
+            caps.generation,
+            CancellationCheckpoint::CooperativeBoundaries
+        );
+        assert_eq!(caps.tree_session_open, CancellationCheckpoint::NotEnabled);
+        assert_eq!(caps.tree_verify, CancellationCheckpoint::NotEnabled);
+        assert_eq!(caps.model_draft, CancellationCheckpoint::NotEnabled);
+        assert_eq!(caps.batch_decode, CancellationCheckpoint::NotEnabled);
+        assert_eq!(
+            generator
+                .runner
+                .kv
+                .iter()
+                .map(|cache| cache.len)
+                .collect::<Vec<_>>(),
+            before
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cancellation_capabilities_native_and_batch_routes_are_conditional() {
+        use super::*;
+        use CancellationCheckpoint::*;
+        let Some(runner) = crate::test_support::tiny_cuda_runner(16) else {
+            return;
+        };
+        let generator = RunnerGenerator::new(runner, 7);
+        let caps = generator.cancellation_capabilities();
+        assert_eq!(caps.generation, CooperativeBoundaries);
+        assert_eq!(caps.tree_session_open, CooperativeIfAvailable);
+        assert_eq!(caps.tree_verify, CooperativeIfAvailable);
+        assert_eq!(caps.model_draft, NotEnabled);
+        let generator = generator.with_draft_model(tiny_legacy_runner());
+        assert_eq!(
+            generator.cancellation_capabilities().model_draft,
+            CooperativeIfAvailable
+        );
+        assert!(generator.runner.kv.iter().all(|cache| cache.len == 0));
+        for has_draft in [false, true] {
+            let caps = CancellationCapabilitiesV1::batched(has_draft);
+            assert_eq!(caps.generation, WorkerIteration);
+            assert_eq!(caps.batch_decode, WorkerIteration);
+            assert_eq!(caps.batch_prompt, CooperativeBoundaries);
+            assert_eq!(caps.tree_verify, CooperativeIfAvailable);
+            assert_eq!(
+                caps.batch_speculation,
+                if has_draft {
+                    CooperativeIfAvailable
+                } else {
+                    NotEnabled
+                }
+            );
+            assert_eq!(caps.model_draft, caps.batch_speculation);
+        }
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     fn speculative_loop_all_queries_retire_and_recover_owned_state() {

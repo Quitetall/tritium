@@ -25,6 +25,112 @@ use tritium_serve::{
 
 /// A generator that always fails (for the backend-error / panic-resilience tests).
 struct ErrGen;
+
+#[tokio::test]
+async fn cancellation_capabilities_health_discloses_legacy_limits() {
+    let (router, draining) = build_router(
+        Box::new(ErrGen),
+        Arc::new(IdPassthroughTokenizer::default()),
+        ServeConfig::default(),
+    );
+    for drain in [false, true] {
+        draining.store(drain, Ordering::Release);
+        let response = router
+            .clone()
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(
+            body["cancellation"],
+            json!({
+                "schema": "tritium.cancellation-capabilities.v1",
+                "kernel_preemption": false,
+                "qualification": "not_assessed",
+                "checkpoints": {
+                    "generation": "entry_and_token_delivery",
+                    "tree_session_open": "entry_only",
+                    "tree_verify": "entry_only",
+                    "model_draft": "unknown",
+                    "batch_prompt": "not_enabled",
+                    "batch_speculation": "not_enabled",
+                    "batch_decode": "not_enabled",
+                },
+            })
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancellation_capabilities_snapshot_once_cannot_grant_readiness() {
+    struct Declared(Arc<AtomicUsize>);
+    impl Generator for Declared {
+        fn cancellation_capabilities(&self) -> tritium_serve::CancellationCapabilitiesV1 {
+            self.0.fetch_add(1, Ordering::SeqCst); // test-only snapshot observation
+            let mut caps = tritium_serve::CancellationCapabilitiesV1::default();
+            caps.generation = tritium_serve::CancellationCheckpoint::CooperativeBoundaries;
+            caps
+        }
+        fn generate(
+            &mut self,
+            _: &GenRequest,
+            _: &mut dyn FnMut(Step) -> bool,
+        ) -> Result<(), GenError> {
+            panic!("reporting must not run inference")
+        }
+        fn n_ctx(&self) -> usize {
+            16
+        }
+        fn vocab(&self) -> usize {
+            8
+        }
+    }
+    for governed in [false, true] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let generator = Box::new(Declared(calls.clone()));
+        let tok = Arc::new(IdPassthroughTokenizer::default());
+        let (router, draining) = if governed {
+            build_router_governed(
+                generator,
+                tok,
+                ServeConfig::default(),
+                RequestLimits::default(),
+                AdmissionPolicy::default(),
+            )
+            .unwrap()
+        } else {
+            build_router(generator, tok, ServeConfig::default())
+        };
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        draining.store(true, Ordering::Release);
+        for _ in 0..3 {
+            let response = router
+                .clone()
+                .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let body: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(
+                body["cancellation"]["checkpoints"]["generation"],
+                "cooperative_boundaries"
+            );
+            assert_eq!(body["cancellation"]["qualification"], "not_assessed");
+            assert_eq!(body["cancellation"]["kernel_preemption"], false);
+        }
+        let ready = router
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
+
 impl Generator for ErrGen {
     fn generate(
         &mut self,

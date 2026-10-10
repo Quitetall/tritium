@@ -29,7 +29,7 @@ use crate::dto::{
     StopField, Usage,
 };
 use crate::generator::TreeOpError;
-use crate::generator::{FinishReason, GenRequest, Generator, Sampling};
+use crate::generator::{CancellationCapabilitiesV1, FinishReason, GenRequest, Generator, Sampling};
 use crate::sse::{
     IncrementalDetok, StopMatcher, content_chunk, error_chunk, role_chunk, terminal_chunk,
 };
@@ -549,6 +549,7 @@ struct AppState {
 
 #[derive(Clone)]
 struct RuntimeState {
+    cancellation: CancellationCapabilitiesV1,
     draining: Arc<AtomicBool>,
     worker_alive: Arc<AtomicBool>,
     worker_ready: Arc<AtomicBool>,
@@ -601,6 +602,7 @@ pub fn build_router_with_limits(
     let backend_faulted = Arc::new(AtomicBool::new(false));
     let backend_faults = Arc::new(AtomicU64::new(0));
     let telemetry = Arc::new(WorkerTelemetry::default());
+    let cancellation = generator.cancellation_capabilities();
     let jobs = spawn_worker(
         generator,
         WorkerSignals {
@@ -629,6 +631,7 @@ pub fn build_router_with_limits(
             backend_faulted,
             backend_faults,
             telemetry,
+            cancellation,
             production: None,
         },
     )
@@ -653,6 +656,7 @@ pub fn build_router_governed(
     let backend_faulted = Arc::new(AtomicBool::new(false));
     let backend_faults = Arc::new(AtomicU64::new(0));
     let telemetry = Arc::new(WorkerTelemetry::default());
+    let cancellation = generator.cancellation_capabilities();
     let jobs = spawn_worker(
         generator,
         WorkerSignals {
@@ -680,6 +684,7 @@ pub fn build_router_governed(
             backend_faulted,
             backend_faults,
             telemetry,
+            cancellation,
             production: None,
         },
     ))
@@ -733,6 +738,7 @@ fn build_router_production_mode(
     let backend_faulted = Arc::new(AtomicBool::new(false));
     let backend_faults = Arc::new(AtomicU64::new(0));
     let telemetry = Arc::new(WorkerTelemetry::default());
+    let cancellation = generator.cancellation_capabilities();
     let jobs = spawn_worker(
         generator,
         WorkerSignals {
@@ -760,6 +766,7 @@ fn build_router_production_mode(
             backend_faulted,
             backend_faults,
             telemetry,
+            cancellation,
             production: Some(production.clone()),
         },
     );
@@ -793,6 +800,7 @@ pub fn build_router_batched_with_limits(
 ) -> std::io::Result<(Router, Arc<AtomicBool>)> {
     let admission = Arc::new(Admission::legacy(cfg.auth_token.as_deref()));
     build_router_batched_inner(runner, None, eos, slots, tok, cfg, limits, admission)
+        .map(|(router, draining, _worker_alive)| (router, draining))
 }
 
 /// Build the continuous-batching router with an attached ADR 0021 draft
@@ -819,6 +827,7 @@ pub fn build_router_batched_with_draft(
         RequestLimits::default(),
         admission,
     )
+    .map(|(router, draining, _worker_alive)| (router, draining))
 }
 
 /// Build the continuous-batching router with rotating bearer keys and
@@ -838,6 +847,7 @@ pub fn build_router_batched_governed(
 ) -> std::io::Result<(Router, Arc<AtomicBool>)> {
     let admission = Arc::new(Admission::new(cfg.auth_token.as_deref(), policy)?);
     build_router_batched_inner(runner, draft, eos, slots, tok, cfg, limits, admission)
+        .map(|(router, draining, _worker_alive)| (router, draining))
 }
 
 #[cfg(feature = "cuda")]
@@ -851,7 +861,7 @@ fn build_router_batched_inner(
     cfg: ServeConfig,
     limits: RequestLimits,
     admission: Arc<Admission>,
-) -> std::io::Result<(Router, Arc<AtomicBool>)> {
+) -> std::io::Result<(Router, Arc<AtomicBool>, Arc<AtomicBool>)> {
     use std::sync::atomic::Ordering;
     if slots == 0 {
         return Err(std::io::Error::new(
@@ -859,8 +869,10 @@ fn build_router_batched_inner(
             "--batch-slots must be >= 1",
         ));
     }
+    let cancellation = CancellationCapabilitiesV1::batched(draft.is_some());
     let (jobs_tx, jobs_rx) = tokio::sync::mpsc::channel(cfg.queue_cap);
     let worker_alive = Arc::new(AtomicBool::new(true));
+    let worker_lifecycle = worker_alive.clone();
     let worker_ready = Arc::new(AtomicBool::new(false));
     let draining = Arc::new(AtomicBool::new(false));
     let phase = Arc::new(AtomicU8::new(PHASE_IDLE));
@@ -898,7 +910,7 @@ fn build_router_batched_inner(
                 worker_telemetry,
             );
         })?;
-    Ok(build_router_inner(
+    let (router, draining) = build_router_inner(
         jobs_tx,
         tok,
         cfg,
@@ -912,9 +924,11 @@ fn build_router_batched_inner(
             backend_faulted,
             backend_faults,
             telemetry,
+            cancellation,
             production: None,
         },
-    ))
+    );
+    Ok((router, draining, worker_lifecycle))
 }
 
 /// Shared across routes and router clones, unlike a per-route service layer.
@@ -2108,12 +2122,19 @@ fn queue_depth(st: &AppState) -> usize {
 
 async fn health(State(st): State<AppState>) -> Response {
     let queue_depth = queue_depth(&st);
+    let cancellation = serde_json::json!({
+        "schema": CancellationCapabilitiesV1::SCHEMA,
+        "checkpoints": st.runtime.cancellation,
+        "kernel_preemption": false,
+        "qualification": "not_assessed",
+    });
     if !st.runtime.worker_alive.load(Ordering::Relaxed) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
                 "status": "unhealthy",
                 "detail": "decode worker stopped",
+                "cancellation": cancellation,
                 "model": &*st.model_id,
             })),
         )
@@ -2125,6 +2146,7 @@ async fn health(State(st): State<AppState>) -> Response {
             Json(serde_json::json!({
                 "status": "unhealthy",
                 "detail": "backend fault latched",
+                "cancellation": cancellation,
                 "model": &*st.model_id,
                 "worker_alive": true,
             })),
@@ -2143,6 +2165,7 @@ async fn health(State(st): State<AppState>) -> Response {
             Json(serde_json::json!({
                 "status": "unhealthy",
                 "detail": "paged KV reclamation fault latched",
+                "cancellation": cancellation,
                 "model": &*st.model_id,
                 "worker_alive": true,
             })),
@@ -2151,6 +2174,7 @@ async fn health(State(st): State<AppState>) -> Response {
     }
     Json(serde_json::json!({
         "status": "ok",
+        "cancellation": cancellation,
         "model": &*st.model_id,
         "worker_alive": true,
         "draining": st.runtime.draining.load(Ordering::Relaxed),
@@ -2697,6 +2721,127 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
+    #[tokio::test]
+    async fn cancellation_capabilities_survive_every_unhealthy_diagnostic() {
+        for fault in 0..3 {
+            let (jobs, _receiver) = mpsc::channel(1);
+            let telemetry = Arc::new(WorkerTelemetry::default());
+            if fault == 2 {
+                telemetry
+                    .kv_pool_release_failures_total
+                    .store(1, Ordering::Release);
+            }
+            let (router, _) = build_router_inner(
+                jobs,
+                Arc::new(crate::IdPassthroughTokenizer::default()),
+                ServeConfig::default(),
+                RequestLimits::default(),
+                Arc::new(Admission::legacy(None)),
+                RuntimeState {
+                    cancellation: CancellationCapabilitiesV1::default(),
+                    draining: Arc::new(AtomicBool::new(false)),
+                    worker_alive: Arc::new(AtomicBool::new(fault != 0)),
+                    worker_ready: Arc::new(AtomicBool::new(true)),
+                    phase: Arc::new(AtomicU8::new(PHASE_IDLE)),
+                    backend_faulted: Arc::new(AtomicBool::new(fault == 1)),
+                    backend_faults: Arc::new(AtomicU64::new(u64::from(fault == 1))),
+                    telemetry,
+                    production: None,
+                },
+            );
+            let response = router
+                .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(
+                body["cancellation"]["schema"],
+                CancellationCapabilitiesV1::SCHEMA
+            );
+            assert_eq!(
+                body["cancellation"]["checkpoints"],
+                serde_json::to_value(CancellationCapabilitiesV1::default()).unwrap()
+            );
+            assert_eq!(body["cancellation"]["qualification"], "not_assessed");
+            assert_eq!(body["cancellation"]["kernel_preemption"], false);
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[tokio::test]
+    async fn cancellation_capabilities_batched_router_preserves_lockstep_limit() {
+        for has_draft in [false, true] {
+            let Some(runner) = crate::test_support::tiny_cuda_runner(16) else {
+                return;
+            };
+            let tok = Arc::new(crate::IdPassthroughTokenizer::default());
+            let draft = has_draft.then(|| crate::test_support::tiny_cuda_runner(16).unwrap());
+            // Cross the actual worker constructor seam and retain its existing
+            // liveness signal. Public router builders still return the old pair.
+            let (router, draining, alive) = build_router_batched_inner(
+                runner,
+                draft,
+                7,
+                2,
+                tok,
+                ServeConfig::default(),
+                RequestLimits::default(),
+                Arc::new(Admission::legacy(None)),
+            )
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let ready = router
+                        .clone()
+                        .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                    if ready.status() == StatusCode::OK {
+                        break;
+                    }
+                    assert!(alive.load(Ordering::Acquire), "batch initialization failed");
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("bounded batch startup");
+            let response = router
+                .clone()
+                .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(
+                body["cancellation"]["checkpoints"],
+                serde_json::to_value(CancellationCapabilitiesV1::batched(has_draft)).unwrap()
+            );
+            assert_eq!(
+                body["cancellation"]["checkpoints"]["generation"],
+                "worker_iteration"
+            );
+            assert_eq!(
+                body["cancellation"]["checkpoints"]["batch_decode"],
+                "worker_iteration"
+            );
+            assert_eq!(body["cancellation"]["qualification"], "not_assessed");
+            draining.store(true, Ordering::Release);
+            drop(router);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while alive.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("worker must retire its models before CUDA process teardown");
+        }
+    }
+
     #[test]
     fn request_budget_reserves_only_exact_get_probe_routes() {
         let budget = RequestBudget::new(1);
@@ -2884,6 +3029,7 @@ mod tests {
                 backend_faulted,
                 backend_faults,
                 telemetry: telemetry.clone(),
+                cancellation: CancellationCapabilitiesV1::default(),
                 production: None,
             },
         )

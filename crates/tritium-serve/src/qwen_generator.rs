@@ -3,7 +3,8 @@
 use std::fmt;
 
 use crate::generator::{
-    FinishReason, GenError, GenRequest, Generator, Sampling, Step, top_logprobs,
+    CancellationCapabilitiesV1, CancellationCheckpoint, FinishReason, GenError, GenRequest,
+    Generator, Sampling, Step, top_logprobs,
 };
 
 /// Generator owning one content-bound Qwen language-plus-MTP bundle.
@@ -43,6 +44,16 @@ impl fmt::Debug for QwenGenerator {
 }
 
 impl Generator for QwenGenerator {
+    fn cancellation_capabilities(&self) -> CancellationCapabilitiesV1 {
+        CancellationCapabilitiesV1 {
+            generation: CancellationCheckpoint::CooperativeBoundaries,
+            tree_session_open: CancellationCheckpoint::NotEnabled,
+            tree_verify: CancellationCheckpoint::NotEnabled,
+            model_draft: CancellationCheckpoint::NotEnabled,
+            ..CancellationCapabilitiesV1::default()
+        }
+    }
+
     fn generate(
         &mut self,
         request: &GenRequest,

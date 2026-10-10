@@ -66,6 +66,27 @@ strict config). It exposes only `GET|POST /drain`, which sets the same one-way
 drain flag as SIGTERM; it never serves model, health, readiness, or metrics
 routes. Kubernetes `preStop` hooks should target `127.0.0.1` explicitly.
 
+## Cancellation diagnostics
+
+`GET /healthz` includes `cancellation` metadata in healthy and unhealthy
+responses, under the same authentication policy as other probes. Schema
+`tritium.cancellation-capabilities.v1` reports configured generation, tree
+session/verify, model-draft, batch-prompt, batch-speculation and batch-decode
+checkpoints separately. The snapshot is taken before worker handoff; probing
+health does not build a resident model or run inference.
+
+Legacy defaults report entry/token-delivery checks, not interruption of an
+entered prefill. `unknown` is undeclared behavior; `not_enabled` is an
+unconfigured route. `cooperative_if_available` is conditional on native route
+availability and request eligibility, not a guarantee that the operation can
+run. Ordinary lockstep batch decode currently reports `worker_iteration`,
+separately from cooperative prompt/speculative work. Running kernels and graphs
+are not preempted: `kernel_preemption` is always false.
+
+These declarations are descriptive, not evidence of rollback, cancellation
+latency, resource reclamation or release readiness. `qualification` is always
+`not_assessed`; `/readyz` and independent candidate-bound gates remain unchanged.
+
 ## Metrics
 
 `GET /metrics` uses same authentication boundary as generation. Prometheus
