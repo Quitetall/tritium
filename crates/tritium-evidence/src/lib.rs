@@ -13,7 +13,12 @@ use std::fmt;
 
 use serde::Serialize;
 use serde_json::Value;
-pub use tritium_schema::{TensorUploaded, UnknownReason, Verdict};
+pub use tritium_schema::{
+    LoadedSourceIdentity, ModelLoaded, TensorUploaded, UnknownReason, Verdict,
+};
+
+mod model_load;
+pub use model_load::{MODEL_LOADED_REGISTRATION, ModelLoadReceiptView};
 
 const EVENT_DOMAIN: &[u8] = b"tritium.evidence.event.v1\0";
 const ROOT_DOMAIN: &[u8] = b"tritium.evidence.run-root.v1\0";
@@ -323,6 +328,15 @@ pub fn aggregate_required(claims: &[ClaimVerdict]) -> Verdict {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum EvidenceError {
+    /// A replay's supplied run root differs from its verified event chains.
+    RootMismatch,
+    /// A recognized event does not have its versioned strict typed payload.
+    InvalidPayload {
+        /// Event schema whose payload cannot be decoded.
+        schema: String,
+        /// Decoder category only, without echoing untrusted payload contents.
+        detail: String,
+    },
     /// Run identifier is empty.
     InvalidRunId,
     /// Event schema identifier is malformed.

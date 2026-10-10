@@ -7,6 +7,8 @@ use tritium_format::{
     AdditiveTensor,
     trit_model::{TritModel, read_trit_model},
 };
+#[cfg(feature = "tokenizer")]
+use tritium_schema::{LoadedSourceIdentity, ModelLoaded, UnknownReason};
 use tritium_schema::{PlaneCounts, ScalePrecision, TensorMeta, TensorStorage};
 use tritium_spec::TensorView;
 
@@ -51,6 +53,20 @@ enum PreparedSource<'a> {
 }
 
 impl<'a> PreparedSource<'a> {
+    #[cfg(feature = "tokenizer")]
+    fn identity(&self) -> Result<LoadedSourceIdentity, NnError> {
+        match self {
+            Self::Hf(_) => Ok(LoadedSourceIdentity::HuggingFace {
+                reason: UnknownReason::MissingCapability,
+            }),
+            Self::Trit { model, level } => Ok(LoadedSourceIdentity::Trit {
+                package_id: tritium_schema::PackageId::from_bytes(*model.package_id().as_bytes()),
+                model_id: model.model_id(level).map_err(format_error)?,
+                level: (*level).to_owned(),
+            }),
+        }
+    }
+
     fn new(source: ModelSource<'a>) -> Result<Self, NnError> {
         match source {
             ModelSource::HuggingFace(path) => Ok(Self::Hf(path)),
@@ -167,7 +183,9 @@ impl ModelWeights {
     }
 }
 
-/// Actual text tokenizer, architecture and runner, not a qualification receipt.
+/// Actual text tokenizer, architecture, runner and recorded initial-load view.
+///
+/// The receipt is not independent qualification or current mutable runner state.
 #[cfg(feature = "tokenizer")]
 #[allow(missing_debug_implementations)]
 pub struct LoadedModel {
@@ -177,6 +195,8 @@ pub struct LoadedModel {
     pub tokenizer: super::HfJsonTokenizer,
     /// Architecture variation data used by the same model builder.
     pub architecture: ArchSpec,
+    /// Immutable view of the registered initial-load observation.
+    pub receipt: tritium_evidence::ModelLoadReceiptView,
 }
 
 /// Load a text model through one source selector and shared admitted execution.
@@ -187,7 +207,11 @@ pub struct LoadedModel {
 /// Tokenizer JSON is bounded to 256 MiB and its config to 16 MiB; these are
 /// source limits, not an accounting of parsed tokenizer or total model memory.
 /// This is standard Attention/SwiGLU/Relu2 execution, not hybrid/MTP, resident
-/// executor, semantic ModelId, full-memory or release qualification.
+/// executor, full-memory or release qualification. Typed sources bind candidate
+/// model/package IDs; HF identity remains explicitly unavailable. Final load
+/// event recording failure drops the unpublished runner and payload leases.
+/// The recorder must register both `TENSOR_UPLOADED_REGISTRATION` and
+/// `MODEL_LOADED_REGISTRATION` from `tritium_evidence`.
 ///
 /// # Errors
 /// Tokenizer, source/config/coverage, payload admission or runner errors.
@@ -200,17 +224,47 @@ pub fn load(
     context: tritium_runtime::TensorUploadContext<'_>,
 ) -> Result<LoadedModel, NnError> {
     let source = PreparedSource::new(source)?;
+    let identity = source.identity()?;
     let tokenizer = source.tokenizer()?;
     let (config, architecture, weights) = {
-        let mut loader = TensorLoader::new(backend.as_ref(), policy, budget, context);
+        let mut loader = TensorLoader::new(
+            backend.as_ref(),
+            policy,
+            budget,
+            tritium_runtime::TensorUploadContext {
+                recorder: &mut *context.recorder,
+                span: context.span,
+                parent: context.parent,
+                logical_time: context.logical_time,
+            },
+        );
         source.weights(&mut loader)?
     };
     tokenizer.validate_model_vocab(weights.vocab)?;
+    let observation = ModelLoaded {
+        source: identity,
+        architecture: config.arch.clone(),
+        backend: backend.device_id().to_owned(),
+        physical_device: backend.physical_device_id().to_owned(),
+        vocab_size: u64::try_from(weights.vocab)
+            .map_err(|_| NnError::Backend("model vocabulary exceeds u64".into()))?,
+        layer_count: u64::from(config.n_layers),
+    };
     let runner = super::ModelRunner::try_from_weights(config, weights, backend)?;
+    let receipt = context
+        .recorder
+        .emit_model_loaded(
+            context.span,
+            context.parent,
+            context.logical_time,
+            &observation,
+        )
+        .map_err(|error| NnError::Backend(format!("model load evidence: {error}")))?;
     Ok(LoadedModel {
         runner,
         tokenizer,
         architecture,
+        receipt,
     })
 }
 

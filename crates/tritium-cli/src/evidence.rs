@@ -7,7 +7,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Subcommand, ValueEnum};
 use serde::Serialize;
-use tritium_evidence::{EventRegistration, EvidenceEvent, EvidenceRecorder, verify_jsonl};
+use tritium_evidence::{
+    EventRegistration, EvidenceEvent, EvidenceRecorder, ModelLoadReceiptView, verify_jsonl,
+};
 
 /// Evidence detail level for a CLI invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -185,6 +187,10 @@ pub(crate) fn run(command: EvidenceCommand) -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!("read evidence log {}: {error}", path.display()))?;
     let verified = verify_jsonl(&input)
         .map_err(|error| anyhow::anyhow!("verify evidence log {}: {error}", path.display()))?;
+    // Known load observations use the shared typed fold, not a CLI schema copy.
+    // Generic integrity is still not qualification or a registry for all events.
+    ModelLoadReceiptView::fold(&verified)
+        .map_err(|error| anyhow::anyhow!("verify model-load view {}: {error}", path.display()))?;
     if view {
         println!("{}", serde_json::to_string_pretty(&verified.events)?);
     } else {
@@ -231,6 +237,68 @@ mod tests {
     impl EvidenceEvent for ProbeEvent {
         const SCHEMA_ID: &'static str = "tritium.test.cli-probe";
         const VERSION: u16 = 1;
+    }
+
+    #[test]
+    fn verify_and_view_accept_registered_load_observations() {
+        use tritium_evidence::{MODEL_LOADED_REGISTRATION, ModelLoaded};
+        let mut recorder = EvidenceRecorder::new("load-view", [MODEL_LOADED_REGISTRATION]).unwrap();
+        recorder
+            .emit_model_loaded(
+                "load",
+                None,
+                0,
+                &ModelLoaded {
+                    source: tritium_evidence::LoadedSourceIdentity::HuggingFace {
+                        reason: tritium_evidence::UnknownReason::MissingCapability,
+                    },
+                    architecture: "llama".into(),
+                    backend: "controlled-test".into(),
+                    physical_device: "unknown".into(),
+                    vocab_size: 10,
+                    layer_count: 2,
+                },
+            )
+            .unwrap();
+        let path = temp_log();
+        std::fs::write(&path, recorder.to_jsonl().unwrap()).unwrap();
+        let verify = run(EvidenceCommand::Verify { path: path.clone() });
+        let view = run(EvidenceCommand::View { path: path.clone() });
+        std::fs::remove_file(path).unwrap();
+        verify.unwrap();
+        view.unwrap();
+    }
+
+    #[test]
+    fn verify_and_view_reject_load_payloads_with_valid_hashes_but_wrong_schema() {
+        use tritium_evidence::{MODEL_LOADED_REGISTRATION, ModelLoaded};
+        #[derive(Serialize)]
+        struct InvalidLoad {
+            unauthorized_release_verdict: bool,
+        }
+        impl EvidenceEvent for InvalidLoad {
+            const SCHEMA_ID: &'static str = ModelLoaded::SCHEMA_ID;
+            const VERSION: u16 = 1;
+        }
+        let mut recorder =
+            EvidenceRecorder::new("wrong-load", [MODEL_LOADED_REGISTRATION]).unwrap();
+        recorder
+            .emit(
+                "load",
+                None,
+                0,
+                &InvalidLoad {
+                    unauthorized_release_verdict: true,
+                },
+            )
+            .unwrap();
+        let path = temp_log();
+        std::fs::write(&path, recorder.to_jsonl().unwrap()).unwrap();
+        let verify = run(EvidenceCommand::Verify { path: path.clone() });
+        let view = run(EvidenceCommand::View { path: path.clone() });
+        std::fs::remove_file(path).unwrap();
+        assert!(verify.unwrap_err().to_string().contains("InvalidPayload"));
+        assert!(view.unwrap_err().to_string().contains("InvalidPayload"));
     }
 
     #[test]

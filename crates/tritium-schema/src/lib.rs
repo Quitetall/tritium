@@ -21,6 +21,11 @@ mod semantic;
 #[cfg(feature = "alloc")]
 pub use semantic::*;
 
+#[cfg(feature = "alloc")]
+mod load;
+#[cfg(feature = "alloc")]
+pub use load::*;
+
 /// Precision used to store additive plane scales.
 #[non_exhaustive]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]

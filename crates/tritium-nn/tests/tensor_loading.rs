@@ -939,10 +939,32 @@ fn check_text_load(
     mut oracle: ModelRunner,
     backend: Box<dyn TernaryBackend>,
 ) {
+    use tritium_evidence::{MODEL_LOADED_REGISTRATION, ModelLoadReceiptView};
     use tritium_nn::Tokenizer;
+    let expected_source = match source {
+        tritium_nn::ModelSource::Trit { bytes, level } => {
+            let model = tritium_format::trit_model::read_trit_model(bytes).unwrap();
+            tritium_schema::LoadedSourceIdentity::Trit {
+                package_id: tritium_schema::PackageId::from_bytes(*model.package_id().as_bytes()),
+                model_id: model.model_id(level).unwrap(),
+                level: level.into(),
+            }
+        }
+        tritium_nn::ModelSource::HuggingFace(_) => {
+            tritium_schema::LoadedSourceIdentity::HuggingFace {
+                reason: tritium_schema::UnknownReason::MissingCapability,
+            }
+        }
+        _ => panic!("unexpected test source"),
+    };
+    let expected_backend = backend.device_id().to_owned();
+    let expected_device = backend.physical_device_id().to_owned();
     let budget = TensorPayloadBudget::new(100_000);
-    let mut recorder =
-        EvidenceRecorder::new("nn-text-load", [TENSOR_UPLOADED_REGISTRATION]).unwrap();
+    let mut recorder = EvidenceRecorder::new(
+        "nn-text-load",
+        [TENSOR_UPLOADED_REGISTRATION, MODEL_LOADED_REGISTRATION],
+    )
+    .unwrap();
     let mut loaded = tritium_nn::load(
         source,
         backend,
@@ -961,6 +983,22 @@ fn check_text_load(
     assert_eq!(loaded.tokenizer.bos(), 4);
     assert_eq!(loaded.tokenizer.eos(), 3);
     assert_eq!(loaded.runner.config.arch, "qwen3");
+    assert_eq!(loaded.receipt.observation().source, expected_source);
+    assert_eq!(loaded.receipt.observation().backend, expected_backend);
+    assert_eq!(
+        loaded.receipt.observation().physical_device,
+        expected_device
+    );
+    assert_eq!(
+        loaded.receipt.observation().architecture,
+        loaded.runner.config.arch
+    );
+    assert_eq!(loaded.receipt.observation().vocab_size, 10);
+    assert_eq!(
+        loaded.receipt.observation().layer_count,
+        u64::from(loaded.runner.config.n_layers)
+    );
+    assert_eq!(Some(loaded.receipt.envelope()), recorder.events().last());
     let prompt = loaded.tokenizer.encode("hello partner").unwrap();
     assert_eq!(
         loaded
@@ -970,11 +1008,15 @@ fn check_text_load(
         oracle.generate(&prompt, 3, 3).unwrap()
     );
     assert!(budget.used_bytes() > 0);
-    verify_jsonl_with_registry(
+    let verified = verify_jsonl_with_registry(
         &recorder.to_jsonl().unwrap(),
-        [TENSOR_UPLOADED_REGISTRATION],
+        [TENSOR_UPLOADED_REGISTRATION, MODEL_LOADED_REGISTRATION],
     )
     .unwrap();
+    assert_eq!(
+        ModelLoadReceiptView::fold(&verified).unwrap().as_slice(),
+        std::slice::from_ref(&loaded.receipt)
+    );
     drop(loaded);
     assert_eq!(budget.used_bytes(), 0);
 }
@@ -1045,6 +1087,7 @@ fn text_source_loads_real_tokenizers_and_generates_with_shared_runner() {
 #[cfg(feature = "tokenizer")]
 #[test]
 fn text_load_rejects_invalid_assets_and_vocab_and_releases_budget() {
+    use tritium_evidence::{EvidenceEvent, MODEL_LOADED_REGISTRATION, ModelLoaded};
     for bad in [
         "missing-config",
         "invalid-json",
@@ -1081,8 +1124,11 @@ fn text_load_rejects_invalid_assets_and_vocab_and_releases_budget() {
             },
         ] {
             let budget = TensorPayloadBudget::new(100_000);
-            let mut recorder =
-                EvidenceRecorder::new("nn-text-failure", [TENSOR_UPLOADED_REGISTRATION]).unwrap();
+            let mut recorder = EvidenceRecorder::new(
+                "nn-text-failure",
+                [TENSOR_UPLOADED_REGISTRATION, MODEL_LOADED_REGISTRATION],
+            )
+            .unwrap();
             let result = tritium_nn::load(
                 source,
                 Box::new(tritium_cpu::CpuBackend::new()),
@@ -1097,12 +1143,181 @@ fn text_load_rejects_invalid_assets_and_vocab_and_releases_budget() {
             );
             assert!(result.is_err(), "{bad}");
             assert_eq!(budget.used_bytes(), 0, "{bad}");
+            assert!(
+                recorder
+                    .events()
+                    .iter()
+                    .all(|event| event.schema != ModelLoaded::SCHEMA_ID)
+            );
             assert_eq!(
                 recorder.events().len(),
                 if bad == "vocab" { hf.upload_count } else { 0 },
                 "{bad}"
             );
         }
+    }
+}
+
+#[cfg(feature = "tokenizer")]
+#[test]
+fn load_observations_bind_selected_level_and_logical_ids_across_codecs() {
+    use tritium_evidence::{MODEL_LOADED_REGISTRATION, ModelLoadReceiptView};
+    use tritium_schema::{BlobId, LoadedSourceIdentity};
+    let hf = HfFixture::new("qwen3", true, 6, None);
+    let (tokenizer, config) = tokenizer_assets(false);
+    let mut baseline = None;
+    let mut packages = Vec::new();
+    for codec in [PlaneCodec::D2, PlaneCodec::B3, PlaneCodec::S34] {
+        let mut fixture = TritFixture::new(&hf, Some((codec, Basis::Identity)));
+        fixture.asset("tokenizer.json", tokenizer.clone());
+        fixture.asset("tokenizer_config.json", config.clone());
+        let mut alias = fixture.manifest.levels[0].clone();
+        alias.name = "alias".into();
+        let mut changed = alias.clone();
+        changed.name = "changed".into();
+        let norm = changed
+            .tensors
+            .iter_mut()
+            .find(|t| t.name == "model.norm.weight")
+            .unwrap();
+        let mut bytes = fixture
+            .blobs
+            .iter()
+            .find(|(_, bytes)| blake3::hash(bytes).as_bytes() == norm.blob.id.as_bytes())
+            .unwrap()
+            .1
+            .clone();
+        bytes[..4].copy_from_slice(&0.5f32.to_le_bytes());
+        norm.blob.id = BlobId::from_bytes(*blake3::hash(&bytes).as_bytes());
+        fixture.blobs.push((
+            tritium_format::TritBlobKind::DenseTensor(tritium_core::DType::F32),
+            bytes,
+        ));
+        fixture.manifest.levels.extend([alias, changed]);
+        let bytes = fixture.bytes();
+        let checked = tritium_format::trit_model::read_trit_model(&bytes).unwrap();
+        let ids = [
+            checked.model_id("standard").unwrap(),
+            checked.model_id("alias").unwrap(),
+            checked.model_id("changed").unwrap(),
+        ];
+        assert_eq!(ids[0], ids[1]);
+        assert_ne!(ids[0], ids[2]);
+        if let Some(baseline) = baseline {
+            assert_eq!(ids, baseline);
+        } else {
+            baseline = Some(ids);
+        }
+        packages.push(checked.package_id());
+        for (level, expected) in ["standard", "alias", "changed"].into_iter().zip(ids) {
+            let budget = TensorPayloadBudget::new(100_000);
+            let mut recorder = EvidenceRecorder::new(
+                "level-load",
+                [TENSOR_UPLOADED_REGISTRATION, MODEL_LOADED_REGISTRATION],
+            )
+            .unwrap();
+            let loaded = tritium_nn::load(
+                tritium_nn::ModelSource::Trit {
+                    bytes: &bytes,
+                    level,
+                },
+                Box::new(tritium_cpu::CpuBackend::new()),
+                TensorUploadPolicy::default(),
+                &budget,
+                TensorUploadContext {
+                    recorder: &mut recorder,
+                    span: "load",
+                    parent: None,
+                    logical_time: 0,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                loaded.receipt.observation().source,
+                LoadedSourceIdentity::Trit {
+                    package_id: tritium_schema::PackageId::from_bytes(
+                        *checked.package_id().as_bytes()
+                    ),
+                    model_id: expected,
+                    level: level.into(),
+                }
+            );
+            let verified = verify_jsonl_with_registry(
+                &recorder.to_jsonl().unwrap(),
+                [TENSOR_UPLOADED_REGISTRATION, MODEL_LOADED_REGISTRATION],
+            )
+            .unwrap();
+            assert_eq!(
+                ModelLoadReceiptView::fold(&verified).unwrap().as_slice(),
+                std::slice::from_ref(&loaded.receipt)
+            );
+            drop(loaded);
+            assert_eq!(budget.used_bytes(), 0);
+        }
+    }
+    assert!(
+        packages
+            .iter()
+            .enumerate()
+            .all(|(i, id)| !packages[..i].contains(id))
+    );
+}
+
+#[cfg(feature = "tokenizer")]
+#[test]
+fn final_load_recording_failure_releases_all_unpublished_payloads() {
+    use tritium_evidence::{EvidenceEvent, ModelLoaded};
+    let hf = HfFixture::new("qwen3", true, 6, None);
+    let (tokenizer, config) = tokenizer_assets(false);
+    std::fs::write(hf.dir.join("tokenizer.json"), &tokenizer).unwrap();
+    std::fs::write(hf.dir.join("tokenizer_config.json"), &config).unwrap();
+    let mut fixture = TritFixture::new(&hf, None);
+    fixture.asset("tokenizer.json", tokenizer);
+    fixture.asset("tokenizer_config.json", config);
+    let bytes = fixture.bytes();
+    for source in [
+        tritium_nn::ModelSource::HuggingFace(&hf.dir),
+        tritium_nn::ModelSource::Trit {
+            bytes: &bytes,
+            level: "standard",
+        },
+    ] {
+        let budget = TensorPayloadBudget::new(100_000);
+        // Matrix uploads succeed; only final ModelLoaded registration is absent.
+        let mut recorder =
+            EvidenceRecorder::new("final-load-failure", [TENSOR_UPLOADED_REGISTRATION]).unwrap();
+        let error = tritium_nn::load(
+            source,
+            Box::new(tritium_cpu::CpuBackend::new()),
+            TensorUploadPolicy::default(),
+            &budget,
+            TensorUploadContext {
+                recorder: &mut recorder,
+                span: "load",
+                parent: None,
+                logical_time: 0,
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("model load evidence: UnregisteredSchema")
+        );
+        assert_eq!(recorder.events().len(), hf.upload_count);
+        assert!(
+            recorder
+                .events()
+                .iter()
+                .all(|event| event.schema != ModelLoaded::SCHEMA_ID)
+        );
+        verify_jsonl_with_registry(
+            &recorder.to_jsonl().unwrap(),
+            [TENSOR_UPLOADED_REGISTRATION],
+        )
+        .unwrap();
+        assert_eq!(budget.used_bytes(), 0);
     }
 }
 
