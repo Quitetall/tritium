@@ -61,6 +61,7 @@ docker run --rm \
   --volume "$RUST_SYSROOT:/opt/rust:ro" \
   --env "CARGO_HOME=/cargo/cargo-home" \
   --env "CARGO_TARGET_DIR=/cargo/target" \
+  --env "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}" \
   --env "HOST_UID=$(id -u)" \
   --env "HOST_GID=$(id -g)" \
   --env "TRITIUM_SOURCE_ID=source-git:$SOURCE_REVISION" \

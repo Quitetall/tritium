@@ -74,6 +74,7 @@ on:
       - "scripts/tests/test_build_cuda_manylinux_wheel.py"
       - "scripts/build-cpu-manylinux-wheel.sh"
       - "scripts/tests/test_build_cpu_manylinux_wheel.py"
+      - "scripts/tests/test_manylinux_build_resources.py"
       - "scripts/generate-wheel-sbom.py"
       - "scripts/tests/test_generate_wheel_sbom.py"
       - "scripts/generate-colab-notebook.py"
