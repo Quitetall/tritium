@@ -36,7 +36,7 @@ mod trit;
 
 pub use additive::{
     AdditiveError, AdditiveView, BasisBound, Gather, Matmul, apply_basis, apply_inverse_basis,
-    reference_embed, reference_ternary_matmul,
+    fast_hadamard, group_is_rotatable, reference_embed, reference_ternary_matmul,
 };
 pub use dense::{DenseError, DenseView};
 pub use dtype::{DType, TernaryFormat};

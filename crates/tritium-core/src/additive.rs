@@ -458,23 +458,53 @@ fn validate_basis_blocks(len: usize, block: u32) -> Result<usize, AdditiveError>
 fn apply_hadamard_blocks(values: &mut [f32], block: u32) -> Result<(), AdditiveError> {
     let block = validate_basis_blocks(values.len(), block)?;
     for vector in values.chunks_exact_mut(block) {
-        let mut width = 1usize;
-        while width < block {
-            for start in (0..block).step_by(width * 2) {
-                for index in start..start + width {
-                    let (left, right) = (vector[index], vector[index + width]);
-                    vector[index] = left + right;
-                    vector[index + width] = left - right;
-                }
-            }
-            width *= 2;
-        }
-        let normalization = hadamard_normalization(block.trailing_zeros());
-        for value in vector {
-            *value *= normalization;
-        }
+        hadamard_vector(vector);
     }
     Ok(())
+}
+
+/// Whether the legacy group-local rotation rule transforms this group width.
+///
+/// A ragged tail is transformed only when its own length is a power of two and
+/// greater than one. This does not admit ragged typed basis blocks: [`apply_basis`]
+/// still requires its block width to divide the entire input axis.
+#[must_use]
+pub const fn group_is_rotatable(len: usize) -> bool {
+    len.is_power_of_two() && len > 1
+}
+
+/// In-place normalized, self-inverse fast Walsh–Hadamard transform.
+///
+/// Uses the same butterflies and normalization as the typed basis path.
+///
+/// # Panics
+/// Panics if the slice length is not a power of two (including an empty slice).
+pub fn fast_hadamard(values: &mut [f32]) {
+    let n = values.len();
+    assert!(
+        n.is_power_of_two(),
+        "Hadamard needs a power-of-two length, got {n}"
+    );
+    hadamard_vector(values);
+}
+
+fn hadamard_vector(vector: &mut [f32]) {
+    let block = vector.len();
+    let mut width = 1usize;
+    while width < block {
+        for start in (0..block).step_by(width * 2) {
+            for index in start..start + width {
+                let (left, right) = (vector[index], vector[index + width]);
+                vector[index] = left + right;
+                vector[index + width] = left - right;
+            }
+        }
+        width *= 2;
+    }
+    let normalization = hadamard_normalization(block.trailing_zeros());
+    for value in vector {
+        *value *= normalization;
+    }
 }
 
 fn hadamard_normalization(log2_block: u32) -> f32 {
@@ -504,6 +534,40 @@ fn splitmix64(mut value: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn normalization_retains_shipping_sqrt_reciprocal_bits() {
+        for log2 in 0..usize::BITS {
+            let len = 1usize << log2;
+            let original = 1.0 / (len as f32).sqrt();
+            assert_eq!(
+                super::hadamard_normalization(log2).to_bits(),
+                original.to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_group_rotation_keeps_its_tail_rule() {
+        for len in 0usize..=513 {
+            assert_eq!(
+                super::group_is_rotatable(len),
+                len > 1 && len.is_power_of_two()
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Hadamard needs a power-of-two length, got 0")]
+    fn fast_hadamard_rejects_empty_input() {
+        super::fast_hadamard(&mut []);
+    }
+
+    #[test]
+    #[should_panic(expected = "Hadamard needs a power-of-two length, got 3")]
+    fn fast_hadamard_rejects_non_power_of_two_input() {
+        super::fast_hadamard(&mut [1.0; 3]);
+    }
+
     use super::{AdditiveError, AdditiveView, apply_basis, reference_ternary_matmul};
     use crate::Trit;
     use tritium_schema::{

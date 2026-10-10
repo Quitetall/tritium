@@ -37,6 +37,7 @@ mod allocate;
 mod architecture;
 mod campaign;
 mod conversion;
+pub mod engine;
 pub mod fisher;
 mod plane;
 mod quantize;
