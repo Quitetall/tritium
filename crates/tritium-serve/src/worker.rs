@@ -334,42 +334,46 @@ pub(crate) fn spawn_worker(
                         // boundary.
                         let outcome = catch_unwind(AssertUnwindSafe(|| {
                             let mut final_reason = FinishReason::Stop;
-                            let res = generator.generate(&req, &mut |step| {
-                                if first_decode_at.is_none() {
-                                    telemetry.observe_prefill(generation_started.elapsed());
-                                    drop(prefill_entered.take());
-                                    prefill_span.record(
-                                        "duration_us",
-                                        generation_started.elapsed().as_micros() as u64,
-                                    );
-                                    decode_span = Some(tracing::info_span!(
-                                        parent: &request_span,
-                                        "model.decode",
-                                        duration_us = tracing::field::Empty,
-                                        emitted_tokens = tracing::field::Empty,
-                                    ));
-                                    first_decode_at = Some(Instant::now());
-                                } else if let Some(previous) = previous_token_at {
-                                    telemetry.observe_decode_token(previous.elapsed());
-                                }
-                                previous_token_at = Some(Instant::now());
-                                phase.store(PHASE_DECODE, Ordering::Release);
-                                if let Some(fr) = step.finish_reason {
-                                    final_reason = fr;
-                                }
-                                // try_send (never blocks): Full (slow client) or
-                                // Closed (gone) cancels this request and frees the
-                                // worker. Tokens delivered so far are an in-order
-                                // prefix — no gaps.
-                                let sent = decode_span.as_ref().is_some_and(|span| {
-                                    span.in_scope(|| {
-                                        tx.try_send(GenEvent::Token(step.token, step.logprobs))
-                                            .is_ok()
-                                    })
-                                }) && !draining.load(Ordering::Relaxed);
-                                emitted_tokens += u64::from(sent);
-                                sent
-                            });
+                            let res = generator.generate_cancellable(
+                                &req,
+                                &mut |step| {
+                                    if first_decode_at.is_none() {
+                                        telemetry.observe_prefill(generation_started.elapsed());
+                                        drop(prefill_entered.take());
+                                        prefill_span.record(
+                                            "duration_us",
+                                            generation_started.elapsed().as_micros() as u64,
+                                        );
+                                        decode_span = Some(tracing::info_span!(
+                                            parent: &request_span,
+                                            "model.decode",
+                                            duration_us = tracing::field::Empty,
+                                            emitted_tokens = tracing::field::Empty,
+                                        ));
+                                        first_decode_at = Some(Instant::now());
+                                    } else if let Some(previous) = previous_token_at {
+                                        telemetry.observe_decode_token(previous.elapsed());
+                                    }
+                                    previous_token_at = Some(Instant::now());
+                                    phase.store(PHASE_DECODE, Ordering::Release);
+                                    if let Some(fr) = step.finish_reason {
+                                        final_reason = fr;
+                                    }
+                                    // try_send (never blocks): Full (slow client) or
+                                    // Closed (gone) cancels this request and frees the
+                                    // worker. Tokens delivered so far are an in-order
+                                    // prefix — no gaps.
+                                    let sent = decode_span.as_ref().is_some_and(|span| {
+                                        span.in_scope(|| {
+                                            tx.try_send(GenEvent::Token(step.token, step.logprobs))
+                                                .is_ok()
+                                        })
+                                    }) && !draining.load(Ordering::Relaxed);
+                                    emitted_tokens += u64::from(sent);
+                                    sent
+                                },
+                                &|| tx.is_closed() || draining.load(Ordering::Acquire),
+                            );
                             (res, final_reason)
                         }));
                         drop(prefill_entered.take());
@@ -587,6 +591,148 @@ mod tests {
         assert_eq!(fault(Box::new(BackendFail), true), (true, 1));
         assert_eq!(fault(Box::new(PanicFail), true), (true, 1));
         assert_eq!(fault(Box::new(BackendFail), false), (false, 1));
+    }
+
+    async fn exercise_active_prefill_cancellation(drain: bool) {
+        struct CooperativePrefill {
+            entered: Arc<AtomicBool>,
+            release: std::sync::mpsc::Receiver<()>,
+            cancelled: Arc<AtomicBool>,
+            subsequent_work: Arc<AtomicU64>,
+        }
+
+        impl Generator for CooperativePrefill {
+            fn generate(
+                &mut self,
+                req: &GenRequest,
+                on_step: &mut dyn FnMut(Step) -> bool,
+            ) -> Result<(), GenError> {
+                self.generate_cancellable(req, on_step, &|| false)
+            }
+
+            fn generate_cancellable(
+                &mut self,
+                req: &GenRequest,
+                on_step: &mut dyn FnMut(Step) -> bool,
+                is_cancelled: &dyn Fn() -> bool,
+            ) -> Result<(), GenError> {
+                let token = req.prompt_tokens[0];
+                if token == 1 {
+                    self.entered.store(true, Ordering::Release);
+                    // One already-running operation is non-interruptible.
+                    // The next checkpoint must prevent subsequent prefill.
+                    let _ = self.release.recv_timeout(Duration::from_secs(2));
+                    if is_cancelled() {
+                        self.cancelled.store(true, Ordering::Release);
+                        return Ok(());
+                    }
+                    self.subsequent_work.fetch_add(1, Ordering::Relaxed);
+                }
+                let _ = on_step(Step {
+                    token,
+                    finished: true,
+                    logprobs: None,
+                    finish_reason: Some(FinishReason::Stop),
+                });
+                Ok(())
+            }
+
+            fn n_ctx(&self) -> usize {
+                4096
+            }
+
+            fn vocab(&self) -> usize {
+                128_256
+            }
+        }
+
+        let entered = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let subsequent_work = Arc::new(AtomicU64::new(0));
+        let draining = Arc::new(AtomicBool::new(false));
+        let faulted = Arc::new(AtomicBool::new(false));
+        let faults = Arc::new(AtomicU64::new(0));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let jobs = spawn_worker(
+            Box::new(CooperativePrefill {
+                entered: entered.clone(),
+                release: release_rx,
+                cancelled: cancelled.clone(),
+                subsequent_work: subsequent_work.clone(),
+            }),
+            WorkerSignals {
+                draining: draining.clone(),
+                worker_alive: Arc::new(AtomicBool::new(true)),
+                phase: Arc::new(AtomicU8::new(PHASE_IDLE)),
+                backend_faulted: faulted.clone(),
+                backend_faults: faults.clone(),
+                telemetry: Arc::new(WorkerTelemetry::default()),
+                latch_backend_faults: true,
+            },
+            2,
+        );
+        let job = |token, tx| Job::Generate {
+            req: GenRequest {
+                prompt_tokens: vec![token],
+                max_new: 1,
+                logprobs: None,
+                sampling: Sampling::Greedy,
+                stop_eos: true,
+            },
+            request_span: tracing::Span::none(),
+            queue_span: tracing::Span::none(),
+            accepted_at: Some(Instant::now()),
+            tx,
+        };
+        let (first_tx, mut first_rx) = mpsc::channel(2);
+        jobs.try_send(job(1, first_tx)).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("prefill must enter before cancellation");
+        if drain {
+            draining.store(true, Ordering::Release);
+        } else {
+            first_rx.close();
+        }
+        release_tx.send(()).unwrap();
+        if drain {
+            let result = tokio::time::timeout(Duration::from_secs(2), first_rx.recv())
+                .await
+                .expect("drained prefill must settle");
+            draining.store(false, Ordering::Release);
+            assert!(matches!(result, Some(GenEvent::Done(FinishReason::Stop))));
+        }
+        let (live_tx, mut live_rx) = mpsc::channel(2);
+        jobs.try_send(job(2, live_tx)).unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(2), async {
+            (live_rx.recv().await, live_rx.recv().await)
+        })
+        .await
+        .expect("following request must recover");
+        assert!(matches!(events.0, Some(GenEvent::Token(2, _))));
+        assert!(matches!(events.1, Some(GenEvent::Done(FinishReason::Stop))));
+        assert_eq!(
+            subsequent_work.load(Ordering::Relaxed),
+            0,
+            "prefill cancellation must skip the next native-operation checkpoint"
+        );
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(!faulted.load(Ordering::Acquire));
+        assert_eq!(faults.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn active_prefill_disconnect_uses_cooperative_query_and_recovers() {
+        exercise_active_prefill_cancellation(false).await;
+    }
+
+    #[tokio::test]
+    async fn active_prefill_drain_uses_cooperative_query_and_recovers() {
+        exercise_active_prefill_cancellation(true).await;
     }
 
     #[test]

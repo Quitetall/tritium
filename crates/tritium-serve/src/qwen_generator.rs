@@ -48,6 +48,18 @@ impl Generator for QwenGenerator {
         request: &GenRequest,
         on_step: &mut dyn FnMut(Step) -> bool,
     ) -> Result<(), GenError> {
+        self.generate_cancellable(request, on_step, &|| false)
+    }
+
+    fn generate_cancellable(
+        &mut self,
+        request: &GenRequest,
+        on_step: &mut dyn FnMut(Step) -> bool,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), GenError> {
+        if is_cancelled() {
+            return Ok(());
+        }
         let runner = self.model.runner();
         let context = self.model.config().text.max_position_embeddings as usize;
         let prompt_len = request.prompt_tokens.len();
@@ -61,10 +73,16 @@ impl Generator for QwenGenerator {
         let mut cache = runner
             .new_cache(capacity)
             .map_err(|error| GenError::Backend(error.to_string()))?;
-        let mut output = runner
-            .forward(&request.prompt_tokens, &mut cache)
-            .map_err(|error| GenError::Backend(error.to_string()))?;
+        let Some(mut output) = runner
+            .forward_cancellable(&request.prompt_tokens, &mut cache, is_cancelled)
+            .map_err(|error| GenError::Backend(error.to_string()))?
+        else {
+            return Ok(());
+        };
         for index in 0..max_new {
+            if is_cancelled() {
+                return Ok(());
+            }
             let logits = output.last_logits();
             let token = Self::sample(logits, &request.sampling, index as u64)
                 .ok_or_else(|| GenError::Backend("sampler produced no token".into()))?;
@@ -87,9 +105,13 @@ impl Generator for QwenGenerator {
             if last || !keep_going {
                 break;
             }
-            output = runner
-                .forward(&[token], &mut cache)
+            let next_output = runner
+                .forward_cancellable(&[token], &mut cache, is_cancelled)
                 .map_err(|error| GenError::Backend(error.to_string()))?;
+            let Some(next_output) = next_output else {
+                return Ok(());
+            };
+            output = next_output;
         }
         Ok(())
     }

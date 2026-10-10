@@ -1294,6 +1294,40 @@ impl Qwen35TextRunner {
         }
     }
 
+    /// Run a forward with cooperative cancellation between native operations.
+    ///
+    /// Returns `Some` only after committing the ordinary forward transaction.
+    /// `None` means cancellation: no output is published and committed DeltaNet
+    /// and full-attention cache state/cursors are unchanged. A subsequent
+    /// forward can reuse the same cache. Checkpoints include entry, embedding,
+    /// mixer/MLP boundaries, language-head entry and pre-commit completion.
+    /// Already-running operations cannot be preempted; callback count is not
+    /// contractual. The query must be cheap, nonblocking and non-panicking.
+    /// A cancellation arriving after the final checkpoint can race with commit.
+    ///
+    /// # Errors
+    /// Runtime errors remain the same as [`Self::forward`], distinct from
+    /// cancellation. Pre-cancelled calls skip validation/work without mutation.
+    pub fn forward_cancellable(
+        &self,
+        tokens: &[u32],
+        cache: &mut Qwen35TextCache,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Qwen35TextOutput>, NnError> {
+        match self.forward_controlled(
+            tokens,
+            cache,
+            &[],
+            |_, _, _, _| Ok(()),
+            |_, _, _| {},
+            || if is_cancelled() { Err(()) } else { Ok(()) },
+        ) {
+            Ok(output) => Ok(Some(output)),
+            Err(Qwen35TextForwardError::Runtime(error)) => Err(error),
+            Err(Qwen35TextForwardError::Observer(())) => Ok(None),
+        }
+    }
+
     /// Execute one forward while borrowing each post-block residual matrix to an observer.
     ///
     /// Outputs are emitted in layer order and are valid only for the observer call. No
@@ -1316,9 +1350,30 @@ impl Qwen35TextRunner {
         tokens: &[u32],
         cache: &mut Qwen35TextCache,
         state_positions: &[usize],
+        observer: impl FnMut(u32, usize, &[u32], &[f32]) -> Result<(), E>,
+        state_observer: impl FnMut(u32, usize, &[f32]),
+    ) -> Result<Qwen35TextOutput, Qwen35TextForwardError<E>> {
+        self.forward_controlled(
+            tokens,
+            cache,
+            state_positions,
+            observer,
+            state_observer,
+            || Ok(()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_controlled<E>(
+        &self,
+        tokens: &[u32],
+        cache: &mut Qwen35TextCache,
+        state_positions: &[usize],
         mut observer: impl FnMut(u32, usize, &[u32], &[f32]) -> Result<(), E>,
         mut state_observer: impl FnMut(u32, usize, &[f32]),
+        mut checkpoint: impl FnMut() -> Result<(), E>,
     ) -> Result<Qwen35TextOutput, Qwen35TextForwardError<E>> {
+        checkpoint().map_err(Qwen35TextForwardError::Observer)?;
         let (base, new_len) = self.preflight_forward(tokens, cache)?;
         let sequence = tokens.len();
         let hidden_len = checked_mul(sequence, self.hidden_size, "hidden-state buffer")?;
@@ -1343,6 +1398,7 @@ impl Qwen35TextRunner {
         input_token_ids.extend_from_slice(tokens);
         self.embedding
             .gather_with_backend(self.backend.as_ref(), tokens, &mut residual)?;
+        checkpoint().map_err(Qwen35TextForwardError::Observer)?;
 
         let result = self.forward_provisional(
             self.backend.as_ref(),
@@ -1356,6 +1412,7 @@ impl Qwen35TextRunner {
             state_positions,
             &mut observer,
             &mut state_observer,
+            &mut checkpoint,
         );
         let output = match result {
             Ok(output) => output,
@@ -1392,11 +1449,13 @@ impl Qwen35TextRunner {
         state_positions: &[usize],
         observer: &mut impl FnMut(u32, usize, &[u32], &[f32]) -> Result<(), E>,
         state_observer: &mut impl FnMut(u32, usize, &[f32]),
+        checkpoint: &mut impl FnMut() -> Result<(), E>,
     ) -> Result<Qwen35TextOutput, Qwen35TextForwardError<E>> {
         let sequence = input_token_ids.len();
         for (block_index, (layer, layer_cache)) in
             self.layers.iter().zip(&mut cache.layers).enumerate()
         {
+            checkpoint().map_err(Qwen35TextForwardError::Observer)?;
             let block_index = u32::try_from(block_index).map_err(|_| {
                 Qwen35TextForwardError::Runtime(NnError::ResourceExhausted(
                     "Qwen3.5 block index exceeds u32".to_owned(),
@@ -1409,6 +1468,7 @@ impl Qwen35TextRunner {
                 self.hidden_size,
                 normalized,
             )?;
+            checkpoint().map_err(Qwen35TextForwardError::Observer)?;
             match (&layer.mixer, layer_cache) {
                 (Qwen35TextMixer::DeltaNet(mixer), Qwen35TextLayerCache::DeltaNet(cache)) => {
                     let mut report_state = |position: usize, state: &[f32]| {
@@ -1436,6 +1496,7 @@ impl Qwen35TextRunner {
                     .into());
                 }
             }
+            checkpoint().map_err(Qwen35TextForwardError::Observer)?;
             add_in_place(residual, branch);
 
             normalize_rows(
@@ -1445,12 +1506,15 @@ impl Qwen35TextRunner {
                 self.hidden_size,
                 normalized,
             )?;
+            checkpoint().map_err(Qwen35TextForwardError::Observer)?;
             layer.mlp.forward(backend, normalized, sequence, branch)?;
+            checkpoint().map_err(Qwen35TextForwardError::Observer)?;
             add_in_place(residual, branch);
             observer(block_index, position_start, &input_token_ids, residual)
                 .map_err(Qwen35TextForwardError::Observer)?;
         }
 
+        checkpoint().map_err(Qwen35TextForwardError::Observer)?;
         let mut final_hidden_states = zeroed_scratch(residual.len(), "final hidden states")?;
         normalize_rows(
             residual,
@@ -1461,6 +1525,7 @@ impl Qwen35TextRunner {
         )?;
         let mut last_logits = zeroed_scratch(self.vocab_size, "last-token logits")?;
         let last_start = checked_mul(sequence - 1, self.hidden_size, "last hidden row")?;
+        checkpoint().map_err(Qwen35TextForwardError::Observer)?;
         self.lm_head.forward(
             backend,
             &final_hidden_states[last_start..last_start + self.hidden_size],
@@ -1477,6 +1542,7 @@ impl Qwen35TextRunner {
             )
             .into());
         }
+        checkpoint().map_err(Qwen35TextForwardError::Observer)?;
         Ok(Qwen35TextOutput {
             runner_identity: Arc::clone(&self.identity),
             position_start,

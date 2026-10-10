@@ -433,6 +433,29 @@ pub trait Generator: Send {
         on_step: &mut dyn FnMut(Step) -> bool,
     ) -> Result<(), GenError>;
 
+    /// Generate with a cheap, nonblocking cooperative cancellation query.
+    ///
+    /// The default avoids already-cancelled work and suppresses token delivery
+    /// after cancellation. It cannot interrupt an arbitrary legacy prefill;
+    /// native adapters must override this method to poll between operations.
+    /// Query invocation count is unspecified. An already-running operation is
+    /// not preempted. Successful cancellation returns `Ok(())`, not a backend
+    /// error. The query must not panic (ADR 0051).
+    ///
+    /// # Errors
+    /// The same runtime/context errors as [`Generator::generate`].
+    fn generate_cancellable(
+        &mut self,
+        req: &GenRequest,
+        on_step: &mut dyn FnMut(Step) -> bool,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), GenError> {
+        if is_cancelled() {
+            return Ok(());
+        }
+        self.generate(req, &mut |step| !is_cancelled() && on_step(step))
+    }
+
     /// Model context length (for prompt-length validation).
     fn n_ctx(&self) -> usize;
     /// Vocabulary size (for logit-shape sanity).
@@ -2458,6 +2481,100 @@ mod tests {
         .unwrap();
         assert_eq!(count, 2);
         assert_eq!(last_reason, Some(FinishReason::Length));
+    }
+
+    #[test]
+    fn default_cancellable_generator_checks_entry_and_token_delivery() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        struct LegacyPrefill {
+            entries: usize,
+            cancelled: Arc<AtomicBool>,
+        }
+        impl Generator for LegacyPrefill {
+            fn generate(
+                &mut self,
+                _req: &GenRequest,
+                on_step: &mut dyn FnMut(Step) -> bool,
+            ) -> Result<(), GenError> {
+                self.entries += 1;
+                self.cancelled.store(true, Ordering::Release);
+                let _ = on_step(Step {
+                    token: 10,
+                    finished: true,
+                    logprobs: None,
+                    finish_reason: Some(FinishReason::Stop),
+                });
+                Ok(())
+            }
+            fn n_ctx(&self) -> usize {
+                8
+            }
+            fn vocab(&self) -> usize {
+                16
+            }
+        }
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let mut generator = LegacyPrefill {
+            entries: 0,
+            cancelled: cancelled.clone(),
+        };
+        let request = GenRequest {
+            prompt_tokens: vec![1],
+            max_new: 1,
+            sampling: Sampling::Greedy,
+            stop_eos: true,
+            logprobs: None,
+        };
+        let mut delivered = 0;
+        for already_cancelled in [true, false] {
+            cancelled.store(already_cancelled, Ordering::Release);
+            generator
+                .generate_cancellable(
+                    &request,
+                    &mut |_| {
+                        delivered += 1;
+                        true
+                    },
+                    &|| cancelled.load(Ordering::Acquire),
+                )
+                .unwrap();
+            assert_eq!(generator.entries, usize::from(!already_cancelled));
+            assert_eq!(delivered, 0);
+        }
+    }
+
+    #[test]
+    fn default_cancellable_generator_preserves_uncancelled_steps() {
+        let request = GenRequest {
+            prompt_tokens: vec![1],
+            max_new: 2,
+            sampling: Sampling::Greedy,
+            stop_eos: true,
+            logprobs: None,
+        };
+        let mut expected = Vec::new();
+        MockGenerator::new(vec![10, 11, 12])
+            .generate(&request, &mut |step| {
+                expected.push((step.token, step.finished, step.finish_reason));
+                true
+            })
+            .unwrap();
+        let mut actual = Vec::new();
+        MockGenerator::new(vec![10, 11, 12])
+            .generate_cancellable(
+                &request,
+                &mut |step| {
+                    actual.push((step.token, step.finished, step.finish_reason));
+                    true
+                },
+                &|| false,
+            )
+            .unwrap();
+        assert_eq!(actual, expected);
     }
 
     /// `on_step` returning false cancels early.

@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     io::Cursor,
     sync::{
         Arc,
@@ -190,6 +191,123 @@ fn exact_runner() -> Qwen35TextRunner {
         Box::new(tritium_cpu::CpuBackend::new()),
     )
     .unwrap()
+}
+
+fn assert_float_bits(actual: &[f32], expected: &[f32]) {
+    assert_eq!(
+        actual
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    );
+}
+
+fn exercise_cancellable_forward(runner: Qwen35TextRunner, continuation: bool) {
+    let seed: &[u32] = if continuation { &[1, 4, 2] } else { &[] };
+    let tokens: &[u32] = if continuation { &[6] } else { &[1, 4, 2] };
+    let seed_cache = || {
+        let mut cache = runner.new_cache(8).unwrap();
+        if !seed.is_empty() {
+            runner.forward(seed, &mut cache).unwrap();
+        }
+        cache
+    };
+    let mut ordinary = seed_cache();
+    let expected = runner.forward(tokens, &mut ordinary).unwrap();
+    let mut counted = seed_cache();
+    let checks = Cell::new(0);
+    let actual = runner
+        .forward_cancellable(tokens, &mut counted, &|| {
+            checks.set(checks.get() + 1);
+            false
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_float_bits(actual.final_hidden_states(), expected.final_hidden_states());
+    assert_float_bits(actual.last_logits(), expected.last_logits());
+    assert!(
+        checks.get() >= 4,
+        "native phases need cooperative checkpoints"
+    );
+    for cancel_at in 1..=checks.get() {
+        let mut cache = seed_cache();
+        let before = if continuation {
+            Some(runner.reference_states(&cache, 4096).unwrap())
+        } else {
+            None
+        };
+        let count = Cell::new(0);
+        let output = runner
+            .forward_cancellable(tokens, &mut cache, &|| {
+                count.set(count.get() + 1);
+                count.get() == cancel_at
+            })
+            .unwrap();
+        assert!(
+            output.is_none(),
+            "checkpoint {cancel_at} ignored cancellation"
+        );
+        assert_eq!(
+            cache.len(),
+            seed.len(),
+            "checkpoint {cancel_at} committed KV"
+        );
+        if let Some(before) = before {
+            let after = runner.reference_states(&cache, 4096).unwrap();
+            assert_eq!(after, before);
+            for (actual, expected) in after.iter().zip(&before) {
+                assert_float_bits(actual.values(), expected.values());
+            }
+        }
+        let recovered = runner.forward(tokens, &mut cache).unwrap();
+        assert_eq!(
+            recovered, expected,
+            "checkpoint {cancel_at} left stale state"
+        );
+        assert_float_bits(
+            recovered.final_hidden_states(),
+            expected.final_hidden_states(),
+        );
+        assert_float_bits(recovered.last_logits(), expected.last_logits());
+    }
+}
+
+#[test]
+fn cancellable_forward_rolls_back_every_prefill_checkpoint() {
+    exercise_cancellable_forward(exact_runner(), false);
+    exercise_cancellable_forward(runner_with_host_qkv(), false);
+}
+
+#[test]
+fn cancellable_forward_preserves_committed_hybrid_state_and_recovers() {
+    exercise_cancellable_forward(exact_runner(), true);
+    exercise_cancellable_forward(runner_with_host_qkv(), true);
+}
+
+#[test]
+fn cancellable_forward_keeps_runtime_errors_distinct_from_cancellation() {
+    let runner = exact_runner();
+    let mut cache = runner.new_cache(8).unwrap();
+    assert!(matches!(
+        runner.forward_cancellable(&[], &mut cache, &|| false),
+        Err(NnError::Shape { .. })
+    ));
+    assert!(matches!(
+        runner.forward_cancellable(&[V as u32], &mut cache, &|| false),
+        Err(NnError::MissingTensor(_))
+    ));
+    assert!(
+        runner
+            .forward_cancellable(&[1], &mut cache, &|| true)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(cache.len(), 0);
 }
 
 #[test]
