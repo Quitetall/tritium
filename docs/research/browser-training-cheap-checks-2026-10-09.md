@@ -113,7 +113,27 @@ after capturing the exact staged diff. Nested tests cannot reuse the caller's
 temporary index. The regression then passed and verifies that unrelated staged
 content remains staged, unchanged in the committed tree, and all fixture scratch
 is removed. Cargo/npm stand-ins in this isolated regression test hook custody,
-not package functionality. Full browser verification must still be rerun.
+not package functionality.
+
+## Completed full staged-tree check
+
+The final normal commit-tree gate completed successfully and created commit
+`091b496f` (`build(web): enforce quality gates in isolated commit snapshots`).
+Unit `tritium-web-quality-isolated-save-20261009.service`, invocation
+`8820fd0c84f64837bad20cb583896ec0`, exited 0 at 19:45:12 EDT.
+`npm --prefix packages/tritium-web run check` passed formatting, warning-denying
+lint, generated drift checks, actual WASM build, strict TypeScript, all 149 Node
+tests (zero failures/skips/cancellations), and `verify:pack`. The latter installed
+the exact 16-member npm archive offline into an empty consumer, ran all 117 WASM
+vectors and checked strict consumer TypeScript. The hook's real-Git isolation
+regression was separately executed and passed.
+
+The hook creates an independent synthetic Git snapshot. Its source ID
+`739ad4445cb7d7f2c63219e2374dce180d510707` and emitted archive result are developer
+validation only, not admissible release provenance for `091b496f`. No retained
+release candidate or registry artifact was produced. Temporary hook/test
+repositories, npm consumer/archive and pinned CLI scratch were removed. The
+project's existing dependency/build cache remains in use.
 
 All three physical
 Chrome/Firefox/Safari lanes, no-readback tracing, fault injection and tutorial

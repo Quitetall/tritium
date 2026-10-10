@@ -12,6 +12,12 @@ VERIFY_GATES = Path(__file__).resolve().parents[1] / "verify-gates.sh"
 
 class PrecommitWebGitIsolationTests(unittest.TestCase):
     def test_commit_only_preserves_parent_index_and_isolates_nested_git(self):
+        self.assert_isolated_commit()
+
+    def test_explicit_repository_environment_cannot_redirect_snapshot_patch(self):
+        self.assert_isolated_commit(explicit_repository=True)
+
+    def assert_isolated_commit(self, *, explicit_repository=False):
         with tempfile.TemporaryDirectory(prefix="tritium-hook-git-", dir=os.environ.get("TMPDIR")) as raw:
             root = Path(raw)
             repo = root / "repo"
@@ -63,6 +69,9 @@ class PrecommitWebGitIsolationTests(unittest.TestCase):
             (package / "package.json").write_text('{"version":"after"}\n')
             (repo / "unrelated.txt").write_text("keep staged\n")
             git("add", "unrelated.txt")
+            if explicit_repository:
+                environment["GIT_DIR"] = str(repo / ".git")
+                environment["GIT_WORK_TREE"] = str(repo)
             result = subprocess.run(
                 ["git", "commit", "--only", "-m", "web", "--",
                  "packages/tritium-web/package.json"],
