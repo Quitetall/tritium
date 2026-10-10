@@ -1827,7 +1827,27 @@ impl CudaDecodeModel {
     /// leaves `cache_len` unadvanced, so the next step rewrites the same KV
     /// row (state stays consistent).
     pub fn step_graph_argmax(&mut self, token: u32, pos: usize) -> Result<u32, BackendError> {
+        self.step_graph_argmax_cancellable(token, pos, &|| false)
+            .map(|output| output.expect("never-cancelled graph argmax"))
+    }
+
+    /// Cooperative graph-argmax step. `None` publishes no id and preserves
+    /// the committed prefix/watermark. Queries never run inside capture.
+    /// Entered decode invalidates pending-tree authority as ordinary decode.
+    pub fn step_graph_argmax_cancellable(
+        &mut self,
+        token: u32,
+        pos: usize,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<u32>, BackendError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
         self.step_graph_replay(token, pos)?;
+        if is_cancelled() {
+            self.settle_cancelled_draft()?;
+            return Ok(None);
+        }
         self.ensure_am_scratch()?;
         let (pvals, pidx, out) = self.am_scratch.as_mut().expect("just seeded");
         // Same stream as the graph replay, so ordering needs no sync.
@@ -1849,8 +1869,11 @@ impl CudaDecodeModel {
         self.cap_stream
             .memcpy_dtoh(&*out, &mut id)
             .map_err(|e| driver_err("decode graph argmax dtoh", &e))?;
+        if is_cancelled() {
+            return Ok(None); // dtoh already settled the producing stream
+        }
         self.cache_len += 1;
-        Ok(id[0] as u32)
+        Ok(Some(id[0] as u32))
     }
 
     /// The shared [`step_graph`]/[`step_graph_argmax`] core: guards, lazy
@@ -1931,6 +1954,24 @@ impl CudaDecodeModel {
         k: usize,
         eos: u32,
     ) -> Result<Vec<u32>, BackendError> {
+        self.draft_chain_cancellable(token, pos, k, eos, &|| false)
+            .map(|output| output.expect("never-cancelled draft chain"))
+    }
+
+    /// Cooperative device-feedback chain. `None` retains the committed
+    /// prefix and watermark, after settling submitted work. The normal path
+    /// retains one trailing chain readback, not a per-token host loop.
+    pub fn draft_chain_cancellable(
+        &mut self,
+        token: u32,
+        pos: usize,
+        k: usize,
+        eos: u32,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<u32>>, BackendError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
         if k == 0 || k > DRAFT_CHAIN_MAX {
             return Err(BackendError::InvalidInput(format!(
                 "draft_chain k={k} out of range (1..={DRAFT_CHAIN_MAX})"
@@ -1945,6 +1986,15 @@ impl CudaDecodeModel {
         // Guards + capture + pre-graph drain + ctrl H2D + replay 0 (consumes
         // `token` at `pos`). Includes the pos == cache_len invariant.
         self.step_graph_replay(token, pos)?;
+        macro_rules! checkpoint {
+            () => {
+                if is_cancelled() {
+                    self.settle_cancelled_draft()?;
+                    return Ok(None);
+                }
+            };
+        }
+        checkpoint!();
         self.ensure_am_scratch()?;
         if self.chain_scratch.is_none() {
             let chain = self
@@ -1967,6 +2017,7 @@ impl CudaDecodeModel {
         }
 
         for step in 0..k {
+            checkpoint!();
             if step > 0 {
                 // Replays 1..k read the ctrl that chain_advance(step-1) wrote
                 // on-device; all stream-ordered on cap_stream.
@@ -1976,6 +2027,7 @@ impl CudaDecodeModel {
                     .launch()
                     .map_err(|e| driver_err("draft chain graph launch", &e))?;
             }
+            checkpoint!();
             let (pvals, pidx, out) = self.am_scratch.as_mut().expect("seeded above");
             Self::bl_argmax_rows_chunked(
                 &self.cap_stream,
@@ -2013,6 +2065,7 @@ impl CudaDecodeModel {
                 l.launch(cfg)
                     .map_err(|e| driver_err("launch draft_chain_advance", &e))?;
             }
+            checkpoint!();
         }
 
         self.cap_stream
@@ -2035,8 +2088,20 @@ impl CudaDecodeModel {
             .take_while(|&&x| x >= 0)
             .map(|&x| x as u32)
             .collect();
+        checkpoint!();
         self.cache_len += out.len();
-        Ok(out)
+        Ok(Some(out))
+    }
+
+    // Only the cancelled path waits here. The normal chain/step keeps its
+    // existing graph and transfer ordering; no per-checkpoint GPU roundtrip.
+    fn settle_cancelled_draft(&self) -> Result<(), BackendError> {
+        self.stream
+            .synchronize()
+            .map_err(|e| driver_err("draft cancel working sync", &e))?;
+        self.cap_stream
+            .synchronize()
+            .map_err(|e| driver_err("draft cancel cap sync", &e))
     }
 
     /// Seed the lazy m=1 argmax scratch (shared by [`step_graph_argmax`] and

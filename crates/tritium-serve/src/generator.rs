@@ -1163,7 +1163,8 @@ impl SpecGovernor {
 /// Free function (not a method) so the batched worker's I0 solo-spec path
 /// (ADR 0032 L3 I0, `batch.rs`) can share the exact reconcile + chain logic
 /// with [`RunnerGenerator::model_draft`] — this is the single source of truth.
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", test))]
+#[allow(clippy::too_many_arguments)] // shared drafter state and borrowed query
 pub(crate) fn draft_greedy_tokens(
     draft: &mut tritium_nn::ModelRunner,
     draft_fed: &mut Vec<u32>,
@@ -1173,13 +1174,58 @@ pub(crate) fn draft_greedy_tokens(
     max_draft: usize,
     chain: bool,
 ) -> Vec<u32> {
+    draft_greedy_tokens_cancellable(
+        draft,
+        draft_fed,
+        draft_pos,
+        eos,
+        history,
+        max_draft,
+        chain,
+        &|| false,
+    )
+    .expect("never-cancelled draft helper")
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)] // request-owned state and borrowed query
+pub(crate) fn draft_greedy_tokens_cancellable(
+    draft: &mut tritium_nn::ModelRunner,
+    draft_fed: &mut Vec<u32>,
+    draft_pos: &mut usize,
+    eos: u32,
+    history: &[u32],
+    max_draft: usize,
+    chain: bool,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Option<Vec<u32>> {
+    if is_cancelled() {
+        return None;
+    }
+    // Reconciliation can rewind committed drafter state before later work is
+    // cancelled. It is request-owned, so retire it for exact next-call resync.
+    macro_rules! cancelled {
+        () => {{
+            draft.reset();
+            *draft_pos = 0;
+            draft_fed.clear();
+            return None;
+        }};
+    }
+    macro_rules! checkpoint {
+        () => {
+            if is_cancelled() {
+                cancelled!();
+            }
+        };
+    }
     if max_draft == 0 || history.is_empty() {
-        return Vec::new();
+        return Some(Vec::new());
     }
     let p = history.len() - 1; // pending's position
     let draft_ctx = draft.config.n_ctx as usize;
     if p + max_draft + 1 >= draft_ctx {
-        return Vec::new(); // draft context exhausted; plain steps carry on
+        return Some(Vec::new()); // draft context exhausted; plain steps carry on
     }
     // Reconcile last call's speculatively-fed tokens against the now-
     // committed history: the matched prefix ADVANCES the watermark (those
@@ -1209,33 +1255,50 @@ pub(crate) fn draft_greedy_tokens(
         *draft_pos = 0;
     }
     draft_fed.clear();
+    checkpoint!();
     // Forward-contiguous sync: feed the history the draft hasn't seen,
     // EXCLUDING pending (fed by the loop below).
     if *draft_pos < p {
         let gap: Vec<u32> = history[*draft_pos..p].to_vec();
         let positions: Vec<usize> = (*draft_pos..p).collect();
-        if draft.forward(&gap, &positions).is_err() {
-            draft.reset();
-            *draft_pos = 0; // full resync next time
-            return Vec::new();
+        match draft.forward_cancellable(&gap, &positions, is_cancelled) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                cancelled!();
+            }
+            Err(_) => {
+                draft.reset();
+                *draft_pos = 0; // full resync next time
+                return Some(Vec::new());
+            }
         }
         *draft_pos = p;
     }
+    checkpoint!();
     let mut out = Vec::with_capacity(max_draft);
     let mut tok = history[p];
     // L1' fastest path (ADR 0032): the whole k-token draft as ONE chained
     // device-side loop — a single host round-trip instead of one per
     // token (the measured ~1.2 ms/token host cost that held spec decode
     // at parity). Drafts are bit-identical to the per-step path (gated by
-    // cuda_draft_chain_matches_per_step). Ok(None) = no resident decoder;
-    // Err = state untouched (cache_len only advances on success) — both
-    // fall through to the per-step ladder below.
+    // cuda_draft_chain_matches_per_step). Native unavailability is typed;
+    // cancellation can NEVER be mistaken for the per-step fallback signal.
     let chained = if chain {
-        draft.decode_greedy_chain(tok, p, max_draft, eos)
+        match draft.decode_greedy_chain_cancellable(tok, p, max_draft, eos, is_cancelled) {
+            Ok(Some(ids)) => Some(ids),
+            Ok(None) => {
+                cancelled!();
+            }
+            Err(tritium_nn::ResidentOpError::Unavailable) => None,
+            // Retain the previous draft-error ladder policy. Native errors
+            // stay errors at the facade, not successful cancellation.
+            Err(_) => None,
+        }
     } else {
-        Ok(None) // TRITIUM_DRAFT_CHAIN=0: per-step ladder (A/B + kill switch)
+        None // TRITIUM_DRAFT_CHAIN=0: per-step ladder (A/B + kill switch)
     };
-    if let Ok(Some(ids)) = chained
+    checkpoint!();
+    if let Some(ids) = chained
         && !ids.is_empty()
     {
         // (Empty ids — only reachable from poisoned all-NaN logits —
@@ -1249,21 +1312,30 @@ pub(crate) fn draft_greedy_tokens(
                 draft_fed.push(id);
             }
         }
-        return out;
+        return Some(out);
     }
-    // Ok(None) (no resident decoder) or Err (state untouched): fall
-    // through to the per-step ladder.
+    // Native unavailability or an ordinary draft error retains the ladder;
+    // cancellation returned above and cannot reach this fallback.
     for i in 0..max_draft {
+        checkpoint!();
         // Fast path: graph replay + device argmax, 4 bytes back per step
         // (the logits download + host scan dominated the drafter's cost).
-        // `Ok(None)` = no resident decoder -> eager logits + host argmax
-        // (same token by the pinned tie rule).
-        let next = match draft.decode_greedy_step(tok, p + i) {
+        // Typed Unavailable -> eager logits + host argmax (same pinned tie
+        // rule); Ok(None) means cancellation, never host fallback.
+        let next = match draft.decode_greedy_step_cancellable(tok, p + i, is_cancelled) {
             Ok(Some(id)) => id,
             Ok(None) => {
-                let Ok(logits) = draft.forward(&[tok], &[p + i]) else {
-                    break;
+                cancelled!();
+            }
+            Err(tritium_nn::ResidentOpError::Unavailable) => {
+                let logits = match draft.forward_cancellable(&[tok], &[p + i], is_cancelled) {
+                    Ok(Some(logits)) => logits,
+                    Ok(None) => {
+                        cancelled!();
+                    }
+                    Err(_) => break,
                 };
+                checkpoint!();
                 // The forward advanced the drafter's KV — record the fed
                 // token BEFORE any bail (the reconcile logic needs it).
                 draft_fed.push(tok);
@@ -1279,6 +1351,7 @@ pub(crate) fn draft_greedy_tokens(
             }
             Err(_) => break,
         };
+        checkpoint!();
         draft_fed.push(tok);
         out.push(next);
         if next == eos {
@@ -1286,7 +1359,8 @@ pub(crate) fn draft_greedy_tokens(
         }
         tok = next;
     }
-    out
+    checkpoint!();
+    Some(out)
 }
 
 impl RunnerGenerator {
@@ -1333,13 +1407,19 @@ impl RunnerGenerator {
 
     #[cfg(feature = "cuda")]
     /// Draft up to `max_draft` tokens with the attached draft model (greedy).
-    /// Thin wrapper over [`draft_greedy_tokens`] — the shared reconcile +
+    /// Thin wrapper over [`draft_greedy_tokens_cancellable`] — shared reconcile +
     /// chain logic (also used by the batched worker's I0 solo-spec path).
-    fn model_draft(&mut self, history: &[u32], max_draft: usize, chain: bool) -> Vec<u32> {
+    fn model_draft(
+        &mut self,
+        history: &[u32],
+        max_draft: usize,
+        chain: bool,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Option<Vec<u32>> {
         let Some(draft) = self.draft.as_mut() else {
-            return Vec::new();
+            return Some(Vec::new());
         };
-        draft_greedy_tokens(
+        draft_greedy_tokens_cancellable(
             draft,
             &mut self.draft_fed,
             &mut self.draft_pos,
@@ -1347,6 +1427,7 @@ impl RunnerGenerator {
             history,
             max_draft,
             chain,
+            is_cancelled,
         )
     }
 
@@ -1453,7 +1534,12 @@ impl RunnerGenerator {
             let drafts = if max_draft == 0 {
                 Vec::new() // suppressed (or clamped): no drafter work at all
             } else if self.draft.is_some() {
-                self.model_draft(&history, max_draft, chain)
+                let Some(drafts) = self.model_draft(&history, max_draft, chain, is_cancelled)
+                else {
+                    self.reset_cancelled_generation();
+                    return Ok(());
+                };
+                drafts
             } else {
                 Self::lookup_draft(&history, max_draft)
             };
@@ -1706,7 +1792,12 @@ impl RunnerGenerator {
             let budget = max_new - emitted;
             let max_draft = policy.len().min(kv_room).min(budget.saturating_sub(1));
             let drafts = if self.draft.is_some() {
-                self.model_draft(&history, max_draft, chain)
+                let Some(drafts) = self.model_draft(&history, max_draft, chain, is_cancelled)
+                else {
+                    self.reset_cancelled_generation();
+                    return Ok(());
+                };
+                drafts
             } else {
                 Self::lookup_draft(&history, max_draft)
             };

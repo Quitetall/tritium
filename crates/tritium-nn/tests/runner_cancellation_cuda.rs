@@ -433,6 +433,271 @@ fn batch_prefix_bytes(
 }
 
 #[test]
+fn resident_draft_chain_and_step_cancel_without_prefix_publication() {
+    let Some(mut runner) = runner() else { return };
+    let model = runner.resident_cuda().unwrap().unwrap();
+    for prefix in [0, 3] {
+        let prepare = |model: &mut tritium_cuda::CudaDecodeModel| {
+            model.reset();
+            if prefix != 0 {
+                model.prefill(&[0, 1, 2], &[0, 1, 2]).unwrap();
+            }
+        };
+        prepare(model);
+        let first = model.step_graph_argmax(3, prefix).unwrap();
+        for eos in [u32::MAX, first] {
+            prepare(model);
+            let before = prefix_bytes(model);
+            let mut expected = Vec::new();
+            let mut token = 3;
+            for i in 0..3 {
+                let id = model.step_graph_argmax(token, prefix + i).unwrap();
+                expected.push(id);
+                if id == eos {
+                    break;
+                }
+                token = id;
+            }
+            let expected_kv = prefix_bytes(model);
+            prepare(model);
+            let polls = Cell::new(0);
+            assert_eq!(
+                model
+                    .draft_chain_cancellable(3, prefix, 3, eos, &|| {
+                        polls.set(polls.get() + 1);
+                        false
+                    })
+                    .unwrap()
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(prefix_bytes(model), expected_kv);
+            assert!(polls.get() >= 10);
+            for cancel_at in 1..=polls.get() {
+                prepare(model);
+                // Entry-only cancellation retains authority; any entered
+                // solo decode invalidates it just like ordinary decode.
+                model.tree_verify_logits(&[3], &[-1]).unwrap();
+                let count = Cell::new(0);
+                assert!(
+                    model
+                        .draft_chain_cancellable(3, prefix, 3, eos, &|| {
+                            count.set(count.get() + 1);
+                            count.get() == cancel_at
+                        })
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(model.cache_len(), prefix);
+                assert_eq!(prefix_bytes(model), before);
+                if cancel_at == 1 {
+                    model.tree_commit(&[0]).unwrap();
+                    model.truncate_kv(prefix).unwrap();
+                } else {
+                    assert!(model.tree_commit(&[0]).is_err());
+                }
+                assert_eq!(model.draft_chain(3, prefix, 3, eos).unwrap(), expected);
+                assert_eq!(prefix_bytes(model), expected_kv);
+            }
+        }
+        prepare(model);
+        let before = prefix_bytes(model);
+        for cancel_at in 1..=3 {
+            let count = Cell::new(0);
+            assert!(
+                model
+                    .step_graph_argmax_cancellable(3, prefix, &|| {
+                        count.set(count.get() + 1);
+                        count.get() == cancel_at
+                    })
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(model.cache_len(), prefix);
+            assert_eq!(prefix_bytes(model), before);
+            assert_eq!(model.step_graph_argmax(3, prefix).unwrap(), first);
+            model.truncate_kv(prefix).unwrap();
+        }
+        assert!(
+            model
+                .draft_chain_cancellable(8, prefix, 3, u32::MAX, &|| false)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn resident_draft_cold_facade_cancellation_recovers_without_host_adoption() {
+    for prefix in [0, 3] {
+        for chain in [false, true] {
+            let Some(mut reference) = runner() else {
+                return;
+            };
+            let prepare = |runner: &mut ModelRunner| {
+                if prefix != 0 {
+                    runner.forward(&[0, 1, 2], &[0, 1, 2]).unwrap();
+                }
+            };
+            prepare(&mut reference);
+            let polls = Cell::new(0);
+            let query = || {
+                polls.set(polls.get() + 1);
+                false
+            };
+            let expected = if chain {
+                reference
+                    .decode_greedy_chain_cancellable(3, prefix, 3, u32::MAX, &query)
+                    .unwrap()
+                    .unwrap()
+            } else {
+                vec![
+                    reference
+                        .decode_greedy_step_cancellable(3, prefix, &query)
+                        .unwrap()
+                        .unwrap(),
+                ]
+            };
+            let expected_kv = prefix_bytes(reference.resident_cuda().unwrap().unwrap());
+            assert!(polls.get() >= 4);
+            for cancel_at in 1..=polls.get() {
+                let mut owned = runner().expect("required cold CUDA fixture");
+                prepare(&mut owned);
+                let before = prefix_bytes(owned.resident_cuda().unwrap().unwrap());
+                let count = Cell::new(0);
+                let cancel = || {
+                    count.set(count.get() + 1);
+                    count.get() == cancel_at
+                };
+                if chain {
+                    assert!(
+                        owned
+                            .decode_greedy_chain_cancellable(3, prefix, 3, u32::MAX, &cancel)
+                            .unwrap()
+                            .is_none()
+                    );
+                } else {
+                    assert!(
+                        owned
+                            .decode_greedy_step_cancellable(3, prefix, &cancel)
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+                let model = owned.resident_cuda().unwrap().unwrap();
+                assert_eq!(model.cache_len(), prefix);
+                assert_eq!(prefix_bytes(model), before);
+                assert!(owned.kv.iter().all(|cache| cache.len == 0));
+                let recovered = if chain {
+                    owned
+                        .decode_greedy_chain(3, prefix, 3, u32::MAX)
+                        .unwrap()
+                        .unwrap()
+                } else {
+                    vec![owned.decode_greedy_step(3, prefix).unwrap().unwrap()]
+                };
+                assert_eq!(recovered, expected);
+                assert_eq!(
+                    prefix_bytes(owned.resident_cuda().unwrap().unwrap()),
+                    expected_kv
+                );
+                assert!(owned.kv.iter().all(|cache| cache.len == 0));
+            }
+        }
+    }
+}
+
+#[test]
+fn resident_draft_batch_cancellation_restores_halts_dead_rows_and_pages() {
+    let Some(mut runner) = runner() else { return };
+    let model = runner.resident_cuda().unwrap().unwrap();
+    for paged in [false, true] {
+        for prefix in [0, 3] {
+            let mut batch = if paged {
+                model.new_batch_paged(3, 3).unwrap()
+            } else {
+                model.new_batch(3).unwrap()
+            };
+            model.reset();
+            model.prefill(&[0, 1, 2], &[0, 1, 2]).unwrap();
+            for row in 0..3 {
+                if paged {
+                    batch.reserve_pages(row, 16).unwrap();
+                }
+                let p = if row == 2 { 3 } else { prefix };
+                model.copy_kv_into_batch_row(&mut batch, row, p).unwrap();
+                batch.set_position(row, p).unwrap();
+                batch.set_live(row, row != 2).unwrap();
+            }
+            let positions = batch.positions().to_vec();
+            let before = batch_prefix_bytes(model, &batch);
+            let free = batch.free_pages();
+            let pages: Vec<_> = (0..3).map(|r| batch.debug_page_table_row(r)).collect();
+            // Dead-row input may be invalid: the drafter masks it before the
+            // unconditional embed guard, and must never feed it on retry.
+            let feeds = [3, 6, u32::MAX];
+            let first = model.draft_batch(&mut batch, &feeds, 1, u32::MAX).unwrap()[0][0];
+            for eos in [u32::MAX, first] {
+                for (row, &p) in positions.iter().enumerate() {
+                    batch.set_position(row, p).unwrap();
+                }
+                let expected = model.draft_batch(&mut batch, &feeds, 3, eos).unwrap();
+                assert!(expected[2].is_empty());
+                let expected_positions = batch.positions().to_vec();
+                let expected_kv = batch_prefix_bytes(model, &batch);
+                for (row, &p) in positions.iter().enumerate() {
+                    batch.set_position(row, p).unwrap();
+                }
+                let polls = Cell::new(0);
+                assert_eq!(
+                    model
+                        .draft_batch_cancellable(&mut batch, &feeds, 3, eos, &|| {
+                            polls.set(polls.get() + 1);
+                            false
+                        })
+                        .unwrap()
+                        .unwrap(),
+                    expected
+                );
+                assert!(polls.get() >= 4);
+                for cancel_at in 1..=polls.get() {
+                    for (row, &p) in positions.iter().enumerate() {
+                        batch.set_position(row, p).unwrap();
+                    }
+                    model.tree_verify_logits(&[3], &[-1]).unwrap();
+                    let count = Cell::new(0);
+                    assert!(
+                        model
+                            .draft_batch_cancellable(&mut batch, &feeds, 3, eos, &|| {
+                                count.set(count.get() + 1);
+                                count.get() == cancel_at
+                            })
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert_eq!(batch.positions(), positions);
+                    assert_eq!(batch_prefix_bytes(model, &batch), before);
+                    assert_eq!(batch.free_pages(), free);
+                    assert_eq!(
+                        (0..3)
+                            .map(|r| batch.debug_page_table_row(r))
+                            .collect::<Vec<_>>(),
+                        pages
+                    );
+                    model.tree_commit(&[0]).unwrap(); // batch leaves solo authority intact
+                    model.truncate_kv(3).unwrap();
+                    assert_eq!(
+                        model.draft_batch(&mut batch, &feeds, 3, eos).unwrap(),
+                        expected
+                    );
+                    assert_eq!(batch.positions(), expected_positions);
+                    assert_eq!(batch_prefix_bytes(model, &batch), expected_kv);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn resident_tree_group_cancellation_has_no_partial_commit() {
     for context in [16, 12289] {
         let Some(mut runner) = runner_with_context(context) else {

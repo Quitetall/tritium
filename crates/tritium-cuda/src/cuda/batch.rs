@@ -1121,6 +1121,25 @@ impl CudaDecodeModel {
         k: usize,
         eos: u32,
     ) -> Result<Vec<Vec<u32>>, BackendError> {
+        self.draft_batch_cancellable(batch, last_tokens, k, eos, &|| false)
+            .map(|output| output.expect("never-cancelled batch draft"))
+    }
+
+    /// Cooperative batched drafting. A cancelled call settles stream work,
+    /// restores entry positions/liveness and publishes no draft output.
+    /// Committed prefix bytes/pages and unrelated solo authority survive.
+    /// Driver errors retain the ordinary partial-state error semantics.
+    pub fn draft_batch_cancellable(
+        &mut self,
+        batch: &mut BatchKv,
+        last_tokens: &[u32],
+        k: usize,
+        eos: u32,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<Vec<u32>>>, BackendError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
         let n = batch.n;
         if last_tokens.len() != n {
             return Err(BackendError::InvalidInput(format!(
@@ -1158,6 +1177,20 @@ impl CudaDecodeModel {
         }
 
         let entry_live = batch.live.clone();
+        let entry_positions = batch.positions.clone();
+        macro_rules! checkpoint {
+            () => {
+                if is_cancelled() {
+                    let settled = self.settle_cancelled_draft();
+                    // As on ordinary device errors, restore liveness even if
+                    // settling fails. Only a successful wait permits rollback.
+                    batch.live.clone_from(&entry_live);
+                    settled?;
+                    batch.positions.clone_from(&entry_positions);
+                    return Ok(None);
+                }
+            };
+        }
         let mut out: Vec<Vec<u32>> = vec![Vec::new(); n];
         // Step-0 feeds. Dead rows' tokens are ignored but still embed-gathered
         // on device (the unconditional vocab guard in
@@ -1170,6 +1203,7 @@ impl CudaDecodeModel {
 
         let mut result = Ok(());
         for _ in 0..k {
+            checkpoint!();
             if batch.live.iter().all(|&l| !l) {
                 break; // every row dead or halted: the draft is complete
             }
@@ -1197,11 +1231,15 @@ impl CudaDecodeModel {
                     feed[r] = ids[r];
                 }
             }
+            checkpoint!();
+        }
+        if result.is_ok() {
+            checkpoint!();
         }
         // Restore entry liveness: rows dead at entry stay dead; halted rows
         // come back live with their frozen (= post-last-feed) position.
         batch.live = entry_live;
-        result.map(|()| out)
+        result.map(|()| Some(out))
     }
 
     /// Extract every batch + weight buffer's stable device pointer (guards dropped here,

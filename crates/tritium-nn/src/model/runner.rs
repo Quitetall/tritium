@@ -610,6 +610,28 @@ impl ModelRunner {
             .map_err(ResidentOpError::Op)
     }
 
+    /// (cuda) Cooperative batched drafting. `None` means cancellation with
+    /// entry positions/liveness retained, never native unavailability.
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] as for [`Self::draft_batch`].
+    #[cfg(feature = "cuda")]
+    pub fn draft_batch_cancellable(
+        &mut self,
+        batch: &mut tritium_cuda::BatchKv,
+        last_tokens: &[u32],
+        k: usize,
+        eos: u32,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<Vec<u32>>>, ResidentOpError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
+        self.resident_for_op()?
+            .draft_batch_cancellable(batch, last_tokens, k, eos, is_cancelled)
+            .map_err(ResidentOpError::Op)
+    }
+
     /// Convenience: load from a GGUF byte buffer using the runtime registry's
     /// `"cpu"` backend.
     ///
@@ -1019,6 +1041,49 @@ impl ModelRunner {
             .draft_chain(token, position, k, eos)
             .map(Some)
             .map_err(|e| NnError::Backend(e.to_string()))
+    }
+
+    /// (cuda) Cooperative native graph argmax. `None` means cancellation;
+    /// absent native support is [`ResidentOpError::Unavailable`], not fallback.
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] on unavailable/build/device or input failures.
+    #[cfg(feature = "cuda")]
+    pub fn decode_greedy_step_cancellable(
+        &mut self,
+        token: u32,
+        position: usize,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<u32>, ResidentOpError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
+        self.resident_for_op()?
+            .step_graph_argmax_cancellable(token, position, is_cancelled)
+            .map_err(ResidentOpError::Op)
+    }
+
+    /// (cuda) Cooperative native device-feedback chain. `None` means cancelled,
+    /// while [`ResidentOpError::Unavailable`] permits a caller's normal ladder.
+    /// Existing [`Self::decode_greedy_chain`] retains its fallback contract.
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] on unavailable/build/device or input failures.
+    #[cfg(feature = "cuda")]
+    pub fn decode_greedy_chain_cancellable(
+        &mut self,
+        token: u32,
+        position: usize,
+        k: usize,
+        eos: u32,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<u32>>, ResidentOpError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
+        self.resident_for_op()?
+            .draft_chain_cancellable(token, position, k, eos, is_cancelled)
+            .map_err(ResidentOpError::Op)
     }
 
     /// (cuda) Build the device-resident decoder on first use. Returns `true` if a
