@@ -51,7 +51,9 @@ passed (0.02-second fixture execution). `cargo test --locked -p tritium-nn --lib
 passed all 167 tests with no failures or skips. `cargo test --locked -p tritium-nn
 --test qwen35_text_runner` passed all 11 tests with no failures or skips. Scoped
 Clippy passed with warnings denied in the managed continuation (3m 11s). The
-SALT admitted-execution regression and normal commit-tree gate remain pending.
+SALT admitted-execution regression passed (1 test, no failures or skips,
+1389.87 seconds of fixture execution). The normal staged-tree whitespace and
+full-workspace Rust-format gate passed before implementation commit `bdd55820`.
 No physical
 CUDA, production checkpoint, MTP oracle, numerical-quality, performance or
 release-admission claim follows from this host regression.
@@ -61,4 +63,12 @@ The first scoped Clippy invocation (`cargo clippy --locked -p tritium-nn --lib
 compiler error. This is incomplete, not a pass. Managed continuation unit
 `tritium-qwen-package-binding-validate-20261009.service` reruns that command and
 the SALT `admitted_qwen_execution_binds_campaign_packages_backend_tokens_and_outputs`
-regression with longer explicit bounds. Its terminal results must be checked.
+regression with longer explicit bounds. Its terminal result was verified on
+2026-10-09 at 20:06:34 EDT: inactive/dead, `Result=success`,
+`ExecMainStatus=0`, invocation `ba828224d6cb41e98b009ca5feb70e0f`.
+The entire job used 49.184 seconds of CPU over 29m11s wall time, with a 1.1-GiB
+memory peak. The test thread was repeatedly observed waiting on filesystem
+journal commits while its read/write counters advanced; this is not a model
+fitting-duration or inference-performance measurement. The existing job was
+allowed to finish without restart or weakened durability checks, and its
+temporary fixture was gone afterward.
