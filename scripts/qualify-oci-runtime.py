@@ -91,14 +91,29 @@ def exact_package_id(value: Any, label: str) -> str:
 
 def run(command: list[str], *, env: dict[str, str] | None = None,
         timeout: float = 120.0) -> str:
+    # Command arguments and subprocess stderr are untrusted diagnostic inputs:
+    # Compose receives transient bearer credentials through its environment,
+    # and a failed tool may echo them (or private paths/prompt data). Retain only
+    # a fixed allowlisted tool label and the failure category/exit status.
+    tool = Path(command[0]).name if command else ""
+    if tool not in {"docker", "nvidia-smi", "run-oci-compose", "tritium"}:
+        tool = "external-tool"
     try:
         result = subprocess.run(command, env=env, text=True, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, timeout=timeout, check=False)
     except (OSError, subprocess.SubprocessError) as error:
-        raise QualificationError(f"command failed: {command[0]}: {error}") from error
+        reason = (
+            "timeout" if isinstance(error, subprocess.TimeoutExpired)
+            else "launch failure" if isinstance(error, OSError)
+            else "subprocess failure"
+        )
+        # Suppress rendered exception context as well as the message: timeout
+        # exceptions retain the original argv and captured subprocess output.
+        raise QualificationError(f"command failed: {tool}: {reason}") from None
     if result.returncode != 0:
-        detail = result.stderr.strip()[-2000:]
-        raise QualificationError(f"command failed ({result.returncode}): {' '.join(command)}: {detail}")
+        raise QualificationError(
+            f"command failed ({result.returncode}): {tool}; subprocess diagnostics withheld"
+        )
     return result.stdout.strip()
 
 
@@ -113,12 +128,12 @@ def request_json(url: str, token: str, body: dict[str, Any] | None = None,
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = response.read(MAX_JSON_RESPONSE_BYTES + 1)
             if len(payload) > MAX_JSON_RESPONSE_BYTES:
-                raise QualificationError(f"response exceeds byte limit: {url}")
+                raise QualificationError("response exceeds byte limit")
             value = json.loads(payload)
-    except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
-        raise QualificationError(f"request failed: {url}: {error}") from error
+    except (OSError, urllib.error.URLError, UnicodeDecodeError, json.JSONDecodeError):
+        raise QualificationError("JSON request failed; transport diagnostics withheld") from None
     if not isinstance(value, dict):
-        raise QualificationError(f"response is not a JSON object: {url}")
+        raise QualificationError("response is not a JSON object")
     return value
 
 
@@ -137,19 +152,23 @@ def request_response(
             headers = dict(response.headers.items())
             payload = response.read(MAX_JSON_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as error:
-        status = error.code
-        headers = dict(error.headers.items())
-        payload = error.read(MAX_JSON_RESPONSE_BYTES + 1)
-    except (OSError, urllib.error.URLError) as error:
-        raise QualificationError(f"request failed: {url}: {error}") from error
+        try:
+            with error:
+                status = error.code
+                headers = dict(error.headers.items())
+                payload = error.read(MAX_JSON_RESPONSE_BYTES + 1)
+        except (OSError, urllib.error.URLError):
+            raise QualificationError("error response body read failed") from None
+    except (OSError, urllib.error.URLError):
+        raise QualificationError("request failed; transport diagnostics withheld") from None
     if len(payload) > MAX_JSON_RESPONSE_BYTES:
-        raise QualificationError(f"error response exceeds byte limit: {url}")
+        raise QualificationError("error response exceeds byte limit")
     try:
         value = json.loads(payload)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise QualificationError(f"error response is not UTF-8 JSON: {url}") from error
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise QualificationError("error response is not UTF-8 JSON") from None
     if not isinstance(value, dict):
-        raise QualificationError(f"error response is not a JSON object: {url}")
+        raise QualificationError("error response is not a JSON object")
     return status, value, {key.lower(): value for key, value in headers.items()}
 
 
@@ -163,9 +182,7 @@ def request_error(
     )
     expected = {"error": {"message": expected_message, "type": expected_type}}
     if status != expected_status or value != expected:
-        raise QualificationError(
-            f"error response differs: {url}: status={status}, body={value!r}"
-        )
+        raise QualificationError("error response differs from expected status/envelope")
     return value, headers
 
 
@@ -175,14 +192,14 @@ def metric_value(base_url: str, token: str, name: str, timeout: float) -> int:
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = response.read(MAX_SSE_RESPONSE_BYTES + 1)
-    except (OSError, urllib.error.URLError) as error:
-        raise QualificationError(f"metrics request failed: {error}") from error
+    except (OSError, urllib.error.URLError):
+        raise QualificationError("metrics request failed; transport diagnostics withheld") from None
     if len(payload) > MAX_SSE_RESPONSE_BYTES:
         raise QualificationError("metrics response exceeds byte limit")
     try:
         text = payload.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise QualificationError("metrics response is not UTF-8") from error
+    except UnicodeDecodeError:
+        raise QualificationError("metrics response is not UTF-8") from None
     match = re.search(rf"(?m)^{re.escape(name)} ([0-9]+)$", text)
     if match is None:
         raise QualificationError(f"metrics response lacks integer {name}")
@@ -252,26 +269,29 @@ def slow_stream_attempt(
             raise QualificationError("slow SSE request did not start streaming")
         return "accepted", response
     except urllib.error.HTTPError as error:
-        with error:
-            body = error.read(MAX_JSON_RESPONSE_BYTES + 1)
+        try:
+            with error:
+                body = error.read(MAX_JSON_RESPONSE_BYTES + 1)
+        except (OSError, urllib.error.URLError):
+            raise QualificationError("queue rejection body read failed") from None
         if len(body) > MAX_JSON_RESPONSE_BYTES:
-            raise QualificationError("queue rejection response exceeds byte limit")
+            raise QualificationError("queue rejection response exceeds byte limit") from None
         try:
             value = json.loads(body)
-        except (UnicodeDecodeError, json.JSONDecodeError) as decode_error:
-            raise QualificationError("queue rejection is not UTF-8 JSON") from decode_error
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise QualificationError("queue rejection is not UTF-8 JSON") from None
         expected = {"error": {
             "message": "server is at capacity; retry shortly",
             "type": "rate_limit_exceeded",
         }}
         if (error.code != 429 or value != expected
                 or error.headers.get("Retry-After") != "1"):
-            raise QualificationError("queue rejection envelope differs")
+            raise QualificationError("queue rejection envelope differs") from None
         return "rejected", None
-    except (OSError, urllib.error.URLError, threading.BrokenBarrierError) as error:
+    except (OSError, urllib.error.URLError, threading.BrokenBarrierError):
         if response is not None:
             response.close()
-        raise QualificationError(f"slow SSE request failed: {error}") from error
+        raise QualificationError("slow SSE request failed; transport diagnostics withheld") from None
 
 
 def exercise_queue_disconnects(
@@ -896,9 +916,9 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             )
             if cleanup.returncode != 0 and not active_error:
                 raise QualificationError("Compose cleanup failed")
-        except (OSError, subprocess.SubprocessError) as error:
+        except (OSError, subprocess.SubprocessError):
             if not active_error:
-                raise QualificationError(f"Compose cleanup failed: {error}") from error
+                raise QualificationError("Compose cleanup failed; subprocess diagnostics withheld") from None
 
     machine_source = Path("/etc/machine-id").read_text(encoding="utf-8").strip()
     machine = hashlib.sha256(machine_source.encode()).hexdigest()

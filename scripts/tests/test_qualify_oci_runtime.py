@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import io
 import os
 from pathlib import Path
 import runpy
 import multiprocessing
 import signal
+import subprocess
+import sys
 import threading
 import time
 import tempfile
+import traceback
 import unittest
 from unittest import mock
 
@@ -22,6 +26,148 @@ validate_ready = MODULE["validate_ready"]
 validate_receipt = MODULE["validate_receipt"]
 request_json = MODULE["request_json"]
 request_error = MODULE["request_error"]
+
+
+class CommandDiagnosticsTests(unittest.TestCase):
+    def test_real_failure_does_not_publish_environment_or_arguments(self):
+        # Deliberately synthetic markers, not real credentials or private data.
+        token = "fixture-only-not-a-credential"
+        argument = "fixture-only-private-command-argument"
+        environment = os.environ.copy()
+        environment["TRITIUM_AUTH_TOKEN"] = token
+        command = [
+            sys.executable, "-c",
+            "import os,sys; "
+            "sys.stderr.write(os.environ['TRITIUM_AUTH_TOKEN'] + ' ' + sys.argv[1]); "
+            "sys.exit(23)",
+            argument,
+        ]
+        with self.assertRaises(QualificationError) as caught:
+            MODULE["run"](command, env=environment, timeout=5)
+        diagnostic = "".join(traceback.format_exception(caught.exception))
+        self.assertIn("23", str(caught.exception))
+        self.assertNotIn(token, diagnostic)
+        self.assertNotIn(argument, diagnostic)
+
+    def test_launch_and_timeout_errors_do_not_publish_exception_context(self):
+        marker = "fixture-only-sensitive-exception-context"
+        command = ["/private/fixture-only-sensitive-executable", marker]
+        failures = (
+            OSError(marker),
+            subprocess.TimeoutExpired(command, 1, stderr=marker.encode()),
+            subprocess.SubprocessError(marker),
+        )
+        for failure in failures:
+            with self.subTest(kind=type(failure).__name__):
+                with mock.patch.object(MODULE["subprocess"], "run", side_effect=failure):
+                    with self.assertRaises(QualificationError) as caught:
+                        MODULE["run"](command, timeout=1)
+                diagnostic = "".join(traceback.format_exception(caught.exception))
+                self.assertNotIn(marker, diagnostic)
+                self.assertNotIn(command[0], diagnostic)
+
+    def test_success_retains_the_command_result(self):
+        self.assertEqual(
+            MODULE["run"]([sys.executable, "-c", "print('verified-output')"], timeout=5),
+            "verified-output",
+        )
+
+    def test_allowlisted_label_does_not_include_path_or_subprocess_output(self):
+        command = ["/private/fixture-sensitive-directory/docker", "fixture-sensitive-argument"]
+        result = subprocess.CompletedProcess(
+            command, 9, "fixture-sensitive-stdout", "fixture-sensitive-stderr"
+        )
+        with mock.patch.object(MODULE["subprocess"], "run", return_value=result):
+            with self.assertRaises(QualificationError) as caught:
+                MODULE["run"](command)
+        self.assertEqual(
+            str(caught.exception),
+            "command failed (9): docker; subprocess diagnostics withheld",
+        )
+
+    def test_real_timeout_withholds_command_and_captured_output(self):
+        marker = "fixture-only-timeout-marker"
+        command = [
+            sys.executable, "-c",
+            "import sys,time; print(sys.argv[1], flush=True); "
+            "sys.stderr.write(sys.argv[1]); sys.stderr.flush(); time.sleep(10)",
+            marker,
+        ]
+        started = time.monotonic()
+        with self.assertRaises(QualificationError) as caught:
+            MODULE["run"](command, timeout=0.1)
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertEqual(str(caught.exception), "command failed: external-tool: timeout")
+        self.assertNotIn(marker, "".join(traceback.format_exception(caught.exception)))
+
+    def test_http_error_mismatch_does_not_publish_response_or_url(self):
+        marker = "fixture-only-sensitive-server-response"
+        function = MODULE["request_error"]
+        with mock.patch.dict(function.__globals__, {
+            "request_response": lambda *_args, **_kwargs: (500, {"error": marker}, {}),
+        }):
+            with self.assertRaises(QualificationError) as caught:
+                function(
+                    "http://127.0.0.1/private?fixture=" + marker,
+                    401, "invalid_request_error", "missing or invalid bearer token",
+                    token="fixture-only-not-a-credential",
+                )
+        self.assertNotIn(marker, "".join(traceback.format_exception(caught.exception)))
+
+    def test_http_transport_failures_do_not_publish_exception_context(self):
+        marker = "fixture-only-sensitive-transport-context"
+        url = "http://127.0.0.1/private?fixture=" + marker
+        token = "fixture-only-not-a-credential"
+        calls = (
+            ("request_json", lambda: MODULE["request_json"](url, token, timeout=1)),
+            ("request_response", lambda: MODULE["request_response"](url, token=token, timeout=1)),
+            ("metric_value", lambda: MODULE["metric_value"](url, token, "tritium_queue_depth", 1)),
+            ("slow_stream_attempt", lambda: MODULE["slow_stream_attempt"](url, token, {}, 1, None)),
+        )
+        for name, call in calls:
+            with self.subTest(operation=name):
+                with mock.patch.object(MODULE["urllib"].request, "urlopen", side_effect=OSError(marker)):
+                    with self.assertRaises(QualificationError) as caught:
+                        call()
+                diagnostic = "".join(traceback.format_exception(caught.exception))
+                self.assertNotIn(marker, diagnostic)
+                self.assertNotIn(token, diagnostic)
+
+    def test_failed_http_error_body_read_is_closed_and_sanitized(self):
+        marker = "fixture-only-sensitive-error-body"
+
+        class FailingBody(io.BytesIO):
+            def read(self, *_args):
+                raise OSError(marker)
+
+        for name in ("request_response", "slow_stream_attempt"):
+            with self.subTest(operation=name):
+                body = FailingBody()
+                error = MODULE["urllib"].error.HTTPError(
+                    "http://127.0.0.1/private?fixture=" + marker, 429, marker,
+                    {"Retry-After": "1"}, body,
+                )
+                with mock.patch.object(MODULE["urllib"].request, "urlopen", side_effect=error):
+                    with self.assertRaises(QualificationError) as caught:
+                        if name == "request_response":
+                            MODULE[name](error.url, token="fixture-only-not-a-credential", timeout=1)
+                        else:
+                            MODULE[name](error.url, "fixture-only-not-a-credential", {}, 1, None)
+                self.assertTrue(body.closed)
+                self.assertNotIn(marker, "".join(traceback.format_exception(caught.exception)))
+
+    def test_sse_rejection_mismatch_does_not_chain_server_reason(self):
+        marker = "fixture-only-sensitive-http-reason"
+        error = MODULE["urllib"].error.HTTPError(
+            "http://127.0.0.1/private?fixture=" + marker, 500, marker,
+            {}, io.BytesIO(canonical({"error": marker})),
+        )
+        with mock.patch.object(MODULE["urllib"].request, "urlopen", side_effect=error):
+            with self.assertRaises(QualificationError) as caught:
+                MODULE["slow_stream_attempt"](
+                    error.url, "fixture-only-not-a-credential", {}, 1, None
+                )
+        self.assertNotIn(marker, "".join(traceback.format_exception(caught.exception)))
 
 
 def readiness(flavor: str = "cpu"):
