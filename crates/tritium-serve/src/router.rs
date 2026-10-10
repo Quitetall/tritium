@@ -112,8 +112,8 @@ pub struct ServeConfig {
     pub max_new_default: usize,
     /// Per-request lifetime budget. For non-streaming requests the service
     /// timeout bounds body handling, queue wait and generation. Streaming
-    /// responses additionally enforce the same budget inside the lazy SSE
-    /// body, starting at queue admission; expiry emits a typed error event and
+    /// responses additionally enforce the same budget independently of lazy SSE
+    /// body polling, starting at queue admission; expiry emits a typed error event and
     /// cancels generation. `0` disables both deadlines.
     pub request_timeout_secs: u64,
     /// Global in-flight request cap (DoS bound on handler memory/FDs).
@@ -387,15 +387,141 @@ impl Drop for GenerationMetricsGuard {
 struct StreamDisconnectGuard {
     metrics: Arc<Metrics>,
     completed: bool,
+    deadline_state: Arc<AtomicU8>,
 }
 
 impl Drop for StreamDisconnectGuard {
     fn drop(&mut self) {
         if !self.completed {
+            // Claim retirement before accounting. A read followed by an
+            // increment lets the watchdog claim timeout between the two.
+            let previous = self
+                .deadline_state
+                .compare_exchange(
+                    STREAM_RUNNING,
+                    STREAM_FINISHED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .unwrap_or_else(|state| state);
+            if previous == STREAM_EXPIRED {
+                return;
+            }
             self.metrics
                 .stream_disconnects
                 .fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+const STREAM_RUNNING: u8 = 0;
+const STREAM_EXPIRED: u8 = 1;
+const STREAM_FINISHED: u8 = 2;
+
+/// Keep the existing bounded event channel, but allow its deadline watchdog to
+/// close it even when the HTTP body is not being polled. No relay buffer or
+/// model-side timer is added. The receiver lock is never retained across yields.
+struct StreamEventReceiver {
+    receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<GenEvent>>>,
+    deadline: Option<tokio::time::Instant>,
+    state: Arc<AtomicU8>,
+    metrics: Arc<Metrics>,
+    watchdog: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl StreamEventReceiver {
+    fn new(
+        receiver: mpsc::Receiver<GenEvent>,
+        started: Instant,
+        timeout: Option<Duration>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        let started = tokio::time::Instant::from_std(started);
+        let deadline = timeout.map(|budget| started.checked_add(budget).unwrap_or(started));
+        let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
+        let state = Arc::new(AtomicU8::new(STREAM_RUNNING));
+        let watchdog = deadline.map(|deadline| {
+            let receiver = Arc::downgrade(&receiver);
+            let state = state.clone();
+            let metrics = metrics.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep_until(deadline).await;
+                if let Some(receiver) = receiver.upgrade() {
+                    let mut receiver = receiver.lock().await;
+                    if Self::expire(&state, &metrics) {
+                        receiver.close();
+                    }
+                }
+            })
+        });
+        Self {
+            receiver,
+            deadline,
+            state,
+            metrics,
+            watchdog,
+        }
+    }
+
+    fn expire(state: &AtomicU8, metrics: &Metrics) -> bool {
+        if state
+            .compare_exchange(
+                STREAM_RUNNING,
+                STREAM_EXPIRED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            metrics.stream_timeouts.fetch_add(1, Ordering::Relaxed);
+        }
+        state.load(Ordering::Acquire) == STREAM_EXPIRED
+    }
+
+    async fn recv(&mut self) -> Result<Option<GenEvent>, ()> {
+        let mut receiver = self.receiver.lock().await;
+        if let Some(deadline) = self.deadline {
+            // Check before reading: timeout_at can otherwise accept an already
+            // buffered event even when its deadline has elapsed.
+            if tokio::time::Instant::now() >= deadline {
+                Self::expire(&self.state, &self.metrics);
+                receiver.close();
+                return Err(());
+            }
+            match tokio::time::timeout_at(deadline, receiver.recv()).await {
+                Ok(event) => Ok(event),
+                Err(_) => {
+                    Self::expire(&self.state, &self.metrics);
+                    receiver.close();
+                    Err(())
+                }
+            }
+        } else {
+            Ok(receiver.recv().await)
+        }
+    }
+
+    fn stop_watchdog(&mut self) {
+        let _ = self.state.compare_exchange(
+            STREAM_RUNNING,
+            STREAM_FINISHED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        if let Some(watchdog) = self.watchdog.take() {
+            watchdog.abort();
+        }
+    }
+
+    async fn finish(&mut self) {
+        self.stop_watchdog();
+        self.receiver.lock().await.close();
+    }
+}
+
+impl Drop for StreamEventReceiver {
+    fn drop(&mut self) {
+        self.stop_watchdog();
     }
 }
 
@@ -1658,7 +1784,7 @@ fn sse_data(chunk: &ChatChunk) -> Event {
 
 #[allow(clippy::too_many_arguments)] // wire contract keeps stream controls explicit
 fn stream_response(
-    mut rx: mpsc::Receiver<GenEvent>,
+    rx: mpsc::Receiver<GenEvent>,
     tok: Arc<dyn Tokenizer + Send + Sync>,
     model: String,
     stops: Vec<String>,
@@ -1675,12 +1801,12 @@ fn stream_response(
     let created = now_secs();
     let detok_eos = tok.eos();
     let stream_tok = tok.clone();
-    let deadline = timeout.map(|budget| {
-        let now = tokio::time::Instant::now();
-        // A pathological public config must fail closed rather than turning
-        // an overflowing lifetime into an unbounded stream.
-        now.checked_add(budget).unwrap_or(now)
-    });
+    let mut rx = StreamEventReceiver::new(rx, generation_started, timeout, metrics.clone());
+    let disconnect = StreamDisconnectGuard {
+        metrics: metrics.clone(),
+        completed: false,
+        deadline_state: rx.state.clone(),
+    };
     let generation_metrics =
         GenerationMetricsGuard::with_start(metrics.clone(), generation_started);
     let request_span = tracing::Span::current();
@@ -1695,10 +1821,7 @@ fn stream_response(
         // than closing the root when only response headers have been sent.
         let _request_span_lifetime = request_span;
         let mut generation_metrics = generation_metrics;
-        let mut disconnect = StreamDisconnectGuard {
-            metrics: metrics.clone(),
-            completed: false,
-        };
+        let mut disconnect = disconnect;
         // 1. role-first chunk
         yield Ok::<Event, std::convert::Infallible>(sse_data(&role_chunk(&id, created, &model)));
 
@@ -1712,16 +1835,12 @@ fn stream_response(
         let mut timed_out = false;
 
         loop {
-            let next = match deadline {
-                Some(deadline) => match tokio::time::timeout_at(deadline, rx.recv()).await {
-                    Ok(event) => event,
-                    Err(_) => {
-                        timed_out = true;
-                        metrics.stream_timeouts.fetch_add(1, Ordering::Relaxed);
-                        break;
-                    }
-                },
-                None => rx.recv().await,
+            let next = match rx.recv().await {
+                Ok(event) => event,
+                Err(()) => {
+                    timed_out = true;
+                    break;
+                }
             };
             let Some(ev) = next else { break };
             match ev {
@@ -1768,6 +1887,9 @@ fn stream_response(
             }
         }
 
+        // Retire cancellation and close model delivery before terminal yields;
+        // a client retaining a completed body must not leave a timer alive.
+        rx.finish().await;
         if timed_out {
             let error = request_timeout_error();
             yield Ok(Event::default().data(serde_json::to_string(&error).unwrap_or_default()));
@@ -2570,6 +2692,107 @@ mod tests {
             .map(|value| value.load(Ordering::Relaxed))
             .collect();
         assert_eq!(observed, vec![1; ADMISSION_OUTCOME_LABELS.len()]);
+    }
+
+    #[tokio::test]
+    async fn stream_event_receiver_finish_stops_watchdog() {
+        let metrics = Arc::new(Metrics::default());
+        let (tx, rx) = mpsc::channel(64);
+        let mut receiver = StreamEventReceiver::new(
+            rx,
+            Instant::now(),
+            Some(Duration::from_millis(10)),
+            metrics.clone(),
+        );
+        receiver.finish().await;
+        assert!(receiver.watchdog.is_none());
+        assert!(tx.is_closed());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(receiver.state.load(Ordering::Acquire), STREAM_FINISHED);
+        assert_eq!(metrics.stream_timeouts.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn stream_disconnect_and_timeout_claim_one_outcome() {
+        for timeout_first in [false, true] {
+            let metrics = Arc::new(Metrics::default());
+            let state = Arc::new(AtomicU8::new(STREAM_RUNNING));
+            let disconnect = StreamDisconnectGuard {
+                metrics: metrics.clone(),
+                completed: false,
+                deadline_state: state.clone(),
+            };
+            if timeout_first {
+                assert!(StreamEventReceiver::expire(&state, &metrics));
+            }
+            drop(disconnect);
+            if !timeout_first {
+                assert!(
+                    !StreamEventReceiver::expire(&state, &metrics),
+                    "disconnect must retire the deadline before it can claim a second outcome"
+                );
+            }
+            assert_eq!(
+                metrics.stream_timeouts.load(Ordering::Relaxed)
+                    + metrics.stream_disconnects.load(Ordering::Relaxed),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_event_receiver_drop_closes_without_late_timeout() {
+        let metrics = Arc::new(Metrics::default());
+        let (tx, rx) = mpsc::channel(64);
+        let receiver = StreamEventReceiver::new(
+            rx,
+            Instant::now(),
+            Some(Duration::from_millis(10)),
+            metrics.clone(),
+        );
+        let weak_receiver = Arc::downgrade(&receiver.receiver);
+        let state = receiver.state.clone();
+        drop(receiver);
+        assert!(weak_receiver.upgrade().is_none());
+        assert!(tx.is_closed());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(state.load(Ordering::Acquire), STREAM_FINISHED);
+        assert_eq!(metrics.stream_timeouts.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn stream_event_receiver_expiry_is_counted_once() {
+        let metrics = Arc::new(Metrics::default());
+        let (tx, rx) = mpsc::channel(64);
+        let mut receiver = StreamEventReceiver::new(
+            rx,
+            Instant::now(),
+            Some(Duration::from_millis(10)),
+            metrics.clone(),
+        );
+        tokio::time::timeout(Duration::from_secs(2), tx.closed())
+            .await
+            .expect("watchdog must close an unpolled receiver");
+        assert_eq!(metrics.stream_timeouts.load(Ordering::Relaxed), 1);
+        assert!(receiver.recv().await.is_err());
+        receiver.finish().await;
+        assert_eq!(receiver.state.load(Ordering::Acquire), STREAM_EXPIRED);
+        assert_eq!(metrics.stream_timeouts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_event_receiver_disabled_deadline_preserves_events() {
+        let metrics = Arc::new(Metrics::default());
+        let (tx, rx) = mpsc::channel(64);
+        let mut receiver = StreamEventReceiver::new(rx, Instant::now(), None, metrics.clone());
+        assert!(receiver.watchdog.is_none());
+        tx.try_send(GenEvent::Done(FinishReason::Length)).unwrap();
+        assert!(matches!(
+            receiver.recv().await,
+            Ok(Some(GenEvent::Done(FinishReason::Length)))
+        ));
+        receiver.finish().await;
+        assert_eq!(metrics.stream_timeouts.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

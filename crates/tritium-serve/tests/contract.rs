@@ -1790,6 +1790,121 @@ async fn sse_deadline_cancels_generation() {
     assert!(text.contains("tritium_stream_timeouts_total 1\n"), "{text}");
 }
 
+async fn exercise_sse_deadline_body_polling(poll_body: bool) {
+    struct TimedDecode {
+        entered: Arc<AtomicBool>,
+        cancelled: Arc<AtomicBool>,
+    }
+    impl Generator for TimedDecode {
+        fn generate(
+            &mut self,
+            req: &GenRequest,
+            on_step: &mut dyn FnMut(Step) -> bool,
+        ) -> Result<(), GenError> {
+            self.entered.store(true, Ordering::SeqCst);
+            for index in 0..req.max_new {
+                std::thread::sleep(Duration::from_millis(50));
+                if !on_step(Step {
+                    token: 10,
+                    finished: index + 1 == req.max_new,
+                    logprobs: None,
+                    finish_reason: (index + 1 == req.max_new).then_some(FinishReason::Length),
+                }) {
+                    self.cancelled.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+            Ok(())
+        }
+        fn n_ctx(&self) -> usize {
+            4096
+        }
+        fn vocab(&self) -> usize {
+            128_256
+        }
+    }
+    let entered = Arc::new(AtomicBool::new(false));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut config = ServeConfig::default();
+    config.request_timeout_secs = 1;
+    let (router, _) = build_router(
+        Box::new(TimedDecode {
+            entered: entered.clone(),
+            cancelled: cancelled.clone(),
+        }),
+        shared_tok(),
+        config,
+    );
+    let response = router
+        .clone()
+        .oneshot(chat(json!({
+            "model": "tritium",
+            "messages": [{"role": "user", "content": "1"}],
+            "max_tokens": 60,
+            "stream": true
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = Some(response.into_body());
+    let collected = if poll_body {
+        let body = body.take().unwrap();
+        Some(tokio::spawn(async move { body.collect().await }))
+    } else {
+        None
+    };
+    wait_flag(&entered).await;
+    // The unpolled variant retains the body. Sixty tokens fit in the existing
+    // 64-event channel, so backpressure cannot masquerade as the deadline.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !cancelled.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("stream deadline must cancel generation independently of body polling");
+    let (_, metrics) = send(
+        &router,
+        Request::get("/metrics").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert!(
+        String::from_utf8(metrics)
+            .unwrap()
+            .contains("tritium_stream_timeouts_total 1\n")
+    );
+    let bytes = match collected {
+        Some(task) => task.await.unwrap().unwrap().to_bytes(),
+        None => body.unwrap().collect().await.unwrap().to_bytes(),
+    };
+    let events = parse_sse(&bytes);
+    assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
+    let chunks = sse_chunks(&events);
+    assert_eq!(chunks.last().unwrap()["error"]["code"], "request_timeout");
+    let (status, bytes) = send(
+        &router,
+        chat(json!({
+            "model": "tritium",
+            "messages": [{"role": "user", "content": "2"}],
+            "max_tokens": 1
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let response: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(response["choices"][0]["message"]["content"], "10");
+}
+
+#[tokio::test]
+async fn sse_deadline_cancels_unpolled_body_and_worker_recovers() {
+    exercise_sse_deadline_body_polling(false).await;
+}
+
+#[tokio::test]
+async fn sse_deadline_cancels_polled_body_and_worker_recovers() {
+    exercise_sse_deadline_body_polling(true).await;
+}
+
 /// Chat-template rendering: the RoleEot template must reproduce the official
 /// transformers template ("{Role}: {content}<|eot_id|>" per message + the
 /// "Assistant: " generation prompt); Concat stays the id-passthrough join.
