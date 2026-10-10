@@ -104,6 +104,65 @@ fn bits(values: &[f32]) -> Vec<u32> {
 }
 
 #[test]
+fn independently_owned_resident_graphs_match_serial_references() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    // Distinct prefixes exercise independent KV ownership, not two copies of
+    // one request. Serial references use separate runners, then leave scope.
+    let inputs = [([0, 1, 2], 3, [4, 5, 6]), ([4, 5, 6], 7, [0, 1, 2])];
+    let mut references = Vec::new();
+    for (seed, token, tree) in inputs {
+        let Some(mut reference) = runner() else {
+            return;
+        };
+        reference.forward(&seed, &[0, 1, 2]).unwrap();
+        let decode = bits(&reference.forward(&[token], &[3]).unwrap());
+        let model = reference.resident_cuda().unwrap().unwrap();
+        let accepted = model.tree_verify_greedy(&tree, &[-1, 0, 0]).unwrap();
+        assert!(model.tree_graph_bucket_count() > 0);
+        references.push((decode, accepted, prefix_bytes(model), model.cache_len()));
+    }
+    let (left_tx, right_rx) = mpsc::sync_channel(1);
+    let (right_tx, left_rx) = mpsc::sync_channel(1);
+    let endpoints = [(left_tx, left_rx), (right_tx, right_rx)];
+    std::thread::scope(|scope| {
+        let mut workers = Vec::new();
+        for ((input, expected), (tx, rx)) in inputs.into_iter().zip(references).zip(endpoints) {
+            workers.push(scope.spawn(move || {
+                let (seed, token, tree) = input;
+                let mut owned = runner().expect("required peer CUDA fixture");
+                let rendezvous = || {
+                    tx.send(()).unwrap();
+                    // Unlike a barrier, a failed peer disconnects this wait.
+                    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                };
+                for _ in 0..8 {
+                    owned.reset();
+                    rendezvous();
+                    owned.forward(&seed, &[0, 1, 2]).unwrap();
+                    rendezvous();
+                    assert_eq!(bits(&owned.forward(&[token], &[3]).unwrap()), expected.0);
+                    rendezvous();
+                    let model = owned.resident_cuda().unwrap().unwrap();
+                    assert_eq!(
+                        model.tree_verify_greedy(&tree, &[-1, 0, 0]).unwrap(),
+                        expected.1
+                    );
+                    assert!(model.tree_graph_bucket_count() > 0);
+                    assert_eq!(prefix_bytes(model), expected.2);
+                    assert_eq!(model.cache_len(), expected.3);
+                    assert!(owned.kv.iter().all(|cache| cache.len == 0));
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    });
+}
+
+#[test]
 fn resident_prefill_cancellation_preserves_prefix_and_recovers() {
     let Some(mut runner) = runner() else { return };
     let model = runner

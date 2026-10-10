@@ -5,18 +5,6 @@ use tritium_nn::{
     TokenEmbedding, TransformerBlock,
 };
 
-// Each fixture models one worker's sequential ownership. CudaBackend instances
-// currently share the device's primary context and default stream: independent
-// test threads can invalidate another fixture's graph capture. Keep graphs
-// enabled while isolating fixture lifetimes, including destruction. This does
-// not qualify concurrent models sharing that context (see the evidence note).
-pub(crate) fn cuda_fixture_guard() -> std::sync::MutexGuard<'static, ()> {
-    static DEVICE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    DEVICE
-        .lock()
-        .expect("CUDA fixture failed while holding device ownership")
-}
-
 pub(crate) fn tiny_cuda_runner(n_ctx: u32) -> Option<ModelRunner> {
     let backend = match tritium_cuda::CudaBackend::new(0) {
         Ok(backend) => backend,

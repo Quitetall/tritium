@@ -778,7 +778,7 @@ pub(crate) struct EmbedSegments {
 /// reference-counted (`Arc`) by `cudarc`.
 #[derive(Debug)]
 pub struct CudaBackend {
-    /// The context's default stream — all memory ops and launches go through it.
+    /// The backend's owned nonblocking working stream for internal memory/launches.
     /// The stream holds its own `Arc<CudaContext>`, so the context stays alive for
     /// as long as the backend does without a separate field.
     pub(super) stream: Arc<CudaStream>,
@@ -1071,7 +1071,14 @@ impl CudaBackend {
         result::init().map_err(|e| driver_err("initialize CUDA driver", &e))?;
         let _context = CurrentContextRestore::capture()?;
         let ctx = CudaContext::new(ordinal).map_err(|e| driver_err("open cuda device", &e))?;
-        let stream = ctx.default_stream();
+        // A fresh wrapper has no owned allocations/work to migrate. Fork joins
+        // prior legacy-stream work by event and establishes multistream tracking
+        // without new_stream's first-stream context-wide synchronization, which
+        // would conflict with another backend's active graph capture (ADR 0052).
+        let stream = ctx
+            .default_stream()
+            .fork()
+            .map_err(|e| driver_err("create backend working stream", &e))?;
 
         let module = ctx
             .load_module(Ptx::from_src(TQ2_0_ADD_PTX))
@@ -3970,7 +3977,7 @@ impl CudaBackend {
         Ok(())
     }
 
-    /// The backend's default CUDA stream. Exposed so the tensor-core training tier in
+    /// The backend's owned nonblocking CUDA stream. Exposed so the tensor-core training tier in
     /// `crate::train` can build a cuBLASLt handle on the same stream — that module lives
     /// outside `crate::cuda` and cannot reach the `pub(super)` field directly.
     pub(crate) fn stream(&self) -> &Arc<CudaStream> {

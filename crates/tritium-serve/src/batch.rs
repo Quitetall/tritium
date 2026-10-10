@@ -2781,7 +2781,6 @@ mod tests {
 
     #[test]
     fn pending_retirement_releases_once_and_preserves_live_cuda_peer() {
-        let _device = crate::test_support::cuda_fixture_guard();
         let Some(mut runner) = crate::test_support::tiny_cuda_runner(16) else {
             return;
         };

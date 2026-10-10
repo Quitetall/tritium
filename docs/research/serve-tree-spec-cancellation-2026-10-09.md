@@ -143,6 +143,15 @@ pre-existing model-backed `truncate_reconcile_pins`, which loads the existing
 8-layer drafter three times; it was not an in-operation cancellation hang.
 The model-backed check is still not a candidate-bound qualification receipt.
 
+Hosted follow-up (2026-10-10): all five workflows for the exact implementation
+commit `5ba8a79a5584d08c0df597abb2d296f481dceb8c` completed successfully:
+CI (`38021878463`), wheels (`38021879596`), docs (`38021878528`), CodeQL
+(`38021878457`) and CPU capstone (`38021878407`). Observed with
+`gh run list --commit 5ba8a79a5584d08c0df597abb2d296f481dceb8c --json
+name,status,conclusion,databaseId --limit 8`. This confirms the hosted software
+checks for that commit; it does not close any candidate-bound empirical gate or
+qualify the subsequent uncommitted CUDA ownership investigation.
+
 ## Limits and remaining gates
 
 Local software and tiny physical checks do not qualify cancellation latency,

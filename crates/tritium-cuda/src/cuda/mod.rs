@@ -24,8 +24,10 @@
 //! ## cudarc 0.19 API
 //!
 //! Ported from the 0.13 device API to the 0.19 context/stream API:
-//! - [`cudarc::driver::CudaContext::new`] returns an `Arc<CudaContext>`; memory
-//!   and launches go through its [`default_stream`](cudarc::driver::CudaContext::default_stream).
+//! - [`cudarc::driver::CudaContext::new`] returns an `Arc<CudaContext>`; each
+//!   backend owns a nonblocking working stream forked from the legacy stream.
+//!   Internal memory/launches use that stream; external operations retain their
+//!   explicitly supplied framework stream (ADR 0052).
 //! - PTX is loaded with [`CudaContext::load_module`] (taking a
 //!   [`cudarc::nvrtc::Ptx`] built from our pre-compiled string) and the kernel is
 //!   fetched with [`CudaModule::load_function`].
@@ -1879,7 +1881,7 @@ impl CudaDecodeModel {
             self.capture_graph()?;
         }
 
-        // Drain any pending work on the default stream before the graph (on `cap_stream`)
+        // Drain any pending work on the owner's working stream before the graph (on `cap_stream`)
         // reads/writes the shared buffers. The graph-only runner path never leaves work
         // there (so this is a no-op sync on an idle stream), but if a caller interleaves
         // the eager `step` (which runs on `self.stream`) with `step_graph`, this closes the

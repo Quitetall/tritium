@@ -6548,6 +6548,94 @@ fn cuda_graph_raw_launch_replay_bit_identical() {
     }
 }
 
+/// A second backend must be able to create its decode stream while the first
+/// owner captures a graph. The capture stays open until peer creation finishes.
+#[test]
+fn cuda_backend_stream_creation_does_not_invalidate_peer_capture() {
+    check_peer_stream_creation_during_capture(false);
+}
+
+#[test]
+fn cuda_backend_construction_during_peer_capture_preserves_replay() {
+    check_peer_stream_creation_during_capture(true);
+}
+
+fn check_peer_stream_creation_during_capture(construct_during_capture: bool) {
+    use cudarc::driver::{DevicePtrMut, result, sys};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let owner = match CudaBackend::new(0) {
+        Ok(backend) => backend,
+        Err(error) => {
+            assert!(
+                std::env::var("TRITIUM_REQUIRE_CUDA").as_deref() != Ok("1"),
+                "required CUDA capture fixture unavailable: {error}"
+            );
+            eprintln!("UNKNOWN: CUDA capture fixture unavailable ({error})");
+            return;
+        }
+    };
+    let peer = (!construct_during_capture).then(|| CudaBackend::new(0).unwrap());
+    let cap = owner.stream.context().new_stream().unwrap();
+    let mut captured = cap.alloc_zeros::<u8>(8).unwrap();
+    let ptr = {
+        let (ptr, guard) = captured.device_ptr_mut(&cap);
+        drop(guard);
+        ptr
+    };
+    cap.synchronize().unwrap();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (finish_tx, finish_rx) = mpsc::sync_channel(1);
+    let (peer, peer_stream, captured_output) = std::thread::scope(|scope| {
+        let capture = scope.spawn(move || -> Result<Vec<u8>, cudarc::driver::DriverError> {
+            cap.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+            #[allow(unsafe_code)]
+            // SAFETY: ptr names the live eight-byte allocation held by captured.
+            // The raw memset adds a node without cudarc event tracking during
+            // capture. The allocation outlives capture, replay and download.
+            unsafe {
+                result::memset_d8_async(ptr, 7, 8, cap.cu_stream())?;
+            }
+            entered_tx.send(()).unwrap();
+            finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Always end the capture before inspecting peer errors, so the
+            // negative case does not leave a capturing stream behind.
+            let graph = cap
+                .end_capture(
+                    sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+                )?
+                .expect("memset capture is nonempty");
+            graph.launch()?;
+            cap.synchronize()?;
+            cap.clone_dtoh(&captured)
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let peer = peer.map(Ok).unwrap_or_else(|| CudaBackend::new(0));
+        // Resident decoder construction creates its first auxiliary stream.
+        let peer_stream = peer
+            .as_ref()
+            .ok()
+            .map(|peer| peer.stream.context().new_stream());
+        finish_tx.send(()).unwrap();
+        (peer, peer_stream, capture.join().unwrap())
+    });
+    let peer = peer.expect("peer backend construction must not invalidate capture");
+    let peer_stream = peer_stream
+        .unwrap()
+        .expect("peer auxiliary stream creation must not invalidate capture");
+    assert!(!owner.stream.cu_stream().is_null());
+    assert!(!peer.stream.cu_stream().is_null());
+    assert_ne!(owner.stream.cu_stream(), peer.stream.cu_stream());
+    assert_ne!(peer.stream.cu_stream(), peer_stream.cu_stream());
+    assert_eq!(
+        captured_output.expect("peer must not invalidate graph"),
+        vec![7; 8]
+    );
+    let data = peer.stream.clone_htod(&[3.0f32, 7.0]).unwrap();
+    assert_eq!(peer.stream.clone_dtoh(&data).unwrap(), vec![3.0, 7.0]);
+}
+
 // ── Sparse kernel tests (P1: zero-block sparsity skip) ─────────────────
 use tritium_format::QK_K;
 

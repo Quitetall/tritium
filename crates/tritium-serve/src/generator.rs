@@ -2085,7 +2085,6 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn speculative_loop_all_queries_retire_and_recover_owned_state() {
-        let _device = crate::test_support::cuda_fixture_guard();
         use super::*;
         use std::cell::Cell;
         for model_draft in [false, true] {
@@ -2275,7 +2274,6 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn runner_tree_adapter_all_checkpoints_are_transactional() {
-        let _device = crate::test_support::cuda_fixture_guard();
         use super::*;
         use crate::test_support::prefix_bytes;
         use std::cell::Cell;
@@ -2381,7 +2379,6 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn speculative_loop_cancellation_avoids_next_target_verification() {
-        let _device = crate::test_support::cuda_fixture_guard();
         use super::*;
         for sampling in [
             Sampling::Greedy,
@@ -2481,7 +2478,6 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn runner_tree_session_query_reaches_native_prefill() {
-        let _device = crate::test_support::cuda_fixture_guard();
         use super::*;
         let Some(runner) = crate::test_support::tiny_cuda_runner(16) else {
             return;
@@ -2515,7 +2511,6 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn runner_tree_verify_query_preserves_session() {
-        let _device = crate::test_support::cuda_fixture_guard();
         use super::*;
         let Some(runner) = crate::test_support::tiny_cuda_runner(16) else {
             return;
