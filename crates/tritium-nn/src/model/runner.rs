@@ -302,6 +302,27 @@ impl ModelRunner {
             .map_err(ResidentOpError::Op)
     }
 
+    /// (cuda) Cooperative greedy tree verification. `None` means cancelled
+    /// before promotion, with the committed prefix unchanged. The query must
+    /// be cheap, nonblocking and non-panicking; graph replay is not preempted.
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] as for [`Self::tree_verify_greedy`].
+    #[cfg(feature = "cuda")]
+    pub fn tree_verify_greedy_cancellable(
+        &mut self,
+        tokens: &[u32],
+        parents: &[i32],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<u32>>, ResidentOpError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
+        self.resident_for_op()?
+            .tree_verify_greedy_cancellable(tokens, parents, is_cancelled)
+            .map_err(ResidentOpError::Op)
+    }
+
     /// (cuda) I2/I3 batch-slot tree-verify (L3 batch-slot spec decode): the
     /// same greedy tree verify as
     /// [`tree_verify_greedy`](Self::tree_verify_greedy), run against batch
@@ -326,6 +347,29 @@ impl ModelRunner {
     ) -> Result<Vec<u32>, ResidentOpError> {
         self.resident_for_op()?
             .tree_verify_greedy_slot(batch, row, tokens, parents)
+            .map_err(ResidentOpError::Op)
+    }
+
+    /// (cuda) Cooperative single-row tree verification, preserving other
+    /// rows and unrelated single-sequence pending-tree authorization.
+    /// Reservation and query requirements match the native tree interfaces.
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] as for [`Self::tree_verify_greedy_slot`].
+    #[cfg(feature = "cuda")]
+    pub fn tree_verify_greedy_slot_cancellable(
+        &mut self,
+        batch: &mut tritium_cuda::BatchKv,
+        row: usize,
+        tokens: &[u32],
+        parents: &[i32],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<u32>>, ResidentOpError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
+        self.resident_for_op()?
+            .tree_verify_greedy_slot_cancellable(batch, row, tokens, parents, is_cancelled)
             .map_err(ResidentOpError::Op)
     }
 
@@ -391,6 +435,27 @@ impl ModelRunner {
     ) -> Result<Vec<f32>, ResidentOpError> {
         self.resident_for_op()?
             .tree_verify_logits(tokens, parents)
+            .map_err(ResidentOpError::Op)
+    }
+
+    /// (cuda) Cooperative host-logit verification. Cancelled entered work
+    /// grants no pending-tree commit; entry cancellation leaves state intact.
+    /// The query must be cheap, nonblocking and non-panicking.
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] as for [`Self::tree_verify_logits`].
+    #[cfg(feature = "cuda")]
+    pub fn tree_verify_logits_cancellable(
+        &mut self,
+        tokens: &[u32],
+        parents: &[i32],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<f32>>, ResidentOpError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
+        self.resident_for_op()?
+            .tree_verify_logits_cancellable(tokens, parents, is_cancelled)
             .map_err(ResidentOpError::Op)
     }
 

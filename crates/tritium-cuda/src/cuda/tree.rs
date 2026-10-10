@@ -146,7 +146,11 @@ impl CudaDecodeModel {
         tokens: &[u32],
         parents: &[i32],
         mut slot: Option<(&mut BatchKv, usize)>,
-    ) -> Result<(usize, bool), BackendError> {
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<(usize, bool)>, BackendError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
         let mut tt = ttrace::Lap::start();
         // A new single-seq forward invalidates any uncommitted previous tree.
         // A batch-slot forward touches neither the single-seq arenas nor the
@@ -365,6 +369,29 @@ impl CudaDecodeModel {
         }
         .expect("tree scratch just ensured");
 
+        // Never poll inside graph capture. Cancellation only abandons
+        // provisional rows, so committed watermarks and prefix bytes need no
+        // repair. Settle submitted work before making scratch reusable (or
+        // releasing a paged target); a failed wait remains a driver error.
+        macro_rules! checkpoint {
+            () => {
+                if is_cancelled() {
+                    self.stream
+                        .synchronize()
+                        .map_err(|e| driver_err("tree cancel default sync", &e))?;
+                    self.cap_stream
+                        .synchronize()
+                        .map_err(|e| driver_err("tree cancel cap sync", &e))?;
+                    match slot.as_mut() {
+                        Some((b, _)) => b.tree_scratch = Some(ts),
+                        None => self.tree_scratch = Some(ts),
+                    }
+                    return Ok(None);
+                }
+            };
+        }
+        checkpoint!();
+
         // Uploads go into the cached buffers too (oversized is fine — kernels
         // read exactly the first m / m·m entries; `max_anc == m` is a stride
         // into linear memory, not a buffer shape).
@@ -388,6 +415,7 @@ impl CudaDecodeModel {
         up.memcpy_htod(&n_anc, &mut ts.d_nanc)
             .map_err(|e| driver_err("tree n_anc htod", &e))?;
         tt.lap(1); // upload
+        checkpoint!();
 
         if let Some(bucket) = bucket {
             // ── Graph route: replay the captured trunk (1 launch), then the
@@ -499,6 +527,7 @@ impl CudaDecodeModel {
                 // freshly captured graph references.
                 tg.raw_keepalive = self.batch_raw.clone();
             }
+            checkpoint!();
             // Uploads, ctrl write, replay and tail all sit on `cap_stream` —
             // stream order is the only ordering needed (no host sync).
             // Word 2: dense = the slot's TOKEN-ROW base; paged = the slot's
@@ -534,6 +563,7 @@ impl CudaDecodeModel {
                     .map_err(|e| driver_err("tree graph launch", &e))?;
             }
             tt.lap(3); // replay (host issue)
+            checkpoint!();
             let cs = &self.cap_stream;
             Self::bl_rmsnorm(
                 cs,
@@ -593,7 +623,9 @@ impl CudaDecodeModel {
                 &mut ts.d_x,
             )?;
 
+            checkpoint!();
             for li in 0..self.layers.len() {
+                checkpoint!();
                 // q/k/v share one fused rmsnorm+quant of d_x (ADR 0036 L5).
                 Self::bl_rmsnorm_quant(
                     s,
@@ -913,6 +945,7 @@ impl CudaDecodeModel {
                 )?;
                 Self::bl_residual(s, &self.f_residual, &mut ts.d_x, &ts.d_proj, m * n_embd)?;
 
+                checkpoint!();
                 // Fused rmsnorm+quant (ADR 0036 L5).
                 Self::bl_rmsnorm_quant(
                     s,
@@ -981,9 +1014,11 @@ impl CudaDecodeModel {
                     &mut ts.d_proj,
                 )?;
                 Self::bl_residual(s, &self.f_residual, &mut ts.d_x, &ts.d_proj, m * n_embd)?;
+                checkpoint!();
             }
 
             // Final norm over ALL rows, batched LM head, per-row greedy argmax.
+            checkpoint!();
             Self::bl_rmsnorm(
                 s,
                 &self.f_rmsnorm_batch,
@@ -996,6 +1031,7 @@ impl CudaDecodeModel {
             )?;
             self.launch_head_tiled(s, &ts.d_norm_all, m, &mut ts.d_logits_all)?;
         }
+        checkpoint!();
         // Forward complete: logits for every tree node sit in the target's
         // `tree_scratch.d_logits_all[0..m*vocab]`; provisional K/V occupy
         // region rows [prefix_len, prefix_len + m). Nothing is committed yet.
@@ -1003,7 +1039,7 @@ impl CudaDecodeModel {
             Some((b, _)) => b.tree_scratch = Some(ts),
             None => self.tree_scratch = Some(ts),
         }
-        Ok((m, bucket.is_some()))
+        Ok(Some((m, bucket.is_some())))
     }
 
     /// Allocate a [`TreeScratch`] sized for `m_cap` tree nodes (shared by the
@@ -1083,7 +1119,20 @@ impl CudaDecodeModel {
         tokens: &[u32],
         parents: &[i32],
     ) -> Result<Vec<u32>, BackendError> {
-        self.tree_verify_greedy_in(tokens, parents, None)
+        self.tree_verify_greedy_in(tokens, parents, None, &|| false)
+            .map(|output| output.expect("never-cancelled tree verify"))
+    }
+
+    /// Cooperatively verify a tree without publishing cancelled output.
+    /// The query must be cheap, nonblocking and non-panicking. `None` means
+    /// cancellation with the committed prefix unchanged, not a device error.
+    pub fn tree_verify_greedy_cancellable(
+        &mut self,
+        tokens: &[u32],
+        parents: &[i32],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<u32>>, BackendError> {
+        self.tree_verify_greedy_in(tokens, parents, None, is_cancelled)
     }
 
     /// Captured tree-graph bucket count on the SINGLE-SEQ target — gate
@@ -1206,6 +1255,24 @@ impl CudaDecodeModel {
         tokens: &[u32],
         parents: &[i32],
     ) -> Result<Vec<u32>, BackendError> {
+        self.tree_verify_greedy_slot_cancellable(batch, row, tokens, parents, &|| false)
+            .map(|output| output.expect("never-cancelled slot verify"))
+    }
+
+    /// Cooperatively verify one batch row. Cancellation leaves every
+    /// committed row and unrelated single-sequence pending tree intact.
+    /// Reserve padded tree rows as for [`Self::tree_verify_greedy_slot`].
+    pub fn tree_verify_greedy_slot_cancellable(
+        &mut self,
+        batch: &mut BatchKv,
+        row: usize,
+        tokens: &[u32],
+        parents: &[i32],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<u32>>, BackendError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
         if row >= batch.n {
             return Err(BackendError::InvalidInput(format!(
                 "tree_verify_greedy_slot: row {row} >= batch n {}",
@@ -1247,7 +1314,7 @@ impl CudaDecodeModel {
                 self.layers.len()
             )));
         }
-        self.tree_verify_greedy_in(tokens, parents, Some((batch, row)))
+        self.tree_verify_greedy_in(tokens, parents, Some((batch, row)), is_cancelled)
     }
 
     /// Shared greedy-verify body — `slot` selects the target region (see
@@ -1257,7 +1324,11 @@ impl CudaDecodeModel {
         tokens: &[u32],
         parents: &[i32],
         mut slot: Option<(&mut BatchKv, usize)>,
-    ) -> Result<Vec<u32>, BackendError> {
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<u32>>, BackendError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
         let t_total = std::time::Instant::now();
         // Trace-only GPU span events: cap_stream is idle at verify entry (the
         // previous verify's trailing dtoh drained it), so a start event
@@ -1277,8 +1348,15 @@ impl CudaDecodeModel {
         } else {
             None
         };
-        let (m, on_cap) =
-            self.tree_forward(tokens, parents, slot.as_mut().map(|(b, r)| (&mut **b, *r)))?;
+        let Some((m, on_cap)) = self.tree_forward(
+            tokens,
+            parents,
+            slot.as_mut().map(|(b, r)| (&mut **b, *r)),
+            is_cancelled,
+        )?
+        else {
+            return Ok(None);
+        };
         let mut tt = ttrace::Lap::start();
         // Consume on the stream that produced the logits (graph route:
         // cap_stream — the trailing pageable dtoh below is the ONE ordering
@@ -1342,13 +1420,16 @@ impl CudaDecodeModel {
                 None => break,
             }
         }
+        if is_cancelled() {
+            return Ok(None);
+        }
         self.tree_promote_in(&path, slot)?;
         tt.lap(7); // promote (walk + accepted-path KV moves)
         if ttrace::on() {
             ttrace::finish(t_total);
         }
 
-        Ok(path.iter().map(|&n| ids[n] as u32).collect())
+        Ok(Some(path.iter().map(|&n| ids[n] as u32).collect()))
     }
 
     /// Forward a draft tree and return every node's logits `[m, vocab]`
@@ -1362,7 +1443,21 @@ impl CudaDecodeModel {
         tokens: &[u32],
         parents: &[i32],
     ) -> Result<Vec<f32>, BackendError> {
-        let (m, on_cap) = self.tree_forward(tokens, parents, None)?;
+        self.tree_verify_logits_cancellable(tokens, parents, &|| false)
+            .map(|output| output.expect("never-cancelled tree logits"))
+    }
+
+    /// Cooperatively obtain host-accept logits. A cancelled forward grants
+    /// no pending-tree authorization; an entry cancellation is a no-op.
+    pub fn tree_verify_logits_cancellable(
+        &mut self,
+        tokens: &[u32],
+        parents: &[i32],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<f32>>, BackendError> {
+        let Some((m, on_cap)) = self.tree_forward(tokens, parents, None, is_cancelled)? else {
+            return Ok(None);
+        };
         let s = if on_cap {
             &self.cap_stream
         } else {
@@ -1377,8 +1472,11 @@ impl CudaDecodeModel {
         s.memcpy_dtoh(&view, &mut logits)
             .map_err(|e| driver_err("tree logits dtoh", &e))?;
         self.tree_scratch = Some(ts);
+        if is_cancelled() {
+            return Ok(None);
+        }
         self.pending_tree = Some((m, self.cache_len, parents.to_vec()));
-        Ok(logits)
+        Ok(Some(logits))
     }
 
     /// Commit the host-chosen accepted path of the pending tree (from
