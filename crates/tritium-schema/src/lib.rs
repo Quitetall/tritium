@@ -11,10 +11,20 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+#[cfg(feature = "alloc")]
+mod model;
+#[cfg(feature = "alloc")]
+pub use model::*;
+
 /// Precision used to store additive plane scales.
 #[non_exhaustive]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd"))]
 pub enum ScalePrecision {
     /// IEEE binary16.
     F16,
@@ -28,6 +38,11 @@ pub enum ScalePrecision {
 #[non_exhaustive]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd"))]
 pub enum ScaleAnchor {
     /// One scale per declared group.
     Group,
@@ -43,6 +58,11 @@ pub enum ScaleAnchor {
 #[non_exhaustive]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
 pub enum PlaneRelation {
     /// Every plane has an independently fitted scale.
     Free,
@@ -58,6 +78,11 @@ pub enum PlaneRelation {
 /// Scale law represented as orthogonal anchor, relation, and storage precision.
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
 pub struct ScaleLaw {
     /// Scale grouping axis.
     pub anchor: ScaleAnchor,
@@ -222,6 +247,11 @@ pub struct TensorUploadPolicy {
 #[non_exhaustive]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
 pub enum Basis {
     /// No transform.
     Identity,
@@ -245,6 +275,11 @@ pub enum Basis {
 #[non_exhaustive]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd"))]
 pub enum PlaneCodec {
     /// Two-bit ternary packing.
     D2,
@@ -258,6 +293,11 @@ pub enum PlaneCodec {
 #[non_exhaustive]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
 pub enum Transport {
     /// Store codec bytes directly.
     Raw,
@@ -272,6 +312,11 @@ pub enum Transport {
 #[non_exhaustive]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd"))]
 pub enum PlaneAllocation {
     /// Every tile uses the tensor's maximum plane count.
     Uniform,
@@ -285,6 +330,11 @@ pub const ADDITIVE_TILE_SIZE: u16 = 256;
 /// Semantic layout parameters for an additive tensor.
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
 pub struct AdditiveLayout {
     /// Number of matrix rows.
     pub rows: u64,
@@ -311,6 +361,11 @@ pub struct AdditiveLayout {
 /// Stable identifier for a schema family and its version.
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
 pub struct SchemaId {
     /// Major version; incompatible schemas require a new major version.
     pub major: u16,
@@ -323,6 +378,11 @@ macro_rules! digest_id {
         #[doc = $doc]
         #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
         #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+        #[cfg_attr(
+            feature = "serde",
+            derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+        )]
+        #[cfg_attr(feature = "serde", serde(crate = "serde_nostd"))]
         pub struct $name([u8; 32]);
 
         impl $name {

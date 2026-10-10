@@ -7,10 +7,12 @@ use std::{
 
 use schemars::JsonSchema;
 use tritium_schema::{
-    AdditiveLayout, AdmittedLaw, Basis, BlobId, EvidenceEnvelope, LayoutError, ModelId, PackageId,
-    PlaneAllocation, PlaneCodec, PlaneRelation, ScaleAnchor, ScaleLaw, ScalePrecision, SchemaId,
-    SemanticTensorDigest, TensorCaps, TensorExecution, TensorUploadPolicy, TensorUploaded,
-    Transport, UnknownReason, Verdict,
+    AdditiveLayout, AdmittedLaw, Basis, BlobId, BlobReference, EvidenceEnvelope, EvidenceReference,
+    LayoutError, LegacyModelIdentity, Level, LevelFit, ManifestAsset, ModelId, ModelManifest,
+    ModelShard, PackageId, PlaneAllocation, PlaneCodec, PlaneCounts, PlaneRelation, ScaleAnchor,
+    ScaleLaw, ScalePrecision, SchemaId, SemanticTensorDigest, TensorCaps, TensorExecution,
+    TensorMeta, TensorStorage, TensorUploadPolicy, TensorUploaded, Transport, UnknownReason,
+    Verdict,
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -58,6 +60,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     project!(Transport, "transport");
     project!(UnknownReason, "unknown-reason");
     project!(Verdict, "verdict");
+    project!(BlobReference, "blob-reference");
+    project!(EvidenceReference, "evidence-reference");
+    project!(LegacyModelIdentity, "legacy-model-identity");
+    project!(Level, "level");
+    project!(LevelFit, "level-fit");
+    project!(ManifestAsset, "manifest-asset");
+    project!(ModelManifest, "model-manifest");
+    project!(ModelShard, "model-shard");
+    project!(PlaneCounts, "plane-counts");
+    project!(TensorMeta, "tensor-meta");
+    project!(TensorStorage, "tensor-storage");
 
     Ok(())
 }

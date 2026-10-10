@@ -58,6 +58,7 @@
       "$ref": "#/$defs/Transport"
     }
   },
+  "additionalProperties": false,
   "required": [
     "rows",
     "cols",
@@ -93,6 +94,7 @@
                   "minimum": 0
                 }
               },
+              "additionalProperties": false,
               "required": [
                 "block"
               ]
@@ -129,6 +131,7 @@
                   "minimum": 0
                 }
               },
+              "additionalProperties": false,
               "required": [
                 "block",
                 "seed",
@@ -206,6 +209,7 @@
                   "minimum": 0
                 }
               },
+              "additionalProperties": false,
               "required": [
                 "num",
                 "den"
@@ -261,6 +265,7 @@
           "$ref": "#/$defs/PlaneRelation"
         }
       },
+      "additionalProperties": false,
       "required": [
         "anchor",
         "relation",
@@ -309,6 +314,7 @@
                   "minimum": 0
                 }
               },
+              "additionalProperties": false,
               "required": [
                 "block"
               ]

@@ -72,6 +72,7 @@ mod tq2;
 mod tqbin;
 mod tqidx;
 mod training_salt;
+pub mod trit_model;
 mod trit_package;
 
 pub use additive_tensor::{AdditiveTensor, AdditiveTensorError};

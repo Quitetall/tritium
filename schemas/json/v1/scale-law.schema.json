@@ -17,6 +17,7 @@
       "$ref": "#/$defs/PlaneRelation"
     }
   },
+  "additionalProperties": false,
   "required": [
     "anchor",
     "relation",
@@ -51,6 +52,7 @@
                   "minimum": 0
                 }
               },
+              "additionalProperties": false,
               "required": [
                 "num",
                 "den"

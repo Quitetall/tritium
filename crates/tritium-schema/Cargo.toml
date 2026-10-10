@@ -14,9 +14,9 @@ categories.workspace = true
 [features]
 default = ["std"]
 std = ["alloc"]
-alloc = []
+alloc = ["serde_nostd?/alloc"]
 serde = ["dep:serde_nostd"]
-schema-gen = ["std", "dep:schemars", "dep:serde_json"]
+schema-gen = ["std", "serde", "dep:schemars", "dep:serde_json"]
 
 [dependencies]
 schemars = { workspace = true, optional = true }

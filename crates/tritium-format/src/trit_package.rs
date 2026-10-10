@@ -68,6 +68,22 @@ pub struct TritPackage<'a> {
 }
 
 impl<'a> TritPackage<'a> {
+    // Only original immutable directory entries reach this index-based seam.
+    // read_trit_package already checked ranges and hashes; do not rehash every
+    // shared tensor reference in every level.
+    pub(crate) fn indexed_blob(&self, index: usize) -> Result<&'a [u8], TritPackageError> {
+        let info = self
+            .blobs
+            .get(index)
+            .ok_or(TritPackageError::InvalidDirectory)?;
+        let start = as_usize(info.offset)?;
+        let end = start
+            .checked_add(as_usize(info.length)?)
+            .ok_or(TritPackageError::LengthOverflow)?;
+        self.bytes
+            .get(start..end)
+            .ok_or(TritPackageError::InvalidDirectory)
+    }
     /// Borrow the canonical CBOR manifest bytes.
     #[must_use]
     pub const fn manifest(&self) -> &'a [u8] {
@@ -521,7 +537,11 @@ fn dtype_from_str(name: &str) -> Result<DType, TritPackageError> {
     }
 }
 
-fn validate_canonical_manifest(bytes: &[u8]) -> Result<(), TritPackageError> {
+pub(crate) fn validate_canonical_manifest(bytes: &[u8]) -> Result<(), TritPackageError> {
+    parse_canonical_manifest(bytes).map(|_| ())
+}
+
+pub(crate) fn parse_canonical_manifest(bytes: &[u8]) -> Result<Value, TritPackageError> {
     if bytes.is_empty() || bytes.len() > MAX_MANIFEST_BYTES {
         return Err(TritPackageError::NonCanonicalManifest);
     }
@@ -531,10 +551,10 @@ fn validate_canonical_manifest(bytes: &[u8]) -> Result<(), TritPackageError> {
     if encode_cbor_value(&value)? != bytes {
         return Err(TritPackageError::NonCanonicalManifest);
     }
-    Ok(())
+    Ok(value)
 }
 
-fn canonicalize_value(value: &mut Value, depth: usize) -> Result<(), TritPackageError> {
+pub(crate) fn canonicalize_value(value: &mut Value, depth: usize) -> Result<(), TritPackageError> {
     if depth > 64 {
         return Err(TritPackageError::NonCanonicalManifest);
     }
@@ -561,7 +581,7 @@ fn canonicalize_value(value: &mut Value, depth: usize) -> Result<(), TritPackage
     Ok(())
 }
 
-fn encode_cbor_value(value: &Value) -> Result<Vec<u8>, TritPackageError> {
+pub(crate) fn encode_cbor_value(value: &Value) -> Result<Vec<u8>, TritPackageError> {
     let mut bytes = Vec::new();
     ciborium::ser::into_writer(value, &mut bytes)
         .map_err(|_| TritPackageError::InvalidDirectory)?;
