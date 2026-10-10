@@ -4818,6 +4818,7 @@ dependencies = [
  "tritium-build-info",
  "tritium-core",
  "tritium-cpu",
+ "tritium-evidence",
  "tritium-format",
  "tritium-runtime",
  "tritium-spec",
@@ -4980,6 +4981,7 @@ version = "1.1.0-rc.2"
 dependencies = [
  "linkme",
  "tritium-core",
+ "tritium-evidence",
  "tritium-spec",
 ]
 

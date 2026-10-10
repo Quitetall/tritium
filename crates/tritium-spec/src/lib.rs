@@ -29,7 +29,7 @@ use core::fmt;
 // needs only depend on `tritium-spec` to implement [`TernaryBackend`].
 pub use tritium_core::{AdditiveView, DType, GemmShape, TernaryFormat, TritError};
 pub use tritium_schema::{
-    TensorCaps, TensorExecution, TensorUploadPolicy, admitted_execution_group,
+    Basis, TensorCaps, TensorExecution, TensorUploadPolicy, admitted_execution_group,
 };
 
 mod caps;

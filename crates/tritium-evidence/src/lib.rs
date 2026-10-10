@@ -13,7 +13,7 @@ use std::fmt;
 
 use serde::Serialize;
 use serde_json::Value;
-pub use tritium_schema::{UnknownReason, Verdict};
+pub use tritium_schema::{TensorUploaded, UnknownReason, Verdict};
 
 const EVENT_DOMAIN: &[u8] = b"tritium.evidence.event.v1\0";
 const ROOT_DOMAIN: &[u8] = b"tritium.evidence.run-root.v1\0";
@@ -51,6 +51,17 @@ pub struct EventRegistration {
     /// Accepted nonzero version.
     pub version: u16,
 }
+
+impl EvidenceEvent for TensorUploaded {
+    const SCHEMA_ID: &'static str = "tritium.runtime.tensor_uploaded";
+    const VERSION: u16 = 1;
+}
+
+/// Registry entry for successful checked tensor uploads (ADR 0044 D9/D12).
+pub const TENSOR_UPLOADED_REGISTRATION: EventRegistration = EventRegistration {
+    schema: TensorUploaded::SCHEMA_ID,
+    version: TensorUploaded::VERSION,
+};
 
 /// A recorder for one run and a fixed registry of typed event schemas.
 #[derive(Debug)]

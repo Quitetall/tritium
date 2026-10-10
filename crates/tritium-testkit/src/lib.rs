@@ -42,6 +42,7 @@ mod jsonl;
 mod portable_training;
 mod reference_backend;
 mod runner;
+mod semantic;
 mod training_receipts;
 mod vector;
 
@@ -60,6 +61,9 @@ pub use portable_training::{
     run_training_conformance,
 };
 pub use runner::{FailedCase, FailureReason, Report, run_conformance, run_fused_fallback_contract};
+pub use semantic::{
+    additive_upload_fixture, assert_additive_tensor_conformance, assert_additive_upload_rejections,
+};
 pub use training_receipts::{
     AdmittedTrainingReceiptBundleV1, SealedTrainingReceiptBundleV1, TrainingReceiptBundleError,
     TrainingReceiptSourcePolicyV1, admit_training_receipts,

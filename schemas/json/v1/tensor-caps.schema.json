@@ -15,6 +15,7 @@
       "minimum": 0
     }
   },
+  "additionalProperties": false,
   "required": [
     "execution",
     "payload_bytes"

@@ -148,6 +148,11 @@ pub fn admitted_execution_group(law: ScaleLaw, group: u16) -> bool {
 /// How a backend executes one semantic tensor combination (ADR 0044 D8/D9).
 #[non_exhaustive]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum TensorExecution {
     /// Executes additive coefficients directly, or an originally dense tensor.
@@ -160,6 +165,14 @@ pub enum TensorExecution {
 
 /// Declared execution and owned payload size for a specific semantic tensor.
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(
+    any(feature = "serde", feature = "schema-gen"),
+    serde(crate = "serde_nostd", deny_unknown_fields)
+)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct TensorCaps {
     /// Direct execution or dense emulation; never inferred from ISA flags.
@@ -167,6 +180,31 @@ pub struct TensorCaps {
     /// Bytes reported by the uploaded buffer, excluding allocator/handle
     /// overhead, scratch, KV, other tensors, and total model residency.
     pub payload_bytes: u64,
+}
+
+/// Successful checked upload observation, not a physical-memory verdict.
+#[cfg(feature = "alloc")]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(
+    any(feature = "serde", feature = "schema-gen"),
+    serde(crate = "serde_nostd", deny_unknown_fields)
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TensorUploaded {
+    /// Caller-selected tensor name within the model or run.
+    pub tensor: alloc::string::String,
+    /// Logical execution adapter identity.
+    pub backend: alloc::string::String,
+    /// Backend-reported physical device identity, which may be unknown.
+    pub physical_device: alloc::string::String,
+    /// Explicit execution tier and actual checked owned payload bytes.
+    pub caps: TensorCaps,
+    /// Decoded scalar input bytes; never packed disk bytes or a savings claim.
+    pub decoded_source_bytes: u64,
 }
 
 /// Pre-upload policy for a single semantic tensor payload.

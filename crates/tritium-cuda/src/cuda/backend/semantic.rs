@@ -1,21 +1,24 @@
-//! Device-owned dense execution through the shared tensor interface.
+//! Device-owned dense and explicitly emulated additive execution.
 //!
-//! This is a prerequisite for additive emulation, not an emulated capability:
-//! additive views remain unsupported here. Existing packed/resident kernels
-//! and their dispatch are unchanged. No dense host shadow is retained.
+//! Additive coefficients expand once at upload in their stored basis. Matmul
+//! transforms activations and gather undoes that basis using the shared core.
+//! Existing packed/resident kernels are unchanged. No host shadow is retained.
 
 use super::{CudaBackend, alloc_or_backend, driver_err};
 use core::any::Any;
 use cudarc::driver::{CudaSlice, CudaStream};
 use std::sync::Arc;
-use tritium_core::GemmShape;
+use tritium_core::{GemmShape, apply_basis, apply_inverse_basis};
+use tritium_format::AdditiveTensor;
 use tritium_spec::{
-    BackendError, DeviceBuffer, TensorCaps, TensorExecution, TensorMatmul, TensorView,
+    BackendError, Basis, DeviceBuffer, TensorCaps, TensorExecution, TensorMatmul, TensorView,
+    admitted_execution_group,
 };
 
 pub(super) struct CudaTensor {
     rows: usize,
     cols: usize,
+    basis: Basis,
     values: Option<CudaSlice<f32>>,
     // Retain the context and identify the exact owning backend stream. A device
     // ordinal/string alone cannot prove that a handle belongs to this adapter.
@@ -45,15 +48,31 @@ fn product(a: usize, b: usize) -> Result<usize, BackendError> {
 
 impl CudaTensor {
     pub(super) fn caps(view: TensorView<'_>) -> Result<Option<TensorCaps>, BackendError> {
-        let TensorView::Dense { rows, cols, .. } = view else {
-            return Ok(None);
+        let (rows, cols, execution) = match view {
+            TensorView::Dense { rows, cols, .. } => {
+                view.decoded_payload_bytes()?;
+                (rows, cols, TensorExecution::Native)
+            }
+            TensorView::Additive(additive) => {
+                let layout = additive.layout();
+                if !admitted_execution_group(layout.law, layout.group) {
+                    return Ok(None);
+                }
+                AdditiveTensor::validate_view(additive)
+                    .map_err(|e| invalid(&format!("CUDA additive capability input: {e:?}")))?;
+                (
+                    usize::try_from(layout.rows).map_err(|_| invalid("row count overflows"))?,
+                    usize::try_from(layout.cols).map_err(|_| invalid("column count overflows"))?,
+                    TensorExecution::Emulated,
+                )
+            }
         };
-        let payload_bytes = view.decoded_payload_bytes()?;
+        let payload_bytes = product(product(rows, cols)?, core::mem::size_of::<f32>())? as u64;
         if rows != 0 && cols != 0 {
             CudaBackend::check_grad_launch_bounds(1, rows, cols)?;
         }
         Ok(Some(TensorCaps {
-            execution: TensorExecution::Native,
+            execution,
             payload_bytes,
         }))
     }
@@ -63,8 +82,34 @@ impl CudaTensor {
         view: TensorView<'_>,
     ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
         let caps = Self::caps(view)?.ok_or(BackendError::UnsupportedTensor)?;
-        let TensorView::Dense { rows, cols, values } = view else {
-            return Err(BackendError::UnsupportedTensor);
+        // Keep dense inputs borrowed; only additive uploads need a temporary
+        // decoded allocation. It is dropped after transfer, never retained.
+        let mut decoded = Vec::new();
+        let (rows, cols, basis, values) = match view {
+            TensorView::Dense { rows, cols, values } => (rows, cols, Basis::Identity, values),
+            TensorView::Additive(additive) => {
+                let layout = additive.layout();
+                let rows = layout.rows as usize; // Checked by caps above.
+                let cols = layout.cols as usize;
+                let count = product(rows, cols)?;
+                decoded
+                    .try_reserve_exact(count)
+                    .map_err(|_| BackendError::OutOfMemory {
+                        requested: caps.payload_bytes as usize,
+                    })?;
+                decoded.resize(count, 0.);
+                for (row, output) in decoded.chunks_exact_mut(cols).enumerate() {
+                    additive
+                        .dequant_row_into(row, output)
+                        .map_err(|e| invalid(&format!("decode CUDA additive row: {e:?}")))?;
+                }
+                if decoded.iter().any(|value| !value.is_finite()) {
+                    return Err(invalid(
+                        "CUDA additive expansion produced nonfinite weights",
+                    ));
+                }
+                (rows, cols, layout.basis, decoded.as_slice())
+            }
         };
         let device = if values.is_empty() {
             None // Do not make a zero-sized driver allocation.
@@ -80,6 +125,7 @@ impl CudaTensor {
         Ok(Box::new(Self {
             rows,
             cols,
+            basis,
             values: device,
             owner: Arc::clone(&backend.stream),
         }))
@@ -110,6 +156,12 @@ impl CudaTensor {
         // operations do not launch and need no int32 device index restriction.
         if outputs == 0 || tensor.cols == 0 {
             p.transformed_act.copy_from_slice(p.act);
+            if tensor.cols != 0 {
+                for act in p.transformed_act.chunks_exact_mut(tensor.cols) {
+                    apply_basis(act, tensor.basis)
+                        .map_err(|e| invalid(&format!("CUDA activation basis: {e:?}")))?;
+                }
+            }
             p.out.fill(0.);
             return Ok(());
         }
@@ -118,7 +170,12 @@ impl CudaTensor {
             .values
             .as_ref()
             .ok_or_else(|| invalid("CUDA semantic dense payload is absent"))?;
-        let activations = backend.stream.clone_htod(p.act).map_err(|e| {
+        p.transformed_act.copy_from_slice(p.act);
+        for act in p.transformed_act.chunks_exact_mut(tensor.cols) {
+            apply_basis(act, tensor.basis)
+                .map_err(|e| invalid(&format!("CUDA activation basis: {e:?}")))?;
+        }
+        let activations = backend.stream.clone_htod(p.transformed_act).map_err(|e| {
             alloc_or_backend(
                 "upload CUDA semantic activations",
                 &e,
@@ -159,7 +216,6 @@ impl CudaTensor {
             .stream
             .memcpy_dtoh(&output, p.out)
             .map_err(|e| driver_err("download CUDA semantic output", &e))?;
-        p.transformed_act.copy_from_slice(p.act);
         Ok(())
     }
 
@@ -187,6 +243,8 @@ impl CudaTensor {
                 .stream
                 .memcpy_dtoh(&weights.slice(start..start + tensor.cols), output)
                 .map_err(|e| driver_err("download CUDA semantic row", &e))?;
+            apply_inverse_basis(output, tensor.basis)
+                .map_err(|e| invalid(&format!("CUDA embedding inverse basis: {e:?}")))?;
         }
         Ok(())
     }

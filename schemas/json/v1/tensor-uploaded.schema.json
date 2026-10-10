@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TensorUploaded",
+  "description": "Successful checked upload observation, not a physical-memory verdict.",
+  "type": "object",
+  "properties": {
+    "backend": {
+      "description": "Logical execution adapter identity.",
+      "type": "string"
+    },
+    "caps": {
+      "description": "Explicit execution tier and actual checked owned payload bytes.",
+      "$ref": "#/$defs/TensorCaps"
+    },
+    "decoded_source_bytes": {
+      "description": "Decoded scalar input bytes; never packed disk bytes or a savings claim.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "physical_device": {
+      "description": "Backend-reported physical device identity, which may be unknown.",
+      "type": "string"
+    },
+    "tensor": {
+      "description": "Caller-selected tensor name within the model or run.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "tensor",
+    "backend",
+    "physical_device",
+    "caps",
+    "decoded_source_bytes"
+  ],
+  "$defs": {
+    "TensorCaps": {
+      "description": "Declared execution and owned payload size for a specific semantic tensor.",
+      "type": "object",
+      "properties": {
+        "execution": {
+          "description": "Direct execution or dense emulation; never inferred from ISA flags.",
+          "$ref": "#/$defs/TensorExecution"
+        },
+        "payload_bytes": {
+          "description": "Bytes reported by the uploaded buffer, excluding allocator/handle\noverhead, scratch, KV, other tensors, and total model residency.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "execution",
+        "payload_bytes"
+      ]
+    },
+    "TensorExecution": {
+      "description": "How a backend executes one semantic tensor combination (ADR 0044 D8/D9).",
+      "oneOf": [
+        {
+          "description": "Executes additive coefficients directly, or an originally dense tensor.\nThis does not assert SIMD, accelerator speed, or empirical qualification.",
+          "type": "string",
+          "const": "Native"
+        },
+        {
+          "description": "Materializes an additive tensor as dense weights for plain GEMM.\nRequires explicit evidence and memory admission before production use.",
+          "type": "string",
+          "const": "Emulated"
+        }
+      ]
+    }
+  }
+}

@@ -6,7 +6,7 @@
 //! edit here — the linker collects every entry at link time and [`Registry::init`]
 //! discovers them at startup.
 //!
-//! This crate depends only on [`tritium_spec`] and `linkme`; it never references a
+//! This crate uses [`tritium_spec`], typed [`tritium_evidence`] and `linkme`; it never references a
 //! concrete backend, which keeps the dependency graph acyclic and lets backends be
 //! built (and the runtime linked) in any order.
 //!
@@ -59,6 +59,9 @@
 use std::sync::OnceLock;
 
 use tritium_spec::{BackendError, DeviceCaps, TernaryBackend};
+
+mod tensor_upload;
+pub use tensor_upload::{TensorUploadContext, TensorUploadError, upload_tensor_logged};
 
 // Re-export the core vocabulary types the dispatch surface uses (via
 // `tritium-spec`'s re-exports) so a dispatch caller needs only depend on
