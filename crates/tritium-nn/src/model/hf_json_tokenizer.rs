@@ -77,6 +77,21 @@ impl HfJsonTokenizer {
         };
         Ok(Self { inner, bos, eos })
     }
+
+    pub(super) fn validate_model_vocab(&self, rows: usize) -> Result<(), NnError> {
+        if rows == 0
+            || self
+                .inner
+                .get_vocab(true)
+                .values()
+                .any(|&id| usize::try_from(id).map_or(true, |id| id >= rows))
+        {
+            return Err(NnError::Tokenizer(
+                "tokenizer id exceeds the model embedding vocabulary".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Tokenizer for HfJsonTokenizer {

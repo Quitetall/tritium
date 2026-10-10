@@ -21,6 +21,7 @@ mod qwen35_salt_v2;
 mod runner;
 #[cfg(feature = "cuda")]
 mod salt_v2;
+mod source;
 mod tokenizer;
 mod training_salt;
 mod weights;
@@ -67,6 +68,9 @@ pub use runner::{ForwardDump, ModelRunner};
 pub use salt_v2::{
     SaltV2LoadedTensorReceipt, SaltV2ModelAllocationReceipt, SaltV2PreservedTensorReceipt,
 };
+pub use source::ModelSource;
+#[cfg(feature = "tokenizer")]
+pub use source::{LoadedModel, load};
 pub use tokenizer::Tokenizer;
 pub use training_salt::{
     TRAINING_SALT_COMPLETED_STEP_KEY, TRAINING_SALT_FORMAT_KEY, TRAINING_SALT_FORMAT_VALUE,

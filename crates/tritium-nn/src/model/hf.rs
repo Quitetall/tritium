@@ -53,6 +53,13 @@ impl ModelWeights {
         dir: &Path,
         loader: &mut TensorLoader<'_>,
     ) -> Result<(ModelConfig, ArchSpec, ModelWeights), NnError> {
+        Self::load_admitted(crate::model::ModelSource::HuggingFace(dir), loader)
+    }
+
+    pub(super) fn load_hf_admitted_impl(
+        dir: &Path,
+        loader: &mut TensorLoader<'_>,
+    ) -> Result<(ModelConfig, ArchSpec, ModelWeights), NnError> {
         let (config, spec, shards, declared_vocab) = open_hf_standard(dir)?;
         if config.n_embd == 0 {
             return Err(NnError::MissingConfig("hidden size must be nonzero".into()));
@@ -706,7 +713,7 @@ pub(super) fn declared_vocab_size(config: &serde_json::Value) -> Result<Option<u
         .map_err(|_| NnError::MissingConfig("vocab_size overflows usize".to_owned()))
 }
 
-const MAX_CONFIG_JSON_BYTES: u64 = 16 * 1024 * 1024;
+pub(super) const MAX_CONFIG_JSON_BYTES: u64 = 16 * 1024 * 1024;
 
 pub(super) fn read_config_json(path: &Path) -> Result<String, NnError> {
     let file = File::open(path)
@@ -741,15 +748,23 @@ pub(super) fn resolve_optional_attention_weights(
     config_value: &serde_json::Value,
     shards: &HfShardSet,
 ) -> Result<(bool, bool), NnError> {
-    let detected_qkv_bias = shards.names().any(|name| {
-        [".q_proj.bias", ".k_proj.bias", ".v_proj.bias"]
-            .iter()
-            .any(|suffix| name.ends_with(suffix))
-    });
-    let detected_qk_norm = shards.names().any(|name| {
-        [".q_norm.weight", ".k_norm.weight"]
-            .iter()
-            .any(|suffix| name.ends_with(suffix))
+    resolve_optional_attention_names(config, config_value, shards.names())
+}
+
+pub(super) fn resolve_optional_attention_names<'a>(
+    config: &ModelConfig,
+    config_value: &serde_json::Value,
+    names: impl Iterator<Item = &'a str>,
+) -> Result<(bool, bool), NnError> {
+    let (detected_qkv_bias, detected_qk_norm) = names.fold((false, false), |(bias, norm), name| {
+        (
+            bias || [".q_proj.bias", ".k_proj.bias", ".v_proj.bias"]
+                .iter()
+                .any(|suffix| name.ends_with(suffix)),
+            norm || [".q_norm.weight", ".k_norm.weight"]
+                .iter()
+                .any(|suffix| name.ends_with(suffix)),
+        )
     });
     let arch = config.arch.to_ascii_lowercase();
     let architecture_requires_qkv_bias = arch.starts_with("qwen2");

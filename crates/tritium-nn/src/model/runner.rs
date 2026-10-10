@@ -184,9 +184,33 @@ impl ModelRunner {
         budget: &TensorPayloadBudget,
         context: TensorUploadContext<'_>,
     ) -> Result<Self, NnError> {
+        Self::from_source_admitted(
+            crate::model::ModelSource::HuggingFace(dir),
+            backend,
+            policy,
+            budget,
+            context,
+        )
+    }
+
+    /// Load token-level execution through one HF/typed-package source selector.
+    ///
+    /// Tokenizer parsing belongs to `load` when the tokenizer feature is enabled.
+    /// This weights-only entrypoint has the same scope as `from_hf_admitted`;
+    /// it does not fabricate a text tokenizer or whole-model qualification receipt.
+    ///
+    /// # Errors
+    /// Source/config/coverage/geometry, payload admission/evidence or KV errors.
+    pub fn from_source_admitted(
+        source: crate::model::ModelSource<'_>,
+        backend: Box<dyn TernaryBackend>,
+        policy: TensorUploadPolicy,
+        budget: &TensorPayloadBudget,
+        context: TensorUploadContext<'_>,
+    ) -> Result<Self, NnError> {
         let (config, _spec, weights) = {
             let mut loader = TensorLoader::new(backend.as_ref(), policy, budget, context);
-            ModelWeights::load_hf_admitted(dir, &mut loader)?
+            ModelWeights::load_admitted(source, &mut loader)?
         };
         Self::try_from_weights(config, weights, backend)
     }

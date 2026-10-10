@@ -168,6 +168,7 @@ struct HfFixture {
     dir: std::path::PathBuf,
     payload_bytes: u64,
     upload_count: usize,
+    tensors: Vec<(String, Vec<usize>, Vec<f32>)>,
 }
 
 impl HfFixture {
@@ -181,6 +182,7 @@ impl HfFixture {
             dir,
             payload_bytes: 0,
             upload_count: 0,
+            tensors: Vec::new(),
         };
         let mut tensors = Vec::new();
         let mut add = |name: &str, shape: &[usize]| {
@@ -291,6 +293,7 @@ impl HfFixture {
             .unwrap(),
         )
         .unwrap();
+        fixture.tensors = tensors;
         fixture
     }
 }
@@ -434,6 +437,833 @@ fn failed_hf_assembly_releases_all_unpublished_payloads() {
             }
         )
         .is_err()
+    );
+    assert_eq!(budget.used_bytes(), 0);
+    assert!(recorder.events().is_empty());
+}
+
+#[test]
+fn one_source_loader_keeps_existing_hf_execution_and_budget() {
+    let fixture = HfFixture::new("qwen3", true, 6, None);
+    let budget = TensorPayloadBudget::new(fixture.payload_bytes);
+    let mut recorder = EvidenceRecorder::new("nn-source", [TENSOR_UPLOADED_REGISTRATION]).unwrap();
+    let mut runner = ModelRunner::from_source_admitted(
+        tritium_nn::ModelSource::HuggingFace(&fixture.dir),
+        Box::new(tritium_cpu::CpuBackend::new()),
+        TensorUploadPolicy::default(),
+        &budget,
+        TensorUploadContext {
+            recorder: &mut recorder,
+            span: "load",
+            parent: None,
+            logical_time: 0,
+        },
+    )
+    .unwrap();
+    let mut oracle =
+        ModelRunner::from_hf(&fixture.dir, Box::new(tritium_cpu::CpuBackend::new())).unwrap();
+    assert_eq!(
+        runner.forward(&[1, 3, 2], &[0, 1, 2]).unwrap(),
+        oracle.forward(&[1, 3, 2], &[0, 1, 2]).unwrap()
+    );
+    assert_eq!(budget.used_bytes(), fixture.payload_bytes);
+    drop(runner);
+    assert_eq!(budget.used_bytes(), 0);
+}
+
+struct TritFixture {
+    manifest: tritium_schema::ModelManifest,
+    blobs: Vec<(tritium_format::TritBlobKind, Vec<u8>)>,
+}
+
+impl TritFixture {
+    fn new(hf: &HfFixture, additive: Option<(PlaneCodec, Basis)>) -> Self {
+        use tritium_schema::{
+            BlobId, BlobReference, Level, LevelFit, ManifestAsset, ModelManifest, PlaneCounts,
+            ScalePrecision, SchemaId, TensorMeta, TensorStorage,
+        };
+        let reference = |bytes: &[u8]| BlobReference {
+            id: BlobId::from_bytes(*blake3::hash(bytes).as_bytes()),
+            shard: None,
+        };
+        let config = std::fs::read(hf.dir.join("config.json")).unwrap();
+        let architecture =
+            serde_json::from_slice::<serde_json::Value>(&config).unwrap()["model_type"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+        let mut blobs = vec![
+            (
+                tritium_format::TritBlobKind::Asset("config.json".into()),
+                config,
+            ),
+            (
+                tritium_format::TritBlobKind::Asset("tokenizer.json".into()),
+                b"{}".to_vec(),
+            ),
+        ];
+        let assets = blobs
+            .iter()
+            .map(|(kind, bytes)| {
+                let tritium_format::TritBlobKind::Asset(name) = kind else {
+                    unreachable!()
+                };
+                ManifestAsset {
+                    name: name.clone(),
+                    blob: reference(bytes),
+                }
+            })
+            .collect();
+        let mut tensors = Vec::new();
+        for (name, shape, values) in &hf.tensors {
+            let (kind, storage, bytes) = if let Some((codec, basis)) =
+                additive.filter(|_| shape.len() == 2)
+            {
+                let layout = AdditiveLayout {
+                    rows: shape[0] as u64,
+                    cols: shape[1] as u64,
+                    tile: 256,
+                    group: 32,
+                    max_planes: 3,
+                    allocation: PlaneAllocation::Uniform,
+                    codec,
+                    law: ADMITTED_LAWS[1].law,
+                    basis,
+                    transport: Transport::Raw,
+                };
+                let trits = (0..3)
+                    .flat_map(|p| {
+                        (0..values.len()).map(move |i| {
+                            if i % 4 == 1 {
+                                Trit::ZERO
+                            } else if (i / shape[1] + p + i) % 2 == 0 {
+                                Trit::POS
+                            } else {
+                                Trit::NEG
+                            }
+                        })
+                    })
+                    .collect();
+                let scales = (0..3)
+                    .flat_map(|p| {
+                        (0..shape[0]).map(move |r| (1 + r % 2) as f32 * 0.0625 * 0.5f32.powi(p))
+                    })
+                    .collect();
+                let tensor = tritium_format::AdditiveTensor::new(layout, 3, trits, scales).unwrap();
+                (
+                    tritium_format::TritBlobKind::AdditiveTensor,
+                    TensorStorage::Additive {
+                        layout,
+                        planes: PlaneCounts::Uniform(3),
+                    },
+                    tensor.encode_payload().unwrap(),
+                )
+            } else {
+                (
+                    tritium_format::TritBlobKind::DenseTensor(tritium_core::DType::F32),
+                    TensorStorage::Dense {
+                        shape: shape.iter().map(|&n| n as u64).collect(),
+                        precision: ScalePrecision::F32,
+                    },
+                    values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                )
+            };
+            tensors.push(TensorMeta {
+                name: name.clone(),
+                blob: reference(&bytes),
+                storage,
+            });
+            blobs.push((kind, bytes));
+        }
+        Self {
+            manifest: ModelManifest {
+                schema: SchemaId { major: 1, minor: 0 },
+                architecture,
+                assets,
+                levels: vec![Level {
+                    name: "standard".into(),
+                    fit: LevelFit::Imported,
+                    tensors,
+                }],
+                shards: vec![],
+                legacy_ids: vec![],
+            },
+            blobs,
+        }
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        let blobs = self
+            .blobs
+            .iter()
+            .map(|(kind, bytes)| tritium_format::TritBlob {
+                kind: kind.clone(),
+                bytes,
+            })
+            .collect::<Vec<_>>();
+        tritium_format::write_trit_package(
+            &tritium_format::trit_model::encode_model_manifest(&self.manifest).unwrap(),
+            &blobs,
+        )
+        .unwrap()
+    }
+
+    fn dense_oracle(&self) -> ModelRunner {
+        // Build the numerical oracle with the unchanged legacy HF loader. Additive
+        // fixtures materialize original-coordinate values through the core gather,
+        // not a second attention/normalization implementation in this test.
+        let hf = HfFixture::new(
+            &self.manifest.architecture,
+            self.manifest.levels[0]
+                .tensors
+                .iter()
+                .all(|t| t.name != "lm_head.weight"),
+            if self.manifest.architecture == "qwen3" {
+                6
+            } else {
+                4
+            },
+            None,
+        );
+        let bytes = self.bytes();
+        let model = tritium_format::trit_model::read_trit_model(&bytes).unwrap();
+        let mut data = Vec::new();
+        let mut header = serde_json::Map::new();
+        for tensor in &self.manifest.levels[0].tensors {
+            let (_, payload) = model.tensor("standard", &tensor.name).unwrap();
+            let (shape, values) = match &tensor.storage {
+                tritium_schema::TensorStorage::Dense { shape, precision } => {
+                    let values = match precision {
+                        tritium_schema::ScalePrecision::F32 => payload
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|b| f32::from_le_bytes(*b))
+                            .collect::<Vec<_>>(),
+                        tritium_schema::ScalePrecision::F16 => payload
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|b| half::f16::from_bits(u16::from_le_bytes(*b)).to_f32())
+                            .collect(),
+                        tritium_schema::ScalePrecision::Bf16 => payload
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|b| half::bf16::from_bits(u16::from_le_bytes(*b)).to_f32())
+                            .collect(),
+                        _ => unreachable!(),
+                    };
+                    (shape.clone(), values)
+                }
+                tritium_schema::TensorStorage::Additive { layout, .. } => {
+                    let tensor =
+                        tritium_format::AdditiveTensor::decode_payload(*layout, 3, payload)
+                            .unwrap();
+                    let ids = (0..layout.rows as usize).collect::<Vec<_>>();
+                    let mut values = vec![0.; (layout.rows * layout.cols) as usize];
+                    tritium_core::reference_embed(&tensor.view().bind_gather(), &ids, &mut values)
+                        .unwrap();
+                    (vec![layout.rows, layout.cols], values)
+                }
+                _ => unreachable!(),
+            };
+            let start = data.len();
+            data.extend(values.iter().flat_map(|v| v.to_le_bytes()));
+            header.insert(tensor.name.clone(), serde_json::json!({"dtype":"F32", "shape":shape, "data_offsets":[start,data.len()]}));
+        }
+        let mut json = serde_json::to_vec(&header).unwrap();
+        while !json.len().is_multiple_of(8) {
+            json.push(b' ');
+        }
+        let mut packed = (json.len() as u64).to_le_bytes().to_vec();
+        packed.extend(json);
+        packed.extend(data);
+        std::fs::write(hf.dir.join("weights.safetensors"), packed).unwrap();
+        let map = self.manifest.levels[0]
+            .tensors
+            .iter()
+            .map(|t| {
+                (
+                    t.name.clone(),
+                    serde_json::Value::String("weights.safetensors".into()),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        std::fs::write(
+            hf.dir.join("model.safetensors.index.json"),
+            serde_json::to_vec(&serde_json::json!({"weight_map":map})).unwrap(),
+        )
+        .unwrap();
+        let (_, config) = self
+            .blobs
+            .iter()
+            .find(|(kind, _)| *kind == tritium_format::TritBlobKind::Asset("config.json".into()))
+            .unwrap();
+        std::fs::write(hf.dir.join("config.json"), config).unwrap();
+        ModelRunner::from_hf(&hf.dir, Box::new(tritium_cpu::CpuBackend::new())).unwrap()
+    }
+
+    fn dense_precision(&mut self, precision: tritium_schema::ScalePrecision) {
+        use tritium_schema::{BlobId, ScalePrecision, TensorStorage};
+        for tensor in &mut self.manifest.levels[0].tensors {
+            let TensorStorage::Dense {
+                precision: stored_precision,
+                ..
+            } = &mut tensor.storage
+            else {
+                continue;
+            };
+            assert_eq!(*stored_precision, ScalePrecision::F32);
+            let original = self
+                .blobs
+                .iter()
+                .find(|(_, b)| blake3::hash(b).as_bytes() == tensor.blob.id.as_bytes())
+                .unwrap();
+            let values = original
+                .1
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b));
+            let (dtype, bytes) = match precision {
+                ScalePrecision::F16 => (
+                    tritium_core::DType::F16,
+                    values
+                        .flat_map(|v| half::f16::from_f32(v).to_bits().to_le_bytes())
+                        .collect::<Vec<_>>(),
+                ),
+                ScalePrecision::Bf16 => (
+                    tritium_core::DType::BF16,
+                    values
+                        .flat_map(|v| half::bf16::from_f32(v).to_bits().to_le_bytes())
+                        .collect(),
+                ),
+                _ => unreachable!(),
+            };
+            *stored_precision = precision;
+            tensor.blob.id = BlobId::from_bytes(*blake3::hash(&bytes).as_bytes());
+            self.blobs
+                .push((tritium_format::TritBlobKind::DenseTensor(dtype), bytes));
+        }
+    }
+
+    #[cfg(feature = "tokenizer")]
+    fn asset(&mut self, name: &str, bytes: Vec<u8>) {
+        use tritium_schema::{BlobId, BlobReference, ManifestAsset};
+        let kind = tritium_format::TritBlobKind::Asset(name.into());
+        self.blobs.retain(|(k, _)| *k != kind);
+        self.manifest.assets.retain(|a| a.name != name);
+        self.manifest.assets.push(ManifestAsset {
+            name: name.into(),
+            blob: BlobReference {
+                id: BlobId::from_bytes(*blake3::hash(&bytes).as_bytes()),
+                shard: None,
+            },
+        });
+        self.blobs.push((kind, bytes));
+    }
+}
+
+fn check_trit_parity(
+    fixture: &TritFixture,
+    backend: Box<dyn TernaryBackend>,
+    native_only: bool,
+    exact: bool,
+) {
+    let bytes = fixture.bytes();
+    let mut oracle = fixture.dense_oracle();
+    let budget = TensorPayloadBudget::new(100_000);
+    let mut recorder = EvidenceRecorder::new("nn-trit", [TENSOR_UPLOADED_REGISTRATION]).unwrap();
+    let mut runner = ModelRunner::from_source_admitted(
+        tritium_nn::ModelSource::Trit {
+            bytes: &bytes,
+            level: "standard",
+        },
+        backend,
+        TensorUploadPolicy {
+            native_only,
+            max_payload_bytes: None,
+        },
+        &budget,
+        TensorUploadContext {
+            recorder: &mut recorder,
+            span: "load",
+            parent: None,
+            logical_time: 0,
+        },
+    )
+    .unwrap();
+    assert!(budget.used_bytes() > 0);
+    assert!(runner.weights.token_embd.as_dense().is_none());
+    assert_eq!(recorder.events().len(), fixture.manifest.levels[0].tensors.iter().filter(|t| !matches!(&t.storage, tritium_schema::TensorStorage::Dense { shape, .. } if shape.len() == 1)).count());
+    for event in recorder.events() {
+        assert_eq!(
+            event.payload["caps"]["execution"],
+            if native_only { "Native" } else { "Emulated" }
+        );
+    }
+    for (tokens, positions) in [
+        (&[1, 3, 2][..], &[0, 1, 2][..]),
+        (&[4][..], &[3][..]),
+        (&[5][..], &[4][..]),
+    ] {
+        let expected = oracle.forward(tokens, positions).unwrap();
+        let actual = runner.forward(tokens, positions).unwrap();
+        if exact {
+            assert_eq!(
+                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        } else {
+            for (a, e) in actual.iter().zip(&expected) {
+                assert!(
+                    a.is_finite() && e.is_finite() && (a - e).abs() <= 1e-5 * e.abs().max(1.),
+                    "{a} != {e}"
+                );
+            }
+        }
+    }
+    verify_jsonl_with_registry(
+        &recorder.to_jsonl().unwrap(),
+        [TENSOR_UPLOADED_REGISTRATION],
+    )
+    .unwrap();
+    drop(runner);
+    assert_eq!(budget.used_bytes(), 0);
+}
+
+#[test]
+fn typed_dense_and_additive_packages_execute_prefill_and_cached_decode() {
+    for arch in ["llama", "qwen2", "qwen3"] {
+        for tied in [false, true] {
+            let hf = HfFixture::new(arch, tied, if arch == "qwen3" { 6 } else { 4 }, None);
+            let fixture = TritFixture::new(&hf, None);
+            check_trit_parity(
+                &fixture,
+                Box::new(tritium_cpu::CpuBackend::new()),
+                true,
+                true,
+            );
+            check_trit_parity(
+                &fixture,
+                Box::new(tritium_testkit::ReferenceBackend::new()),
+                true,
+                true,
+            );
+        }
+    }
+    for codec in [PlaneCodec::D2, PlaneCodec::B3, PlaneCodec::S34] {
+        for basis in [
+            Basis::Identity,
+            Basis::Hadamard { block: 4 },
+            Basis::SignedRht {
+                block: 4,
+                seed: 7,
+                domain: 9,
+            },
+        ] {
+            for tied in [false, true] {
+                let hf = HfFixture::new("qwen3", tied, 6, None);
+                let fixture = TritFixture::new(&hf, Some((codec, basis)));
+                check_trit_parity(
+                    &fixture,
+                    Box::new(tritium_cpu::CpuBackend::new()),
+                    true,
+                    false,
+                );
+                check_trit_parity(
+                    &fixture,
+                    Box::new(tritium_testkit::ReferenceBackend::new()),
+                    true,
+                    false,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn typed_f16_and_bf16_sources_match_lossless_f32_decode() {
+    for precision in [
+        tritium_schema::ScalePrecision::F16,
+        tritium_schema::ScalePrecision::Bf16,
+    ] {
+        let hf = HfFixture::new("qwen3", true, 6, None);
+        let mut fixture = TritFixture::new(&hf, None);
+        fixture.dense_precision(precision);
+        check_trit_parity(
+            &fixture,
+            Box::new(tritium_cpu::CpuBackend::new()),
+            true,
+            true,
+        );
+        check_trit_parity(
+            &fixture,
+            Box::new(tritium_testkit::ReferenceBackend::new()),
+            true,
+            true,
+        );
+    }
+}
+
+#[cfg(feature = "tokenizer")]
+fn tokenizer_assets(out_of_range: bool) -> (Vec<u8>, Vec<u8>) {
+    let mut vocab = [
+        "[UNK]", "hello", "partner", "[EOS]", "[BOS]", "t5", "t6", "t7", "t8", "t9",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(id, word)| (word.to_owned(), id as u32))
+    .collect::<Vec<_>>();
+    if out_of_range {
+        // Even an unused/added vocabulary ID must be admitted against embeddings.
+        vocab.push(("not-in-model".into(), 10));
+    }
+    let model = tokenizers::models::wordlevel::WordLevel::builder()
+        .vocab(vocab.into_iter().collect())
+        .unk_token("[UNK]".to_owned())
+        .build()
+        .unwrap();
+    let mut tokenizer = tokenizers::Tokenizer::new(model);
+    tokenizer.with_pre_tokenizer(Some(tokenizers::pre_tokenizers::whitespace::Whitespace));
+    (
+        tokenizer.to_string(false).unwrap().into_bytes(),
+        br#"{"bos_token":"[BOS]","eos_token":{"content":"[EOS]"}}"#.to_vec(),
+    )
+}
+
+#[cfg(feature = "tokenizer")]
+fn check_text_load(
+    source: tritium_nn::ModelSource<'_>,
+    mut oracle: ModelRunner,
+    backend: Box<dyn TernaryBackend>,
+) {
+    use tritium_nn::Tokenizer;
+    let budget = TensorPayloadBudget::new(100_000);
+    let mut recorder =
+        EvidenceRecorder::new("nn-text-load", [TENSOR_UPLOADED_REGISTRATION]).unwrap();
+    let mut loaded = tritium_nn::load(
+        source,
+        backend,
+        TensorUploadPolicy::default(),
+        &budget,
+        TensorUploadContext {
+            recorder: &mut recorder,
+            span: "load",
+            parent: None,
+            logical_time: 0,
+        },
+    )
+    .unwrap();
+    assert_eq!(loaded.tokenizer.encode("hello partner").unwrap(), [1, 2]);
+    assert_eq!(loaded.tokenizer.decode(&[1, 2]).unwrap(), "hello partner");
+    assert_eq!(loaded.tokenizer.bos(), 4);
+    assert_eq!(loaded.tokenizer.eos(), 3);
+    assert_eq!(loaded.runner.config.arch, "qwen3");
+    let prompt = loaded.tokenizer.encode("hello partner").unwrap();
+    assert_eq!(
+        loaded
+            .runner
+            .generate(&prompt, 3, loaded.tokenizer.eos())
+            .unwrap(),
+        oracle.generate(&prompt, 3, 3).unwrap()
+    );
+    assert!(budget.used_bytes() > 0);
+    verify_jsonl_with_registry(
+        &recorder.to_jsonl().unwrap(),
+        [TENSOR_UPLOADED_REGISTRATION],
+    )
+    .unwrap();
+    drop(loaded);
+    assert_eq!(budget.used_bytes(), 0);
+}
+
+#[cfg(feature = "tokenizer")]
+#[test]
+fn text_source_loads_real_tokenizers_and_generates_with_shared_runner() {
+    let hf = HfFixture::new("qwen3", true, 6, None);
+    let (tokenizer, config) = tokenizer_assets(false);
+    std::fs::write(hf.dir.join("tokenizer.json"), &tokenizer).unwrap();
+    std::fs::write(hf.dir.join("tokenizer_config.json"), &config).unwrap();
+    check_text_load(
+        tritium_nn::ModelSource::HuggingFace(&hf.dir),
+        ModelRunner::from_hf(&hf.dir, Box::new(tritium_cpu::CpuBackend::new())).unwrap(),
+        Box::new(tritium_cpu::CpuBackend::new()),
+    );
+    for additive in [
+        None,
+        Some((
+            PlaneCodec::B3,
+            Basis::SignedRht {
+                block: 4,
+                seed: 7,
+                domain: 9,
+            },
+        )),
+    ] {
+        let mut fixture = TritFixture::new(&hf, additive);
+        fixture.asset("tokenizer.json", tokenizer.clone());
+        fixture.asset("tokenizer_config.json", config.clone());
+        let bytes = fixture.bytes();
+        check_text_load(
+            tritium_nn::ModelSource::Trit {
+                bytes: &bytes,
+                level: "standard",
+            },
+            fixture.dense_oracle(),
+            Box::new(tritium_cpu::CpuBackend::new()),
+        );
+        check_text_load(
+            tritium_nn::ModelSource::Trit {
+                bytes: &bytes,
+                level: "standard",
+            },
+            fixture.dense_oracle(),
+            Box::new(tritium_testkit::ReferenceBackend::new()),
+        );
+        #[cfg(feature = "cuda")]
+        if let Ok(backend) = tritium_cuda::CudaBackend::new(0) {
+            check_text_load(
+                tritium_nn::ModelSource::Trit {
+                    bytes: &bytes,
+                    level: "standard",
+                },
+                fixture.dense_oracle(),
+                Box::new(backend),
+            );
+        } else {
+            assert!(
+                std::env::var_os("TRITIUM_REQUIRE_CUDA").is_none(),
+                "required text-load CUDA device unavailable"
+            );
+            eprintln!("UNKNOWN text-load CUDA device unavailable");
+        }
+    }
+}
+
+#[cfg(feature = "tokenizer")]
+#[test]
+fn text_load_rejects_invalid_assets_and_vocab_and_releases_budget() {
+    for bad in [
+        "missing-config",
+        "invalid-json",
+        "missing-eos",
+        "vocab",
+        "large-config",
+    ] {
+        let hf = HfFixture::new("qwen3", true, 6, None);
+        let (mut tokenizer, mut config) = tokenizer_assets(bad == "vocab");
+        if bad == "invalid-json" {
+            tokenizer = b"{}".to_vec();
+        }
+        if bad == "missing-eos" {
+            config = br#"{"eos_token":"not-in-model"}"#.to_vec();
+        }
+        if bad == "large-config" {
+            config.resize(16 * 1024 * 1024 + 1, b' ');
+        }
+        std::fs::write(hf.dir.join("tokenizer.json"), &tokenizer).unwrap();
+        if bad != "missing-config" {
+            std::fs::write(hf.dir.join("tokenizer_config.json"), &config).unwrap();
+        }
+        let mut fixture = TritFixture::new(&hf, None);
+        fixture.asset("tokenizer.json", tokenizer);
+        if bad != "missing-config" {
+            fixture.asset("tokenizer_config.json", config);
+        }
+        let bytes = fixture.bytes();
+        for source in [
+            tritium_nn::ModelSource::HuggingFace(&hf.dir),
+            tritium_nn::ModelSource::Trit {
+                bytes: &bytes,
+                level: "standard",
+            },
+        ] {
+            let budget = TensorPayloadBudget::new(100_000);
+            let mut recorder =
+                EvidenceRecorder::new("nn-text-failure", [TENSOR_UPLOADED_REGISTRATION]).unwrap();
+            let result = tritium_nn::load(
+                source,
+                Box::new(tritium_cpu::CpuBackend::new()),
+                TensorUploadPolicy::default(),
+                &budget,
+                TensorUploadContext {
+                    recorder: &mut recorder,
+                    span: "load",
+                    parent: None,
+                    logical_time: 0,
+                },
+            );
+            assert!(result.is_err(), "{bad}");
+            assert_eq!(budget.used_bytes(), 0, "{bad}");
+            assert_eq!(
+                recorder.events().len(),
+                if bad == "vocab" { hf.upload_count } else { 0 },
+                "{bad}"
+            );
+        }
+    }
+}
+
+#[test]
+fn typed_model_rejects_false_coverage_geometry_and_releases_failed_uploads() {
+    let hf = HfFixture::new("llama", true, 4, None);
+    for bad in [
+        "missing",
+        "extra",
+        "shape",
+        "architecture",
+        "budget",
+        "level",
+    ] {
+        let mut fixture = TritFixture::new(&hf, None);
+        match bad {
+            "missing" => fixture.manifest.levels[0]
+                .tensors
+                .retain(|t| !t.name.ends_with("down_proj.weight")),
+            "extra" => {
+                let mut extra = fixture.manifest.levels[0].tensors[0].clone();
+                extra.name = "unexpected.weight".into();
+                fixture.manifest.levels[0].tensors.push(extra);
+            }
+            "shape" => {
+                let meta = fixture.manifest.levels[0]
+                    .tensors
+                    .iter_mut()
+                    .find(|t| t.name.ends_with("q_proj.weight"))
+                    .unwrap();
+                let tritium_schema::TensorStorage::Dense { shape, .. } = &mut meta.storage else {
+                    unreachable!()
+                };
+                *shape = vec![4, 16];
+            }
+            "architecture" => fixture.manifest.architecture = "not-llama".into(),
+            _ => {}
+        }
+        let bytes = fixture.bytes();
+        let budget = TensorPayloadBudget::new(if bad == "budget" { 320 } else { 100_000 });
+        let mut recorder =
+            EvidenceRecorder::new("nn-trit-failure", [TENSOR_UPLOADED_REGISTRATION]).unwrap();
+        let result = ModelRunner::from_source_admitted(
+            tritium_nn::ModelSource::Trit {
+                bytes: &bytes,
+                level: if bad == "level" { "absent" } else { "standard" },
+            },
+            Box::new(tritium_cpu::CpuBackend::new()),
+            TensorUploadPolicy::default(),
+            &budget,
+            TensorUploadContext {
+                recorder: &mut recorder,
+                span: "load",
+                parent: None,
+                logical_time: 0,
+            },
+        );
+        assert!(result.is_err(), "{bad}");
+        assert_eq!(budget.used_bytes(), 0, "{bad}");
+    }
+    for bad in ["unregistered", "corrupt-bytes"] {
+        let fixture = TritFixture::new(&hf, None);
+        let mut bytes = fixture.bytes();
+        if bad == "corrupt-bytes" {
+            // Corrupt an authenticated payload, not the metadata gate or oracle.
+            bytes[256] ^= 1;
+        }
+        let budget = TensorPayloadBudget::new(100_000);
+        let mut recorder = EvidenceRecorder::new(
+            "nn-trit-integrity",
+            if bad == "unregistered" {
+                vec![]
+            } else {
+                vec![TENSOR_UPLOADED_REGISTRATION]
+            },
+        )
+        .unwrap();
+        assert!(
+            ModelRunner::from_source_admitted(
+                tritium_nn::ModelSource::Trit {
+                    bytes: &bytes,
+                    level: "standard"
+                },
+                Box::new(tritium_cpu::CpuBackend::new()),
+                TensorUploadPolicy::default(),
+                &budget,
+                TensorUploadContext {
+                    recorder: &mut recorder,
+                    span: "load",
+                    parent: None,
+                    logical_time: 0
+                }
+            )
+            .is_err(),
+            "{bad}"
+        );
+        assert_eq!(budget.used_bytes(), 0);
+        assert!(recorder.events().is_empty());
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn typed_packages_execute_on_real_cuda_without_backend_downcasts() {
+    if let Err(e) = tritium_cuda::CudaBackend::new(0) {
+        assert!(
+            std::env::var_os("TRITIUM_REQUIRE_CUDA").is_none(),
+            "required CUDA device: {e}"
+        );
+        eprintln!("UNKNOWN typed CUDA: {e}");
+        return;
+    }
+    for tied in [false, true] {
+        let hf = HfFixture::new("qwen3", tied, 6, None);
+        for additive in [
+            None,
+            Some((
+                PlaneCodec::D2,
+                Basis::SignedRht {
+                    block: 4,
+                    seed: 7,
+                    domain: 9,
+                },
+            )),
+        ] {
+            let fixture = TritFixture::new(&hf, additive);
+            check_trit_parity(
+                &fixture,
+                Box::new(tritium_cuda::CudaBackend::new(0).unwrap()),
+                additive.is_none(),
+                additive.is_none(),
+            );
+        }
+    }
+    let hf = HfFixture::new("qwen3", true, 6, None);
+    let fixture = TritFixture::new(&hf, Some((PlaneCodec::D2, Basis::Identity)));
+    let bytes = fixture.bytes();
+    let budget = TensorPayloadBudget::new(100_000);
+    let mut recorder =
+        EvidenceRecorder::new("nn-trit-native-only", [TENSOR_UPLOADED_REGISTRATION]).unwrap();
+    let result = ModelRunner::from_source_admitted(
+        tritium_nn::ModelSource::Trit {
+            bytes: &bytes,
+            level: "standard",
+        },
+        Box::new(tritium_cuda::CudaBackend::new(0).unwrap()),
+        TensorUploadPolicy {
+            native_only: true,
+            max_payload_bytes: None,
+        },
+        &budget,
+        TensorUploadContext {
+            recorder: &mut recorder,
+            span: "load",
+            parent: None,
+            logical_time: 0,
+        },
+    );
+    assert!(
+        result.is_err(),
+        "emulated additive CUDA must reject native-only"
     );
     assert_eq!(budget.used_bytes(), 0);
     assert!(recorder.events().is_empty());
