@@ -16,10 +16,11 @@
 //! - **Liveness.** An [`AliveGuard`] clears a shared flag if the thread ever exits
 //!   (panic or shutdown), so `/healthz` can report a dead worker.
 //!
-//! Cancellation is cooperative + per-step: a disconnect/drain is observed at the
-//! next token boundary (a single in-flight `forward` is not interrupted). For the
-//! bounded-latency CPU/GPU decode steps here that is acceptable; a future
-//! interruptible-kernel path would tighten it.
+//! Cancellation is cooperative: generation and tree jobs receive a runtime-free
+//! disconnect/drain query. Native adapters poll between operations and before
+//! commit; compatibility defaults cannot interrupt arbitrary legacy work. A
+//! running kernel/graph is not preempted. Physical cancellation latency remains
+//! a candidate-bound qualification gate, not an inference from checkpoints.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -424,12 +425,27 @@ pub(crate) fn spawn_worker(
                                 resp.send(Err(TreeOpError::Draining("server draining".to_owned())));
                             continue;
                         }
+                        if resp.is_closed() {
+                            continue;
+                        }
                         phase.store(PHASE_PREFILL, Ordering::Release);
                         let _phase = PhaseGuard(phase.clone());
-                        let outcome =
-                            catch_unwind(AssertUnwindSafe(|| generator.open_tree_session(&prompt)));
+                        let outcome = catch_unwind(AssertUnwindSafe(|| {
+                            generator.open_tree_session_cancellable(&prompt, &|| {
+                                resp.is_closed() || draining.load(Ordering::Acquire)
+                            })
+                        }));
                         let result = match outcome {
-                            Ok(r) => r,
+                            Ok(Ok(Some(token))) => Ok(token),
+                            Ok(Ok(None)) => {
+                                if draining.load(Ordering::Acquire) {
+                                    let _ = resp.send(Err(TreeOpError::Draining(
+                                        "server draining".to_owned(),
+                                    )));
+                                }
+                                continue;
+                            }
+                            Ok(Err(error)) => Err(error),
                             Err(_panic) => Err(TreeOpError::Internal(
                                 "internal tree-session error".to_owned(),
                             )),
@@ -453,13 +469,27 @@ pub(crate) fn spawn_worker(
                                 resp.send(Err(TreeOpError::Draining("server draining".to_owned())));
                             continue;
                         }
+                        if resp.is_closed() {
+                            continue;
+                        }
                         phase.store(PHASE_DECODE, Ordering::Release);
                         let _phase = PhaseGuard(phase.clone());
                         let outcome = catch_unwind(AssertUnwindSafe(|| {
-                            generator.tree_verify(&tokens, &parents)
+                            generator.tree_verify_cancellable(&tokens, &parents, &|| {
+                                resp.is_closed() || draining.load(Ordering::Acquire)
+                            })
                         }));
                         let result = match outcome {
-                            Ok(r) => r,
+                            Ok(Ok(Some(tokens))) => Ok(tokens),
+                            Ok(Ok(None)) => {
+                                if draining.load(Ordering::Acquire) {
+                                    let _ = resp.send(Err(TreeOpError::Draining(
+                                        "server draining".to_owned(),
+                                    )));
+                                }
+                                continue;
+                            }
+                            Ok(Err(error)) => Err(error),
                             Err(_panic) => Err(TreeOpError::Internal(
                                 "internal tree-verify error".to_owned(),
                             )),
@@ -733,6 +763,189 @@ mod tests {
     #[tokio::test]
     async fn active_prefill_drain_uses_cooperative_query_and_recovers() {
         exercise_active_prefill_cancellation(true).await;
+    }
+
+    async fn exercise_active_tree_cancellation(open: bool, drain: bool) {
+        struct CooperativeTree {
+            entered: Arc<AtomicBool>,
+            release: std::sync::mpsc::Receiver<()>,
+            cancelled: Arc<AtomicBool>,
+            subsequent_work: Arc<AtomicU64>,
+        }
+
+        impl CooperativeTree {
+            fn operation(&mut self, token: u32, query: &dyn Fn() -> bool) -> Option<u32> {
+                if token == 1 {
+                    self.entered.store(true, Ordering::Release);
+                    self.release.recv_timeout(Duration::from_secs(2)).unwrap();
+                    if query() {
+                        self.cancelled.store(true, Ordering::Release);
+                        return None;
+                    }
+                    self.subsequent_work.fetch_add(1, Ordering::Relaxed);
+                }
+                Some(token)
+            }
+        }
+
+        impl Generator for CooperativeTree {
+            fn generate(
+                &mut self,
+                _: &GenRequest,
+                _: &mut dyn FnMut(Step) -> bool,
+            ) -> Result<(), GenError> {
+                Ok(())
+            }
+            fn n_ctx(&self) -> usize {
+                16
+            }
+            fn vocab(&self) -> usize {
+                8
+            }
+            fn open_tree_session(&mut self, prompt: &[u32]) -> Result<u32, TreeOpError> {
+                self.open_tree_session_cancellable(prompt, &|| false)
+                    .map(|output| output.unwrap())
+            }
+            fn open_tree_session_cancellable(
+                &mut self,
+                prompt: &[u32],
+                query: &dyn Fn() -> bool,
+            ) -> Result<Option<u32>, TreeOpError> {
+                Ok(self.operation(prompt[0], query))
+            }
+            fn tree_verify(
+                &mut self,
+                tokens: &[u32],
+                parents: &[i32],
+            ) -> Result<Vec<u32>, TreeOpError> {
+                self.tree_verify_cancellable(tokens, parents, &|| false)
+                    .map(|output| output.unwrap())
+            }
+            fn tree_verify_cancellable(
+                &mut self,
+                tokens: &[u32],
+                _: &[i32],
+                query: &dyn Fn() -> bool,
+            ) -> Result<Option<Vec<u32>>, TreeOpError> {
+                Ok(self.operation(tokens[0], query).map(|token| vec![token]))
+            }
+        }
+
+        let entered = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let subsequent_work = Arc::new(AtomicU64::new(0));
+        let draining = Arc::new(AtomicBool::new(false));
+        let faulted = Arc::new(AtomicBool::new(false));
+        let faults = Arc::new(AtomicU64::new(0));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let jobs = spawn_worker(
+            Box::new(CooperativeTree {
+                entered: entered.clone(),
+                release: release_rx,
+                cancelled: cancelled.clone(),
+                subsequent_work: subsequent_work.clone(),
+            }),
+            WorkerSignals {
+                draining: draining.clone(),
+                worker_alive: Arc::new(AtomicBool::new(true)),
+                phase: Arc::new(AtomicU8::new(PHASE_IDLE)),
+                backend_faulted: faulted.clone(),
+                backend_faults: faults.clone(),
+                telemetry: Arc::new(WorkerTelemetry::default()),
+                latch_backend_faults: true,
+            },
+            2,
+        );
+        // Keep the actual response type; no relay or dummy channel.
+        let (job, open_rx, verify_rx) = if open {
+            let (resp, rx) = tokio::sync::oneshot::channel();
+            (
+                Job::OpenTreeSession {
+                    prompt: vec![1],
+                    resp,
+                },
+                Some(rx),
+                None,
+            )
+        } else {
+            let (resp, rx) = tokio::sync::oneshot::channel();
+            (
+                Job::TreeVerify {
+                    tokens: vec![1],
+                    parents: vec![-1],
+                    resp,
+                },
+                None,
+                Some(rx),
+            )
+        };
+        jobs.try_send(job).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("tree operation must enter before cancellation");
+        if drain {
+            draining.store(true, Ordering::Release);
+        }
+        if !drain {
+            drop(open_rx);
+            drop(verify_rx);
+            release_tx.send(()).unwrap();
+        } else {
+            release_tx.send(()).unwrap();
+            let result = if let Some(response) = open_rx {
+                tokio::time::timeout(Duration::from_secs(2), response)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .map(|token| vec![token])
+            } else {
+                tokio::time::timeout(Duration::from_secs(2), verify_rx.unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            };
+            assert!(
+                matches!(result, Err(TreeOpError::Draining(_))),
+                "drain must not publish a tree result"
+            );
+            draining.store(false, Ordering::Release);
+        }
+        let (recovery_tx, recovery_rx) = tokio::sync::oneshot::channel();
+        jobs.try_send(Job::TreeVerify {
+            tokens: vec![2],
+            parents: vec![-1],
+            resp: recovery_tx,
+        })
+        .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), recovery_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, Ok(vec![2]));
+        assert_eq!(
+            subsequent_work.load(Ordering::Relaxed),
+            0,
+            "tree cancellation must stop entered work"
+        );
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(!faulted.load(Ordering::Acquire));
+        assert_eq!(faults.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn active_tree_disconnect_uses_cooperative_query_and_recovers() {
+        exercise_active_tree_cancellation(true, false).await;
+        exercise_active_tree_cancellation(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn active_tree_drain_uses_cooperative_query_and_recovers() {
+        exercise_active_tree_cancellation(true, true).await;
+        exercise_active_tree_cancellation(false, true).await;
     }
 
     #[test]

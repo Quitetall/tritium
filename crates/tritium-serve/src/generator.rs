@@ -473,6 +473,21 @@ pub trait Generator: Send {
         ))
     }
 
+    /// Open with a cheap, nonblocking, non-panicking cancellation query.
+    /// The compatibility default avoids pre-cancelled entry only; it cannot
+    /// interrupt or roll back arbitrary legacy prefill. Native adapters must
+    /// override it for in-operation cancellation. `None` publishes no result.
+    fn open_tree_session_cancellable(
+        &mut self,
+        prompt: &[u32],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<u32>, TreeOpError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
+        self.open_tree_session(prompt).map(Some)
+    }
+
     /// Verify one draft tree against the open session (see
     /// `CudaDecodeModel::tree_verify_greedy` for the tree contract: node 0 is
     /// the pending token, `parents[i] < i`). Returns the newly committed
@@ -481,6 +496,22 @@ pub trait Generator: Send {
         Err(TreeOpError::Unsupported(
             "tree-verify sessions are not supported by this generator".to_owned(),
         ))
+    }
+
+    /// Verify with the same cooperative query contract as session opening.
+    /// The compatibility default checks entry only; it makes no in-operation
+    /// or rollback claim. Native cancellation preserves the committed session
+    /// for retry. Query invocation count is unspecified (ADR 0051).
+    fn tree_verify_cancellable(
+        &mut self,
+        tokens: &[u32],
+        parents: &[i32],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<u32>>, TreeOpError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
+        self.tree_verify(tokens, parents).map(Some)
     }
 }
 
@@ -1334,6 +1365,7 @@ impl RunnerGenerator {
         max_new: usize,
         prefill_logits: Vec<f32>,
         on_step: &mut dyn FnMut(Step) -> bool,
+        is_cancelled: &dyn Fn() -> bool,
     ) -> Result<(), GenError> {
         let n_ctx = self.runner.config.n_ctx as usize;
         let mut history: Vec<u32> = req.prompt_tokens.clone();
@@ -1362,6 +1394,10 @@ impl RunnerGenerator {
         let mut pending = tritium_nn::sample_greedy(&prefill_logits)
             .ok_or_else(|| GenError::Backend("sampler produced no token".into()))?;
         loop {
+            if is_cancelled() {
+                self.reset_cancelled_generation();
+                return Ok(());
+            }
             let is_eos = req.stop_eos && pending == self.eos;
             let last = is_eos || emitted + 1 >= max_new;
             let cont = on_step(Step {
@@ -1390,6 +1426,11 @@ impl RunnerGenerator {
             }
             history.push(pending);
 
+            if is_cancelled() {
+                self.reset_cancelled_generation();
+                return Ok(());
+            }
+
             // Budget-clamped draft: total tree rows must fit the KV arena
             // (cache_len = history.len() - 1 here, the verifier needs
             // cache_len + 1 + d <= n_ctx, so d <= n_ctx - history.len()), and
@@ -1416,6 +1457,10 @@ impl RunnerGenerator {
             } else {
                 Self::lookup_draft(&history, max_draft)
             };
+            if is_cancelled() {
+                self.reset_cancelled_generation();
+                return Ok(());
+            }
             // Cost-model d: drafter wall per drafted token (empty results —
             // bails, no match — carry no per-token denominator; skipped).
             // Probe cycles feed draft_resync (telemetry), steady-state
@@ -1431,10 +1476,14 @@ impl RunnerGenerator {
                 // Plain M=1 graph step (faster than a 1-node tree).
                 let t0 = std::time::Instant::now();
                 let pos = history.len() - 1;
-                let logits = self
+                let Some(logits) = self
                     .runner
-                    .forward(&[pending], &[pos])
-                    .map_err(|e| GenError::Backend(e.to_string()))?;
+                    .forward_cancellable(&[pending], &[pos], is_cancelled)
+                    .map_err(|e| GenError::Backend(e.to_string()))?
+                else {
+                    self.reset_cancelled_generation();
+                    return Ok(());
+                };
                 n_plain += 1;
                 let el = t0.elapsed();
                 t_plain += el;
@@ -1450,10 +1499,14 @@ impl RunnerGenerator {
             tokens.extend(&drafts);
             let parents: Vec<i32> = (0..tokens.len() as i32).map(|i| i - 1).collect();
             let t0 = std::time::Instant::now();
-            let committed = self
+            let Some(committed) = self
                 .runner
-                .tree_verify_greedy(&tokens, &parents)
-                .map_err(|e| GenError::Backend(e.to_string()))?;
+                .tree_verify_greedy_cancellable(&tokens, &parents, is_cancelled)
+                .map_err(|e| GenError::Backend(e.to_string()))?
+            else {
+                self.reset_cancelled_generation();
+                return Ok(());
+            };
             n_verify += 1;
             n_committed += committed.len();
             SPEC_VERIFIES.fetch_add(1, Ordering::Relaxed);
@@ -1595,6 +1648,7 @@ impl RunnerGenerator {
         max_new: usize,
         prefill_logits: Vec<f32>,
         on_step: &mut dyn FnMut(Step) -> bool,
+        is_cancelled: &dyn Fn() -> bool,
     ) -> Result<(), GenError> {
         let n_ctx = self.runner.config.n_ctx as usize;
         let seed = match req.sampling {
@@ -1619,6 +1673,10 @@ impl RunnerGenerator {
             tritium_nn::sample_categorical(&idx, &probs, seed.wrapping_add(salt))
         };
         loop {
+            if is_cancelled() {
+                self.reset_cancelled_generation();
+                return Ok(());
+            }
             let is_eos = req.stop_eos && pending == self.eos;
             let last = is_eos || emitted + 1 >= max_new;
             let cont = on_step(Step {
@@ -1639,6 +1697,11 @@ impl RunnerGenerator {
             }
             history.push(pending);
 
+            if is_cancelled() {
+                self.reset_cancelled_generation();
+                return Ok(());
+            }
+
             let kv_room = n_ctx.saturating_sub(history.len());
             let budget = max_new - emitted;
             let max_draft = policy.len().min(kv_room).min(budget.saturating_sub(1));
@@ -1647,13 +1710,21 @@ impl RunnerGenerator {
             } else {
                 Self::lookup_draft(&history, max_draft)
             };
+            if is_cancelled() {
+                self.reset_cancelled_generation();
+                return Ok(());
+            }
 
             if drafts.is_empty() {
                 let pos = history.len() - 1;
-                let logits = self
+                let Some(logits) = self
                     .runner
-                    .forward(&[pending], &[pos])
-                    .map_err(|e| GenError::Backend(e.to_string()))?;
+                    .forward_cancellable(&[pending], &[pos], is_cancelled)
+                    .map_err(|e| GenError::Backend(e.to_string()))?
+                else {
+                    self.reset_cancelled_generation();
+                    return Ok(());
+                };
                 let (idx, probs) = Self::truncated(&logits, &req.sampling)
                     .ok_or_else(|| GenError::Backend("sampler produced no token".into()))?;
                 salt += 1;
@@ -1665,10 +1736,14 @@ impl RunnerGenerator {
             tokens.push(pending);
             tokens.extend(&drafts);
             let parents: Vec<i32> = (0..tokens.len() as i32).map(|i| i - 1).collect();
-            let logits_all = self
+            let Some(logits_all) = self
                 .runner
-                .tree_verify_logits(&tokens, &parents)
-                .map_err(|e| GenError::Backend(e.to_string()))?;
+                .tree_verify_logits_cancellable(&tokens, &parents, is_cancelled)
+                .map_err(|e| GenError::Backend(e.to_string()))?
+            else {
+                self.reset_cancelled_generation();
+                return Ok(());
+            };
             let vocab = logits_all.len() / tokens.len();
 
             // Chain walk with the accept rule. `path` holds tree-node indices;
@@ -1676,6 +1751,10 @@ impl RunnerGenerator {
             let mut path = vec![0usize];
             let mut final_token: Option<u32> = None;
             for (child, &d) in tokens.iter().enumerate().skip(1) {
+                if is_cancelled() {
+                    self.reset_cancelled_generation();
+                    return Ok(());
+                }
                 let node = child - 1;
                 let row = &logits_all[node * vocab..(node + 1) * vocab];
                 let (idx, probs) = Self::truncated(row, &req.sampling)
@@ -1708,6 +1787,10 @@ impl RunnerGenerator {
                     tritium_nn::sample_categorical(&idx, &probs, seed.wrapping_add(salt))
                 }
             };
+            if is_cancelled() {
+                self.reset_cancelled_generation();
+                return Ok(());
+            }
             self.runner
                 .tree_commit(&path)
                 .map_err(|e| GenError::Backend(e.to_string()))?;
@@ -1819,6 +1902,7 @@ impl Generator for RunnerGenerator {
                         max_new,
                         logits,
                         &mut controlled_step,
+                        is_cancelled,
                     ),
                     // Stochastic sampling uses the speculative accept rule
                     // (lossless IN DISTRIBUTION, not stream-equal to the plain
@@ -1831,6 +1915,7 @@ impl Generator for RunnerGenerator {
                             max_new,
                             logits,
                             &mut controlled_step,
+                            is_cancelled,
                         ),
                 };
                 if result.is_ok() && (stopped || is_cancelled()) {
@@ -1890,6 +1975,18 @@ impl Generator for RunnerGenerator {
     }
 
     fn open_tree_session(&mut self, prompt: &[u32]) -> Result<u32, TreeOpError> {
+        self.open_tree_session_cancellable(prompt, &|| false)
+            .map(|output| output.expect("never-cancelled tree session"))
+    }
+
+    fn open_tree_session_cancellable(
+        &mut self,
+        prompt: &[u32],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<u32>, TreeOpError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
         // Refuse at OPEN when verify can never succeed — cheaper and more
         // honest than burning a full prefill before the client learns.
         #[cfg(not(feature = "cuda"))]
@@ -1921,18 +2018,35 @@ impl Generator for RunnerGenerator {
             self.runner.reset();
             let positions: Vec<usize> = (0..prompt.len()).collect();
             self.tree_session_open = false;
-            let logits = self
+            let Some(logits) = self
                 .runner
-                .forward(prompt, &positions)
-                .map_err(|e| TreeOpError::Internal(e.to_string()))?;
+                .forward_cancellable(prompt, &positions, is_cancelled)
+                .map_err(|e| TreeOpError::Internal(e.to_string()))?
+            else {
+                self.runner.reset();
+                return Ok(None);
+            };
             let pending = tritium_nn::sample_greedy(&logits)
                 .ok_or_else(|| TreeOpError::Internal("empty logits from prefill".to_owned()))?;
             self.tree_session_open = true;
-            Ok(pending)
+            Ok(Some(pending))
         }
     }
 
     fn tree_verify(&mut self, tokens: &[u32], parents: &[i32]) -> Result<Vec<u32>, TreeOpError> {
+        self.tree_verify_cancellable(tokens, parents, &|| false)
+            .map(|output| output.expect("never-cancelled tree verify"))
+    }
+
+    fn tree_verify_cancellable(
+        &mut self,
+        tokens: &[u32],
+        parents: &[i32],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<u32>>, TreeOpError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
         if !self.tree_session_open {
             return Err(TreeOpError::Conflict(
                 "no open tree session (open one with /v1/tree/session; a chat \
@@ -1943,7 +2057,7 @@ impl Generator for RunnerGenerator {
         #[cfg(feature = "cuda")]
         {
             self.runner
-                .tree_verify_greedy(tokens, parents)
+                .tree_verify_greedy_cancellable(tokens, parents, is_cancelled)
                 .map_err(|e| match e {
                     tritium_nn::ResidentOpError::Unavailable => TreeOpError::Unsupported(
                         "tree-verify needs the CUDA device-resident decoder".to_owned(),
@@ -1968,6 +2082,480 @@ impl Generator for RunnerGenerator {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn speculative_loop_all_queries_retire_and_recover_owned_state() {
+        let _device = crate::test_support::cuda_fixture_guard();
+        use super::*;
+        use std::cell::Cell;
+        for model_draft in [false, true] {
+            for sampling in [
+                Sampling::Greedy,
+                Sampling::TopK {
+                    k: 3,
+                    temp: 0.8,
+                    seed: 7,
+                },
+                Sampling::TopP {
+                    p: 0.9,
+                    temp: 0.8,
+                    seed: 7,
+                },
+            ] {
+                let Some(runner) = crate::test_support::tiny_cuda_runner(64) else {
+                    return;
+                };
+                let mut generator = RunnerGenerator::new(runner, 7).with_spec_lookup(true);
+                if model_draft {
+                    let Some(draft) = crate::test_support::tiny_cuda_runner(64) else {
+                        return;
+                    };
+                    generator = generator.with_draft_model(draft);
+                }
+                let request = GenRequest {
+                    prompt_tokens: vec![0, 0, 0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0],
+                    max_new: 4,
+                    sampling,
+                    logprobs: None,
+                    stop_eos: false,
+                };
+                let checks = Cell::new(0);
+                let mut expected = Vec::new();
+                generator
+                    .generate_cancellable(
+                        &request,
+                        &mut |step| {
+                            expected.push(step.token);
+                            true
+                        },
+                        &|| {
+                            checks.set(checks.get() + 1);
+                            false
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(expected.len(), 4);
+                assert!(
+                    generator
+                        .runner
+                        .resident_cuda()
+                        .unwrap()
+                        .unwrap()
+                        .tree_graph_bucket_count()
+                        > 0
+                );
+                let mut cancelled_work = 0;
+                for cancel_at in 1..=checks.get() {
+                    generator.reset_cancelled_generation();
+                    let count = Cell::new(0);
+                    let observed = Cell::new(false);
+                    let mut emitted = Vec::new();
+                    generator
+                        .generate_cancellable(
+                            &request,
+                            &mut |step| {
+                                emitted.push(step.token);
+                                true
+                            },
+                            &|| {
+                                count.set(count.get() + 1);
+                                let cancelled = count.get() == cancel_at;
+                                observed.set(observed.get() || cancelled);
+                                cancelled
+                            },
+                        )
+                        .unwrap();
+                    assert!(
+                        observed.get(),
+                        "query {cancel_at} not reached, model_draft {model_draft}"
+                    );
+                    assert!(expected.starts_with(&emitted));
+                    // A cancellation after the final token can race normal
+                    // success; only incomplete generations require retirement.
+                    if emitted.len() < expected.len() {
+                        cancelled_work += 1;
+                        assert_eq!(
+                            generator
+                                .runner
+                                .resident_cuda()
+                                .unwrap()
+                                .unwrap()
+                                .cache_len(),
+                            0
+                        );
+                        if let Some(draft) = generator.draft.as_mut() {
+                            assert_eq!(draft.resident_cuda().unwrap().unwrap().cache_len(), 0);
+                        }
+                        assert!(generator.draft_fed.is_empty());
+                        assert_eq!(generator.draft_pos, 0);
+                    }
+                    let mut recovered = Vec::new();
+                    generator
+                        .generate(&request, &mut |step| {
+                            recovered.push(step.token);
+                            true
+                        })
+                        .unwrap();
+                    assert_eq!(recovered, expected);
+                }
+                assert!(
+                    cancelled_work >= 5,
+                    "must exercise in-operation target query propagation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn default_cancellable_tree_methods_preserve_entry_and_errors() {
+        use super::*;
+        struct LegacyTree {
+            calls: usize,
+        }
+        impl Generator for LegacyTree {
+            fn generate(
+                &mut self,
+                _: &GenRequest,
+                _: &mut dyn FnMut(Step) -> bool,
+            ) -> Result<(), GenError> {
+                Ok(())
+            }
+            fn n_ctx(&self) -> usize {
+                16
+            }
+            fn vocab(&self) -> usize {
+                8
+            }
+            fn open_tree_session(&mut self, _: &[u32]) -> Result<u32, TreeOpError> {
+                self.calls += 1;
+                Ok(3)
+            }
+            fn tree_verify(&mut self, _: &[u32], parents: &[i32]) -> Result<Vec<u32>, TreeOpError> {
+                self.calls += 1;
+                if parents.is_empty() {
+                    Err(TreeOpError::Internal("legacy error".into()))
+                } else {
+                    Ok(vec![4])
+                }
+            }
+        }
+        let mut generator = LegacyTree { calls: 0 };
+        assert_eq!(
+            generator
+                .open_tree_session_cancellable(&[], &|| true)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            generator
+                .tree_verify_cancellable(&[], &[], &|| true)
+                .unwrap(),
+            None
+        );
+        assert_eq!(generator.calls, 0);
+        assert_eq!(
+            generator
+                .open_tree_session_cancellable(&[0], &|| false)
+                .unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            generator
+                .tree_verify_cancellable(&[3], &[-1], &|| false)
+                .unwrap(),
+            Some(vec![4])
+        );
+        assert_eq!(
+            generator.tree_verify_cancellable(&[], &[], &|| false),
+            Err(TreeOpError::Internal("legacy error".into()))
+        );
+        assert_eq!(generator.calls, 3);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn runner_tree_adapter_all_checkpoints_are_transactional() {
+        let _device = crate::test_support::cuda_fixture_guard();
+        use super::*;
+        use crate::test_support::prefix_bytes;
+        use std::cell::Cell;
+        for context in [16, 12289] {
+            let Some(runner) = crate::test_support::tiny_cuda_runner(context) else {
+                return;
+            };
+            let mut generator = RunnerGenerator::new(runner, 7);
+            let polls = Cell::new(0);
+            let expected = generator
+                .open_tree_session_cancellable(&[0, 1, 2], &|| {
+                    polls.set(polls.get() + 1);
+                    false
+                })
+                .unwrap()
+                .unwrap();
+            assert!(polls.get() >= 5);
+            for cancel_at in 1..=polls.get() {
+                generator.open_tree_session(&[5, 6]).unwrap();
+                let before = prefix_bytes(&mut generator.runner);
+                let count = Cell::new(0);
+                assert!(
+                    generator
+                        .open_tree_session_cancellable(&[0, 1, 2], &|| {
+                            count.set(count.get() + 1);
+                            count.get() == cancel_at
+                        })
+                        .unwrap()
+                        .is_none()
+                );
+                if cancel_at == 1 {
+                    assert!(generator.tree_session_open);
+                    assert_eq!(prefix_bytes(&mut generator.runner), before);
+                } else {
+                    assert!(!generator.tree_session_open);
+                    assert_eq!(
+                        generator
+                            .runner
+                            .resident_cuda()
+                            .unwrap()
+                            .unwrap()
+                            .cache_len(),
+                        0
+                    );
+                }
+                assert_eq!(generator.open_tree_session(&[0, 1, 2]).unwrap(), expected);
+            }
+            let tokens = [expected, (expected + 1) % 8];
+            let parents = [-1, 0];
+            let expected_tokens = generator.tree_verify(&tokens, &parents).unwrap();
+            let expected_kv = prefix_bytes(&mut generator.runner);
+            generator.open_tree_session(&[0, 1, 2]).unwrap();
+            let polls = Cell::new(0);
+            assert_eq!(
+                generator
+                    .tree_verify_cancellable(&tokens, &parents, &|| {
+                        polls.set(polls.get() + 1);
+                        false
+                    })
+                    .unwrap()
+                    .unwrap(),
+                expected_tokens
+            );
+            assert!(polls.get() >= 6);
+            assert_eq!(
+                generator
+                    .runner
+                    .resident_cuda()
+                    .unwrap()
+                    .unwrap()
+                    .tree_graph_bucket_count()
+                    > 0,
+                context == 16
+            );
+            for cancel_at in 1..=polls.get() {
+                generator.open_tree_session(&[0, 1, 2]).unwrap();
+                let before = prefix_bytes(&mut generator.runner);
+                let count = Cell::new(0);
+                assert!(
+                    generator
+                        .tree_verify_cancellable(&tokens, &parents, &|| {
+                            count.set(count.get() + 1);
+                            count.get() == cancel_at
+                        })
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(generator.tree_session_open);
+                assert_eq!(prefix_bytes(&mut generator.runner), before);
+                assert_eq!(
+                    generator.tree_verify(&tokens, &parents).unwrap(),
+                    expected_tokens
+                );
+                assert_eq!(prefix_bytes(&mut generator.runner), expected_kv);
+            }
+            assert!(matches!(
+                generator.tree_verify_cancellable(&tokens, &[], &|| false),
+                Err(TreeOpError::BadRequest(_))
+            ));
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn speculative_loop_cancellation_avoids_next_target_verification() {
+        let _device = crate::test_support::cuda_fixture_guard();
+        use super::*;
+        for sampling in [
+            Sampling::Greedy,
+            Sampling::TopK {
+                k: 3,
+                temp: 0.8,
+                seed: 7,
+            },
+            Sampling::TopP {
+                p: 0.9,
+                temp: 0.8,
+                seed: 7,
+            },
+        ] {
+            let request = GenRequest {
+                // Every possible [0, pending] suffix has a prior occurrence
+                // with a continuation, ensuring a real lookup tree verify.
+                prompt_tokens: vec![0, 0, 0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0],
+                max_new: 4,
+                sampling,
+                logprobs: None,
+                stop_eos: false,
+            };
+            let Some(runner) = crate::test_support::tiny_cuda_runner(64) else {
+                return;
+            };
+            let mut baseline = RunnerGenerator::new(runner, 7).with_spec_lookup(true);
+            let mut expected = Vec::new();
+            baseline
+                .generate(&request, &mut |step| {
+                    expected.push(step.token);
+                    true
+                })
+                .unwrap();
+            assert_eq!(expected.len(), 4);
+            assert!(
+                baseline
+                    .runner
+                    .resident_cuda()
+                    .unwrap()
+                    .unwrap()
+                    .tree_graph_bucket_count()
+                    > 0,
+                "fixture must reach the existing speculative tree dispatch"
+            );
+            let Some(runner) = crate::test_support::tiny_cuda_runner(64) else {
+                return;
+            };
+            let mut generator = RunnerGenerator::new(runner, 7).with_spec_lookup(true);
+            let cancelled = std::cell::Cell::new(false);
+            let mut emitted = Vec::new();
+            generator
+                .generate_cancellable(
+                    &request,
+                    &mut |step| {
+                        emitted.push(step.token);
+                        // Disconnect occurs after a delivered step; returning true
+                        // forces subsequent cancellation to use the separate query.
+                        cancelled.set(true);
+                        true
+                    },
+                    &|| cancelled.get(),
+                )
+                .unwrap();
+            assert_eq!(emitted, expected[..1]);
+            assert_eq!(
+                generator
+                    .runner
+                    .resident_cuda()
+                    .unwrap()
+                    .unwrap()
+                    .tree_graph_bucket_count(),
+                0,
+                "cancelled speculative loop performed another target verification"
+            );
+            assert_eq!(
+                generator
+                    .runner
+                    .resident_cuda()
+                    .unwrap()
+                    .unwrap()
+                    .cache_len(),
+                0
+            );
+            assert!(generator.draft_fed.is_empty());
+            let mut recovered = Vec::new();
+            generator
+                .generate(&request, &mut |step| {
+                    recovered.push(step.token);
+                    true
+                })
+                .unwrap();
+            assert_eq!(recovered, expected);
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn runner_tree_session_query_reaches_native_prefill() {
+        let _device = crate::test_support::cuda_fixture_guard();
+        use super::*;
+        let Some(runner) = crate::test_support::tiny_cuda_runner(16) else {
+            return;
+        };
+        let mut generator = RunnerGenerator::new(runner, 7);
+        let expected = generator.open_tree_session(&[0, 1, 2]).unwrap();
+        let polls = std::cell::Cell::new(0);
+        assert!(
+            generator
+                .open_tree_session_cancellable(&[0, 1, 2], &|| {
+                    polls.set(polls.get() + 1);
+                    polls.get() == 2
+                })
+                .unwrap()
+                .is_none(),
+            "tree session did not forward the native query"
+        );
+        assert!(!generator.tree_session_open);
+        assert_eq!(
+            generator
+                .runner
+                .resident_cuda()
+                .unwrap()
+                .unwrap()
+                .cache_len(),
+            0
+        );
+        assert_eq!(generator.open_tree_session(&[0, 1, 2]).unwrap(), expected);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn runner_tree_verify_query_preserves_session() {
+        let _device = crate::test_support::cuda_fixture_guard();
+        use super::*;
+        let Some(runner) = crate::test_support::tiny_cuda_runner(16) else {
+            return;
+        };
+        let mut generator = RunnerGenerator::new(runner, 7);
+        let pending = generator.open_tree_session(&[0, 1, 2]).unwrap();
+        let before = crate::test_support::prefix_bytes(&mut generator.runner);
+        let polls = std::cell::Cell::new(0);
+        assert!(
+            generator
+                .tree_verify_cancellable(&[pending, (pending + 1) % 8], &[-1, 0], &|| {
+                    polls.set(polls.get() + 1);
+                    polls.get() == 2
+                })
+                .unwrap()
+                .is_none(),
+            "tree verify did not forward the native query"
+        );
+        assert!(generator.tree_session_open);
+        assert_eq!(
+            generator
+                .runner
+                .resident_cuda()
+                .unwrap()
+                .unwrap()
+                .cache_len(),
+            3
+        );
+        assert_eq!(
+            crate::test_support::prefix_bytes(&mut generator.runner),
+            before
+        );
+        assert!(
+            !generator
+                .tree_verify(&[pending, (pending + 1) % 8], &[-1, 0])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     /// Reconcile pins for `draft_greedy_tokens` (the ADR 0032 truncate-based
     /// reconcile). PIN 1 — partial accept: a rejected draft suffix must be
     /// truncated away (not reset), and the next drafts must equal a FRESH

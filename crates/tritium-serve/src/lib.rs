@@ -26,6 +26,8 @@
 pub mod dto;
 pub mod generator;
 mod qwen_generator;
+#[cfg(all(test, feature = "cuda"))]
+mod test_support;
 pub mod tokenizer_passthrough;
 
 #[cfg(feature = "serve")]

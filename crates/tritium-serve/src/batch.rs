@@ -535,7 +535,11 @@ fn spec_cycle(
     s: &mut SpecSeq,
     eos: u32,
     n_ctx: usize,
+    draining: &AtomicBool,
 ) -> Result<SpecOutcome, String> {
+    if s.tx.is_closed() || draining.load(Ordering::Acquire) {
+        return Ok(SpecOutcome::Cancelled);
+    }
     let pending = *s.history.last().expect("spec history holds the prompt");
     // Budget-clamped draft: total tree rows must fit the KV arena
     // (cache_len = history.len() - 1, the verifier needs
@@ -568,6 +572,9 @@ fn spec_cycle(
             s.chain,
         )
     };
+    if s.tx.is_closed() || draining.load(Ordering::Acquire) {
+        return Ok(SpecOutcome::Cancelled);
+    }
     // Cost-model d: drafter wall per drafted token (empty results — bails —
     // carry no per-token denominator; skipped). Probe cycles feed
     // draft_resync (telemetry), steady-state cycles the floor's draft_tok.
@@ -582,9 +589,14 @@ fn spec_cycle(
         // Plain M=1 graph step (faster than a 1-node tree).
         let t0 = std::time::Instant::now();
         let pos = s.history.len() - 1;
-        let logits = runner
-            .forward(&[pending], &[pos])
-            .map_err(|e| e.to_string())?;
+        let Some(logits) = runner
+            .forward_cancellable(&[pending], &[pos], &|| {
+                s.tx.is_closed() || draining.load(Ordering::Acquire)
+            })
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(SpecOutcome::Cancelled);
+        };
         s.n_plain += 1;
         let el = t0.elapsed();
         s.t_plain += el;
@@ -602,9 +614,14 @@ fn spec_cycle(
     tokens.extend(&drafts);
     let parents: Vec<i32> = (0..tokens.len() as i32).map(|i| i - 1).collect();
     let t0 = std::time::Instant::now();
-    let committed = runner
-        .tree_verify_greedy(&tokens, &parents)
-        .map_err(|e| e.to_string())?;
+    let Some(committed) = runner
+        .tree_verify_greedy_cancellable(&tokens, &parents, &|| {
+            s.tx.is_closed() || draining.load(Ordering::Acquire)
+        })
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(SpecOutcome::Cancelled);
+    };
     s.n_verify += 1;
     s.n_committed += committed.len();
     SPEC_VERIFIES.fetch_add(1, Ordering::Relaxed);
@@ -1805,6 +1822,9 @@ pub(crate) fn run_batched(
                 // admissions use, so it interleaves with live slots instead
                 // of stalling them.
                 Job::OpenTreeSession { prompt, resp } => {
+                    if resp.is_closed() {
+                        continue;
+                    }
                     if prompt.is_empty() || prompt.len() >= n_ctx {
                         let _ = resp.send(Err(crate::generator::TreeOpError::BadRequest(
                             "prompt is empty or exceeds the model context window".into(),
@@ -1859,6 +1879,9 @@ pub(crate) fn run_batched(
                     parents,
                     resp,
                 } => {
+                    if resp.is_closed() {
+                        continue;
+                    }
                     if !tree_open {
                         let _ = resp.send(Err(crate::generator::TreeOpError::Conflict(
                             "no open tree session (open one with /v1/tree/session; a chat \
@@ -1869,7 +1892,9 @@ pub(crate) fn run_batched(
                     }
                     let prior_phase = phase.swap(PHASE_DECODE, Ordering::AcqRel);
                     let out = runner
-                        .tree_verify_greedy(&tokens, &parents)
+                        .tree_verify_greedy_cancellable(&tokens, &parents, &|| {
+                            resp.is_closed() || draining.load(Ordering::Acquire)
+                        })
                         .map_err(|e| match e {
                             tritium_nn::ResidentOpError::Unavailable => {
                                 crate::generator::TreeOpError::Unsupported(
@@ -1882,7 +1907,21 @@ pub(crate) fn run_batched(
                             other => crate::generator::TreeOpError::Internal(other.to_string()),
                         });
                     phase.store(prior_phase, Ordering::Release);
-                    let _ = resp.send(out);
+                    match out {
+                        Ok(Some(tokens)) => {
+                            let _ = resp.send(Ok(tokens));
+                        }
+                        Ok(None) => {
+                            if draining.load(Ordering::Acquire) {
+                                let _ = resp.send(Err(crate::generator::TreeOpError::Draining(
+                                    "server draining".into(),
+                                )));
+                            }
+                        }
+                        Err(error) => {
+                            let _ = resp.send(Err(error));
+                        }
+                    }
                 }
             }
         }
@@ -2117,9 +2156,17 @@ pub(crate) fn run_batched(
             let decode_started = Instant::now();
             let spec_span =
                 tracing::info_span!(parent: &s.request_span, "model.speculative_decode");
-            match spec_span.in_scope(|| spec_cycle(&mut runner, d, &mut s, eos, n_ctx)) {
+            match spec_span.in_scope(|| spec_cycle(&mut runner, d, &mut s, eos, n_ctx, &draining)) {
                 Ok(SpecOutcome::Continue) => spec = Some(s),
-                Ok(SpecOutcome::Done | SpecOutcome::Cancelled) => s.print_stats(),
+                Ok(SpecOutcome::Done) => s.print_stats(),
+                Ok(SpecOutcome::Cancelled) => {
+                    if draining.load(Ordering::Acquire) {
+                        let _ = s.tx.try_send(GenEvent::Error("server draining".into()));
+                    }
+                    runner.reset();
+                    d.reset();
+                    s.print_stats();
+                }
                 Err(msg) => {
                     let _ = s.tx.try_send(GenEvent::Error(msg));
                 }
@@ -2268,6 +2315,165 @@ pub(crate) fn run_batched(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn solo_spec_cycle_cancels_inside_target_forward_without_publication() {
+        for drain in [false, true] {
+            for prefix in [0, 1] {
+                let trigger: ArmedTrigger = Arc::new(Mutex::new(None));
+                let mut runner = tiny_runner(trigger.clone());
+                let mut reference = tiny_runner(Arc::new(Mutex::new(None)));
+                let mut draft = tiny_runner(Arc::new(Mutex::new(Some(Box::new(|| {
+                    panic!("budget-clamped cycle must not enter the drafter")
+                })))));
+                if prefix != 0 {
+                    runner.forward(&[0], &[0]).unwrap();
+                    reference.forward(&[0], &[0]).unwrap();
+                }
+                let before = cache_bits(&runner);
+                let (tx, rx) = mpsc::channel(4);
+                let mut receiver = Some(rx);
+                let draining = Arc::new(AtomicBool::new(false));
+                *trigger.lock().unwrap() = Some(if drain {
+                    let flag = draining.clone();
+                    Box::new(move || flag.store(true, Ordering::Release))
+                } else {
+                    let receiver = receiver.take().unwrap();
+                    Box::new(move || drop(receiver))
+                });
+                let history = if prefix == 0 { vec![1] } else { vec![0, 1] };
+                let mut state = SpecSeq {
+                    tx,
+                    request_span: tracing::Span::none(),
+                    history: history.clone(),
+                    emitted: 3,
+                    max_new: 4,
+                    req: GenRequest {
+                        prompt_tokens: vec![0],
+                        max_new: 4,
+                        logprobs: None,
+                        sampling: Sampling::Greedy,
+                        stop_eos: false,
+                    },
+                    policy: DraftPolicy::Adaptive { acc: 0.75 },
+                    governor: SpecGovernor::Off,
+                    chain: true,
+                    draft_fed: Vec::new(),
+                    draft_pos: 0,
+                    stats: false,
+                    n_verify: 0,
+                    n_committed: 0,
+                    n_plain: 0,
+                    t_verify: std::time::Duration::ZERO,
+                    t_plain: std::time::Duration::ZERO,
+                };
+                assert!(matches!(
+                    spec_cycle(&mut runner, &mut draft, &mut state, 7, 16, &draining).unwrap(),
+                    SpecOutcome::Cancelled
+                ));
+                assert!(
+                    trigger.lock().unwrap().is_none(),
+                    "target projection must enter"
+                );
+                assert_eq!(cache_bits(&runner), before);
+                assert_eq!(state.history, history);
+                assert_eq!(state.emitted, 3);
+                assert_eq!(
+                    (state.n_plain, state.n_verify, state.n_committed),
+                    (0, 0, 0)
+                );
+                assert_eq!(state.tx.is_closed(), !drain);
+                if let Some(receiver) = receiver.as_mut() {
+                    assert!(matches!(
+                        receiver.try_recv(),
+                        Err(mpsc::error::TryRecvError::Empty)
+                    ));
+                }
+                let recovered = runner.forward(&[1], &[prefix]).unwrap();
+                let expected = reference.forward(&[1], &[prefix]).unwrap();
+                assert_eq!(
+                    recovered
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    expected
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(cache_bits(&runner), cache_bits(&reference));
+            }
+        }
+    }
+
+    #[test]
+    fn solo_spec_cycle_skips_closed_or_draining_target_work() {
+        for drain in [false, true] {
+            let trigger = || -> ArmedTrigger {
+                Arc::new(Mutex::new(Some(Box::new(|| {
+                    panic!("cancelled solo cycle entered a projection")
+                }))))
+            };
+            let mut runner = tiny_runner(trigger());
+            let mut draft = tiny_runner(trigger());
+            let (tx, rx) = mpsc::channel(4);
+            let mut rx = Some(rx);
+            if !drain {
+                rx.take();
+            }
+            let req = GenRequest {
+                prompt_tokens: vec![0],
+                max_new: 4,
+                logprobs: None,
+                sampling: Sampling::Greedy,
+                stop_eos: false,
+            };
+            let mut state = SpecSeq {
+                tx,
+                request_span: tracing::Span::none(),
+                history: vec![0],
+                emitted: 1,
+                max_new: 4,
+                req,
+                policy: DraftPolicy::from_env().unwrap(),
+                governor: SpecGovernor::from_env().unwrap(),
+                chain: true,
+                draft_fed: Vec::new(),
+                draft_pos: 0,
+                stats: false,
+                n_verify: 0,
+                n_committed: 0,
+                n_plain: 0,
+                t_verify: std::time::Duration::ZERO,
+                t_plain: std::time::Duration::ZERO,
+            };
+            assert_eq!(state.tx.is_closed(), !drain);
+            assert!(matches!(
+                spec_cycle(
+                    &mut runner,
+                    &mut draft,
+                    &mut state,
+                    7,
+                    16,
+                    &AtomicBool::new(drain)
+                )
+                .unwrap(),
+                SpecOutcome::Cancelled
+            ));
+            assert_eq!(state.history, vec![0]);
+            assert_eq!(
+                (state.n_verify, state.n_plain, state.n_committed),
+                (0, 0, 0)
+            );
+            assert!(
+                runner
+                    .kv
+                    .iter()
+                    .chain(&draft.kv)
+                    .all(|cache| cache.len == 0)
+            );
+        }
+    }
+
     use super::*;
     use std::sync::Mutex;
     use tritium_nn::{
@@ -2555,80 +2761,6 @@ mod tests {
         }
     }
 
-    fn tiny_cuda_runner() -> Option<ModelRunner> {
-        let backend = match tritium_cuda::CudaBackend::new(0) {
-            Ok(backend) => backend,
-            Err(error) => {
-                assert!(
-                    std::env::var("TRITIUM_REQUIRE_CUDA").as_deref() != Ok("1"),
-                    "required CUDA fixture cannot initialize: {error}"
-                );
-                eprintln!("UNKNOWN: CUDA retirement fixture unavailable ({error})");
-                return None;
-            }
-        };
-        let projection = |rows, cols, seed| {
-            let trits: Vec<_> = (0..rows * cols)
-                .map(|i| tritium_core::Trit::from_i8(((i * 7 + seed) % 3) as i8 - 1).unwrap())
-                .collect();
-            Projection::Ternary(TernaryLinear::new(&backend, &trits, rows, cols, 0.03125).unwrap())
-        };
-        let config = ModelConfig {
-            arch: "bitnet".into(),
-            n_layers: 2,
-            n_embd: 64,
-            n_head: 2,
-            n_head_kv: 1,
-            head_dim: 32,
-            n_ff: 64,
-            n_ctx: 16,
-            rope_theta: 10_000.0,
-            rms_eps: 1e-5,
-        };
-        let weights = ModelWeights {
-            token_embd: TokenEmbedding::from_dense(
-                (0..512)
-                    .map(|i| ((i * 5 % 23) as f32 - 11.0) / 64.0)
-                    .collect(),
-                8,
-                64,
-            )
-            .unwrap(),
-            vocab: 8,
-            n_embd: 64,
-            layers: (0..2)
-                .map(|li| TransformerBlock {
-                    attn_norm: vec![1.0; 64],
-                    q_proj: projection(64, 64, li + 1),
-                    k_proj: projection(32, 64, li + 2),
-                    v_proj: projection(32, 64, li + 3),
-                    o_proj: projection(64, 64, li + 4),
-                    attn_sub_norm: Vec::new(),
-                    q_bias: Vec::new(),
-                    k_bias: Vec::new(),
-                    v_bias: Vec::new(),
-                    q_norm: Vec::new(),
-                    k_norm: Vec::new(),
-                    ffn_norm: vec![1.0; 64],
-                    mlp: Mlp::Relu2(tritium_nn::Relu2Mlp {
-                        gate: projection(64, 64, li + 5),
-                        up: projection(64, 64, li + 6),
-                        down: projection(64, 64, li + 7),
-                        ffn_sub_norm: Vec::new(),
-                        rms_eps: 1e-5,
-                    }),
-                })
-                .collect(),
-            output_norm: vec![1.0; 64],
-            lm_head: None,
-        };
-        Some(ModelRunner::from_weights(
-            config,
-            weights,
-            Box::new(backend),
-        ))
-    }
-
     fn peer_bytes(runner: &mut ModelRunner, batch: &tritium_cuda::BatchKv) -> Vec<Vec<u8>> {
         let model = runner.resident_cuda().unwrap().unwrap();
         (0..2)
@@ -2649,7 +2781,8 @@ mod tests {
 
     #[test]
     fn pending_retirement_releases_once_and_preserves_live_cuda_peer() {
-        let Some(mut runner) = tiny_cuda_runner() else {
+        let _device = crate::test_support::cuda_fixture_guard();
+        let Some(mut runner) = crate::test_support::tiny_cuda_runner(16) else {
             return;
         };
         let mut batch = runner.new_batch_paged(2, 2).unwrap();
