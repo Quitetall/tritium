@@ -66,9 +66,9 @@ pub fn ladder_step(bs: &[f32], t: usize, grid: usize) -> f32 {
 
 /// Round one value onto the ladder's grid at step `delta`: `clamp(round(w/Δ), ±(3^t−1)/2)·Δ`.
 ///
-/// The single definition of what the ladder does to a scalar, shared with [`ladder_digits`] and
-/// [`ladder_sse`]. An activation-aware fitter must round with exactly this or it is fitting a
-/// different quantizer than the packer will encode.
+/// The single definition of what the ladder does to a scalar, shared with the
+/// balanced-ternary encoder and SSE metric. An activation-aware fitter must round
+/// with exactly this or it is fitting a different quantizer than the packer will encode.
 #[must_use]
 pub fn ladder_quantize_at(w: f32, t: usize, delta: f32) -> f32 {
     if delta <= 0.0 || !delta.is_finite() {

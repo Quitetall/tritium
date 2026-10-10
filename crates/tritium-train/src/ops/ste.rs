@@ -544,7 +544,8 @@ fn fit_group_geometric_rotated(
 /// [`salt_quantize_forward_grouped`] on the **balanced-ternary ladder** — same shape, same output
 /// layout, same rotation semantics; only the scale rule differs.
 ///
-/// `grid` is the number of deterministic `Δ` candidates (see [`fit_group_geometric`]); `0` or `1`
+/// `grid` is the number of deterministic `Δ` candidates (see
+/// [`tritium_quantize::engine::fit_ladder_group`]); `0` or `1`
 /// means the single clipping-free step. `16` spans a 16× range and is the usual choice — the search
 /// is load-bearing on heavy-tailed groups, where a clipping-free ladder wastes resolution on outliers.
 #[must_use]
@@ -709,7 +710,7 @@ pub fn salt_quantize_forward_grouped_geometric_alloc(
 /// row-major group order (`row * cols.div_ceil(group) + block`) — the layout a packer and the
 /// diagnostics index by.
 ///
-/// Goes through the same [`fit_group_geometric_rotated`] as the dense forward, so the symbols a
+/// Goes through the same group-local rotation and fit as the dense forward, so the symbols a
 /// packer writes cannot drift from the reconstruction training optimised against.
 #[must_use]
 pub fn geometric_ladder_fit(

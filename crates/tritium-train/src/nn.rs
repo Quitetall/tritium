@@ -1,4 +1,4 @@
-//! Higher-level differentiable building blocks assembled on the [`Tape`](crate::Tape) — the pieces
+//! Higher-level differentiable building blocks assembled on the [`Tape`] — the pieces
 //! the real-model SALT-distillation forward needs beyond the flat op set (plan 0040).
 
 use crate::Tape;
