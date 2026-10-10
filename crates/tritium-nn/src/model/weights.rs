@@ -74,7 +74,7 @@ impl ModelWeights {
     /// LLM activations are outlier-heavy. Measured end to end, this is worth **0.24% at best and
     /// only on an unrotated artifact**; with rotation on — the default — it is worth nothing,
     /// because the Hadamard already whitens the activation. See
-    /// [`SaltLinear::set_activation_group`] for the table and the mechanism.
+    /// [`crate::SaltLinear::set_activation_group`] for the table and the mechanism.
     ///
     /// Off by default and switched per model rather than per build, because the per-group path
     /// hands the GEMM dequantized f32 instead of integers (a per-group scale cannot factor out of
