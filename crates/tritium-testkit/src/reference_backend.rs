@@ -10,7 +10,8 @@
 use core::any::Any;
 
 use tritium_core::{
-    GemmShape, TernaryFormat, Trit, reference_embed, reference_mpgemm, reference_ternary_matmul,
+    DenseView, GemmShape, TernaryFormat, Trit, reference_embed, reference_mpgemm,
+    reference_ternary_matmul,
 };
 use tritium_format::AdditiveTensor;
 use tritium_format::{
@@ -98,16 +99,7 @@ impl TernaryBackend for ReferenceBackend {
     fn upload_tensor(&self, tensor: TensorView<'_>) -> Result<Box<dyn DeviceBuffer>, BackendError> {
         match tensor {
             TensorView::Additive(view) => {
-                let plane_count = u8::try_from(view.plane_count()).map_err(|_| {
-                    BackendError::InvalidInput("additive plane count exceeds u8".into())
-                })?;
-                let tensor = AdditiveTensor::new(
-                    view.layout(),
-                    plane_count,
-                    view.trits().to_vec(),
-                    view.scales().to_vec(),
-                )
-                .map_err(|error| {
+                let tensor = AdditiveTensor::from_view(view).map_err(|error| {
                     BackendError::InvalidInput(format!("invalid additive tensor: {error:?}"))
                 })?;
                 Ok(Box::new(RefAdditiveBuffer { tensor }))
@@ -148,39 +140,11 @@ impl TernaryBackend for ReferenceBackend {
             .as_any()
             .downcast_ref::<RefDenseBuffer>()
             .ok_or_else(|| BackendError::InvalidInput("unknown reference tensor kind".into()))?;
-        let activation_count = p
-            .batch
-            .checked_mul(buf.cols)
-            .ok_or_else(|| BackendError::InvalidInput("activation dimensions overflow".into()))?;
-        let output_count = p
-            .batch
-            .checked_mul(buf.rows)
-            .ok_or_else(|| BackendError::InvalidInput("output dimensions overflow".into()))?;
-        if p.act.len() != activation_count || p.transformed_act.len() != activation_count {
-            return Err(BackendError::ShapeMismatch {
-                expected: activation_count,
-                got: p.act.len().max(p.transformed_act.len()),
-            });
-        }
-        if p.out.len() != output_count {
-            return Err(BackendError::ShapeMismatch {
-                expected: output_count,
-                got: p.out.len(),
-            });
-        }
-        p.transformed_act.copy_from_slice(p.act);
-        for batch in 0..p.batch {
-            for row in 0..buf.rows {
-                let weights = &buf.values[row * buf.cols..(row + 1) * buf.cols];
-                let activations = &p.act[batch * buf.cols..(batch + 1) * buf.cols];
-                p.out[batch * buf.rows + row] = activations
-                    .iter()
-                    .zip(weights)
-                    .map(|(activation, weight)| activation * weight)
-                    .sum();
-            }
-        }
-        Ok(())
+        DenseView::new(buf.rows, buf.cols, &buf.values)
+            .and_then(|view| view.matmul(p.act, p.batch, p.transformed_act, p.out))
+            .map_err(|e| {
+                BackendError::InvalidInput(format!("reference dense matmul failed: {e:?}"))
+            })
     }
 
     fn embed_rows(
@@ -198,28 +162,11 @@ impl TernaryBackend for ReferenceBackend {
             .as_any()
             .downcast_ref::<RefDenseBuffer>()
             .ok_or_else(|| BackendError::InvalidInput("unknown reference tensor kind".into()))?;
-        let expected = ids
-            .len()
-            .checked_mul(buf.cols)
-            .ok_or_else(|| BackendError::InvalidInput("gather dimensions overflow".into()))?;
-        if out.len() != expected {
-            return Err(BackendError::ShapeMismatch {
-                expected,
-                got: out.len(),
-            });
-        }
-        if ids.iter().any(|&row| row >= buf.rows) {
-            return Err(BackendError::InvalidInput(
-                "gather row outside tensor".into(),
-            ));
-        }
-        // Zero-width dense rows are legal; chunks_exact_mut(0) would panic.
-        if buf.cols != 0 {
-            for (&row, output) in ids.iter().zip(out.chunks_exact_mut(buf.cols)) {
-                output.copy_from_slice(&buf.values[row * buf.cols..(row + 1) * buf.cols]);
-            }
-        }
-        Ok(())
+        DenseView::new(buf.rows, buf.cols, &buf.values)
+            .and_then(|view| view.embed(ids, out))
+            .map_err(|e| {
+                BackendError::InvalidInput(format!("reference dense gather failed: {e:?}"))
+            })
     }
 
     fn upload_weights(

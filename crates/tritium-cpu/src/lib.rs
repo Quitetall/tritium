@@ -35,6 +35,16 @@
 //! dispatch path — its production form is the per-ISA SIMD gather (deferred). The
 //! independent `M` rows are spread across `rayon`'s thread pool without changing
 //! per-row arithmetic, so results are deterministic regardless of thread count.
+//!
+//! ## Unified semantic tensors
+//!
+//! [`CpuBackend::upload_tensor`], [`CpuBackend::matmul`] and
+//! [`CpuBackend::embed_rows`] accept additive and dense semantic tensors. This
+//! path currently uses the scalar core implementation, including consumer-bound
+//! basis transforms. It owns decoded i8 trits/f32 scales or dense f32 values;
+//! buffer byte counts are decoded payload sizes, not packed artifact sizes.
+//! The ISA flags above describe legacy packed kernel availability, not SIMD
+//! acceleration or packed residency for these semantic operations.
 //
 // `linkme`'s `distributed_slice` expands to a static with a custom
 // `#[link_section]`, and the AVX2 kernel needs hand-written `unsafe` for its
@@ -51,7 +61,8 @@ use tritium_format::{
 };
 use tritium_runtime::BackendEntry;
 use tritium_spec::{
-    BackendError, DeviceBuffer, DeviceCaps, MpGemm, MpGemmProjectedVjp, TernaryBackend,
+    BackendError, DeviceBuffer, DeviceCaps, MpGemm, MpGemmProjectedVjp, TensorMatmul, TensorView,
+    TernaryBackend,
 };
 
 #[cfg(test)]
@@ -79,6 +90,7 @@ mod simd;
 
 /// Exact, allocation-accounted SALT V2 CPU semantic reference.
 pub mod salt_v2;
+mod semantic;
 
 /// Owned host-memory buffer of packed weight bytes.
 ///
@@ -218,6 +230,25 @@ impl CpuBackend {
 }
 
 impl TernaryBackend for CpuBackend {
+    // Unified semantic operations currently use the scalar core implementation,
+    // owning decoded trits/scales rather than packed-residency or SIMD claims.
+    fn upload_tensor(&self, tensor: TensorView<'_>) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        semantic::CpuTensor::upload(tensor)
+    }
+
+    fn matmul(&self, p: TensorMatmul<'_>) -> Result<(), BackendError> {
+        semantic::CpuTensor::matmul(p)
+    }
+
+    fn embed_rows(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        ids: &[usize],
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        semantic::CpuTensor::embed(tensor, ids, out)
+    }
+
     fn device_id(&self) -> &str {
         "cpu"
     }

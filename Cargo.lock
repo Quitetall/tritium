@@ -4800,6 +4800,7 @@ dependencies = [
  "tritium-core",
  "tritium-format",
  "tritium-runtime",
+ "tritium-schema",
  "tritium-spec",
  "tritium-testkit",
 ]

@@ -25,6 +25,7 @@
 extern crate alloc;
 
 mod additive;
+mod dense;
 mod dtype;
 mod error;
 mod feedback;
@@ -37,6 +38,7 @@ pub use additive::{
     AdditiveError, AdditiveView, BasisBound, Gather, Matmul, apply_basis, apply_inverse_basis,
     reference_embed, reference_ternary_matmul,
 };
+pub use dense::{DenseError, DenseView};
 pub use dtype::{DType, TernaryFormat};
 pub use error::TritError;
 #[cfg(feature = "std")]

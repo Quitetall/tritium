@@ -49,6 +49,26 @@ pub struct AdditiveTensor {
 }
 
 impl AdditiveTensor {
+    /// Copy a validated semantic view with fallible buffer reservations.
+    ///
+    /// The owned constructor additionally enforces exact stored scale precision.
+    /// Coefficients remain ternary; this does not materialize dense weights.
+    pub fn from_view(view: AdditiveView<'_>) -> Result<Self, AdditiveTensorError> {
+        let planes =
+            u8::try_from(view.plane_count()).map_err(|_| AdditiveTensorError::LengthOverflow)?;
+        let scale_bytes = core::mem::size_of_val(view.scales());
+        view.trits()
+            .len()
+            .checked_add(scale_bytes)
+            .ok_or(AdditiveTensorError::LengthOverflow)?;
+        Self::new(
+            view.layout(),
+            planes,
+            copy_payload(view.trits())?,
+            copy_payload(view.scales())?,
+        )
+    }
+
     /// Validate and own a decoded additive tensor.
     pub fn new(
         layout: AdditiveLayout,
@@ -267,6 +287,17 @@ impl AdditiveTensor {
         AdditiveView::new(self.layout, self.plane_count, &self.trits, &self.scales)
             .expect("AdditiveTensor invariants are immutable after construction")
     }
+}
+
+fn copy_payload<T: Copy>(values: &[T]) -> Result<Vec<T>, AdditiveTensorError> {
+    let mut owned = Vec::new();
+    owned
+        .try_reserve_exact(values.len())
+        .map_err(|_| AdditiveTensorError::AllocationFailed {
+            requested: core::mem::size_of_val(values),
+        })?;
+    owned.extend_from_slice(values);
+    Ok(owned)
 }
 
 fn tensor_coefficients(layout: AdditiveLayout) -> Result<usize, AdditiveTensorError> {
