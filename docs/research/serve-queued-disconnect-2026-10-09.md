@@ -61,11 +61,19 @@ Every managed command has an explicit timeout. Results so far:
 - Full HTTP contract suite: 33 passed, 0 failed, 0 ignored, 1.22 seconds.
 - Workspace formatting: passed.
 - Both new tests: 20 consecutive cached-executable repeats each, all passed.
+- Scoped Clippy with `--all-targets -- -D warnings`: passed, completed
+  20:35:18 EDT; the managed validation ended successfully with exit 0.
 
-Scoped Clippy and the remaining package-level tests are still pending; no
-pending result is a pass. The latter are tracked by managed invocation
-`0fd2956808c74e688a05f8a521dd4811`, which waits for the scoped validation to
-finish successfully before running the full `serve`-feature package suite.
+The complete `cargo test --locked -p tritium-serve --features serve` package
+check also passed at 20:36:42 EDT (managed invocation
+`0fd2956808c74e688a05f8a521dd4811`, terminal success/exit 0): 44 library,
+4 binary, 2 CLI, 33 HTTP contract and 1 OpenTelemetry tests, 84 executed tests
+in total. CUDA batch/speculative and real-model e2e feature lanes were disabled;
+their zero-case targets and zero doc-tests are not hardware/model evidence.
+Implementation and tests were saved in commit `3b19cc72`; this follow-up records
+the checks that finished after that commit. The working tree also contained
+unrelated edits, so these results remain developer checks, not clean candidate
+qualification receipts.
 
 The HTTP test holds the first request in a controlled generator, observes a
 second request in the real router/worker queue, polls its SSE role frame, closes
