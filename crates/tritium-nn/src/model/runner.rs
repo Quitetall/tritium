@@ -380,7 +380,7 @@ impl ModelRunner {
     /// `(tokens, parents)` draft tree, and `out[k]` its accepted tokens
     /// (bit-identical to verifying the slots sequentially). The LM head +
     /// argmax run once over the concatenated rows, amortizing the dominant
-    /// per-verify cost (ADR 0032) across the batch. Requires the f32 KV
+    /// per-verify cost (ADR 0032) across the batch. Requires the f32 or f16 KV
     /// rung, `head_dim % 4 == 0`, live non-duplicate rows and
     /// `Σ tokensₖ.len() <= 48`; paged slots need reservations covering each
     /// slot's `positions[r] + tokens.len()` tokens
@@ -399,6 +399,28 @@ impl ModelRunner {
     ) -> Result<Vec<Vec<u32>>, ResidentOpError> {
         self.resident_for_op()?
             .tree_verify_greedy_slots(batch, rows, trees)
+            .map_err(ResidentOpError::Op)
+    }
+
+    /// (cuda) Cooperative grouped verification. Cancellation returns no output
+    /// or row promotion; all selected and unrelated committed prefixes survive.
+    /// Query and reservation requirements match the native tree interfaces.
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] as for [`Self::tree_verify_greedy_slots`].
+    #[cfg(feature = "cuda")]
+    pub fn tree_verify_greedy_slots_cancellable(
+        &mut self,
+        batch: &mut tritium_cuda::BatchKv,
+        rows: &[usize],
+        trees: &[(&[u32], &[i32])],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<Vec<u32>>>, ResidentOpError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
+        self.resident_for_op()?
+            .tree_verify_greedy_slots_cancellable(batch, rows, trees, is_cancelled)
             .map_err(ResidentOpError::Op)
     }
 

@@ -2351,7 +2351,29 @@ impl CudaDecodeModel {
         rows: &[usize],
         trees: &[(&[u32], &[i32])],
     ) -> Result<Vec<Vec<u32>>, BackendError> {
-        let (m_total, on_cap) = self.tree_forward_slots(batch, rows, trees)?;
+        self.tree_verify_greedy_slots_cancellable(batch, rows, trees, &|| false)
+            .map(|output| output.expect("never-cancelled slots verify"))
+    }
+
+    /// Cooperatively verify one group with no partial cancellation commit.
+    /// `None` preserves every committed row and unrelated solo-tree authority.
+    /// The query must be cheap, nonblocking and non-panicking. Graphs are not
+    /// preempted; cancellation after the final checkpoint can race promotion.
+    /// Driver errors retain their existing non-atomic error semantics.
+    pub fn tree_verify_greedy_slots_cancellable(
+        &mut self,
+        batch: &mut BatchKv,
+        rows: &[usize],
+        trees: &[(&[u32], &[i32])],
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<Vec<u32>>>, BackendError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
+        let Some((m_total, on_cap)) = self.tree_forward_slots(batch, rows, trees, is_cancelled)?
+        else {
+            return Ok(None);
+        };
         // Consume on the stream that produced the logits; the pageable ids
         // dtoh below is the ONE ordering point (drains the whole verify
         // before the promotes' default-stream dtods touch the arenas) — the
@@ -2385,9 +2407,11 @@ impl CudaDecodeModel {
         // Per-slot accept walks over the CONCATENATED ids buffer: slot k's
         // rows are ids[row_start .. row_start + mᵢ] (local node i ↦ global
         // row row_start + i — the one strided mapping in the whole path,
-        // kept explicit here). Walk + promote are per-slot independent;
-        // regions are disjoint, so the sequential promotes can't interact.
+        // kept explicit here). Compute ALL paths before checking cancellation
+        // once and promoting ANY row. Never query between promotes: that
+        // would make cancellation a partially committed group.
         let mut outs: Vec<Vec<u32>> = Vec::with_capacity(rows.len());
+        let mut paths = Vec::with_capacity(rows.len());
         let mut row_start = 0usize;
         for (&row, &(tokens, parents)) in rows.iter().zip(trees) {
             let m_i = tokens.len();
@@ -2403,11 +2427,20 @@ impl CudaDecodeModel {
                     None => break,
                 }
             }
-            self.tree_promote_in(&path, Some((batch, row)))?;
             outs.push(path.iter().map(|&n| ids_r[n] as u32).collect());
+            paths.push((row, path));
             row_start += m_i;
         }
-        Ok(outs)
+        // The preceding dtoh settled the producing stream. Every KV write
+        // so far is beyond a committed watermark; cancellation leaves the
+        // prefixes, positions, pages and solo pending authority unchanged.
+        if is_cancelled() {
+            return Ok(None);
+        }
+        for (row, path) in paths {
+            self.tree_promote_in(&path, Some((batch, row)))?;
+        }
+        Ok(Some(outs))
     }
 
     /// The batched-slots FORWARD half: validate every target + tree UP
@@ -2415,7 +2448,8 @@ impl CudaDecodeModel {
     /// host tables, run ONE trunk over `mb` rows (graph replay of the slots
     /// twins, or the eager slots launches) and leave all `m_total` real
     /// rows' logits in `batch.tree_scratch.d_logits_all`. Returns
-    /// `(m_total, on_cap)` with `tree_forward`'s stream-ordering contract.
+    /// `Some((m_total, on_cap))` with `tree_forward`'s stream-ordering contract,
+    /// or `None` after cancellation settles all submitted work.
     ///
     /// Per-ROW ctrl layout (the I4 ctrl plane, `[mb, 3]` i32 row-major,
     /// uploaded into the batch's `tree_slots_graphs.d_ctrl`):
@@ -2429,7 +2463,11 @@ impl CudaDecodeModel {
         batch: &mut BatchKv,
         rows: &[usize],
         trees: &[(&[u32], &[i32])],
-    ) -> Result<(usize, bool), BackendError> {
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<(usize, bool)>, BackendError> {
+        if is_cancelled() {
+            return Ok(None);
+        }
         // ── Guard phase: EVERYTHING host-checked before any device work, so
         // a refusal is atomic across all listed slots. ──
         if rows.is_empty() || rows.len() != trees.len() {
@@ -2656,6 +2694,24 @@ impl CudaDecodeModel {
             .take()
             .expect("tree scratch just ensured");
 
+        // Exactly as for single-slot verification, polls never occur inside
+        // capture. Settle both owned streams before returning scratch or
+        // allowing paged-row retirement. A failed wait is a driver error.
+        macro_rules! checkpoint {
+            () => {
+                if is_cancelled() {
+                    self.stream
+                        .synchronize()
+                        .map_err(|e| driver_err("tree slots cancel working sync", &e))?;
+                    self.cap_stream
+                        .synchronize()
+                        .map_err(|e| driver_err("tree slots cancel cap sync", &e))?;
+                    batch.tree_scratch = Some(ts);
+                    return Ok(None);
+                }
+            };
+        }
+        checkpoint!();
         let up = if bucket.is_some() {
             &self.cap_stream
         } else {
@@ -2669,6 +2725,7 @@ impl CudaDecodeModel {
             .map_err(|e| driver_err("tree slots anc htod", &e))?;
         up.memcpy_htod(&n_anc, &mut ts.d_nanc)
             .map_err(|e| driver_err("tree slots n_anc htod", &e))?;
+        checkpoint!();
 
         if let Some(bucket) = bucket {
             // ── Graph route: replay the captured SLOTS trunk, then the eager
@@ -2724,6 +2781,7 @@ impl CudaDecodeModel {
                 tg.graphs.insert((bucket, false), SendGraph(g));
                 tg.raw_keepalive = self.batch_raw.clone();
             }
+            checkpoint!();
             // Per-replay data: page-table content (paged), then the per-row
             // ctrl plane; replay + tail all on cap_stream (stream order is
             // the only ordering needed).
@@ -2746,6 +2804,7 @@ impl CudaDecodeModel {
                     .launch()
                     .map_err(|e| driver_err("tree slots graph launch", &e))?;
             }
+            checkpoint!();
             let cs = &self.cap_stream;
             Self::bl_rmsnorm(
                 cs,
@@ -2810,7 +2869,9 @@ impl CudaDecodeModel {
                 m,
                 &mut ts.d_x,
             )?;
+            checkpoint!();
             for li in 0..self.layers.len() {
+                checkpoint!();
                 // q/k/v share one fused rmsnorm+quant of d_x (ADR 0036 L5).
                 Self::bl_rmsnorm_quant(
                     s,
@@ -2960,6 +3021,7 @@ impl CudaDecodeModel {
                 )?;
                 Self::bl_residual(s, &self.f_residual, &mut ts.d_x, &ts.d_proj, m * n_embd)?;
 
+                checkpoint!();
                 // Fused rmsnorm+quant (ADR 0036 L5).
                 Self::bl_rmsnorm_quant(
                     s,
@@ -3028,7 +3090,9 @@ impl CudaDecodeModel {
                     &mut ts.d_proj,
                 )?;
                 Self::bl_residual(s, &self.f_residual, &mut ts.d_x, &ts.d_proj, m * n_embd)?;
+                checkpoint!();
             }
+            checkpoint!();
             Self::bl_rmsnorm(
                 s,
                 &self.f_rmsnorm_batch,
@@ -3041,8 +3105,9 @@ impl CudaDecodeModel {
             )?;
             self.launch_head_tiled(s, &ts.d_norm_all, m, &mut ts.d_logits_all)?;
         }
+        checkpoint!();
         batch.tree_scratch = Some(ts);
-        Ok((m_total, bucket.is_some()))
+        Ok(Some((m_total, bucket.is_some())))
     }
 
     /// I4 eager launch: `kv_append_tree_slots[_paged]_g` — each REAL row's

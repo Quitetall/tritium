@@ -770,6 +770,10 @@ struct MultiFallbackLog {
 enum MultiOutcome {
     /// The round ran: drafts verified, committed tokens emitted.
     Ran,
+    /// A grouped verify observed drain or a closed response before any
+    /// promotion. Drop drafter enrollment and re-enter retirement/admission;
+    /// do not fall through to an uncancellable lockstep step in this tick.
+    Cancelled,
     /// Machinery unavailable this round (capacity edge, page exhaustion, or
     /// a device error — logged when it is an error): the caller drops the
     /// pool state and falls through to a lockstep step. Streams unaffected —
@@ -786,6 +790,13 @@ enum MultiOutcome {
     /// watermarks go stale on purpose; a probe re-syncs via the enrollment
     /// prefill.
     Lockstep,
+}
+
+fn spec_group_cancelled(pool: &[Option<Active>], rows: &[usize], draining: &AtomicBool) -> bool {
+    draining.load(Ordering::Acquire)
+        || rows
+            .iter()
+            .any(|&row| pool[row].as_ref().is_none_or(|a| a.tx.is_closed()))
 }
 
 /// One multi-slot spec round (module docs, "Multi-slot speculative
@@ -810,6 +821,7 @@ fn multi_spec_round(
     n_ctx: usize,
     log: &mut MultiFallbackLog,
     telemetry: &WorkerTelemetry,
+    draining: &AtomicBool,
 ) -> MultiOutcome {
     let slots = pool.len();
     let rows: Vec<usize> = (0..slots).filter(|&r| pool[r].is_some()).collect();
@@ -1252,8 +1264,13 @@ fn multi_spec_round(
             .map(|(_, t, p)| (t.as_slice(), p.as_slice()))
             .collect();
         let t_v = std::time::Instant::now();
-        let outs = match runner.tree_verify_greedy_slots(batch, &group_rows, &group_trees) {
-            Ok(o) => {
+        let outs = match runner.tree_verify_greedy_slots_cancellable(
+            batch,
+            &group_rows,
+            &group_trees,
+            &|| spec_group_cancelled(pool, &group_rows, draining),
+        ) {
+            Ok(Some(o)) => {
                 // Cost-model V_round: one grouped verify's wall (with the
                 // equal-split k clamp there is one group per round). The
                 // RAW group wall is recorded at whatever group size is live
@@ -1265,6 +1282,20 @@ fn multi_spec_round(
                     .verify_round
                     .record(t_v.elapsed().as_secs_f64() * 1e6);
                 o
+            }
+            Ok(None) => {
+                // Every selected target prefix is unchanged. The drafter
+                // already fed chains, so the caller drops all enrollment and
+                // live peers re-enroll from their unmodified host histories.
+                // Release only disconnected rows here; drain framing and
+                // release for still-connected rows belong to the outer loop.
+                for &row in &group_rows {
+                    if pool[row].as_ref().is_some_and(|a| a.tx.is_closed()) {
+                        pool[row] = None;
+                        release_slot(batch, row, telemetry);
+                    }
+                }
+                return MultiOutcome::Cancelled;
             }
             // An InvalidInput refusal is ATOMIC — every target and tree is
             // host-validated before any device work, so no listed slot
@@ -2223,11 +2254,16 @@ pub(crate) fn run_batched(
                     n_ctx,
                     &mut multi_log,
                     telemetry.as_ref(),
+                    &draining,
                 )
             });
             telemetry.observe_decode(decode_started.elapsed());
             match outcome {
                 MultiOutcome::Ran => continue,
+                MultiOutcome::Cancelled => {
+                    multi = None;
+                    continue;
+                }
                 MultiOutcome::Fallback => multi = None,
                 MultiOutcome::Disable => {
                     multi = None;
@@ -2315,6 +2351,234 @@ pub(crate) fn run_batched(
 
 #[cfg(test)]
 mod tests {
+    fn group_active(id: u64, tx: mpsc::Sender<GenEvent>, history: Vec<u32>) -> Active {
+        Active {
+            tx,
+            request_span: tracing::Span::none(),
+            id,
+            sampling: Sampling::Greedy,
+            logprobs: None,
+            stop_eos: false,
+            remaining: 16,
+            last_token: *history.last().unwrap(),
+            history,
+            salt: 0,
+        }
+    }
+
+    #[test]
+    fn grouped_query_observes_only_selected_responses_and_drain() {
+        let (tx0, rx0) = mpsc::channel(8);
+        let (tx1, rx1) = mpsc::channel(8);
+        let pool = vec![
+            Some(group_active(0, tx0, vec![0])),
+            Some(group_active(1, tx1, vec![1])),
+        ];
+        let draining = AtomicBool::new(false);
+        assert!(!spec_group_cancelled(&pool, &[0, 1], &draining));
+        drop(rx1);
+        assert!(!spec_group_cancelled(&pool, &[0], &draining));
+        assert!(spec_group_cancelled(&pool, &[0, 1], &draining));
+        draining.store(true, Ordering::Release);
+        assert!(spec_group_cancelled(&pool, &[0], &draining));
+        draining.store(false, Ordering::Release);
+        drop(rx0);
+        assert!(spec_group_cancelled(&pool, &[0], &draining));
+    }
+
+    #[test]
+    fn grouped_response_query_cancels_submitted_native_work() {
+        use std::cell::{Cell, RefCell};
+
+        for context in [16, 12289] {
+            for drain in [false, true] {
+                let Some(mut runner) = crate::test_support::tiny_cuda_runner(context) else {
+                    return;
+                };
+                runner.forward(&[0, 1, 2], &[0, 1, 2]).unwrap();
+                let mut batch = runner.new_batch_paged(2, 2).unwrap();
+                for row in 0..2 {
+                    batch.reserve_pages(row, 16).unwrap();
+                    runner.adopt_into_batch_row(&mut batch, row, 3).unwrap();
+                    batch.set_position(row, 3).unwrap();
+                }
+                let before = peer_bytes(&mut runner, &batch);
+                let free = batch.free_pages();
+                let (tx0, rx0) = mpsc::channel(8);
+                let receiver = RefCell::new(Some(rx0));
+                let (tx1, mut rx1) = mpsc::channel(8);
+                let pool = vec![
+                    Some(group_active(0, tx0, vec![0, 1, 2, 3])),
+                    Some(group_active(1, tx1, vec![0, 1, 2, 4])),
+                ];
+                let draining = AtomicBool::new(false);
+                let polls = Cell::new(0);
+                let trees = [(&[3, 4][..], &[-1, 0][..]), (&[4, 5][..], &[-1, 0][..])];
+                assert!(
+                    runner
+                        .tree_verify_greedy_slots_cancellable(&mut batch, &[0, 1], &trees, &|| {
+                            polls.set(polls.get() + 1);
+                            // Fixture injection after device uploads, not entry-only.
+                            // Invocation count remains intentionally non-contractual.
+                            if polls.get() == 5 {
+                                if drain {
+                                    draining.store(true, Ordering::Release);
+                                } else {
+                                    drop(receiver.borrow_mut().take());
+                                }
+                            }
+                            spec_group_cancelled(&pool, &[0, 1], &draining)
+                        })
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(polls.get(), 5);
+                assert_eq!(batch.positions(), &[3, 3]);
+                assert_eq!(peer_bytes(&mut runner, &batch), before);
+                assert_eq!(batch.free_pages(), free);
+                assert!(matches!(
+                    rx1.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+                assert_eq!(pool[1].as_ref().unwrap().remaining, 16);
+                assert!(runner.kv.iter().all(|cache| cache.len == 0));
+                assert!(
+                    runner
+                        .tree_verify_greedy_slots(&mut batch, &[0, 1], &trees)
+                        .is_ok()
+                );
+                assert_eq!(
+                    batch.debug_tree_slots_graph_bucket_count() > 0,
+                    context == 16
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_spec_cancellation_preserves_live_peer_and_recovers() {
+        for context in [16, 12289] {
+            for drain in [false, true] {
+                let Some(mut runner) = crate::test_support::tiny_cuda_runner(context) else {
+                    return;
+                };
+                let mut draft = crate::test_support::tiny_cuda_runner(16).unwrap();
+                let mut reference = crate::test_support::tiny_cuda_runner(context).unwrap();
+                let mut batch = runner.new_batch_paged(2, 2).unwrap();
+                let telemetry = WorkerTelemetry::default();
+                let histories = [vec![0, 1, 2, 3], vec![4, 5, 6, 7]];
+                for (row, history) in histories.iter().enumerate() {
+                    reserve_pages(&mut batch, row, 16, &telemetry).unwrap();
+                    runner.reset();
+                    runner.forward(&history[..3], &[0, 1, 2]).unwrap();
+                    runner.adopt_into_batch_row(&mut batch, row, 3).unwrap();
+                    batch.set_position(row, 3).unwrap();
+                }
+                let before = peer_bytes(&mut runner, &batch);
+                let free = batch.free_pages();
+                let pages = batch.debug_page_table_row(1);
+                let (tx0, rx0) = mpsc::channel(64);
+                let (tx1, mut rx1) = mpsc::channel(64);
+                let mut rx0 = Some(rx0);
+                let mut pool = vec![
+                    Some(group_active(0, tx0, histories[0].clone())),
+                    Some(group_active(1, tx1, histories[1].clone())),
+                ];
+                if !drain {
+                    drop(rx0.take());
+                }
+                let draining = AtomicBool::new(drain);
+                let mut multi = None;
+                let mut log = MultiFallbackLog::default();
+                assert!(matches!(
+                    multi_spec_round(
+                        &mut runner,
+                        &mut draft,
+                        &mut batch,
+                        &mut multi,
+                        &mut pool,
+                        7,
+                        context as usize,
+                        &mut log,
+                        &telemetry,
+                        &draining
+                    ),
+                    MultiOutcome::Cancelled
+                ));
+                // Drafting really ran, but cancelled target verification did
+                // not emit, fold history/budget or move the connected peer.
+                assert!(
+                    multi
+                        .as_ref()
+                        .unwrap()
+                        .dbatch
+                        .positions()
+                        .iter()
+                        .any(|&p| p > 3)
+                );
+                assert!(matches!(
+                    rx1.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+                assert_eq!(pool[1].as_ref().unwrap().history, histories[1]);
+                assert_eq!(pool[1].as_ref().unwrap().remaining, 16);
+                assert_eq!(batch.positions()[1], 3);
+                assert_eq!(peer_bytes(&mut runner, &batch), before);
+                assert_eq!(batch.debug_page_table_row(1), pages);
+                assert_eq!(batch.free_pages(), free + usize::from(!drain));
+                assert_eq!(
+                    telemetry.kv_pool_releases_total.load(Ordering::Relaxed),
+                    u64::from(!drain)
+                );
+                assert_eq!(pool[0].is_none(), !drain);
+                // Mirror the caller's cancellation arm: discard overfed draft
+                // enrollment and start the next tick, never same-tick lockstep.
+                multi = None;
+                draining.store(false, Ordering::Release);
+                assert!(matches!(
+                    multi_spec_round(
+                        &mut runner,
+                        &mut draft,
+                        &mut batch,
+                        &mut multi,
+                        &mut pool,
+                        7,
+                        context as usize,
+                        &mut log,
+                        &telemetry,
+                        &draining
+                    ),
+                    MultiOutcome::Ran
+                ));
+                let mut emitted = Vec::new();
+                while let Ok(event) = rx1.try_recv() {
+                    match event {
+                        GenEvent::Token(token, _) => emitted.push(token),
+                        other => panic!("unexpected grouped event: {other:?}"),
+                    }
+                }
+                assert!(!emitted.is_empty());
+                reference.forward(&histories[1][..3], &[0, 1, 2]).unwrap();
+                let mut pending = 7;
+                for (offset, &token) in emitted.iter().enumerate() {
+                    let logits = reference.forward(&[pending], &[3 + offset]).unwrap();
+                    assert_eq!(token, sample(&logits, &Sampling::Greedy, (0, 0)).unwrap());
+                    pending = token;
+                }
+                assert_eq!(
+                    batch.debug_tree_slots_graph_bucket_count() > 0,
+                    context == 16
+                );
+                assert_eq!(
+                    telemetry
+                        .kv_pool_release_failures_total
+                        .load(Ordering::Relaxed),
+                    0
+                );
+            }
+        }
+    }
+
     #[test]
     fn solo_spec_cycle_cancels_inside_target_forward_without_publication() {
         for drain in [false, true] {

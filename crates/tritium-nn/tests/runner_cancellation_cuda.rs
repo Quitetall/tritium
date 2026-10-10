@@ -419,7 +419,7 @@ fn batch_prefix_bytes(
 ) -> Vec<Vec<u8>> {
     (0..2)
         .flat_map(|layer| {
-            (0..2).flat_map(move |slot| {
+            (0..batch.positions().len()).flat_map(move |slot| {
                 (0..batch.positions()[slot])
                     .flat_map(move |row| [false, true].map(move |value| (layer, slot, row, value)))
             })
@@ -430,6 +430,182 @@ fn batch_prefix_bytes(
                 .unwrap()
         })
         .collect()
+}
+
+#[test]
+fn resident_tree_group_cancellation_has_no_partial_commit() {
+    for context in [16, 12289] {
+        let Some(mut runner) = runner_with_context(context) else {
+            return;
+        };
+        let model = runner.resident_cuda().unwrap().unwrap();
+        for paged in [false, true] {
+            for prefix in [0, 3] {
+                let mut batch = if paged {
+                    model.new_batch_paged(3, 3).unwrap()
+                } else {
+                    model.new_batch(3).unwrap()
+                };
+                model.reset();
+                model.prefill(&[0, 1, 2], &[0, 1, 2]).unwrap();
+                for row in 0..3 {
+                    if paged {
+                        batch.reserve_pages(row, 16).unwrap();
+                    }
+                    let n = if row == 2 { 3 } else { prefix };
+                    model.copy_kv_into_batch_row(&mut batch, row, n).unwrap();
+                    batch.set_position(row, n).unwrap();
+                    batch.set_live(row, true).unwrap();
+                }
+                // Distinct shapes and reverse slot order exercise concatenated
+                // offsets; the third live row must never enter this group.
+                let tokens = [[3, 4, 5], [6, 7, 0]];
+                let trees = [
+                    (&tokens[0][..], &[-1, 0, 0][..]),
+                    (&tokens[1][..2], &[-1, 0][..]),
+                ];
+                let rows = [1, 0];
+                let before = batch_prefix_bytes(model, &batch);
+                let positions = batch.positions().to_vec();
+                let free = batch.free_pages();
+                let pages: Vec<_> = (0..3).map(|r| batch.debug_page_table_row(r)).collect();
+                let mut expected = Vec::new();
+                for (&row, &(t, p)) in rows.iter().zip(&trees) {
+                    expected.push(
+                        model
+                            .tree_verify_greedy_slot(&mut batch, row, t, p)
+                            .unwrap(),
+                    );
+                }
+                let expected_positions = batch.positions().to_vec();
+                let expected_kv = batch_prefix_bytes(model, &batch);
+                for &row in &rows {
+                    batch.set_position(row, prefix).unwrap();
+                }
+                let checks = Cell::new(0);
+                assert_eq!(
+                    model
+                        .tree_verify_greedy_slots_cancellable(&mut batch, &rows, &trees, &|| {
+                            checks.set(checks.get() + 1);
+                            false
+                        })
+                        .unwrap()
+                        .unwrap(),
+                    expected
+                );
+                assert!(checks.get() >= 8, "must exercise in-operation checkpoints");
+                assert_eq!(batch.positions(), expected_positions);
+                assert_eq!(batch_prefix_bytes(model, &batch), expected_kv);
+                assert_eq!(
+                    batch.debug_tree_slots_graph_bucket_count() > 0,
+                    context == 16
+                );
+                for cancel_at in 1..=checks.get() {
+                    for &row in &rows {
+                        batch.set_position(row, prefix).unwrap();
+                    }
+                    // Group work must leave unrelated solo authorization intact.
+                    model.tree_verify_logits(&[3, 4], &[-1, 0]).unwrap();
+                    let count = Cell::new(0);
+                    assert!(
+                        model
+                            .tree_verify_greedy_slots_cancellable(
+                                &mut batch,
+                                &rows,
+                                &trees,
+                                &|| {
+                                    count.set(count.get() + 1);
+                                    count.get() == cancel_at
+                                }
+                            )
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert_eq!(count.get(), cancel_at);
+                    assert_eq!(batch.positions(), positions);
+                    assert_eq!(batch_prefix_bytes(model, &batch), before);
+                    assert_eq!(batch.free_pages(), free);
+                    assert_eq!(
+                        (0..3)
+                            .map(|r| batch.debug_page_table_row(r))
+                            .collect::<Vec<_>>(),
+                        pages
+                    );
+                    model.tree_commit(&[0]).unwrap();
+                    assert_eq!(model.cache_len(), 4);
+                    model.truncate_kv(3).unwrap();
+                    assert_eq!(
+                        model
+                            .tree_verify_greedy_slots(&mut batch, &rows, &trees)
+                            .unwrap(),
+                        expected
+                    );
+                    assert_eq!(batch.positions(), expected_positions);
+                    assert_eq!(batch_prefix_bytes(model, &batch), expected_kv);
+                }
+                for &row in &rows {
+                    batch.set_position(row, prefix).unwrap();
+                }
+                assert!(
+                    model
+                        .tree_verify_greedy_slots_cancellable(&mut batch, &[1, 1], &trees, &|| {
+                            false
+                        })
+                        .is_err()
+                );
+                assert_eq!(batch.positions(), positions);
+                assert_eq!(batch_prefix_bytes(model, &batch), before);
+            }
+        }
+    }
+}
+
+#[test]
+fn resident_tree_group_cold_capture_and_facade_recover() {
+    let Some(mut runner) = runner() else { return };
+    runner.forward(&[0, 1, 2], &[0, 1, 2]).unwrap();
+    for paged in [false, true] {
+        for cancel_at in 1..=9 {
+            let mut batch = if paged {
+                runner.new_batch_paged(2, 2).unwrap()
+            } else {
+                runner.new_batch(2).unwrap()
+            };
+            for row in 0..2 {
+                if paged {
+                    batch.reserve_pages(row, 16).unwrap();
+                }
+                runner.adopt_into_batch_row(&mut batch, row, 3).unwrap();
+                batch.set_position(row, 3).unwrap();
+            }
+            assert_eq!(batch.debug_tree_slots_graph_bucket_count(), 0);
+            let before = batch_prefix_bytes(runner.resident_cuda().unwrap().unwrap(), &batch);
+            let count = Cell::new(0);
+            let trees = [(&[3, 4][..], &[-1, 0][..]), (&[5][..], &[-1][..])];
+            assert!(
+                runner
+                    .tree_verify_greedy_slots_cancellable(&mut batch, &[0, 1], &trees, &|| {
+                        count.set(count.get() + 1);
+                        count.get() == cancel_at
+                    })
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(count.get(), cancel_at);
+            assert_eq!(batch.positions(), &[3, 3]);
+            assert_eq!(
+                batch_prefix_bytes(runner.resident_cuda().unwrap().unwrap(), &batch),
+                before
+            );
+            assert!(runner.kv.iter().all(|cache| cache.len == 0));
+            let recovered = runner
+                .tree_verify_greedy_slots(&mut batch, &[0, 1], &trees)
+                .unwrap();
+            assert_eq!(recovered.len(), 2);
+            assert!(recovered.iter().all(|tokens| !tokens.is_empty()));
+            assert_eq!(batch.debug_tree_slots_graph_bucket_count(), 1);
+        }
+    }
 }
 
 #[test]
