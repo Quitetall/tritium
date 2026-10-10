@@ -19,6 +19,7 @@ SOURCE_ROOT = (Path(__file__).resolve().parents[1] / "python").resolve()
 PACKAGE_ROOT = (SOURCE_ROOT / "tritium").resolve()
 INSTALLED_WHEEL_ONLY = frozenset({
     "test_hf_lifecycle_receipt.py",
+    "test_hf_candidate_provenance.py",
     "test_tutorial_qat.py",
 })
 

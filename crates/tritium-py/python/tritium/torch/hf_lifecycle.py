@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import importlib.metadata
 import json
@@ -15,7 +16,9 @@ import torch
 import transformers
 
 import tritium
+from tritium import _tritium
 
+from ._wheel_identity import file_sha256, wheel_identity
 from .config import TernaryConfig
 from .conversion import inspect, prepare_qat
 from .tutorial_receipt import (
@@ -27,17 +30,80 @@ from .tutorial_receipt import (
 )
 
 
-def _installed_distribution() -> tuple[str, Path]:
+def _installed_distribution(
+    *,
+    wheel_artifact: Path | None = None,
+    source_revision: str | None = None,
+    release: str | None = None,
+) -> tuple[str, Path]:
+    """Bind executing files and native source, not merely a namespace/version."""
     try:
         distribution = importlib.metadata.distribution("pytritium")
     except importlib.metadata.PackageNotFoundError as error:
         raise RuntimeError("qualification requires installed pytritium") from error
+    if source_revision is not None:
+        identity = getattr(_tritium, "source_identity", None)
+        if not callable(identity) or identity() != "source-git:" + source_revision:
+            raise ValueError("candidate native source identity differs")
+    if release is not None and distribution.version != release.replace("-rc.", "rc"):
+        raise ValueError("candidate installed release version differs")
     module = Path(tritium.__file__).resolve(strict=True)
     if distribution.files is None:
         raise RuntimeError("installed pytritium has no file inventory")
-    owned = {distribution.locate_file(item).resolve() for item in distribution.files}
-    if module not in owned:
-        raise RuntimeError("imported tritium package is not owned by pytritium")
+    files = tuple(distribution.files)
+    logical = {str(item).replace("\\", "/"): item for item in files}
+    if len(logical) != len(files):
+        raise ValueError("candidate installed RECORD contains duplicate paths")
+    owned = {distribution.locate_file(item).resolve() for item in files}
+    origins = (Path(tritium.__file__), Path(_tritium.__file__), Path(__file__))
+    if any(path.is_symlink() or path.resolve(strict=True) not in owned for path in origins):
+        raise RuntimeError("candidate executing package is not owned by pytritium")
+    if wheel_artifact is not None:
+        inventory = wheel_identity(wheel_artifact)
+        if inventory["distribution_version"] != distribution.version:
+            raise ValueError("candidate wheel distribution version differs")
+        for entry in inventory["entries"]:
+            name = entry["path"]
+            if name not in logical:
+                raise ValueError("candidate wheel member is absent from installed RECORD")
+            path = distribution.locate_file(logical[name])
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("candidate installed member is not an ordinary file")
+            # Installers rewrite RECORD for their generated metadata/bytecode;
+            # all actual wheel payload members must still match exact bytes.
+            if name == inventory["record_path"]:
+                continue
+            if path.stat().st_size != entry["bytes"] or file_sha256(path) != entry["sha256"]:
+                raise ValueError("candidate wheel differs from executing installed files")
+        expected = {
+            distribution.locate_file(logical[entry["path"]]).resolve()
+            for entry in inventory["entries"]
+        }
+        if any(path.resolve(strict=True) not in expected for path in origins):
+            raise ValueError("candidate wheel does not own executing qualification code")
+    elif source_revision is not None:
+        # A replay without an external wheel still verifies installed RECORD
+        # integrity. It cannot independently establish archive-byte identity.
+        for item in files:
+            name = str(item).replace("\\", "/")
+            if not name.startswith("tritium/") or name.endswith(".pyc"):
+                continue
+            path = distribution.locate_file(item)
+            digest = item.hash
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or digest is None
+                or digest.mode not in {"sha256", "sha384", "sha512"}
+            ):
+                raise ValueError("candidate installed package lacks strong RECORD integrity")
+            hasher = hashlib.new(digest.mode)
+            with path.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    hasher.update(chunk)
+            encoded = base64.urlsafe_b64encode(hasher.digest()).rstrip(b"=").decode()
+            if encoded != digest.value or path.stat().st_size != item.size:
+                raise ValueError("candidate installed package RECORD identity differs")
     return distribution.version, module
 
 
@@ -104,7 +170,9 @@ def run_hf_lifecycle(
         raise ValueError("source revision must be 40 lowercase hexadecimal characters")
     if not release or not run_id:
         raise ValueError("release and run id must be non-empty")
-    version, module_path = _installed_distribution()
+    version, module_path = _installed_distribution(
+        wheel_artifact=wheel_artifact, source_revision=source_revision, release=release
+    )
 
     torch.manual_seed(seed)
     model = prepare_qat(
@@ -210,7 +278,11 @@ def validate_hf_lifecycle_receipt(
         expected_source_revision=expected_source_revision,
         expected_release=expected_release,
     )
-    version, module_path = _installed_distribution()
+    version, module_path = _installed_distribution(
+        wheel_artifact=expected_wheel,
+        source_revision=receipt["source_revision"],
+        release=receipt["release"],
+    )
     if receipt["distribution_version"] != version:
         raise ValueError("Hugging Face lifecycle distribution version mismatch")
     if receipt["tritium_module"] != str(module_path):

@@ -63,7 +63,9 @@ def _run(
     run_id: str,
     seed: int,
 ) -> dict[str, object]:
-    version, module_path = _installed_distribution()
+    version, module_path = _installed_distribution(
+        wheel_artifact=wheel_artifact, source_revision=source_revision, release=release
+    )
     torch.manual_seed(seed)
     prepared = prepare(
         _tiny_llama(),
@@ -203,6 +205,9 @@ def qualify_hf_export(
         raise ValueError("source revision must be 40 lowercase hexadecimal characters")
     if not release or not run_id:
         raise ValueError("release and run id must be non-empty")
+    _installed_distribution(
+        wheel_artifact=wheel_artifact, source_revision=source_revision, release=release
+    )
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}.", dir=output_dir.parent))
     try:
@@ -271,7 +276,11 @@ def validate_hf_export_receipt(
         expected_source_revision=expected_source_revision,
         expected_release=expected_release,
     )
-    version, module_path = _installed_distribution()
+    version, module_path = _installed_distribution(
+        wheel_artifact=expected_wheel,
+        source_revision=receipt["source_revision"],
+        release=receipt["release"],
+    )
     if receipt["distribution_version"] != version:
         raise ValueError("Hugging Face export distribution version mismatch")
     if receipt["tritium_module"] != str(module_path):
