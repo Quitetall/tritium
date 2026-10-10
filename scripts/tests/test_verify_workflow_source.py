@@ -16,6 +16,17 @@ CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
 
 class VerifyWorkflowSourceTests(unittest.TestCase):
+    def test_shared_source_helper_and_regressions_trigger_wheels(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        paths = workflow.split("  pull_request:", 1)[1].split("  workflow_dispatch:", 1)[0]
+        for path in (
+            "scripts/_qualification_git.py",
+            "scripts/tests/test_qualification_git_context.py",
+            "scripts/tests/test_release_source_git_context.py",
+        ):
+            with self.subTest(path=path):
+                self.assertIn(f'      - "{path}"', paths)
+
     def test_supply_chain_gate_avoids_docker_hub_without_weakening_checks(self):
         workflow = CI_WORKFLOW.read_text(encoding="utf-8")
         start = workflow.index("  cargo-deny:")

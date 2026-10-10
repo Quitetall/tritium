@@ -81,6 +81,14 @@ python3 -B -m unittest \
 Normal push gates passed `cargo fmt --all --check` and
 `cargo clippy --locked --workspace --all-targets -- -D warnings`; remote readback
 confirmed the code revision. Logs are retained in the archive below.
+
+A follow-up path-filter regression failed three subchecks twice: changing the
+shared Git helper or either real-context regression module alone did not trigger
+the wheel PR smoke. The wheel workflow now includes all three dependency paths;
+the general CI script lane already discovers both regression modules. This
+follow-up is workflow coverage, not additional numerical qualification.
+The workflow/source-context follow-up suite passes 22 tests; `actionlint
+.github/workflows/wheels.yml` and `git diff --check` pass.
 Synthetic receipt PASS messages printed by unit fixtures are not real receipts.
 
 Durable source/log/probe archive:
