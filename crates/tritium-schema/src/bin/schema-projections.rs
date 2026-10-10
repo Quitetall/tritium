@@ -7,13 +7,14 @@ use std::{
 
 use schemars::JsonSchema;
 use tritium_schema::{
-    AdditiveLayout, AdmittedLaw, Basis, BlobId, BlobReference, EvidenceEnvelope, EvidenceReference,
-    LayoutError, LegacyModelIdentity, Level, LevelFit, LoadedSourceIdentity, ManifestAsset,
-    ModelId, ModelLoaded, ModelManifest, ModelSemanticMeta, ModelShard, NamedAssetDigest,
-    NamedTensorDigest, PackageId, PlaneAllocation, PlaneCodec, PlaneCounts, PlaneRelation,
-    ScaleAnchor, ScaleLaw, ScalePrecision, SchemaId, SemanticTensorDigest, TensorCaps,
-    TensorExecution, TensorMeta, TensorSemanticMeta, TensorStorage, TensorUploadPolicy,
-    TensorUploaded, Transport, UnknownReason, Verdict,
+    AdditiveLayout, AdmittedLaw, Basis, BlobId, BlobReference, DirectFitLevel, DirectFitLimits,
+    DirectFitPlan, DirectFitProfile, EvidenceEnvelope, EvidenceReference, JointGroupFitOptions,
+    LadderFitOptions, LadderScaleRefit, LayoutError, LegacyModelIdentity, Level, LevelFit,
+    LoadedSourceIdentity, ManifestAsset, ModelId, ModelLoaded, ModelManifest, ModelSemanticMeta,
+    ModelShard, NamedAssetDigest, NamedTensorDigest, PackageId, PlaneAllocation, PlaneCodec,
+    PlaneCounts, PlaneRelation, ScaleAnchor, ScaleLaw, ScalePrecision, SchemaId,
+    SemanticTensorDigest, TensorCaps, TensorExecution, TensorMeta, TensorSemanticMeta,
+    TensorStorage, TensorUploadPolicy, TensorUploaded, Transport, UnknownReason, Verdict,
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -78,6 +79,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     project!(NamedTensorDigest, "named-tensor-digest");
     project!(LoadedSourceIdentity, "loaded-source-identity");
     project!(ModelLoaded, "model-loaded");
+    project!(DirectFitPlan, "direct-fit-plan");
+    project!(DirectFitProfile, "direct-fit-profile");
+    project!(DirectFitLevel, "direct-fit-level");
+    project!(DirectFitLimits, "direct-fit-limits");
+    project!(LadderFitOptions, "ladder-fit-options");
+    project!(LadderScaleRefit, "ladder-scale-refit");
+    project!(JointGroupFitOptions, "joint-group-fit-options");
 
     Ok(())
 }

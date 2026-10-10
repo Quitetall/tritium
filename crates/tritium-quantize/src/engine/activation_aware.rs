@@ -122,7 +122,7 @@ fn rotate_row_f64(row: &mut [f64], group: usize) {
 
 /// `H ← R·H·Rᵀ`, `R` block-diagonal Hadamard over scale groups, so the metric is expressed in the
 /// basis the codes are stored in.
-fn rotate_gram(h: &mut [f64], k: usize, group: usize) {
+pub(super) fn rotate_gram(h: &mut [f64], k: usize, group: usize) {
     h.par_chunks_mut(k)
         .for_each(|row| rotate_row_f64(row, group));
     let mut col = vec![0.0f64; k];

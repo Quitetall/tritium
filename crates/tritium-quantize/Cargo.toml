@@ -16,11 +16,13 @@ categories.workspace = true
 [dependencies]
 tritium-core = { workspace = true }
 tritium-format = { workspace = true }
+tritium-schema = { workspace = true }
 half = { workspace = true }
 blake3 = { workspace = true }
 rayon = { workspace = true }
 
 [dev-dependencies]
+tritium-testkit = { workspace = true }
 proptest = { workspace = true }
 serde_json = { workspace = true }
 

@@ -5,7 +5,10 @@
 //! The f64 feedback oracle remains an explicitly separate reference profile.
 
 mod activation_aware;
+mod direct;
 mod ladder;
+
+pub use direct::{DirectFitError, DirectTensorFit, fit_direct_levels};
 
 pub use activation_aware::{
     ActivationAwareConfig, ScaleRefitMode, auto_decay, fit_tensor,
