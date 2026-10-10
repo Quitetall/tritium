@@ -25,6 +25,7 @@ extern crate alloc;
 
 mod dtype;
 mod error;
+mod feedback;
 mod reference;
 mod scale;
 mod shape;
@@ -32,6 +33,9 @@ mod trit;
 
 pub use dtype::{DType, TernaryFormat};
 pub use error::TritError;
+#[cfg(feature = "std")]
+pub use feedback::auto_feedback_decay;
+pub use feedback::{FeedbackDecay, FeedbackDecayError};
 pub use reference::{reference_conv1d, reference_fsq, reference_mpgemm};
 pub use scale::{ScaleGranularity, absmean};
 pub use shape::{ConvShape, GemmShape};

@@ -102,14 +102,7 @@ impl Default for ActivationAwareConfig {
 /// on one model, not a derivation; a wider sweep should replace the constants, not the shape.
 #[must_use]
 pub fn auto_decay(calibration_tokens: usize, cols: usize) -> f64 {
-    const LOW: (f64, f64) = (2.7, 0.5);
-    const HIGH: (f64, f64) = (10.7, 0.75);
-    if calibration_tokens == 0 || cols == 0 {
-        return LOW.1;
-    }
-    let ratio = calibration_tokens as f64 / cols as f64;
-    let t = ((ratio.ln() - LOW.0.ln()) / (HIGH.0.ln() - LOW.0.ln())).clamp(0.0, 1.0);
-    LOW.1 + t * (HIGH.1 - LOW.1)
+    tritium_core::auto_feedback_decay(calibration_tokens, cols)
 }
 
 /// Input Gram `E[x·xᵀ]` at each of the four projection inputs, per layer.
@@ -364,6 +357,7 @@ pub fn fit_tensor_with_scale_refit_mode(
     cfg: &ActivationAwareConfig,
     refit_mode: ScaleRefitMode,
 ) -> Option<Vec<(f32, Vec<Vec<i8>>)>> {
+    let decay = tritium_core::FeedbackDecay::new(cfg.decay, cfg.decay_ramp).ok()?;
     let group = cfg.group.max(1);
     let per_row = cols.div_ceil(group);
     let kmax = (3i64.pow(cfg.planes as u32) - 1) / 2;
@@ -410,11 +404,7 @@ pub fn fit_tensor_with_scale_refit_mode(
         }
         // Decay on the propagated error: a multiplier on `err`, so `lambda == 1.0` is plain GPTQ
         // to the bit. Under the ramp it runs from 1 at the first column to `cfg.decay` at the last.
-        let lambda = if cfg.decay_ramp && cols > 1 {
-            1.0 - (1.0 - cfg.decay) * j as f64 / (cols - 1) as f64
-        } else {
-            cfg.decay
-        };
+        let lambda = decay.coefficient(j, cols).ok()?;
         quantized
             .par_chunks_mut(cols)
             .zip(work.par_chunks_mut(cols))
@@ -999,25 +989,5 @@ mod decay_tests {
             plain, decayed,
             "decay 0.5 must alter the codes GPTQ produces"
         );
-    }
-
-    #[test]
-    fn auto_decay_follows_the_measured_ends_and_clamps_outside_them() {
-        // The two measured ends, on down_proj's 1,536-wide input.
-        assert!((auto_decay(4_096, 1_536) - 0.5).abs() < 0.01);
-        assert!((auto_decay(16_384, 1_536) - 0.75).abs() < 0.01);
-        // Clamped past them.
-        assert_eq!(auto_decay(1_024, 1_536), 0.5);
-        assert_eq!(auto_decay(1 << 20, 1_536), 0.75);
-        // Monotone non-decreasing in tokens at fixed width.
-        let mut last = 0.0;
-        for tokens in [512, 1_024, 2_048, 4_096, 8_192, 16_384, 32_768] {
-            let d = auto_decay(tokens, 576);
-            assert!(d >= last, "auto_decay must not fall as tokens grow");
-            last = d;
-        }
-        // Degenerate inputs pick the cautious end rather than NaN.
-        assert_eq!(auto_decay(0, 576), 0.5);
-        assert_eq!(auto_decay(4_096, 0), 0.5);
     }
 }

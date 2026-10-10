@@ -6,6 +6,7 @@
 //! working weights left by all earlier groups.
 
 use core::fmt;
+use tritium_core::FeedbackDecay;
 
 /// One contiguous column group, expressed as a half-open range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -325,6 +326,7 @@ pub struct FeedbackState {
     reconstruction: Vec<f64>,
     fit_inputs: Vec<Vec<f64>>,
     fitted: Vec<bool>,
+    decay_factors: Vec<f64>,
 }
 
 impl FeedbackState {
@@ -461,8 +463,17 @@ impl FeedbackState {
             for later in 0..block.later_columns {
                 let mut correction = 0.0;
                 for local_column in 0..width {
-                    correction += residual_delta[row * width + local_column]
-                        * block.coefficients[local_column * block.later_columns + later];
+                    let residual = residual_delta[row * width + local_column];
+                    let decay = self.decay_factors[block.group.start + local_column];
+                    // Preserve the original arithmetic at the default exactly. A ramp is
+                    // per source column, even when the fitter receives a multi-column block.
+                    let decayed = if decay == 1.0 {
+                        residual
+                    } else {
+                        decay * residual
+                    };
+                    correction +=
+                        decayed * block.coefficients[local_column * block.later_columns + later];
                 }
                 let column = block.group.end + later;
                 let updated = self.working_weights[row * self.columns + column] - correction;
@@ -523,6 +534,24 @@ impl FeedbackState {
 /// other fitter that returns a finite reconstruction with the same compact shape as its request.
 pub fn fit_with_feedback<F, E>(
     problem: FeedbackProblem<'_>,
+    fitter: F,
+) -> Result<FeedbackState, FeedbackRunError<E>>
+where
+    F: FnMut(GroupFitRequest<'_>) -> Result<Vec<f64>, E>,
+{
+    fit_with_feedback_decay(problem, FeedbackDecay::default(), fitter)
+}
+
+/// Fit with an explicit validated column-order decay policy.
+///
+/// This remains the `f64` correctness oracle, not the production F32Accum64
+/// engine. The policy scales each source-column residual before propagation
+/// through the active inverse-Hessian Schur block. Refits retain the same
+/// policy. Unit decay preserves [`fit_with_feedback`] bit for bit; zero decay
+/// suppresses downstream correction without skipping metric validation.
+pub fn fit_with_feedback_decay<F, E>(
+    problem: FeedbackProblem<'_>,
+    decay: FeedbackDecay,
     mut fitter: F,
 ) -> Result<FeedbackState, FeedbackRunError<E>>
 where
@@ -540,6 +569,13 @@ where
         reconstruction: vec![0.0; problem.weights.len()],
         fit_inputs: vec![Vec::new(); problem.groups.len()],
         fitted: vec![false; problem.groups.len()],
+        decay_factors: (0..problem.columns)
+            .map(|column| {
+                decay
+                    .coefficient(column, problem.columns)
+                    .expect("validated nonempty source-column geometry")
+            })
+            .collect(),
     };
     for group in 0..state.groups.len() {
         state.fit_one(group, &mut fitter)?;
