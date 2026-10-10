@@ -4,6 +4,8 @@ import importlib.metadata
 import importlib.util
 from pathlib import Path
 import re
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -31,6 +33,27 @@ def _forbidden_model(*_args, **_kwargs):
 
 def _expected_error(failure):
     return {"source": "native source", "wheel": "wheel", "release": "release"}[failure]
+
+
+def test_tutorial_import_is_transformers_optional(tmp_path):
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", """
+import importlib.abc
+import sys
+class NoTransformers(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split(".", 1)[0] == "transformers":
+            raise ImportError("Transformers deliberately absent")
+        return None
+sys.meta_path.insert(0, NoTransformers())
+from tritium.torch.tutorial_qat import run_installed_qat_tutorial
+from tritium.torch._installed_candidate import verify_installed_candidate
+assert "transformers" not in sys.modules
+assert callable(run_installed_qat_tutorial) and callable(verify_installed_candidate)
+"""],
+        cwd=tmp_path, capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize("failure", ["source", "wheel", "release"])
