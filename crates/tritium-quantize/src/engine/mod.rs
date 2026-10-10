@@ -10,6 +10,9 @@ mod ladder;
 
 pub use direct::{DirectFitError, DirectTensorFit, fit_direct_levels};
 
+mod recorded;
+pub use recorded::{RecordedDirectFit, RecordedDirectFitError, fit_direct_levels_recorded};
+
 pub use activation_aware::{
     ActivationAwareConfig, ScaleRefitMode, auto_decay, fit_tensor,
     fit_tensor_with_scale_refit_mode, fit_to_dense,

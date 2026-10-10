@@ -8,7 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::{Subcommand, ValueEnum};
 use serde::Serialize;
 use tritium_evidence::{
-    EventRegistration, EvidenceEvent, EvidenceRecorder, ModelLoadReceiptView, verify_jsonl,
+    DirectFitReceiptView, EventRegistration, EvidenceEvent, EvidenceRecorder, ModelLoadReceiptView,
+    verify_jsonl,
 };
 
 /// Evidence detail level for a CLI invocation.
@@ -191,6 +192,8 @@ pub(crate) fn run(command: EvidenceCommand) -> anyhow::Result<()> {
     // Generic integrity is still not qualification or a registry for all events.
     ModelLoadReceiptView::fold(&verified)
         .map_err(|error| anyhow::anyhow!("verify model-load view {}: {error}", path.display()))?;
+    DirectFitReceiptView::fold(&verified)
+        .map_err(|error| anyhow::anyhow!("verify direct-fit view {}: {error}", path.display()))?;
     if view {
         println!("{}", serde_json::to_string_pretty(&verified.events)?);
     } else {
@@ -321,6 +324,38 @@ mod tests {
         let cleanup = std::fs::remove_file(path);
         cleanup.expect("remove temporary log");
         result.expect("CLI verification succeeds");
+    }
+
+    #[test]
+    fn verify_and_view_reject_invalid_fit_payload_even_with_valid_hashes() {
+        use tritium_evidence::DIRECT_LEVELS_FITTED_REGISTRATION;
+        #[derive(Serialize)]
+        struct InvalidFit {
+            release_approved: bool,
+        }
+        impl EvidenceEvent for InvalidFit {
+            const SCHEMA_ID: &'static str = "tritium.quantize.direct_levels_fitted";
+            const VERSION: u16 = 1;
+        }
+        let mut recorder =
+            EvidenceRecorder::new("invalid-fit", [DIRECT_LEVELS_FITTED_REGISTRATION]).unwrap();
+        recorder
+            .emit(
+                "fit",
+                None,
+                0,
+                &InvalidFit {
+                    release_approved: true,
+                },
+            )
+            .unwrap();
+        let path = temp_log();
+        std::fs::write(&path, recorder.to_jsonl().unwrap()).unwrap();
+        let verify = run(EvidenceCommand::Verify { path: path.clone() });
+        let view = run(EvidenceCommand::View { path: path.clone() });
+        std::fs::remove_file(path).unwrap();
+        assert!(verify.unwrap_err().to_string().contains("InvalidPayload"));
+        assert!(view.unwrap_err().to_string().contains("InvalidPayload"));
     }
 
     #[test]

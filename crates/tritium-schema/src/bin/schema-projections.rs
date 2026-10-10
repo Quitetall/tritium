@@ -86,6 +86,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     project!(LadderFitOptions, "ladder-fit-options");
     project!(LadderScaleRefit, "ladder-scale-refit");
     project!(JointGroupFitOptions, "joint-group-fit-options");
+    project!(tritium_schema::FitInputDigest, "fit-input-digest");
+    project!(tritium_schema::DirectFitMetric, "direct-fit-metric");
+    project!(tritium_schema::DirectFitOutput, "direct-fit-output");
+    project!(tritium_schema::DirectLevelsFitted, "direct-levels-fitted");
 
     Ok(())
 }

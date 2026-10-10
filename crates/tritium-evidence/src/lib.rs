@@ -20,6 +20,9 @@ pub use tritium_schema::{
 mod model_load;
 pub use model_load::{MODEL_LOADED_REGISTRATION, ModelLoadReceiptView};
 
+mod direct_fit;
+pub use direct_fit::{DIRECT_LEVELS_FITTED_REGISTRATION, DirectFitReceiptView};
+
 const EVENT_DOMAIN: &[u8] = b"tritium.evidence.event.v1\0";
 const ROOT_DOMAIN: &[u8] = b"tritium.evidence.run-root.v1\0";
 const ZERO_DIGEST: [u8; 32] = [0; 32];

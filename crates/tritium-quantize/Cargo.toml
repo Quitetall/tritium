@@ -17,6 +17,7 @@ categories.workspace = true
 tritium-core = { workspace = true }
 tritium-format = { workspace = true }
 tritium-schema = { workspace = true }
+tritium-evidence = { workspace = true }
 half = { workspace = true }
 blake3 = { workspace = true }
 rayon = { workspace = true }
@@ -25,6 +26,7 @@ rayon = { workspace = true }
 tritium-testkit = { workspace = true }
 proptest = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true }
 
 [lints]
 workspace = true

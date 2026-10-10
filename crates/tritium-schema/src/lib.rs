@@ -31,6 +31,11 @@ mod fit;
 #[cfg(feature = "alloc")]
 pub use fit::*;
 
+#[cfg(feature = "alloc")]
+mod fit_observation;
+#[cfg(feature = "alloc")]
+pub use fit_observation::*;
+
 /// Precision used to store additive plane scales.
 #[non_exhaustive]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
