@@ -74,7 +74,7 @@ fn frozen_free_group_two_plane_reference_vector() {
     let mut output = [0.0; 1];
     reference_ternary_matmul(
         &[1.0, 2.0, 3.0, 4.0],
-        &view,
+        &view.bind_matmul(),
         1,
         &mut transformed,
         &mut output,
@@ -184,7 +184,7 @@ fn frozen_tied_group_three_plane_reference_vector() {
     let mut output = [0.0; 1];
     reference_ternary_matmul(
         &[1.0, 2.0, 3.0, 4.0],
-        &view,
+        &view.bind_matmul(),
         1,
         &mut transformed,
         &mut output,
@@ -210,7 +210,7 @@ fn frozen_hadamard_basis_reference_vector() {
     let mut output = [0.0; 1];
     reference_ternary_matmul(
         &[1.0, 2.0, 3.0, 4.0],
-        &view,
+        &view.bind_matmul(),
         1,
         &mut transformed,
         &mut output,

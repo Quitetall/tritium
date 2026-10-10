@@ -10,6 +10,41 @@ use tritium_schema::{
 
 use crate::Trit;
 
+/// Consumer marker: rotate activations before additive matrix multiplication.
+#[derive(Clone, Copy, Debug)]
+pub enum Matmul {}
+
+/// Consumer marker: undo the stored basis before returning embedding rows.
+#[derive(Clone, Copy, Debug)]
+pub enum Gather {}
+
+/// A validated tensor bound to its consumer's basis semantics.
+///
+/// Construct through [`AdditiveView::bind_matmul`] or
+/// [`AdditiveView::bind_gather`]. The tensor and marker are private: a gather
+/// binding cannot be passed to the matmul reference, or vice versa. No storage
+/// is copied or allocated when binding.
+///
+/// ```compile_fail
+/// use tritium_core::{AdditiveView, reference_embed};
+/// fn wrong_consumer(view: AdditiveView<'_>) {
+///     reference_embed(&view.bind_matmul(), &[0], &mut [0.0; 4]).unwrap();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use tritium_core::{AdditiveView, reference_ternary_matmul};
+/// fn wrong_consumer(view: AdditiveView<'_>) {
+///     reference_ternary_matmul(&[0.0; 4], &view.bind_gather(), 1,
+///         &mut [0.0; 4], &mut [0.0; 1]).unwrap();
+/// }
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct BasisBound<T, C> {
+    tensor: T,
+    consumer: core::marker::PhantomData<C>,
+}
+
 /// Failure while validating or executing a decoded additive tensor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -173,7 +208,28 @@ impl<'a> AdditiveView<'a> {
         self.scales
     }
 
+    /// Bind this tensor to matmul, whose activations use the forward basis.
+    #[must_use]
+    pub const fn bind_matmul(self) -> BasisBound<Self, Matmul> {
+        BasisBound {
+            tensor: self,
+            consumer: core::marker::PhantomData,
+        }
+    }
+
+    /// Bind this tensor to gather, whose decoded rows use the inverse basis.
+    #[must_use]
+    pub const fn bind_gather(self) -> BasisBound<Self, Gather> {
+        BasisBound {
+            tensor: self,
+            consumer: core::marker::PhantomData,
+        }
+    }
+
     /// Decode one output row into `out`, using the declared additive scale law.
+    ///
+    /// This returns the stored-basis row, not an original-coordinate embedding.
+    /// Embedding consumers must use [`Self::bind_gather`] and [`reference_embed`].
     pub fn dequant_row_into(&self, row: usize, out: &mut [f32]) -> Result<(), AdditiveError> {
         let rows = usize::try_from(self.layout.rows).map_err(|_| AdditiveError::SizeOverflow)?;
         let cols = usize::try_from(self.layout.cols).map_err(|_| AdditiveError::SizeOverflow)?;
@@ -279,15 +335,75 @@ pub fn apply_basis(values: &mut [f32], basis: Basis) -> Result<(), AdditiveError
             domain,
         } => {
             validate_basis_blocks(values.len(), block)?;
-            for (index, value) in values.iter_mut().enumerate() {
-                if signed_rht_negative(seed, domain, index as u64) {
-                    *value = -*value;
-                }
-            }
+            apply_signs(values, seed, domain);
             apply_hadamard_blocks(values, block)
         }
         _ => Err(AdditiveError::UnsupportedBasis),
     }
+}
+
+/// Undo the declared input-axis basis on a decoded embedding row.
+///
+/// SignedRht's forward transform is `H D`, so its inverse is `D H`:
+/// normalized Hadamard first, then the same deterministic signs. Reapplying
+/// the forward transform is incorrect in general. Invalid block geometry is
+/// rejected before mutating `values`.
+pub fn apply_inverse_basis(values: &mut [f32], basis: Basis) -> Result<(), AdditiveError> {
+    match basis {
+        Basis::Identity => Ok(()),
+        Basis::Hadamard { block } => apply_hadamard_blocks(values, block),
+        Basis::SignedRht {
+            block,
+            seed,
+            domain,
+        } => {
+            apply_hadamard_blocks(values, block)?;
+            apply_signs(values, seed, domain);
+            Ok(())
+        }
+        _ => Err(AdditiveError::UnsupportedBasis),
+    }
+}
+
+fn apply_signs(values: &mut [f32], seed: u64, domain: u64) {
+    for (index, value) in values.iter_mut().enumerate() {
+        if signed_rht_negative(seed, domain, index as u64) {
+            *value = -*value;
+        }
+    }
+}
+
+/// Gather original-coordinate embedding rows from a gather-bound tensor.
+///
+/// `out` contains exactly `ids.len() * cols` values, preserving ID order and
+/// duplicates. All IDs and output geometry are checked before any output is
+/// written. Empty gathers are valid. This path allocates no scratch memory.
+pub fn reference_embed(
+    weights: &BasisBound<AdditiveView<'_>, Gather>,
+    ids: &[usize],
+    out: &mut [f32],
+) -> Result<(), AdditiveError> {
+    let weights = &weights.tensor;
+    let rows = usize::try_from(weights.layout.rows).map_err(|_| AdditiveError::SizeOverflow)?;
+    let cols = usize::try_from(weights.layout.cols).map_err(|_| AdditiveError::SizeOverflow)?;
+    let expected = ids
+        .len()
+        .checked_mul(cols)
+        .ok_or(AdditiveError::SizeOverflow)?;
+    if out.len() != expected {
+        return Err(AdditiveError::OutputLength {
+            expected,
+            got: out.len(),
+        });
+    }
+    if ids.iter().any(|&row| row >= rows) {
+        return Err(AdditiveError::RowOutOfRange);
+    }
+    for (&row, output) in ids.iter().zip(out.chunks_exact_mut(cols)) {
+        weights.dequant_row_into(row, output)?;
+        apply_inverse_basis(output, weights.layout.basis)?;
+    }
+    Ok(())
 }
 
 /// Reference additive-ternary matrix multiplication over a validated view.
@@ -297,11 +413,12 @@ pub fn apply_basis(values: &mut [f32], basis: Basis) -> Result<(), AdditiveError
 /// The reference uses only add/subtract/skip for ternary dot products.
 pub fn reference_ternary_matmul(
     activations: &[f32],
-    weights: &AdditiveView<'_>,
+    weights: &BasisBound<AdditiveView<'_>, Matmul>,
     batch: usize,
     transformed_activations: &mut [f32],
     out: &mut [f32],
 ) -> Result<(), AdditiveError> {
+    let weights = &weights.tensor;
     let rows = usize::try_from(weights.layout.rows).map_err(|_| AdditiveError::SizeOverflow)?;
     let cols = usize::try_from(weights.layout.cols).map_err(|_| AdditiveError::SizeOverflow)?;
     let activation_count = batch.checked_mul(cols).ok_or(AdditiveError::SizeOverflow)?;
@@ -456,8 +573,14 @@ mod tests {
         let activations = [1.0, 2.0, 3.0, 4.0];
         let mut transformed = [0.0; 4];
         let mut out = [0.0; 1];
-        reference_ternary_matmul(&activations, &view, 1, &mut transformed, &mut out)
-            .expect("valid reference matmul");
+        reference_ternary_matmul(
+            &activations,
+            &view.bind_matmul(),
+            1,
+            &mut transformed,
+            &mut out,
+        )
+        .expect("valid reference matmul");
         assert_eq!(out, [6.0]);
     }
 

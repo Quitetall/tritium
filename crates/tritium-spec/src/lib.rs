@@ -245,6 +245,24 @@ pub trait TernaryBackend: Send + Sync {
         )))
     }
 
+    /// Gather `[ids.len(), K]` original-coordinate rows from an uploaded tensor.
+    ///
+    /// Additive tensors undo their declared input-axis basis after decoding;
+    /// dense tensors copy rows directly. Preserve ID order and duplicates,
+    /// and reject invalid IDs/output lengths before writing. Empty gathers
+    /// are valid. Compatibility defaults fail closed, never return rotated rows.
+    fn embed_rows(
+        &self,
+        _tensor: &dyn DeviceBuffer,
+        _ids: &[usize],
+        _out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        Err(BackendError::Backend(format!(
+            "backend `{}` does not implement semantic tensor gather",
+            self.device_id()
+        )))
+    }
+
     /// Upload host-side packed weight bytes (`format`, shape `[N, K]`) to device
     /// memory, returning an opaque handle for reuse across `mpgemm` calls.
     ///

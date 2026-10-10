@@ -33,7 +33,10 @@ mod scale;
 mod shape;
 mod trit;
 
-pub use additive::{AdditiveError, AdditiveView, apply_basis, reference_ternary_matmul};
+pub use additive::{
+    AdditiveError, AdditiveView, BasisBound, Gather, Matmul, apply_basis, apply_inverse_basis,
+    reference_embed, reference_ternary_matmul,
+};
 pub use dtype::{DType, TernaryFormat};
 pub use error::TritError;
 #[cfg(feature = "std")]

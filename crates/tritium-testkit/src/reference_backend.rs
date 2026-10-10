@@ -9,7 +9,9 @@
 
 use core::any::Any;
 
-use tritium_core::{GemmShape, TernaryFormat, Trit, reference_mpgemm, reference_ternary_matmul};
+use tritium_core::{
+    GemmShape, TernaryFormat, Trit, reference_embed, reference_mpgemm, reference_ternary_matmul,
+};
 use tritium_format::AdditiveTensor;
 use tritium_format::{
     TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row, unpack_tq2_0_row,
@@ -132,10 +134,14 @@ impl TernaryBackend for ReferenceBackend {
     fn matmul(&self, p: TensorMatmul<'_>) -> Result<(), BackendError> {
         if let Some(buf) = p.tensor.as_any().downcast_ref::<RefAdditiveBuffer>() {
             let view = buf.tensor.view();
-            return reference_ternary_matmul(p.act, &view, p.batch, p.transformed_act, p.out)
-                .map_err(|e| {
-                    BackendError::InvalidInput(format!("reference matmul failed: {e:?}"))
-                });
+            return reference_ternary_matmul(
+                p.act,
+                &view.bind_matmul(),
+                p.batch,
+                p.transformed_act,
+                p.out,
+            )
+            .map_err(|e| BackendError::InvalidInput(format!("reference matmul failed: {e:?}")));
         }
         let buf = p
             .tensor
@@ -172,6 +178,45 @@ impl TernaryBackend for ReferenceBackend {
                     .zip(weights)
                     .map(|(activation, weight)| activation * weight)
                     .sum();
+            }
+        }
+        Ok(())
+    }
+
+    fn embed_rows(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        ids: &[usize],
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        if let Some(buf) = tensor.as_any().downcast_ref::<RefAdditiveBuffer>() {
+            return reference_embed(&buf.tensor.view().bind_gather(), ids, out).map_err(|e| {
+                BackendError::InvalidInput(format!("reference gather failed: {e:?}"))
+            });
+        }
+        let buf = tensor
+            .as_any()
+            .downcast_ref::<RefDenseBuffer>()
+            .ok_or_else(|| BackendError::InvalidInput("unknown reference tensor kind".into()))?;
+        let expected = ids
+            .len()
+            .checked_mul(buf.cols)
+            .ok_or_else(|| BackendError::InvalidInput("gather dimensions overflow".into()))?;
+        if out.len() != expected {
+            return Err(BackendError::ShapeMismatch {
+                expected,
+                got: out.len(),
+            });
+        }
+        if ids.iter().any(|&row| row >= buf.rows) {
+            return Err(BackendError::InvalidInput(
+                "gather row outside tensor".into(),
+            ));
+        }
+        // Zero-width dense rows are legal; chunks_exact_mut(0) would panic.
+        if buf.cols != 0 {
+            for (&row, output) in ids.iter().zip(out.chunks_exact_mut(buf.cols)) {
+                output.copy_from_slice(&buf.values[row * buf.cols..(row + 1) * buf.cols]);
             }
         }
         Ok(())
