@@ -1,0 +1,36 @@
+{
+  "schema": "tritium.npm-archive-qualification.v1",
+  "release": "1.1.0-rc.2",
+  "source_revision": "a3542beebd2e8bc518544e0b795a448b94203b24",
+  "run_id": "github-38040527733-1-npm-archive",
+  "started_at_utc": "2026-10-10T09:14:18Z",
+  "duration_ms": 1679.353978,
+  "machine": {
+    "machine_id": "sha256:16371017b6371b307ba49967213a530cd0f97986f4cd75d03a3650124219b97b",
+    "system": "linux",
+    "architecture": "x64"
+  },
+  "toolchain": {
+    "node": "v22.23.3",
+    "npm": "10.9.9"
+  },
+  "artifact": {
+    "kind": "npm-archive",
+    "name": "tritium-ai-web-1.1.0-rc.2.tgz",
+    "package": "@tritium-ai/web@1.1.0-rc.2",
+    "bytes": 627941,
+    "sha256": "35f0f44c618dfc7dcb3ce3a9a6e089a95f4ca99d353da1ee7ca7375603284781",
+    "integrity": "sha512-AWEEmQdE/IFhgmXoiKvSFDq6twjaCgPTjKIuQdl2wGbJ4ozU2jcdAZ6CChQRuIwuKArmn9t1PSj97Z8U9UzpuA=="
+  },
+  "evidence": {
+    "source_dirty": false,
+    "entry_count": 16,
+    "source_free": true,
+    "installed_offline": true,
+    "strict_typescript": true,
+    "wasm_build_id": "tritium-wasm@1.1.0-rc.2+source-git:a3542beebd2e8bc518544e0b795a448b94203b24",
+    "wasm_guest_digest": "a5d242a06e6eb6d76dff95fc50af588450993c0cbb4a4e8b7eefc6eec6e26651"
+  },
+  "result": "pass",
+  "receipt_id": "sha256:d8978f975a0493dd25a46134eb7710d3dbf53abdef3f550abe060aecf5f61a43"
+}
