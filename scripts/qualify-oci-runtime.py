@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
+import multiprocessing
 import os
 from pathlib import Path
 import platform
@@ -34,6 +35,15 @@ SCHEMA = "tritium.oci-runtime-qualification.v4"
 HEX = frozenset("0123456789abcdef")
 MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_SSE_RESPONSE_BYTES = 1024 * 1024
+MAX_QUEUE_WORKER_MESSAGE_BYTES = 4092
+QUEUE_WORKER_REAP_GRACE_SECONDS = 1.0
+QUEUE_RESULT_FIELDS = frozenset({
+    "queue_rejections_before", "queue_rejections_after", "disconnects_before",
+    "disconnects_after", "accepted_streams", "rejected_streams",
+    "settled_queue_depth", "worker_alive", "queue_capacity", "saturated_queue_depth",
+    "slow_hold_ms", "tokens_out_before_hold", "tokens_out_after_hold",
+    "recovery_status", "recovery_ms", "recovery_timeout_ms",
+})
 CHECKS = (
     "production-readiness", "models", "buffered-generation", "sse-generation",
     "auth-required", "malformed-json", "principal-rate-limit",
@@ -265,6 +275,110 @@ def slow_stream_attempt(
 
 
 def exercise_queue_disconnects(
+    *, base_url: str, token: str, metric_token: str, model_id: str,
+    prompt: str, clients: int, max_tokens: int, timeout: float,
+    hold_seconds: float, recovery_timeout: float, wall_timeout: float = 600.0,
+) -> dict[str, int]:
+    """Own and reap the entire workload, including noncooperative HTTP threads."""
+    for name, duration in (("wall timeout", wall_timeout), ("request timeout", timeout),
+                           ("hold", hold_seconds), ("recovery timeout", recovery_timeout)):
+        positive_finite_duration(duration, name)
+    if hold_seconds < 1:
+        raise QualificationError("slow-reader hold must be >= 1s")
+    if type(clients) is not int or not 3 <= clients <= 32:
+        raise QualificationError("queue flood clients must be in [3, 32]")
+    if type(max_tokens) is not int or not 32 <= max_tokens <= 4096:
+        raise QualificationError("slow reader tokens must be in [32, 4096]")
+    deadline = time.monotonic() + wall_timeout
+    try:
+        context = multiprocessing.get_context("fork")
+    except ValueError as error:
+        raise QualificationError("queue workload requires fork process isolation") from error
+    receive, send = context.Pipe(duplex=False)
+    process = None
+    try:
+        try:
+            process = context.Process(target=_queue_disconnect_worker, args=(send, {
+                "base_url": base_url, "token": token, "metric_token": metric_token,
+                "model_id": model_id, "prompt": prompt, "clients": clients,
+                "max_tokens": max_tokens, "timeout": timeout, "hold_seconds": hold_seconds,
+                "recovery_timeout": recovery_timeout,
+            }), daemon=True)
+            process.start()
+        except (OSError, RuntimeError) as error:
+            raise QualificationError("queue workload worker could not start") from error
+        send.close()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not receive.poll(remaining):
+            raise QualificationError("queue workload wall deadline exceeded")
+        try:
+            message = json.loads(receive.recv_bytes(MAX_QUEUE_WORKER_MESSAGE_BYTES))
+        except (EOFError, OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise QualificationError("queue workload returned missing or invalid evidence") from error
+        process.join(max(0.0, deadline - time.monotonic()))
+        if process.is_alive() or time.monotonic() >= deadline:
+            raise QualificationError("queue workload wall deadline exceeded")
+        if process.exitcode != 0:
+            raise QualificationError("queue workload worker exited unsuccessfully")
+        if not isinstance(message, dict) or type(message.get("ok")) is not bool:
+            raise QualificationError("queue workload returned invalid evidence envelope")
+        if not message["ok"]:
+            if (set(message) != {"ok", "detail"} or not isinstance(message["detail"], str)
+                    or len(message["detail"]) > 1024):
+                raise QualificationError("queue workload returned invalid failure envelope")
+            raise QualificationError(f"queue workload failed: {message['detail']}")
+        result = message.get("result")
+        if (set(message) != {"ok", "result"} or not isinstance(result, dict)
+                or set(result) != QUEUE_RESULT_FIELDS
+                or any(type(value) is not int or value < 0 for value in result.values())):
+            raise QualificationError("queue workload returned invalid evidence fields")
+        return result
+    finally:
+        try:
+            if process is not None and process.is_alive():
+                process.terminate()
+                process.join(QUEUE_WORKER_REAP_GRACE_SECONDS)
+            if process is not None and process.is_alive():
+                process.kill()
+                process.join(QUEUE_WORKER_REAP_GRACE_SECONDS)
+            if process is not None and process.is_alive():
+                raise QualificationError("queue workload worker could not be reaped")
+        finally:
+            receive.close()
+            send.close()
+            if process is not None and not process.is_alive():
+                process.close()
+
+
+def positive_finite_duration(value: float, label: str) -> None:
+    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+        raise QualificationError(f"{label} must be positive and finite")
+
+
+def _queue_disconnect_worker(connection: Any, arguments: dict[str, Any]) -> None:
+    try:
+        try:
+            message = {"ok": True, "result": _exercise_queue_disconnects(**arguments)}
+        except BaseException as error:
+            detail = str(error)
+            for sensitive in sorted({arguments["token"], arguments["metric_token"],
+                                     arguments["prompt"]}, key=len, reverse=True):
+                if sensitive:
+                    detail = detail.replace(sensitive, "[redacted]")
+            message = {"ok": False, "detail": detail[:1024]}
+        data = canonical(message)
+        # Keep header + payload within one atomic pipe write, so poll/recv cannot
+        # strand the parent on a partial message from a stopped child.
+        limit = min(MAX_QUEUE_WORKER_MESSAGE_BYTES,
+                    os.fpathconf(connection.fileno(), "PC_PIPE_BUF") - 4)
+        if len(data) > limit:
+            data = canonical({"ok": False, "detail": "queue workload evidence exceeds IPC limit"})
+        connection.send_bytes(data)
+    finally:
+        connection.close()
+
+
+def _exercise_queue_disconnects(
     *, base_url: str, token: str, metric_token: str, model_id: str,
     prompt: str, clients: int, max_tokens: int, timeout: float,
     hold_seconds: float, recovery_timeout: float,
@@ -558,14 +672,15 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         raise QualificationError("release must be a canonical 1.1.0 release candidate")
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", args.run_id) is None:
         raise QualificationError("run ID is not a safe canonical identifier")
-    if min(args.startup_timeout, args.request_timeout, args.shutdown_timeout) <= 0:
-        raise QualificationError("timeouts must be positive")
+    for name in ("startup_timeout", "request_timeout", "shutdown_timeout",
+                 "slow_reader_hold", "disconnect_recovery_timeout", "queue_workload_timeout"):
+        positive_finite_duration(getattr(args, name), name.replace("_", " "))
     if not 3 <= args.queue_flood_clients <= 32:
         raise QualificationError("queue flood clients must be in [3, 32]")
     if not 32 <= args.slow_reader_tokens <= 4096:
         raise QualificationError("slow reader tokens must be in [32, 4096]")
-    if args.slow_reader_hold < 1 or args.disconnect_recovery_timeout <= 0:
-        raise QualificationError("slow-reader hold must be >= 1s and recovery timeout positive")
+    if args.slow_reader_hold < 1:
+        raise QualificationError("slow-reader hold must be >= 1s")
     if not 256 <= args.sigterm_prefill_repetitions <= 8192:
         raise QualificationError("SIGTERM prefill repetitions must be in [256, 8192]")
     if not 100 <= args.phase_signal_latency_ms <= 10000:
@@ -672,6 +787,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             clients=args.queue_flood_clients, max_tokens=args.slow_reader_tokens,
             timeout=args.request_timeout, hold_seconds=args.slow_reader_hold,
             recovery_timeout=args.disconnect_recovery_timeout,
+            wall_timeout=args.queue_workload_timeout,
         )
         request_error(
             f"http://127.0.0.1:{port}/v1/chat/completions", 400,
@@ -1102,6 +1218,8 @@ def main() -> int:
     parser.add_argument("--slow-reader-tokens", type=int, default=4096)
     parser.add_argument("--slow-reader-hold", type=float, default=2.0)
     parser.add_argument("--disconnect-recovery-timeout", type=float, default=60.0)
+    parser.add_argument("--queue-workload-timeout", type=float, default=600.0,
+                        help="absolute queue/disconnect worker wall budget in seconds")
     parser.add_argument("--sigterm-prefill-repetitions", type=int, default=1024)
     parser.add_argument("--phase-signal-latency-ms", type=int, default=2000)
     args = parser.parse_args()
