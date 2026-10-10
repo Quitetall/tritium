@@ -28,6 +28,7 @@ class ManylinuxBuildResourceTests(unittest.TestCase):
                     tools = {
                         "git": """#!/bin/sh
 case "$*" in
+  *--local-env-vars*) printf 'GIT_DIR\\nGIT_WORK_TREE\\nGIT_INDEX_FILE\\n' ;;
   *--show-toplevel*) printf '%s\\n' "$FIXTURE_ROOT" ;;
   *status*) exit 0 ;;
   *'rev-parse HEAD'*) printf '%040d\\n' 1 ;;
@@ -36,7 +37,12 @@ esac
 """,
                         "rustup": '#!/bin/sh\nprintf "%s\\n" "$FIXTURE_SYSROOT"\n',
                         "nvcc": '#!/bin/sh\nprintf "Cuda compilation tools, release 13.4\\n"\n',
-                        "python": "#!/bin/sh\nexit 0\n",
+                        "python": """#!/bin/sh
+case "$1" in
+  */_qualification_git.py) exec /usr/bin/python3 "$@" ;;
+  *) exit 0 ;;
+esac
+""",
                         "docker": """#!/usr/bin/python3
 import json, os, pathlib, sys
 pathlib.Path(os.environ["FIXTURE_DOCKER_ARGS"]).write_text(json.dumps(sys.argv[1:]))

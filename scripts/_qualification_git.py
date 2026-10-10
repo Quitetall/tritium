@@ -48,3 +48,31 @@ def run_git(repo: Path, *args: str, error_type=ValueError) -> str:
     if result.returncode:
         raise error_type(result.stderr.strip() or "git command failed")
     return result.stdout.strip()
+
+
+def main() -> int:
+    """Bounded binary-preserving bridge for shell source-admission callers."""
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", type=Path, required=True)
+    parser.add_argument("git_args", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    command = args.git_args
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        parser.error("a Git command is required after --")
+    try:
+        result = git_result(args.repo, *command, text=False)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    sys.stdout.buffer.write(result.stdout)
+    sys.stderr.buffer.write(result.stderr)
+    return result.returncode if result.returncode >= 0 else 128 - result.returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

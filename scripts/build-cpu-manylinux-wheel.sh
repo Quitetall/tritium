@@ -21,12 +21,19 @@ if [[ $# -gt 1 ]]; then
   exit 2
 fi
 
-ROOT="$(git rev-parse --show-toplevel)"
-if [[ -n "$(git -C "$ROOT" status --porcelain=v1 --untracked-files=all)" ]]; then
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+source_git() {
+  python "$SCRIPT_DIR/_qualification_git.py" --repo "$1" -- "${@:2}"
+}
+ROOT="$(source_git "$PWD" rev-parse --show-toplevel)"
+# Keep the command status outside [[ ... ]]: a failed status probe is not an
+# empty clean worktree. The helper isolates only its Git children.
+WORKTREE_STATUS="$(source_git "$ROOT" status --porcelain=v1 --untracked-files=all)"
+if [[ -n "$WORKTREE_STATUS" ]]; then
   echo "CPU manylinux release builds require a clean Git worktree" >&2
   exit 1
 fi
-SOURCE_REVISION="$(git -C "$ROOT" rev-parse HEAD)"
+SOURCE_REVISION="$(source_git "$ROOT" rev-parse HEAD)"
 if [[ ! "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
   echo "Git HEAD is not a full lowercase object ID" >&2
   exit 1
