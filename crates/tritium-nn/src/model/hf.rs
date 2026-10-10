@@ -25,11 +25,12 @@ use std::path::Path;
 use tritium_format::salt_joint_bundle::{JointSaltBundleReader, SALT_JOINT_BUNDLE_MAGIC};
 use tritium_format::{PackedSaltRow, SALT_BUNDLE_MAGIC, SaltBundleReader, SaltGgufReader};
 
-use crate::config::{ArchSpec, MlpKind, ModelConfig};
+use super::standard::StandardModelPlan;
+use crate::config::{ArchSpec, ModelConfig};
 use crate::error::NnError;
 use crate::layers::{
-    DenseLinear, Mlp, PackedSaltMatrix, PackedSaltMatrixBuilder, Projection, Relu2Mlp, SaltLinear,
-    SwiGluMlp, TensorLoader, TokenEmbedding, TransformerBlock,
+    DenseLinear, PackedSaltMatrix, PackedSaltMatrixBuilder, Projection, SaltLinear, TensorLoader,
+    TokenEmbedding,
 };
 use crate::model::ModelWeights;
 use crate::model::hf_shards::HfShardSet;
@@ -57,23 +58,17 @@ impl ModelWeights {
     }
 
     pub(super) fn load_hf_admitted_impl(
-        dir: &Path,
+        config: &ModelConfig,
+        spec: &ArchSpec,
+        shards: &HfShardSet,
+        plan: &StandardModelPlan,
         loader: &mut TensorLoader<'_>,
-    ) -> Result<(ModelConfig, ArchSpec, ModelWeights), NnError> {
-        let (config, spec, shards, declared_vocab) = open_hf_standard(dir)?;
-        if config.n_embd == 0 {
-            return Err(NnError::MissingConfig("hidden size must be nonzero".into()));
-        }
-        let values = shards.tensor_f32_matrix(
-            NameSchema::Hf.top("token_embd"),
-            declared_vocab,
-            config.n_embd as usize,
-        )?;
-        let rows = values.len() / config.n_embd as usize;
+    ) -> Result<ModelWeights, NnError> {
+        let values = shards.tensor_f32_exact(&plan.embedding.name, &plan.embedding.shape)?;
         let embedding = loader.upload(
-            NameSchema::Hf.top("token_embd"),
+            &plan.embedding.name,
             tritium_spec::TensorView::Dense {
-                rows,
+                rows: plan.vocab(),
                 cols: config.n_embd as usize,
                 values: &values,
             },
@@ -91,10 +86,9 @@ impl ModelWeights {
                 "embedding is already bound to its admitted tensor".into(),
             )),
         };
-        let weights = build_standard_model_with_embedding(
-            &config,
-            &spec,
-            NameSchema::Hf,
+        let weights = plan.assemble(
+            config,
+            spec,
             TokenEmbedding::from_linear(embedding),
             get,
             |name, rows, cols| {
@@ -111,7 +105,7 @@ impl ModelWeights {
                     .map(Projection::Tensor)
             },
         )?;
-        Ok((config, spec, weights))
+        Ok(weights)
     }
 
     /// Load a standard-transformer fp model from a directory holding `config.json` and
@@ -549,145 +543,13 @@ pub(crate) fn build_standard_model_with_embedding(
     schema: NameSchema,
     token_embd: TokenEmbedding,
     dense: impl Fn(&str, DenseTensorRequest) -> Result<Vec<f32>, NnError>,
-    mut proj: impl FnMut(&str, usize, usize) -> Result<Projection, NnError>,
+    proj: impl FnMut(&str, usize, usize) -> Result<Projection, NnError>,
 ) -> Result<ModelWeights, NnError> {
-    let n_embd = config.n_embd as usize;
-    if n_embd == 0 || token_embd.cols() != n_embd || token_embd.rows() == 0 {
-        return Err(NnError::Shape {
-            expected: n_embd.max(1),
-            got: token_embd.cols(),
-        });
-    }
-    let vocab = token_embd.rows();
-    let head_dim = config.head_dim() as usize;
-    if head_dim == 0 || !head_dim.is_multiple_of(2) {
-        return Err(NnError::Backend(
-            "attention head dimension must be nonzero and even".to_owned(),
-        ));
-    }
-    let q_width = (config.n_head as usize)
-        .checked_mul(head_dim)
-        .ok_or_else(|| NnError::Backend("query projection width overflows usize".to_owned()))?;
-    let kv_width = (config.n_head_kv as usize)
-        .checked_mul(head_dim)
-        .ok_or_else(|| NnError::Backend("KV projection width overflows usize".to_owned()))?;
-    let n_ff = config.n_ff as usize;
-    let dense_exact = |name: &str, expected: usize| -> Result<Vec<f32>, NnError> {
-        let values = dense(name, DenseTensorRequest::Vector { len: expected })?;
-        if values.len() != expected {
-            return Err(NnError::Shape {
-                expected,
-                got: values.len(),
-            });
-        }
-        Ok(values)
-    };
-    let output_norm = dense_exact(schema.top("output_norm"), n_embd)?;
-
-    let layer_count = config.n_layers as usize;
-    let mut layers = Vec::new();
-    layers.try_reserve_exact(layer_count).map_err(|_| {
-        NnError::Backend(format!(
-            "allocate metadata for {layer_count} transformer layers"
-        ))
-    })?;
-    for i in 0..layer_count {
-        let p = |s: &str| schema.layer(i, s);
-        let (gate, up, down) = (
-            proj(&p("gate"), n_ff, n_embd)?,
-            proj(&p("up"), n_ff, n_embd)?,
-            proj(&p("down"), n_embd, n_ff)?,
-        );
-        let mlp = match spec.mlp {
-            MlpKind::SwiGlu => Mlp::SwiGlu(SwiGluMlp::new(gate, up, down)?),
-            MlpKind::Relu2 => Mlp::Relu2(Relu2Mlp {
-                gate,
-                up,
-                down,
-                ffn_sub_norm: if spec.ffn_sub_norm {
-                    dense_exact(&p("ffn_sub_norm"), n_ff)?
-                } else {
-                    Vec::new()
-                },
-                rms_eps: config.rms_eps,
-            }),
-        };
-        // Optional Qwen2/2.5 QKV bias and Qwen3 QK-norm (empty = absent).
-        let (q_bias, k_bias, v_bias) = if spec.qkv_bias {
-            (
-                dense_exact(&p("q_bias"), q_width)?,
-                dense_exact(&p("k_bias"), kv_width)?,
-                dense_exact(&p("v_bias"), kv_width)?,
-            )
-        } else {
-            (Vec::new(), Vec::new(), Vec::new())
-        };
-        let (q_norm, k_norm) = if spec.qk_norm {
-            (
-                dense_exact(&p("q_norm"), head_dim)?,
-                dense_exact(&p("k_norm"), head_dim)?,
-            )
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        // Validate optional-weight lengths at load — a wrong-length bias would mis-stride
-        // `add_bias`, a wrong-length QK-norm would mis-normalize. Fail loudly here, not later.
-        for (b, w) in [(&q_bias, q_width), (&k_bias, kv_width), (&v_bias, kv_width)] {
-            if !b.is_empty() && b.len() != w {
-                return Err(NnError::Shape {
-                    expected: w,
-                    got: b.len(),
-                });
-            }
-        }
-        for n in [&q_norm, &k_norm] {
-            if !n.is_empty() && n.len() != head_dim {
-                return Err(NnError::Shape {
-                    expected: head_dim,
-                    got: n.len(),
-                });
-            }
-        }
-        layers.push(TransformerBlock {
-            attn_norm: dense_exact(&p("attn_norm"), n_embd)?,
-            q_proj: proj(&p("q"), q_width, n_embd)?,
-            k_proj: proj(&p("k"), kv_width, n_embd)?,
-            v_proj: proj(&p("v"), kv_width, n_embd)?,
-            o_proj: proj(&p("o"), n_embd, q_width)?,
-            // BitNet applies attn_sub_norm before o_proj; absent elsewhere.
-            attn_sub_norm: if spec.attn_sub_norm {
-                dense_exact(&p("attn_sub_norm"), q_width)?
-            } else {
-                Vec::new()
-            },
-            q_bias,
-            k_bias,
-            v_bias,
-            q_norm,
-            k_norm,
-            ffn_norm: dense_exact(&p("ffn_norm"), n_embd)?,
-            mlp,
-        });
-    }
-
-    // Untied lm_head when the config says so; else tie to the embedding.
-    let lm_head = if spec.tied_embeddings {
-        None
-    } else {
-        Some(proj(schema.top("lm_head"), vocab, n_embd)?)
-    };
-
-    Ok(ModelWeights {
-        token_embd,
-        vocab,
-        n_embd,
-        layers,
-        output_norm,
-        lm_head,
-    })
+    StandardModelPlan::new(config, spec, schema, token_embd.rows())?
+        .assemble(config, spec, token_embd, dense, proj)
 }
 
-fn open_hf_standard(
+pub(super) fn open_hf_standard(
     dir: &Path,
 ) -> Result<(ModelConfig, ArchSpec, HfShardSet, Option<usize>), NnError> {
     let cfg_json = read_config_json(&dir.join("config.json"))?;

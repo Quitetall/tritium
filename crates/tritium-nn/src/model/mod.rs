@@ -22,6 +22,7 @@ mod runner;
 #[cfg(feature = "cuda")]
 mod salt_v2;
 mod source;
+mod standard;
 mod tokenizer;
 mod training_salt;
 mod weights;

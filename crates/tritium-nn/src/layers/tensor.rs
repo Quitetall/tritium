@@ -49,6 +49,17 @@ impl<'a> TensorLoader<'a> {
         }
     }
 
+    pub(crate) fn check_evidence(&self) -> Result<(), NnError> {
+        self.context
+            .recorder
+            .check_emit::<tritium_evidence::TensorUploaded>(
+                self.context.span,
+                self.context.parent,
+                self.context.logical_time,
+            )
+            .map_err(|error| NnError::Backend(format!("tensor upload evidence: {error}")))
+    }
+
     /// Validate finite model weights and upload without retaining a host shadow.
     ///
     /// The returned handle owns its reservation independently of this loader.

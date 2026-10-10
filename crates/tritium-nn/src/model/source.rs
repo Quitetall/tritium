@@ -1,6 +1,6 @@
 //! Shared admitted source loading; typed profile remains experimental (ADR 0054).
 
-use std::{cell::RefCell, collections::BTreeSet, path::Path};
+use std::{cell::RefCell, collections::BTreeMap, path::Path};
 
 use half::{bf16, f16};
 use tritium_format::{
@@ -15,9 +15,11 @@ use tritium_spec::TensorView;
 use super::{
     ModelWeights,
     hf::{
-        DenseTensorRequest, MAX_CONFIG_JSON_BYTES, NameSchema, build_standard_model_with_embedding,
-        declared_vocab_size, resolve_optional_attention_names,
+        DenseTensorRequest, MAX_CONFIG_JSON_BYTES, NameSchema, declared_vocab_size,
+        open_hf_standard, resolve_optional_attention_names,
     },
+    hf_shards::HfShardSet,
+    standard::StandardModelPlan,
 };
 use crate::{ArchSpec, ModelConfig, NnError, Projection, TensorLoader, TokenEmbedding};
 
@@ -45,10 +47,20 @@ pub enum ModelSource<'a> {
 }
 
 enum PreparedSource<'a> {
-    Hf(&'a Path),
+    Hf {
+        #[cfg(feature = "tokenizer")]
+        path: &'a Path,
+        shards: HfShardSet,
+        config: ModelConfig,
+        spec: ArchSpec,
+        plan: StandardModelPlan,
+    },
     Trit {
         model: Box<TritModel<'a>>,
         level: &'a str,
+        config: ModelConfig,
+        spec: ArchSpec,
+        plan: StandardModelPlan,
     },
 }
 
@@ -56,10 +68,10 @@ impl<'a> PreparedSource<'a> {
     #[cfg(feature = "tokenizer")]
     fn identity(&self) -> Result<LoadedSourceIdentity, NnError> {
         match self {
-            Self::Hf(_) => Ok(LoadedSourceIdentity::HuggingFace {
+            Self::Hf { .. } => Ok(LoadedSourceIdentity::HuggingFace {
                 reason: UnknownReason::MissingCapability,
             }),
-            Self::Trit { model, level } => Ok(LoadedSourceIdentity::Trit {
+            Self::Trit { model, level, .. } => Ok(LoadedSourceIdentity::Trit {
                 package_id: tritium_schema::PackageId::from_bytes(*model.package_id().as_bytes()),
                 model_id: model.model_id(level).map_err(format_error)?,
                 level: (*level).to_owned(),
@@ -69,7 +81,49 @@ impl<'a> PreparedSource<'a> {
 
     fn new(source: ModelSource<'a>) -> Result<Self, NnError> {
         match source {
-            ModelSource::HuggingFace(path) => Ok(Self::Hf(path)),
+            ModelSource::HuggingFace(path) => {
+                let (config, spec, shards, declared_vocab) = open_hf_standard(path)?;
+                let inventory: BTreeMap<_, _> = shards.metadata().map(|t| (t.name, t)).collect();
+                let embedding = inventory
+                    .get(NameSchema::Hf.top("token_embd"))
+                    .ok_or_else(|| NnError::MissingTensor("embedding absent".into()))?;
+                let vocab =
+                    embedding.shape.first().copied().ok_or_else(|| {
+                        NnError::MissingTensor("embedding must be a matrix".into())
+                    })?;
+                if declared_vocab.is_some_and(|n| n != vocab) {
+                    return Err(NnError::MissingTensor(
+                        "embedding vocabulary disagrees with config".into(),
+                    ));
+                }
+                let plan = StandardModelPlan::new(&config, &spec, NameSchema::Hf, vocab)?;
+                for request in plan.tensors() {
+                    let actual = inventory
+                        .get(request.name.as_str())
+                        .ok_or_else(|| NnError::MissingTensor(request.name.clone()))?;
+                    if actual.shape != request.shape
+                        || !matches!(actual.dtype, "F32" | "F16" | "BF16")
+                    {
+                        return Err(NnError::MissingTensor(format!(
+                            "{} has incompatible shape or storage",
+                            request.name
+                        )));
+                    }
+                }
+                if inventory.len() != plan.tensors().count() {
+                    return Err(NnError::MissingTensor(
+                        "unexpected tensor in the complete HF source".into(),
+                    ));
+                }
+                Ok(Self::Hf {
+                    #[cfg(feature = "tokenizer")]
+                    path,
+                    shards,
+                    config,
+                    spec,
+                    plan,
+                })
+            }
             ModelSource::Trit { bytes, level } => {
                 let model = read_trit_model(bytes).map_err(format_error)?;
                 if !model.manifest().levels.iter().any(|l| l.name == level) {
@@ -77,9 +131,13 @@ impl<'a> PreparedSource<'a> {
                         "absent model level {level}"
                     )));
                 }
+                let (config, spec, plan) = prepare_trit(&model, level)?;
                 Ok(Self::Trit {
                     model: Box::new(model),
                     level,
+                    config,
+                    spec,
+                    plan,
                 })
             }
         }
@@ -90,15 +148,35 @@ impl<'a> PreparedSource<'a> {
         loader: &mut TensorLoader<'_>,
     ) -> Result<(ModelConfig, ArchSpec, ModelWeights), NnError> {
         match self {
-            Self::Hf(path) => ModelWeights::load_hf_admitted_impl(path, loader),
-            Self::Trit { model, level } => load_trit(model, level, loader),
+            Self::Hf {
+                shards,
+                config,
+                spec,
+                plan,
+                ..
+            } => Ok((
+                config.clone(),
+                spec.clone(),
+                ModelWeights::load_hf_admitted_impl(config, spec, shards, plan, loader)?,
+            )),
+            Self::Trit {
+                model,
+                level,
+                config,
+                spec,
+                plan,
+            } => Ok((
+                config.clone(),
+                spec.clone(),
+                load_trit(model, level, config, spec, plan, loader)?,
+            )),
         }
     }
 
     #[cfg(feature = "tokenizer")]
     fn tokenizer(&self) -> Result<super::HfJsonTokenizer, NnError> {
         match self {
-            Self::Hf(path) => {
+            Self::Hf { path, .. } => {
                 let tokenizer =
                     read_tokenizer_asset(path, "tokenizer.json", MAX_TOKENIZER_JSON_BYTES)?;
                 let config = read_tokenizer_asset(
@@ -123,6 +201,13 @@ impl<'a> PreparedSource<'a> {
                 )?;
                 super::HfJsonTokenizer::from_bytes(tokenizer, config)
             }
+        }
+    }
+
+    #[cfg(feature = "tokenizer")]
+    fn vocab(&self) -> usize {
+        match self {
+            Self::Hf { plan, .. } | Self::Trit { plan, .. } => plan.vocab(),
         }
     }
 }
@@ -168,7 +253,8 @@ fn read_tokenizer_asset(path: &Path, name: &str, limit: u64) -> Result<Vec<u8>, 
 impl ModelWeights {
     /// Load backend-owned standard-model weights through the shared source path.
     ///
-    /// Norm/bias vectors remain finite host data; matrix uploads use the same
+    /// Config, complete name inventory, shape and storage admission precede
+    /// matrix upload. Norm/bias vectors remain finite host data; matrices use the same
     /// capability/payload-budget/evidence interface. A tied head shares its
     /// embedding handle. Failed assembly releases all unpublished handles.
     /// Tokenizers are not inferred by this weights-only operation.
@@ -179,6 +265,7 @@ impl ModelWeights {
         source: ModelSource<'_>,
         loader: &mut TensorLoader<'_>,
     ) -> Result<(ModelConfig, ArchSpec, Self), NnError> {
+        loader.check_evidence()?;
         PreparedSource::new(source)?.weights(loader)
     }
 }
@@ -201,15 +288,19 @@ pub struct LoadedModel {
 
 /// Load a text model through one source selector and shared admitted execution.
 ///
-/// Parses tokenizer assets before upload; validates all tokenizer IDs against
-/// embedding rows before returning a runner. A `.trit` container is parsed only
+/// Checks config, complete name inventory, shapes/storage and recorder context
+/// before matrix upload. Parses tokenizer assets and checks all tokenizer IDs
+/// against embedding rows before upload too. A `.trit` container is parsed only
 /// once; no filesystem extraction or retained dense model shadow is introduced.
 /// Tokenizer JSON is bounded to 256 MiB and its config to 16 MiB; these are
 /// source limits, not an accounting of parsed tokenizer or total model memory.
 /// This is standard Attention/SwiGLU/Relu2 execution, not hybrid/MTP, resident
 /// executor, full-memory or release qualification. Typed sources bind candidate
 /// model/package IDs; HF identity remains explicitly unavailable. Final load
-/// event recording failure drops the unpublished runner and payload leases.
+/// event recording still validates the actual payload and drops the unpublished
+/// runner and payload leases on failure. HF numerical payload checks remain
+/// seek-read during assembly; metadata preflight is not a full snapshot, payload
+/// scan, capability/aggregate-budget admission or total-memory qualification.
 /// The recorder must register both `TENSOR_UPLOADED_REGISTRATION` and
 /// `MODEL_LOADED_REGISTRATION` from `tritium_evidence`.
 ///
@@ -223,9 +314,22 @@ pub fn load(
     budget: &tritium_runtime::TensorPayloadBudget,
     context: tritium_runtime::TensorUploadContext<'_>,
 ) -> Result<LoadedModel, NnError> {
+    context
+        .recorder
+        .check_emit::<ModelLoaded>(context.span, context.parent, context.logical_time)
+        .map_err(|error| NnError::Backend(format!("model load evidence: {error}")))?;
+    context
+        .recorder
+        .check_emit::<tritium_evidence::TensorUploaded>(
+            context.span,
+            context.parent,
+            context.logical_time,
+        )
+        .map_err(|error| NnError::Backend(format!("tensor upload evidence: {error}")))?;
     let source = PreparedSource::new(source)?;
     let identity = source.identity()?;
     let tokenizer = source.tokenizer()?;
+    tokenizer.validate_model_vocab(source.vocab())?;
     let (config, architecture, weights) = {
         let mut loader = TensorLoader::new(
             backend.as_ref(),
@@ -240,7 +344,6 @@ pub fn load(
         );
         source.weights(&mut loader)?
     };
-    tokenizer.validate_model_vocab(weights.vocab)?;
     let observation = ModelLoaded {
         source: identity,
         architecture: config.arch.clone(),
@@ -370,11 +473,10 @@ fn upload_matrix(
     }
 }
 
-fn load_trit(
+fn prepare_trit(
     model: &TritModel<'_>,
     level: &str,
-    loader: &mut TensorLoader<'_>,
-) -> Result<(ModelConfig, ArchSpec, ModelWeights), NnError> {
+) -> Result<(ModelConfig, ArchSpec, StandardModelPlan), NnError> {
     let config_bytes = model.asset("config.json").map_err(format_error)?;
     if u64::try_from(config_bytes.len()).unwrap_or(u64::MAX) > MAX_CONFIG_JSON_BYTES {
         return Err(NnError::MissingConfig(
@@ -402,13 +504,9 @@ fn load_trit(
         &json,
         selected.tensors.iter().map(|t| t.name.as_str()),
     )?;
-    let consumed = RefCell::new(BTreeSet::new());
-    let tensor = |name: &str| {
-        let binding = model.tensor(level, name).map_err(format_error)?;
-        consumed.borrow_mut().insert(name.to_owned());
-        Ok::<_, NnError>(binding)
-    };
-    let (meta, bytes) = tensor(NameSchema::Hf.top("token_embd"))?;
+    let (meta, _) = model
+        .tensor(level, NameSchema::Hf.top("token_embd"))
+        .map_err(format_error)?;
     let (vocab, columns) = matrix_shape(meta)?;
     if columns != config.n_embd as usize || declared_vocab_size(&json)?.is_some_and(|n| n != vocab)
     {
@@ -416,6 +514,56 @@ fn load_trit(
             "embedding geometry disagrees with config".into(),
         ));
     }
+    let plan = StandardModelPlan::new(&config, &spec, NameSchema::Hf, vocab)?;
+    let inventory: BTreeMap<_, _> = selected
+        .tensors
+        .iter()
+        .map(|t| (t.name.as_str(), t))
+        .collect();
+    for request in plan.tensors() {
+        let meta = inventory
+            .get(request.name.as_str())
+            .ok_or_else(|| NnError::MissingTensor(request.name.clone()))?;
+        let matches = match &meta.storage {
+            TensorStorage::Dense { shape, .. } => {
+                shape.len() == request.shape.len()
+                    && shape
+                        .iter()
+                        .zip(&request.shape)
+                        .all(|(&a, &b)| usize::try_from(a) == Ok(b))
+            }
+            TensorStorage::Additive { .. } => {
+                request.shape.len() == 2
+                    && matrix_shape(meta)? == (request.shape[0], request.shape[1])
+            }
+            _ => false,
+        };
+        if !matches {
+            return Err(NnError::MissingTensor(format!(
+                "{} has incompatible tensor geometry",
+                request.name
+            )));
+        }
+    }
+    if inventory.len() != plan.tensors().count() {
+        return Err(NnError::MissingTensor(
+            "unexpected tensor in the selected complete level".into(),
+        ));
+    }
+    Ok((config, spec, plan))
+}
+
+fn load_trit(
+    model: &TritModel<'_>,
+    level: &str,
+    config: &ModelConfig,
+    spec: &ArchSpec,
+    plan: &StandardModelPlan,
+    loader: &mut TensorLoader<'_>,
+) -> Result<ModelWeights, NnError> {
+    let tensor = |name: &str| model.tensor(level, name).map_err(format_error);
+    let (meta, bytes) = tensor(&plan.embedding.name)?;
+    let (vocab, columns) = matrix_shape(meta)?;
     let embedding =
         TokenEmbedding::from_linear(upload_matrix(loader, meta, bytes, vocab, columns)?);
     let loader = RefCell::new(loader);
@@ -438,22 +586,6 @@ fn load_trit(
         let (meta, bytes) = tensor(name)?;
         upload_matrix(&mut loader.borrow_mut(), meta, bytes, rows, cols).map(Projection::Tensor)
     };
-    let weights = build_standard_model_with_embedding(
-        &config,
-        &spec,
-        NameSchema::Hf,
-        embedding,
-        vectors,
-        projections,
-    )?;
-    if selected
-        .tensors
-        .iter()
-        .any(|t| !consumed.borrow().contains(&t.name))
-    {
-        return Err(NnError::MissingTensor(
-            "unexpected tensor in the selected complete level".into(),
-        ));
-    }
-    Ok((config, spec, weights))
+    let weights = plan.assemble(config, spec, embedding, vectors, projections)?;
+    Ok(weights)
 }

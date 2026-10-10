@@ -12,6 +12,50 @@ use tritium_schema::{
 };
 use tritium_spec::{TensorExecution, TensorView, TernaryBackend};
 
+#[derive(Debug)]
+struct UploadProbe(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl TernaryBackend for UploadProbe {
+    fn device_id(&self) -> &str {
+        "cpu-preflight-probe"
+    }
+    fn capabilities(&self) -> tritium_spec::DeviceCaps {
+        tritium_cpu::CpuBackend::new().capabilities()
+    }
+    fn tensor_caps(
+        &self,
+        tensor: TensorView<'_>,
+    ) -> Result<Option<tritium_spec::TensorCaps>, tritium_spec::BackendError> {
+        tritium_cpu::CpuBackend::new().tensor_caps(tensor)
+    }
+    fn upload_tensor(
+        &self,
+        tensor: TensorView<'_>,
+    ) -> Result<Box<dyn tritium_spec::DeviceBuffer>, tritium_spec::BackendError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tritium_cpu::CpuBackend::new().upload_tensor(tensor)
+    }
+    fn upload_weights(
+        &self,
+        packed: &[u8],
+        shape: tritium_core::GemmShape,
+        format: tritium_core::TernaryFormat,
+    ) -> Result<Box<dyn tritium_spec::DeviceBuffer>, tritium_spec::BackendError> {
+        tritium_cpu::CpuBackend::new().upload_weights(packed, shape, format)
+    }
+    fn mpgemm(&self, p: tritium_spec::MpGemm<'_>) -> Result<(), tritium_spec::BackendError> {
+        tritium_cpu::CpuBackend::new().mpgemm(p)
+    }
+}
+
+fn upload_probe() -> (
+    Box<dyn TernaryBackend>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    (Box::new(UploadProbe(count.clone())), count)
+}
+
 #[test]
 fn one_admitted_handle_executes_linear_gather_and_tied_head() {
     let cpu = tritium_cpu::CpuBackend::new();
@@ -238,6 +282,23 @@ impl HfFixture {
         if bad == Some("missing-down") {
             tensors.retain(|(name, _, _)| !name.ends_with("down_proj.weight"));
         }
+        if bad == Some("shape") {
+            let (_, shape, _) = tensors
+                .iter_mut()
+                .find(|(name, _, _)| name.ends_with("q_proj.weight"))
+                .unwrap();
+            *shape = vec![1, shape.iter().product()];
+        }
+        if bad == Some("vector-shape") {
+            let (_, shape, _) = tensors
+                .iter_mut()
+                .find(|(name, _, _)| name == "model.norm.weight")
+                .unwrap();
+            *shape = vec![1, 8];
+        }
+        if bad == Some("extra") {
+            tensors.push(("unexpected.weight".into(), vec![1], vec![0.]));
+        }
         if bad == Some("nan-norm") {
             tensors
                 .iter_mut()
@@ -264,7 +325,12 @@ impl HfFixture {
                 for value in values {
                     data.extend_from_slice(&value.to_le_bytes());
                 }
-                header.insert(name.clone(), serde_json::json!({"dtype":"F32", "shape":shape, "data_offsets":[start,data.len()]}));
+                let dtype = if bad == Some("dtype") && name.ends_with("q_proj.weight") {
+                    "U32"
+                } else {
+                    "F32"
+                };
+                header.insert(name.clone(), serde_json::json!({"dtype":dtype, "shape":shape, "data_offsets":[start,data.len()]}));
                 weight_map.insert(name.clone(), filename.into());
             }
             let mut json = serde_json::to_vec(&header).unwrap();
@@ -396,7 +462,7 @@ fn admitted_hf_cuda_matches_legacy_logits_bit_for_bit() {
 fn failed_hf_assembly_releases_all_unpublished_payloads() {
     for (bad, limit, expected_events) in [
         (None, 320, 1),
-        (Some("missing-down"), u64::MAX, 3),
+        (Some("missing-down"), u64::MAX, 0),
         (Some("nan-norm"), u64::MAX, 1),
     ] {
         let fixture = HfFixture::new("llama", true, 4, bad);
@@ -440,6 +506,37 @@ fn failed_hf_assembly_releases_all_unpublished_payloads() {
     );
     assert_eq!(budget.used_bytes(), 0);
     assert!(recorder.events().is_empty());
+}
+
+#[test]
+fn hf_complete_inventory_preflight_rejects_before_backend_upload() {
+    for arch in ["llama", "qwen2", "qwen3"] {
+        for tied in [false, true] {
+            for bad in ["missing-down", "shape", "extra", "dtype", "vector-shape"] {
+                let fixture = HfFixture::new(arch, tied, 6, Some(bad));
+                let budget = TensorPayloadBudget::new(u64::MAX);
+                let mut recorder =
+                    EvidenceRecorder::new("hf-preflight", [TENSOR_UPLOADED_REGISTRATION]).unwrap();
+                let (backend, uploads) = upload_probe();
+                let result = ModelRunner::from_hf_admitted(
+                    &fixture.dir,
+                    backend,
+                    TensorUploadPolicy::default(),
+                    &budget,
+                    TensorUploadContext {
+                        recorder: &mut recorder,
+                        span: "load",
+                        parent: None,
+                        logical_time: 0,
+                    },
+                );
+                assert!(result.is_err(), "{arch}/{tied}/{bad}");
+                assert!(recorder.events().is_empty());
+                assert_eq!(uploads.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert_eq!(budget.used_bytes(), 0);
+            }
+        }
+    }
 }
 
 #[test]
@@ -1129,9 +1226,10 @@ fn text_load_rejects_invalid_assets_and_vocab_and_releases_budget() {
                 [TENSOR_UPLOADED_REGISTRATION, MODEL_LOADED_REGISTRATION],
             )
             .unwrap();
+            let (backend, uploads) = upload_probe();
             let result = tritium_nn::load(
                 source,
-                Box::new(tritium_cpu::CpuBackend::new()),
+                backend,
                 TensorUploadPolicy::default(),
                 &budget,
                 TensorUploadContext {
@@ -1143,16 +1241,20 @@ fn text_load_rejects_invalid_assets_and_vocab_and_releases_budget() {
             );
             assert!(result.is_err(), "{bad}");
             assert_eq!(budget.used_bytes(), 0, "{bad}");
+            assert_eq!(
+                uploads.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{bad}"
+            );
             assert!(
                 recorder
                     .events()
                     .iter()
                     .all(|event| event.schema != ModelLoaded::SCHEMA_ID)
             );
-            assert_eq!(
-                recorder.events().len(),
-                if bad == "vocab" { hf.upload_count } else { 0 },
-                "{bad}"
+            assert!(
+                recorder.events().is_empty(),
+                "{bad}: upload before preflight"
             );
         }
     }
@@ -1265,7 +1367,7 @@ fn load_observations_bind_selected_level_and_logical_ids_across_codecs() {
 
 #[cfg(feature = "tokenizer")]
 #[test]
-fn final_load_recording_failure_releases_all_unpublished_payloads() {
+fn missing_load_registration_rejects_before_backend_upload() {
     use tritium_evidence::{EvidenceEvent, ModelLoaded};
     let hf = HfFixture::new("qwen3", true, 6, None);
     let (tokenizer, config) = tokenizer_assets(false);
@@ -1283,12 +1385,13 @@ fn final_load_recording_failure_releases_all_unpublished_payloads() {
         },
     ] {
         let budget = TensorPayloadBudget::new(100_000);
-        // Matrix uploads succeed; only final ModelLoaded registration is absent.
+        // Missing registration is a cheap preflight rejection, not a late failure.
         let mut recorder =
             EvidenceRecorder::new("final-load-failure", [TENSOR_UPLOADED_REGISTRATION]).unwrap();
+        let (backend, uploads) = upload_probe();
         let error = tritium_nn::load(
             source,
-            Box::new(tritium_cpu::CpuBackend::new()),
+            backend,
             TensorUploadPolicy::default(),
             &budget,
             TensorUploadContext {
@@ -1305,18 +1408,21 @@ fn final_load_recording_failure_releases_all_unpublished_payloads() {
                 .to_string()
                 .contains("model load evidence: UnregisteredSchema")
         );
-        assert_eq!(recorder.events().len(), hf.upload_count);
+        assert!(recorder.events().is_empty());
+        assert_eq!(uploads.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(
             recorder
                 .events()
                 .iter()
                 .all(|event| event.schema != ModelLoaded::SCHEMA_ID)
         );
-        verify_jsonl_with_registry(
-            &recorder.to_jsonl().unwrap(),
-            [TENSOR_UPLOADED_REGISTRATION],
-        )
-        .unwrap();
+        assert!(matches!(
+            verify_jsonl_with_registry(
+                &recorder.to_jsonl().unwrap(),
+                [TENSOR_UPLOADED_REGISTRATION],
+            ),
+            Err(tritium_evidence::EvidenceError::EmptyRun)
+        ));
         assert_eq!(budget.used_bytes(), 0);
     }
 }
@@ -1360,12 +1466,13 @@ fn typed_model_rejects_false_coverage_geometry_and_releases_failed_uploads() {
         let budget = TensorPayloadBudget::new(if bad == "budget" { 320 } else { 100_000 });
         let mut recorder =
             EvidenceRecorder::new("nn-trit-failure", [TENSOR_UPLOADED_REGISTRATION]).unwrap();
+        let (backend, uploads) = upload_probe();
         let result = ModelRunner::from_source_admitted(
             tritium_nn::ModelSource::Trit {
                 bytes: &bytes,
                 level: if bad == "level" { "absent" } else { "standard" },
             },
-            Box::new(tritium_cpu::CpuBackend::new()),
+            backend,
             TensorUploadPolicy::default(),
             &budget,
             TensorUploadContext {
@@ -1377,6 +1484,17 @@ fn typed_model_rejects_false_coverage_geometry_and_releases_failed_uploads() {
         );
         assert!(result.is_err(), "{bad}");
         assert_eq!(budget.used_bytes(), 0, "{bad}");
+        if bad != "budget" {
+            assert!(
+                recorder.events().is_empty(),
+                "{bad}: upload before preflight"
+            );
+            assert_eq!(
+                uploads.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{bad}"
+            );
+        }
     }
     for bad in ["unregistered", "corrupt-bytes"] {
         let fixture = TritFixture::new(&hf, None);

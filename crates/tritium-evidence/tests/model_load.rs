@@ -20,6 +20,55 @@ fn observation() -> ModelLoaded {
 }
 
 #[test]
+fn emit_preflight_is_nonmutating_and_checks_current_context() {
+    let mut recorder = EvidenceRecorder::new("preflight", [MODEL_LOADED_REGISTRATION]).unwrap();
+    let before = recorder.root_digest();
+    for _ in 0..2 {
+        recorder.check_emit::<ModelLoaded>("load", None, 7).unwrap();
+    }
+    assert!(recorder.events().is_empty());
+    assert_eq!(recorder.root_digest(), before);
+    for (span, parent, time) in [
+        ("", None, 0),
+        ("load", Some("load"), 0),
+        ("load", None, 1 << 53),
+    ] {
+        assert!(
+            recorder
+                .check_emit::<ModelLoaded>(span, parent, time)
+                .is_err()
+        );
+    }
+    let recorded = recorder
+        .emit_model_loaded("load", None, 7, &observation())
+        .unwrap();
+    assert_eq!(recorded.envelope().seq, 0);
+    let before = recorder.root_digest().unwrap();
+    assert!(matches!(
+        recorder.check_emit::<ModelLoaded>("load", None, 6),
+        Err(EvidenceError::NonMonotonicTime(_))
+    ));
+    assert!(matches!(
+        recorder.check_emit::<ModelLoaded>("load", Some("new-parent"), 7),
+        Err(EvidenceError::ParentMismatch(_))
+    ));
+    assert!(matches!(
+        recorder.check_emit::<tritium_evidence::TensorUploaded>("load", None, 7),
+        Err(EvidenceError::UnregisteredSchema(_))
+    ));
+    assert_eq!(recorder.root_digest().unwrap(), before);
+    assert_eq!(recorder.events().len(), 1);
+    assert_eq!(
+        recorder
+            .emit_model_loaded("load", None, 7, &observation())
+            .unwrap()
+            .envelope()
+            .seq,
+        1
+    );
+}
+
+#[test]
 fn recorded_load_view_matches_verified_replay_without_a_verdict() {
     let mut recorder = EvidenceRecorder::new("load-test", [MODEL_LOADED_REGISTRATION]).unwrap();
     let view = recorder

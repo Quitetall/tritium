@@ -116,14 +116,21 @@ impl EvidenceRecorder {
         })
     }
 
-    /// Emit one registered event and append it to this run's in-memory log.
-    pub fn emit<E: EvidenceEvent>(
-        &mut self,
+    /// Check registration and span/time/sequence admission without recording.
+    ///
+    /// This checks the current recorder state only. It does not reserve a
+    /// sequence, serialize a payload, establish ancestry or guarantee a later
+    /// emission. `emit` repeats the checks and validates the actual payload.
+    ///
+    /// # Errors
+    /// Unregistered schema/version, invalid span/parent, changed parent,
+    /// nonmonotonic/unsafe logical time or unsafe/overflowing current sequence.
+    pub fn check_emit<E: EvidenceEvent>(
+        &self,
         span: &str,
         parent: Option<&str>,
         logical_time: u64,
-        event: &E,
-    ) -> Result<&EvidenceEnvelope, EvidenceError> {
+    ) -> Result<(), EvidenceError> {
         if self.registered.get(E::SCHEMA_ID) != Some(&E::VERSION) {
             return Err(EvidenceError::UnregisteredSchema(format!(
                 "{}@{}",
@@ -137,9 +144,8 @@ impl EvidenceRecorder {
         if parent == Some(span) {
             return Err(EvidenceError::InvalidParent(span.to_owned()));
         }
-        let parent = parent.map(str::to_owned);
         if let Some(previous_parent) = self.span_parent.get(span)
-            && previous_parent != &parent
+            && previous_parent.as_deref() != parent
         {
             return Err(EvidenceError::ParentMismatch(span.to_owned()));
         }
@@ -156,13 +162,28 @@ impl EvidenceRecorder {
         {
             return Err(EvidenceError::NonMonotonicTime(span.to_owned()));
         }
-        let payload = serde_json::to_value(event)
-            .map_err(|error| EvidenceError::Serialization(error.to_string()))?;
-        validate_json_numbers(&payload)?;
         let seq = *self.next_seq.get(span).unwrap_or(&0);
         if seq > MAX_SAFE_JSON_INTEGER {
             return Err(EvidenceError::UnsafeInteger("seq"));
         }
+        seq.checked_add(1).ok_or(EvidenceError::SequenceOverflow)?;
+        Ok(())
+    }
+
+    /// Emit one registered event and append it to this run's in-memory log.
+    pub fn emit<E: EvidenceEvent>(
+        &mut self,
+        span: &str,
+        parent: Option<&str>,
+        logical_time: u64,
+        event: &E,
+    ) -> Result<&EvidenceEnvelope, EvidenceError> {
+        self.check_emit::<E>(span, parent, logical_time)?;
+        let parent = parent.map(str::to_owned);
+        let payload = serde_json::to_value(event)
+            .map_err(|error| EvidenceError::Serialization(error.to_string()))?;
+        validate_json_numbers(&payload)?;
+        let seq = *self.next_seq.get(span).unwrap_or(&0);
         let next_seq = seq.checked_add(1).ok_or(EvidenceError::SequenceOverflow)?;
         let body = DigestBody {
             schema: E::SCHEMA_ID,
