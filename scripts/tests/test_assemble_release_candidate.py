@@ -18,6 +18,9 @@ MODULE = runpy.run_path(ROOT / "scripts" / "assemble-release-candidate.py")
 ReleaseError = MODULE["ReleaseError"]
 assemble = MODULE["assemble"]
 candidate_validate = MODULE["candidate_validate"]
+INPUTS_MODULE = runpy.run_path(ROOT / "scripts" / "generate-release-inputs.py")
+build_release_inputs = INPUTS_MODULE["build_inputs"]
+write_release_inputs = INPUTS_MODULE["write_inputs"]
 
 
 def write_json(path: Path, value: object) -> None:
@@ -187,6 +190,63 @@ def missing_oci_fixture(base: Path) -> tuple[Path, Path, Path]:
 
 
 class AssembleReleaseCandidateTests(unittest.TestCase):
+    def test_nested_same_named_wheels_assemble_from_generated_inputs(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            candidate = base / "candidate"
+            candidate.mkdir()
+            filename = "pytritium-1.1.0rc2-cp39-abi3-manylinux_2_28_x86_64.whl"
+            for platform in ("cpu", "cuda"):
+                directory = candidate / platform
+                directory.mkdir()
+                payload = f"{platform}-wheel".encode()
+                (directory / filename).write_bytes(payload)
+                write_json(
+                    directory / f"wheel-{platform}.cdx.json",
+                    {
+                        "bomFormat": "CycloneDX",
+                        "specVersion": "1.6",
+                        "metadata": {
+                            "component": {
+                                "bom-ref": f"wheel-{platform}",
+                                "hashes": [
+                                    {
+                                        "alg": "SHA-256",
+                                        "content": hashlib.sha256(payload).hexdigest(),
+                                    }
+                                ],
+                                "properties": [
+                                    {"name": "tritium:artifact:file", "value": filename},
+                                    {
+                                        "name": "tritium:artifact:bytes",
+                                        "value": str(len(payload)),
+                                    },
+                                ],
+                            }
+                        },
+                    },
+                )
+
+            inputs = build_release_inputs(
+                candidate,
+                release="1.1.0-rc.2",
+                source_revision="a" * 40,
+                builder_id="https://github.com/tritium/ci/release",
+                invocation_id="run-nested-wheels",
+            )
+            inputs_path = base / "release-inputs.json"
+            write_release_inputs(inputs_path, inputs)
+            manifest = assemble(
+                inputs_path,
+                candidate / "manifest.json",
+                str(fake_tool(base)),
+            )
+
+            self.assertEqual(
+                [item["path"] for item in manifest["artifacts"]],
+                [f"cpu/{filename}", f"cuda/{filename}"],
+            )
+
     def test_assembly_generates_missing_canonical_oci_sbom(self):
         with tempfile.TemporaryDirectory() as raw:
             base = Path(raw)
