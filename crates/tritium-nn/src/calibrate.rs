@@ -22,11 +22,12 @@
 //! weight SSE and 12% worse perplexity at identical bits — so it is a research artifact, not a
 //! shipping path.
 //!
-//! `o_proj` is not calibrated. Its input is the attention concat, which under GQA has query heads
-//! sharing kv dims — exactly the case the salience fold also skips.
+//! [`forward_observed`] exposes all actual projection inputs and pre-transform
+//! outputs for a caller-owned backward phase. The legacy salience fold still
+//! skips `o_proj` and the tied head for its unchanged structural reasons.
 
 use tritium_train::Tape;
-use tritium_train::nn::{attention, attention_heads};
+use tritium_train::nn::attention_heads_traced;
 use tritium_train::tape::ValueId;
 
 use crate::{Mlp, ModelRunner, Projection};
@@ -152,39 +153,7 @@ pub fn norm_tensors(a: &Arch) -> Vec<(String, &[f32])> {
 /// `tape_model_conformance`): embed_gather → N GQA blocks → SwiGLU → tied head. `wids[0]` is the
 /// tied embed/head; then per layer `q,k,v,o,gate,up,down`. Returns `[tokens.len(), vocab]` logits.
 pub fn forward(t: &mut Tape, wids: &[ValueId], a: &Arch, tokens: &[u32]) -> ValueId {
-    let seq = tokens.len();
-    let mut hidden = t.embed_gather(wids[0], tokens, a.vocab, a.n_embd);
-    for li in 0..a.n_layers {
-        let base = 1 + 7 * li;
-        let an = t.leaf(a.attn_norms[li].clone());
-        let xn = t.rmsnorm(hidden, an, seq, a.n_embd, a.eps);
-        let attn = attention(
-            t,
-            xn,
-            wids[base],
-            wids[base + 1],
-            wids[base + 2],
-            wids[base + 3],
-            seq,
-            a.n_embd,
-            a.n_head,
-            a.n_head_kv,
-            a.head_dim,
-            a.theta,
-        );
-        hidden = t.add(hidden, attn);
-        let fnw = t.leaf(a.ffn_norms[li].clone());
-        let hn = t.rmsnorm(hidden, fnw, seq, a.n_embd, a.eps);
-        let g = t.dense_matmul(hn, wids[base + 4], seq, a.ff, a.n_embd);
-        let u = t.dense_matmul(hn, wids[base + 5], seq, a.ff, a.n_embd);
-        let ga = t.silu(g);
-        let gated = t.mul(ga, u);
-        let down = t.dense_matmul(gated, wids[base + 6], seq, a.n_embd, a.ff);
-        hidden = t.add(hidden, down);
-    }
-    let onw = t.leaf(a.out_norm.clone());
-    let fnorm = t.rmsnorm(hidden, onw, seq, a.n_embd, a.eps);
-    t.dense_matmul(fnorm, wids[0], seq, a.vocab, a.n_embd) // tied head
+    forward_observed(t, wids, a, tokens, &mut |_, _| {})
 }
 
 /// An activation transform applied at a projection input: `(which projection, layer, values, seq, cols)`.
@@ -201,8 +170,8 @@ pub type ActFn<'a> = dyn FnMut(Tap, usize, &mut [f32], usize, usize) + 'a;
 /// meant a second forward pass nobody had written.
 ///
 /// **Every projection input is covered**, `o_proj`'s included: it used to live inside
-/// [`attention`], where nothing could reach it, so results carried an upper-bound caveat with one
-/// of seven projections per layer unpenalised. [`attention_heads`] splits the output projection off
+/// [`tritium_train::nn::attention`], where nothing could reach it, so results carried an upper-bound caveat with one
+/// of seven projections per layer unpenalised. [`tritium_train::nn::attention_heads`] splits the output projection off
 /// so this pass can tap and quantize it like any other.
 pub fn forward_aq(
     t: &mut Tape,
@@ -211,62 +180,18 @@ pub fn forward_aq(
     tokens: &[u32],
     aq: &mut ActFn<'_>,
 ) -> ValueId {
-    fn requant(
-        t: &mut Tape,
-        id: ValueId,
-        kind: Tap,
-        li: usize,
-        seq: usize,
-        cols: usize,
-        aq: &mut ActFn<'_>,
-    ) -> ValueId {
-        let mut v = t.value(id).to_vec();
-        aq(kind, li, &mut v, seq, cols);
-        t.leaf(v)
-    }
-
-    let seq = tokens.len();
-    let mut hidden = t.embed_gather(wids[0], tokens, a.vocab, a.n_embd);
-    for li in 0..a.n_layers {
-        let base = 1 + 7 * li;
-        let an = t.leaf(a.attn_norms[li].clone());
-        let xn = t.rmsnorm(hidden, an, seq, a.n_embd, a.eps);
-        let xn = requant(t, xn, Tap::AttnIn, li, seq, a.n_embd, aq);
-        // Split so `o_proj`'s input is reachable. Running `attention` whole would leave one
-        // projection per layer at fp32 and make every number here an upper bound.
-        let qd = a.n_head * a.head_dim;
-        let heads = attention_heads(
-            t,
-            xn,
-            wids[base],
-            wids[base + 1],
-            wids[base + 2],
-            seq,
-            a.n_embd,
-            a.n_head,
-            a.n_head_kv,
-            a.head_dim,
-            a.theta,
-        );
-        let heads = requant(t, heads, Tap::OProjIn, li, seq, qd, aq);
-        let attn = t.dense_matmul(heads, wids[base + 3], seq, a.n_embd, qd);
-        hidden = t.add(hidden, attn);
-        let fnw = t.leaf(a.ffn_norms[li].clone());
-        let hn = t.rmsnorm(hidden, fnw, seq, a.n_embd, a.eps);
-        let hn = requant(t, hn, Tap::FfnIn, li, seq, a.n_embd, aq);
-        let g = t.dense_matmul(hn, wids[base + 4], seq, a.ff, a.n_embd);
-        let u = t.dense_matmul(hn, wids[base + 5], seq, a.ff, a.n_embd);
-        let ga = t.silu(g);
-        let gated = t.mul(ga, u);
-        let gated = requant(t, gated, Tap::DownIn, li, seq, a.ff, aq);
-        let down = t.dense_matmul(gated, wids[base + 6], seq, a.n_embd, a.ff);
-        hidden = t.add(hidden, down);
-    }
-    let onw = t.leaf(a.out_norm.clone());
-    let fnorm = t.rmsnorm(hidden, onw, seq, a.n_embd, a.eps);
-    // The tied head is a projection too, and skipping it would understate a full-precision sweep.
-    let fnorm = requant(t, fnorm, Tap::Head, a.n_layers, seq, a.n_embd, aq);
-    t.dense_matmul(fnorm, wids[0], seq, a.vocab, a.n_embd)
+    forward_impl(
+        t,
+        wids,
+        a,
+        tokens,
+        &mut ForwardHooks {
+            head: true,
+            transform: Some(aq),
+            input: &mut |_, _, _, _, _, _| {},
+            projection: &mut |_, _| {},
+        },
+    )
 }
 
 /// Per-input-channel second moments for the projections whose scale is foldable.
@@ -334,6 +259,265 @@ pub enum Tap {
 /// materialises a copy — [`accumulate`] reads straight out of the tape.
 pub type TapFn<'a> = dyn FnMut(Tap, usize, &Tape, ValueId, usize, usize) + 'a;
 
+/// Actual consumer of a weight in the supported tied-head GQA/SwiGLU graph.
+/// These are runtime observations, not registered calibration evidence.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProjectionRole {
+    /// Token gather; its output has hidden width, not vocabulary width.
+    Embedding,
+    /// Query projection before RoPE.
+    Query,
+    /// Key projection before RoPE.
+    Key,
+    /// Value projection.
+    Value,
+    /// Concatenated attention heads to the residual stream.
+    Output,
+    /// SwiGLU gate projection before SiLU.
+    Gate,
+    /// SwiGLU up projection before multiplication.
+    Up,
+    /// Gated intermediate to the residual stream.
+    Down,
+    /// Final normalized hidden to the tied language head.
+    Head,
+}
+
+/// Actual original projection input/output IDs on the caller-owned tape.
+/// IDs are valid only on that tape. Callbacks borrow it only for their invocation;
+/// callers may retain this metadata and inspect values/gradients after backward.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProjectionTap {
+    /// Actual graph consumer, distinguishing tied embedding and head uses.
+    pub role: ProjectionRole,
+    /// Transformer layer, absent for embedding/head.
+    pub layer: Option<usize>,
+    /// Index in [`extract`] / [`weight_names`], not a generated display name.
+    pub weight_index: usize,
+    /// Actual weight value ID; tied consumers share this ID.
+    pub weight: ValueId,
+    /// Original activation ID. Only token gather has no dense input ID;
+    /// its actual token indices are the caller's `tokens` argument.
+    pub input: Option<ValueId>,
+    /// Actual projection output ID, before RoPE/SiLU or later graph operations.
+    pub output: ValueId,
+    /// Observed token count.
+    pub samples: usize,
+    /// Original weight matrix row count (vocabulary for token gather/head).
+    pub rows: usize,
+    /// Original weight matrix column count.
+    pub columns: usize,
+}
+
+/// Observation callback at actual projection seams. It produces no gradients,
+/// hashes or evidence itself. `Tape::backward` for a declared caller objective
+/// supplies gradients of these exact output IDs; activations are not Fisher.
+pub type ProjectionTapFn<'a> = dyn FnMut(&Tape, ProjectionTap) + 'a;
+
+/// The real differentiable forward with all original projection observations.
+/// Caller ownership permits post-objective backward inspection without retaining
+/// a borrowed internal tape or running a second neural forward. Legacy forward,
+/// activation transform and fold calibration are adapters over this implementation.
+///
+/// Scope/shape/ValueId contracts are the same as [`forward`] and [`Arch`]: tied
+/// head, full-RoPE GQA, SwiGLU, original dense reference weights. This is not a
+/// Qwen hybrid/MTP tap implementation, cache verifier, RSS bound or receipt.
+pub fn forward_observed(
+    t: &mut Tape,
+    wids: &[ValueId],
+    a: &Arch,
+    tokens: &[u32],
+    observe: &mut ProjectionTapFn<'_>,
+) -> ValueId {
+    forward_impl(
+        t,
+        wids,
+        a,
+        tokens,
+        &mut ForwardHooks {
+            head: true,
+            transform: None,
+            input: &mut |_, _, _, _, _, _| {},
+            projection: observe,
+        },
+    )
+}
+
+struct ForwardHooks<'call, 'callback> {
+    // Legacy fold calibration deliberately stops before vocabulary-sized logits.
+    // Full/observed/AQ forwards always include the head; no requested tap fallback.
+    head: bool,
+    transform: Option<&'call mut ActFn<'callback>>,
+    input: &'call mut TapFn<'callback>,
+    projection: &'call mut ProjectionTapFn<'callback>,
+}
+impl ForwardHooks<'_, '_> {
+    fn input(
+        &mut self,
+        t: &mut Tape,
+        id: ValueId,
+        kind: Tap,
+        li: usize,
+        seq: usize,
+        cols: usize,
+    ) -> ValueId {
+        (self.input)(kind, li, t, id, seq, cols);
+        if let Some(transform) = &mut self.transform {
+            let mut values = t.value(id).to_vec();
+            transform(kind, li, &mut values, seq, cols);
+            t.leaf(values) // Preserve forward_aq's existing graph-detaching transform semantics.
+        } else {
+            id
+        }
+    }
+}
+
+fn forward_impl(
+    t: &mut Tape,
+    wids: &[ValueId],
+    a: &Arch,
+    tokens: &[u32],
+    hooks: &mut ForwardHooks<'_, '_>,
+) -> ValueId {
+    let seq = tokens.len();
+    let mut hidden = t.embed_gather(wids[0], tokens, a.vocab, a.n_embd);
+    (hooks.projection)(
+        t,
+        ProjectionTap {
+            role: ProjectionRole::Embedding,
+            layer: None,
+            weight_index: 0,
+            weight: wids[0],
+            input: None,
+            output: hidden,
+            samples: seq,
+            rows: a.vocab,
+            columns: a.n_embd,
+        },
+    );
+    let qd = a.n_head * a.head_dim;
+    let kvd = a.n_head_kv * a.head_dim;
+    for li in 0..a.n_layers {
+        let base = 1 + 7 * li;
+        let an = t.leaf(a.attn_norms[li].clone());
+        let xn = t.rmsnorm(hidden, an, seq, a.n_embd, a.eps);
+        let xn = hooks.input(t, xn, Tap::AttnIn, li, seq, a.n_embd);
+        let trace = attention_heads_traced(
+            t,
+            xn,
+            wids[base],
+            wids[base + 1],
+            wids[base + 2],
+            seq,
+            a.n_embd,
+            a.n_head,
+            a.n_head_kv,
+            a.head_dim,
+            a.theta,
+        );
+        for (offset, role, output, rows) in [
+            (0, ProjectionRole::Query, trace.query, qd),
+            (1, ProjectionRole::Key, trace.key, kvd),
+            (2, ProjectionRole::Value, trace.value, kvd),
+        ] {
+            (hooks.projection)(
+                t,
+                ProjectionTap {
+                    role,
+                    layer: Some(li),
+                    weight_index: base + offset,
+                    weight: wids[base + offset],
+                    input: Some(xn),
+                    output,
+                    samples: seq,
+                    rows,
+                    columns: a.n_embd,
+                },
+            );
+        }
+        let heads = hooks.input(t, trace.heads, Tap::OProjIn, li, seq, qd);
+        let attn = t.dense_matmul(heads, wids[base + 3], seq, a.n_embd, qd);
+        (hooks.projection)(
+            t,
+            ProjectionTap {
+                role: ProjectionRole::Output,
+                layer: Some(li),
+                weight_index: base + 3,
+                weight: wids[base + 3],
+                input: Some(heads),
+                output: attn,
+                samples: seq,
+                rows: a.n_embd,
+                columns: qd,
+            },
+        );
+        hidden = t.add(hidden, attn);
+        let fnw = t.leaf(a.ffn_norms[li].clone());
+        let hn = t.rmsnorm(hidden, fnw, seq, a.n_embd, a.eps);
+        let hn = hooks.input(t, hn, Tap::FfnIn, li, seq, a.n_embd);
+        let g = t.dense_matmul(hn, wids[base + 4], seq, a.ff, a.n_embd);
+        let u = t.dense_matmul(hn, wids[base + 5], seq, a.ff, a.n_embd);
+        for (offset, role, output) in [(4, ProjectionRole::Gate, g), (5, ProjectionRole::Up, u)] {
+            (hooks.projection)(
+                t,
+                ProjectionTap {
+                    role,
+                    layer: Some(li),
+                    weight_index: base + offset,
+                    weight: wids[base + offset],
+                    input: Some(hn),
+                    output,
+                    samples: seq,
+                    rows: a.ff,
+                    columns: a.n_embd,
+                },
+            );
+        }
+        let ga = t.silu(g);
+        let gated = t.mul(ga, u);
+        let gated = hooks.input(t, gated, Tap::DownIn, li, seq, a.ff);
+        let down = t.dense_matmul(gated, wids[base + 6], seq, a.n_embd, a.ff);
+        (hooks.projection)(
+            t,
+            ProjectionTap {
+                role: ProjectionRole::Down,
+                layer: Some(li),
+                weight_index: base + 6,
+                weight: wids[base + 6],
+                input: Some(gated),
+                output: down,
+                samples: seq,
+                rows: a.n_embd,
+                columns: a.ff,
+            },
+        );
+        hidden = t.add(hidden, down);
+    }
+    if !hooks.head {
+        return hidden;
+    }
+    let onw = t.leaf(a.out_norm.clone());
+    let fnorm = t.rmsnorm(hidden, onw, seq, a.n_embd, a.eps);
+    let fnorm = hooks.input(t, fnorm, Tap::Head, a.n_layers, seq, a.n_embd);
+    let logits = t.dense_matmul(fnorm, wids[0], seq, a.vocab, a.n_embd);
+    (hooks.projection)(
+        t,
+        ProjectionTap {
+            role: ProjectionRole::Head,
+            layer: None,
+            weight_index: 0,
+            weight: wids[0],
+            input: Some(fnorm),
+            output: logits,
+            samples: seq,
+            rows: a.vocab,
+            columns: a.n_embd,
+        },
+    );
+    logits
+}
+
 /// Run the calibration forward pass and hand each tap's raw activations to `tap`.
 ///
 /// [`calibrate`] is this with a closure that reduces to second moments. Anything wanting the
@@ -342,39 +526,22 @@ pub type TapFn<'a> = dyn FnMut(Tap, usize, &Tape, ValueId, usize, usize) + 'a;
 pub fn calibrate_tapped(weights: &[Vec<f32>], a: &Arch, tokens: &[u32], tap: &mut TapFn<'_>) {
     let mut t = Tape::new();
     let wids: Vec<ValueId> = weights.iter().map(|w| t.leaf(w.clone())).collect();
-    let seq = tokens.len();
-    let mut hidden = t.embed_gather(wids[0], tokens, a.vocab, a.n_embd);
-    for li in 0..a.n_layers {
-        let base = 1 + 7 * li;
-        let an = t.leaf(a.attn_norms[li].clone());
-        let xn = t.rmsnorm(hidden, an, seq, a.n_embd, a.eps);
-        tap(Tap::AttnIn, li, &t, xn, seq, a.n_embd);
-        let attn = attention(
-            &mut t,
-            xn,
-            wids[base],
-            wids[base + 1],
-            wids[base + 2],
-            wids[base + 3],
-            seq,
-            a.n_embd,
-            a.n_head,
-            a.n_head_kv,
-            a.head_dim,
-            a.theta,
-        );
-        hidden = t.add(hidden, attn);
-        let fnw = t.leaf(a.ffn_norms[li].clone());
-        let hn = t.rmsnorm(hidden, fnw, seq, a.n_embd, a.eps);
-        tap(Tap::FfnIn, li, &t, hn, seq, a.n_embd);
-        let g = t.dense_matmul(hn, wids[base + 4], seq, a.ff, a.n_embd);
-        let u = t.dense_matmul(hn, wids[base + 5], seq, a.ff, a.n_embd);
-        let ga = t.silu(g);
-        let gated = t.mul(ga, u);
-        tap(Tap::DownIn, li, &t, gated, seq, a.ff);
-        let down = t.dense_matmul(gated, wids[base + 6], seq, a.n_embd, a.ff);
-        hidden = t.add(hidden, down);
-    }
+    forward_impl(
+        &mut t,
+        &wids,
+        a,
+        tokens,
+        &mut ForwardHooks {
+            head: false,
+            transform: None,
+            input: &mut |kind, li, t, id, seq, cols| {
+                if matches!(kind, Tap::AttnIn | Tap::FfnIn | Tap::DownIn) {
+                    tap(kind, li, t, id, seq, cols);
+                }
+            },
+            projection: &mut |_, _| {},
+        },
+    );
 }
 
 pub fn calibrate(weights: &[Vec<f32>], a: &Arch, tokens: &[u32], c: &mut Calib) {
@@ -391,46 +558,6 @@ pub fn calibrate(weights: &[Vec<f32>], a: &Arch, tokens: &[u32], c: &mut Calib) 
         };
         accumulate(t, id, seq, cols, acc);
     });
-    c.rows += seq;
-}
-
-#[allow(dead_code)]
-fn calibrate_old(weights: &[Vec<f32>], a: &Arch, tokens: &[u32], c: &mut Calib) {
-    let mut t = Tape::new();
-    let wids: Vec<ValueId> = weights.iter().map(|w| t.leaf(w.clone())).collect();
-    let seq = tokens.len();
-    let mut hidden = t.embed_gather(wids[0], tokens, a.vocab, a.n_embd);
-    for li in 0..a.n_layers {
-        let base = 1 + 7 * li;
-        let an = t.leaf(a.attn_norms[li].clone());
-        let xn = t.rmsnorm(hidden, an, seq, a.n_embd, a.eps);
-        accumulate(&t, xn, seq, a.n_embd, &mut c.attn_in[li]);
-        let attn = attention(
-            &mut t,
-            xn,
-            wids[base],
-            wids[base + 1],
-            wids[base + 2],
-            wids[base + 3],
-            seq,
-            a.n_embd,
-            a.n_head,
-            a.n_head_kv,
-            a.head_dim,
-            a.theta,
-        );
-        hidden = t.add(hidden, attn);
-        let fnw = t.leaf(a.ffn_norms[li].clone());
-        let hn = t.rmsnorm(hidden, fnw, seq, a.n_embd, a.eps);
-        accumulate(&t, hn, seq, a.n_embd, &mut c.ffn_in[li]);
-        let g = t.dense_matmul(hn, wids[base + 4], seq, a.ff, a.n_embd);
-        let u = t.dense_matmul(hn, wids[base + 5], seq, a.ff, a.n_embd);
-        let ga = t.silu(g);
-        let gated = t.mul(ga, u);
-        accumulate(&t, gated, seq, a.ff, &mut c.down_in[li]);
-        let down = t.dense_matmul(gated, wids[base + 6], seq, a.n_embd, a.ff);
-        hidden = t.add(hidden, down);
-    }
     c.rows += seq;
 }
 
