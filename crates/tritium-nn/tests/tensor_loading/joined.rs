@@ -1,5 +1,7 @@
 //! Engine-produced joined C crosses the existing model-loading/forward seam.
 //! Toy standard-transformer software evidence, not real-model qualification.
+#[path = "joined/staged.rs"]
+mod staged;
 use super::*;
 use std::collections::BTreeMap;
 use tritium_evidence::{

@@ -30,6 +30,9 @@ use tritium_train::Tape;
 use tritium_train::nn::{AttentionQkNorm, attention_heads_traced_with_qk_norm};
 use tritium_train::tape::ValueId;
 
+mod staged;
+pub use staged::{StagedCalibrationLimits, StagedCalibrationModel};
+
 use crate::{Mlp, ModelRunner, Projection};
 use tritium_quantize::engine::SaliencePair;
 pub use tritium_quantize::engine::{SalienceFoldError, divide_rows, scale_cols, smooth_scales};

@@ -268,6 +268,16 @@ impl TokenEmbedding {
         }
     }
 
+    /// Move an already dense table into calibration masters without cloning it.
+    pub(crate) fn into_dense(self) -> Result<Vec<f32>, NnError> {
+        match self.storage {
+            Storage::Dense(values) => Ok(values),
+            _ => Err(NnError::Backend(
+                "calibration requires an original dense token table".into(),
+            )),
+        }
+    }
+
     /// Whether this table retains additive SALT storage.
     ///
     /// The historical method name covers both host-packed SALT V1 rows and a
