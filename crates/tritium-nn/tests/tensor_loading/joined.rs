@@ -46,6 +46,10 @@ fn conversion_limits() -> SalienceConversionLimits {
 }
 
 fn produced(input: &TritFixture, additive: bool) -> JoinedFixture {
+    produced_with_alpha(input, additive, 0.75)
+}
+
+fn produced_with_alpha(input: &TritFixture, additive: bool, alpha: f64) -> JoinedFixture {
     let bytes = input.bytes();
     let model = tritium_format::trit_model::read_trit_model(&bytes).unwrap();
     let mut a = InMemoryWeightSource {
@@ -141,7 +145,7 @@ fn produced(input: &TritFixture, additive: bool) -> JoinedFixture {
             inverse: format!("model.layers.0.{inverse}"),
             inverse_axis,
             moments: stats[name].binding().unwrap(),
-            alpha_bits: 0.75f64.to_le_bytes(),
+            alpha_bits: alpha.to_le_bytes(),
         },
     )
     .collect();

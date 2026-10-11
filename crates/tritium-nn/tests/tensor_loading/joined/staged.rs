@@ -4,6 +4,10 @@ use tritium_nn::calibrate::{StagedCalibrationLimits, StagedCalibrationModel};
 use tritium_schema::ScalePrecision;
 use tritium_train::Tape;
 
+#[cfg(feature = "tokenizer")]
+#[path = "staged/text.rs"]
+mod text;
+
 fn limits() -> StagedCalibrationLimits {
     StagedCalibrationLimits {
         max_config_bytes: 16_000,

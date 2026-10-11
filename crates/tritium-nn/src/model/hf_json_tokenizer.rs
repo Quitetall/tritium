@@ -78,7 +78,7 @@ impl HfJsonTokenizer {
         Ok(Self { inner, bos, eos })
     }
 
-    pub(super) fn validate_model_vocab(&self, rows: usize) -> Result<(), NnError> {
+    pub(crate) fn validate_model_vocab(&self, rows: usize) -> Result<(), NnError> {
         if rows == 0
             || self
                 .inner
@@ -88,6 +88,15 @@ impl HfJsonTokenizer {
         {
             return Err(NnError::Tokenizer(
                 "tokenizer id exceeds the model embedding vocabulary".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_capture_windows(&self) -> Result<(), NnError> {
+        if self.inner.get_truncation().is_some() || self.inner.get_padding().is_some() {
+            return Err(NnError::Tokenizer(
+                "staged capture forbids configured tokenizer truncation/padding".into(),
             ));
         }
         Ok(())

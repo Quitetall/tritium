@@ -7,6 +7,10 @@ use tritium_train::{Tape, tape::ValueId};
 
 mod capture;
 pub use capture::StagedCaptureLimits;
+#[cfg(feature = "tokenizer")]
+mod text;
+#[cfg(feature = "tokenizer")]
+pub use text::StagedTextCaptureLimits;
 
 /// Explicit input/master limits; NOT source, tape, cache, parsed metadata or RSS limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
