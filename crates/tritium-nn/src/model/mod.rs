@@ -73,7 +73,7 @@ pub use salt_v2::{
 pub use source::ModelSource;
 #[cfg(feature = "tokenizer")]
 pub use source::{LoadedModel, load};
-pub(crate) use staged_calibration::dense_stage_weights;
+pub(crate) use staged_calibration::{dense_source_weights, dense_stage_weights};
 pub use tokenizer::Tokenizer;
 pub use training_salt::{
     TRAINING_SALT_COMPLETED_STEP_KEY, TRAINING_SALT_FORMAT_KEY, TRAINING_SALT_FORMAT_VALUE,

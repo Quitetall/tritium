@@ -1,6 +1,8 @@
 //! Actual raw source -> shared fitter -> sealed log -> checked package -> sinks.
 #[path = "model_engine/calibrated.rs"]
 mod calibrated;
+#[path = "model_engine/observed.rs"]
+mod observed;
 use std::{collections::BTreeMap, io::Cursor};
 use tritium_evidence::{
     DIRECT_LEVELS_FITTED_REGISTRATION, EvidenceRecorder, QUANTIZATION_COMPLETED_REGISTRATION,
@@ -149,6 +151,39 @@ fn source(precision: ScalePrecision) -> InMemoryWeightSource {
             ("tokenizer.json".into(), b"{}".to_vec()),
         ]),
         grams: BTreeMap::new(),
+    }
+}
+
+#[test]
+fn original_source_content_identity_oracle() {
+    let mut output = Vec::new();
+    for precision in [
+        ScalePrecision::F32,
+        ScalePrecision::F16,
+        ScalePrecision::Bf16,
+    ] {
+        for change in 0..4 {
+            let mut input = source(precision);
+            match change {
+                1 => {
+                    input.assets.insert("config.json".into(), b"{ }".to_vec());
+                }
+                2 => {
+                    input.tensors.get_mut("norm").unwrap().bytes.fill(0);
+                }
+                3 => {
+                    input.assets.insert("extra.json".into(), b"extra".to_vec());
+                }
+                _ => {}
+            }
+            let request = plan(&input);
+            let id = Engine::observe_source(&request, &mut input).unwrap();
+            assert_eq!(id, Engine::observe_source(&request, &mut input).unwrap());
+            output.extend_from_slice(id.as_bytes());
+        }
+    }
+    if let Some(path) = std::env::var_os("TRITIUM_OBSERVED_SOURCE_ORACLE_OUTPUT") {
+        std::fs::write(path, output).unwrap();
     }
 }
 fn plan(source: &dyn WeightSource) -> QuantPlan {

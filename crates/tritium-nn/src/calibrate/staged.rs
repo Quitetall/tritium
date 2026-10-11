@@ -1,7 +1,7 @@
 //! Immutable dense B masters behind the actual shared calibration graph.
 use super::{Arch, ProjectionTapFn, QkNorm, forward_observed};
-use crate::{Mlp, ModelWeights, NnError, Projection};
-use tritium_quantize::engine::StagedSalienceSource;
+use crate::{Mlp, ModelConfig, ModelWeights, NnError, Projection};
+use tritium_quantize::engine::{ObservedWeightSource, StagedSalienceSource, WeightSource};
 use tritium_schema::OriginalSourceId;
 use tritium_train::{Tape, tape::ValueId};
 
@@ -30,6 +30,17 @@ pub struct StagedCalibrationLimits {
 /// The caller owns objective/backward. This does not certify captured caches,
 /// hybrid/MTP support, source arithmetic replay, out-of-core fitting or quality.
 pub struct StagedCalibrationModel {
+    core: DenseCalibrationModel,
+}
+
+/// Actual observed original-source masters, not a transformed B or capture receipt.
+/// Reuses the same admitted dense loader, immutable masters and graph as B.
+/// Does not certify salience statistics, raw text, out-of-core/RSS or model quality.
+pub struct SourceCalibrationModel {
+    core: DenseCalibrationModel,
+}
+
+struct DenseCalibrationModel {
     source: OriginalSourceId,
     arch: Arch,
     masters: Vec<Vec<f32>>,
@@ -40,10 +51,10 @@ pub struct StagedCalibrationModel {
 impl std::fmt::Debug for StagedCalibrationModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StagedCalibrationModel")
-            .field("source", &self.source)
-            .field("layers", &self.arch.n_layers)
-            .field("vocabulary", &self.arch.vocab)
-            .field("max_window_tokens", &self.max_window_tokens)
+            .field("source", &self.core.source)
+            .field("layers", &self.core.arch.n_layers)
+            .field("vocabulary", &self.core.arch.vocab)
+            .field("max_window_tokens", &self.core.max_window_tokens)
             .finish_non_exhaustive()
     }
 }
@@ -56,6 +67,109 @@ impl StagedCalibrationModel {
         source: &mut StagedSalienceSource<'_>,
         limits: StagedCalibrationLimits,
     ) -> Result<Self, NnError> {
+        DenseCalibrationModel::validate_limits(limits)?;
+        let source_id = source.source_id();
+        let (config, weights) = crate::model::dense_stage_weights(
+            source,
+            limits.max_config_bytes,
+            limits.max_dense_bytes,
+        )?;
+        Ok(Self {
+            core: DenseCalibrationModel::from_weights(source_id, config, weights, limits)?,
+        })
+    }
+
+    /// Exact complete B stored-byte identity; not a PackageId.
+    #[must_use]
+    pub const fn source_id(&self) -> OriginalSourceId {
+        self.core.source
+    }
+
+    /// Immutable graph/norm descriptor from the actual shared loader.
+    #[must_use]
+    pub const fn arch(&self) -> &Arch {
+        &self.core.arch
+    }
+
+    /// Execute the shared graph on caller-owned tape with actual projection taps.
+    /// Each window copies immutable masters into leaves; this is not RSS admission.
+    /// # Errors
+    /// Invalid/oversized tokens or overflowing geometry before tape mutation.
+    pub fn forward_observed(
+        &self,
+        tape: &mut Tape,
+        tokens: &[u32],
+        observe: &mut ProjectionTapFn<'_>,
+    ) -> Result<ValueId, NnError> {
+        self.core.forward_observed(tape, tokens, observe)
+    }
+}
+
+impl std::fmt::Debug for SourceCalibrationModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceCalibrationModel")
+            .field("source", &self.core.source)
+            .field("layers", &self.core.arch.n_layers)
+            .field("vocabulary", &self.core.arch.vocab)
+            .field("max_window_tokens", &self.core.max_window_tokens)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SourceCalibrationModel {
+    /// Decode actual checked original reads and move weights into immutable masters.
+    /// Retains no borrowed source or second full raw model. This is not capture evidence.
+    /// # Errors
+    /// Changed source/assets/inventory, invalid limits/config/geometry or unsupported graph.
+    pub fn new(
+        source: &mut ObservedWeightSource<'_>,
+        limits: StagedCalibrationLimits,
+    ) -> Result<Self, NnError> {
+        DenseCalibrationModel::validate_limits(limits)?;
+        let source_id = source.source_id();
+        let architecture = source.architecture().to_owned();
+        let (config, weights) = crate::model::dense_source_weights(
+            source,
+            &architecture,
+            limits.max_config_bytes,
+            limits.max_dense_bytes,
+        )?;
+        source
+            .inventory()
+            .map_err(|e| NnError::InvalidArtifact(e.to_string()))?;
+        Ok(Self {
+            core: DenseCalibrationModel::from_weights(source_id, config, weights, limits)?,
+        })
+    }
+
+    /// Exact original stored-byte identity, preserved across execution widening.
+    #[must_use]
+    pub const fn source_id(&self) -> OriginalSourceId {
+        self.core.source
+    }
+
+    /// Immutable admitted graph/norm descriptor.
+    #[must_use]
+    pub const fn arch(&self) -> &Arch {
+        &self.core.arch
+    }
+
+    /// Execute original masters through the existing forward/projection graph.
+    /// Caller owns objective/backward; no salience/cache receipt is fabricated.
+    /// # Errors
+    /// Invalid/oversized tokens or overflowing geometry before tape mutation.
+    pub fn forward_observed(
+        &self,
+        tape: &mut Tape,
+        tokens: &[u32],
+        observe: &mut ProjectionTapFn<'_>,
+    ) -> Result<ValueId, NnError> {
+        self.core.forward_observed(tape, tokens, observe)
+    }
+}
+
+impl DenseCalibrationModel {
+    fn validate_limits(limits: StagedCalibrationLimits) -> Result<(), NnError> {
         if limits.max_config_bytes == 0
             || limits.max_dense_bytes == 0
             || limits.max_window_tokens == 0
@@ -64,12 +178,15 @@ impl StagedCalibrationModel {
                 "staged calibration limits must be positive".into(),
             ));
         }
-        let source_id = source.source_id();
-        let (config, weights) = crate::model::dense_stage_weights(
-            source,
-            limits.max_config_bytes,
-            limits.max_dense_bytes,
-        )?;
+        Ok(())
+    }
+
+    fn from_weights(
+        source_id: OriginalSourceId,
+        config: ModelConfig,
+        weights: ModelWeights,
+        limits: StagedCalibrationLimits,
+    ) -> Result<Self, NnError> {
         let ModelWeights {
             token_embd,
             vocab,
@@ -134,23 +251,11 @@ impl StagedCalibrationModel {
         })
     }
 
-    /// Exact complete B source identity checked by stage admission; not a PackageId.
-    #[must_use]
-    pub const fn source_id(&self) -> OriginalSourceId {
-        self.source
-    }
-
-    /// Immutable graph/norm descriptor using the loader's actual geometry.
-    #[must_use]
-    pub const fn arch(&self) -> &Arch {
-        &self.arch
-    }
-
     /// Execute B with actual pre-transform projection taps on the caller's tape.
     /// Each call copies masters into tape-owned leaves; this memory is not RSS-admitted.
     /// # Errors
     /// Invalid/oversized tokens or overflowing window geometry, before tape mutation.
-    pub fn forward_observed(
+    fn forward_observed(
         &self,
         tape: &mut Tape,
         tokens: &[u32],

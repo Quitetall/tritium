@@ -42,7 +42,7 @@ impl StagedCalibrationModel {
         windows: &[&[u32]],
         limits: StagedCaptureLimits,
     ) -> Result<Vec<CalibrationCache>, NnError> {
-        if source.source_id() != self.source {
+        if source.source_id() != self.core.source {
             return Err(reject("capture stage differs from immutable B masters"));
         }
         let (samples, objective_bytes) = self.admit_capture_windows(windows, limits)?;
@@ -87,7 +87,7 @@ impl StagedCalibrationModel {
                 CalibrationCacheBuilder::new(
                     CalibrationCacheRequest {
                         tensor,
-                        model: self.source,
+                        model: self.core.source,
                         consumer: CalibrationConsumer::Matmul,
                         output: CalibrationOutput::DenseFisher,
                         sample_start: 0,
@@ -122,7 +122,7 @@ impl StagedCalibrationModel {
                 window[1..].to_vec(),
                 vec![1.0; input.len()],
                 input.len(),
-                self.arch.vocab,
+                self.core.arch.vocab,
                 1,
             );
             if !tape.value(loss)[0].is_finite() {
@@ -171,10 +171,10 @@ impl StagedCalibrationModel {
         let mut objective_bytes = OBJECTIVE.len() as u64 + 8;
         for window in windows {
             if window.len() < 2
-                || window.len() - 1 > self.max_window_tokens
+                || window.len() - 1 > self.core.max_window_tokens
                 || window
                     .iter()
-                    .any(|&id| usize::try_from(id).map_or(true, |id| id >= self.arch.vocab))
+                    .any(|&id| usize::try_from(id).map_or(true, |id| id >= self.core.arch.vocab))
             {
                 return Err(reject("invalid B capture token window"));
             }
@@ -199,7 +199,7 @@ impl StagedCalibrationModel {
         let inventory = source
             .inventory()
             .map_err(|e| reject(&format!("B capture inventory: {e}")))?;
-        let names = weight_names(&self.arch);
+        let names = weight_names(&self.core.arch);
         names[1..]
             .iter()
             .chain(&names[..1])

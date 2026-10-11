@@ -157,40 +157,7 @@ impl Engine {
         plan: &QuantPlan,
         source: &mut dyn WeightSource,
     ) -> Result<OriginalSourceId, QuantEngineError> {
-        plan.validate().map_err(QuantEngineError::Plan)?;
-        check_source_inventory(ModelQuantPlan::Uncalibrated(plan), source)?;
-        let total = plan.tensors.iter().try_fold(0u64, |total, tensor| {
-            total
-                .checked_add(tensor.source.byte_len().map_err(QuantEngineError::Plan)?)
-                .ok_or(QuantEngineError::Limit("source bytes"))
-        })?;
-        bound(total, plan.limits.max_source_bytes, "source bytes")?;
-        let mut assets = Vec::new();
-        let mut asset_bytes = 0u64;
-        for name in &plan.assets {
-            let remaining = plan.limits.max_asset_bytes - asset_bytes;
-            let bytes = source.asset(name, platform(remaining, "asset bytes")?)?;
-            bound(bytes.len() as u64, remaining, "asset bytes")?;
-            asset_bytes += bytes.len() as u64;
-            assets.push(NamedAssetDigest {
-                name: name.clone(),
-                content: BlobId::from_bytes(*blake3::hash(&bytes).as_bytes()),
-            });
-        }
-        let mut tensors = Vec::new();
-        for request in &plan.tensors {
-            let original = &request.source;
-            let bytes = source.tensor(
-                &original.name,
-                platform(
-                    original.byte_len().map_err(QuantEngineError::Plan)?,
-                    "source bytes",
-                )?,
-            )?;
-            tensors.push(source_binding(original, &bytes)?);
-        }
-        tritium_evidence::original_source_id(&plan.architecture, &tensors, &assets)
-            .map_err(QuantEngineError::Plan)
+        Ok(super::ObservedWeightSource::new(plan, source)?.source_id())
     }
 
     /// Fit complete levels from original sources, seal evidence, write and check
@@ -679,7 +646,7 @@ impl Engine {
     }
 }
 
-fn check_source_inventory(
+pub(super) fn check_source_inventory(
     plan: ModelQuantPlan<'_>,
     source: &dyn WeightSource,
 ) -> Result<(), QuantEngineError> {

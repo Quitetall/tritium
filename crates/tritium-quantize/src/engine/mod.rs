@@ -13,6 +13,7 @@ mod direct;
 mod joint_feedback;
 mod ladder;
 mod model;
+mod observed_source;
 mod salience;
 mod salience_model;
 mod sinks;
@@ -20,6 +21,7 @@ mod source_stage;
 mod source_transform;
 mod sources;
 
+pub use observed_source::ObservedWeightSource;
 pub use salience::{SalienceFoldError, SaliencePair, divide_rows, scale_cols, smooth_scales};
 pub use salience_model::JoinedSalienceModel;
 

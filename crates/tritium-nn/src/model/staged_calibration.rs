@@ -15,6 +15,16 @@ pub(crate) fn dense_stage_weights(
     max_config_bytes: u64,
     max_dense_bytes: u64,
 ) -> Result<(ModelConfig, ModelWeights), NnError> {
+    let architecture = source.manifest().observation.plan.architecture.clone();
+    dense_source_weights(source, &architecture, max_config_bytes, max_dense_bytes)
+}
+
+pub(crate) fn dense_source_weights(
+    source: &mut dyn WeightSource,
+    architecture: &str,
+    max_config_bytes: u64,
+    max_dense_bytes: u64,
+) -> Result<(ModelConfig, ModelWeights), NnError> {
     let maximum = usize::try_from(max_config_bytes)
         .map_err(|_| NnError::MissingConfig("config limit exceeds usize".into()))?;
     let bytes = source
@@ -26,7 +36,7 @@ pub(crate) fn dense_stage_weights(
     let json = serde_json::from_str(text)
         .map_err(|e| NnError::MissingConfig(format!("config.json: {e}")))?;
     drop(bytes);
-    if source.manifest().observation.plan.architecture != config.arch {
+    if architecture != config.arch {
         return Err(NnError::MissingConfig(
             "stage/config architecture mismatch".into(),
         ));

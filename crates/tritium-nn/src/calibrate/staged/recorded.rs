@@ -30,7 +30,7 @@ impl StagedCalibrationModel {
         recorder: EvidenceRecorder,
     ) -> Result<RecordedStagedCapture, NnError> {
         check_recorder(&recorder)?;
-        if source.source_id() != self.source {
+        if source.source_id() != self.core.source {
             return Err(reject("recorded capture has foreign B"));
         }
         self.admit_capture_windows(windows, limits)?;
@@ -82,7 +82,7 @@ impl StagedCalibrationModel {
         max_text_bytes: u64,
         max_tokenizer_config_bytes: u64,
     ) -> Result<CalibrationCapturePlan, NnError> {
-        if source.source_id() != self.source {
+        if source.source_id() != self.core.source {
             return Err(reject("recorded capture has foreign B"));
         }
         let asset = |name: &str| {
@@ -97,7 +97,7 @@ impl StagedCalibrationModel {
         };
         let plan = CalibrationCapturePlan {
             stage_package: source.package_id(),
-            source: self.source,
+            source: self.core.source,
             transform: source.manifest().transform.clone(),
             tokenizer: asset("tokenizer.json")?,
             tokenizer_config: if max_text_bytes > 0 {
@@ -109,9 +109,9 @@ impl StagedCalibrationModel {
             tensors: self.capture_tensors(source)?,
             input,
             limits: CalibrationCaptureLimits {
-                max_config_bytes: self.limits.max_config_bytes,
-                max_dense_bytes: self.limits.max_dense_bytes,
-                max_window_tokens: self.max_window_tokens as u64,
+                max_config_bytes: self.core.limits.max_config_bytes,
+                max_dense_bytes: self.core.limits.max_dense_bytes,
+                max_window_tokens: self.core.max_window_tokens as u64,
                 per_cache: capture.per_cache,
                 max_total_payload_bytes: capture.max_total_payload_bytes,
                 max_text_bytes,

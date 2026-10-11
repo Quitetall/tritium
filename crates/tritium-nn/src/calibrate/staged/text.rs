@@ -43,7 +43,7 @@ impl StagedCalibrationModel {
         text_limits: StagedTextCaptureLimits,
         capture_limits: StagedCaptureLimits,
     ) -> Result<Vec<Vec<u32>>, NnError> {
-        if source.source_id() != self.source {
+        if source.source_id() != self.core.source {
             return Err(reject(
                 "text capture stage differs from immutable B masters",
             ));
@@ -82,13 +82,13 @@ impl StagedCalibrationModel {
             .map_err(|e| reject(&format!("staged text tokenizer config: {e}")))?
             .into_owned();
         let tokenizer = HfJsonTokenizer::from_bytes(&tokenizer_bytes, &config_bytes)?;
-        tokenizer.validate_model_vocab(self.arch.vocab)?;
+        tokenizer.validate_model_vocab(self.core.arch.vocab)?;
         tokenizer.validate_capture_windows()?;
         let mut windows = Vec::new();
         let mut samples = 0u64;
         for text in texts {
             let ids = tokenizer.encode(text)?;
-            if ids.len() < 2 || ids.len() - 1 > self.max_window_tokens {
+            if ids.len() < 2 || ids.len() - 1 > self.core.max_window_tokens {
                 return Err(reject("invalid encoded staged text window"));
             }
             samples = samples

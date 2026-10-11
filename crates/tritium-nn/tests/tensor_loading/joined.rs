@@ -1,5 +1,7 @@
 //! Engine-produced joined C crosses the existing model-loading/forward seam.
 //! Toy standard-transformer software evidence, not real-model qualification.
+#[path = "joined/original.rs"]
+mod original;
 #[path = "joined/staged.rs"]
 mod staged;
 use super::*;
@@ -49,10 +51,10 @@ fn produced(input: &TritFixture, additive: bool) -> JoinedFixture {
     produced_with_alpha(input, additive, 0.75)
 }
 
-fn produced_with_alpha(input: &TritFixture, additive: bool, alpha: f64) -> JoinedFixture {
+fn raw_fixture_source(input: &TritFixture) -> InMemoryWeightSource {
     let bytes = input.bytes();
     let model = tritium_format::trit_model::read_trit_model(&bytes).unwrap();
-    let mut a = InMemoryWeightSource {
+    InMemoryWeightSource {
         tensors: model.manifest().levels[0]
             .tensors
             .iter()
@@ -77,7 +79,11 @@ fn produced_with_alpha(input: &TritFixture, additive: bool, alpha: f64) -> Joine
             .map(|asset| (asset.name.clone(), model.asset(&asset.name).unwrap().into()))
             .collect(),
         grams: BTreeMap::new(),
-    };
+    }
+}
+
+fn produced_with_alpha(input: &TritFixture, additive: bool, alpha: f64) -> JoinedFixture {
+    let mut a = raw_fixture_source(input);
     let dense_plan = |source: &dyn WeightSource| QuantPlan {
         architecture: input.manifest.architecture.clone(),
         tensors: source
