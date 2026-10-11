@@ -47,6 +47,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     project!(LayoutError, "layout-error");
     project!(ModelId, "model-id");
     project!(tritium_schema::OriginalSourceId, "original-source-id");
+    project!(tritium_schema::CalibrationCacheId, "calibration-cache-id");
+    project!(
+        tritium_schema::CalibrationCacheLimits,
+        "calibration-cache-limits"
+    );
+    project!(
+        tritium_schema::CalibrationCacheRequest,
+        "calibration-cache-request"
+    );
+    project!(
+        tritium_schema::CalibrationCacheBinding,
+        "calibration-cache-binding"
+    );
     project!(PackageId, "package-id");
     project!(PlaneAllocation, "plane-allocation");
     project!(PlaneCodec, "plane-codec");

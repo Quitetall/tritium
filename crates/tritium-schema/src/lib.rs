@@ -442,6 +442,10 @@ digest_id!(
     "Candidate identity of original named tensor/asset content, not fitted content or provenance."
 );
 digest_id!(
+    CalibrationCacheId,
+    "Candidate identity of finalized calibration payloads and context, not independent model provenance."
+);
+digest_id!(
     SemanticTensorDigest,
     "Identity for a tensor's semantic values independent of its container."
 );

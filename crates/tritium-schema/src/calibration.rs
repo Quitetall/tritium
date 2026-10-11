@@ -1,5 +1,5 @@
 //! Candidate source-bound calibration requests and factor views (ADR 0060).
-use crate::{FitInputDigest, QuantSourceTensor};
+use crate::{BlobId, FitInputDigest, OriginalSourceId, QuantSourceTensor};
 use alloc::vec::Vec;
 
 /// Declared identities of the already finalized calibration source/cache.
@@ -192,4 +192,95 @@ pub struct CalibrationFactors {
     pub inputs: Vec<CalibrationFactor>,
     /// Actual output factor, absent for input-only statistics.
     pub output: Option<CalibrationFactor>,
+}
+
+/// Logical retained cache bounds, separate from reducer workspace or process RSS.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
+pub struct CalibrationCacheLimits {
+    /// Exact retained scalar/token/mask and recipe bytes; excludes metadata/capacity overhead.
+    pub max_payload_bytes: u64,
+    /// Maximum observed samples, including masked samples.
+    pub max_samples: u64,
+    /// Maximum declared model-context windows, not reduction replay chunks.
+    pub max_windows: u64,
+}
+
+/// Context for collecting one tensor's actual original-basis paired cache.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
+pub struct CalibrationCacheRequest {
+    /// Exact original interpretation, not fitted weights.
+    pub tensor: QuantSourceTensor,
+    /// Declared original identity; the engine must verify actual byte equality.
+    pub model: OriginalSourceId,
+    /// Actual operation/explicit approximation producing the inputs.
+    pub consumer: CalibrationConsumer,
+    /// Required actual gradient encoding; absent is explicitly input-only.
+    pub output: CalibrationOutput,
+    /// First canonical sample ordinal, retained across replay/shards.
+    pub sample_start: u64,
+    /// Logical cache admission, not numerical reduction admission.
+    pub limits: CalibrationCacheLimits,
+}
+impl CalibrationCacheRequest {
+    /// Validate context without creating fake cache/token identities.
+    /// # Errors
+    /// Invalid original geometry, missing model identity, consumer or logical budget.
+    pub fn validate(&self) -> Result<(), CalibrationPlanError> {
+        if self.tensor.shape.len() != 2 || self.tensor.byte_len().is_err() {
+            return Err(CalibrationPlanError::Source);
+        }
+        if self.model.as_bytes() == &[0; 32] {
+            return Err(CalibrationPlanError::MissingSource);
+        }
+        if self.consumer == CalibrationConsumer::GatherIdentity
+            && self.output != CalibrationOutput::IndexedFisher
+        {
+            return Err(CalibrationPlanError::Consumer);
+        }
+        if self.limits.max_payload_bytes == 0
+            || self.limits.max_samples == 0
+            || self.limits.max_windows == 0
+        {
+            return Err(CalibrationPlanError::Budget);
+        }
+        Ok(())
+    }
+}
+
+/// Immutable finalized cache context, not a registered/audited observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
+pub struct CalibrationCacheBinding {
+    /// Context actually used, including declared logical limits.
+    pub request: CalibrationCacheRequest,
+    /// Actual finalized cache/token identities; model identity remains declared until engine admission.
+    pub source: CalibrationSource,
+    /// BLAKE3 of actual supplied tokenizer bytes, not a name.
+    pub tokenizer: BlobId,
+    /// BLAKE3 of exact supplied objective/teacher/recovery recipe bytes.
+    /// Byte identity does not independently establish that this recipe was executed.
+    pub objective: BlobId,
+    /// Observed sample count, including masked samples.
+    pub samples: u64,
+    /// Declared context-window count, not the number of reduction chunks.
+    pub windows: u64,
+    /// Actual retained payload bytes, excluding metadata/capacity overhead and full RSS.
+    pub payload_bytes: u64,
 }

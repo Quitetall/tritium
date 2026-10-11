@@ -6,6 +6,7 @@
 
 mod activation_aware;
 mod calibration;
+mod calibration_cache;
 mod direct;
 mod joint_feedback;
 mod ladder;
@@ -24,6 +25,7 @@ pub use calibration::{
     CalibratedTensor, CalibrationBatch, CalibrationCollector, CalibrationError, CalibrationInput,
     CalibrationOutputBatch,
 };
+pub use calibration_cache::{CalibrationCache, CalibrationCacheBuilder, CalibrationCacheError};
 
 pub use direct::{DirectFitError, DirectTensorFit, fit_direct_levels};
 

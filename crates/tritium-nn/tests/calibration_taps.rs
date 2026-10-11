@@ -1,11 +1,12 @@
 //! Execute the real graph and inspect actual pre-transform outputs after backward.
 use tritium_nn::calibrate::{self, Arch, Calib, ProjectionRole, ProjectionTap, Tap};
 use tritium_quantize::engine::{
-    CalibrationBatch, CalibrationCollector, CalibrationInput, CalibrationOutputBatch,
+    CalibrationBatch, CalibrationCacheBuilder, CalibrationInput, CalibrationOutputBatch,
 };
 use tritium_schema::{
-    CalibrationConsumer, CalibrationOutput, CalibrationPartition, CalibrationPlan,
-    CalibrationSource, FitInputDigest, QuantSourceTensor, ScalePrecision,
+    BlobId, CalibrationCacheLimits, CalibrationCacheRequest, CalibrationConsumer,
+    CalibrationOutput, CalibrationPartition, NamedAssetDigest, QuantSourceBinding,
+    QuantSourceTensor, ScalePrecision,
 };
 use tritium_train::Tape;
 
@@ -151,65 +152,106 @@ fn actual_post_objective_buffers_replay_into_the_shared_collector() {
     let target = t.leaf(vec![0.25; t.value(logits).len()]);
     let loss = t.mse(logits, target);
     let gradients = t.backward(loss);
-    // Finalize actual test cache content BEFORE source-bound accumulation.
-    // This is a test replay identity, not the future canonical source inventory
-    // or an independently verified cache/registered release receipt.
-    let mut model = blake3::Hasher::new();
-    for weight in &w {
-        for value in weight {
-            model.update(&value.to_le_bytes());
-        }
-    }
-    let mut token_hash = blake3::Hasher::new();
-    for token in tokens {
-        token_hash.update(&token.to_le_bytes());
-    }
-    let mut cache = blake3::Hasher::new();
-    cache.update(b"test-MSE-target-0.25-not-quality-receipt");
-    for tap in &taps {
-        cache.update(&(tap.weight_index as u64).to_le_bytes());
-        if let Some(id) = tap.input {
-            for value in t.value(id) {
-                cache.update(&value.to_le_bytes());
-            }
-        }
-        for value in &gradients[tap.output] {
-            cache.update(&value.to_le_bytes());
-        }
-    }
-    let source = CalibrationSource {
-        model: FitInputDigest(*model.finalize().as_bytes()),
-        cache: FitInputDigest(*cache.finalize().as_bytes()),
-        tokens: FitInputDigest(*token_hash.finalize().as_bytes()),
-    };
+    // Canonical inventory of all actual toy forward parameters, not an HF/quality receipt.
     let names = calibrate::weight_names(&a);
+    let mut sources = Vec::new();
+    let mut add = |name: String, shape: Vec<u64>, values: &[f32]| {
+        let bytes = values
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>();
+        sources.push(QuantSourceBinding {
+            source: QuantSourceTensor {
+                name,
+                shape,
+                precision: ScalePrecision::F32,
+            },
+            content: BlobId::from_bytes(*blake3::hash(&bytes).as_bytes()),
+        });
+    };
+    for (index, values) in w.iter().enumerate() {
+        let tap = taps.iter().find(|tap| tap.weight_index == index).unwrap();
+        add(
+            names[index].clone(),
+            vec![tap.rows as u64, tap.columns as u64],
+            values,
+        );
+    }
+    for li in 0..a.n_layers {
+        add(
+            format!("model.layers.{li}.input_layernorm.weight"),
+            vec![a.n_embd as u64],
+            &a.attn_norms[li],
+        );
+        add(
+            format!("model.layers.{li}.post_attention_layernorm.weight"),
+            vec![a.n_embd as u64],
+            &a.ffn_norms[li],
+        );
+    }
+    add(
+        "model.norm.weight".into(),
+        vec![a.n_embd as u64],
+        &a.out_norm,
+    );
+    sources.sort_by(|a, b| a.source.name.cmp(&b.source.name));
+    let config = serde_json::to_vec(&serde_json::json!({"n_embd":a.n_embd,"n_head":a.n_head,"n_head_kv":a.n_head_kv,"head_dim":a.head_dim,"ff":a.ff,"vocab":a.vocab,"eps":a.eps,"theta":a.theta,"n_layers":a.n_layers})).unwrap();
+    let tokenizer = b"actual-test-token-id-stream-no-production-tokenizer-claim";
+    let assets = [
+        NamedAssetDigest {
+            name: "config.json".into(),
+            content: BlobId::from_bytes(*blake3::hash(&config).as_bytes()),
+        },
+        NamedAssetDigest {
+            name: "tokenizer.json".into(),
+            content: BlobId::from_bytes(*blake3::hash(tokenizer).as_bytes()),
+        },
+    ];
+    let model = tritium_evidence::original_source_id("toy-gqa", &sources, &assets).unwrap();
     for tap in taps {
         let Some(input) = tap.input else { continue }; // no invented dense embedding input
-        let p = CalibrationPlan {
+        let request = CalibrationCacheRequest {
             tensor: QuantSourceTensor {
                 name: names[tap.weight_index].clone(),
                 shape: vec![tap.rows as u64, tap.columns as u64],
                 precision: ScalePrecision::F32,
             },
-            source,
-            partition: CalibrationPartition::Full,
+            model,
             output: CalibrationOutput::DenseFisher,
             consumer: CalibrationConsumer::Matmul,
             sample_start: 0,
-            damping: 0.125,
-            max_numeric_bytes: 4 * 1024 * 1024,
+            limits: CalibrationCacheLimits {
+                max_payload_bytes: 1024 * 1024,
+                max_samples: tokens.len() as u64,
+                max_windows: 1,
+            },
         };
-        let mut collector = CalibrationCollector::new(p).unwrap();
-        collector
-            .accumulate(CalibrationBatch {
-                samples: tap.samples,
-                input: CalibrationInput::Activations(t.value(input)),
-                output: CalibrationOutputBatch::Dense(&gradients[tap.output]),
-                weights: None,
-                mask: None,
-            })
+        let mut cache = CalibrationCacheBuilder::new(
+            request,
+            tokenizer,
+            b"test-Tape-mse(logits,target=0.25)-mean",
+        )
+        .unwrap();
+        cache
+            .capture(
+                &tokens,
+                CalibrationBatch {
+                    samples: tap.samples,
+                    input: CalibrationInput::Activations(t.value(input)),
+                    output: CalibrationOutputBatch::Dense(&gradients[tap.output]),
+                    weights: None,
+                    mask: None,
+                },
+            )
             .unwrap();
-        let result = collector.finish().unwrap();
+        let cache = cache.finish().unwrap();
+        let result = cache
+            .collect(CalibrationPartition::Full, 0.125, 4 * 1024 * 1024)
+            .unwrap();
+        let chunked = cache
+            .collect_chunked(CalibrationPartition::Full, 0.125, 4 * 1024 * 1024, 1)
+            .unwrap();
+        assert_eq!(result.factors(), chunked.factors());
         assert_eq!(result.factors().inputs[0].samples, tap.samples as u64);
         assert_eq!(
             result.factors().output.as_ref().unwrap().dimension,
