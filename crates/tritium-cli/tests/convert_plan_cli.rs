@@ -32,7 +32,13 @@ impl Drop for Scratch {
 }
 fn run(args: &[OsString]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_tritium"))
-        .env("RAYON_NUM_THREADS", "2")
+        // Thread count is part of the recorded fit context, hence the package
+        // identity. Match the actual reference pool (including an installed
+        // local pool), not a fixed child-only count or the host's CPU count.
+        .env(
+            "RAYON_NUM_THREADS",
+            rayon::current_num_threads().to_string(),
+        )
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -443,6 +449,21 @@ fn actual_calibrated_filesystem_conversion_matches_in_memory_engine() {
         args[i + 1] = dir.0.join("missing").into();
         assert!(!run(&args).status.success());
         assert!(!dir.0.join("missing").exists());
+    }
+}
+
+#[test]
+fn actual_cli_and_reference_match_in_distinct_rayon_pools() {
+    for threads in [1, 3] {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| {
+                actual_plain_filesystem_conversion_matches_engine_for_all_original_precisions();
+                actual_calibrated_filesystem_conversion_matches_in_memory_engine();
+                actual_raw_gram_bits_are_bound_and_swaps_reject_without_publication();
+            });
     }
 }
 
