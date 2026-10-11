@@ -4,7 +4,7 @@ use crate::{
     BlobId, DirectFitMetric, DirectFitPlan, ModelManifestError, NamedAssetDigest, ScalePrecision,
     TensorMeta,
 };
-use alloc::{string::String, vec::Vec};
+use alloc::{boxed::Box, string::String, vec::Vec};
 
 /// Original tensor interpretation, never an adapter-supplied content hash.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -57,8 +57,9 @@ pub enum QuantAction {
     KeepDense,
     /// Independently fit all requested levels from this original source.
     Fit {
-        /// Existing per-tensor production fitting request.
-        plan: DirectFitPlan,
+        /// Existing per-tensor production fitting request, boxed to keep dense actions small.
+        /// Boxing is transparent to the derived wire representation.
+        plan: Box<DirectFitPlan>,
         /// Explicit identity or exact expected original f64 Gram content.
         metric: DirectFitMetric,
     },

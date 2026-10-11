@@ -1,12 +1,13 @@
 //! Reference second-order sequential feedback for SALT V2.
 //!
-//! This module deliberately uses `f64` and dense matrices. It is the correctness oracle for
+//! This module uses dense f64 metric/state buffers. Its F64 profile is the correctness oracle for
 //! GPTQ/BlockLDLQ-style feedback around a caller-supplied additive-ternary group fitter, not a
 //! deployment kernel. Groups are visited in the exact order supplied, and each group sees the
 //! working weights left by all earlier groups.
 
 use core::fmt;
 use tritium_core::FeedbackDecay;
+use tritium_schema::WorkPrecision;
 
 /// One contiguous column group, expressed as a half-open range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,6 +66,8 @@ pub struct GroupFitRequest<'a> {
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum FeedbackError {
+    /// A future precision tag is not implemented by this controller.
+    UnsupportedPrecision,
     /// The matrix had no rows or no columns.
     EmptyMatrix,
     /// A matrix dimension product overflowed `usize`.
@@ -195,6 +198,7 @@ pub enum FeedbackError {
 impl fmt::Display for FeedbackError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnsupportedPrecision => formatter.write_str("unsupported feedback precision"),
             Self::EmptyMatrix => formatter.write_str("feedback matrix must have rows and columns"),
             Self::ShapeOverflow => formatter.write_str("feedback matrix shape overflow"),
             Self::WeightLengthMismatch { expected, actual } => write!(
@@ -318,6 +322,7 @@ struct FeedbackBlock {
 /// Owned result and mutable state of a sequential-feedback pass.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FeedbackState {
+    precision: WorkPrecision,
     rows: usize,
     columns: usize,
     groups: Vec<ColumnGroup>,
@@ -330,6 +335,11 @@ pub struct FeedbackState {
 }
 
 impl FeedbackState {
+    /// Arithmetic retained for propagation and every subsequent refit.
+    #[must_use]
+    pub fn precision(&self) -> WorkPrecision {
+        self.precision
+    }
     /// Number of output rows in the full matrix.
     #[must_use]
     pub fn rows(&self) -> usize {
@@ -442,19 +452,46 @@ impl FeedbackState {
             return Err(FeedbackError::NonFiniteReconstruction { group, index });
         }
 
+        let rounded;
+        let reconstruction = if self.precision == WorkPrecision::F32Accum64 {
+            rounded = reconstruction
+                .iter()
+                .map(|&v| f64::from(v as f32))
+                .collect::<Vec<_>>();
+            if let Some(index) = rounded.iter().position(|value| !value.is_finite()) {
+                return Err(FeedbackError::NonFiniteReconstruction { group, index });
+            }
+            rounded.as_slice()
+        } else {
+            reconstruction
+        };
+
         let current_input =
             compact_block(&self.working_weights, self.rows, self.columns, block.group);
         let old_reconstruction =
             compact_block(&self.reconstruction, self.rows, self.columns, block.group);
         let mut residual_delta = vec![0.0; expected];
         for index in 0..expected {
-            let new_residual = current_input[index] - reconstruction[index];
+            let subtract = |a: f64, b: f64| {
+                if self.precision == WorkPrecision::F32Accum64 {
+                    f64::from(a as f32 - b as f32)
+                } else {
+                    a - b
+                }
+            };
+            let new_residual = subtract(current_input[index], reconstruction[index]);
             let old_residual = if self.fitted[group] {
-                self.fit_inputs[group][index] - old_reconstruction[index]
+                subtract(self.fit_inputs[group][index], old_reconstruction[index])
             } else {
                 0.0
             };
             residual_delta[index] = new_residual - old_residual;
+            if self.precision == WorkPrecision::F32Accum64 && !residual_delta[index].is_finite() {
+                return Err(FeedbackError::NonFiniteFeedback {
+                    row: index / width,
+                    column: block.group.start + index % width,
+                });
+            }
         }
 
         // Build and validate all updates before mutating state.
@@ -476,7 +513,12 @@ impl FeedbackState {
                         decayed * block.coefficients[local_column * block.later_columns + later];
                 }
                 let column = block.group.end + later;
-                let updated = self.working_weights[row * self.columns + column] - correction;
+                let current = self.working_weights[row * self.columns + column];
+                let updated = if self.precision == WorkPrecision::F32Accum64 {
+                    f64::from(current as f32 - correction as f32)
+                } else {
+                    current - correction
+                };
                 if !updated.is_finite() {
                     return Err(FeedbackError::NonFiniteFeedback { row, column });
                 }
@@ -552,20 +594,60 @@ where
 pub fn fit_with_feedback_decay<F, E>(
     problem: FeedbackProblem<'_>,
     decay: FeedbackDecay,
+    fitter: F,
+) -> Result<FeedbackState, FeedbackRunError<E>>
+where
+    F: FnMut(GroupFitRequest<'_>) -> Result<Vec<f64>, E>,
+{
+    fit_with_feedback_precision(problem, decay, WorkPrecision::F64, fitter)
+}
+
+/// Fit with explicit working arithmetic and the same validated feedback implementation.
+///
+/// F32Accum64 rounds initial weights/reconstructions to f32, subtracts residuals
+/// in f32, accumulates group corrections in f64 and subtracts f32-rounded
+/// corrections from f32 working values. Refits retain this policy. F64 preserves
+/// the legacy oracle. The callback always receives f64 slices; in F32Accum64
+/// they contain exact widened f32 values. State buffers remain f64: this is not
+/// full RSS admission, an f32-memory optimization or a fitter precision promise.
+/// # Errors
+/// Invalid problem/precision, finite narrowing overflow, callback or propagation failure.
+pub fn fit_with_feedback_precision<F, E>(
+    problem: FeedbackProblem<'_>,
+    decay: FeedbackDecay,
+    precision: WorkPrecision,
     mut fitter: F,
 ) -> Result<FeedbackState, FeedbackRunError<E>>
 where
     F: FnMut(GroupFitRequest<'_>) -> Result<Vec<f64>, E>,
 {
+    if !matches!(precision, WorkPrecision::F32Accum64 | WorkPrecision::F64) {
+        return Err(FeedbackError::UnsupportedPrecision.into());
+    }
     let inverse_hessian = validate_problem(problem).map_err(FeedbackRunError::Feedback)?;
+    let working_weights = problem
+        .weights
+        .iter()
+        .map(|&v| {
+            if precision == WorkPrecision::F32Accum64 {
+                f64::from(v as f32)
+            } else {
+                v
+            }
+        })
+        .collect::<Vec<_>>();
+    if let Some(index) = working_weights.iter().position(|value| !value.is_finite()) {
+        return Err(FeedbackError::NonFiniteWeight { index }.into());
+    }
     let blocks = build_feedback_blocks(problem.columns, problem.groups, &inverse_hessian)
         .map_err(FeedbackRunError::Feedback)?;
     let mut state = FeedbackState {
+        precision,
         rows: problem.rows,
         columns: problem.columns,
         groups: problem.groups.to_vec(),
         blocks,
-        working_weights: problem.weights.to_vec(),
+        working_weights,
         reconstruction: vec![0.0; problem.weights.len()],
         fit_inputs: vec![Vec::new(); problem.groups.len()],
         fitted: vec![false; problem.groups.len()],

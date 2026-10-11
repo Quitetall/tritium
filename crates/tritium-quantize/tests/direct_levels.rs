@@ -7,8 +7,9 @@ use tritium_quantize::engine::{
 use tritium_quantize::{JointFitConfig, JointFitMetric, RelayBasins, fit_joint_ternary};
 use tritium_schema::{
     ADDITIVE_TILE_SIZE, AdditiveLayout, Basis, DirectFitLevel, DirectFitLimits, DirectFitPlan,
-    DirectFitProfile, JointGroupFitOptions, LadderFitOptions, LadderScaleRefit, PlaneAllocation,
-    PlaneCodec, PlaneRelation, ScaleAnchor, ScaleLaw, ScalePrecision, Transport,
+    DirectFitProfile, JointFeedbackFitOptions, JointGroupFitOptions, LadderFitOptions,
+    LadderScaleRefit, PlaneAllocation, PlaneCodec, PlaneRelation, ScaleAnchor, ScaleLaw,
+    ScalePrecision, Transport, WorkPrecision,
 };
 
 fn weights(rows: usize, cols: usize) -> Vec<f32> {
@@ -81,6 +82,113 @@ fn joint() -> DirectFitProfile {
         softened_relay: false,
         modulated_relay: false,
     })
+}
+
+fn feedback(precision: WorkPrecision, decay: f64, damp: f64) -> DirectFitProfile {
+    let DirectFitProfile::JointIndependentGroups(fitter) = joint() else {
+        unreachable!()
+    };
+    DirectFitProfile::JointFeedbackGroups(JointFeedbackFitOptions {
+        fitter,
+        damp,
+        precision,
+        decay,
+        decay_ramp: false,
+    })
+}
+
+#[test]
+fn zero_joint_feedback_equals_independent_fits_in_both_precisions() {
+    for precision in [WorkPrecision::F32Accum64, WorkPrecision::F64] {
+        for stored in [ScalePrecision::F16, ScalePrecision::F32] {
+            for (cols, basis) in [(35, Basis::Identity), (64, Basis::Hadamard { block: 64 })] {
+                let source = weights(2, cols);
+                let metric = gram(cols);
+                let mut independent = plan(joint(), cols as u64);
+                independent.layout.law.precision = stored;
+                independent.layout.basis = basis;
+                let expected = fit_direct_levels(&independent, &source, Some(&metric)).unwrap();
+                let mut sequential = independent.clone();
+                sequential.profile = feedback(precision, 0.0, 0.0);
+                assert_eq!(
+                    fit_direct_levels(&sequential, &source, Some(&metric)).unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn correlated_joint_feedback_changes_later_groups_and_refits_each_level() {
+    let cols = 35;
+    let source = weights(2, cols);
+    let metric = (0..cols * cols)
+        .map(|i| if i / cols == i % cols { 1.2 } else { 0.2 })
+        .collect::<Vec<_>>();
+    let independent =
+        fit_direct_levels(&plan(joint(), cols as u64), &source, Some(&metric)).unwrap();
+    for precision in [WorkPrecision::F32Accum64, WorkPrecision::F64] {
+        let mut request = plan(feedback(precision, 1.0, 0.01), cols as u64);
+        let sequential = fit_direct_levels(&request, &source, Some(&metric)).unwrap();
+        assert!(sequential.iter().zip(&independent).any(|(a, b)| a != b));
+        for fitted in sequential {
+            // The first group starts with exactly the original values, while the ragged suffix
+            // receives cross-group residuals. Every level also agrees with a fresh single fit.
+            let expected = independent
+                .iter()
+                .find(|f| f.level == fitted.level)
+                .unwrap();
+            for plane in 0..usize::from(fitted.tensor.plane_count()) {
+                assert_eq!(
+                    fitted.tensor.scales()[plane * 4],
+                    expected.tensor.scales()[plane * 4]
+                );
+                assert_eq!(
+                    &fitted.tensor.trits()[plane * 70..plane * 70 + 32],
+                    &expected.tensor.trits()[plane * 70..plane * 70 + 32]
+                );
+            }
+            request.levels.retain(|level| level.name == fitted.level);
+            assert_eq!(
+                fit_direct_levels(&request, &source, Some(&metric)).unwrap(),
+                vec![fitted]
+            );
+            request.levels = plan(joint(), cols as u64).levels;
+        }
+    }
+}
+
+#[test]
+fn joint_feedback_rejects_invalid_options_full_metric_and_implicit_metric_limit() {
+    let source = weights(2, 35);
+    let valid = plan(feedback(WorkPrecision::F32Accum64, 1.0, 0.0), 35);
+    let indefinite = vec![1.0; 35 * 35];
+    assert!(matches!(
+        fit_direct_levels(&valid, &source, Some(&indefinite)),
+        Err(DirectFitError::JointFactorization)
+    ));
+    for (decay, damp) in [
+        (f64::NAN, 0.0),
+        (1.01, 0.0),
+        (1.0, -1.0),
+        (1.0, f64::INFINITY),
+    ] {
+        let invalid = plan(feedback(WorkPrecision::F32Accum64, decay, damp), 35);
+        assert!(matches!(
+            fit_direct_levels(&invalid, &source, None),
+            Err(DirectFitError::InvalidOptions(_))
+        ));
+    }
+    let mut limited = valid;
+    limited.limits.max_metric_entries = 1224;
+    assert!(matches!(
+        fit_direct_levels(&limited, &source, None),
+        Err(DirectFitError::LimitExceeded {
+            resource: "input Gram",
+            ..
+        })
+    ));
 }
 
 #[test]

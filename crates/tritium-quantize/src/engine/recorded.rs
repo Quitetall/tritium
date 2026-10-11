@@ -46,7 +46,7 @@ impl std::error::Error for RecordedDirectFitError {}
 /// actual f32/f64 bits; they never claim original BF16/HF file or calibration
 /// dataset identity. Calls the unchanged `fit_direct_levels`, then uses the
 /// format's shared semantic hash, not a parallel tensor identity implementation.
-/// This is still the per-tensor step toward the full model source/sink engine.
+/// This is the per-tensor step used by the model source/sink engine.
 /// # Errors
 /// Invalid name/context, production fit, output hashing or event recording.
 #[allow(clippy::too_many_arguments)]

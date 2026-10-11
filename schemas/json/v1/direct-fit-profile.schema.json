@@ -28,9 +28,58 @@
       "required": [
         "JointIndependentGroups"
       ]
+    },
+    {
+      "description": "Joint f32-input group fitter with validated full-Gram sequential feedback.",
+      "type": "object",
+      "properties": {
+        "JointFeedbackGroups": {
+          "$ref": "#/$defs/JointFeedbackFitOptions"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "JointFeedbackGroups"
+      ]
     }
   ],
   "$defs": {
+    "JointFeedbackFitOptions": {
+      "description": "Joint row-group fitting with full input-axis sequential residual propagation.",
+      "type": "object",
+      "properties": {
+        "damp": {
+          "description": "Full-Gram feedback damping relative to the mean diagonal; finite and nonnegative.",
+          "type": "number",
+          "format": "double"
+        },
+        "decay": {
+          "description": "Finite residual propagation fraction in `0..=1`.",
+          "type": "number",
+          "format": "double"
+        },
+        "decay_ramp": {
+          "description": "Ramp from one to the configured fraction along the input axis.",
+          "type": "boolean"
+        },
+        "fitter": {
+          "description": "Existing f32-input joint solver configuration; no f64 solver is implied.",
+          "$ref": "#/$defs/JointGroupFitOptions"
+        },
+        "precision": {
+          "description": "Working feedback arithmetic, independent of stored scale precision.",
+          "$ref": "#/$defs/WorkPrecision"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "fitter",
+        "damp",
+        "precision",
+        "decay",
+        "decay_ramp"
+      ]
+    },
     "JointGroupFitOptions": {
       "description": "Existing joint fitter applied independently to each row-local scale group.\n\nThis profile does not propagate cross-group residual feedback, implement K-FAC\noutput curvature, or claim to be the full SALT campaign solver.",
       "type": "object",
@@ -138,6 +187,21 @@
           "description": "Refit completed groups before propagating to the remaining columns.",
           "type": "string",
           "const": "InLoop"
+        }
+      ]
+    },
+    "WorkPrecision": {
+      "description": "Arithmetic of sequential feedback, not the storage precision or memory footprint.",
+      "oneOf": [
+        {
+          "description": "f32 working values/residuals, with f64 metric and correction accumulation.",
+          "type": "string",
+          "const": "F32Accum64"
+        },
+        {
+          "description": "Existing f64 feedback oracle; a selected fitter may still accept f32 inputs.",
+          "type": "string",
+          "const": "F64"
         }
       ]
     }

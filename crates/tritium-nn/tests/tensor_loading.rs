@@ -1164,7 +1164,7 @@ fn engine_produced_ternary_model_executes_through_actual_text_loader() {
                 let action = if source.shape.len() == 2 {
                     QuantAction::Fit {
                         metric: DirectFitMetric::Identity,
-                        plan: DirectFitPlan {
+                        plan: Box::new(DirectFitPlan {
                             layout: AdditiveLayout {
                                 rows: source.shape[0],
                                 cols: source.shape[1],
@@ -1196,7 +1196,7 @@ fn engine_produced_ternary_model_executes_through_actual_text_loader() {
                                 max_metric_entries: 10_000,
                                 max_output_trits: 300_000,
                             },
-                        },
+                        }),
                     }
                 } else {
                     QuantAction::KeepDense

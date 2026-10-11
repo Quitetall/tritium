@@ -3,8 +3,9 @@
 use tritium_core::FeedbackDecay;
 use tritium_quantize::{
     ColumnGroup, FeedbackMetric, FeedbackProblem, FeedbackState, fit_with_feedback,
-    fit_with_feedback_decay,
+    fit_with_feedback_decay, fit_with_feedback_precision,
 };
+use tritium_schema::WorkPrecision;
 
 fn problem<'a>(
     weights: &'a [f64],
@@ -51,7 +52,101 @@ fn unit_decay_matches_the_default_public_interface() {
         let explicit =
             fit_with_feedback_decay(data, FeedbackDecay::new(1.0, ramp).unwrap(), fit).unwrap();
         assert_eq!(original, explicit);
+        let precise = fit_with_feedback_precision(
+            data,
+            FeedbackDecay::new(1.0, ramp).unwrap(),
+            WorkPrecision::F64,
+            fit,
+        )
+        .unwrap();
+        assert_eq!(original, precise);
     }
+}
+
+#[test]
+fn f32_feedback_and_refits_preserve_explicit_arithmetic_and_atomic_failure() {
+    let weights = [1.125, 1.5];
+    let metric = [1.0, 0.5, 0.5, 1.0];
+    let groups = [
+        ColumnGroup { start: 0, end: 1 },
+        ColumnGroup { start: 1, end: 2 },
+    ];
+    let mut state = fit_with_feedback_precision(
+        problem(&weights, &metric, &groups),
+        FeedbackDecay::default(),
+        WorkPrecision::F32Accum64,
+        |request| {
+            Ok::<_, ()>(if request.group_index == 0 {
+                vec![0.25]
+            } else {
+                request.working_weights.to_vec()
+            })
+        },
+    )
+    .unwrap();
+    assert_eq!(state.precision(), WorkPrecision::F32Accum64);
+    assert_eq!(state.working_weights(), &[1.125, 1.0625]);
+    assert_eq!(state.reconstruction(), &[0.25, 1.0625]);
+    state.replace_group_reconstruction(0, &[0.75]).unwrap();
+    assert_eq!(state.working_weights(), &[1.125, 1.3125]);
+    state
+        .refit_suffix(1, |request| Ok::<_, ()>(request.working_weights.to_vec()))
+        .unwrap();
+    assert_eq!(state.reconstruction(), &[0.75, 1.3125]);
+    let before = state.clone();
+    for invalid in [f64::MAX, f64::NAN, f64::INFINITY] {
+        assert!(state.replace_group_reconstruction(0, &[invalid]).is_err());
+        assert_eq!(state, before);
+    }
+}
+
+#[test]
+fn f32_narrowing_is_not_silently_f64_and_residual_overflow_is_rejected() {
+    let metric = [1.0];
+    let groups = [ColumnGroup { start: 0, end: 1 }];
+    let weights = [1.0000000001];
+    for precision in [WorkPrecision::F32Accum64, WorkPrecision::F64] {
+        let state = fit_with_feedback_precision(
+            problem(&weights, &metric, &groups),
+            FeedbackDecay::default(),
+            precision,
+            |request| Ok::<_, ()>(request.working_weights.to_vec()),
+        )
+        .unwrap();
+        assert_eq!(
+            state.working_weights()[0],
+            if precision == WorkPrecision::F64 {
+                weights[0]
+            } else {
+                1.0
+            }
+        );
+    }
+    let mut calls = 0;
+    let too_large = [f64::MAX];
+    assert!(
+        fit_with_feedback_precision(
+            problem(&too_large, &metric, &groups),
+            FeedbackDecay::default(),
+            WorkPrecision::F32Accum64,
+            |request| {
+                calls += 1;
+                Ok::<_, ()>(request.working_weights.to_vec())
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(calls, 0);
+    let huge = [f64::from(f32::MAX)];
+    assert!(
+        fit_with_feedback_precision(
+            problem(&huge, &metric, &groups),
+            FeedbackDecay::default(),
+            WorkPrecision::F32Accum64,
+            |_| Ok::<_, ()>(vec![-f64::from(f32::MAX)])
+        )
+        .is_err()
+    );
 }
 
 #[test]

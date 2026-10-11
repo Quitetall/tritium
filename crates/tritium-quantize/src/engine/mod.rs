@@ -6,6 +6,7 @@
 
 mod activation_aware;
 mod direct;
+mod joint_feedback;
 mod ladder;
 mod model;
 mod sinks;

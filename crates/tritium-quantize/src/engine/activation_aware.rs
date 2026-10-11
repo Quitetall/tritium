@@ -163,6 +163,13 @@ fn damped_cholesky(h: &[f64], k: usize, damp: f64) -> Option<Vec<f64>> {
 
 /// `H⁻¹` from `H + λI`, and the lower Cholesky of that inverse. GPTQ's compensation reads the second.
 fn damped_inverse_cholesky(h: &[f64], k: usize, damp: f64) -> Option<(Vec<f64>, Vec<f64>)> {
+    let hinv = damped_inverse(h, k, damp)?;
+    let chol = damped_cholesky(&hinv, k, 0.0)?;
+    Some((hinv, chol))
+}
+
+/// Shared full-Gram inverse; group feedback does not need the ladder's extra Cholesky.
+pub(super) fn damped_inverse(h: &[f64], k: usize, damp: f64) -> Option<Vec<f64>> {
     let l = damped_cholesky(h, k, damp)?;
     let mut inv_l = vec![0.0f64; k * k];
     for i in 0..k {
@@ -186,8 +193,7 @@ fn damped_inverse_cholesky(h: &[f64], k: usize, damp: f64) -> Option<(Vec<f64>, 
             hinv[j * k + i] = sum;
         }
     }
-    let chol = damped_cholesky(&hinv, k, 0.0)?;
-    Some((hinv, chol))
+    Some(hinv)
 }
 
 /// Balanced-ternary digits of `k`, most significant plane first — the ladder's own encoding.

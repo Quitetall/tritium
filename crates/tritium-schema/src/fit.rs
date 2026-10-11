@@ -72,6 +72,44 @@ pub struct JointGroupFitOptions {
     pub modulated_relay: bool,
 }
 
+/// Arithmetic of sequential feedback, not the storage precision or memory footprint.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd"))]
+pub enum WorkPrecision {
+    /// f32 working values/residuals, with f64 metric and correction accumulation.
+    #[default]
+    F32Accum64,
+    /// Existing f64 feedback oracle; a selected fitter may still accept f32 inputs.
+    F64,
+}
+
+/// Joint row-group fitting with full input-axis sequential residual propagation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
+pub struct JointFeedbackFitOptions {
+    /// Existing f32-input joint solver configuration; no f64 solver is implied.
+    pub fitter: JointGroupFitOptions,
+    /// Full-Gram feedback damping relative to the mean diagonal; finite and nonnegative.
+    pub damp: f64,
+    /// Working feedback arithmetic, independent of stored scale precision.
+    pub precision: WorkPrecision,
+    /// Finite residual propagation fraction in `0..=1`.
+    pub decay: f64,
+    /// Ramp from one to the configured fraction along the input axis.
+    pub decay_ramp: bool,
+}
+
 /// Exact numerical profile, not an interchangeable precision or SOTA claim.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -86,6 +124,8 @@ pub enum DirectFitProfile {
     ActivationAwareLadder(LadderFitOptions),
     /// Free F16/F32 planes fitted independently per group with the existing joint solver.
     JointIndependentGroups(JointGroupFitOptions),
+    /// Joint f32-input group fitter with validated full-Gram sequential feedback.
+    JointFeedbackGroups(JointFeedbackFitOptions),
 }
 
 /// One requested direct fit; plane counts need not be sorted or nested.

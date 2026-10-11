@@ -7,9 +7,9 @@ use std::collections::BTreeSet;
 use tritium_core::{AdditiveError, Trit, apply_basis};
 use tritium_format::{AdditiveTensor, AdditiveTensorError};
 use tritium_schema::{
-    AdditiveLayout, Basis, DirectFitPlan, DirectFitProfile, JointGroupFitOptions, LadderFitOptions,
-    LadderScaleRefit, LayoutError, PlaneAllocation, PlaneCodec, PlaneRelation, ScaleAnchor,
-    ScalePrecision, Transport, admitted_execution_group,
+    AdditiveLayout, Basis, DirectFitPlan, DirectFitProfile, JointFeedbackFitOptions,
+    JointGroupFitOptions, LadderFitOptions, LadderScaleRefit, LayoutError, PlaneAllocation,
+    PlaneCodec, PlaneRelation, ScaleAnchor, ScalePrecision, Transport, admitted_execution_group,
 };
 
 /// One directly fitted level; no release verdict or manifest provenance is fabricated.
@@ -86,6 +86,17 @@ pub enum DirectFitError {
     LadderFactorization,
     /// The existing joint solver rejected the numerical problem.
     Joint(JointFitError),
+    /// Full-Gram inverse factorization failed; no identity fallback is attempted.
+    JointFactorization,
+    /// Validated sequential propagation rejected the numerical problem or update.
+    Feedback(crate::FeedbackError),
+    /// A finite feedback working value cannot be represented by the f32-input joint fitter.
+    FitterNarrowing {
+        /// Output row.
+        row: usize,
+        /// Input column.
+        column: usize,
+    },
     /// The shared owned tensor rejected the fitted output.
     Output(AdditiveTensorError),
     /// A preflighted owned buffer could not be reserved.
@@ -99,6 +110,65 @@ impl core::fmt::Display for DirectFitError {
 }
 impl std::error::Error for DirectFitError {}
 
+// Real closed-form and joint adapters share the law-bearing layout interface.
+// Keep this seam internal until another production fitter actually needs to plug in.
+trait LevelFitter {
+    fn fit(
+        &self,
+        layout: AdditiveLayout,
+        source: &[f32],
+        gram: Option<&[f64]>,
+    ) -> Result<AdditiveTensor, DirectFitError>;
+}
+struct ClosedFormFitter(LadderFitOptions);
+impl LevelFitter for ClosedFormFitter {
+    fn fit(
+        &self,
+        layout: AdditiveLayout,
+        source: &[f32],
+        gram: Option<&[f64]>,
+    ) -> Result<AdditiveTensor, DirectFitError> {
+        fit_ladder(
+            layout,
+            source,
+            layout.rows as usize,
+            layout.cols as usize,
+            gram.expect("ladder metric built"),
+            self.0,
+        )
+    }
+}
+struct JointFitter {
+    options: JointGroupFitOptions,
+    feedback: Option<JointFeedbackFitOptions>,
+}
+impl LevelFitter for JointFitter {
+    fn fit(
+        &self,
+        layout: AdditiveLayout,
+        source: &[f32],
+        gram: Option<&[f64]>,
+    ) -> Result<AdditiveTensor, DirectFitError> {
+        if let Some(options) = self.feedback {
+            super::joint_feedback::fit(
+                layout,
+                source,
+                gram.expect("feedback metric built"),
+                options,
+            )
+        } else {
+            fit_joint(
+                layout,
+                source,
+                layout.rows as usize,
+                layout.cols as usize,
+                gram,
+                self.options,
+            )
+        }
+    }
+}
+
 /// Fit every named level from the same original row-major f32 weights.
 ///
 /// `gram` is optional input curvature in the *source* basis. `None` explicitly
@@ -107,8 +177,8 @@ impl std::error::Error for DirectFitError {}
 /// Hadamard block width is independent of scale group width. Caller inputs
 /// remain unchanged, and no fitted level is another level's prefix/source.
 ///
-/// This is the per-tensor implementation, not yet the complete model
-/// QuantPlan/source/sink/evidence engine or allocator. It grants no new backend
+/// This is the per-tensor implementation used by the model source/sink/evidence
+/// engine, not a model controller or allocator itself. It grants no new backend
 /// admission and emits no quality, memory, performance or release verdict.
 ///
 /// # Errors
@@ -120,7 +190,7 @@ pub fn fit_direct_levels(
     weights: &[f32],
     gram: Option<&[f64]>,
 ) -> Result<Vec<DirectTensorFit>, DirectFitError> {
-    let (rows, cols, count) = admit(plan, weights, gram)?;
+    let (_, cols, count) = admit(plan, weights, gram)?;
     let mut source = reserved_vec(count)?;
     source.extend_from_slice(weights);
     for row in source.chunks_mut(cols) {
@@ -136,7 +206,10 @@ pub fn fit_direct_levels(
             owned.extend_from_slice(values);
             Some(owned)
         }
-        (None, DirectFitProfile::ActivationAwareLadder(_)) => {
+        (
+            None,
+            DirectFitProfile::ActivationAwareLadder(_) | DirectFitProfile::JointFeedbackGroups(_),
+        ) => {
             let mut identity = reserved_vec(cols * cols)?;
             identity.resize(cols * cols, 0.0);
             for col in 0..cols {
@@ -156,26 +229,36 @@ pub fn fit_direct_levels(
         return Err(DirectFitError::NonFiniteBasisMetric { index });
     }
 
+    let ladder;
+    let joint;
+    let fitter: &dyn LevelFitter = match plan.profile {
+        DirectFitProfile::ActivationAwareLadder(options) => {
+            ladder = ClosedFormFitter(options);
+            &ladder
+        }
+        DirectFitProfile::JointIndependentGroups(options) => {
+            joint = JointFitter {
+                options,
+                feedback: None,
+            };
+            &joint
+        }
+        DirectFitProfile::JointFeedbackGroups(options) => {
+            joint = JointFitter {
+                options: options.fitter,
+                feedback: Some(options),
+            };
+            &joint
+        }
+        _ => return Err(DirectFitError::Unsupported("numerical profile")),
+    };
     let mut output = reserved_vec(plan.levels.len())?;
     for level in &plan.levels {
         let layout = AdditiveLayout {
             max_planes: level.planes,
             ..plan.layout
         };
-        let tensor = match plan.profile {
-            DirectFitProfile::ActivationAwareLadder(options) => fit_ladder(
-                layout,
-                &source,
-                rows,
-                cols,
-                metric.as_deref().expect("ladder metric built"),
-                options,
-            )?,
-            DirectFitProfile::JointIndependentGroups(options) => {
-                fit_joint(layout, &source, rows, cols, metric.as_deref(), options)?
-            }
-            _ => return Err(DirectFitError::Unsupported("numerical profile")),
-        };
+        let tensor = fitter.fit(layout, &source, metric.as_deref())?;
         output.push(DirectTensorFit {
             level: level.name.clone(),
             tensor,
@@ -240,7 +323,10 @@ pub(super) fn admit_plan(
                 return Err(DirectFitError::Unsupported("scale refit placement"));
             }
         }
-        DirectFitProfile::JointIndependentGroups(options) => {
+        DirectFitProfile::JointIndependentGroups(options)
+        | DirectFitProfile::JointFeedbackGroups(JointFeedbackFitOptions {
+            fitter: options, ..
+        }) => {
             if layout.law.relation != PlaneRelation::Free
                 || !matches!(
                     layout.law.precision,
@@ -248,6 +334,19 @@ pub(super) fn admit_plan(
                 )
             {
                 return Err(DirectFitError::Unsupported("joint scale law"));
+            }
+            if let DirectFitProfile::JointFeedbackGroups(feedback) = plan.profile {
+                if !feedback.damp.is_finite() || feedback.damp < 0.0 {
+                    return Err(DirectFitError::InvalidOptions("joint feedback damping"));
+                }
+                if !matches!(
+                    feedback.precision,
+                    tritium_schema::WorkPrecision::F32Accum64 | tritium_schema::WorkPrecision::F64
+                ) {
+                    return Err(DirectFitError::Unsupported("feedback precision"));
+                }
+                tritium_core::FeedbackDecay::new(feedback.decay, feedback.decay_ramp)
+                    .map_err(|_| DirectFitError::InvalidOptions("feedback decay"))?;
             }
             if options.max_iterations == 0
                 || options.em_restarts == 0
@@ -290,7 +389,12 @@ pub(super) fn admit_plan(
         .checked_mul(total_planes)
         .ok_or(DirectFitError::ShapeOverflow)?;
     limit("source weights", count, plan.limits.max_weights)?;
-    if has_gram || matches!(plan.profile, DirectFitProfile::ActivationAwareLadder(_)) {
+    if has_gram
+        || matches!(
+            plan.profile,
+            DirectFitProfile::ActivationAwareLadder(_) | DirectFitProfile::JointFeedbackGroups(_)
+        )
+    {
         limit("input Gram", metric_count, plan.limits.max_metric_entries)?;
     }
     limit("output trits", output_count, plan.limits.max_output_trits)?;
@@ -359,7 +463,7 @@ fn limit(resource: &'static str, required: u64, maximum: u64) -> Result<(), Dire
     }
 }
 
-fn reserved_vec<T>(count: usize) -> Result<Vec<T>, DirectFitError> {
+pub(super) fn reserved_vec<T>(count: usize) -> Result<Vec<T>, DirectFitError> {
     let mut values = Vec::new();
     values
         .try_reserve_exact(count)
@@ -421,27 +525,7 @@ fn fit_joint(
 ) -> Result<AdditiveTensor, DirectFitError> {
     let group = usize::from(layout.group);
     let per_row = cols.div_ceil(group);
-    let planes = usize::from(layout.max_planes);
-    let units = rows * per_row;
-    let mut trits = reserved_vec(rows * cols * planes)?;
-    trits.resize(rows * cols * planes, Trit::ZERO);
-    let mut scales = reserved_vec(units * planes)?;
-    scales.resize(units * planes, 0.0);
-    let config = JointFitConfig {
-        planes,
-        max_iterations: options.max_iterations as usize,
-        ridge: options.ridge,
-        em_restarts: options.em_restarts as usize,
-        ridge_condition_limit: options.ridge_condition_limit,
-        scale_precision: match layout.law.precision {
-            ScalePrecision::F16 => crate::ScalePrecision::F16,
-            _ => crate::ScalePrecision::F32,
-        },
-        relay_basins: RelayBasins {
-            softened: options.softened_relay,
-            modulated: options.modulated_relay,
-        },
-    };
+    let mut output = JointOutput::new(layout, options)?;
     for block in 0..per_row {
         let start = block * group;
         let end = (start + group).min(cols);
@@ -459,20 +543,88 @@ fn fit_joint(
             let metric = metric
                 .as_ref()
                 .map_or(JointFitMetric::Identity, JointFitMetric::Dense);
-            let fit = crate::fit_joint_ternary(
+            output.fit_row(
+                row,
+                block,
                 &source[row * cols + start..row * cols + end],
                 metric,
-                config,
-            )
-            .map_err(DirectFitError::Joint)?;
-            for plane in 0..planes {
-                scales[plane * units + row * per_row + block] = fit.scales[plane];
-                let offset = plane * rows * cols + row * cols + start;
-                for (index, &digit) in fit.trits[plane].iter().enumerate() {
-                    trits[offset + index] = Trit::from_i8(digit).expect("joint digits are ternary");
-                }
-            }
+            )?;
         }
     }
-    AdditiveTensor::new(layout, layout.max_planes, trits, scales).map_err(DirectFitError::Output)
+    output.finish()
+}
+
+// One solver invocation/scale rounding/output installation for independent and feedback fits.
+pub(super) struct JointOutput {
+    layout: AdditiveLayout,
+    config: JointFitConfig,
+    trits: Vec<Trit>,
+    scales: Vec<f32>,
+}
+impl JointOutput {
+    pub(super) fn new(
+        layout: AdditiveLayout,
+        options: JointGroupFitOptions,
+    ) -> Result<Self, DirectFitError> {
+        let rows = layout.rows as usize;
+        let cols = layout.cols as usize;
+        let planes = usize::from(layout.max_planes);
+        let units = rows * cols.div_ceil(usize::from(layout.group));
+        let mut trits = reserved_vec(rows * cols * planes)?;
+        trits.resize(rows * cols * planes, Trit::ZERO);
+        let mut scales = reserved_vec(units * planes)?;
+        scales.resize(units * planes, 0.0);
+        Ok(Self {
+            layout,
+            config: joint_config(layout, options),
+            trits,
+            scales,
+        })
+    }
+    pub(super) fn fit_row(
+        &mut self,
+        row: usize,
+        block: usize,
+        input: &[f32],
+        metric: JointFitMetric<'_>,
+    ) -> Result<Vec<f32>, DirectFitError> {
+        let fit =
+            crate::fit_joint_ternary(input, metric, self.config).map_err(DirectFitError::Joint)?;
+        let rows = self.layout.rows as usize;
+        let cols = self.layout.cols as usize;
+        let group = usize::from(self.layout.group);
+        let per_row = cols.div_ceil(group);
+        let units = rows * per_row;
+        for plane in 0..self.config.planes {
+            self.scales[plane * units + row * per_row + block] = fit.scales[plane];
+            let offset = plane * rows * cols + row * cols + block * group;
+            for (index, &digit) in fit.trits[plane].iter().enumerate() {
+                self.trits[offset + index] =
+                    Trit::from_i8(digit).expect("joint digits are ternary");
+            }
+        }
+        Ok(fit.reconstruction)
+    }
+    pub(super) fn finish(self) -> Result<AdditiveTensor, DirectFitError> {
+        AdditiveTensor::new(self.layout, self.layout.max_planes, self.trits, self.scales)
+            .map_err(DirectFitError::Output)
+    }
+}
+
+fn joint_config(layout: AdditiveLayout, options: JointGroupFitOptions) -> JointFitConfig {
+    JointFitConfig {
+        planes: usize::from(layout.max_planes),
+        max_iterations: options.max_iterations as usize,
+        ridge: options.ridge,
+        em_restarts: options.em_restarts as usize,
+        ridge_condition_limit: options.ridge_condition_limit,
+        scale_precision: match layout.law.precision {
+            ScalePrecision::F16 => crate::ScalePrecision::F16,
+            _ => crate::ScalePrecision::F32,
+        },
+        relay_basins: RelayBasins {
+            softened: options.softened_relay,
+            modulated: options.modulated_relay,
+        },
+    }
 }

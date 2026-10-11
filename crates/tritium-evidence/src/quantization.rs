@@ -163,7 +163,7 @@ impl QuantizationReceiptView {
                     QuantAction::KeepDense => {}
                     QuantAction::Fit { plan, metric } => {
                         let fit = fitted.ok_or_else(|| invalid("requested fit absent"))?;
-                        if &fit.plan != plan || &fit.metric != metric {
+                        if &fit.plan != plan.as_ref() || &fit.metric != metric {
                             return Err(invalid("fit plan or metric changed"));
                         }
                     }

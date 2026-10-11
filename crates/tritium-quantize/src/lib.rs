@@ -114,7 +114,7 @@ pub use salt_v2_evidence::{
 };
 pub use salt_v2_feedback::{
     ColumnGroup, FeedbackError, FeedbackMetric, FeedbackProblem, FeedbackRunError, FeedbackState,
-    GroupFitRequest, fit_with_feedback, fit_with_feedback_decay,
+    GroupFitRequest, fit_with_feedback, fit_with_feedback_decay, fit_with_feedback_precision,
 };
 pub use salt_v2_model::{
     CurvatureArtifact, KroneckerCurvature, PhysicalRateTarget, SaltV2Config, SaltV2Curvature,

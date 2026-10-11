@@ -117,7 +117,7 @@ fn plan(source: &dyn WeightSource) -> QuantPlan {
             .map(|source| {
                 let action = if source.shape.len() == 2 {
                     QuantAction::Fit {
-                        plan: direct(),
+                        plan: Box::new(direct()),
                         metric: DirectFitMetric::Identity,
                     }
                 } else {
@@ -490,6 +490,89 @@ fn requested_real_gram_is_used_and_input_changes_rebind_provenance() {
             model.tensor(&level.level, "weight").unwrap().1,
             level.tensor.encode_payload().unwrap()
         );
+    }
+}
+
+#[test]
+fn joint_feedback_profile_is_source_bound_replayed_and_published_deterministically() {
+    for precision in [WorkPrecision::F32Accum64, WorkPrecision::F64] {
+        let mut source = source(ScalePrecision::F32);
+        let values = (0..64)
+            .map(|i| ((i * 29 % 101) as f32 - 50.0) / 37.0)
+            .collect::<Vec<_>>();
+        source.tensors.insert(
+            "weight".into(),
+            RawTensor {
+                shape: vec![1, 64],
+                precision: ScalePrecision::F32,
+                bytes: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            },
+        );
+        let mut fit_plan = direct();
+        let DirectFitProfile::JointIndependentGroups(fitter) = fit_plan.profile else {
+            unreachable!()
+        };
+        fit_plan.profile = DirectFitProfile::JointFeedbackGroups(JointFeedbackFitOptions {
+            fitter,
+            damp: 0.01,
+            precision,
+            decay: 0.6,
+            decay_ramp: true,
+        });
+        fit_plan.layout.cols = 64;
+        fit_plan.layout.basis = Basis::Hadamard { block: 64 };
+        fit_plan.limits.max_weights = 64;
+        fit_plan.limits.max_metric_entries = 4096;
+        fit_plan.limits.max_output_trits = 384;
+        let curvature = (0..4096)
+            .map(|i| if i / 64 == i % 64 { 1.2 } else { 0.2 })
+            .collect::<Vec<f64>>();
+        let mut recording =
+            EvidenceRecorder::new("metric-source", [DIRECT_LEVELS_FITTED_REGISTRATION]).unwrap();
+        let actual = tritium_quantize::engine::fit_direct_levels_recorded(
+            "weight",
+            &fit_plan,
+            &values,
+            Some(&curvature),
+            &mut recording,
+            "fit",
+            None,
+            0,
+        )
+        .unwrap();
+        let mut request = plan(&source);
+        request.tensors[1].action = QuantAction::Fit {
+            plan: Box::new(fit_plan.clone()),
+            metric: actual.observation.observation().metric.clone(),
+        };
+        source.grams.insert("weight".into(), curvature);
+        let before = source.clone();
+        let mut first = MemoryTensorSink::default();
+        let result = Engine::run(&request, &mut source, &mut first, recorder()).unwrap();
+        let replay = verify_jsonl(result.evidence.jsonl()).unwrap();
+        let views = QuantizationReceiptView::fold(&replay).unwrap();
+        assert_eq!(views[0].fits()[0].observation().plan, fit_plan);
+        verify_package_with_fit_log(first.artifact().unwrap().0, &replay).unwrap();
+        let model = read_trit_model(first.artifact().unwrap().0).unwrap();
+        for level in actual.levels {
+            assert_eq!(
+                model.tensor(&level.level, "weight").unwrap().1,
+                level.tensor.encode_payload().unwrap()
+            );
+        }
+        let mut second = MemoryTensorSink::default();
+        let repeated = Engine::run(&request, &mut source, &mut second, recorder()).unwrap();
+        assert_eq!(result.package_id, repeated.package_id);
+        assert_eq!(result.evidence.jsonl(), repeated.evidence.jsonl());
+        assert_eq!(first.artifact().unwrap().0, second.artifact().unwrap().0);
+        assert_eq!(
+            source.tensors["weight"].bytes,
+            before.tensors["weight"].bytes
+        );
+        let mut json = serde_json::to_value(&fit_plan).unwrap();
+        json["profile"]["JointFeedbackGroups"]["precision"] =
+            serde_json::json!("ImaginaryPrecision");
+        assert!(serde_json::from_value::<DirectFitPlan>(json).is_err());
     }
 }
 
