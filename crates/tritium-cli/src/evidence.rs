@@ -9,7 +9,7 @@ use clap::{Subcommand, ValueEnum};
 use serde::Serialize;
 use tritium_evidence::{
     DirectFitReceiptView, EventRegistration, EvidenceEvent, EvidenceRecorder, ModelLoadReceiptView,
-    verify_jsonl,
+    QuantizationReceiptView, verify_jsonl,
 };
 
 /// Evidence detail level for a CLI invocation.
@@ -194,6 +194,8 @@ pub(crate) fn run(command: EvidenceCommand) -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!("verify model-load view {}: {error}", path.display()))?;
     DirectFitReceiptView::fold(&verified)
         .map_err(|error| anyhow::anyhow!("verify direct-fit view {}: {error}", path.display()))?;
+    QuantizationReceiptView::fold(&verified)
+        .map_err(|error| anyhow::anyhow!("verify quantization view {}: {error}", path.display()))?;
     if view {
         println!("{}", serde_json::to_string_pretty(&verified.events)?);
     } else {
@@ -428,5 +430,34 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(std::fs::read(&path).expect("read sentinel"), b"preserve me");
         std::fs::remove_file(path).expect("remove sentinel");
+    }
+
+    #[test]
+    fn recognized_malformed_quantization_payload_is_not_integrity_success() {
+        #[derive(serde::Serialize)]
+        struct Malformed {
+            unexpected: bool,
+        }
+        impl tritium_evidence::EvidenceEvent for Malformed {
+            const SCHEMA_ID: &'static str = "tritium.quantize.quantization_completed";
+            const VERSION: u16 = 1;
+        }
+        let path = temp_log();
+        let mut recorder = EvidenceRecorder::new(
+            "malformed-model-fit",
+            [tritium_evidence::QUANTIZATION_COMPLETED_REGISTRATION],
+        )
+        .unwrap();
+        recorder
+            .emit("fit", None, 0, &Malformed { unexpected: true })
+            .unwrap();
+        std::fs::write(&path, recorder.to_jsonl().unwrap()).unwrap();
+        for command in [
+            EvidenceCommand::Verify { path: path.clone() },
+            EvidenceCommand::View { path: path.clone() },
+        ] {
+            assert!(run(command).is_err());
+        }
+        std::fs::remove_file(path).unwrap();
     }
 }

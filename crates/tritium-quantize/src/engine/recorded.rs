@@ -73,24 +73,12 @@ pub fn fit_direct_levels_recorded(
         .map_err(|_| RecordedDirectFitError::ThreadCountOverflow)?;
     let levels = fit_direct_levels(plan, weights, gram).map_err(RecordedDirectFitError::Fit)?;
 
-    let mut source = blake3::Hasher::new_derive_key("tritium.quantize.source-f32.v1");
-    source.update(&plan.layout.rows.to_le_bytes());
-    source.update(&plan.layout.cols.to_le_bytes());
-    for value in weights {
-        source.update(&value.to_bits().to_le_bytes());
-    }
+    let source_f32 = source_digest(plan.layout.rows, plan.layout.cols, weights);
     let metric = match gram {
         None => DirectFitMetric::Identity,
-        Some(values) => {
-            let mut hash = blake3::Hasher::new_derive_key("tritium.quantize.input-gram-f64.v1");
-            hash.update(&plan.layout.cols.to_le_bytes());
-            for value in values {
-                hash.update(&value.to_bits().to_le_bytes());
-            }
-            DirectFitMetric::InputGramF64 {
-                content: FitInputDigest(*hash.finalize().as_bytes()),
-            }
-        }
+        Some(values) => DirectFitMetric::InputGramF64 {
+            content: gram_digest(plan.layout.cols, values),
+        },
     };
     let outputs = levels
         .iter()
@@ -111,7 +99,7 @@ pub fn fit_direct_levels_recorded(
             &DirectLevelsFitted {
                 tensor: tensor_name.into(),
                 plan: plan.clone(),
-                source_f32: FitInputDigest(*source.finalize().as_bytes()),
+                source_f32,
                 metric,
                 rayon_threads,
                 outputs,
@@ -122,4 +110,31 @@ pub fn fit_direct_levels_recorded(
         levels,
         observation,
     })
+}
+
+pub(super) fn source_digest(rows: u64, cols: u64, weights: &[f32]) -> FitInputDigest {
+    let mut hash = blake3::Hasher::new_derive_key("tritium.quantize.source-f32.v1");
+    hash.update(&rows.to_le_bytes());
+    hash.update(&cols.to_le_bytes());
+    let mut staging = [0u8; 4096];
+    for chunk in weights.chunks(staging.len() / 4) {
+        for (value, bytes) in chunk.iter().zip(staging.as_chunks_mut::<4>().0) {
+            bytes.copy_from_slice(&value.to_bits().to_le_bytes());
+        }
+        hash.update(&staging[..chunk.len() * 4]);
+    }
+    FitInputDigest(*hash.finalize().as_bytes())
+}
+
+pub(super) fn gram_digest(cols: u64, values: &[f64]) -> FitInputDigest {
+    let mut hash = blake3::Hasher::new_derive_key("tritium.quantize.input-gram-f64.v1");
+    hash.update(&cols.to_le_bytes());
+    let mut staging = [0u8; 4096];
+    for chunk in values.chunks(staging.len() / 8) {
+        for (value, bytes) in chunk.iter().zip(staging.as_chunks_mut::<8>().0) {
+            bytes.copy_from_slice(&value.to_bits().to_le_bytes());
+        }
+        hash.update(&staging[..chunk.len() * 8]);
+    }
+    FitInputDigest(*hash.finalize().as_bytes())
 }

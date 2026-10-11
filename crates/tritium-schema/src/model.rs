@@ -398,7 +398,7 @@ impl ModelManifest {
     }
 }
 
-fn name(value: &str, basename: bool) -> Result<(), ModelManifestError> {
+pub(crate) fn name(value: &str, basename: bool) -> Result<(), ModelManifestError> {
     if value.is_empty()
         || value.len() > 4096
         || value.chars().any(char::is_control)
@@ -409,7 +409,7 @@ fn name(value: &str, basename: bool) -> Result<(), ModelManifestError> {
     Ok(())
 }
 
-fn sorted<'a>(
+pub(crate) fn sorted<'a>(
     values: impl Iterator<Item = &'a str>,
     inventory: &'static str,
 ) -> Result<(), ModelManifestError> {

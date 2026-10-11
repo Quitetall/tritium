@@ -90,6 +90,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     project!(tritium_schema::DirectFitMetric, "direct-fit-metric");
     project!(tritium_schema::DirectFitOutput, "direct-fit-output");
     project!(tritium_schema::DirectLevelsFitted, "direct-levels-fitted");
+    project!(tritium_schema::QuantSourceTensor, "quant-source-tensor");
+    project!(tritium_schema::QuantAction, "quant-action");
+    project!(tritium_schema::QuantTensorPlan, "quant-tensor-plan");
+    project!(tritium_schema::QuantLimits, "quant-limits");
+    project!(tritium_schema::QuantPlan, "quant-plan");
+    project!(tritium_schema::QuantSourceBinding, "quant-source-binding");
+    project!(tritium_schema::QuantOutputLevel, "quant-output-level");
+    project!(tritium_schema::QuantizationStarted, "quantization-started");
+    project!(
+        tritium_schema::QuantizationCompleted,
+        "quantization-completed"
+    );
 
     Ok(())
 }

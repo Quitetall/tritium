@@ -1,0 +1,687 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "QuantTensorPlan",
+  "description": "One exact source binding and its requested operation.",
+  "type": "object",
+  "properties": {
+    "action": {
+      "description": "Preservation or the actual numerical profile/metric selection.",
+      "$ref": "#/$defs/QuantAction"
+    },
+    "source": {
+      "description": "Original source interpretation must match discovery exactly.",
+      "$ref": "#/$defs/QuantSourceTensor"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "source",
+    "action"
+  ],
+  "$defs": {
+    "AdditiveLayout": {
+      "description": "Semantic layout parameters for an additive tensor.",
+      "type": "object",
+      "properties": {
+        "allocation": {
+          "description": "Plane count allocation mode.",
+          "$ref": "#/$defs/PlaneAllocation"
+        },
+        "basis": {
+          "description": "Input-axis basis.",
+          "$ref": "#/$defs/Basis"
+        },
+        "codec": {
+          "description": "Per-plane codec.",
+          "$ref": "#/$defs/PlaneCodec"
+        },
+        "cols": {
+          "description": "Number of coefficients per row.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "group": {
+          "description": "Scale group width.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "law": {
+          "description": "Scale law.",
+          "$ref": "#/$defs/ScaleLaw"
+        },
+        "max_planes": {
+          "description": "Maximum plane count represented by this tensor.",
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "rows": {
+          "description": "Number of matrix rows.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "tile": {
+          "description": "Canonical tile width. Currently fixed at [`ADDITIVE_TILE_SIZE`].",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "transport": {
+          "description": "Outer entropy transport.",
+          "$ref": "#/$defs/Transport"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "rows",
+        "cols",
+        "tile",
+        "group",
+        "max_planes",
+        "allocation",
+        "codec",
+        "law",
+        "basis",
+        "transport"
+      ]
+    },
+    "Basis": {
+      "description": "Input-axis transform associated with an additive tensor.",
+      "oneOf": [
+        {
+          "description": "No transform.",
+          "type": "string",
+          "const": "Identity"
+        },
+        {
+          "description": "Normalized, self-inverse Walsh–Hadamard transform.",
+          "type": "object",
+          "properties": {
+            "Hadamard": {
+              "type": "object",
+              "properties": {
+                "block": {
+                  "description": "Power-of-two transform block width.",
+                  "type": "integer",
+                  "format": "uint32",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "block"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Hadamard"
+          ]
+        },
+        {
+          "description": "Deterministic signed Walsh–Hadamard transform.",
+          "type": "object",
+          "properties": {
+            "SignedRht": {
+              "type": "object",
+              "properties": {
+                "block": {
+                  "description": "Power-of-two transform block width.",
+                  "type": "integer",
+                  "format": "uint32",
+                  "minimum": 0
+                },
+                "domain": {
+                  "description": "Stable domain identifier for sign derivation.",
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "seed": {
+                  "description": "Seed used to derive signs.",
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "block",
+                "seed",
+                "domain"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "SignedRht"
+          ]
+        }
+      ]
+    },
+    "DirectFitLevel": {
+      "description": "One requested direct fit; plane counts need not be sorted or nested.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Unique nonempty level name within this request.",
+          "type": "string"
+        },
+        "planes": {
+          "description": "Positive plane count bounded by the layout and its admitted law.",
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "planes"
+      ]
+    },
+    "DirectFitLimits": {
+      "description": "Pre-allocation shape limits for one direct-level request.\n\nThese bound specified logical element counts, not total process RSS, solver\ntemporary storage, Rayon overhead, or complete production memory admission.",
+      "type": "object",
+      "properties": {
+        "max_metric_entries": {
+          "description": "Maximum dense input-Gram count (`cols * cols`), even when implicit identity is used.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_output_trits": {
+          "description": "Maximum sum of retained trits over all directly fitted levels.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_weights": {
+          "description": "Maximum source scalar count (`rows * cols`).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max_weights",
+        "max_metric_entries",
+        "max_output_trits"
+      ]
+    },
+    "DirectFitMetric": {
+      "description": "Original metric supplied to the controller, before any basis transform.",
+      "oneOf": [
+        {
+          "description": "Explicit plan invocation without an input Gram.",
+          "type": "string",
+          "const": "Identity"
+        },
+        {
+          "description": "Exact row-major f64 Gram bits; not original calibration data identity.",
+          "type": "object",
+          "properties": {
+            "InputGramF64": {
+              "type": "object",
+              "properties": {
+                "content": {
+                  "description": "Candidate `tritium.quantize.input-gram-f64.v1` digest.",
+                  "$ref": "#/$defs/FitInputDigest"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "content"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "InputGramF64"
+          ]
+        }
+      ]
+    },
+    "DirectFitPlan": {
+      "description": "Typed per-tensor direct-level fit request, not the complete model QuantPlan.\n\nThe layout is the highest permitted plane count. Each returned level has\nits own exact plane count as `max_planes`, and is fitted from the same\noriginal source rather than from a prefix or another level's reconstruction.",
+      "type": "object",
+      "properties": {
+        "layout": {
+          "description": "Declared geometry, law, basis, packing codec and transport.",
+          "$ref": "#/$defs/AdditiveLayout"
+        },
+        "levels": {
+          "description": "Ordered direct levels to produce.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DirectFitLevel"
+          }
+        },
+        "limits": {
+          "description": "Required explicit shape limits, checked before numerical allocations.",
+          "$ref": "#/$defs/DirectFitLimits"
+        },
+        "profile": {
+          "description": "Selected real numerical implementation.",
+          "$ref": "#/$defs/DirectFitProfile"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "layout",
+        "profile",
+        "levels",
+        "limits"
+      ]
+    },
+    "DirectFitProfile": {
+      "description": "Exact numerical profile, not an interchangeable precision or SOTA claim.",
+      "oneOf": [
+        {
+          "description": "Tied one-third F16 ladder with the shipping activation-aware arithmetic.",
+          "type": "object",
+          "properties": {
+            "ActivationAwareLadder": {
+              "$ref": "#/$defs/LadderFitOptions"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ActivationAwareLadder"
+          ]
+        },
+        {
+          "description": "Free F16/F32 planes fitted independently per group with the existing joint solver.",
+          "type": "object",
+          "properties": {
+            "JointIndependentGroups": {
+              "$ref": "#/$defs/JointGroupFitOptions"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "JointIndependentGroups"
+          ]
+        }
+      ]
+    },
+    "FitInputDigest": {
+      "description": "Exact original fitting input bits under a named candidate digest domain.\nNot a stored blob, package, HF identity or calibration dataset identity.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "JointGroupFitOptions": {
+      "description": "Existing joint fitter applied independently to each row-local scale group.\n\nThis profile does not propagate cross-group residual feedback, implement K-FAC\noutput curvature, or claim to be the full SALT campaign solver.",
+      "type": "object",
+      "properties": {
+        "em_restarts": {
+          "description": "Positive deterministic output-aware restart count.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_iterations": {
+          "description": "Positive maximum alternating scale/assignment iterations.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "modulated_relay": {
+          "description": "Enable the existing modulated-relay initialization basin.",
+          "type": "boolean"
+        },
+        "ridge": {
+          "description": "Finite positive scale-solve ridge.",
+          "type": "number",
+          "format": "double"
+        },
+        "ridge_condition_limit": {
+          "description": "Finite ridge condition-number limit greater than one.",
+          "type": "number",
+          "format": "double"
+        },
+        "softened_relay": {
+          "description": "Enable the existing softened-relay initialization basin.",
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max_iterations",
+        "ridge",
+        "em_restarts",
+        "ridge_condition_limit",
+        "softened_relay",
+        "modulated_relay"
+      ]
+    },
+    "LadderFitOptions": {
+      "description": "Shipping f32 working weights with f64 metric/feedback/search arithmetic.",
+      "type": "object",
+      "properties": {
+        "damp": {
+          "description": "Finite, nonnegative damping relative to the mean input-Gram diagonal.",
+          "type": "number",
+          "format": "double"
+        },
+        "decay": {
+          "description": "Finite feedback fraction in `0..=1`; one is plain GPTQ.",
+          "type": "number",
+          "format": "double"
+        },
+        "decay_ramp": {
+          "description": "Ramp feedback from one to the configured fraction along the input axis.",
+          "type": "boolean"
+        },
+        "grid": {
+          "description": "Quarter-octave anchor grid candidates per group; zero retains the legacy single guess.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "scale_refit": {
+          "description": "Scale refit placement.",
+          "$ref": "#/$defs/LadderScaleRefit"
+        },
+        "search_sweeps": {
+          "description": "Number of optional coordinate-search sweeps.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "grid",
+        "damp",
+        "search_sweeps",
+        "scale_refit",
+        "decay",
+        "decay_ramp"
+      ]
+    },
+    "LadderScaleRefit": {
+      "description": "Placement of the ladder scale refit, without changing its numerical policy.",
+      "oneOf": [
+        {
+          "description": "Do not refit ladder scales.",
+          "type": "string",
+          "const": "None"
+        },
+        {
+          "description": "Refit during the post-feedback coordinate search.",
+          "type": "string",
+          "const": "PostPass"
+        },
+        {
+          "description": "Refit completed groups before propagating to the remaining columns.",
+          "type": "string",
+          "const": "InLoop"
+        }
+      ]
+    },
+    "PlaneAllocation": {
+      "description": "Uniform or per-tile plane-count allocation policy.",
+      "oneOf": [
+        {
+          "description": "Every tile uses the tensor's maximum plane count.",
+          "type": "string",
+          "const": "Uniform"
+        },
+        {
+          "description": "Each tile records its own plane count.",
+          "type": "string",
+          "const": "PerTile"
+        }
+      ]
+    },
+    "PlaneCodec": {
+      "description": "Compact code used for each additive ternary plane.",
+      "oneOf": [
+        {
+          "description": "Two-bit ternary packing.",
+          "type": "string",
+          "const": "D2"
+        },
+        {
+          "description": "Base-3 packing of five ternary coefficients per byte.",
+          "type": "string",
+          "const": "B3"
+        },
+        {
+          "description": "Structured sparse 3-of-4 encoding.",
+          "type": "string",
+          "const": "S34"
+        }
+      ]
+    },
+    "PlaneRelation": {
+      "description": "Relationship between scales of successive additive planes.",
+      "oneOf": [
+        {
+          "description": "Every plane has an independently fitted scale.",
+          "type": "string",
+          "const": "Free"
+        },
+        {
+          "description": "Plane `p` has scale `s0 * (num / den)^p`.",
+          "type": "object",
+          "properties": {
+            "Tied": {
+              "type": "object",
+              "properties": {
+                "den": {
+                  "description": "Denominator of the positive scale ratio.",
+                  "type": "integer",
+                  "format": "uint32",
+                  "minimum": 0
+                },
+                "num": {
+                  "description": "Numerator of the positive scale ratio.",
+                  "type": "integer",
+                  "format": "uint32",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "num",
+                "den"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Tied"
+          ]
+        }
+      ]
+    },
+    "QuantAction": {
+      "description": "Requested transform; preservation does not claim ternary weights.",
+      "oneOf": [
+        {
+          "description": "Preserve exact source bytes and original precision in every model level.",
+          "type": "string",
+          "const": "KeepDense"
+        },
+        {
+          "description": "Independently fit all requested levels from this original source.",
+          "type": "object",
+          "properties": {
+            "Fit": {
+              "type": "object",
+              "properties": {
+                "metric": {
+                  "description": "Explicit identity or exact expected original f64 Gram content.",
+                  "$ref": "#/$defs/DirectFitMetric"
+                },
+                "plan": {
+                  "description": "Existing per-tensor production fitting request.",
+                  "$ref": "#/$defs/DirectFitPlan"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "plan",
+                "metric"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Fit"
+          ]
+        }
+      ]
+    },
+    "QuantSourceTensor": {
+      "description": "Original tensor interpretation, never an adapter-supplied content hash.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Exact logical tensor name.",
+          "type": "string"
+        },
+        "precision": {
+          "description": "Original stored float precision, before widening or fitting.",
+          "$ref": "#/$defs/ScalePrecision"
+        },
+        "shape": {
+          "description": "Positive row-major dimensions in the original source.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "shape",
+        "precision"
+      ]
+    },
+    "ScaleAnchor": {
+      "description": "Grouping axis to which an additive scale is anchored.",
+      "oneOf": [
+        {
+          "description": "One scale per declared group.",
+          "type": "string",
+          "const": "Group"
+        },
+        {
+          "description": "One scale per matrix row.",
+          "type": "string",
+          "const": "Row"
+        },
+        {
+          "description": "One scale for the complete tensor.",
+          "type": "string",
+          "const": "Tensor"
+        },
+        {
+          "description": "One scale per output channel.",
+          "type": "string",
+          "const": "Channel"
+        }
+      ]
+    },
+    "ScaleLaw": {
+      "description": "Scale law represented as orthogonal anchor, relation, and storage precision.",
+      "type": "object",
+      "properties": {
+        "anchor": {
+          "description": "Scale grouping axis.",
+          "$ref": "#/$defs/ScaleAnchor"
+        },
+        "precision": {
+          "description": "Scale storage precision.",
+          "$ref": "#/$defs/ScalePrecision"
+        },
+        "relation": {
+          "description": "Cross-plane scale relationship.",
+          "$ref": "#/$defs/PlaneRelation"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "anchor",
+        "relation",
+        "precision"
+      ]
+    },
+    "ScalePrecision": {
+      "description": "Precision used to store additive plane scales.",
+      "oneOf": [
+        {
+          "description": "IEEE binary16.",
+          "type": "string",
+          "const": "F16"
+        },
+        {
+          "description": "Brain floating-point 16-bit.",
+          "type": "string",
+          "const": "Bf16"
+        },
+        {
+          "description": "IEEE binary32.",
+          "type": "string",
+          "const": "F32"
+        }
+      ]
+    },
+    "Transport": {
+      "description": "Optional entropy transport applied outside the tensor's plane codec.",
+      "oneOf": [
+        {
+          "description": "Store codec bytes directly.",
+          "type": "string",
+          "const": "Raw"
+        },
+        {
+          "description": "Joint Huffman coding with the specified block width.",
+          "type": "object",
+          "properties": {
+            "JointHuffman": {
+              "type": "object",
+              "properties": {
+                "block": {
+                  "description": "Number of symbols grouped into one entropy-coding block.",
+                  "type": "integer",
+                  "format": "uint32",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "block"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "JointHuffman"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -23,6 +23,11 @@ pub use model_load::{MODEL_LOADED_REGISTRATION, ModelLoadReceiptView};
 mod direct_fit;
 pub use direct_fit::{DIRECT_LEVELS_FITTED_REGISTRATION, DirectFitReceiptView};
 
+mod quantization;
+pub use quantization::{
+    QUANTIZATION_COMPLETED_REGISTRATION, QUANTIZATION_STARTED_REGISTRATION, QuantizationReceiptView,
+};
+
 const EVENT_DOMAIN: &[u8] = b"tritium.evidence.event.v1\0";
 const ROOT_DOMAIN: &[u8] = b"tritium.evidence.run-root.v1\0";
 const ZERO_DIGEST: [u8; 32] = [0; 32];
@@ -225,6 +230,33 @@ impl EvidenceRecorder {
         &self.events
     }
 
+    /// Actual recorder run identity, not an artifact identity.
+    #[must_use]
+    pub fn run(&self) -> &str {
+        &self.run
+    }
+
+    /// Consume the recorder and retain the actual canonical, verified log.
+    /// Sealing proves integrity, not completion or independent qualification.
+    /// # Errors
+    /// Serialization, chain/root or registry consistency failure.
+    pub fn seal(self) -> Result<SealedEvidence, EvidenceError> {
+        let jsonl = self.to_jsonl()?;
+        let log = verify_jsonl(&jsonl)?;
+        for event in &log.events {
+            if self.registered.get(&event.schema) != Some(&event.v) {
+                return Err(EvidenceError::UnregisteredSchema(event.schema.clone()));
+            }
+        }
+        let root = decode_hex(&log.root_digest)?;
+        Ok(SealedEvidence {
+            run: self.run,
+            jsonl,
+            log,
+            root,
+        })
+    }
+
     /// Serialize the log as canonical JSON Lines.
     pub fn to_jsonl(&self) -> Result<String, EvidenceError> {
         let mut output = String::new();
@@ -308,6 +340,46 @@ pub struct VerifiedLog {
     pub events: Vec<EvidenceEnvelope>,
     /// BLAKE3 run root over sorted span roots.
     pub root_digest: String,
+}
+
+/// Immutable owned seal of one actual recorder, without a qualification verdict.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SealedEvidence {
+    run: String,
+    jsonl: String,
+    log: VerifiedLog,
+    root: [u8; 32],
+}
+
+impl SealedEvidence {
+    /// Actual recorder identity, retained even for an empty sealed log.
+    #[must_use]
+    pub fn run(&self) -> &str {
+        &self.run
+    }
+    /// Canonical JSONL bytes actually reverified at sealing.
+    #[must_use]
+    pub fn jsonl(&self) -> &str {
+        &self.jsonl
+    }
+    /// Read-only verified view. Cloned mutable logs must be checked again.
+    #[must_use]
+    pub fn log(&self) -> &VerifiedLog {
+        &self.log
+    }
+    /// Actual run root in the schema's evidence-reference representation.
+    #[must_use]
+    pub fn root(&self) -> [u8; 32] {
+        self.root
+    }
+}
+
+fn verify_log(log: &VerifiedLog) -> Result<(), EvidenceError> {
+    verify_events(&log.events)?;
+    if root_digest(&final_digests(&log.events)?)? != log.root_digest {
+        return Err(EvidenceError::RootMismatch);
+    }
+    Ok(())
 }
 
 /// One claim and the review obligation attached to it.

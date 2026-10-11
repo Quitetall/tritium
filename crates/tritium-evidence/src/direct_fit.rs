@@ -2,7 +2,7 @@
 
 use super::{
     EventRegistration, EvidenceEnvelope, EvidenceError, EvidenceEvent, EvidenceRecorder,
-    VerifiedLog, final_digests, root_digest, verify_events,
+    VerifiedLog, verify_log,
 };
 use tritium_schema::DirectLevelsFitted;
 
@@ -43,10 +43,7 @@ impl DirectFitReceiptView {
     /// # Errors
     /// Invalid chain/root, event version, strict payload or output bindings.
     pub fn fold(log: &VerifiedLog) -> Result<Vec<Self>, EvidenceError> {
-        verify_events(&log.events)?;
-        if root_digest(&final_digests(&log.events)?)? != log.root_digest {
-            return Err(EvidenceError::RootMismatch);
-        }
+        verify_log(log)?;
         log.events
             .iter()
             .filter(|event| event.schema == DirectLevelsFitted::SCHEMA_ID)

@@ -1,12 +1,22 @@
 //! Shared production numerical kernels for conversion and training (ADR 0044 D11).
 //!
 //! These kernels preserve the legacy F32Accum64 ladder semantics. They are the
-//! numerical implementation, not yet the full typed QuantPlan/source/sink engine.
+//! numerical implementation shared by the typed model source/sink engine.
 //! The f64 feedback oracle remains an explicitly separate reference profile.
 
 mod activation_aware;
 mod direct;
 mod ladder;
+mod model;
+mod sinks;
+mod sources;
+
+pub use model::{
+    Engine, PublicationWarning, QuantEngineError, QuantizedModel, TensorSink, WeightSource,
+    verify_package_with_fit_log,
+};
+pub use sinks::{DirectoryTensorSink, MemoryTensorSink};
+pub use sources::{InMemoryWeightSource, RawTensor, SafeTensorsWeightSource};
 
 pub use direct::{DirectFitError, DirectTensorFit, fit_direct_levels};
 

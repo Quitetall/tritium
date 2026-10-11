@@ -467,6 +467,59 @@ fn decode_additive(meta: &TensorMeta, bytes: &[u8]) -> Result<AdditiveTensor, Tr
     AdditiveTensor::decode_payload(*layout, *count, bytes).map_err(TritModelError::Additive)
 }
 
+/// Validate original raw dense bytes without changing precision or bit patterns.
+/// # Errors
+/// Invalid shape, length, nonfinite values or unsupported precision.
+pub fn validate_dense_payload(
+    name: &str,
+    shape: &[u64],
+    precision: ScalePrecision,
+    bytes: &[u8],
+) -> Result<(), TritModelError> {
+    if shape.is_empty() || shape.contains(&0) {
+        return Err(TritModelError::DensePayload(name.into()));
+    }
+    validate_dense(name, shape, precision, bytes)
+}
+
+/// Widen the same validated raw payload for the production f32 fitter.
+/// # Errors
+/// Invalid payload or failed bounded output allocation.
+pub fn decode_dense_f32(
+    name: &str,
+    shape: &[u64],
+    precision: ScalePrecision,
+    bytes: &[u8],
+) -> Result<Vec<f32>, TritModelError> {
+    validate_dense_payload(name, shape, precision, bytes)?;
+    let width = if precision == ScalePrecision::F32 {
+        4
+    } else {
+        2
+    };
+    let count = bytes.len() / width;
+    let requested = count
+        .checked_mul(4)
+        .ok_or(TritPackageError::LengthOverflow)?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| TritPackageError::AllocationFailed { requested })?;
+    for bytes in bytes.chunks_exact(width) {
+        values.push(match precision {
+            ScalePrecision::F32 => f32::from_le_bytes(bytes.try_into().expect("four bytes")),
+            ScalePrecision::F16 => {
+                f16::from_bits(u16::from_le_bytes(bytes.try_into().expect("two bytes"))).to_f32()
+            }
+            ScalePrecision::Bf16 => {
+                bf16::from_bits(u16::from_le_bytes(bytes.try_into().expect("two bytes"))).to_f32()
+            }
+            _ => return Err(TritModelError::UnsupportedFeature("dense precision")),
+        });
+    }
+    Ok(values)
+}
+
 fn validate_dense(
     name: &str,
     shape: &[u64],

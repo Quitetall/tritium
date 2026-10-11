@@ -2,7 +2,7 @@
 
 use super::{
     EventRegistration, EvidenceEnvelope, EvidenceError, EvidenceEvent, EvidenceRecorder,
-    ModelLoaded, VerifiedLog, final_digests, root_digest, verify_events,
+    ModelLoaded, VerifiedLog, verify_log,
 };
 
 impl EvidenceEvent for ModelLoaded {
@@ -49,10 +49,7 @@ impl ModelLoadReceiptView {
     /// # Errors
     /// Invalid chains/root, unsupported load version or invalid typed payload.
     pub fn fold(log: &VerifiedLog) -> Result<Vec<Self>, EvidenceError> {
-        verify_events(&log.events)?;
-        if root_digest(&final_digests(&log.events)?)? != log.root_digest {
-            return Err(EvidenceError::RootMismatch);
-        }
+        verify_log(log)?;
         log.events
             .iter()
             .filter(|event| event.schema == ModelLoaded::SCHEMA_ID)

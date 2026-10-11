@@ -189,6 +189,18 @@ fn admit(
     weights: &[f32],
     gram: Option<&[f64]>,
 ) -> Result<(usize, usize, usize), DirectFitError> {
+    let (rows, cols, count) = admit_plan(plan, gram.is_some())?;
+    let metric_count = cols
+        .checked_mul(cols)
+        .ok_or(DirectFitError::ShapeOverflow)?;
+    admit_payload(weights, gram, cols, count, metric_count)?;
+    Ok((rows, cols, count))
+}
+
+pub(super) fn admit_plan(
+    plan: &DirectFitPlan,
+    has_gram: bool,
+) -> Result<(usize, usize, usize), DirectFitError> {
     let layout = plan.layout;
     layout.validate().map_err(DirectFitError::Layout)?;
     if !admitted_execution_group(layout.law, layout.group) {
@@ -278,15 +290,25 @@ fn admit(
         .checked_mul(total_planes)
         .ok_or(DirectFitError::ShapeOverflow)?;
     limit("source weights", count, plan.limits.max_weights)?;
-    if gram.is_some() || matches!(plan.profile, DirectFitProfile::ActivationAwareLadder(_)) {
+    if has_gram || matches!(plan.profile, DirectFitProfile::ActivationAwareLadder(_)) {
         limit("input Gram", metric_count, plan.limits.max_metric_entries)?;
     }
     limit("output trits", output_count, plan.limits.max_output_trits)?;
     let rows = usize::try_from(layout.rows).map_err(|_| DirectFitError::ShapeOverflow)?;
     let cols = usize::try_from(layout.cols).map_err(|_| DirectFitError::ShapeOverflow)?;
     let count = usize::try_from(count).map_err(|_| DirectFitError::ShapeOverflow)?;
-    let metric_count = usize::try_from(metric_count).map_err(|_| DirectFitError::ShapeOverflow)?;
+    usize::try_from(metric_count).map_err(|_| DirectFitError::ShapeOverflow)?;
     usize::try_from(output_count).map_err(|_| DirectFitError::ShapeOverflow)?;
+    Ok((rows, cols, count))
+}
+
+fn admit_payload(
+    weights: &[f32],
+    gram: Option<&[f64]>,
+    cols: usize,
+    count: usize,
+    metric_count: usize,
+) -> Result<(), DirectFitError> {
     if weights.len() != count {
         return Err(DirectFitError::WeightLength {
             expected: count,
@@ -322,7 +344,7 @@ fn admit(
             }
         }
     }
-    Ok((rows, cols, count))
+    Ok(())
 }
 
 fn limit(resource: &'static str, required: u64, maximum: u64) -> Result<(), DirectFitError> {

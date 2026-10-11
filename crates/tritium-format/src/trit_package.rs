@@ -143,6 +143,13 @@ pub enum TritPackageError {
     LengthOverflow,
     /// Manifest or directory exceeds its explicit parser bound.
     MetadataLimitExceeded,
+    /// Complete output exceeds the caller's bound before output allocation.
+    PackageLimitExceeded {
+        /// Computed complete package size, including alignment and metadata.
+        requested: usize,
+        /// Caller-admitted maximum bytes.
+        limit: usize,
+    },
     /// Manifest is not deterministic, definite-length CBOR in the supported profile.
     NonCanonicalManifest,
     /// Directory bytes are malformed or not in canonical form.
@@ -176,6 +183,9 @@ impl fmt::Display for TritPackageError {
             Self::NonZeroReserved => f.write_str("trit package reserved bytes are nonzero"),
             Self::LengthOverflow => f.write_str("trit package length arithmetic overflowed"),
             Self::MetadataLimitExceeded => f.write_str("trit package metadata exceeds its limit"),
+            Self::PackageLimitExceeded { requested, limit } => {
+                write!(f, "trit package needs {requested} bytes, limit is {limit}")
+            }
             Self::NonCanonicalManifest => {
                 f.write_str("trit package manifest is not canonical CBOR")
             }
@@ -205,6 +215,18 @@ impl std::error::Error for TritPackageError {}
 pub fn write_trit_package(
     manifest_cbor: &[u8],
     blobs: &[TritBlob<'_>],
+) -> Result<Vec<u8>, TritPackageError> {
+    write_trit_package_bounded(manifest_cbor, blobs, usize::MAX)
+}
+
+/// Build the same deterministic package with a complete output byte bound.
+/// Metadata/index allocations retain their existing independent limits.
+/// # Errors
+/// Invalid input, overflow, allocation failure, or complete size above `max_bytes`.
+pub fn write_trit_package_bounded(
+    manifest_cbor: &[u8],
+    blobs: &[TritBlob<'_>],
+    max_bytes: usize,
 ) -> Result<Vec<u8>, TritPackageError> {
     if manifest_cbor.len() > MAX_MANIFEST_BYTES || blobs.len() > MAX_BLOBS {
         return Err(TritPackageError::MetadataLimitExceeded);
@@ -281,6 +303,12 @@ pub fn write_trit_package(
         .and_then(|value| value.checked_add(FOOTER_BYTES))
         .ok_or(TritPackageError::LengthOverflow)?;
 
+    if cursor > max_bytes {
+        return Err(TritPackageError::PackageLimitExceeded {
+            requested: cursor,
+            limit: max_bytes,
+        });
+    }
     let mut output = Vec::new();
     output
         .try_reserve_exact(cursor)
