@@ -12,6 +12,267 @@ fn limits() -> StagedCalibrationLimits {
     }
 }
 
+fn capture_limits() -> tritium_nn::calibrate::StagedCaptureLimits {
+    tritium_nn::calibrate::StagedCaptureLimits {
+        per_cache: tritium_schema::CalibrationCacheLimits {
+            max_payload_bytes: 64_000,
+            max_samples: 8,
+            max_windows: 3,
+        },
+        max_total_payload_bytes: 512_000,
+    }
+}
+
+#[test]
+fn actual_b_next_token_capture_matches_dense_objective_cache_and_replay() {
+    use tritium_quantize::engine::{
+        CalibrationBatch, CalibrationCache, CalibrationCacheBuilder, CalibrationInput,
+        CalibrationOutputBatch,
+    };
+    use tritium_schema::{CalibrationConsumer, CalibrationPartition};
+    let windows = [&[1, 4, 2][..], &[3, 7][..]];
+    for precision in [
+        ScalePrecision::F32,
+        ScalePrecision::F16,
+        ScalePrecision::Bf16,
+    ] {
+        let hf = HfFixture::new("qwen3", true, 6, None);
+        let mut input = TritFixture::new(&hf, None);
+        if precision != ScalePrecision::F32 {
+            input.dense_precision(precision);
+        }
+        let fixture = produced(&input, false);
+        let mut stage =
+            StagedSalienceSource::open(&fixture.b, &fixture.transform, stage_limits()).unwrap();
+        let model = StagedCalibrationModel::new(&mut stage, limits()).unwrap();
+        let caches = model
+            .capture_next_token(&mut stage, &windows, capture_limits())
+            .unwrap();
+        let repeated = model
+            .capture_next_token(&mut stage, &windows, capture_limits())
+            .unwrap();
+        assert_eq!(caches.len(), 7 * model.arch().n_layers + 1);
+        let names = tritium_nn::calibrate::weight_names(model.arch());
+        let inventory = stage.inventory().unwrap();
+        let mut oracle: Vec<_> = caches
+            .iter()
+            .map(|cache| {
+                assert_eq!(cache.binding().request.model, stage.source_id());
+                assert_eq!(cache.binding().samples, 3);
+                assert_eq!(cache.binding().windows, 2);
+                assert_eq!(
+                    cache.binding().request.consumer,
+                    CalibrationConsumer::Matmul
+                );
+                assert_eq!(
+                    cache.tokenizer(),
+                    stage.asset("tokenizer.json", 64_000).unwrap().as_ref()
+                );
+                assert_eq!(
+                    &cache.binding().request.tensor,
+                    inventory
+                        .iter()
+                        .find(|t| t.name == cache.binding().request.tensor.name)
+                        .unwrap()
+                );
+                CalibrationCacheBuilder::new(
+                    cache.binding().request.clone(),
+                    cache.tokenizer(),
+                    cache.objective(),
+                )
+                .unwrap()
+            })
+            .collect();
+        for window in windows {
+            let tokens = &window[..window.len() - 1];
+            let mut tape = Tape::new();
+            let mut taps = Vec::new();
+            let logits = model
+                .forward_observed(&mut tape, tokens, &mut |_, tap| {
+                    if tap.input.is_some() {
+                        taps.push(tap);
+                    }
+                })
+                .unwrap();
+            // Separately execute the existing dense one-hot CE, not a copied loss.
+            let mut target = vec![0.0; tokens.len() * model.arch().vocab];
+            for (i, &id) in window[1..].iter().enumerate() {
+                target[i * model.arch().vocab + id as usize] = 1.0;
+            }
+            let target = tape.leaf(target);
+            let loss = tape.softmax_xent(logits, target, tokens.len(), model.arch().vocab);
+            let gradients = tape.backward(loss);
+            for ((builder, cache), tap) in oracle.iter_mut().zip(&caches).zip(taps) {
+                assert_eq!(cache.binding().request.tensor.name, names[tap.weight_index]);
+                builder
+                    .capture(
+                        tokens,
+                        CalibrationBatch {
+                            samples: tokens.len(),
+                            input: CalibrationInput::Activations(tape.value(tap.input.unwrap())),
+                            output: CalibrationOutputBatch::Dense(&gradients[tap.output]),
+                            weights: None,
+                            mask: None,
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+        for ((cache, repeated), oracle) in caches.iter().zip(&repeated).zip(oracle) {
+            let oracle = oracle.finish().unwrap();
+            assert_eq!(cache.id(), repeated.id());
+            assert_eq!(cache.id(), oracle.id());
+            let full = cache
+                .collect(CalibrationPartition::Full, 0.125, 8_000_000)
+                .unwrap();
+            let chunked = cache
+                .collect_chunked(CalibrationPartition::Full, 0.125, 8_000_000, 1)
+                .unwrap();
+            assert_eq!(full.factors(), chunked.factors());
+            assert_eq!(
+                full.factors(),
+                oracle
+                    .collect(CalibrationPartition::Full, 0.125, 8_000_000)
+                    .unwrap()
+                    .factors()
+            );
+            let bytes = cache.encode_package(1_000_000).unwrap();
+            let decoded = CalibrationCache::decode_package(
+                &bytes,
+                cache.id(),
+                capture_limits().per_cache,
+                1_000_000,
+            )
+            .unwrap();
+            assert_eq!(decoded.binding(), cache.binding());
+            assert_eq!(
+                decoded
+                    .collect(CalibrationPartition::Full, 0.125, 8_000_000)
+                    .unwrap()
+                    .factors(),
+                full.factors()
+            );
+            let mut changed = bytes.clone();
+            changed[256] ^= 1;
+            assert!(
+                CalibrationCache::decode_package(
+                    &changed,
+                    cache.id(),
+                    capture_limits().per_cache,
+                    1_000_000
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            caches.last().unwrap().binding().request.tensor.precision,
+            precision
+        );
+        let changed = model
+            .capture_next_token(&mut stage, &[&[1, 4, 3], &[3, 7]], capture_limits())
+            .unwrap();
+        for (old, new) in caches.iter().zip(changed) {
+            assert_eq!(old.binding().source.tokens, new.binding().source.tokens);
+            assert_ne!(old.binding().objective, new.binding().objective);
+            assert_ne!(old.id(), new.id());
+        }
+    }
+}
+
+#[test]
+fn b_capture_admits_exact_payload_limits_and_rejects_foreign_stage_and_bad_windows() {
+    let hf = HfFixture::new("llama", true, 4, None);
+    let input = TritFixture::new(&hf, None);
+    let fixture = produced(&input, false);
+    let mut stage =
+        StagedSalienceSource::open(&fixture.b, &fixture.transform, stage_limits()).unwrap();
+    let model = StagedCalibrationModel::new(&mut stage, limits()).unwrap();
+    let windows = [&[1, 4, 2][..], &[3, 7][..]];
+    let caches = model
+        .capture_next_token(&mut stage, &windows, capture_limits())
+        .unwrap();
+    let total = caches
+        .iter()
+        .map(|c| c.binding().payload_bytes)
+        .sum::<u64>();
+    let maximum = caches
+        .iter()
+        .map(|c| c.binding().payload_bytes)
+        .max()
+        .unwrap();
+    let exact = tritium_nn::calibrate::StagedCaptureLimits {
+        per_cache: tritium_schema::CalibrationCacheLimits {
+            max_payload_bytes: maximum,
+            max_samples: 3,
+            max_windows: 2,
+        },
+        max_total_payload_bytes: total,
+    };
+    assert!(
+        model
+            .capture_next_token(&mut stage, &windows, exact)
+            .is_ok()
+    );
+    for bad in [
+        tritium_nn::calibrate::StagedCaptureLimits {
+            max_total_payload_bytes: total - 1,
+            ..exact
+        },
+        tritium_nn::calibrate::StagedCaptureLimits {
+            per_cache: tritium_schema::CalibrationCacheLimits {
+                max_payload_bytes: maximum - 1,
+                ..exact.per_cache
+            },
+            ..exact
+        },
+        tritium_nn::calibrate::StagedCaptureLimits {
+            per_cache: tritium_schema::CalibrationCacheLimits {
+                max_samples: 2,
+                ..exact.per_cache
+            },
+            ..exact
+        },
+        tritium_nn::calibrate::StagedCaptureLimits {
+            per_cache: tritium_schema::CalibrationCacheLimits {
+                max_windows: 1,
+                ..exact.per_cache
+            },
+            ..exact
+        },
+    ] {
+        assert!(model.capture_next_token(&mut stage, &windows, bad).is_err());
+    }
+    for bad in [&[][..], &[1][..], &[1, 99][..], &[1, 2, 3, 4, 5, 6][..]] {
+        assert!(
+            model
+                .capture_next_token(&mut stage, &[bad], capture_limits())
+                .is_err()
+        );
+    }
+    assert!(
+        model
+            .capture_next_token(&mut stage, &[], capture_limits())
+            .is_err()
+    );
+    let mut foreign_input = TritFixture::new(&hf, None);
+    foreign_input.asset("tokenizer.json", b"different-tokenizer".to_vec());
+    let foreign = produced(&foreign_input, false);
+    let mut foreign_stage =
+        StagedSalienceSource::open(&foreign.b, &foreign.transform, stage_limits()).unwrap();
+    assert_ne!(stage.source_id(), foreign_stage.source_id());
+    assert!(
+        model
+            .capture_next_token(&mut foreign_stage, &windows, capture_limits())
+            .is_err()
+    );
+    assert_eq!(model.source_id(), stage.source_id());
+    assert!(
+        model
+            .capture_next_token(&mut stage, &windows, exact)
+            .is_ok()
+    );
+}
+
 #[test]
 fn admitted_b_graph_matches_actual_joined_dense_runtime_and_vjps_after_source_drop() {
     for precision in [

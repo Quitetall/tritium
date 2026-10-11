@@ -5,6 +5,9 @@ use tritium_quantize::engine::StagedSalienceSource;
 use tritium_schema::OriginalSourceId;
 use tritium_train::{Tape, tape::ValueId};
 
+mod capture;
+pub use capture::StagedCaptureLimits;
+
 /// Explicit input/master limits; NOT source, tape, cache, parsed metadata or RSS limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StagedCalibrationLimits {
