@@ -592,7 +592,7 @@ fn check_source_inventory(
     Ok(())
 }
 
-fn source_binding(
+pub(super) fn source_binding(
     original: &QuantSourceTensor,
     bytes: &[u8],
 ) -> Result<QuantSourceBinding, QuantEngineError> {

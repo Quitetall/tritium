@@ -42,6 +42,11 @@ mod quant_plan;
 pub use quant_plan::*;
 
 #[cfg(feature = "alloc")]
+mod salience_transform;
+#[cfg(feature = "alloc")]
+pub use salience_transform::*;
+
+#[cfg(feature = "alloc")]
 mod calibration;
 #[cfg(feature = "alloc")]
 pub use calibration::*;

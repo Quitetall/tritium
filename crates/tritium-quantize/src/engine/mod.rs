@@ -15,6 +15,7 @@ mod ladder;
 mod model;
 mod salience;
 mod sinks;
+mod source_transform;
 mod sources;
 
 pub use salience::{SalienceFoldError, SaliencePair, divide_rows, scale_cols, smooth_scales};
@@ -24,6 +25,9 @@ pub use model::{
     verify_package_with_fit_log,
 };
 pub use sinks::{DirectoryTensorSink, MemoryTensorSink};
+pub use source_transform::{
+    DeclaredSalienceStatistics, DerivedSalienceSource, SalienceSourceError, SourceTransform,
+};
 pub use sources::{InMemoryWeightSource, RawTensor, SafeTensorsWeightSource};
 
 pub use calibrated_fit::{CalibratedFitError, fit_calibrated_levels};

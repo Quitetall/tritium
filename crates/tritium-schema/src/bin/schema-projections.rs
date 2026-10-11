@@ -133,6 +133,36 @@ fn main() -> Result<(), Box<dyn Error>> {
     project!(tritium_schema::QuantTensorPlan, "quant-tensor-plan");
     project!(tritium_schema::QuantLimits, "quant-limits");
     project!(tritium_schema::QuantPlan, "quant-plan");
+    project!(tritium_schema::SalienceInverseAxis, "salience-inverse-axis");
+    project!(tritium_schema::SalienceNumerics, "salience-numerics");
+    project!(
+        tritium_schema::SalienceStatisticsKind,
+        "salience-statistics-kind"
+    );
+    project!(
+        tritium_schema::SalienceMomentBinding,
+        "salience-moment-binding"
+    );
+    project!(
+        tritium_schema::SalienceTransformOperation,
+        "salience-transform-operation"
+    );
+    project!(
+        tritium_schema::SalienceTransformLimits,
+        "salience-transform-limits"
+    );
+    project!(
+        tritium_schema::SalienceTransformPlan,
+        "salience-transform-plan"
+    );
+    project!(
+        tritium_schema::SalienceOperationOutput,
+        "salience-operation-output"
+    );
+    project!(
+        tritium_schema::SalienceTransformObservation,
+        "salience-transform-observation"
+    );
     project!(
         tritium_schema::CalibratedQuantAction,
         "calibrated-quant-action"
