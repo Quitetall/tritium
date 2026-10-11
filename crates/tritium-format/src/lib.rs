@@ -75,6 +75,7 @@ mod training_salt;
 pub mod trit_calibration;
 pub mod trit_model;
 mod trit_package;
+pub mod trit_salience;
 
 pub use additive_tensor::{AdditiveTensor, AdditiveTensorError};
 pub use artifact::{
@@ -163,7 +164,8 @@ pub use training_salt::{PackedTrainingSaltSnapshot, TernaryStructure, TrainingSa
 pub use trit_package::{
     TRIT_BLOB_ALIGNMENT, TRIT_HEADER_BYTES, TRIT_MAGIC, TRIT_PACKAGE_MAJOR, TritBlob, TritBlobInfo,
     TritBlobKind, TritPackage, TritPackageError, TritPackageWriteError, read_trit_package,
-    write_trit_package, write_trit_package_bounded, write_trit_package_to,
+    read_trit_package_with_manifest_limit, write_trit_package, write_trit_package_bounded,
+    write_trit_package_to,
 };
 
 /// Weights per quantization block (ggml `QK_K`).

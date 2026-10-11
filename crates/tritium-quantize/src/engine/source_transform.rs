@@ -103,6 +103,10 @@ pub struct DerivedSalienceSource {
     observation: SalienceTransformObservation,
 }
 impl DerivedSalienceSource {
+    pub(super) fn raw_source(&self) -> &InMemoryWeightSource {
+        &self.source
+    }
+
     /// Actual complete A/B observation; returned metadata cannot mutate this source.
     #[must_use]
     pub fn observation(&self) -> &SalienceTransformObservation {

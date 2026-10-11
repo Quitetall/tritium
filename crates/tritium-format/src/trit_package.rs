@@ -463,6 +463,18 @@ fn prepare_write<'a>(
 
 /// Parse and fully validate a `.trit` package held in memory.
 pub fn read_trit_package(bytes: &[u8]) -> Result<TritPackage<'_>, TritPackageError> {
+    read_trit_package_with_manifest_limit(bytes, MAX_MANIFEST_BYTES)
+}
+
+/// Parse through the common validator with a receiving manifest byte ceiling.
+/// Rejects the header's declared manifest size before canonical CBOR allocation.
+/// The directory retains its global ceiling; this is not a full RSS bound.
+/// # Errors
+/// The same format/integrity errors as the default reader, or exceeded metadata caps.
+pub fn read_trit_package_with_manifest_limit(
+    bytes: &[u8],
+    max_manifest_bytes: usize,
+) -> Result<TritPackage<'_>, TritPackageError> {
     if bytes.len() < TRIT_HEADER_BYTES + FOOTER_BYTES {
         return Err(TritPackageError::Truncated);
     }
@@ -487,7 +499,9 @@ pub fn read_trit_package(bytes: &[u8]) -> Result<TritPackage<'_>, TritPackageErr
     let manifest_len = as_usize(read_u64(bytes, 24)?)?;
     let directory_offset = as_usize(read_u64(bytes, 32)?)?;
     let directory_len = as_usize(read_u64(bytes, 40)?)?;
-    if manifest_len > MAX_MANIFEST_BYTES || directory_len > MAX_DIRECTORY_BYTES {
+    if manifest_len > MAX_MANIFEST_BYTES.min(max_manifest_bytes)
+        || directory_len > MAX_DIRECTORY_BYTES
+    {
         return Err(TritPackageError::MetadataLimitExceeded);
     }
     let manifest_end = manifest_offset

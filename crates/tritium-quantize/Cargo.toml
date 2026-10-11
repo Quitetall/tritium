@@ -27,6 +27,7 @@ tritium-testkit = { workspace = true }
 proptest = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
+ciborium = { workspace = true }
 
 [lints]
 workspace = true

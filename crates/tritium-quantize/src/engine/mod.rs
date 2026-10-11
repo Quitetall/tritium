@@ -15,6 +15,7 @@ mod ladder;
 mod model;
 mod salience;
 mod sinks;
+mod source_stage;
 mod source_transform;
 mod sources;
 
@@ -25,6 +26,7 @@ pub use model::{
     verify_package_with_fit_log,
 };
 pub use sinks::{DirectoryTensorSink, MemoryTensorSink};
+pub use source_stage::{PublishedSalienceStage, StagedSalienceSource};
 pub use source_transform::{
     DeclaredSalienceStatistics, DerivedSalienceSource, RecordedSalienceSource, SalienceSourceError,
     SourceTransform,

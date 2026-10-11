@@ -53,13 +53,18 @@ impl DirectoryTensorSink {
             directory: directory.into(),
         }
     }
-}
-impl TensorSink for DirectoryTensorSink {
-    fn publish(
+
+    /// Emit into one owned pending file and commit through the common no-clobber path.
+    /// The callback must admit its inputs and report partial write errors. It does
+    /// not publish; this module owns sync, hard-link commit, cleanup and warnings.
+    /// No full output buffer is required. This is not power-loss/security qualification.
+    /// # Errors
+    /// Existing destination, callback error or filesystem failure before commit.
+    pub fn publish_with_writer<R>(
         &mut self,
-        package: &[u8],
         evidence: &SealedEvidence,
-    ) -> Result<Vec<PublicationWarning>, QuantEngineError> {
+        emit: impl FnOnce(&mut File) -> Result<R, QuantEngineError>,
+    ) -> Result<(R, Vec<PublicationWarning>), QuantEngineError> {
         fs::create_dir(&self.directory).map_err(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 QuantEngineError::DestinationExists
@@ -82,22 +87,25 @@ impl TensorSink for DirectoryTensorSink {
                 .create_new(true)
                 .open(&pending)?;
             owned_pending = true;
-            file.write_all(package)?;
+            let value = emit(&mut file)?;
             file.sync_all()?;
             fs::hard_link(&pending, &model)?;
-            Ok::<(), std::io::Error>(())
+            Ok::<R, QuantEngineError>(value)
         })();
-        if let Err(e) = result {
-            if owned_pending {
-                let _ = fs::remove_file(&pending);
+        let value = match result {
+            Ok(value) => value,
+            Err(e) => {
+                if owned_pending {
+                    let _ = fs::remove_file(&pending);
+                }
+                if owned_log {
+                    let _ = fs::remove_file(&log);
+                }
+                // Never recursively remove unexpected/foreign files injected here.
+                let _ = fs::remove_dir(&self.directory);
+                return Err(e);
             }
-            if owned_log {
-                let _ = fs::remove_file(&log);
-            }
-            // Never recursively remove unexpected/foreign files injected here.
-            let _ = fs::remove_dir(&self.directory);
-            return Err(QuantEngineError::Io(e));
-        }
+        };
         let mut warnings = Vec::new();
         if fs::remove_file(&pending).is_err() {
             warnings.push(PublicationWarning::PendingCleanup);
@@ -108,6 +116,19 @@ impl TensorSink for DirectoryTensorSink {
         {
             warnings.push(PublicationWarning::DirectorySync);
         }
-        Ok(warnings)
+        Ok((value, warnings))
+    }
+}
+impl TensorSink for DirectoryTensorSink {
+    fn publish(
+        &mut self,
+        package: &[u8],
+        evidence: &SealedEvidence,
+    ) -> Result<Vec<PublicationWarning>, QuantEngineError> {
+        self.publish_with_writer(evidence, |file| {
+            file.write_all(package)?;
+            Ok(())
+        })
+        .map(|(_, warnings)| warnings)
     }
 }

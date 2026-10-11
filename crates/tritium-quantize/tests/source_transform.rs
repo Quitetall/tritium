@@ -17,6 +17,9 @@ use tritium_quantize::engine::{
 };
 use tritium_schema::*;
 
+#[path = "source_transform/stage.rs"]
+mod stage;
+
 fn raw(shape: &[u64], precision: ScalePrecision, values: &[f32]) -> RawTensor {
     RawTensor {
         shape: shape.into(),
@@ -572,120 +575,138 @@ fn actual_cache_builder_binds_b_identity_and_does_not_reuse_a_cache_identity() {
 
 #[test]
 fn calibrated_engine_consumes_b_and_rejects_a_cache_or_a_source_declaration() {
-    let mut source = fixture(true);
-    let (transform, stats) = plan(&mut source);
-    let mut derived = SourceTransform::run(&transform, &mut source, &stats).unwrap();
-    let b = derived.observation().derived_source;
-    let tensor = derived
-        .inventory()
-        .unwrap()
-        .into_iter()
-        .find(|t| t.name == "q")
-        .unwrap();
-    let build = |model| {
-        let mut builder = CalibrationCacheBuilder::new(
-            CalibrationCacheRequest {
-                tensor: tensor.clone(),
-                model,
-                consumer: CalibrationConsumer::Matmul,
-                output: CalibrationOutput::None,
-                sample_start: 0,
-                limits: CalibrationCacheLimits {
-                    max_payload_bytes: 10_000,
-                    max_samples: 32,
-                    max_windows: 1,
+    for durable in [false, true] {
+        let mut source = fixture(true);
+        let (transform, stats) = plan(&mut source);
+        let recorded =
+            SourceTransform::run_recorded(&transform, &mut source, &stats, transform_recorder())
+                .unwrap();
+        let b = recorded.source.observation().derived_source;
+        let bytes = recorded
+            .encode_stage_package(&stats, stage::limits())
+            .unwrap();
+        let log = verify_jsonl(recorded.evidence.jsonl()).unwrap();
+        let mut derived: Box<dyn WeightSource + '_> = if durable {
+            drop(recorded);
+            Box::new(
+                tritium_quantize::engine::StagedSalienceSource::open(&bytes, &log, stage::limits())
+                    .unwrap(),
+            )
+        } else {
+            Box::new(recorded.source)
+        };
+        let tensor = derived
+            .inventory()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.name == "q")
+            .unwrap();
+        let build = |model| {
+            let mut builder = CalibrationCacheBuilder::new(
+                CalibrationCacheRequest {
+                    tensor: tensor.clone(),
+                    model,
+                    consumer: CalibrationConsumer::Matmul,
+                    output: CalibrationOutput::None,
+                    sample_start: 0,
+                    limits: CalibrationCacheLimits {
+                        max_payload_bytes: 10_000,
+                        max_samples: 32,
+                        max_windows: 1,
+                    },
                 },
-            },
-            b"tokenizer",
-            b"declared-fixture-context",
-        )
-        .unwrap();
-        let input: Vec<_> = (0..1024).map(|i| f32::from(i / 32 == i % 32)).collect();
-        builder
-            .capture(
-                &(0..32).collect::<Vec<u32>>(),
-                CalibrationBatch {
-                    samples: 32,
-                    input: CalibrationInput::Activations(&input),
-                    output: CalibrationOutputBatch::None,
-                    weights: None,
-                    mask: None,
-                },
+                b"tokenizer",
+                b"declared-fixture-context",
             )
             .unwrap();
-        builder.finish().unwrap()
-    };
-    let make_plan = |cache: &tritium_quantize::engine::CalibrationCache, model| {
-        let dense = dense_plan(&derived);
-        CalibratedQuantPlan {
-            architecture: dense.architecture,
-            original_source: model,
-            tensors: dense
-                .tensors
-                .into_iter()
-                .map(|t| CalibratedQuantTensorPlan {
-                    action: if t.source.name == "q" {
-                        CalibratedQuantAction::CalibratedFit {
-                            plan: Box::new(calibrated(cache)),
-                        }
-                    } else {
-                        CalibratedQuantAction::KeepDense
+            let input: Vec<_> = (0..1024).map(|i| f32::from(i / 32 == i % 32)).collect();
+            builder
+                .capture(
+                    &(0..32).collect::<Vec<u32>>(),
+                    CalibrationBatch {
+                        samples: 32,
+                        input: CalibrationInput::Activations(&input),
+                        output: CalibrationOutputBatch::None,
+                        weights: None,
+                        mask: None,
                     },
-                    source: t.source,
-                })
-                .collect(),
-            assets: dense.assets,
-            levels: dense.levels,
-            limits: dense.limits,
-            max_cache_payload_bytes: 10_000,
-            max_cache_package_bytes: 100_000,
-        }
-    };
-    let a_cache = build(transform.original_source);
-    let wrong_cache_plan = make_plan(&a_cache, b);
-    assert!(
-        wrong_cache_plan.validate().is_err(),
-        "A cache cannot be declared a B cache"
-    );
-    let wrong_source_plan = make_plan(&a_cache, transform.original_source);
-    let b_cache = build(b);
-    let fit = make_plan(&b_cache, b);
-    let rec = || {
-        EvidenceRecorder::new(
-            "derived-calibrated-fit",
-            [
-                CALIBRATED_LEVELS_FITTED_REGISTRATION,
-                CALIBRATED_QUANTIZATION_STARTED_REGISTRATION,
-                CALIBRATED_QUANTIZATION_COMPLETED_REGISTRATION,
-            ],
-        )
-        .unwrap()
-    };
-    let mut a_caches = InMemoryCalibrationSource::new([a_cache]).unwrap();
-    let mut rejected = MemoryTensorSink::default();
-    assert!(
-        Engine::run_calibrated(
-            &wrong_source_plan,
-            &mut derived,
-            &mut a_caches,
-            &mut rejected,
-            rec()
-        )
-        .is_err()
-    );
-    assert!(rejected.artifact().is_none());
-    let mut b_caches = InMemoryCalibrationSource::new([b_cache]).unwrap();
-    let mut sink = MemoryTensorSink::default();
-    let result =
-        Engine::run_calibrated(&fit, &mut derived, &mut b_caches, &mut sink, rec()).unwrap();
-    assert_eq!(result.source_id, b);
-    let (package, sealed) = sink.artifact().unwrap();
-    let log = verify_jsonl(sealed.jsonl()).unwrap();
-    verify_package_with_fit_log(package, &log).unwrap();
-    assert_eq!(
-        CalibratedQuantizationReceiptView::fold(&log).unwrap()[0].source_id(),
-        b
-    );
+                )
+                .unwrap();
+            builder.finish().unwrap()
+        };
+        let make_plan = |cache: &tritium_quantize::engine::CalibrationCache, model| {
+            let dense = dense_plan(derived.as_ref());
+            CalibratedQuantPlan {
+                architecture: dense.architecture,
+                original_source: model,
+                tensors: dense
+                    .tensors
+                    .into_iter()
+                    .map(|t| CalibratedQuantTensorPlan {
+                        action: if t.source.name == "q" {
+                            CalibratedQuantAction::CalibratedFit {
+                                plan: Box::new(calibrated(cache)),
+                            }
+                        } else {
+                            CalibratedQuantAction::KeepDense
+                        },
+                        source: t.source,
+                    })
+                    .collect(),
+                assets: dense.assets,
+                levels: dense.levels,
+                limits: dense.limits,
+                max_cache_payload_bytes: 10_000,
+                max_cache_package_bytes: 100_000,
+            }
+        };
+        let a_cache = build(transform.original_source);
+        let wrong_cache_plan = make_plan(&a_cache, b);
+        assert!(
+            wrong_cache_plan.validate().is_err(),
+            "A cache cannot be declared a B cache"
+        );
+        let wrong_source_plan = make_plan(&a_cache, transform.original_source);
+        let b_cache = build(b);
+        let fit = make_plan(&b_cache, b);
+        let rec = || {
+            EvidenceRecorder::new(
+                "derived-calibrated-fit",
+                [
+                    CALIBRATED_LEVELS_FITTED_REGISTRATION,
+                    CALIBRATED_QUANTIZATION_STARTED_REGISTRATION,
+                    CALIBRATED_QUANTIZATION_COMPLETED_REGISTRATION,
+                ],
+            )
+            .unwrap()
+        };
+        let mut a_caches = InMemoryCalibrationSource::new([a_cache]).unwrap();
+        let mut rejected = MemoryTensorSink::default();
+        assert!(
+            Engine::run_calibrated(
+                &wrong_source_plan,
+                derived.as_mut(),
+                &mut a_caches,
+                &mut rejected,
+                rec()
+            )
+            .is_err()
+        );
+        assert!(rejected.artifact().is_none());
+        let mut b_caches = InMemoryCalibrationSource::new([b_cache]).unwrap();
+        let mut sink = MemoryTensorSink::default();
+        let result =
+            Engine::run_calibrated(&fit, derived.as_mut(), &mut b_caches, &mut sink, rec())
+                .unwrap();
+        assert_eq!(result.source_id, b);
+        let (package, sealed) = sink.artifact().unwrap();
+        let log = verify_jsonl(sealed.jsonl()).unwrap();
+        verify_package_with_fit_log(package, &log).unwrap();
+        assert_eq!(
+            CalibratedQuantizationReceiptView::fold(&log).unwrap()[0].source_id(),
+            b
+        );
+    }
 }
 
 #[test]
