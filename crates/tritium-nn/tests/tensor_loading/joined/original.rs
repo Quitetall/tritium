@@ -8,6 +8,8 @@ use tritium_train::Tape;
 
 #[path = "original/captured.rs"]
 mod captured;
+#[path = "original/lineage.rs"]
+mod lineage;
 
 fn limits() -> StagedCalibrationLimits {
     StagedCalibrationLimits {

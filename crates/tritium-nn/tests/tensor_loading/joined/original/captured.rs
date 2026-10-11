@@ -13,7 +13,7 @@ use tritium_schema::{
     OriginalSalienceCaptureLimits, OriginalSalienceCaptureStarted,
 };
 
-fn capture_limits() -> OriginalSalienceCaptureLimits {
+pub(super) fn capture_limits() -> OriginalSalienceCaptureLimits {
     OriginalSalienceCaptureLimits {
         max_source_bytes: 64_000,
         max_asset_bytes: 16_000,
@@ -27,7 +27,7 @@ fn capture_limits() -> OriginalSalienceCaptureLimits {
         max_tokenizer_config_bytes: 0,
     }
 }
-fn recorder() -> EvidenceRecorder {
+pub(super) fn recorder() -> EvidenceRecorder {
     EvidenceRecorder::new(
         "actual-original-salience",
         [
@@ -37,7 +37,7 @@ fn recorder() -> EvidenceRecorder {
     )
     .unwrap()
 }
-fn rehashed(
+pub(super) fn rehashed(
     start: OriginalSalienceCaptureStarted,
     completed: OriginalSalienceCaptureCompleted,
 ) -> SealedEvidence {

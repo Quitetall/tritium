@@ -5,7 +5,7 @@ use tritium_schema::ScalePrecision;
 use tritium_train::Tape;
 
 #[path = "staged/recorded.rs"]
-mod recorded;
+pub(super) mod recorded;
 
 #[cfg(feature = "tokenizer")]
 #[path = "staged/text.rs"]
@@ -19,7 +19,7 @@ fn limits() -> StagedCalibrationLimits {
     }
 }
 
-fn capture_limits() -> tritium_nn::calibrate::StagedCaptureLimits {
+pub(super) fn capture_limits() -> tritium_nn::calibrate::StagedCaptureLimits {
     tritium_nn::calibrate::StagedCaptureLimits {
         per_cache: tritium_schema::CalibrationCacheLimits {
             max_payload_bytes: 64_000,

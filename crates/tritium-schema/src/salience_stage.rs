@@ -112,3 +112,44 @@ impl SalienceSourceStageManifest {
         Ok(())
     }
 }
+
+/// Distinct mandatory original-capture ancestry, not a numerical qualification.
+/// Old Declared lineage is preserved, never silently promoted or unwrapped.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
+pub struct OriginalCapturedSalienceSourceStageManifest {
+    /// Complete unchanged transform/source/moment vocabulary.
+    pub lineage: SalienceSourceStageManifest,
+    /// Required standalone original-A forward salience capture run/span/root.
+    pub original_capture: EvidenceReference,
+}
+impl OriginalCapturedSalienceSourceStageManifest {
+    /// Check strict inner version and references; actual log/payload truth is separate.
+    /// # Errors
+    /// Invalid lineage, missing/invalid original capture or transform reference.
+    pub fn validate(&self) -> Result<(), SalienceTransformPlanError> {
+        self.lineage.validate()?;
+        for name in [&self.original_capture.run, &self.original_capture.span] {
+            crate::model::name(name, false).map_err(|_| SalienceTransformPlanError::Observation)?;
+        }
+        if self.original_capture.root == [0; 32] || self.lineage.transform.root == [0; 32] {
+            return Err(SalienceTransformPlanError::Observation);
+        }
+        Ok(())
+    }
+    /// The same complete stage payload caps, not process RSS or log allocation admission.
+    /// # Errors
+    /// Invalid structure, zero caps, overflow or insufficient stage limits.
+    pub fn validate_limits(
+        &self,
+        limits: SalienceStageLimits,
+    ) -> Result<(), SalienceTransformPlanError> {
+        self.validate()?;
+        self.lineage.validate_limits(limits)
+    }
+}

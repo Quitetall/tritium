@@ -8,6 +8,8 @@ use tritium_format::trit_salience_conversion::{
 };
 use tritium_format::{TritBlob, read_trit_package, write_trit_package};
 use tritium_nn::calibrate::replay_staged_capture;
+use tritium_quantize::engine::CalibrationCache;
+use tritium_schema::CalibratedQuantAction;
 
 fn projection_caches(caches: Vec<CalibrationCache>) -> Vec<CalibrationCache> {
     caches

@@ -183,6 +183,25 @@ impl SourceTransform {
         })
     }
 
+    /// Record the existing paired transform after mandatory original-capture admission.
+    /// Supplied log/statistics are structurally bound, not arbitrary caller execution proof.
+    /// No new carrier is published and the old Declared numerical semantics remain.
+    /// # Errors
+    /// Incomplete/foreign capture/request/moments, source/numerics or recorder failure.
+    pub fn run_original_captured_recorded(
+        plan: &SalienceTransformPlan,
+        source: &mut dyn WeightSource,
+        statistics: &BTreeMap<String, DeclaredSalienceStatistics>,
+        original_capture_log: &VerifiedLog,
+        recorder: EvidenceRecorder,
+    ) -> Result<RecordedSalienceSource, SalienceSourceError> {
+        let capture = super::original_capture::OriginalCaptureJoin::from_log(original_capture_log)?;
+        capture.check_plan(plan)?;
+        let recorded = Self::run_recorded(plan, source, statistics, recorder)?;
+        capture.check_observation(recorded.source.observation())?;
+        Ok(recorded)
+    }
+
     /// Re-execute the shared controller on actual A/moment bytes and compare the
     /// complete observation with one sealed standalone transform's typed view.
     /// Structural/hash validity alone cannot establish numerical truth.

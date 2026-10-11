@@ -10,7 +10,10 @@ pub use capture::StagedCaptureLimits;
 mod recorded;
 pub use recorded::{RecordedStagedCapture, replay_staged_capture};
 mod original;
-pub use original::{RecordedOriginalSalienceCapture, replay_original_salience_capture};
+pub use original::{
+    RecordedOriginalCapturedStage, RecordedOriginalSalienceCapture,
+    replay_original_salience_capture, verify_original_captured_stage,
+};
 #[cfg(feature = "tokenizer")]
 mod text;
 #[cfg(feature = "tokenizer")]

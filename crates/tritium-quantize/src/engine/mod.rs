@@ -14,6 +14,7 @@ mod joint_feedback;
 mod ladder;
 mod model;
 mod observed_source;
+mod original_capture;
 mod salience;
 mod salience_model;
 mod sinks;

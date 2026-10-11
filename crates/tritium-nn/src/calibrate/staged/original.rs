@@ -1,9 +1,11 @@
 //! Actual original masters -> existing ordered salience reducer -> sealed record/replay.
+mod lineage;
 use super::{SourceCalibrationModel, StagedCalibrationLimits};
 use crate::{
     NnError,
     calibrate::{Calib, Tap, accumulate, calibrate_tapped},
 };
+pub use lineage::{RecordedOriginalCapturedStage, verify_original_captured_stage};
 use std::collections::BTreeMap;
 use tritium_evidence::{
     EvidenceRecorder, OriginalSalienceCaptureView, SealedEvidence, VerifiedLog,

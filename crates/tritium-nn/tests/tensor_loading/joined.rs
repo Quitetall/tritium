@@ -1,5 +1,7 @@
 //! Engine-produced joined C crosses the existing model-loading/forward seam.
 //! Toy standard-transformer software evidence, not real-model qualification.
+#[path = "joined/fitting.rs"]
+mod fitting;
 #[path = "joined/original.rs"]
 mod original;
 #[path = "joined/staged.rs"]

@@ -106,6 +106,41 @@ impl CapturedSalienceConversionManifest {
     }
 }
 
+/// Distinct mandatory A-salience plus B-training capture ancestry through C.
+/// Strict structure does not establish either numerical execution or qualification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
+pub struct OriginalCapturedSalienceConversionManifest {
+    /// Unchanged complete B-captured A->B->C vocabulary.
+    pub lineage: CapturedSalienceConversionManifest,
+    /// Mandatory distinct original-A forward-only capture reference.
+    pub original_capture: EvidenceReference,
+}
+impl OriginalCapturedSalienceConversionManifest {
+    /// Check inner schema/reference structure, not actual source/log/cache truth.
+    /// # Errors
+    /// Invalid lineage/version or missing/invalid mandatory references.
+    pub fn validate(&self) -> Result<(), SalienceConversionManifestError> {
+        self.lineage.validate()?;
+        for name in [&self.original_capture.run, &self.original_capture.span] {
+            crate::model::name(name, false)
+                .map_err(|_| SalienceConversionManifestError::Reference)?;
+        }
+        if self.original_capture.root == [0; 32]
+            || self.lineage.lineage.transform.root == [0; 32]
+            || self.lineage.lineage.conversion.root == [0; 32]
+        {
+            return Err(SalienceConversionManifestError::Reference);
+        }
+        Ok(())
+    }
+}
+
 /// Structural carrier failure, not an empirical verdict.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]

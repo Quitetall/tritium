@@ -2,10 +2,14 @@
 use crate::trit_model::{TritModelError, decode_model_manifest, encode_model_manifest};
 use crate::trit_package::{canonicalize_value, encode_cbor_value, parse_canonical_manifest};
 use ciborium::value::Value;
-use tritium_schema::{CapturedSalienceConversionManifest, SalienceConversionManifest};
+use tritium_schema::{
+    CapturedSalienceConversionManifest, OriginalCapturedSalienceConversionManifest,
+    SalienceConversionManifest,
+};
 
 const PROFILE: &str = "tritium.salience-conversion.v1";
 const CAPTURED_PROFILE: &str = "tritium.captured-salience-conversion.v1";
+const ORIGINAL_CAPTURED_PROFILE: &str = "tritium.original-captured-salience-conversion.v1";
 
 /// Encode the mandatory carrier using the same Rust model canonicalizer.
 /// Does not establish actual stage/log identity or numerical truth.
@@ -69,6 +73,39 @@ pub fn decode_captured_salience_conversion_manifest(
         CAPTURED_PROFILE,
         max_bytes,
         encode_captured_salience_conversion_manifest,
+    )
+}
+
+/// Encode the distinct original-A plus B capture carrier before package publication.
+/// # Errors
+/// Invalid inner lineage/references, codec or complete encoded metadata cap.
+pub fn encode_original_captured_salience_conversion_manifest(
+    manifest: &OriginalCapturedSalienceConversionManifest,
+    max_bytes: usize,
+) -> Result<Vec<u8>, TritModelError> {
+    let mut canonical = manifest.clone();
+    canonical.lineage = decode_captured_salience_conversion_manifest(
+        &encode_captured_salience_conversion_manifest(&canonical.lineage, max_bytes)?,
+        max_bytes,
+    )?;
+    canonical
+        .validate()
+        .map_err(|e| TritModelError::Schema(e.to_string()))?;
+    encode_profile(&canonical, ORIGINAL_CAPTURED_PROFILE, max_bytes)
+}
+
+/// Decode only the strict original-captured C profile; joined admission is separate.
+/// # Errors
+/// Wrong profile/version/fields, noncanonical lineage/reference bytes or metadata cap.
+pub fn decode_original_captured_salience_conversion_manifest(
+    bytes: &[u8],
+    max_bytes: usize,
+) -> Result<OriginalCapturedSalienceConversionManifest, TritModelError> {
+    decode_profile(
+        bytes,
+        ORIGINAL_CAPTURED_PROFILE,
+        max_bytes,
+        encode_original_captured_salience_conversion_manifest,
     )
 }
 

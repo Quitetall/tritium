@@ -5,15 +5,18 @@ use tritium_evidence::{CalibrationCaptureView, EvidenceEvent, VerifiedLog};
 use tritium_format::read_trit_package_with_manifest_limit;
 use tritium_format::trit_model::{TritModel, bind_trit_model_payloads};
 use tritium_format::trit_salience_conversion::{
-    decode_captured_salience_conversion_manifest, decode_salience_conversion_manifest,
-    encode_captured_salience_conversion_manifest, encode_salience_conversion_manifest,
+    decode_captured_salience_conversion_manifest,
+    decode_original_captured_salience_conversion_manifest, decode_salience_conversion_manifest,
+    encode_captured_salience_conversion_manifest,
+    encode_original_captured_salience_conversion_manifest, encode_salience_conversion_manifest,
 };
 use tritium_schema::{
     CalibratedLevelsFitted, CalibratedQuantAction, CalibratedQuantPlan,
     CalibratedQuantizationCompleted, CalibratedQuantizationStarted,
-    CapturedSalienceConversionManifest, DirectLevelsFitted, EvidenceReference, PackageId,
-    QuantizationCompleted, QuantizationStarted, SalienceConversionLimits,
-    SalienceConversionManifest, SalienceSourceStageManifest, SchemaId,
+    CapturedSalienceConversionManifest, DirectLevelsFitted, EvidenceReference,
+    OriginalCapturedSalienceConversionManifest, PackageId, QuantizationCompleted,
+    QuantizationStarted, SalienceConversionLimits, SalienceConversionManifest,
+    SalienceSourceStageManifest, SchemaId,
 };
 
 /// A complete C carrier bound to actual B payload and both real logs.
@@ -24,6 +27,7 @@ pub struct JoinedSalienceModel<'a> {
     model: TritModel<'a>,
     manifest: SalienceConversionManifest,
     capture: Option<EvidenceReference>,
+    original_capture: Option<EvidenceReference>,
 }
 impl<'a> JoinedSalienceModel<'a> {
     /// Open only with an actual checked B stage (including its transform log)
@@ -52,6 +56,28 @@ impl<'a> JoinedSalienceModel<'a> {
         limits: SalienceConversionLimits,
     ) -> Result<Self, QuantEngineError> {
         SalienceProductionContext::from_capture(stage, capture_log, limits)?.open(bytes, fit_log)
+    }
+
+    /// Open only the distinct original-A plus B capture carrier and admitted stage.
+    /// Reuses common output/runtime admission, retaining references rather than text/B.
+    /// # Errors
+    /// Missing original-captured stage, either foreign root/cache/fit/payload or byte cap.
+    pub fn open_original_captured(
+        bytes: &'a [u8],
+        stage: &StagedSalienceSource<'_>,
+        capture_log: &VerifiedLog,
+        fit_log: &VerifiedLog,
+        limits: SalienceConversionLimits,
+    ) -> Result<Self, QuantEngineError> {
+        SalienceProductionContext::from_original_capture(stage, capture_log, limits)?
+            .open(bytes, fit_log)
+    }
+
+    /// Mandatory original-A capture ancestry; absent from all older C profiles.
+    /// This is structural provenance, not numerical or independent qualification.
+    #[must_use]
+    pub fn original_capture_reference(&self) -> Option<&EvidenceReference> {
+        self.original_capture.as_ref()
     }
 
     /// Mandatory capture ancestry for the captured profile; absent for legacy joined C.
@@ -87,6 +113,7 @@ impl<'a> JoinedSalienceModel<'a> {
             || self.manifest.transform != stage.manifest().transform
             || self.manifest.original_source != stage.manifest().observation.original_source
             || self.manifest.derived_source != stage.source_id()
+            || self.original_capture.as_ref() != stage.original_capture_reference()
         {
             return Err(QuantEngineError::Binding("foreign stage for joined replay").into());
         }
@@ -106,12 +133,35 @@ pub(super) struct SalienceProductionContext {
     stage: SalienceSourceStageManifest,
     limits: SalienceConversionLimits,
     capture: Option<CalibrationCaptureView>,
+    original_capture: Option<EvidenceReference>,
+}
+
+enum OriginalCaptureRequirement {
+    Absent,
+    Required,
 }
 impl SalienceProductionContext {
     pub(super) fn from_stage(
         stage: &StagedSalienceSource<'_>,
         limits: SalienceConversionLimits,
     ) -> Result<Self, QuantEngineError> {
+        Self::from_stage_with_requirement(stage, limits, OriginalCaptureRequirement::Absent)
+    }
+
+    fn from_stage_with_requirement(
+        stage: &StagedSalienceSource<'_>,
+        limits: SalienceConversionLimits,
+        requirement: OriginalCaptureRequirement,
+    ) -> Result<Self, QuantEngineError> {
+        match (stage.original_capture_reference(), requirement) {
+            (None, OriginalCaptureRequirement::Absent)
+            | (Some(_), OriginalCaptureRequirement::Required) => {}
+            _ => {
+                return Err(QuantEngineError::Binding(
+                    "stage original capture profile differs from requested carrier",
+                ));
+            }
+        }
         limits
             .validate()
             .map_err(|_| QuantEngineError::Limit("salience conversion byte caps"))?;
@@ -120,6 +170,7 @@ impl SalienceProductionContext {
             stage: stage.manifest().clone(),
             limits,
             capture: None,
+            original_capture: stage.original_capture_reference().cloned(),
         })
     }
 
@@ -128,7 +179,29 @@ impl SalienceProductionContext {
         log: &VerifiedLog,
         limits: SalienceConversionLimits,
     ) -> Result<Self, QuantEngineError> {
-        let mut context = Self::from_stage(stage, limits)?;
+        Self::from_capture_with_requirement(stage, log, limits, OriginalCaptureRequirement::Absent)
+    }
+
+    pub(super) fn from_original_capture(
+        stage: &StagedSalienceSource<'_>,
+        log: &VerifiedLog,
+        limits: SalienceConversionLimits,
+    ) -> Result<Self, QuantEngineError> {
+        Self::from_capture_with_requirement(
+            stage,
+            log,
+            limits,
+            OriginalCaptureRequirement::Required,
+        )
+    }
+
+    fn from_capture_with_requirement(
+        stage: &StagedSalienceSource<'_>,
+        log: &VerifiedLog,
+        limits: SalienceConversionLimits,
+        requirement: OriginalCaptureRequirement,
+    ) -> Result<Self, QuantEngineError> {
+        let mut context = Self::from_stage_with_requirement(stage, limits, requirement)?;
         let mut views = CalibrationCaptureView::fold(log)?;
         if views.len() != 1 || log.events.len() != 2 {
             return Err(QuantEngineError::Binding(
@@ -207,15 +280,32 @@ impl SalienceProductionContext {
             self.limits.max_manifest_bytes,
             "salience conversion metadata",
         )?;
-        Ok(match &self.capture {
-            Some(capture) => encode_captured_salience_conversion_manifest(
+        Ok(match (&self.capture, &self.original_capture) {
+            (Some(capture), Some(original_capture)) => {
+                encode_original_captured_salience_conversion_manifest(
+                    &OriginalCapturedSalienceConversionManifest {
+                        lineage: CapturedSalienceConversionManifest {
+                            lineage: carrier,
+                            capture: capture.reference().clone(),
+                        },
+                        original_capture: original_capture.clone(),
+                    },
+                    maximum,
+                )?
+            }
+            (Some(capture), None) => encode_captured_salience_conversion_manifest(
                 &CapturedSalienceConversionManifest {
                     lineage: carrier,
                     capture: capture.reference().clone(),
                 },
                 maximum,
             )?,
-            None => encode_salience_conversion_manifest(&carrier, maximum)?,
+            (None, None) => encode_salience_conversion_manifest(&carrier, maximum)?,
+            (None, Some(_)) => {
+                return Err(QuantEngineError::Binding(
+                    "original-captured C needs actual B capture",
+                ));
+            }
         })
     }
 
@@ -238,8 +328,22 @@ impl SalienceProductionContext {
             "salience conversion metadata",
         )?;
         let package = read_trit_package_with_manifest_limit(bytes, maximum)?;
-        let carrier = match &self.capture {
-            Some(capture) => {
+        let carrier = match (&self.capture, &self.original_capture) {
+            (Some(capture), Some(original)) => {
+                let carrier = decode_original_captured_salience_conversion_manifest(
+                    package.manifest(),
+                    maximum,
+                )?;
+                if carrier.original_capture != *original
+                    || carrier.lineage.capture != *capture.reference()
+                {
+                    return Err(QuantEngineError::Binding(
+                        "mandatory original/B capture root differs",
+                    ));
+                }
+                carrier.lineage.lineage
+            }
+            (Some(capture), None) => {
                 let carrier =
                     decode_captured_salience_conversion_manifest(package.manifest(), maximum)?;
                 if carrier.capture != *capture.reference() {
@@ -247,7 +351,12 @@ impl SalienceProductionContext {
                 }
                 carrier.lineage
             }
-            None => decode_salience_conversion_manifest(package.manifest(), maximum)?,
+            (None, None) => decode_salience_conversion_manifest(package.manifest(), maximum)?,
+            (None, Some(_)) => {
+                return Err(QuantEngineError::Binding(
+                    "original-captured C needs actual B capture",
+                ));
+            }
         };
         let mut views = conversion_views(fit_log)?;
         if views.len() != 1 {
@@ -275,6 +384,7 @@ impl SalienceProductionContext {
             model,
             manifest: carrier,
             capture: self.capture.as_ref().map(|c| c.reference().clone()),
+            original_capture: self.original_capture.clone(),
         })
     }
 

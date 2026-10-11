@@ -327,6 +327,38 @@ impl Engine {
         )
     }
 
+    /// Fit through mandatory original-A and B capture ancestry with the common engine.
+    /// Only an explicitly admitted original-captured B stage can select this carrier.
+    /// No supplied original reference, plain-fit fallback, new fitter or repack is accepted.
+    /// # Errors
+    /// Wrong stage profile, actual B/capture/cache/request mismatch, caps or publication failure.
+    pub fn run_original_captured_salience(
+        plan: &CalibratedQuantPlan,
+        stage: &mut StagedSalienceSource<'_>,
+        capture_log: &tritium_evidence::VerifiedLog,
+        caches: &mut dyn CalibrationSource,
+        sink: &mut dyn TensorSink,
+        recorder: EvidenceRecorder,
+        limits: SalienceConversionLimits,
+    ) -> Result<QuantizedModel, QuantEngineError> {
+        if plan.original_source != stage.source_id() {
+            return Err(QuantEngineError::Binding(
+                "original-captured request differs from actual B",
+            ));
+        }
+        let context = SalienceProductionContext::from_original_capture(stage, capture_log, limits)?;
+        context.check_capture_plan(plan)?;
+        Self::run_impl(
+            ModelQuantPlan::Calibrated(plan),
+            stage,
+            Some(caches),
+            sink,
+            recorder,
+            Some(plan.original_source),
+            Some(context),
+        )
+    }
+
     fn run_impl(
         plan: ModelQuantPlan<'_>,
         source: &mut dyn WeightSource,

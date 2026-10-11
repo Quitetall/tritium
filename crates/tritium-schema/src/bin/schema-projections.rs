@@ -196,6 +196,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         "salience-statistics-kind"
     );
     project!(
+        tritium_schema::OriginalCapturedSalienceSourceStageManifest,
+        "original-captured-salience-source-stage-manifest"
+    );
+    project!(
+        tritium_schema::OriginalCapturedSalienceConversionManifest,
+        "original-captured-salience-conversion-manifest"
+    );
+    project!(
         tritium_schema::SalienceMomentBinding,
         "salience-moment-binding"
     );

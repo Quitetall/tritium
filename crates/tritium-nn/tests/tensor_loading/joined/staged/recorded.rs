@@ -7,7 +7,7 @@ use tritium_evidence::{
 use tritium_nn::calibrate::replay_staged_capture;
 use tritium_schema::{CalibrationCaptureCompleted, CalibrationCaptureStarted, FitInputDigest};
 
-pub(super) fn recorder() -> EvidenceRecorder {
+pub(in super::super) fn recorder() -> EvidenceRecorder {
     EvidenceRecorder::new(
         "actual-capture",
         [

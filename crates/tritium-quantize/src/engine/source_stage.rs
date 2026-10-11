@@ -8,15 +8,17 @@ use std::{borrow::Cow, collections::BTreeMap, io::Write};
 use tritium_core::DType;
 use tritium_evidence::{SalienceTransformView, VerifiedLog};
 use tritium_format::trit_salience::{
-    decode_salience_stage_manifest, encode_salience_stage_manifest,
+    decode_original_captured_salience_stage_manifest, decode_salience_stage_manifest,
+    encode_original_captured_salience_stage_manifest, encode_salience_stage_manifest,
 };
 use tritium_format::{
     TritBlob, TritBlobKind, TritPackage, TritPackageWriteError,
     read_trit_package_with_manifest_limit, write_trit_package_bounded, write_trit_package_to,
 };
 use tritium_schema::{
-    BlobId, OriginalSourceId, PackageId, QuantSourceTensor, SalienceSourceStageManifest,
-    SalienceStageLimits, ScalePrecision, SchemaId, salience_moment_asset,
+    BlobId, EvidenceReference, OriginalCapturedSalienceSourceStageManifest, OriginalSourceId,
+    PackageId, QuantSourceTensor, SalienceSourceStageManifest, SalienceStageLimits, ScalePrecision,
+    SchemaId, salience_moment_asset,
 };
 
 /// Actual no-clobber stage publication, not arithmetic or release qualification.
@@ -38,7 +40,7 @@ impl RecordedSalienceSource {
         statistics: &BTreeMap<String, DeclaredSalienceStatistics>,
         limits: SalienceStageLimits,
     ) -> Result<Vec<u8>, SalienceSourceError> {
-        self.with_stage_package(statistics, limits, |manifest, blobs| {
+        self.with_stage_package(statistics, limits, None, |manifest, blobs| {
             write_trit_package_bounded(manifest, blobs, size(limits.max_package_bytes)?)
                 .map_err(QuantEngineError::from)
                 .map_err(SalienceSourceError::from)
@@ -56,7 +58,7 @@ impl RecordedSalienceSource {
         limits: SalienceStageLimits,
         destination: &mut impl Write,
     ) -> Result<PackageId, SalienceSourceError> {
-        self.with_stage_package(statistics, limits, |manifest, blobs| {
+        self.with_stage_package(statistics, limits, None, |manifest, blobs| {
             write_trit_package_to(
                 manifest,
                 blobs,
@@ -79,7 +81,7 @@ impl RecordedSalienceSource {
         limits: SalienceStageLimits,
         destination: &mut DirectoryTensorSink,
     ) -> Result<PublishedSalienceStage, SalienceSourceError> {
-        self.with_stage_package(statistics, limits, |manifest, blobs| {
+        self.with_stage_package(statistics, limits, None, |manifest, blobs| {
             let maximum = size(limits.max_package_bytes)?;
             let (package_id, warnings) =
                 destination.publish_with_writer(&self.evidence, |file| {
@@ -94,10 +96,93 @@ impl RecordedSalienceSource {
         })
     }
 
+    /// Encode the distinct mandatory original-capture stage using the common writer.
+    /// Binds supplied log/statistics structurally; numerical capture requires cold replay.
+    /// # Errors
+    /// Missing/foreign capture, source/moments, metadata/payload caps or allocation.
+    pub fn encode_original_captured_stage_package(
+        &self,
+        statistics: &BTreeMap<String, DeclaredSalienceStatistics>,
+        original_capture_log: &VerifiedLog,
+        limits: SalienceStageLimits,
+    ) -> Result<Vec<u8>, SalienceSourceError> {
+        self.with_stage_package(
+            statistics,
+            limits,
+            Some(original_capture_log),
+            |manifest, blobs| {
+                write_trit_package_bounded(manifest, blobs, size(limits.max_package_bytes)?)
+                    .map_err(QuantEngineError::from)
+                    .map_err(SalienceSourceError::from)
+            },
+        )
+    }
+
+    /// Stream the same original-captured carrier without retaining a second package.
+    /// A failed destination may hold a prefix; no success identity is returned.
+    /// # Errors
+    /// Original/transform/moment disagreement, byte caps or destination failure.
+    pub fn write_original_captured_stage_package_to(
+        &self,
+        statistics: &BTreeMap<String, DeclaredSalienceStatistics>,
+        original_capture_log: &VerifiedLog,
+        limits: SalienceStageLimits,
+        destination: &mut impl Write,
+    ) -> Result<PackageId, SalienceSourceError> {
+        self.with_stage_package(
+            statistics,
+            limits,
+            Some(original_capture_log),
+            |manifest, blobs| {
+                write_trit_package_to(
+                    manifest,
+                    blobs,
+                    size(limits.max_package_bytes)?,
+                    destination,
+                )
+                .map(id)
+                .map_err(write_error)
+                .map_err(SalienceSourceError::from)
+            },
+        )
+    }
+
+    /// Publish only after complete original/transform/payload admission, no clobber.
+    /// The single existing directory commit protocol is unchanged.
+    /// # Errors
+    /// Capture/source/moment/cap mismatch or any pre-commit writer/publication failure.
+    pub fn publish_original_captured_stage(
+        &self,
+        statistics: &BTreeMap<String, DeclaredSalienceStatistics>,
+        original_capture_log: &VerifiedLog,
+        limits: SalienceStageLimits,
+        destination: &mut DirectoryTensorSink,
+    ) -> Result<PublishedSalienceStage, SalienceSourceError> {
+        self.with_stage_package(
+            statistics,
+            limits,
+            Some(original_capture_log),
+            |manifest, blobs| {
+                let maximum = size(limits.max_package_bytes)?;
+                let (package_id, warnings) =
+                    destination.publish_with_writer(&self.evidence, |file| {
+                        write_trit_package_to(manifest, blobs, maximum, file)
+                            .map(id)
+                            .map_err(write_error)
+                    })?;
+                Ok(PublishedSalienceStage {
+                    package_id,
+                    warnings,
+                })
+            },
+        )
+    }
+
     fn with_stage_package<R>(
         &self,
         statistics: &BTreeMap<String, DeclaredSalienceStatistics>,
         limits: SalienceStageLimits,
+        original_capture_log: Option<&VerifiedLog>,
         emit: impl FnOnce(&[u8], &[TritBlob<'_>]) -> Result<R, SalienceSourceError>,
     ) -> Result<R, SalienceSourceError> {
         let view = one_view(self.evidence.log())?;
@@ -112,8 +197,21 @@ impl RecordedSalienceSource {
         manifest
             .validate_limits(limits)
             .map_err(SalienceSourceError::Plan)?;
-        let encoded = encode_salience_stage_manifest(&manifest, size(limits.max_manifest_bytes)?)
-            .map_err(QuantEngineError::from)?;
+        let encoded = match original_capture_log {
+            Some(log) => {
+                let capture = super::original_capture::OriginalCaptureJoin::from_log(log)?;
+                capture.check_observation(&manifest.observation)?;
+                encode_original_captured_salience_stage_manifest(
+                    &OriginalCapturedSalienceSourceStageManifest {
+                        lineage: manifest.clone(),
+                        original_capture: capture.reference().clone(),
+                    },
+                    size(limits.max_manifest_bytes)?,
+                )
+            }
+            None => encode_salience_stage_manifest(&manifest, size(limits.max_manifest_bytes)?),
+        }
+        .map_err(QuantEngineError::from)?;
         let source = self.source.raw_source();
         let mut blobs = Vec::new();
         let mut asset_bytes = 0u64;
@@ -193,6 +291,7 @@ pub struct StagedSalienceSource<'a> {
     tensors: BTreeMap<String, usize>,
     assets: BTreeMap<String, usize>,
     moments: Vec<usize>,
+    original_capture: Option<EvidenceReference>,
 }
 impl<'a> StagedSalienceSource<'a> {
     /// Check exact profile, receiving caps, mandatory log, every payload and actual B identity.
@@ -204,6 +303,28 @@ impl<'a> StagedSalienceSource<'a> {
         log: &'a VerifiedLog,
         limits: SalienceStageLimits,
     ) -> Result<Self, SalienceSourceError> {
+        Self::open_profile(bytes, log, None, limits)
+    }
+
+    /// Open only the original-captured stage with both complete actual logs.
+    /// Retains the reference, not raw capture text or another dense B.
+    /// # Errors
+    /// Wrong profile/log/root/source/consumer/moment/payload or receiving cap.
+    pub fn open_original_captured(
+        bytes: &'a [u8],
+        transform_log: &'a VerifiedLog,
+        original_capture_log: &VerifiedLog,
+        limits: SalienceStageLimits,
+    ) -> Result<Self, SalienceSourceError> {
+        Self::open_profile(bytes, transform_log, Some(original_capture_log), limits)
+    }
+
+    fn open_profile(
+        bytes: &'a [u8],
+        log: &'a VerifiedLog,
+        original_capture_log: Option<&VerifiedLog>,
+        limits: SalienceStageLimits,
+    ) -> Result<Self, SalienceSourceError> {
         bound(
             bytes.len() as u64,
             limits.max_package_bytes,
@@ -212,9 +333,32 @@ impl<'a> StagedSalienceSource<'a> {
         let package =
             read_trit_package_with_manifest_limit(bytes, size(limits.max_manifest_bytes)?)
                 .map_err(QuantEngineError::from)?;
-        let manifest =
-            decode_salience_stage_manifest(package.manifest(), size(limits.max_manifest_bytes)?)
+        let (manifest, original_capture) = match original_capture_log {
+            Some(log) => {
+                let carrier = decode_original_captured_salience_stage_manifest(
+                    package.manifest(),
+                    size(limits.max_manifest_bytes)?,
+                )
                 .map_err(QuantEngineError::from)?;
+                carrier
+                    .validate_limits(limits)
+                    .map_err(SalienceSourceError::Plan)?;
+                let capture = super::original_capture::OriginalCaptureJoin::from_log(log)?;
+                if carrier.original_capture != *capture.reference() {
+                    return Err(binding("mandatory original capture root differs"));
+                }
+                capture.check_observation(&carrier.lineage.observation)?;
+                (carrier.lineage, Some(carrier.original_capture))
+            }
+            None => (
+                decode_salience_stage_manifest(
+                    package.manifest(),
+                    size(limits.max_manifest_bytes)?,
+                )
+                .map_err(QuantEngineError::from)?,
+                None,
+            ),
+        };
         manifest
             .validate_limits(limits)
             .map_err(SalienceSourceError::Plan)?;
@@ -315,6 +459,7 @@ impl<'a> StagedSalienceSource<'a> {
             tensors,
             assets,
             moments,
+            original_capture,
         })
     }
 
@@ -322,6 +467,13 @@ impl<'a> StagedSalienceSource<'a> {
     #[must_use]
     pub fn manifest(&self) -> &SalienceSourceStageManifest {
         &self.manifest
+    }
+
+    /// Mandatory original-A capture reference; absent for the old declared profile.
+    /// This is structural ancestry, not numerical or release clearance.
+    #[must_use]
+    pub fn original_capture_reference(&self) -> Option<&EvidenceReference> {
+        self.original_capture.as_ref()
     }
 
     /// Exact physical stage identity, not B's source identity or a release verdict.
