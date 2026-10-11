@@ -8,8 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::{Subcommand, ValueEnum};
 use serde::Serialize;
 use tritium_evidence::{
-    CalibratedFitReceiptView, CalibratedQuantizationReceiptView, DirectFitReceiptView,
-    EventRegistration, EvidenceEvent, EvidenceRecorder, ModelLoadReceiptView,
+    CalibratedFitReceiptView, CalibratedQuantizationReceiptView, CalibrationCaptureView,
+    DirectFitReceiptView, EventRegistration, EvidenceEvent, EvidenceRecorder, ModelLoadReceiptView,
     QuantizationReceiptView, SalienceTransformView, verify_jsonl,
 };
 
@@ -206,6 +206,12 @@ pub(crate) fn run(command: EvidenceCommand) -> anyhow::Result<()> {
     SalienceTransformView::fold(&verified).map_err(|error| {
         anyhow::anyhow!("verify salience transform view {}: {error}", path.display())
     })?;
+    CalibrationCaptureView::fold(&verified).map_err(|error| {
+        anyhow::anyhow!(
+            "verify calibration capture view {}: {error}",
+            path.display()
+        )
+    })?;
     if view {
         println!("{}", serde_json::to_string_pretty(&verified.events)?);
     } else {
@@ -351,6 +357,53 @@ mod tests {
         std::fs::write(&path, recorded.evidence.jsonl()).unwrap();
         run(EvidenceCommand::Verify { path: path.clone() }).unwrap();
         run(EvidenceCommand::View { path: path.clone() }).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn verify_and_view_reject_known_capture_payload_with_unknown_fields() {
+        #[derive(Serialize)]
+        struct BadCapture {
+            windows: Vec<Vec<u32>>,
+            caches: Vec<serde_json::Value>,
+            claimed_quality: bool,
+        }
+        impl EvidenceEvent for BadCapture {
+            const SCHEMA_ID: &'static str = "tritium.calibration.capture_completed";
+            const VERSION: u16 = 1;
+        }
+        let mut recorder = EvidenceRecorder::new(
+            "bad-capture",
+            [tritium_evidence::CALIBRATION_CAPTURE_COMPLETED_REGISTRATION],
+        )
+        .unwrap();
+        recorder
+            .emit(
+                "capture",
+                None,
+                0,
+                &BadCapture {
+                    windows: vec![vec![1, 2]],
+                    caches: vec![],
+                    claimed_quality: true,
+                },
+            )
+            .unwrap();
+        let sealed = recorder.seal().unwrap();
+        verify_jsonl(sealed.jsonl()).unwrap();
+        let path = temp_log();
+        std::fs::write(&path, sealed.jsonl()).unwrap();
+        for command in [
+            EvidenceCommand::Verify { path: path.clone() },
+            EvidenceCommand::View { path: path.clone() },
+        ] {
+            assert!(
+                run(command)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("calibration capture")
+            );
+        }
         std::fs::remove_file(path).unwrap();
     }
 

@@ -26,7 +26,12 @@ pub use direct_fit::{DIRECT_LEVELS_FITTED_REGISTRATION, DirectFitReceiptView};
 mod calibrated_fit;
 pub use calibrated_fit::{CALIBRATED_LEVELS_FITTED_REGISTRATION, CalibratedFitReceiptView};
 
+mod calibration_capture;
 mod original_source;
+pub use calibration_capture::{
+    CALIBRATION_CAPTURE_COMPLETED_REGISTRATION, CALIBRATION_CAPTURE_STARTED_REGISTRATION,
+    CalibrationCaptureView,
+};
 mod salience_transform;
 pub use salience_transform::{
     SALIENCE_TRANSFORM_COMPLETED_REGISTRATION, SALIENCE_TRANSFORM_STARTED_REGISTRATION,

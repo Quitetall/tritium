@@ -4,6 +4,9 @@ use tritium_nn::calibrate::{StagedCalibrationLimits, StagedCalibrationModel};
 use tritium_schema::ScalePrecision;
 use tritium_train::Tape;
 
+#[path = "staged/recorded.rs"]
+mod recorded;
+
 #[cfg(feature = "tokenizer")]
 #[path = "staged/text.rs"]
 mod text;

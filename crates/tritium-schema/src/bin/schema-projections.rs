@@ -49,6 +49,30 @@ fn main() -> Result<(), Box<dyn Error>> {
     project!(tritium_schema::OriginalSourceId, "original-source-id");
     project!(tritium_schema::CalibrationCacheId, "calibration-cache-id");
     project!(
+        tritium_schema::CalibrationCaptureProfile,
+        "calibration-capture-profile"
+    );
+    project!(
+        tritium_schema::CalibrationCaptureLimits,
+        "calibration-capture-limits"
+    );
+    project!(
+        tritium_schema::CalibrationCaptureInput,
+        "calibration-capture-input"
+    );
+    project!(
+        tritium_schema::CalibrationCapturePlan,
+        "calibration-capture-plan"
+    );
+    project!(
+        tritium_schema::CalibrationCaptureStarted,
+        "calibration-capture-started"
+    );
+    project!(
+        tritium_schema::CalibrationCaptureCompleted,
+        "calibration-capture-completed"
+    );
+    project!(
         tritium_schema::CalibrationCacheLimits,
         "calibration-cache-limits"
     );

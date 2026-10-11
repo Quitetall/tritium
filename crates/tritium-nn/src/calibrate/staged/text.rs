@@ -31,6 +31,18 @@ impl StagedCalibrationModel {
         text_limits: StagedTextCaptureLimits,
         capture_limits: StagedCaptureLimits,
     ) -> Result<Vec<CalibrationCache>, NnError> {
+        let windows = self.encode_capture_text(source, texts, text_limits, capture_limits)?;
+        let windows: Vec<_> = windows.iter().map(Vec::as_slice).collect();
+        self.capture_next_token(source, &windows, capture_limits)
+    }
+
+    pub(super) fn encode_capture_text(
+        &self,
+        source: &mut StagedSalienceSource<'_>,
+        texts: &[&str],
+        text_limits: StagedTextCaptureLimits,
+        capture_limits: StagedCaptureLimits,
+    ) -> Result<Vec<Vec<u32>>, NnError> {
         if source.source_id() != self.source {
             return Err(reject(
                 "text capture stage differs from immutable B masters",
@@ -87,8 +99,7 @@ impl StagedCalibrationModel {
             }
             windows.push(ids);
         }
-        let windows: Vec<_> = windows.iter().map(Vec::as_slice).collect();
-        self.capture_next_token(source, &windows, capture_limits)
+        Ok(windows)
     }
 }
 

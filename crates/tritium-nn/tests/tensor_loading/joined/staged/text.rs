@@ -24,6 +24,71 @@ fn text_input(hf: &HfFixture) -> TritFixture {
 }
 
 #[test]
+fn recorded_text_capture_cold_replays_and_checks_actual_raw_text_encoding() {
+    use super::recorded::{recorder, rehashed};
+    use tritium_evidence::CalibrationCaptureView;
+    use tritium_nn::calibrate::replay_staged_capture;
+    use tritium_schema::CalibrationCaptureInput;
+    let hf = HfFixture::new("qwen3", true, 6, None);
+    let fixture = produced(&text_input(&hf), false);
+    let mut stage =
+        StagedSalienceSource::open(&fixture.b, &fixture.transform, stage_limits()).unwrap();
+    let model = StagedCalibrationModel::new(&mut stage, limits()).unwrap();
+    let actual = model
+        .capture_next_token_text_recorded(
+            &mut stage,
+            &["hello partner hello", "partner hello"],
+            text_limits(),
+            capture_limits(),
+            recorder(),
+        )
+        .unwrap();
+    let view = CalibrationCaptureView::fold(actual.evidence.log())
+        .unwrap()
+        .remove(0);
+    assert!(
+        matches!(&view.started().plan.input,CalibrationCaptureInput::RawText {windows} if windows==&["hello partner hello","partner hello"])
+    );
+    assert!(view.started().plan.tokenizer_config.is_some());
+    let receiving = view.started().plan.limits;
+    drop(model);
+    drop(stage);
+    let log = tritium_evidence::verify_jsonl(actual.evidence.jsonl()).unwrap();
+    let mut stage =
+        StagedSalienceSource::open(&fixture.b, &fixture.transform, stage_limits()).unwrap();
+    let replay = replay_staged_capture(&log, &mut stage, receiving).unwrap();
+    assert_eq!(
+        replay.iter().map(|c| c.id()).collect::<Vec<_>>(),
+        actual.caches.iter().map(|c| c.id()).collect::<Vec<_>>()
+    );
+    for bad in [
+        tritium_schema::CalibrationCaptureLimits {
+            max_text_bytes: receiving.max_text_bytes - 1,
+            ..receiving
+        },
+        tritium_schema::CalibrationCaptureLimits {
+            max_tokenizer_config_bytes: receiving.max_tokenizer_config_bytes - 1,
+            ..receiving
+        },
+    ] {
+        assert!(replay_staged_capture(&log, &mut stage, bad).is_err());
+    }
+    let mut changed = view.started().clone();
+    let CalibrationCaptureInput::RawText { windows } = &mut changed.plan.input else {
+        panic!()
+    };
+    windows[0] = "partner hello partner".into();
+    let forged = rehashed(&changed, &serde_json::to_value(view.completed()).unwrap());
+    // Structure alone cannot certify text->tokens. Actual shared runtime encode
+    // reruns from this changed text and rejects its old encoded cache claim.
+    assert_eq!(CalibrationCaptureView::fold(forged.log()).unwrap().len(), 1);
+    assert!(replay_staged_capture(forged.log(), &mut stage, receiving).is_err());
+    if let Some(path) = std::env::var_os("TRITIUM_CAPTURE_ORACLE_OUTPUT") {
+        std::fs::write(path, actual.evidence.jsonl()).unwrap();
+    }
+}
+
+#[test]
 fn actual_text_capture_matches_shared_runtime_tokenizer_and_token_id_capture() {
     let hf = HfFixture::new("qwen3", true, 6, None);
     let fixture = produced(&text_input(&hf), false);

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CalibrationCaptureProfile",
+  "description": "The fixed actually executed objective and widened-f32 graph profile.",
+  "oneOf": [
+    {
+      "description": "Per-window mean next-token CE, sparse k1 labels, unit weights/true masks.",
+      "type": "string",
+      "const": "NextTokenWindowMeanK1F32V1"
+    }
+  ]
+}

@@ -7,6 +7,8 @@ use tritium_train::{Tape, tape::ValueId};
 
 mod capture;
 pub use capture::StagedCaptureLimits;
+mod recorded;
+pub use recorded::{RecordedStagedCapture, replay_staged_capture};
 #[cfg(feature = "tokenizer")]
 mod text;
 #[cfg(feature = "tokenizer")]
@@ -32,6 +34,7 @@ pub struct StagedCalibrationModel {
     arch: Arch,
     masters: Vec<Vec<f32>>,
     max_window_tokens: usize,
+    limits: StagedCalibrationLimits,
 }
 
 impl std::fmt::Debug for StagedCalibrationModel {
@@ -127,6 +130,7 @@ impl StagedCalibrationModel {
             arch,
             masters,
             max_window_tokens: limits.max_window_tokens.min(config.n_ctx as usize),
+            limits,
         })
     }
 

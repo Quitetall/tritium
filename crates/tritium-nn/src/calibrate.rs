@@ -33,7 +33,10 @@ use tritium_train::tape::ValueId;
 mod staged;
 #[cfg(feature = "tokenizer")]
 pub use staged::StagedTextCaptureLimits;
-pub use staged::{StagedCalibrationLimits, StagedCalibrationModel, StagedCaptureLimits};
+pub use staged::{
+    RecordedStagedCapture, StagedCalibrationLimits, StagedCalibrationModel, StagedCaptureLimits,
+    replay_staged_capture,
+};
 
 use crate::{Mlp, ModelRunner, Projection};
 use tritium_quantize::engine::SaliencePair;

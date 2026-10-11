@@ -7,6 +7,7 @@ use tritium_quantize::engine::{
 };
 use tritium_schema::{
     CalibrationCacheLimits, CalibrationCacheRequest, CalibrationConsumer, CalibrationOutput,
+    QuantSourceTensor, next_token_capture_objective,
 };
 use tritium_train::Tape;
 
@@ -44,52 +45,9 @@ impl StagedCalibrationModel {
         if source.source_id() != self.source {
             return Err(reject("capture stage differs from immutable B masters"));
         }
-        if windows.is_empty()
-            || windows.len() as u64 > limits.per_cache.max_windows
-            || limits.per_cache.max_payload_bytes == 0
-            || limits.per_cache.max_samples == 0
-            || limits.max_total_payload_bytes == 0
-        {
-            return Err(reject("invalid B capture windows or limits"));
-        }
-        let mut samples = 0u64;
-        let mut objective_bytes = OBJECTIVE.len() as u64 + 8;
-        for window in windows {
-            if window.len() < 2
-                || window.len() - 1 > self.max_window_tokens
-                || window
-                    .iter()
-                    .any(|&id| usize::try_from(id).map_or(true, |id| id >= self.arch.vocab))
-            {
-                return Err(reject("invalid B capture token window"));
-            }
-            let n = (window.len() - 1) as u64;
-            samples = checked(samples.checked_add(n))?;
-            objective_bytes = checked(
-                n.checked_mul(4)
-                    .and_then(|n| n.checked_add(8))
-                    .and_then(|n| objective_bytes.checked_add(n)),
-            )?;
-        }
-        if samples > limits.per_cache.max_samples {
-            return Err(reject("B capture sample limit exceeded"));
-        }
+        let (samples, objective_bytes) = self.admit_capture_windows(windows, limits)?;
         // Exact B interpretations, including retained F16/Bf16 untouched weights.
-        let inventory = source
-            .inventory()
-            .map_err(|e| reject(&format!("B capture inventory: {e}")))?;
-        let names = weight_names(&self.arch);
-        let selected: Vec<_> = names[1..]
-            .iter()
-            .chain(&names[..1])
-            .map(|name| {
-                inventory
-                    .iter()
-                    .find(|tensor| &tensor.name == name)
-                    .cloned()
-                    .ok_or_else(|| reject("missing actual B capture tensor"))
-            })
-            .collect::<Result<_, _>>()?;
+        let selected = self.capture_tensors(source)?;
         let tokenizer = source
             .asset(
                 "tokenizer.json",
@@ -121,21 +79,8 @@ impl StagedCalibrationModel {
         }
         // Fixed controller-owned recipe records actual labels, including each
         // final target absent from the input token stream. No arbitrary recipe.
-        let mut objective = Vec::new();
-        objective
-            .try_reserve_exact(
-                usize::try_from(objective_bytes)
-                    .map_err(|_| reject("B capture objective limit overflows usize"))?,
-            )
-            .map_err(|_| reject("B capture objective allocation failed"))?;
-        objective.extend_from_slice(OBJECTIVE);
-        objective.extend_from_slice(&(windows.len() as u64).to_le_bytes());
-        for window in windows {
-            objective.extend_from_slice(&((window.len() - 1) as u64).to_le_bytes());
-            for target in &window[1..] {
-                objective.extend_from_slice(&target.to_le_bytes());
-            }
-        }
+        let objective = next_token_capture_objective(windows)
+            .ok_or_else(|| reject("B capture objective allocation/geometry rejected"))?;
         let mut builders: Vec<_> = selected
             .into_iter()
             .map(|tensor| {
@@ -205,6 +150,65 @@ impl StagedCalibrationModel {
                 builder
                     .finish()
                     .map_err(|e| reject(&format!("B capture finalization: {e}")))
+            })
+            .collect()
+    }
+
+    pub(super) fn admit_capture_windows(
+        &self,
+        windows: &[&[u32]],
+        limits: StagedCaptureLimits,
+    ) -> Result<(u64, u64), NnError> {
+        if windows.is_empty()
+            || windows.len() as u64 > limits.per_cache.max_windows
+            || limits.per_cache.max_payload_bytes == 0
+            || limits.per_cache.max_samples == 0
+            || limits.max_total_payload_bytes == 0
+        {
+            return Err(reject("invalid B capture windows or limits"));
+        }
+        let mut samples = 0u64;
+        let mut objective_bytes = OBJECTIVE.len() as u64 + 8;
+        for window in windows {
+            if window.len() < 2
+                || window.len() - 1 > self.max_window_tokens
+                || window
+                    .iter()
+                    .any(|&id| usize::try_from(id).map_or(true, |id| id >= self.arch.vocab))
+            {
+                return Err(reject("invalid B capture token window"));
+            }
+            let n = (window.len() - 1) as u64;
+            samples = checked(samples.checked_add(n))?;
+            objective_bytes = checked(
+                n.checked_mul(4)
+                    .and_then(|n| n.checked_add(8))
+                    .and_then(|n| objective_bytes.checked_add(n)),
+            )?;
+        }
+        if samples > limits.per_cache.max_samples {
+            return Err(reject("B capture sample limit exceeded"));
+        }
+        Ok((samples, objective_bytes))
+    }
+
+    pub(super) fn capture_tensors(
+        &self,
+        source: &StagedSalienceSource<'_>,
+    ) -> Result<Vec<QuantSourceTensor>, NnError> {
+        let inventory = source
+            .inventory()
+            .map_err(|e| reject(&format!("B capture inventory: {e}")))?;
+        let names = weight_names(&self.arch);
+        names[1..]
+            .iter()
+            .chain(&names[..1])
+            .map(|name| {
+                inventory
+                    .iter()
+                    .find(|tensor| &tensor.name == name)
+                    .cloned()
+                    .ok_or_else(|| reject("missing actual B capture tensor"))
             })
             .collect()
     }
