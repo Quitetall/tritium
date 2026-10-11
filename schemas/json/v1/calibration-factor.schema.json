@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CalibrationFactor",
+  "description": "View of one actual normalized factor and its existing numerical digest domain.",
+  "type": "object",
+  "properties": {
+    "content": {
+      "description": "Existing InputGram or OutputFisher content digest, not a raw Gram digest.",
+      "$ref": "#/$defs/FitInputDigest"
+    },
+    "dimension": {
+      "description": "Gram input width or Fisher output-row count.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "samples": {
+      "description": "Observed samples, including masked samples.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "selected": {
+      "description": "Selected samples, including selected zero-weight samples.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "selection": {
+      "description": "Exact source/ordinal/weight/mask selection digest.",
+      "$ref": "#/$defs/FitInputDigest"
+    },
+    "total_weight": {
+      "description": "Sum of selected weights used to normalize the factor.",
+      "type": "number",
+      "format": "double"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "dimension",
+    "samples",
+    "selected",
+    "total_weight",
+    "selection",
+    "content"
+  ],
+  "$defs": {
+    "FitInputDigest": {
+      "description": "Exact original fitting input bits under a named candidate digest domain.\nNot a stored blob, package, HF identity or calibration dataset identity.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    }
+  }
+}

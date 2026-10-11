@@ -92,6 +92,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         "joint-feedback-fit-options"
     );
     project!(tritium_schema::FitInputDigest, "fit-input-digest");
+    project!(tritium_schema::CalibrationSource, "calibration-source");
+    project!(
+        tritium_schema::CalibrationPartition,
+        "calibration-partition"
+    );
+    project!(tritium_schema::CalibrationOutput, "calibration-output");
+    project!(tritium_schema::CalibrationConsumer, "calibration-consumer");
+    project!(tritium_schema::CalibrationPlan, "calibration-plan");
+    project!(tritium_schema::CalibrationFactor, "calibration-factor");
+    project!(tritium_schema::CalibrationFactors, "calibration-factors");
     project!(tritium_schema::DirectFitMetric, "direct-fit-metric");
     project!(tritium_schema::DirectFitOutput, "direct-fit-output");
     project!(tritium_schema::DirectLevelsFitted, "direct-levels-fitted");
