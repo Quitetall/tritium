@@ -406,7 +406,7 @@ pub(super) fn admit_plan(
     Ok((rows, cols, count))
 }
 
-fn admit_payload(
+pub(super) fn admit_payload(
     weights: &[f32],
     gram: Option<&[f64]>,
     cols: usize,

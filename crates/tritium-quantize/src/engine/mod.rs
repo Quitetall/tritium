@@ -5,6 +5,7 @@
 //! The f64 feedback oracle remains an explicitly separate reference profile.
 
 mod activation_aware;
+mod calibrated_fit;
 mod calibration;
 mod calibration_cache;
 mod direct;
@@ -21,6 +22,7 @@ pub use model::{
 pub use sinks::{DirectoryTensorSink, MemoryTensorSink};
 pub use sources::{InMemoryWeightSource, RawTensor, SafeTensorsWeightSource};
 
+pub use calibrated_fit::{CalibratedFitError, fit_calibrated_levels};
 pub use calibration::{
     CalibratedTensor, CalibrationBatch, CalibrationCollector, CalibrationError, CalibrationInput,
     CalibrationOutputBatch,
