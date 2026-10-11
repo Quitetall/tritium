@@ -164,6 +164,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         "salience-transform-observation"
     );
     project!(
+        tritium_schema::SalienceTransformStarted,
+        "salience-transform-started"
+    );
+    project!(
+        tritium_schema::SalienceTransformCompleted,
+        "salience-transform-completed"
+    );
+    project!(
         tritium_schema::CalibratedQuantAction,
         "calibrated-quant-action"
     );

@@ -153,6 +153,8 @@ pub enum SalienceTransformPlanError {
     Statistics,
     /// Declared source/derived/statistics/pair working bound is insufficient.
     Limit,
+    /// Complete observed inventories, ordered scales or output interpretations disagree.
+    Observation,
 }
 impl core::fmt::Display for SalienceTransformPlanError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -327,4 +329,84 @@ pub struct SalienceTransformObservation {
     pub assets: Vec<NamedAssetDigest>,
     /// Actual ordered pair output scales.
     pub operations: Vec<SalienceOperationOutput>,
+}
+
+impl SalienceTransformObservation {
+    /// Check complete recorded structure, not actual byte or arithmetic truth.
+    /// Identities must additionally be derived by the shared evidence module.
+    /// # Errors
+    /// Invalid request, incomplete/changed inventories, output shape/dtype,
+    /// unchanged tensor content or ordered finite-positive scale bindings.
+    pub fn validate(&self) -> Result<(), SalienceTransformPlanError> {
+        self.plan.validate()?;
+        let invalid = SalienceTransformPlanError::Observation;
+        if self.original_source != self.plan.original_source
+            || self
+                .original_tensors
+                .iter()
+                .map(|t| &t.source)
+                .ne(self.plan.tensors.iter())
+            || self
+                .assets
+                .iter()
+                .map(|a| &a.name)
+                .ne(self.plan.assets.iter())
+            || self.derived_tensors.len() != self.original_tensors.len()
+            || self.operations.len() != self.plan.operations.len()
+        {
+            return Err(invalid);
+        }
+        let mut touched = BTreeSet::new();
+        for (request, output) in self.plan.operations.iter().zip(&self.operations) {
+            if output.operation != request.name
+                || output.scale_bits.len() as u64 != request.moments.channels
+                || output.scale_bits.iter().any(|bits| {
+                    let scale = f32::from_le_bytes(*bits);
+                    !scale.is_finite() || scale <= 0.0
+                })
+            {
+                return Err(invalid);
+            }
+            touched.insert(request.inverse.as_str());
+            touched.extend(request.projections.iter().map(String::as_str));
+        }
+        for (original, derived) in self.original_tensors.iter().zip(&self.derived_tensors) {
+            let mut expected = original.source.clone();
+            if touched.contains(expected.name.as_str()) {
+                expected.precision = crate::ScalePrecision::F32;
+            } else if original.content != derived.content {
+                return Err(invalid);
+            }
+            if derived.source != expected {
+                return Err(invalid);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Typed transform request event; expected A is not yet an observed-byte claim.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
+pub struct SalienceTransformStarted {
+    /// Complete declared request, including logical limits and statistic class.
+    pub plan: SalienceTransformPlan,
+}
+
+/// Actual complete transform event; not publication or captured-graph admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
+pub struct SalienceTransformCompleted {
+    /// Actual complete A/B raw bindings and ordered stored scales.
+    pub observation: SalienceTransformObservation,
 }

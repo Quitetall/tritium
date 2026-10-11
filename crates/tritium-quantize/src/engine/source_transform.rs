@@ -5,12 +5,15 @@ use super::{
     WeightSource,
 };
 use std::{borrow::Cow, collections::BTreeMap};
+use tritium_evidence::{
+    EvidenceError, EvidenceRecorder, SalienceTransformView, SealedEvidence, VerifiedLog,
+};
 use tritium_format::trit_model::decode_dense_f32;
 use tritium_schema::{
     BlobId, NamedAssetDigest, QuantSourceTensor, SalienceInverseAxis, SalienceMomentBinding,
-    SalienceNumerics, SalienceOperationOutput, SalienceStatisticsKind,
+    SalienceNumerics, SalienceOperationOutput, SalienceStatisticsKind, SalienceTransformCompleted,
     SalienceTransformObservation, SalienceTransformPlan, SalienceTransformPlanError,
-    ScalePrecision,
+    SalienceTransformStarted, ScalePrecision,
 };
 
 /// Actual supplied vectors and declared rows, not proof of graph capture.
@@ -59,6 +62,10 @@ pub enum SalienceSourceError {
     Fold(SalienceFoldError),
     /// Unsupported policy; never silently substitute one.
     Unsupported,
+    /// Existing recorder, strict typed lifecycle or integrity validation failed.
+    Evidence(EvidenceError),
+    /// Actual byte/numerical replay disagrees with the complete recorded observation.
+    Replay,
 }
 impl core::fmt::Display for SalienceSourceError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -70,6 +77,20 @@ impl From<QuantEngineError> for SalienceSourceError {
     fn from(error: QuantEngineError) -> Self {
         Self::Source(error)
     }
+}
+impl From<EvidenceError> for SalienceSourceError {
+    fn from(error: EvidenceError) -> Self {
+        Self::Evidence(error)
+    }
+}
+
+/// Actual immutable B and its sealed standalone transform log, not a model package.
+#[derive(Debug)]
+pub struct RecordedSalienceSource {
+    /// Derived bytes consumed through the existing source interface.
+    pub source: DerivedSalienceSource,
+    /// Actual typed start/completion log; no captured-graph or release claim.
+    pub evidence: SealedEvidence,
 }
 
 /// Private-field immutable B source, usable by the existing fitting/cache seam.
@@ -115,6 +136,72 @@ impl WeightSource for DerivedSalienceSource {
 #[derive(Debug)]
 pub struct SourceTransform;
 impl SourceTransform {
+    /// Run the actual source controller and seal distinct typed transform events.
+    /// Uses one root span `transform`; no v1 quantization event is fabricated.
+    /// Publishes no dense/model payload and admits no complete A->B->C carrier.
+    /// # Errors
+    /// Any ordinary transform failure or invalid recorder/lifecycle. No B/log is returned.
+    pub fn run_recorded(
+        plan: &SalienceTransformPlan,
+        source: &mut dyn WeightSource,
+        statistics: &BTreeMap<String, DeclaredSalienceStatistics>,
+        mut recorder: EvidenceRecorder,
+    ) -> Result<RecordedSalienceSource, SalienceSourceError> {
+        plan.validate().map_err(SalienceSourceError::Plan)?;
+        recorder.check_emit::<SalienceTransformStarted>("transform", None, 0)?;
+        recorder.check_emit::<SalienceTransformCompleted>("transform", None, 1)?;
+        recorder.emit(
+            "transform",
+            None,
+            0,
+            &SalienceTransformStarted { plan: plan.clone() },
+        )?;
+        let derived = Self::run(plan, source, statistics)?;
+        recorder.emit(
+            "transform",
+            None,
+            1,
+            &SalienceTransformCompleted {
+                observation: derived.observation.clone(),
+            },
+        )?;
+        let evidence = recorder.seal()?;
+        let views = SalienceTransformView::fold(evidence.log())?;
+        if views.len() != 1
+            || evidence.log().events.len() != 2
+            || views[0].completed().observation != derived.observation
+        {
+            return Err(SalienceSourceError::Replay);
+        }
+        Ok(RecordedSalienceSource {
+            source: derived,
+            evidence,
+        })
+    }
+
+    /// Re-execute the shared controller on actual A/moment bytes and compare the
+    /// complete observation with one sealed standalone transform's typed view.
+    /// Structural/hash validity alone cannot establish numerical truth.
+    /// This is not graph capture, model quality or complete A->B->C qualification.
+    /// # Errors
+    /// Bad/incomplete/foreign log, actual input rejection, or changed recorded outputs.
+    pub fn replay(
+        log: &VerifiedLog,
+        source: &mut dyn WeightSource,
+        statistics: &BTreeMap<String, DeclaredSalienceStatistics>,
+    ) -> Result<DerivedSalienceSource, SalienceSourceError> {
+        let views = SalienceTransformView::fold(log)?;
+        if views.len() != 1 || log.events.len() != 2 {
+            return Err(SalienceSourceError::Replay);
+        }
+        let view = &views[0];
+        let actual = Self::run(&view.started().plan, source, statistics)?;
+        if actual.observation != view.completed().observation {
+            return Err(SalienceSourceError::Replay);
+        }
+        Ok(actual)
+    }
+
     /// Consume actual A bytes, check identity/moments, apply ordered paired numerics,
     /// then return one immutable B with complete actual raw bindings.
     ///

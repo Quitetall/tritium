@@ -26,7 +26,8 @@ pub use model::{
 };
 pub use sinks::{DirectoryTensorSink, MemoryTensorSink};
 pub use source_transform::{
-    DeclaredSalienceStatistics, DerivedSalienceSource, SalienceSourceError, SourceTransform,
+    DeclaredSalienceStatistics, DerivedSalienceSource, RecordedSalienceSource, SalienceSourceError,
+    SourceTransform,
 };
 pub use sources::{InMemoryWeightSource, RawTensor, SafeTensorsWeightSource};
 

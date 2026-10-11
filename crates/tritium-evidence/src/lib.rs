@@ -27,6 +27,11 @@ mod calibrated_fit;
 pub use calibrated_fit::{CALIBRATED_LEVELS_FITTED_REGISTRATION, CalibratedFitReceiptView};
 
 mod original_source;
+mod salience_transform;
+pub use salience_transform::{
+    SALIENCE_TRANSFORM_COMPLETED_REGISTRATION, SALIENCE_TRANSFORM_STARTED_REGISTRATION,
+    SalienceTransformView,
+};
 mod quantization;
 pub use original_source::original_source_id;
 pub use quantization::{

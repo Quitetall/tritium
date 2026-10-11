@@ -68,8 +68,10 @@ reproduction or human activation clearance follows from these checks.
 
 ## Remaining migration and full release
 
-Typed start/completion events, executed B-bound capture/replay, durable immutable
-staging and a mandatory versioned A->B->C carrier/verifier/loader remain required.
+The subsequent [recorded source-transform slice](recorded-source-transform-2026-10-11.md)
+adds standalone typed start/completion events and actual A->B numerical replay.
+Executed B-bound capture/replay, durable immutable staging and a mandatory
+versioned A->B->C carrier/verifier/loader remain required.
 Do not put lineage into optional ignored metadata or call B->C verification
 complete transformed-source admission. Model-aware CLI/Qwen/Python/HF surfaces
 and both historical campaigns still need differential migration verification.

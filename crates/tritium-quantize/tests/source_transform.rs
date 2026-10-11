@@ -3,8 +3,10 @@ use std::{collections::BTreeMap, io::Cursor};
 use tritium_evidence::{
     CALIBRATED_LEVELS_FITTED_REGISTRATION, CALIBRATED_QUANTIZATION_COMPLETED_REGISTRATION,
     CALIBRATED_QUANTIZATION_STARTED_REGISTRATION, CalibratedQuantizationReceiptView,
-    DIRECT_LEVELS_FITTED_REGISTRATION, EvidenceRecorder, QUANTIZATION_COMPLETED_REGISTRATION,
-    QUANTIZATION_STARTED_REGISTRATION, QuantizationReceiptView, verify_jsonl,
+    DIRECT_LEVELS_FITTED_REGISTRATION, EventRegistration, EvidenceEvent, EvidenceRecorder,
+    QUANTIZATION_COMPLETED_REGISTRATION, QUANTIZATION_STARTED_REGISTRATION,
+    QuantizationReceiptView, SALIENCE_TRANSFORM_COMPLETED_REGISTRATION,
+    SALIENCE_TRANSFORM_STARTED_REGISTRATION, SalienceTransformView, SealedEvidence, verify_jsonl,
 };
 use tritium_format::trit_model::{decode_dense_f32, read_trit_model};
 use tritium_quantize::engine::{
@@ -755,4 +757,293 @@ fn seekable_safetensors_adapter_produces_the_same_complete_derived_source() {
             expected.tensor(&tensor.name, 20_000).unwrap()
         );
     }
+}
+
+fn transform_recorder() -> EvidenceRecorder {
+    EvidenceRecorder::new(
+        "transform-fixture",
+        [
+            SALIENCE_TRANSFORM_STARTED_REGISTRATION,
+            SALIENCE_TRANSFORM_COMPLETED_REGISTRATION,
+        ],
+    )
+    .unwrap()
+}
+
+fn claim(
+    start: &SalienceTransformPlan,
+    observation: &SalienceTransformObservation,
+) -> SealedEvidence {
+    let mut recorder = transform_recorder();
+    recorder
+        .emit(
+            "transform",
+            None,
+            0,
+            &SalienceTransformStarted {
+                plan: start.clone(),
+            },
+        )
+        .unwrap();
+    recorder
+        .emit(
+            "transform",
+            None,
+            1,
+            &SalienceTransformCompleted {
+                observation: observation.clone(),
+            },
+        )
+        .unwrap();
+    recorder.seal().unwrap()
+}
+
+#[test]
+fn recorded_transform_and_actual_replay_bind_bytes_scales_and_true_log_root() {
+    let mut source = fixture(true);
+    let (plan, stats) = plan(&mut source);
+    let original = source.clone();
+    let recorded =
+        SourceTransform::run_recorded(&plan, &mut source, &stats, transform_recorder()).unwrap();
+    unchanged(&source, &original);
+    let log = verify_jsonl(recorded.evidence.jsonl()).unwrap();
+    assert_eq!(log.events.len(), 2);
+    let views = SalienceTransformView::fold(&log).unwrap();
+    assert_eq!(views.len(), 1);
+    assert_eq!(
+        views[0].completed().observation,
+        *recorded.source.observation()
+    );
+    assert_eq!(views[0].reference().run, "transform-fixture");
+    assert_eq!(views[0].reference().span, "transform");
+    assert_eq!(views[0].reference().root, recorded.evidence.root());
+    assert!(log.events.iter().all(|event| {
+        event
+            .schema
+            .starts_with("tritium.quantize.salience_transform_")
+    }));
+    let mut replayed = SourceTransform::replay(&log, &mut source, &stats).unwrap();
+    assert_eq!(replayed.observation(), recorded.source.observation());
+    assert_eq!(
+        Engine::observe_source(&dense_plan(&replayed), &mut replayed).unwrap(),
+        recorded.source.observation().derived_source
+    );
+}
+
+#[test]
+fn valid_new_hash_chains_do_not_prove_recorded_scales_or_touched_content() {
+    let mut source = fixture(true);
+    let (plan, stats) = plan(&mut source);
+    let recorded =
+        SourceTransform::run_recorded(&plan, &mut source, &stats, transform_recorder()).unwrap();
+    for case in 0..2 {
+        let mut false_observation = recorded.source.observation().clone();
+        if case == 0 {
+            false_observation.operations[0].scale_bits[0] = 1.0f32.to_le_bytes();
+        } else {
+            false_observation
+                .derived_tensors
+                .iter_mut()
+                .find(|t| t.source.name == "q")
+                .unwrap()
+                .content = BlobId::from_bytes([7; 32]);
+            false_observation.derived_source = tritium_evidence::original_source_id(
+                &plan.architecture,
+                &false_observation.derived_tensors,
+                &false_observation.assets,
+            )
+            .unwrap();
+        }
+        let malicious = claim(&plan, &false_observation);
+        let log = verify_jsonl(malicious.jsonl()).unwrap();
+        assert_eq!(
+            SalienceTransformView::fold(&log).unwrap().len(),
+            1,
+            "recorded structure is deliberately not numerical proof"
+        );
+        assert!(
+            matches!(
+                SourceTransform::replay(&log, &mut source, &stats),
+                Err(SalienceSourceError::Replay)
+            ),
+            "case {case}"
+        );
+    }
+}
+
+#[test]
+fn strict_transform_fold_rejects_incomplete_inventories_output_dtype_and_scale_lies() {
+    let mut source = fixture(true);
+    let (plan, stats) = plan(&mut source);
+    let recorded =
+        SourceTransform::run_recorded(&plan, &mut source, &stats, transform_recorder()).unwrap();
+    for case in 0..10 {
+        let mut changed = recorded.source.observation().clone();
+        match case {
+            0 => {
+                changed.original_tensors.pop();
+            }
+            1 => {
+                changed.derived_tensors.pop();
+            }
+            2 => {
+                changed.assets.pop();
+            }
+            3 => {
+                changed
+                    .derived_tensors
+                    .iter_mut()
+                    .find(|t| t.source.name == "embedding")
+                    .unwrap()
+                    .content = BlobId::from_bytes([9; 32])
+            }
+            4 => {
+                changed
+                    .derived_tensors
+                    .iter_mut()
+                    .find(|t| t.source.name == "q")
+                    .unwrap()
+                    .source
+                    .precision = ScalePrecision::F16
+            }
+            5 => changed.operations.swap(0, 1),
+            6 => {
+                changed.operations[0].scale_bits.pop();
+            }
+            7 => changed.operations[0].scale_bits[0] = f32::INFINITY.to_le_bytes(),
+            8 => changed.operations[0].scale_bits[0] = (-0.0f32).to_le_bytes(),
+            9 => changed.derived_source = OriginalSourceId::from_bytes([9; 32]),
+            _ => unreachable!(),
+        }
+        let sealed = claim(&plan, &changed);
+        let log = verify_jsonl(sealed.jsonl()).unwrap();
+        assert!(SalienceTransformView::fold(&log).is_err(), "case {case}");
+    }
+}
+
+#[test]
+fn unfinished_or_ambiguous_lifecycles_never_pass_actual_replay() {
+    let mut source = fixture(true);
+    let (plan, stats) = plan(&mut source);
+    let observation = SourceTransform::run(&plan, &mut source, &stats)
+        .unwrap()
+        .observation()
+        .clone();
+    let start = SalienceTransformStarted { plan: plan.clone() };
+    let complete = SalienceTransformCompleted { observation };
+    let mut unfinished = transform_recorder();
+    unfinished.emit("transform", None, 0, &start).unwrap();
+    let log = verify_jsonl(unfinished.seal().unwrap().jsonl()).unwrap();
+    assert!(SalienceTransformView::fold(&log).unwrap().is_empty());
+    assert!(SourceTransform::replay(&log, &mut source, &stats).is_err());
+
+    let mut orphan = transform_recorder();
+    orphan.emit("transform", None, 1, &complete).unwrap();
+    let log = verify_jsonl(orphan.seal().unwrap().jsonl()).unwrap();
+    assert!(SalienceTransformView::fold(&log).is_err());
+
+    let mut duplicate = transform_recorder();
+    duplicate.emit("transform", None, 0, &start).unwrap();
+    duplicate.emit("transform", None, 1, &complete).unwrap();
+    duplicate.emit("transform", None, 2, &complete).unwrap();
+    let log = verify_jsonl(duplicate.seal().unwrap().jsonl()).unwrap();
+    assert!(SalienceTransformView::fold(&log).is_err());
+
+    let mut ambiguous = transform_recorder();
+    for span in ["one", "two"] {
+        ambiguous.emit(span, None, 0, &start).unwrap();
+        ambiguous.emit(span, None, 1, &complete).unwrap();
+    }
+    let log = verify_jsonl(ambiguous.seal().unwrap().jsonl()).unwrap();
+    assert_eq!(SalienceTransformView::fold(&log).unwrap().len(), 2);
+    assert!(SourceTransform::replay(&log, &mut source, &stats).is_err());
+}
+
+#[derive(serde::Serialize)]
+#[serde(transparent)]
+struct DynamicComplete(serde_json::Value);
+impl EvidenceEvent for DynamicComplete {
+    const SCHEMA_ID: &'static str = "tritium.quantize.salience_transform_completed";
+    const VERSION: u16 = 1;
+}
+#[derive(serde::Serialize)]
+#[serde(transparent)]
+struct FutureComplete(serde_json::Value);
+impl EvidenceEvent for FutureComplete {
+    const SCHEMA_ID: &'static str = "tritium.quantize.salience_transform_completed";
+    const VERSION: u16 = 2;
+}
+
+#[test]
+fn typed_transform_replay_rejects_future_versions_and_unknown_fields_with_valid_hashes() {
+    let mut source = fixture(true);
+    let (plan, stats) = plan(&mut source);
+    let observation = SourceTransform::run(&plan, &mut source, &stats)
+        .unwrap()
+        .observation()
+        .clone();
+    let complete = serde_json::to_value(SalienceTransformCompleted { observation }).unwrap();
+    for location in ["", "/observation", "/observation/operations/0"] {
+        let mut value = complete.clone();
+        value
+            .pointer_mut(location)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("ignored_capture".into(), serde_json::json!(true));
+        let mut recorder = transform_recorder();
+        recorder
+            .emit(
+                "transform",
+                None,
+                0,
+                &SalienceTransformStarted { plan: plan.clone() },
+            )
+            .unwrap();
+        recorder
+            .emit("transform", None, 1, &DynamicComplete(value))
+            .unwrap();
+        let log = verify_jsonl(recorder.seal().unwrap().jsonl()).unwrap();
+        assert!(SalienceTransformView::fold(&log).is_err(), "{location}");
+    }
+    let mut future = EvidenceRecorder::new(
+        "future",
+        [
+            SALIENCE_TRANSFORM_STARTED_REGISTRATION,
+            EventRegistration {
+                schema: FutureComplete::SCHEMA_ID,
+                version: 2,
+            },
+        ],
+    )
+    .unwrap();
+    future
+        .emit("transform", None, 0, &SalienceTransformStarted { plan })
+        .unwrap();
+    future
+        .emit("transform", None, 1, &FutureComplete(complete))
+        .unwrap();
+    let log = verify_jsonl(future.seal().unwrap().jsonl()).unwrap();
+    assert!(SalienceTransformView::fold(&log).is_err());
+}
+
+#[test]
+fn changed_replay_source_or_statistics_and_invalid_recorder_return_no_candidate() {
+    let mut source = fixture(true);
+    let (plan, mut stats) = plan(&mut source);
+    let recorded =
+        SourceTransform::run_recorded(&plan, &mut source, &stats, transform_recorder()).unwrap();
+    stats.get_mut("attn").unwrap().moments[0] = 9.0;
+    assert!(SourceTransform::replay(recorded.evidence.log(), &mut source, &stats).is_err());
+    stats.get_mut("attn").unwrap().moments[0] = 1.0;
+    source.assets.get_mut("config.json").unwrap().push(b' ');
+    assert!(SourceTransform::replay(recorded.evidence.log(), &mut source, &stats).is_err());
+    let before = source.clone();
+    let unregistered =
+        EvidenceRecorder::new("unregistered", [SALIENCE_TRANSFORM_STARTED_REGISTRATION]).unwrap();
+    assert!(matches!(
+        SourceTransform::run_recorded(&plan, &mut source, &stats, unregistered),
+        Err(SalienceSourceError::Evidence(_))
+    ));
+    unchanged(&source, &before);
 }

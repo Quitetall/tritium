@@ -10,7 +10,7 @@ use serde::Serialize;
 use tritium_evidence::{
     CalibratedFitReceiptView, CalibratedQuantizationReceiptView, DirectFitReceiptView,
     EventRegistration, EvidenceEvent, EvidenceRecorder, ModelLoadReceiptView,
-    QuantizationReceiptView, verify_jsonl,
+    QuantizationReceiptView, SalienceTransformView, verify_jsonl,
 };
 
 /// Evidence detail level for a CLI invocation.
@@ -203,6 +203,9 @@ pub(crate) fn run(command: EvidenceCommand) -> anyhow::Result<()> {
     CalibratedQuantizationReceiptView::fold(&verified).map_err(|error| {
         anyhow::anyhow!("verify calibrated model view {}: {error}", path.display())
     })?;
+    SalienceTransformView::fold(&verified).map_err(|error| {
+        anyhow::anyhow!("verify salience transform view {}: {error}", path.display())
+    })?;
     if view {
         println!("{}", serde_json::to_string_pretty(&verified.events)?);
     } else {
@@ -249,6 +252,164 @@ mod tests {
     impl EvidenceEvent for ProbeEvent {
         const SCHEMA_ID: &'static str = "tritium.test.cli-probe";
         const VERSION: u16 = 1;
+    }
+
+    fn actual_transform() -> tritium_quantize::engine::RecordedSalienceSource {
+        use std::collections::BTreeMap;
+        use tritium_quantize::engine::{
+            DeclaredSalienceStatistics, Engine, InMemoryWeightSource, RawTensor, SourceTransform,
+            WeightSource,
+        };
+        use tritium_schema::*;
+        let raw = |shape: Vec<u64>, values: &[f32]| RawTensor {
+            shape,
+            precision: ScalePrecision::F32,
+            bytes: values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+        };
+        let mut source = InMemoryWeightSource {
+            tensors: BTreeMap::from([
+                ("norm".into(), raw(vec![2], &[1.0, 1.0])),
+                ("q".into(), raw(vec![1, 2], &[2.0, -2.0])),
+            ]),
+            assets: BTreeMap::from([
+                ("config.json".into(), b"{}".to_vec()),
+                ("tokenizer.json".into(), b"{}".to_vec()),
+            ]),
+            ..Default::default()
+        };
+        let observe = QuantPlan {
+            architecture: "fixture".into(),
+            tensors: source
+                .inventory()
+                .unwrap()
+                .into_iter()
+                .map(|source| QuantTensorPlan {
+                    source,
+                    action: QuantAction::KeepDense,
+                })
+                .collect(),
+            assets: source.asset_names(),
+            levels: vec!["dense".into()],
+            limits: QuantLimits {
+                max_source_bytes: 128,
+                max_asset_bytes: 128,
+                max_retained_blob_bytes: 128,
+                max_package_bytes: 10_000,
+            },
+        };
+        let stats = DeclaredSalienceStatistics {
+            moments: vec![1.0, 16.0],
+            rows: 1,
+        };
+        let plan = SalienceTransformPlan {
+            architecture: "fixture".into(),
+            original_source: Engine::observe_source(&observe, &mut source).unwrap(),
+            tensors: source.inventory().unwrap(),
+            assets: source.asset_names(),
+            operations: vec![SalienceTransformOperation {
+                name: "attn".into(),
+                projections: vec!["q".into()],
+                inverse: "norm".into(),
+                inverse_axis: SalienceInverseAxis::NormChannels,
+                moments: stats.binding().unwrap(),
+                alpha_bits: 0.75f64.to_le_bytes(),
+            }],
+            numerics: SalienceNumerics::LegacyF64ScaleF32V1,
+            statistics_kind: SalienceStatisticsKind::Declared,
+            limits: SalienceTransformLimits {
+                max_source_bytes: 128,
+                max_asset_bytes: 128,
+                max_derived_bytes: 128,
+                max_statistics_bytes: 16,
+                max_pair_working_bytes: 128,
+            },
+        };
+        let recorder = EvidenceRecorder::new(
+            "cli-transform",
+            [
+                tritium_evidence::SALIENCE_TRANSFORM_STARTED_REGISTRATION,
+                tritium_evidence::SALIENCE_TRANSFORM_COMPLETED_REGISTRATION,
+            ],
+        )
+        .unwrap();
+        SourceTransform::run_recorded(
+            &plan,
+            &mut source,
+            &BTreeMap::from([("attn".into(), stats)]),
+            recorder,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn verify_and_view_accept_actual_declared_transform_observations() {
+        let recorded = actual_transform();
+        let path = temp_log();
+        std::fs::write(&path, recorded.evidence.jsonl()).unwrap();
+        run(EvidenceCommand::Verify { path: path.clone() }).unwrap();
+        run(EvidenceCommand::View { path: path.clone() }).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn verify_and_view_reject_invalid_transform_payloads_with_valid_hashes() {
+        use tritium_schema::SalienceTransformStarted;
+        #[derive(Serialize)]
+        struct BadCompletion {
+            observation: serde_json::Value,
+        }
+        impl EvidenceEvent for BadCompletion {
+            const SCHEMA_ID: &'static str = "tritium.quantize.salience_transform_completed";
+            const VERSION: u16 = 1;
+        }
+        let actual = actual_transform();
+        let observation = actual.source.observation();
+        let mut value = serde_json::to_value(observation).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("claimed_capture".into(), serde_json::json!(true));
+        let mut recorder = EvidenceRecorder::new(
+            "bad-transform",
+            [
+                tritium_evidence::SALIENCE_TRANSFORM_STARTED_REGISTRATION,
+                tritium_evidence::SALIENCE_TRANSFORM_COMPLETED_REGISTRATION,
+            ],
+        )
+        .unwrap();
+        recorder
+            .emit(
+                "transform",
+                None,
+                0,
+                &SalienceTransformStarted {
+                    plan: observation.plan.clone(),
+                },
+            )
+            .unwrap();
+        recorder
+            .emit("transform", None, 1, &BadCompletion { observation: value })
+            .unwrap();
+        let sealed = recorder.seal().unwrap();
+        verify_jsonl(sealed.jsonl()).unwrap();
+        let path = temp_log();
+        std::fs::write(&path, sealed.jsonl()).unwrap();
+        assert!(
+            run(EvidenceCommand::Verify { path: path.clone() })
+                .unwrap_err()
+                .to_string()
+                .contains("salience transform")
+        );
+        assert!(
+            run(EvidenceCommand::View { path: path.clone() })
+                .unwrap_err()
+                .to_string()
+                .contains("salience transform")
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
