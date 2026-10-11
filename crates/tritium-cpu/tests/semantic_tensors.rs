@@ -10,7 +10,7 @@ use tritium_schema::{
 use tritium_spec::{TensorMatmul, TensorView, TernaryBackend};
 
 #[test]
-fn compact_and_all_pruned_views_cannot_enter_uniform_cpu_storage() {
+fn compact_and_all_pruned_views_use_allocation_aware_cpu_storage() {
     let cpu = CpuBackend::new();
     let mut layout = layout(Basis::Identity, PlaneCodec::D2);
     layout.allocation = PlaneAllocation::PerTile;
@@ -23,19 +23,109 @@ fn compact_and_all_pruned_views_cannot_enter_uniform_cpu_storage() {
         let trits = vec![Trit::POS; index.trit_count()];
         let scales = vec![0.5; index.scale_count()];
         let view = AdditiveView::new_per_tile(index, &trits, &scales).unwrap();
-        assert!(
-            cpu.tensor_caps(TensorView::Additive(view))
-                .unwrap()
-                .is_none()
-        );
-        assert!(matches!(
-            cpu.upload_tensor(TensorView::Additive(view)),
-            Err(tritium_spec::BackendError::UnsupportedTensor)
-        ));
+        let caps = cpu
+            .tensor_caps(TensorView::Additive(view))
+            .unwrap()
+            .unwrap();
+        let uploaded = cpu.upload_tensor(TensorView::Additive(view)).unwrap();
+        assert_eq!(caps.execution, tritium_schema::TensorExecution::Native);
+        assert_eq!(caps.payload_bytes, uploaded.len_bytes() as u64);
+        let mut out = [99.; 2];
+        cpu.matmul(TensorMatmul {
+            act: &[1.; 4],
+            tensor: &*uploaded,
+            batch: 1,
+            transformed_act: &mut [0.; 4],
+            out: &mut out,
+        })
+        .unwrap();
+        assert_eq!(out, if counts[0] == 0 { [0., 0.] } else { [2., 0.] });
         let owned = AdditiveTensor::from_view(view).unwrap();
         assert_eq!(owned.tile_counts(), Some(counts.as_slice()));
         assert_eq!(owned.trits(), view.trits());
         assert_eq!(owned.scales(), view.scales());
+    }
+}
+
+#[test]
+fn compact_cpu_replays_shared_candidate_vectors_in_one_and_four_threads() {
+    for threads in [1, 4] {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| {
+                assert_eq!(
+                    tritium_testkit::assert_candidate_per_tile_conformance(
+                        &CpuBackend::new(),
+                        tritium_schema::TensorExecution::Native
+                    ),
+                    624
+                );
+            });
+    }
+}
+
+#[test]
+fn compact_upload_counts_every_owned_buffer_and_rejects_invalid_s34() {
+    use tritium_schema::{ADMITTED_LAWS, TensorUploadPolicy};
+    use tritium_spec::BackendError;
+    let cpu = CpuBackend::new();
+    for (codec, payload) in [(PlaneCodec::D2, 213), (PlaneCodec::B3, 174)] {
+        let mut meta = layout(Basis::Identity, codec);
+        meta.cols = 257;
+        meta.group = 128;
+        meta.law = ADMITTED_LAWS[0].law;
+        meta.allocation = PlaneAllocation::PerTile;
+        let owned = AdditiveTensor::new_per_tile(
+            meta,
+            vec![1, 3, 2, 0],
+            vec![Trit::POS; 771],
+            vec![0.5; 9],
+        )
+        .unwrap();
+        let expected = payload
+            + 4
+            + 6 * core::mem::size_of::<tritium_core::PerTileRowSpan>()
+            + 3 * 2 * core::mem::size_of::<usize>();
+        let view = TensorView::Additive(owned.view());
+        assert_eq!(
+            cpu.tensor_caps(view).unwrap().unwrap().payload_bytes,
+            expected as u64
+        );
+        assert!(matches!(
+            cpu.upload_tensor_checked(
+                view,
+                TensorUploadPolicy {
+                    native_only: true,
+                    max_payload_bytes: Some(expected as u64 - 1),
+                }
+            ),
+            Err(BackendError::TensorPayloadBudgetExceeded { .. })
+        ));
+        let (uploaded, _) = cpu
+            .upload_tensor_checked(
+                view,
+                TensorUploadPolicy {
+                    native_only: true,
+                    max_payload_bytes: Some(expected as u64),
+                },
+            )
+            .unwrap();
+        assert_eq!(uploaded.len_bytes(), expected);
+    }
+    let mut meta = layout(Basis::Identity, PlaneCodec::S34);
+    meta.allocation = PlaneAllocation::PerTile;
+    for (cols, trits) in [(4, vec![Trit::POS; 4]), (5, vec![Trit::ZERO; 5])] {
+        meta.rows = 1;
+        meta.cols = cols;
+        let owned = AdditiveTensor::new_per_tile(meta, vec![1], trits, vec![1.]).unwrap();
+        let view = TensorView::Additive(owned.view());
+        assert!(cpu.tensor_caps(view).is_err());
+        assert!(
+            cpu.upload_tensor_checked(view, TensorUploadPolicy::default())
+                .is_err()
+        );
     }
 }
 

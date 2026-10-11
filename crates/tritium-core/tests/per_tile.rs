@@ -28,6 +28,47 @@ fn layout(
 }
 
 #[test]
+fn public_row_cursor_and_buffer_lengths_share_checked_geometry() {
+    // Tied scales skip nonpruned lower-count tiles even when the higher plane
+    // omits their trits. Rows use absolute compact offsets, not dense offsets.
+    let layout = layout(2, 257, ADMITTED_LAWS[2], 128);
+    let counts = [1, 3, 2, 0];
+    let plan = tritium_core::PerTilePlan::new(layout, &counts).unwrap();
+    let expected = counts.len() + 6 * core::mem::size_of::<PerTileRowSpan>();
+    assert_eq!(plan.buffer_len_bytes().unwrap(), expected);
+    let mut spans = vec![PerTileRowSpan::default(); plan.index_len()];
+    let index = plan.build(&mut spans).unwrap();
+    assert_eq!(index.buffer_len_bytes().unwrap(), expected);
+    let tiles: Vec<_> = index
+        .tiles_in_row(1, 0)
+        .unwrap()
+        .map(|t| (t.columns(), t.trit_offset(), t.scale_offset()))
+        .collect();
+    assert_eq!(tiles, [(256..257, 513, 2)]);
+    let tiles: Vec<_> = index
+        .tiles_in_row(1, 1)
+        .unwrap()
+        .map(|t| (t.columns(), t.trit_offset(), t.scale_offset()))
+        .collect();
+    assert_eq!(tiles, [(0..256, 514, 3)]);
+    assert!(matches!(
+        index.tiles_in_row(0, 2),
+        Err(AdditiveError::RowOutOfRange)
+    ));
+    assert!(matches!(
+        index.tiles_in_row(3, 0),
+        Err(AdditiveError::InvalidPlaneCount)
+    ));
+    let plan = tritium_core::PerTilePlan::new(layout, &[0; 4]).unwrap();
+    assert_eq!(plan.buffer_len_bytes().unwrap(), 4);
+    let index = plan.build(&mut []).unwrap();
+    assert!(matches!(
+        index.tiles_in_row(0, 0),
+        Err(AdditiveError::InvalidPlaneCount)
+    ));
+}
+
+#[test]
 fn logical_prefix_uses_retained_coordinates_and_stored_bits_not_dense_equivalence() {
     let layout = layout(1, 257, ADMITTED_LAWS[0], 128);
     let parent_counts = [1, 2];

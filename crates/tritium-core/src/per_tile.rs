@@ -52,6 +52,13 @@ impl<'a> PerTilePlan<'a> {
         self.geometry.slots
     }
 
+    /// Checked logical lengths of count and row-span buffers in bytes.
+    ///
+    /// Excludes capacity slack, handles and allocator overhead; not full RSS.
+    pub fn buffer_len_bytes(&self) -> Result<usize, AdditiveError> {
+        buffer_len_bytes(self.counts.len(), self.geometry.slots)
+    }
+
     /// Exact total compact coefficient count.
     #[must_use]
     pub const fn trit_count(&self) -> usize {
@@ -251,6 +258,28 @@ impl<'a> PerTileIndex<'a> {
         self.geometry.scales
     }
 
+    /// Checked logical lengths of borrowed count and row-span buffers in bytes.
+    ///
+    /// This is not their allocator capacity or full process RSS.
+    pub fn buffer_len_bytes(&self) -> Result<usize, AdditiveError> {
+        buffer_len_bytes(self.counts.len(), self.spans.len())
+    }
+
+    /// Iterate present tiles in one logical row using the shared sealed cursor.
+    ///
+    /// Starts at the indexed row; never scans preceding rows. Tile offsets are
+    /// absolute within compact trit/stored-scale buffers. Invalid row or plane
+    /// indices return typed errors, including every plane of all-pruned data.
+    pub fn tiles_in_row(&self, plane: usize, row: usize) -> Result<ActiveTiles<'a>, AdditiveError> {
+        if row >= self.geometry.rows {
+            return Err(AdditiveError::RowOutOfRange);
+        }
+        if plane >= self.geometry.planes {
+            return Err(AdditiveError::InvalidPlaneCount);
+        }
+        Ok(self.row_tiles(plane, row))
+    }
+
     pub(crate) const fn plane_count(&self) -> usize {
         self.geometry.planes
     }
@@ -282,20 +311,51 @@ impl<'a> PerTileIndex<'a> {
     }
 }
 
-pub(crate) struct ActiveTile {
+/// Opaque present tile yielded by the shared compact row cursor.
+#[derive(Debug)]
+pub struct ActiveTile {
     pub(crate) col: usize,
     pub(crate) len: usize,
     pub(crate) trit: usize,
     pub(crate) scale: usize,
 }
 
-pub(crate) struct ActiveTiles<'a> {
+impl ActiveTile {
+    /// Logical columns occupied by this tile, with an unpadded ragged tail.
+    #[must_use]
+    pub fn columns(&self) -> core::ops::Range<usize> {
+        self.col..self.col + self.len
+    }
+
+    /// Absolute start in the plane-major compact trit buffer.
+    #[must_use]
+    pub const fn trit_offset(&self) -> usize {
+        self.trit
+    }
+
+    /// Absolute stored-scale start; tied laws refer to base-plane anchors.
+    #[must_use]
+    pub const fn scale_offset(&self) -> usize {
+        self.scale
+    }
+}
+
+/// Allocation-free iterator over a single checked compact row/plane.
+#[derive(Debug)]
+pub struct ActiveTiles<'a> {
     index: PerTileIndex<'a>,
     plane: usize,
     row: usize,
     next: usize,
     trit: usize,
     scale: usize,
+}
+
+fn buffer_len_bytes(counts: usize, slots: usize) -> Result<usize, AdditiveError> {
+    slots
+        .checked_mul(core::mem::size_of::<PerTileRowSpan>())
+        .and_then(|bytes| bytes.checked_add(counts))
+        .ok_or(AdditiveError::SizeOverflow)
 }
 
 impl Iterator for ActiveTiles<'_> {

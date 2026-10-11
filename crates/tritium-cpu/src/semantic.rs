@@ -12,6 +12,10 @@ mod packed;
 use packed::PackedAdditive;
 
 #[derive(Debug)]
+// Device handles already box this enum once. Keep sealed compact geometry
+// inline rather than adding a second infallible allocation/indirection. All
+// payload/index buffers reserve fallibly; handle overhead is not payload bytes.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum CpuTensor {
     Additive(PackedAdditive),
     Dense {
@@ -37,8 +41,10 @@ impl CpuTensor {
     pub(crate) fn caps(view: TensorView<'_>) -> Result<Option<TensorCaps>, BackendError> {
         let payload_bytes = if let TensorView::Additive(additive) = view {
             let layout = additive.layout();
-            if layout.allocation != tritium_schema::PlaneAllocation::Uniform
-                || !admitted_execution_group(layout.law, layout.group)
+            if !matches!(
+                layout.allocation,
+                tritium_schema::PlaneAllocation::Uniform | tritium_schema::PlaneAllocation::PerTile
+            ) || !admitted_execution_group(layout.law, layout.group)
             {
                 return Ok(None);
             }
