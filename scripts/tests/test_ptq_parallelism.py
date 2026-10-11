@@ -134,9 +134,21 @@ def _cpu_quota_diagnostics(root="/sys/fs/cgroup", membership="/proc/self/cgroup"
     return result
 
 
+def _profile_summary(profile):
+    """Bounded function timings, never a qualified performance measurement."""
+    import io
+    import pstats
+
+    stream = io.StringIO()
+    pstats.Stats(profile, stream=stream).strip_dirs().sort_stats("cumulative").print_stats(25)
+    return {"diagnostic_only": True, "text": stream.getvalue()[:16_000]}
+
+
 # Embed the exact guard in the standalone installed-wheel child, without
 # importing scripts or adding the source checkout to that child's sys.path.
-_PROBE = inspect.getsource(_native_probe_installation) + inspect.getsource(_cpu_quota_diagnostics) + r"""
+_PROBE = (inspect.getsource(_native_probe_installation) + inspect.getsource(_cpu_quota_diagnostics)
+          + inspect.getsource(_profile_summary)) + r"""
+import cProfile
 import hashlib
 import json
 import os
@@ -180,6 +192,9 @@ with tempfile.TemporaryDirectory(prefix="tritium-ptq-parallelism-") as root:
     # Count only work inside the measured public convert call, not preparation.
     native_work.update(calls=0, rows=0)
     native_timing.update(wall_seconds=0.0, cpu_seconds=0.0)
+    profiler = cProfile.Profile() if os.environ.get("TRITIUM_PTQ_DIAGNOSTIC_PROFILE") == "1" else None
+    if profiler is not None:
+        profiler.enable()
     started = time.perf_counter()
     cpu_started = time.process_time()
     artifact = convert(
@@ -190,6 +205,8 @@ with tempfile.TemporaryDirectory(prefix="tritium-ptq-parallelism-") as root:
     )
     cpu_elapsed = time.process_time() - cpu_started
     elapsed = time.perf_counter() - started
+    if profiler is not None:
+        profiler.disable()
     fitted = artifact.weight("weight")
     digest = hashlib.sha256()
     for plane in fitted.planes:
@@ -217,6 +234,7 @@ with tempfile.TemporaryDirectory(prefix="tritium-ptq-parallelism-") as root:
         },
         "fit_digest": digest.hexdigest(),
         "weighted_mse": fitted.weighted_mse,
+        "diagnostic_profile": _profile_summary(profiler) if profiler is not None else None,
     }, sort_keys=True))
 """
 
@@ -226,8 +244,12 @@ with tempfile.TemporaryDirectory(prefix="tritium-ptq-parallelism-") as root:
     "the PTQ parallelism probe runs in the installed-wheel PyTorch lane",
 )
 class PublicPtqParallelismTests(unittest.TestCase):
-    def _convert(self, rayon_threads: int) -> dict[str, object]:
+    def _convert(self, rayon_threads: int, *, diagnostic_profile=False) -> dict[str, object]:
         env = os.environ.copy()
+        # Ambient diagnostic configuration must never contaminate the gate.
+        env.pop("TRITIUM_PTQ_DIAGNOSTIC_PROFILE", None)
+        if diagnostic_profile:
+            env["TRITIUM_PTQ_DIAGNOSTIC_PROFILE"] = "1"
         env["RAYON_NUM_THREADS"] = str(rayon_threads)
         env["OMP_NUM_THREADS"] = "1"
         env["MKL_NUM_THREADS"] = "1"
@@ -247,6 +269,27 @@ class PublicPtqParallelismTests(unittest.TestCase):
             f"stderr:\n{completed.stderr}",
         )
         return json.loads(completed.stdout)
+
+    def _report_failure_profiles(self, measured):
+        """Re-exercise the public path; never retry or replace the measured verdict."""
+        try:
+            profiles = {}
+            for threads in (1, 4):
+                diagnostic = self._convert(threads, diagnostic_profile=True)
+                for key in ("installation", "algorithm_id", "fit_digest", "weighted_mse", "native_work"):
+                    if diagnostic.get(key) != measured[key]:
+                        raise ValueError("diagnostic identity, fit or coverage differs")
+                profile = diagnostic.get("diagnostic_profile")
+                if (not isinstance(profile, dict) or profile.get("diagnostic_only") is not True
+                        or not isinstance(profile.get("text"), str) or len(profile["text"]) > 16_000):
+                    raise ValueError("invalid bounded diagnostic profile")
+                profiles[str(threads)] = profile
+            print("PTQ failure profile diagnostic_only=" + json.dumps(profiles, sort_keys=True))
+        except Exception as error:
+            # Diagnostic failures cannot mask the original speedup failure.
+            # Do not print exception messages or child output: they may contain
+            # private caller paths or ambient environment details.
+            print("PTQ failure profile unknown: " + type(error).__name__)
 
     def test_public_convert_parallelizes_rows_without_changing_fitted_artifact(self):
         serial = self._convert(1)
@@ -273,6 +316,8 @@ class PublicPtqParallelismTests(unittest.TestCase):
             f"serial_environment={serial['benchmark_environment']} "
             f"parallel_environment={parallel['benchmark_environment']}"
         )
+        if speedup < 1.5:
+            self._report_failure_profiles(serial)
         self.assertGreaterEqual(
             speedup,
             1.5,

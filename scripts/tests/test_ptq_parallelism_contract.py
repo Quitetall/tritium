@@ -1,8 +1,11 @@
 """Fail-closed installed-native provenance for the public PTQ performance probe."""
 
 import base64
+from contextlib import redirect_stdout
 import hashlib
 import importlib.util
+import io
+import json
 from pathlib import Path
 import tempfile
 from types import ModuleType, SimpleNamespace
@@ -176,6 +179,114 @@ class PtqParallelismContractTests(unittest.TestCase):
 
 
 class PtqPerformanceDiagnosticsTests(unittest.TestCase):
+    @staticmethod
+    def case():
+        return MODULE.PublicPtqParallelismTests(
+            "test_public_convert_parallelizes_rows_without_changing_fitted_artifact"
+        )
+
+    @staticmethod
+    def result(elapsed, **changes):
+        return {
+            "algorithm_id": "fixture", "fit_digest": "fixture", "weighted_mse": 0,
+            "installation": {"source_identity": "fixture"},
+            "native_work": {"calls": 1, "rows": 2048},
+            "benchmark_environment": {}, "timing": {},
+            "elapsed_seconds": elapsed, **changes,
+        }
+
+    def test_failure_profiles_without_replacing_the_failed_measurement(self):
+        case = self.case()
+        profile = {"diagnostic_only": True, "text": "profile fixture"}
+        values = [self.result(1.39), self.result(1),
+                  self.result(4, diagnostic_profile=profile),
+                  self.result(1, diagnostic_profile=profile)]
+        output = io.StringIO()
+        with mock.patch.object(case, "_convert", side_effect=values) as convert, redirect_stdout(output):
+            with self.assertRaisesRegex(AssertionError, "only 1.39x"):
+                case.test_public_convert_parallelizes_rows_without_changing_fitted_artifact()
+        self.assertEqual(convert.call_args_list, [mock.call(1), mock.call(4),
+                         mock.call(1, diagnostic_profile=True), mock.call(4, diagnostic_profile=True)])
+        self.assertIn("diagnostic_only", output.getvalue())
+
+    def test_success_never_runs_diagnostic_profiles(self):
+        case = self.case()
+        with mock.patch.object(case, "_convert", side_effect=[self.result(2), self.result(1)]) as convert:
+            with redirect_stdout(io.StringIO()):
+                case.test_public_convert_parallelizes_rows_without_changing_fitted_artifact()
+        self.assertEqual(convert.call_args_list, [mock.call(1), mock.call(4)])
+
+    def test_profile_failure_cannot_mask_original_failure_or_print_private_error(self):
+        case = self.case()
+        output = io.StringIO()
+        with mock.patch.object(case, "_convert", side_effect=[
+            self.result(1.39), self.result(1), RuntimeError("private-error-sentinel"),
+        ]) as convert, redirect_stdout(output):
+            with self.assertRaisesRegex(AssertionError, "only 1.39x"):
+                case.test_public_convert_parallelizes_rows_without_changing_fitted_artifact()
+        self.assertEqual(convert.call_count, 3)
+        self.assertIn("unknown", output.getvalue())
+        self.assertNotIn("private-error-sentinel", output.getvalue())
+
+    def test_changed_profile_identity_fit_or_coverage_is_not_reported(self):
+        profile = {"diagnostic_only": True, "text": "must-not-report"}
+        for changed in [{"installation": {}}, {"algorithm_id": "other"}, {"fit_digest": "other"},
+                        {"weighted_mse": 1}, {"native_work": {"calls": 0, "rows": 2048}}]:
+            with self.subTest(changed=changed):
+                case = self.case()
+                output = io.StringIO()
+                with mock.patch.object(case, "_convert", side_effect=[
+                    self.result(1.39), self.result(1), self.result(1, diagnostic_profile=profile, **changed),
+                    self.result(1, diagnostic_profile=profile),
+                ]), redirect_stdout(output):
+                    with self.assertRaisesRegex(AssertionError, "only 1.39x"):
+                        case.test_public_convert_parallelizes_rows_without_changing_fitted_artifact()
+                self.assertIn("unknown", output.getvalue())
+                self.assertNotIn("must-not-report", output.getvalue())
+
+    def test_invalid_profiles_cannot_replace_the_failed_measurement(self):
+        for profile in [None, {}, {"diagnostic_only": False, "text": "must-not-report"},
+                        {"diagnostic_only": True, "text": 1},
+                        {"diagnostic_only": True, "text": "must-not-report" * 2000}]:
+            with self.subTest(profile_type=type(profile).__name__):
+                case = self.case()
+                output = io.StringIO()
+                with mock.patch.object(case, "_convert", side_effect=[
+                    self.result(1.39), self.result(1), self.result(1, diagnostic_profile=profile),
+                ]), redirect_stdout(output):
+                    with self.assertRaisesRegex(AssertionError, "only 1.39x"):
+                        case.test_public_convert_parallelizes_rows_without_changing_fitted_artifact()
+                self.assertIn("unknown", output.getvalue())
+                self.assertNotIn("must-not-report", output.getvalue())
+
+    def test_ordinary_probe_clears_ambient_profile_switch(self):
+        completed = SimpleNamespace(returncode=0, stdout=json.dumps(self.result(1)), stderr="")
+        with mock.patch.dict("os.environ", {"TRITIUM_PTQ_DIAGNOSTIC_PROFILE": "1"}, clear=True):
+            with mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run:
+                self.case()._convert(1)
+        self.assertFalse("TRITIUM_PTQ_DIAGNOSTIC_PROFILE" in run.call_args.kwargs["env"])
+
+    def test_diagnostic_probe_reuses_the_exact_installed_program(self):
+        completed = SimpleNamespace(returncode=0, stdout=json.dumps(self.result(1)), stderr="")
+        with mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run:
+            self.case()._convert(4, diagnostic_profile=True)
+        self.assertEqual(run.call_args.args[0], [MODULE.sys.executable, "-c", MODULE._PROBE])
+        self.assertEqual(run.call_args.kwargs["env"]["TRITIUM_PTQ_DIAGNOSTIC_PROFILE"], "1")
+        self.assertEqual(run.call_args.kwargs["env"]["RAYON_NUM_THREADS"], "4")
+
+    def test_profile_summary_is_bounded_path_stripped_and_diagnostic_only(self):
+        import cProfile
+
+        profile = cProfile.Profile()
+        profile.runctx(compile("sum(range(100))", "/private-owner/work/probe.py", "exec"), {}, {})
+        result = MODULE._profile_summary(profile)
+        self.assertTrue(result["diagnostic_only"])
+        self.assertLessEqual(len(result["text"]), 16_000)
+        self.assertNotIn("private-owner", result["text"])
+        namespace = {}
+        exec(MODULE._PROBE.split("\nimport torch\n", 1)[0], namespace)
+        self.assertEqual(namespace["_profile_summary"](profile), result)
+
     def test_inherited_cpu_quota_is_observed_without_reporting_private_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
