@@ -58,7 +58,44 @@ against the existing reference backend without copying neural math.
 
 These fixtures are software correctness evidence only: no official Qwen weights,
 GPU performance, model-quality, complete memory or release qualification.
-Final exact-code test/gate identities are recorded after verification.
+Exact code: `4bcda7da5d0624d39abbc03efbe0474277ecc7a8` (base
+`f95b7d41b904ab7e6307ab35d7df4d6fdbd39b68`). Private ADR candidate commit:
+`5c2f856ded5007bdbd5345d9d14803a3f3b71af5`.
+
+The separately executed exact-code verifier invocation
+`a2b66d0af57b4933973d0569393db70b` reached its terminal exit marker 0 on
+2026-10-10, CPU Intel Core i9-14900K. This is software verification, not an
+independent empirical release clearance. Commands used the project's existing
+SSD Cargo cache and per-run SSD scratch, never a new target cache.
+
+- `cargo test --locked -p tritium-schema -p tritium-format -p tritium-evidence
+  -p tritium-quantize --all-targets`: **734 passed, zero failed, 15 ignored**.
+- `cargo test --locked -p tritium-nn --features tokenizer --test tensor_loading`:
+  **14 passed**, including the actual engine-package/text-runner case.
+- `cargo test --locked -p tritium-cli evidence::tests`: **8 passed**; unrelated
+  CLI tests are filtered, not claimed executed.
+- Total: **756 passed**, zero failed, 15 existing declared artifact/manual
+  ignores. Ten new engine tests are included, not counted twice.
+- Strict rustdoc on schema/format/evidence/quantize and actual bare-metal
+  schema `alloc,serde` compilation pass.
+- `scripts/verify-gates.sh prepush` passes on the clean exact-code tree:
+  formatting, generated JSON Schema drift, no-std foundations, default and
+  all-feature/toolkit-free workspace Clippy, Windows cfg compilation, actionlint.
+  ShellCheck is missing and explicitly warned, not passed.
+
+Initial source-size type-inference/Debug issues and new constant-chunk/manual-
+multiple Clippy errors were corrected without numerical/golden/tolerance changes.
+The initial detached Clippy failure log is retained. The final engine reuses one
+fully validated package view rather than immediately decoding the package twice;
+the final committed tree was retested after that change. Replay inventory checks
+use one ordered tensor comparison per level rather than repeated whole-inventory
+scans for every tensor. Neither change is a measured performance claim.
+
+Custody directory:
+`/home/brianklam/Projects/Tritium/archive/verification/model-engine-4bcda7da-20261010`.
+It retains the committed source archive, candidate ADR, authored full-scope plan,
+scripts/logs and exact-code exit markers. Hash custody is not a replacement for
+independent model reproduction, profile acceptance or public authorization.
 
 ## Full remaining release scope
 
