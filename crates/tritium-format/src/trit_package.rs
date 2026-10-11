@@ -7,7 +7,7 @@ use ciborium::value::{CanonicalValue, Value};
 use tritium_core::DType;
 use tritium_schema::BlobId;
 
-use crate::artifact::PackageId;
+use crate::artifact::{PackageHasher, PackageId};
 
 /// `.trit` file magic.
 pub const TRIT_MAGIC: [u8; 8] = *b"TRITIUM\0";
@@ -228,6 +228,106 @@ pub fn write_trit_package_bounded(
     blobs: &[TritBlob<'_>],
     max_bytes: usize,
 ) -> Result<Vec<u8>, TritPackageError> {
+    let plan = prepare_write(manifest_cbor, blobs, max_bytes)?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(plan.size)
+        .map_err(|_| TritPackageError::AllocationFailed {
+            requested: plan.size,
+        })?;
+    let result: Result<(), core::convert::Infallible> = plan.emit(|bytes| {
+        output.extend_from_slice(bytes);
+        Ok(())
+    });
+    match result {
+        Ok(()) => Ok(output),
+        Err(never) => match never {},
+    }
+}
+
+/// Failure admitting or emitting a package to a caller-owned writer.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum TritPackageWriteError {
+    /// Invalid package input or complete physical byte bound, before any write.
+    Package(TritPackageError),
+    /// Destination failed after zero or more bytes; no success identity is returned.
+    Io(std::io::Error),
+}
+impl fmt::Display for TritPackageWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Package(e) => e.fmt(f),
+            Self::Io(e) => write!(f, "trit package destination failed: {e}"),
+        }
+    }
+}
+impl std::error::Error for TritPackageWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Package(e) => Some(e),
+            Self::Io(e) => Some(e),
+        }
+    }
+}
+
+/// Emit the identical admitted package without retaining a complete output buffer.
+///
+/// Uses the same layout, canonical directory and chunk emitter as the Vec adapter,
+/// and the existing incremental package hasher. All input/complete-size checks
+/// finish before the first destination write. Borrowed inputs and metadata are
+/// retained; this is not full RSS admission or an out-of-core source reader.
+/// Writes at the current destination position, without seeking, flushing, syncing
+/// or publishing. The caller must use an owned pending destination and handle
+/// partial I/O failure before its no-clobber commit point.
+/// # Errors
+/// Package admission leaves the destination untouched. I/O failure may leave
+/// partial output and never returns a successful PackageId.
+pub fn write_trit_package_to(
+    manifest_cbor: &[u8],
+    blobs: &[TritBlob<'_>],
+    max_bytes: usize,
+    destination: &mut impl std::io::Write,
+) -> Result<PackageId, TritPackageWriteError> {
+    let plan =
+        prepare_write(manifest_cbor, blobs, max_bytes).map_err(TritPackageWriteError::Package)?;
+    let mut hash = PackageHasher::new();
+    plan.emit(|bytes| {
+        destination.write_all(bytes)?;
+        hash.update(bytes);
+        Ok(())
+    })
+    .map_err(TritPackageWriteError::Io)?;
+    Ok(hash.finalize())
+}
+
+struct PackageWritePlan<'a> {
+    header: [u8; TRIT_HEADER_BYTES],
+    payloads: Vec<(usize, &'a [u8])>,
+    manifest: &'a [u8],
+    directory: Vec<u8>,
+    footer: [u8; FOOTER_BYTES],
+    size: usize,
+}
+impl PackageWritePlan<'_> {
+    fn emit<E>(&self, mut chunk: impl FnMut(&[u8]) -> Result<(), E>) -> Result<(), E> {
+        chunk(&self.header)?;
+        let padding = [0u8; TRIT_BLOB_ALIGNMENT];
+        for (pad, payload) in &self.payloads {
+            chunk(&padding[..*pad])?;
+            chunk(payload)?;
+        }
+        chunk(self.manifest)?;
+        chunk(&self.directory)?;
+        chunk(&self.footer)
+    }
+}
+
+fn prepare_write<'a>(
+    manifest_cbor: &'a [u8],
+    blobs: &[TritBlob<'a>],
+    max_bytes: usize,
+) -> Result<PackageWritePlan<'a>, TritPackageError> {
     if manifest_cbor.len() > MAX_MANIFEST_BYTES || blobs.len() > MAX_BLOBS {
         return Err(TritPackageError::MetadataLimitExceeded);
     }
@@ -309,38 +409,56 @@ pub fn write_trit_package_bounded(
             limit: max_bytes,
         });
     }
-    let mut output = Vec::new();
-    output
-        .try_reserve_exact(cursor)
-        .map_err(|_| TritPackageError::AllocationFailed { requested: cursor })?;
-    output.resize(TRIT_HEADER_BYTES, 0);
+    let mut payloads = Vec::new();
+    payloads
+        .try_reserve_exact(unique.len())
+        .map_err(|_| TritPackageError::AllocationFailed {
+            requested: unique.len(),
+        })?;
+    let mut position = TRIT_HEADER_BYTES;
     for (digest, (payload, _)) in unique {
         let expected_offset =
             usize::try_from(offsets[&digest]).map_err(|_| TritPackageError::LengthOverflow)?;
-        output.resize(expected_offset, 0);
-        output.extend_from_slice(payload);
+        let pad = expected_offset
+            .checked_sub(position)
+            .ok_or(TritPackageError::InvalidDirectory)?;
+        if pad >= TRIT_BLOB_ALIGNMENT {
+            return Err(TritPackageError::InvalidDirectory);
+        }
+        payloads.push((pad, payload));
+        position = expected_offset
+            .checked_add(payload.len())
+            .ok_or(TritPackageError::LengthOverflow)?;
     }
-    if output.len() != manifest_offset {
+    if position != manifest_offset {
         return Err(TritPackageError::InvalidDirectory);
     }
-    output.extend_from_slice(manifest_cbor);
-    if output.len() != directory_offset {
+    position = position
+        .checked_add(manifest_cbor.len())
+        .ok_or(TritPackageError::LengthOverflow)?;
+    if position != directory_offset {
         return Err(TritPackageError::InvalidDirectory);
     }
-    output.extend_from_slice(&directory);
-    output.extend_from_slice(&TRIT_FOOTER_MAGIC);
-    output.extend_from_slice(blake3::hash(manifest_cbor).as_bytes());
-    output.extend_from_slice(blake3::hash(&directory).as_bytes());
-
-    output[..8].copy_from_slice(&TRIT_MAGIC);
-    output[8..10].copy_from_slice(&TRIT_PACKAGE_MAJOR.to_le_bytes());
-    output[10..12].copy_from_slice(&TRIT_PACKAGE_MINOR.to_le_bytes());
-    output[12..16].copy_from_slice(&0u32.to_le_bytes());
-    write_u64(&mut output, 16, manifest_offset)?;
-    write_u64(&mut output, 24, manifest_cbor.len())?;
-    write_u64(&mut output, 32, directory_offset)?;
-    write_u64(&mut output, 40, directory.len())?;
-    Ok(output)
+    let mut header = [0u8; TRIT_HEADER_BYTES];
+    header[..8].copy_from_slice(&TRIT_MAGIC);
+    header[8..10].copy_from_slice(&TRIT_PACKAGE_MAJOR.to_le_bytes());
+    header[10..12].copy_from_slice(&TRIT_PACKAGE_MINOR.to_le_bytes());
+    write_u64(&mut header, 16, manifest_offset)?;
+    write_u64(&mut header, 24, manifest_cbor.len())?;
+    write_u64(&mut header, 32, directory_offset)?;
+    write_u64(&mut header, 40, directory.len())?;
+    let mut footer = [0u8; FOOTER_BYTES];
+    footer[..8].copy_from_slice(&TRIT_FOOTER_MAGIC);
+    footer[8..40].copy_from_slice(blake3::hash(manifest_cbor).as_bytes());
+    footer[40..].copy_from_slice(blake3::hash(&directory).as_bytes());
+    Ok(PackageWritePlan {
+        header,
+        payloads,
+        manifest: manifest_cbor,
+        directory,
+        footer,
+        size: cursor,
+    })
 }
 
 /// Parse and fully validate a `.trit` package held in memory.
