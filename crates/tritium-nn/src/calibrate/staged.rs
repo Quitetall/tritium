@@ -9,6 +9,8 @@ mod capture;
 pub use capture::StagedCaptureLimits;
 mod recorded;
 pub use recorded::{RecordedStagedCapture, replay_staged_capture};
+mod original;
+pub use original::{RecordedOriginalSalienceCapture, replay_original_salience_capture};
 #[cfg(feature = "tokenizer")]
 mod text;
 #[cfg(feature = "tokenizer")]
@@ -261,6 +263,12 @@ impl DenseCalibrationModel {
         tokens: &[u32],
         observe: &mut ProjectionTapFn<'_>,
     ) -> Result<ValueId, NnError> {
+        self.validate_window(tokens)?;
+        let ids: Vec<_> = self.masters.iter().map(|w| tape.leaf(w.clone())).collect();
+        Ok(forward_observed(tape, &ids, &self.arch, tokens, observe))
+    }
+
+    fn validate_window(&self, tokens: &[u32]) -> Result<(), NnError> {
         if tokens.is_empty()
             || tokens.len() > self.max_window_tokens
             || tokens
@@ -290,7 +298,6 @@ impl DenseCalibrationModel {
             .and_then(|n| n.checked_mul(self.arch.n_head))
             .and_then(|n| n.checked_mul(4))
             .ok_or_else(|| NnError::Backend("staged attention geometry overflows usize".into()))?;
-        let ids: Vec<_> = self.masters.iter().map(|w| tape.leaf(w.clone())).collect();
-        Ok(forward_observed(tape, &ids, &self.arch, tokens, observe))
+        Ok(())
     }
 }

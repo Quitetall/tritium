@@ -58,49 +58,79 @@ impl StagedCalibrationModel {
         {
             return Err(reject("invalid staged text capture limits/windows"));
         }
-        let text_bytes = texts.iter().try_fold(0u64, |sum, text| {
-            sum.checked_add(text.len() as u64)
-                .ok_or_else(|| reject("staged text byte count overflow"))
-        })?;
-        if text_bytes > text_limits.max_text_bytes {
-            return Err(reject("staged text byte limit exceeded"));
-        }
-        let tokenizer_bytes = source
-            .asset(
-                "tokenizer.json",
-                usize::try_from(capture_limits.per_cache.max_payload_bytes)
-                    .map_err(|_| reject("staged tokenizer limit overflows usize"))?,
-            )
-            .map_err(|e| reject(&format!("staged text tokenizer: {e}")))?
-            .into_owned();
-        let config_bytes = source
-            .asset(
-                "tokenizer_config.json",
-                usize::try_from(text_limits.max_tokenizer_config_bytes)
-                    .map_err(|_| reject("staged tokenizer config limit overflows usize"))?,
-            )
-            .map_err(|e| reject(&format!("staged text tokenizer config: {e}")))?
-            .into_owned();
-        let tokenizer = HfJsonTokenizer::from_bytes(&tokenizer_bytes, &config_bytes)?;
-        tokenizer.validate_model_vocab(self.core.arch.vocab)?;
-        tokenizer.validate_capture_windows()?;
-        let mut windows = Vec::new();
         let mut samples = 0u64;
-        for text in texts {
-            let ids = tokenizer.encode(text)?;
-            if ids.len() < 2 || ids.len() - 1 > self.core.max_window_tokens {
-                return Err(reject("invalid encoded staged text window"));
-            }
-            samples = samples
-                .checked_add((ids.len() - 1) as u64)
-                .ok_or_else(|| reject("staged text sample count overflow"))?;
-            if samples > capture_limits.per_cache.max_samples {
-                return Err(reject("staged text sample limit exceeded"));
-            }
-            windows.push(ids);
-        }
-        Ok(windows)
+        encode_checked_text_windows(
+            source,
+            texts,
+            self.core.arch.vocab,
+            TextInputLimits {
+                max_text_bytes: text_limits.max_text_bytes,
+                max_tokenizer_bytes: capture_limits.per_cache.max_payload_bytes,
+                max_tokenizer_config_bytes: text_limits.max_tokenizer_config_bytes,
+            },
+            |ids| {
+                if ids.len() < 2 || ids.len() - 1 > self.core.max_window_tokens {
+                    return Err(reject("invalid encoded staged text window"));
+                }
+                samples = samples
+                    .checked_add((ids.len() - 1) as u64)
+                    .ok_or_else(|| reject("staged text sample count overflow"))?;
+                if samples > capture_limits.per_cache.max_samples {
+                    return Err(reject("staged text sample limit exceeded"));
+                }
+                Ok(())
+            },
+        )
     }
+}
+
+pub(super) struct TextInputLimits {
+    pub max_text_bytes: u64,
+    pub max_tokenizer_bytes: u64,
+    pub max_tokenizer_config_bytes: u64,
+}
+
+// One runtime tokenizer/policy implementation; callers own distinct A/B row admission.
+pub(super) fn encode_checked_text_windows(
+    source: &mut dyn WeightSource,
+    texts: &[&str],
+    vocab: usize,
+    limits: TextInputLimits,
+    mut admit: impl FnMut(&[u32]) -> Result<(), NnError>,
+) -> Result<Vec<Vec<u32>>, NnError> {
+    let text_bytes = texts.iter().try_fold(0u64, |sum, text| {
+        sum.checked_add(text.len() as u64)
+            .ok_or_else(|| reject("staged text byte count overflow"))
+    })?;
+    if text_bytes > limits.max_text_bytes {
+        return Err(reject("staged text byte limit exceeded"));
+    }
+    let tokenizer_bytes = source
+        .asset(
+            "tokenizer.json",
+            usize::try_from(limits.max_tokenizer_bytes)
+                .map_err(|_| reject("staged tokenizer limit overflows usize"))?,
+        )
+        .map_err(|e| reject(&format!("staged text tokenizer: {e}")))?
+        .into_owned();
+    let config_bytes = source
+        .asset(
+            "tokenizer_config.json",
+            usize::try_from(limits.max_tokenizer_config_bytes)
+                .map_err(|_| reject("staged tokenizer config limit overflows usize"))?,
+        )
+        .map_err(|e| reject(&format!("staged text tokenizer config: {e}")))?
+        .into_owned();
+    let tokenizer = HfJsonTokenizer::from_bytes(&tokenizer_bytes, &config_bytes)?;
+    tokenizer.validate_model_vocab(vocab)?;
+    tokenizer.validate_capture_windows()?;
+    let mut windows = Vec::new();
+    for text in texts {
+        let ids = tokenizer.encode(text)?;
+        admit(&ids)?;
+        windows.push(ids);
+    }
+    Ok(windows)
 }
 
 fn reject(message: &str) -> NnError {

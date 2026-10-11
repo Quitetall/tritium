@@ -6,6 +6,9 @@ use tritium_quantize::engine::{ObservedWeightSource, SafeTensorsWeightSource};
 use tritium_schema::ScalePrecision;
 use tritium_train::Tape;
 
+#[path = "original/captured.rs"]
+mod captured;
+
 fn limits() -> StagedCalibrationLimits {
     StagedCalibrationLimits {
         max_config_bytes: 16_000,

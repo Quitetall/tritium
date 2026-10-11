@@ -34,8 +34,9 @@ mod staged;
 #[cfg(feature = "tokenizer")]
 pub use staged::StagedTextCaptureLimits;
 pub use staged::{
-    RecordedStagedCapture, SourceCalibrationModel, StagedCalibrationLimits, StagedCalibrationModel,
-    StagedCaptureLimits, replay_staged_capture,
+    RecordedOriginalSalienceCapture, RecordedStagedCapture, SourceCalibrationModel,
+    StagedCalibrationLimits, StagedCalibrationModel, StagedCaptureLimits,
+    replay_original_salience_capture, replay_staged_capture,
 };
 
 use crate::{Mlp, ModelRunner, Projection};
