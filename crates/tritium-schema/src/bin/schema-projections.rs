@@ -49,6 +49,38 @@ fn main() -> Result<(), Box<dyn Error>> {
     project!(tritium_schema::OriginalSourceId, "original-source-id");
     project!(tritium_schema::CalibrationCacheId, "calibration-cache-id");
     project!(
+        tritium_schema::OriginalSalienceCaptureProfile,
+        "original-salience-capture-profile"
+    );
+    project!(
+        tritium_schema::OriginalSalienceCaptureLimits,
+        "original-salience-capture-limits"
+    );
+    project!(
+        tritium_schema::OriginalSalienceCaptureInput,
+        "original-salience-capture-input"
+    );
+    project!(
+        tritium_schema::OriginalSalienceCapturePair,
+        "original-salience-capture-pair"
+    );
+    project!(
+        tritium_schema::OriginalSalienceCapturePlan,
+        "original-salience-capture-plan"
+    );
+    project!(
+        tritium_schema::OriginalSalienceCaptureStarted,
+        "original-salience-capture-started"
+    );
+    project!(
+        tritium_schema::OriginalSalienceCaptureOutput,
+        "original-salience-capture-output"
+    );
+    project!(
+        tritium_schema::OriginalSalienceCaptureCompleted,
+        "original-salience-capture-completed"
+    );
+    project!(
         tritium_schema::CalibrationCaptureProfile,
         "calibration-capture-profile"
     );

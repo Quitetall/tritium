@@ -10,7 +10,7 @@ use serde::Serialize;
 use tritium_evidence::{
     CalibratedFitReceiptView, CalibratedQuantizationReceiptView, CalibrationCaptureView,
     DirectFitReceiptView, EventRegistration, EvidenceEvent, EvidenceRecorder, ModelLoadReceiptView,
-    QuantizationReceiptView, SalienceTransformView, verify_jsonl,
+    OriginalSalienceCaptureView, QuantizationReceiptView, SalienceTransformView, verify_jsonl,
 };
 
 /// Evidence detail level for a CLI invocation.
@@ -212,6 +212,12 @@ pub(crate) fn run(command: EvidenceCommand) -> anyhow::Result<()> {
             path.display()
         )
     })?;
+    OriginalSalienceCaptureView::fold(&verified).map_err(|error| {
+        anyhow::anyhow!(
+            "verify original salience capture view {}: {error}",
+            path.display()
+        )
+    })?;
     if view {
         println!("{}", serde_json::to_string_pretty(&verified.events)?);
     } else {
@@ -357,6 +363,85 @@ mod tests {
         std::fs::write(&path, recorded.evidence.jsonl()).unwrap();
         run(EvidenceCommand::Verify { path: path.clone() }).unwrap();
         run(EvidenceCommand::View { path: path.clone() }).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn original_salience_cli_checks_structural_context_not_numerical_truth() {
+        use tritium_schema::*;
+        // Actual original content observation, but synthetic capture claims:
+        // this tests CLI structural inspection, never a numerical producer.
+        let transformed = actual_transform();
+        let observation = transformed.source.observation();
+        let operation = &observation.plan.operations[0];
+        let plan = OriginalSalienceCapturePlan {
+            architecture: observation.plan.architecture.clone(),
+            source: observation.original_source,
+            tensors: observation.original_tensors.clone(),
+            assets: observation.assets.clone(),
+            profile: OriginalSalienceCaptureProfile::AllTokenF64SecondMomentV1,
+            pairs: vec![OriginalSalienceCapturePair {
+                name: operation.name.clone(),
+                projections: operation.projections.clone(),
+                inverse: operation.inverse.clone(),
+                inverse_axis: operation.inverse_axis,
+                channels: operation.moments.channels,
+            }],
+            input: OriginalSalienceCaptureInput::Tokens {
+                windows: vec![vec![0]],
+            },
+            limits: OriginalSalienceCaptureLimits {
+                max_source_bytes: 128,
+                max_asset_bytes: 128,
+                max_config_bytes: 128,
+                max_dense_bytes: 128,
+                max_window_tokens: 1,
+                max_windows: 1,
+                max_total_tokens: 1,
+                max_moment_bytes: 16,
+                max_text_bytes: 0,
+                max_tokenizer_config_bytes: 0,
+            },
+        };
+        let mut completion = OriginalSalienceCaptureCompleted {
+            windows: vec![vec![0]],
+            outputs: vec![OriginalSalienceCaptureOutput {
+                operation: operation.name.clone(),
+                moments: operation.moments.clone(),
+            }],
+        };
+        let seal = |completion: &OriginalSalienceCaptureCompleted| {
+            let mut recorder = EvidenceRecorder::new(
+                "cli-original-structural",
+                [
+                    tritium_evidence::ORIGINAL_SALIENCE_CAPTURE_STARTED_REGISTRATION,
+                    tritium_evidence::ORIGINAL_SALIENCE_CAPTURE_COMPLETED_REGISTRATION,
+                ],
+            )
+            .unwrap();
+            recorder
+                .emit(
+                    "salience",
+                    None,
+                    0,
+                    &OriginalSalienceCaptureStarted { plan: plan.clone() },
+                )
+                .unwrap();
+            recorder.emit("salience", None, 1, completion).unwrap();
+            recorder.seal().unwrap()
+        };
+        let path = temp_log();
+        std::fs::write(&path, seal(&completion).jsonl()).unwrap();
+        run(EvidenceCommand::Verify { path: path.clone() }).unwrap();
+        run(EvidenceCommand::View { path: path.clone() }).unwrap();
+        // A different moment digest with a valid chain is still only a claim.
+        completion.outputs[0].moments.content = BlobId::from_bytes([7; 32]);
+        std::fs::write(&path, seal(&completion).jsonl()).unwrap();
+        run(EvidenceCommand::Verify { path: path.clone() }).unwrap();
+        completion.outputs[0].moments.rows = 2;
+        std::fs::write(&path, seal(&completion).jsonl()).unwrap();
+        assert!(run(EvidenceCommand::Verify { path: path.clone() }).is_err());
+        assert!(run(EvidenceCommand::View { path: path.clone() }).is_err());
         std::fs::remove_file(path).unwrap();
     }
 

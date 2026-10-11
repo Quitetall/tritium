@@ -210,28 +210,15 @@ impl SalienceTransformPlan {
             statistics = statistics
                 .checked_add(op.moments.channels.checked_mul(8).ok_or(E::Statistics)?)
                 .ok_or(E::Statistics)?;
-            let inverse = self.tensor(&op.inverse)?;
-            let inverse_ok = match op.inverse_axis {
-                SalienceInverseAxis::NormChannels => inverse.shape == [op.moments.channels],
-                SalienceInverseAxis::LinearOutputRows => {
-                    inverse.shape.len() == 2 && inverse.shape[0] == op.moments.channels
-                }
-            };
-            if !inverse_ok {
-                return Err(E::Pair);
-            }
-            let mut members = BTreeSet::from([op.inverse.as_str()]);
-            let mut values = elements(inverse)?;
+            let values = pair_geometry(
+                |name| self.tensor(name),
+                &op.projections,
+                &op.inverse,
+                op.inverse_axis,
+                op.moments.channels,
+            )?;
             touched.insert(op.inverse.as_str());
             for name in &op.projections {
-                let projection = self.tensor(name)?;
-                if !members.insert(name.as_str())
-                    || projection.shape.len() != 2
-                    || projection.shape[1] != op.moments.channels
-                {
-                    return Err(E::Pair);
-                }
-                values = values.checked_add(elements(projection)?).ok_or(E::Limit)?;
                 touched.insert(name.as_str());
             }
             // Decoded f32 values + replacement encoded values + RMS/scales.
@@ -278,6 +265,40 @@ impl SalienceTransformPlan {
             .map(|i| &self.tensors[i])
             .map_err(|_| SalienceTransformPlanError::Pair)
     }
+}
+// One geometry implementation for transform and original-capture requests.
+// This checks interpretations, not whether a pair exists in an executable graph.
+pub(crate) fn pair_geometry<'a>(
+    lookup: impl Fn(&str) -> Result<&'a QuantSourceTensor, SalienceTransformPlanError>,
+    projections: &[String],
+    inverse: &str,
+    axis: SalienceInverseAxis,
+    channels: u64,
+) -> Result<u64, SalienceTransformPlanError> {
+    use SalienceTransformPlanError as E;
+    let partner = lookup(inverse)?;
+    let valid = match axis {
+        SalienceInverseAxis::NormChannels => partner.shape == [channels],
+        SalienceInverseAxis::LinearOutputRows => {
+            partner.shape.len() == 2 && partner.shape[0] == channels
+        }
+    };
+    if channels == 0 || projections.is_empty() || !valid {
+        return Err(E::Pair);
+    }
+    let mut members = BTreeSet::from([inverse]);
+    let mut values = elements(partner)?;
+    for name in projections {
+        let projection = lookup(name)?;
+        if !members.insert(name.as_str())
+            || projection.shape.len() != 2
+            || projection.shape[1] != channels
+        {
+            return Err(E::Pair);
+        }
+        values = values.checked_add(elements(projection)?).ok_or(E::Limit)?;
+    }
+    Ok(values)
 }
 fn elements(tensor: &QuantSourceTensor) -> Result<u64, SalienceTransformPlanError> {
     let bytes = tensor

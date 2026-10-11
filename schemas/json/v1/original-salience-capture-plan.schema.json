@@ -1,0 +1,378 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OriginalSalienceCapturePlan",
+  "description": "Controller-derived complete original content and graph context.",
+  "type": "object",
+  "properties": {
+    "architecture": {
+      "description": "Actual raw-source architecture, not a caller-owned Arch.",
+      "type": "string"
+    },
+    "assets": {
+      "description": "Complete sorted raw asset bindings, including config and tokenizer.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/NamedAssetDigest"
+      }
+    },
+    "input": {
+      "description": "Exact input/context boundaries, private when raw text is used.",
+      "$ref": "#/$defs/OriginalSalienceCaptureInput"
+    },
+    "limits": {
+      "description": "Actual logical admission, separately bounded during cold replay.",
+      "$ref": "#/$defs/OriginalSalienceCaptureLimits"
+    },
+    "pairs": {
+      "description": "Complete ordered actual graph pairs; structural geometry is not graph proof.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/OriginalSalienceCapturePair"
+      }
+    },
+    "profile": {
+      "description": "One fixed all-token ordered forward-only reducer.",
+      "$ref": "#/$defs/OriginalSalienceCaptureProfile"
+    },
+    "source": {
+      "description": "Complete stored-byte A identity; the typed view rederives it.",
+      "$ref": "#/$defs/OriginalSourceId"
+    },
+    "tensors": {
+      "description": "Complete sorted raw interpretations and content bindings.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/QuantSourceBinding"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "architecture",
+    "source",
+    "tensors",
+    "assets",
+    "profile",
+    "pairs",
+    "input",
+    "limits"
+  ],
+  "$defs": {
+    "BlobId": {
+      "description": "Content identity for stored tensor or asset bytes.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "NamedAssetDigest": {
+      "description": "Exact named asset-content binding in the candidate model preimage.",
+      "type": "object",
+      "properties": {
+        "content": {
+          "description": "Exact stored asset-content digest, not a shard/package identity.",
+          "$ref": "#/$defs/BlobId"
+        },
+        "name": {
+          "description": "Asset basename; names affect model semantics.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "content"
+      ]
+    },
+    "OriginalSalienceCaptureInput": {
+      "description": "Exact ordered inputs. Tokens are all inputs, never next-token targets.",
+      "oneOf": [
+        {
+          "description": "Complete pretokenized nonempty windows.",
+          "type": "object",
+          "properties": {
+            "Tokens": {
+              "type": "object",
+              "properties": {
+                "windows": {
+                  "description": "Every token is executed, in this exact order and context partition.",
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer",
+                      "format": "uint32",
+                      "minimum": 0
+                    }
+                  }
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "windows"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Tokens"
+          ]
+        },
+        {
+          "description": "Exact private raw text, encoded without special tokens/template/fallback.",
+          "type": "object",
+          "properties": {
+            "RawText": {
+              "type": "object",
+              "properties": {
+                "windows": {
+                  "description": "UTF-8 input windows, without padding or truncation.",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "windows"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "RawText"
+          ]
+        }
+      ]
+    },
+    "OriginalSalienceCaptureLimits": {
+      "description": "Logical input/master/moment caps, not parser, tape, filesystem or full RSS admission.",
+      "type": "object",
+      "properties": {
+        "max_asset_bytes": {
+          "description": "Complete raw asset payload cap for actual source observation.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_config_bytes": {
+          "description": "Config bytes before parsing.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_dense_bytes": {
+          "description": "Aggregate retained widened f32 master bytes.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_moment_bytes": {
+          "description": "Aggregate retained raw f64 moment-vector bytes.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_source_bytes": {
+          "description": "Complete raw tensor payload cap for actual source observation.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_text_bytes": {
+          "description": "Aggregate exact UTF-8 text bytes; zero for token-ID input.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_tokenizer_config_bytes": {
+          "description": "Actual tokenizer_config.json bytes; zero for token-ID input.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_total_tokens": {
+          "description": "Aggregate executed tokens/rows, without shared-consumer multiplication.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_window_tokens": {
+          "description": "Every token in one context, including its final token.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_windows": {
+          "description": "Complete number of ordered contexts.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max_source_bytes",
+        "max_asset_bytes",
+        "max_config_bytes",
+        "max_dense_bytes",
+        "max_window_tokens",
+        "max_windows",
+        "max_total_tokens",
+        "max_moment_bytes",
+        "max_text_bytes",
+        "max_tokenizer_config_bytes"
+      ]
+    },
+    "OriginalSalienceCapturePair": {
+      "description": "Ordered actual graph pair interpretation, without fabricated moment bindings.",
+      "type": "object",
+      "properties": {
+        "channels": {
+          "description": "Actual input columns/partner output channels.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "inverse": {
+          "description": "Actual preceding norm or linear output-row partner.",
+          "type": "string"
+        },
+        "inverse_axis": {
+          "description": "Explicit partner axis.",
+          "$ref": "#/$defs/SalienceInverseAxis"
+        },
+        "name": {
+          "description": "Unique logical operation name, in graph execution order.",
+          "type": "string"
+        },
+        "projections": {
+          "description": "Exact raw matrices sharing one observed input, without duplicate accumulation.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "projections",
+        "inverse",
+        "inverse_axis",
+        "channels"
+      ]
+    },
+    "OriginalSalienceCaptureProfile": {
+      "description": "Fixed ordered legacy reducer; no loss, backward, weighting or averaging.",
+      "oneOf": [
+        {
+          "description": "Every input token, f32 activation widened to f64, ordered per-channel x*x sums.",
+          "type": "string",
+          "const": "AllTokenF64SecondMomentV1"
+        }
+      ]
+    },
+    "OriginalSourceId": {
+      "description": "Candidate identity of original named tensor/asset content, not fitted content or provenance.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "QuantSourceBinding": {
+      "description": "Actual original raw tensor-byte binding computed by the engine itself.",
+      "type": "object",
+      "properties": {
+        "content": {
+          "description": "BLAKE3 of exact original raw bytes; not original container/HF identity.",
+          "$ref": "#/$defs/BlobId"
+        },
+        "source": {
+          "description": "Original interpretation, not fitted layout.",
+          "$ref": "#/$defs/QuantSourceTensor"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "content"
+      ]
+    },
+    "QuantSourceTensor": {
+      "description": "Original tensor interpretation, never an adapter-supplied content hash.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Exact logical tensor name.",
+          "type": "string"
+        },
+        "precision": {
+          "description": "Original stored float precision, before widening or fitting.",
+          "$ref": "#/$defs/ScalePrecision"
+        },
+        "shape": {
+          "description": "Positive row-major dimensions in the original source.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "shape",
+        "precision"
+      ]
+    },
+    "SalienceInverseAxis": {
+      "description": "Explicit axis of the graph partner divided by each stored scale.",
+      "oneOf": [
+        {
+          "description": "Rank-one preceding norm, one channel per projection input column.",
+          "type": "string",
+          "const": "NormChannels"
+        },
+        {
+          "description": "Rank-two linear partner, one output row per projection input column.",
+          "type": "string",
+          "const": "LinearOutputRows"
+        }
+      ]
+    },
+    "ScalePrecision": {
+      "description": "Precision used to store additive plane scales.",
+      "oneOf": [
+        {
+          "description": "IEEE binary16.",
+          "type": "string",
+          "const": "F16"
+        },
+        {
+          "description": "Brain floating-point 16-bit.",
+          "type": "string",
+          "const": "Bf16"
+        },
+        {
+          "description": "IEEE binary32.",
+          "type": "string",
+          "const": "F32"
+        }
+      ]
+    }
+  }
+}

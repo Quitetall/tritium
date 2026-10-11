@@ -67,6 +67,11 @@ mod calibration_capture;
 pub use calibration_capture::*;
 
 #[cfg(feature = "alloc")]
+mod original_salience_capture;
+#[cfg(feature = "alloc")]
+pub use original_salience_capture::*;
+
+#[cfg(feature = "alloc")]
 mod calibrated_fit_observation;
 #[cfg(feature = "alloc")]
 pub use calibrated_fit_observation::*;

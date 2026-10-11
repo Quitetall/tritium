@@ -27,10 +27,15 @@ mod calibrated_fit;
 pub use calibrated_fit::{CALIBRATED_LEVELS_FITTED_REGISTRATION, CalibratedFitReceiptView};
 
 mod calibration_capture;
+mod original_salience_capture;
 mod original_source;
 pub use calibration_capture::{
     CALIBRATION_CAPTURE_COMPLETED_REGISTRATION, CALIBRATION_CAPTURE_STARTED_REGISTRATION,
     CalibrationCaptureView,
+};
+pub use original_salience_capture::{
+    ORIGINAL_SALIENCE_CAPTURE_COMPLETED_REGISTRATION,
+    ORIGINAL_SALIENCE_CAPTURE_STARTED_REGISTRATION, OriginalSalienceCaptureView,
 };
 mod salience_transform;
 pub use salience_transform::{
