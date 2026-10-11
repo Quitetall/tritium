@@ -1,4 +1,4 @@
-//! Filesystem inputs for the actual shared model conversion engine (ADR0063).
+//! Shared convert/quantize filesystem receiver for the actual engine (ADR0063).
 //! No fitting, identities, package assembly or publication logic lives here.
 use crate::stage_input::{StageArgs, read_bounded, regular_file};
 use anyhow::{Context, Result, bail, ensure};

@@ -30,6 +30,22 @@ tritium convert --plan request.json --source-shard model.safetensors \
 tritium evidence verify new-output/evidence.jsonl
 ```
 
+`quantize` receives the same typed plans and filesystem bindings through that
+same engine adapter. Use `tritium quantize --plan ... --output new-output`
+(`--out` is an alias), or `--calibrated-plan` with its exact cache inventory.
+The original-captured stage mode below is also available through `quantize`.
+Typed output is a new `model.trit`/`evidence.jsonl` directory, not a `.tslb` file.
+`--conversion-run-id` keeps its meaning; outer lifecycle summaries identify the
+chosen command and cannot disable the sealed engine log.
+
+Typed `quantize` rejects legacy `--input`/`--model`, `--bpw`, `--scale-group`,
+`--sensitivity`, `--fisher`, `--format`, `--ladder`, `--planes`, `--group`,
+`--grid` and `--rotate`, even when explicitly set to their legacy defaults.
+Legacy SALT geometric/ITF defaults and execution remain unchanged. This does
+not infer plans from old recipes or retire that route: legacy numerical/receipt
+parity, model-aware Qwen/Python migration and both campaign migrations remain
+separate prerequisites to full consolidation.
+
 `request.json` is the generated Rust `QuantPlan` JSON representation, not a
 CLI-owned recipe. For the distinct cache-bound `CalibratedQuantPlan`, use
 `--calibrated-plan` instead and repeat `--calibration-cache TENSOR=cache.trit`

@@ -325,12 +325,24 @@ enum Command {
         #[arg(long, default_value_t = 16)]
         grid: usize,
     },
-    /// SALT-quantize an fp safetensors model to a SALT bundle.
+    /// Quantize through an explicit typed model plan, or write a legacy SALT bundle.
+    #[command(group(clap::ArgGroup::new("conversion_source")
+        .args(["source_shard", "original_captured_stage"])
+        .requires("conversion_plan")
+        .multiple(false)))]
+    #[command(group(clap::ArgGroup::new("conversion_plan")
+        .args(["plan", "calibrated_plan"])
+        .multiple(false)
+        .conflicts_with_all(["input", "bpw", "scale_group", "sensitivity", "fisher",
+            "format", "ladder", "planes", "group", "grid", "rotate"])))]
     Quantize {
         /// Path to the fp16/bf16/f32 `.safetensors` source model.
-        #[arg(long, alias = "model")]
-        input: PathBuf,
-        /// Path to write the SALT bundle (`.tslb`).
+        #[arg(long, alias = "model", required_unless_present = "conversion_plan")]
+        input: Option<PathBuf>,
+        /// Explicit typed-plan receiver shared with convert; no legacy recipe remapping.
+        #[command(flatten)]
+        plan: Box<convert_plan::PlanArgs>,
+        /// Legacy SALT bundle file, or a new model.trit/evidence.jsonl directory with a plan.
         #[arg(long, alias = "out")]
         output: PathBuf,
         /// Target average bits-per-weight (`1.585` = all base ternary … `~4.75` at T=3).
@@ -772,6 +784,7 @@ fn main() -> anyhow::Result<()> {
             }
             Command::Quantize {
                 input,
+                plan,
                 output,
                 bpw,
                 scale_group,
@@ -783,25 +796,32 @@ fn main() -> anyhow::Result<()> {
                 group,
                 grid,
                 rotate,
-            } => quantize::run(
-                &input,
-                &output,
-                bpw,
-                scale_group,
-                sensitivity,
-                fisher.as_deref(),
-                format,
-                ladder,
-                quantize_ladder::LadderConfig {
-                    planes,
-                    group,
-                    grid,
-                    // Opt-in here, unlike `convert`: two of this command's three containers cannot
-                    // record a rotation, so the default has to be the one every format can express.
-                    // `quantize::run` refuses the combination rather than writing it silently wrong.
-                    rotate,
-                },
-            )?,
+            } => {
+                if plan.enabled() {
+                    convert_plan::run(&plan, &output)?;
+                } else {
+                    quantize::run(
+                        input
+                            .as_deref()
+                            .context("legacy quantize requires --input")?,
+                        &output,
+                        bpw,
+                        scale_group,
+                        sensitivity,
+                        fisher.as_deref(),
+                        format,
+                        ladder,
+                        quantize_ladder::LadderConfig {
+                            planes,
+                            group,
+                            grid,
+                            // Opt-in here: two legacy containers cannot record rotation.
+                            // The existing quantizer refuses those combinations.
+                            rotate,
+                        },
+                    )?;
+                }
+            }
         }
         Ok(())
     })();
@@ -909,6 +929,74 @@ mod tests {
                 )
                 .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn typed_quantize_reuses_plan_contract_and_rejects_legacy_overrides() {
+        let base = [
+            "tritium",
+            "quantize",
+            "--plan",
+            "plan.json",
+            "--source-shard",
+            "weights.safetensors",
+            "--conversion-run-id",
+            "stable",
+            "--output",
+            "out",
+        ];
+        let cli = Cli::try_parse_from(base).expect("typed quantize");
+        assert!(
+            matches!(cli.command, Command::Quantize { input: None, plan, .. } if plan.enabled())
+        );
+        for extra in [
+            vec!["--input", "weights"],
+            vec!["--model", "weights"],
+            vec!["--bpw", "2"],
+            vec!["--scale-group", "block"],
+            vec!["--sensitivity", "uniform"],
+            vec!["--fisher", "fisher"],
+            vec!["--format", "sidecar"],
+            vec!["--ladder", "geometric"],
+            vec!["--planes", "4"],
+            vec!["--group", "256"],
+            vec!["--grid", "16"],
+            vec!["--rotate"],
+            vec!["--calibrated-plan", "cal.json"],
+            vec!["--calibration-cache", "weight=cache.trit"],
+        ] {
+            assert!(
+                Cli::try_parse_from(base.into_iter().chain(extra.iter().copied())).is_err(),
+                "typed quantize accepted legacy/mixed flag: {extra:?}"
+            );
+        }
+        for missing in [
+            "--plan",
+            "--source-shard",
+            "--conversion-run-id",
+            "--output",
+        ] {
+            let mut args = base.to_vec();
+            let i = args.iter().position(|a| *a == missing).unwrap();
+            args.drain(i..i + 2);
+            assert!(Cli::try_parse_from(args).is_err(), "missing {missing}");
+        }
+        let legacy = [
+            "tritium", "quantize", "--input", "weights", "--output", "bundle",
+        ];
+        assert!(matches!(Cli::try_parse_from(legacy).unwrap().command,
+            Command::Quantize { input: Some(_), plan, .. } if !plan.enabled()));
+        for extra in [
+            vec!["--asset", "config.json=config.json"],
+            vec!["--max-plan-bytes", "10"],
+            vec!["--input-gram", "weight=gram"],
+            vec!["--calibration-cache", "weight=cache"],
+            vec!["--conversion-run-id", "stable"],
+            vec!["--source-shard", "weights"],
+            vec!["--max-evidence-bytes", "10"],
+        ] {
+            assert!(Cli::try_parse_from(legacy.into_iter().chain(extra.iter().copied())).is_err());
         }
     }
 

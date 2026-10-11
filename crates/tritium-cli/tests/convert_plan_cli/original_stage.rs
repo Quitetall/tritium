@@ -465,6 +465,104 @@ fn logits(model: &JoinedSalienceModel<'_>) -> Vec<Vec<f32>> {
 }
 
 #[test]
+fn typed_quantize_original_captured_stage_matches_convert_engine_and_decode() {
+    for precision in [
+        ScalePrecision::F32,
+        ScalePrecision::F16,
+        ScalePrecision::Bf16,
+    ] {
+        let f = Fixture::new(precision);
+        let mut args = f.args("quantized");
+        args[0] = "quantize".into();
+        let result = run(&args);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let c = std::fs::read(f.dir.0.join("quantized/model.trit")).unwrap();
+        let fit = std::fs::read_to_string(f.dir.0.join("quantized/evidence.jsonl")).unwrap();
+        assert_eq!(c, f.expected);
+        assert_eq!(fit, f.fit);
+        let stage = StagedSalienceSource::open_original_captured(
+            &f.b,
+            &f.transform,
+            &f.original,
+            stage_limits(),
+        )
+        .unwrap();
+        let log = verify_jsonl(&fit).unwrap();
+        let expected_log = verify_jsonl(&f.fit).unwrap();
+        let model = JoinedSalienceModel::open_original_captured(
+            &c,
+            &stage,
+            &f.capture,
+            &log,
+            conversion_limits(),
+        )
+        .unwrap();
+        let expected = JoinedSalienceModel::open_original_captured(
+            &f.expected,
+            &stage,
+            &f.capture,
+            &expected_log,
+            conversion_limits(),
+        )
+        .unwrap();
+        assert_eq!(logits(&model), logits(&expected));
+        assert!(!run(&args).status.success());
+        assert_eq!(
+            std::fs::read(f.dir.0.join("quantized/model.trit")).unwrap(),
+            c
+        );
+        replace(&mut args, "--out", f.dir.0.join("rejected"));
+        for (flag, value) in [
+            ("--input", "raw"),
+            ("--model", "raw"),
+            ("--format", "sidecar"),
+            ("--ladder", "geometric"),
+            ("--source-shard", "raw"),
+            ("--asset", "config.json=raw"),
+            ("--input-gram", "weight=raw"),
+            ("--max-evidence-bytes", "1"),
+        ] {
+            let mut bad = args.clone();
+            bad.extend([flag.into(), value.into()]);
+            f.rejected(&bad);
+        }
+        for flag in [
+            "--original-captured-stage",
+            "--transform-evidence",
+            "--original-salience-evidence",
+            "--capture-evidence",
+            "--stage-limits",
+            "--conversion-limits",
+            "--calibrated-plan",
+        ] {
+            let mut bad = args.clone();
+            let i = bad.iter().position(|arg| arg == flag).unwrap();
+            bad.drain(i..i + 2);
+            f.rejected(&bad);
+        }
+        // A valid command with a foreign actual cache still cannot publish C.
+        let binding = args
+            .iter()
+            .position(|arg| arg == "--calibration-cache")
+            .unwrap();
+        args[binding + 1] = format!(
+            "{}=missing",
+            args[binding + 1]
+                .to_string_lossy()
+                .split('=')
+                .next()
+                .unwrap()
+        )
+        .into();
+        f.rejected(&args);
+    }
+}
+
+#[test]
 fn original_captured_command_matches_actual_fitter_and_loaded_decode_in_all_precisions() {
     for precision in [
         ScalePrecision::F32,
