@@ -61,6 +61,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         "calibration-cache-binding"
     );
     project!(PackageId, "package-id");
+    project!(
+        tritium_schema::CalibrationCacheManifest,
+        "calibration-cache-manifest"
+    );
     project!(PlaneAllocation, "plane-allocation");
     project!(PlaneCodec, "plane-codec");
     project!(PlaneRelation, "plane-relation");

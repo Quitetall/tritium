@@ -1,6 +1,8 @@
 //! Bounded paired payload capture, final identity, then existing reducer replay.
 //! Byte verification is not independent proof of forward/backward/recipe execution.
 
+mod transport;
+
 use super::{
     CalibratedTensor, CalibrationBatch, CalibrationCollector, CalibrationError, CalibrationInput,
     CalibrationOutputBatch,
@@ -15,6 +17,10 @@ use tritium_schema::{
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum CalibrationCacheError {
+    /// Existing canonical package or typed manifest verification failed.
+    Transport(String),
+    /// Actual reconstructed content differs from the expected or stored binding.
+    Binding,
     /// Invalid declared context or budget.
     Plan(CalibrationPlanError),
     /// Empty tokenizer/objective bytes or no captured window.

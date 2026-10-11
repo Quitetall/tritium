@@ -284,3 +284,50 @@ pub struct CalibrationCacheBinding {
     /// Actual retained payload bytes, excluding metadata/capacity overhead and full RSS.
     pub payload_bytes: u64,
 }
+
+/// Candidate typed manifest carried by the existing `.trit` cache transport.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
+pub struct CalibrationCacheManifest {
+    /// Claimed binding; readers must reconstruct it from actual payload bytes.
+    pub binding: CalibrationCacheBinding,
+    /// Ordered declared model-context lengths, not physical replay chunks.
+    pub window_samples: Vec<u64>,
+}
+impl CalibrationCacheManifest {
+    /// Check structural counts and both producer and receiving logical admission.
+    /// This does not verify payloads, identities or full process RSS.
+    pub fn validate(&self, limits: CalibrationCacheLimits) -> Result<(), CalibrationPlanError> {
+        self.binding.request.validate()?;
+        let b = &self.binding;
+        let declared = b.request.limits;
+        if self.window_samples.is_empty()
+            || self.window_samples.len() as u64 != b.windows
+            || self.window_samples.contains(&0)
+            || self
+                .window_samples
+                .iter()
+                .try_fold(0u64, |sum, n| sum.checked_add(*n))
+                != Some(b.samples)
+            || b.request.sample_start.checked_add(b.samples).is_none()
+        {
+            return Err(CalibrationPlanError::Source);
+        }
+        if [declared, limits].iter().any(|l| {
+            l.max_payload_bytes == 0
+                || l.max_samples == 0
+                || l.max_windows == 0
+                || b.payload_bytes > l.max_payload_bytes
+                || b.samples > l.max_samples
+                || b.windows > l.max_windows
+        }) {
+            return Err(CalibrationPlanError::Budget);
+        }
+        Ok(())
+    }
+}
