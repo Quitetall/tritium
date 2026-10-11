@@ -49,6 +49,7 @@ mod gguf_write;
 mod i2s;
 mod i2s_int8;
 mod le_cursor;
+mod legacy_salt_import;
 mod q2_0;
 mod rows;
 mod runtime_evidence;
@@ -108,6 +109,7 @@ pub use i2s::{
 pub use i2s_int8::{
     I2sInt8Weights, IMMA_K, IMMA_N, IMMA_WTILE_BYTES, convert_i2s_to_int8, convert_i2s_to_tq2_0,
 };
+pub use legacy_salt_import::{SaltTensorImportError, SaltTensorImportLimits, import_salt_rows};
 pub use q2_0::{
     Q2_0_BLOCK_BYTES, Q2_0_GROUP_SIZE, pack_q2_0_block, pack_q2_0_row, q2_0_num_blocks,
     unpack_q2_0_block, unpack_q2_0_row,
