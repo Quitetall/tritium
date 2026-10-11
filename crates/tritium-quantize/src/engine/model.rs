@@ -191,7 +191,41 @@ impl Engine {
         plan: &QuantPlan,
         source: &mut dyn WeightSource,
         sink: &mut dyn TensorSink,
+        recorder: EvidenceRecorder,
+    ) -> Result<QuantizedModel, QuantEngineError> {
+        Self::run_impl(plan, source, sink, recorder, None)
+    }
+
+    /// Convert only if the actual complete original inventory matches preparation.
+    ///
+    /// The expected identity should come from actual `observe_source` execution.
+    /// Conversion derives its own identity from bytes actually consumed and checks
+    /// equality before allocating/publishing the final package. Fitting may already
+    /// have occurred when a mismatch is detected; there is no second original-byte
+    /// read or fallback. Existing unguarded conversion retains its original semantics.
+    ///
+    /// This runtime predicate does not lock mutable sources, verify calibration
+    /// cache/objective/data, or add a recorded expected-identity claim to the v1 log.
+    /// The existing view still exposes actual source identity; audited metric/package
+    /// provenance needs its separately typed binding/verification.
+    /// # Errors
+    /// Original consumed source differs, or any ordinary conversion error occurs.
+    pub fn run_with_source_guard(
+        plan: &QuantPlan,
+        source: &mut dyn WeightSource,
+        sink: &mut dyn TensorSink,
+        recorder: EvidenceRecorder,
+        expected_source: OriginalSourceId,
+    ) -> Result<QuantizedModel, QuantEngineError> {
+        Self::run_impl(plan, source, sink, recorder, Some(expected_source))
+    }
+
+    fn run_impl(
+        plan: &QuantPlan,
+        source: &mut dyn WeightSource,
+        sink: &mut dyn TensorSink,
         mut recorder: EvidenceRecorder,
+        expected_source: Option<OriginalSourceId>,
     ) -> Result<QuantizedModel, QuantEngineError> {
         plan.validate().map_err(QuantEngineError::Plan)?;
         if !recorder.events().is_empty() {
@@ -364,6 +398,11 @@ impl Engine {
             ));
         }
         let view = &views[0];
+        if expected_source.is_some_and(|expected| expected != view.source_id()) {
+            return Err(QuantEngineError::Binding(
+                "actual original source differs from preparation",
+            ));
+        }
         let manifest = encode_model_manifest(view.manifest())?;
         let records = blobs.records();
         let package = write_trit_package_bounded(

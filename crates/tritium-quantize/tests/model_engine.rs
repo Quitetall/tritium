@@ -16,6 +16,48 @@ use tritium_quantize::engine::{
 };
 use tritium_schema::*;
 
+struct ChangingSource {
+    inner: InMemoryWeightSource,
+    tensor_reads: usize,
+    asset_reads: usize,
+}
+impl WeightSource for ChangingSource {
+    fn inventory(&self) -> Result<Vec<QuantSourceTensor>, QuantEngineError> {
+        self.inner.inventory()
+    }
+    fn asset_names(&self) -> Vec<String> {
+        self.inner.asset_names()
+    }
+    fn tensor(
+        &mut self,
+        name: &str,
+        max_bytes: usize,
+    ) -> Result<std::borrow::Cow<'_, [u8]>, QuantEngineError> {
+        self.tensor_reads += 1;
+        if self.tensor_reads == 3 {
+            // Actual source mutation at conversion's first read, after preparation.
+            self.inner.tensors.get_mut("weight").unwrap().bytes[..4]
+                .copy_from_slice(&0.25f32.to_le_bytes());
+        }
+        self.inner.tensor(name, max_bytes)
+    }
+    fn asset(
+        &mut self,
+        name: &str,
+        max_bytes: usize,
+    ) -> Result<std::borrow::Cow<'_, [u8]>, QuantEngineError> {
+        self.asset_reads += 1;
+        self.inner.asset(name, max_bytes)
+    }
+    fn input_gram(
+        &mut self,
+        name: &str,
+        max_entries: usize,
+    ) -> Result<std::borrow::Cow<'_, [f64]>, QuantEngineError> {
+        self.inner.input_gram(name, max_entries)
+    }
+}
+
 fn recorder() -> EvidenceRecorder {
     EvidenceRecorder::new(
         "engine-run",
@@ -321,6 +363,89 @@ fn original_source_observation_enforces_inventory_payload_and_logical_limits() {
             "complete original inventory changed"
         ))
     ));
+}
+
+#[test]
+fn source_guard_checks_consumed_content_before_any_publication_without_changing_v1_evidence() {
+    let mut input = source(ScalePrecision::F32);
+    let request = plan(&input);
+    let expected = Engine::observe_source(&request, &mut input).unwrap();
+    let mut original_sink = MemoryTensorSink::default();
+    let original = Engine::run(&request, &mut input, &mut original_sink, recorder()).unwrap();
+    let mut guarded_sink = MemoryTensorSink::default();
+    let guarded = Engine::run_with_source_guard(
+        &request,
+        &mut input,
+        &mut guarded_sink,
+        recorder(),
+        expected,
+    )
+    .unwrap();
+    assert_eq!(guarded.source_id, expected);
+    assert_eq!(guarded.package_id, original.package_id);
+    assert_eq!(guarded.evidence, original.evidence);
+    assert_eq!(
+        guarded_sink.artifact().unwrap().0,
+        original_sink.artifact().unwrap().0
+    );
+
+    for change in 0..3 {
+        let mut changed = source(ScalePrecision::F32);
+        match change {
+            0 => changed.tensors.get_mut("weight").unwrap().bytes[..4]
+                .copy_from_slice(&0.25f32.to_le_bytes()),
+            1 => changed.tensors.get_mut("norm").unwrap().bytes[..4]
+                .copy_from_slice(&0f32.to_le_bytes()),
+            _ => {
+                changed
+                    .assets
+                    .insert("tokenizer.json".into(), b"{ }".to_vec());
+            }
+        }
+        let mut sink = MemoryTensorSink::default();
+        assert!(matches!(
+            Engine::run_with_source_guard(&request, &mut changed, &mut sink, recorder(), expected),
+            Err(QuantEngineError::Binding(
+                "actual original source differs from preparation"
+            ))
+        ));
+        assert!(sink.artifact().is_none());
+    }
+    let mut sink = MemoryTensorSink::default();
+    assert!(
+        Engine::run_with_source_guard(
+            &request,
+            &mut input,
+            &mut sink,
+            recorder(),
+            OriginalSourceId::from_bytes([0; 32])
+        )
+        .is_err()
+    );
+    assert!(sink.artifact().is_none());
+}
+
+#[test]
+fn source_guard_detects_mutation_during_conversion_without_rereading_the_source() {
+    let mut input = ChangingSource {
+        inner: source(ScalePrecision::F32),
+        tensor_reads: 0,
+        asset_reads: 0,
+    };
+    let request = plan(&input);
+    let expected = Engine::observe_source(&request, &mut input).unwrap();
+    assert_eq!(input.tensor_reads, 2);
+    assert_eq!(input.asset_reads, 2);
+    let mut sink = MemoryTensorSink::default();
+    assert!(matches!(
+        Engine::run_with_source_guard(&request, &mut input, &mut sink, recorder(), expected),
+        Err(QuantEngineError::Binding(
+            "actual original source differs from preparation"
+        ))
+    ));
+    assert!(sink.artifact().is_none());
+    assert_eq!(input.tensor_reads, 4);
+    assert_eq!(input.asset_reads, 4);
 }
 
 #[test]
