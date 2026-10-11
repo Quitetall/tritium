@@ -7,6 +7,7 @@ use tritium_format::{
     AdditiveTensor,
     trit_model::{TritModel, read_trit_model},
 };
+use tritium_quantize::engine::JoinedSalienceModel;
 #[cfg(feature = "tokenizer")]
 use tritium_schema::{LoadedSourceIdentity, ModelLoaded, UnknownReason};
 use tritium_schema::{PlaneCounts, ScalePrecision, TensorMeta, TensorStorage};
@@ -44,6 +45,31 @@ pub enum ModelSource<'a> {
         /// Explicit level name; never infer a compact prefix or choose a default.
         level: &'a str,
     },
+    /// Mandatory lineage carrier already admitted against the actual B stage
+    /// and both logs by the shared joined verifier (proposed ADR 0064).
+    /// This is structural admission, not transform arithmetic or quality proof.
+    JoinedSalience {
+        /// Checked view borrowing only C bytes; the B payload need not be retained.
+        model: &'a JoinedSalienceModel<'a>,
+        /// Explicit complete level, subject to the same architecture admission.
+        level: &'a str,
+    },
+}
+
+enum PreparedTrit<'a> {
+    Owned(Box<TritModel<'a>>),
+    Joined(&'a TritModel<'a>),
+}
+
+impl<'a> std::ops::Deref for PreparedTrit<'a> {
+    type Target = TritModel<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(model) => model,
+            Self::Joined(model) => model,
+        }
+    }
 }
 
 enum PreparedSource<'a> {
@@ -56,7 +82,7 @@ enum PreparedSource<'a> {
         plan: StandardModelPlan,
     },
     Trit {
-        model: Box<TritModel<'a>>,
+        model: PreparedTrit<'a>,
         level: &'a str,
         config: ModelConfig,
         spec: ArchSpec,
@@ -126,21 +152,28 @@ impl<'a> PreparedSource<'a> {
             }
             ModelSource::Trit { bytes, level } => {
                 let model = read_trit_model(bytes).map_err(format_error)?;
-                if !model.manifest().levels.iter().any(|l| l.name == level) {
-                    return Err(NnError::MissingTensor(format!(
-                        "absent model level {level}"
-                    )));
-                }
-                let (config, spec, plan) = prepare_trit(&model, level)?;
-                Ok(Self::Trit {
-                    model: Box::new(model),
-                    level,
-                    config,
-                    spec,
-                    plan,
-                })
+                Self::typed(PreparedTrit::Owned(Box::new(model)), level)
+            }
+            ModelSource::JoinedSalience { model, level } => {
+                Self::typed(PreparedTrit::Joined(model.model()), level)
             }
         }
+    }
+
+    fn typed(model: PreparedTrit<'a>, level: &'a str) -> Result<Self, NnError> {
+        if !model.manifest().levels.iter().any(|l| l.name == level) {
+            return Err(NnError::MissingTensor(format!(
+                "absent model level {level}"
+            )));
+        }
+        let (config, spec, plan) = prepare_trit(&model, level)?;
+        Ok(Self::Trit {
+            model,
+            level,
+            config,
+            spec,
+            plan,
+        })
     }
 
     fn weights(

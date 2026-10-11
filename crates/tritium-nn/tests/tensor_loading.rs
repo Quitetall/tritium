@@ -12,6 +12,9 @@ use tritium_schema::{
 };
 use tritium_spec::{TensorExecution, TensorView, TernaryBackend};
 
+#[path = "tensor_loading/joined.rs"]
+mod joined;
+
 #[derive(Debug)]
 struct UploadProbe(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
@@ -845,7 +848,6 @@ impl TritFixture {
         }
     }
 
-    #[cfg(feature = "tokenizer")]
     fn asset(&mut self, name: &str, bytes: Vec<u8>) {
         use tritium_schema::{BlobId, BlobReference, ManifestAsset};
         let kind = tritium_format::TritBlobKind::Asset(name.into());
@@ -1050,6 +1052,15 @@ fn check_text_load(
         tritium_nn::ModelSource::HuggingFace(_) => {
             tritium_schema::LoadedSourceIdentity::HuggingFace {
                 reason: tritium_schema::UnknownReason::MissingCapability,
+            }
+        }
+        tritium_nn::ModelSource::JoinedSalience { model, level } => {
+            tritium_schema::LoadedSourceIdentity::Trit {
+                package_id: tritium_schema::PackageId::from_bytes(
+                    *model.model().package_id().as_bytes(),
+                ),
+                model_id: model.model().model_id(level).unwrap(),
+                level: level.into(),
             }
         }
         _ => panic!("unexpected test source"),
