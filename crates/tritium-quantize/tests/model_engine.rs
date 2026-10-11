@@ -426,7 +426,18 @@ fn real_file_source_and_directory_sink_never_overwrite() {
         let out = root.join("out");
         let mut sink = DirectoryTensorSink::new(&out);
         let result = Engine::run(&request, &mut source, &mut sink, recorder()).unwrap();
-        assert!(result.warnings.is_empty());
+        // Publication warnings describe post-commit operations. Directory
+        // handles cannot be opened/synced on every supported OS/filesystem;
+        // assert the observed contract instead of assuming Unix semantics.
+        let expected_warnings = if std::fs::File::open(&out)
+            .and_then(|directory| directory.sync_all())
+            .is_err()
+        {
+            vec![PublicationWarning::DirectorySync]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(result.warnings, expected_warnings);
         let bytes = std::fs::read(out.join("model.trit")).unwrap();
         let log = std::fs::read_to_string(out.join("evidence.jsonl")).unwrap();
         verify_package_with_fit_log(&bytes, &verify_jsonl(&log).unwrap()).unwrap();
