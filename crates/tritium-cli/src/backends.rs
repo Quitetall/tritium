@@ -1,4 +1,4 @@
-//! `tritium list-backends`: enumerate every registered [`TernaryBackend`].
+//! `tritium list-backends`: enumerate every registered [`tritium_spec::TernaryBackend`].
 //!
 //! Discovery is handled by [`tritium_runtime::Registry`], which collects backends
 //! self-registered through `linkme`. The CLI crate links `tritium_cpu` (see the
