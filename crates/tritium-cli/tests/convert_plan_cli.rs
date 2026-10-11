@@ -12,6 +12,9 @@ use tritium_evidence::*;
 use tritium_quantize::engine::*;
 use tritium_schema::*;
 
+#[path = "convert_plan_cli/original_stage.rs"]
+mod original_stage;
+
 static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Scratch(PathBuf);
 impl Scratch {

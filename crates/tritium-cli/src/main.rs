@@ -199,6 +199,9 @@ enum Command {
     /// fold (`--calib`) — the lever every published SALT number was measured under — and it writes
     /// the folded norms alongside the bundle. Writing only a bundle would produce a model whose
     /// weights carry the fold and whose norms do not.
+    #[command(group(clap::ArgGroup::new("conversion_source")
+        .args(["source_shard", "original_captured_stage"])
+        .multiple(false)))]
     #[command(group(clap::ArgGroup::new("conversion_plan")
         .args(["plan", "calibrated_plan"])
         .multiple(false)

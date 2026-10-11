@@ -13,14 +13,15 @@ use tritium_evidence::{
     CALIBRATED_LEVELS_FITTED_REGISTRATION, CALIBRATED_QUANTIZATION_COMPLETED_REGISTRATION,
     CALIBRATED_QUANTIZATION_STARTED_REGISTRATION, DIRECT_LEVELS_FITTED_REGISTRATION,
     EvidenceRecorder, QUANTIZATION_COMPLETED_REGISTRATION, QUANTIZATION_STARTED_REGISTRATION,
+    VerifiedLog, verify_jsonl,
 };
 use tritium_quantize::engine::{
-    DirectoryTensorSink, Engine, QuantEngineError, SafeTensorsWeightSource, TritCalibrationSource,
-    WeightSource,
+    DirectoryTensorSink, Engine, QuantEngineError, QuantizedModel, SafeTensorsWeightSource,
+    StagedSalienceSource, TritCalibrationSource, WeightSource,
 };
 use tritium_schema::{
     CalibratedQuantPlan, DirectFitMetric, ModelQuantPlan, QuantActionRef, QuantPlan,
-    QuantSourceTensor,
+    QuantSourceTensor, SalienceConversionLimits, SalienceStageLimits,
 };
 
 const DEFAULT_MAX_PLAN_BYTES: u64 = 16 * 1024 * 1024;
@@ -44,19 +45,19 @@ fn parse_named_path(value: &str) -> std::result::Result<NamedPath, String> {
 #[derive(Args, Debug)]
 pub(crate) struct PlanArgs {
     /// Existing Rust QuantPlan JSON; mutually exclusive with legacy recipe flags.
-    #[arg(long, requires_all = ["source_shard", "conversion_run_id"])]
+    #[arg(long, requires_all = ["conversion_source", "conversion_run_id"], conflicts_with = "original_captured_stage")]
     plan: Option<PathBuf>,
     /// Existing Rust CalibratedQuantPlan JSON, with actual bound .trit caches.
-    #[arg(long, requires_all = ["source_shard", "conversion_run_id"])]
+    #[arg(long, requires_all = ["conversion_source", "conversion_run_id"])]
     calibrated_plan: Option<PathBuf>,
     /// Repeat for every original safetensors shard; no source tensor may be omitted.
     #[arg(long, requires = "conversion_plan")]
     source_shard: Vec<PathBuf>,
     /// Original asset basename and file, NAME=PATH; repeat for the exact plan inventory.
-    #[arg(long, requires = "conversion_plan", value_parser = parse_named_path)]
+    #[arg(long, requires = "conversion_plan", conflicts_with = "original_captured_stage", value_parser = parse_named_path)]
     asset: Vec<NamedPath>,
     /// Original row-major little-endian f64 Gram, TENSOR=PATH; no implicit fallback.
-    #[arg(long, requires = "conversion_plan", value_parser = parse_named_path)]
+    #[arg(long, requires = "conversion_plan", conflicts_with = "original_captured_stage", value_parser = parse_named_path)]
     input_gram: Vec<NamedPath>,
     /// Actual .trit calibration cache, TENSOR=PATH; exact calibrated inventory required.
     #[arg(long, requires = "calibrated_plan", conflicts_with = "plan", value_parser = parse_named_path)]
@@ -67,6 +68,27 @@ pub(crate) struct PlanArgs {
     /// Positive physical JSON plan bound (default 16MiB); not a process-RSS bound.
     #[arg(long, requires = "conversion_plan")]
     max_plan_bytes: Option<u64>,
+    /// Immutable original-captured B .trit stage; no raw source or implicit ancestry upgrade.
+    #[arg(long, requires_all = ["calibrated_plan", "transform_evidence", "original_salience_evidence", "capture_evidence", "stage_limits", "conversion_limits"])]
+    original_captured_stage: Option<PathBuf>,
+    /// Complete canonical A-to-B transform JSONL log.
+    #[arg(long, requires = "original_captured_stage")]
+    transform_evidence: Option<PathBuf>,
+    /// Complete original-A salience capture JSONL log.
+    #[arg(long, requires = "original_captured_stage")]
+    original_salience_evidence: Option<PathBuf>,
+    /// Complete actual B next-token capture JSONL log.
+    #[arg(long, requires = "original_captured_stage")]
+    capture_evidence: Option<PathBuf>,
+    /// Strict Rust SalienceStageLimits JSON; independent receiving byte ceilings.
+    #[arg(long, requires = "original_captured_stage")]
+    stage_limits: Option<PathBuf>,
+    /// Strict Rust SalienceConversionLimits JSON; physical C and manifest ceilings.
+    #[arg(long, requires = "original_captured_stage")]
+    conversion_limits: Option<PathBuf>,
+    /// Positive aggregate bound on the three input logs (default 16MiB), not RSS.
+    #[arg(long, requires = "original_captured_stage")]
+    max_evidence_bytes: Option<u64>,
 }
 impl PlanArgs {
     pub(crate) fn enabled(&self) -> bool {
@@ -236,8 +258,6 @@ pub(crate) fn run(args: &PlanArgs, output: &Path) -> Result<()> {
     };
     let view = request.view();
     view.validate().context("validate conversion plan")?;
-    let assets = paths(&args.asset)?;
-    inventory(&assets, view.assets().iter().map(String::as_str), "asset")?;
     let gram_paths = paths(&args.input_gram)?;
     let mut gram_sizes = BTreeMap::new();
     let mut cache_names = Vec::new();
@@ -282,6 +302,16 @@ pub(crate) fn run(args: &PlanArgs, output: &Path) -> Result<()> {
         .as_deref()
         .context("missing --conversion-run-id")?;
     ensure!(!run.is_empty(), "--conversion-run-id must not be empty");
+    let recorder = recorder(run)?;
+    if args.original_captured_stage.is_some() {
+        let Request::Calibrated(plan) = request else {
+            bail!("original-captured stage requires a calibrated plan");
+        };
+        let result = run_stage(args, &plan, caches, output, recorder, max)?;
+        return print_result(output, &result);
+    }
+    let assets = paths(&args.asset)?;
+    inventory(&assets, view.assets().iter().map(String::as_str), "asset")?;
     ensure!(
         !args.source_shard.is_empty(),
         "at least one --source-shard is required"
@@ -306,17 +336,6 @@ pub(crate) fn run(args: &PlanArgs, output: &Path) -> Result<()> {
         gram_sizes,
     };
     let mut sink = DirectoryTensorSink::new(output);
-    let recorder = EvidenceRecorder::new(
-        run,
-        [
-            DIRECT_LEVELS_FITTED_REGISTRATION,
-            QUANTIZATION_STARTED_REGISTRATION,
-            QUANTIZATION_COMPLETED_REGISTRATION,
-            CALIBRATED_LEVELS_FITTED_REGISTRATION,
-            CALIBRATED_QUANTIZATION_STARTED_REGISTRATION,
-            CALIBRATED_QUANTIZATION_COMPLETED_REGISTRATION,
-        ],
-    )?;
     let result = match request {
         Request::Plain(plan) => Engine::run(&plan, &mut source, &mut sink, recorder)?,
         Request::Calibrated(plan) => Engine::run_calibrated(
@@ -327,6 +346,87 @@ pub(crate) fn run(args: &PlanArgs, output: &Path) -> Result<()> {
             recorder,
         )?,
     };
+    print_result(output, &result)
+}
+
+fn recorder(run: &str) -> Result<EvidenceRecorder> {
+    Ok(EvidenceRecorder::new(
+        run,
+        [
+            DIRECT_LEVELS_FITTED_REGISTRATION,
+            QUANTIZATION_STARTED_REGISTRATION,
+            QUANTIZATION_COMPLETED_REGISTRATION,
+            CALIBRATED_LEVELS_FITTED_REGISTRATION,
+            CALIBRATED_QUANTIZATION_STARTED_REGISTRATION,
+            CALIBRATED_QUANTIZATION_COMPLETED_REGISTRATION,
+        ],
+    )?)
+}
+
+fn read_evidence(path: &Path, remaining: &mut u64) -> Result<VerifiedLog> {
+    let bytes = read_bounded(path, *remaining)?;
+    *remaining -= u64::try_from(bytes.len()).context("evidence platform size")?;
+    let text = std::str::from_utf8(&bytes).context("evidence must be UTF-8 JSONL")?;
+    verify_jsonl(text).with_context(|| format!("verify evidence {}", path.display()))
+}
+
+fn run_stage(
+    args: &PlanArgs,
+    plan: &CalibratedQuantPlan,
+    caches: BTreeMap<String, PathBuf>,
+    output: &Path,
+    recorder: EvidenceRecorder,
+    max_json: u64,
+) -> Result<QuantizedModel> {
+    ensure!(
+        args.source_shard.is_empty() && args.asset.is_empty() && args.input_gram.is_empty(),
+        "original-captured stage conflicts with raw source inputs"
+    );
+    let required = |path: &Option<PathBuf>| path.clone().context("missing required stage input");
+    let stage_limits: SalienceStageLimits =
+        serde_json::from_slice(&read_bounded(&required(&args.stage_limits)?, max_json)?)
+            .context("parse Rust SalienceStageLimits")?;
+    ensure!(
+        [
+            stage_limits.max_package_bytes,
+            stage_limits.max_manifest_bytes,
+            stage_limits.max_tensor_bytes,
+            stage_limits.max_asset_bytes,
+            stage_limits.max_statistics_bytes,
+        ]
+        .into_iter()
+        .all(|limit| limit > 0),
+        "stage limits must be positive"
+    );
+    let conversion_limits: SalienceConversionLimits = serde_json::from_slice(&read_bounded(
+        &required(&args.conversion_limits)?,
+        max_json,
+    )?)
+    .context("parse Rust SalienceConversionLimits")?;
+    conversion_limits.validate()?;
+    let mut remaining = args.max_evidence_bytes.unwrap_or(DEFAULT_MAX_PLAN_BYTES);
+    ensure!(remaining > 0, "--max-evidence-bytes must be positive");
+    let transform = read_evidence(&required(&args.transform_evidence)?, &mut remaining)?;
+    let original = read_evidence(&required(&args.original_salience_evidence)?, &mut remaining)?;
+    let capture = read_evidence(&required(&args.capture_evidence)?, &mut remaining)?;
+    let bytes = read_bounded(
+        &required(&args.original_captured_stage)?,
+        stage_limits.max_package_bytes,
+    )?;
+    let mut stage =
+        StagedSalienceSource::open_original_captured(&bytes, &transform, &original, stage_limits)?;
+    Ok(Engine::run_original_captured_salience(
+        plan,
+        &mut stage,
+        &capture,
+        &mut TritCalibrationSource::new(caches)?,
+        &mut DirectoryTensorSink::new(output),
+        recorder,
+        conversion_limits,
+    )?)
+}
+
+fn print_result(output: &Path, result: &QuantizedModel) -> Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({

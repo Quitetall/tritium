@@ -50,6 +50,36 @@ recipe flags rather than ignoring them. This additive mode is not completion
 of paired salience-fold/Qwen/Python migration. Its package targets the shared
 `.trit` loader; legacy `generate` is not newly migrated by this command.
 
+An explicit original-captured stage can instead feed the calibrated plan:
+
+```text
+tritium convert --calibrated-plan request.json \
+  --original-captured-stage stage.trit \
+  --transform-evidence transform.jsonl \
+  --original-salience-evidence original.jsonl \
+  --capture-evidence capture.jsonl \
+  --stage-limits stage-limits.json --conversion-limits conversion-limits.json \
+  --calibration-cache TENSOR=cache.trit \
+  --conversion-run-id conversion-02 --out new-output
+```
+
+Repeat `--calibration-cache` for exactly the plan's calibrated tensors. All six
+stage/log/limits inputs are required together. This mode rejects raw shards,
+assets, Grams, plain plans, legacy recipe flags and old stage profiles. Limits
+files use the strict Rust `SalienceStageLimits` and `SalienceConversionLimits`
+types; `--max-plan-bytes` bounds both the plan and each limits file.
+`--max-evidence-bytes` defaults to a positive aggregate 16MiB ceiling across
+the three logs. These are physical/logical file-byte checks, not a full RSS
+bound or a streaming/mmap implementation.
+
+The common engine writes C with mandatory original-A and B-capture ancestry.
+It checks the supplied stage/log/cache agreement and runs the actual fitter;
+it does not rerun A salience or B capture, authenticate logs, or qualify model
+quality. Cold C admission still requires B and the mandatory logs; the output
+does not copy B or private capture text into C. Preserve those custody inputs.
+This command does not migrate legacy generation, retire the complete model-aware
+conversion route, or establish a standalone public model's byte-reduction claim.
+
 For storage or transfer, wrap an existing fixed-codec artifact without changing
 runtime accounting:
 
