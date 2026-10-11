@@ -327,6 +327,39 @@ impl Engine {
         )
     }
 
+    /// Fit through the distinct mandatory capture-root carrier, using the common engine.
+    /// Requires actual B and a complete registered capture log whose exact cache
+    /// bindings agree with every calibrated action. Does not prove graph replay,
+    /// clone dense B, recast plain fits or publish/repack an ordinary C artifact.
+    /// # Errors
+    /// Missing/foreign capture/stage/cache, uncalibrated actions, caps or conversion failure.
+    pub fn run_captured_salience(
+        plan: &CalibratedQuantPlan,
+        stage: &mut StagedSalienceSource<'_>,
+        capture_log: &tritium_evidence::VerifiedLog,
+        caches: &mut dyn CalibrationSource,
+        sink: &mut dyn TensorSink,
+        recorder: EvidenceRecorder,
+        limits: SalienceConversionLimits,
+    ) -> Result<QuantizedModel, QuantEngineError> {
+        if plan.original_source != stage.source_id() {
+            return Err(QuantEngineError::Binding(
+                "captured request differs from actual B",
+            ));
+        }
+        let context = SalienceProductionContext::from_capture(stage, capture_log, limits)?;
+        context.check_capture_plan(plan)?;
+        Self::run_impl(
+            ModelQuantPlan::Calibrated(plan),
+            stage,
+            Some(caches),
+            sink,
+            recorder,
+            Some(plan.original_source),
+            Some(context),
+        )
+    }
+
     fn run_impl(
         plan: ModelQuantPlan<'_>,
         source: &mut dyn WeightSource,

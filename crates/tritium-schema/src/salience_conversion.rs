@@ -75,6 +75,37 @@ impl SalienceConversionManifest {
     }
 }
 
+/// Separate mandatory captured profile; never silently unwrap into ordinary C.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
+pub struct CapturedSalienceConversionManifest {
+    /// Complete unchanged A->B->C source/output vocabulary.
+    pub lineage: SalienceConversionManifest,
+    /// Required complete standalone B capture run/span/root.
+    pub capture: EvidenceReference,
+}
+impl CapturedSalienceConversionManifest {
+    /// Check structure only; actual source/log/cache execution requires admission/replay.
+    /// # Errors
+    /// Invalid lineage/version or missing/invalid capture reference.
+    pub fn validate(&self) -> Result<(), SalienceConversionManifestError> {
+        self.lineage.validate()?;
+        for name in [&self.capture.run, &self.capture.span] {
+            crate::model::name(name, false)
+                .map_err(|_| SalienceConversionManifestError::Reference)?;
+        }
+        if self.capture.root == [0; 32] {
+            return Err(SalienceConversionManifestError::Reference);
+        }
+        Ok(())
+    }
+}
+
 /// Structural carrier failure, not an empirical verdict.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]

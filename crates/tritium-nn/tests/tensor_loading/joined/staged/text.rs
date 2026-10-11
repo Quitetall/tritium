@@ -8,6 +8,9 @@ use tritium_schema::{
     CalibrationPartition,
 };
 
+#[path = "text/captured.rs"]
+mod captured;
+
 fn text_limits() -> StagedTextCaptureLimits {
     StagedTextCaptureLimits {
         max_text_bytes: 1024,

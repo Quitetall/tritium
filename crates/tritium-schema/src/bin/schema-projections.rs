@@ -205,6 +205,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         "salience-conversion-manifest"
     );
     project!(
+        tritium_schema::CapturedSalienceConversionManifest,
+        "captured-salience-conversion-manifest"
+    );
+    project!(
         tritium_schema::SalienceConversionLimits,
         "salience-conversion-limits"
     );
