@@ -38,6 +38,7 @@ use tritium_rocm as _;
 #[cfg(feature = "wgpu")]
 use tritium_wgpu as _;
 
+use anyhow::Context as _;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -66,6 +67,7 @@ mod repack;
 mod report;
 mod salt;
 mod stage7_evidence;
+mod stage_input;
 mod transport;
 
 /// BitNet 2B4T uses the LLaMA-3 tokenizer, whose end-of-text token is `128001`.
@@ -131,11 +133,17 @@ enum Command {
         #[arg(long, default_value = "main")]
         revision: String,
     },
-    /// Load a GGUF model and greedily generate tokens from a JSON file of input IDs.
+    /// Load a model and greedily generate from exact token IDs or its own tokenizer.
+    #[command(group(clap::ArgGroup::new("joined_generation")
+        .args(["original_captured_stage"])
+        .requires_all(["conversion_evidence", "level", "max_payload_bytes", "eos"])))]
     Generate {
-        /// A `.gguf` model file, or a directory written by `tritium convert`.
+        /// A `.gguf` file, a legacy converted directory, or explicit joined C `.trit`.
         #[arg(long, alias = "input")]
         model: PathBuf,
+        /// Explicit original-captured joined admission; ordinary readers never unwrap it.
+        #[command(flatten)]
+        joined: Box<generate::JoinedArgs>,
         /// Path to a JSON file holding the input token IDs, e.g. `[1, 128000, 9906]`. The
         /// reproducible path: no tokenizer is consulted, so the same ids always go in and out.
         #[arg(long, conflicts_with = "prompt", required_unless_present = "prompt")]
@@ -153,9 +161,9 @@ enum Command {
         /// OpenAI API); the flag exists so scripts can be explicit.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         greedy: bool,
-        /// End-of-sequence token ID that stops generation early.
-        #[arg(long, default_value_t = DEFAULT_EOS)]
-        eos: u32,
+        /// Stop token ID; legacy defaults to 128001, joined mode requires an explicit policy.
+        #[arg(long)]
+        eos: Option<u32>,
     },
     /// Emit reproducible benchmark/validation reports.
     Report {
@@ -201,6 +209,7 @@ enum Command {
     /// weights carry the fold and whose norms do not.
     #[command(group(clap::ArgGroup::new("conversion_source")
         .args(["source_shard", "original_captured_stage"])
+        .requires("conversion_plan")
         .multiple(false)))]
     #[command(group(clap::ArgGroup::new("conversion_plan")
         .args(["plan", "calibrated_plan"])
@@ -598,6 +607,7 @@ fn main() -> anyhow::Result<()> {
             } => pull::run(&repo, file.as_deref(), &revision)?,
             Command::Generate {
                 model,
+                joined,
                 tokens,
                 prompt,
                 max_new,
@@ -611,7 +621,18 @@ fn main() -> anyhow::Result<()> {
                     (None, Some(text)) => generate::Prompt::Text(text),
                     (None, None) => unreachable!("clap requires --tokens or --prompt"),
                 };
-                generate::run(&model, &source, max_new, greedy, eos)?;
+                if joined.enabled() {
+                    generate::run_joined(
+                        &model,
+                        &joined,
+                        &source,
+                        max_new,
+                        greedy,
+                        eos.context("joined generation requires --eos")?,
+                    )?;
+                } else {
+                    generate::run(&model, &source, max_new, greedy, eos.unwrap_or(DEFAULT_EOS))?;
+                }
             }
             Command::Repack { input, output, to } => repack::run(&input, &output, to)?,
             Command::Transport { transport: command } => transport::run(command)?,

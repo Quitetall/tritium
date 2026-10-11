@@ -80,6 +80,45 @@ does not copy B or private capture text into C. Preserve those custody inputs.
 This command does not migrate legacy generation, retire the complete model-aware
 conversion route, or establish a standalone public model's byte-reduction claim.
 
+For cold generation from that original-captured C, supply its exact admission
+inputs explicitly:
+
+```text
+tritium generate --model new-output/model.trit --tokens prompt-ids.json \
+  --original-captured-stage stage.trit \
+  --transform-evidence transform.jsonl \
+  --original-salience-evidence original.jsonl \
+  --capture-evidence capture.jsonl \
+  --stage-limits stage-limits.json --conversion-limits conversion-limits.json \
+  --conversion-evidence new-output/evidence.jsonl \
+  --level LEVEL_NAME --max-payload-bytes BYTE_CEILING --eos EOS_ID \
+  --max-new 16
+```
+
+`LEVEL_NAME` must be a complete named level actually present in C. The payload
+ceiling is a positive backend tensor-byte budget, not a full process, KV or
+tokenizer RSS bound. `--max-evidence-bytes` now bounds all four logs together;
+`--max-limits-bytes` bounds each limits JSON separately (default 16MiB).
+All stage/log/limits inputs, the conversion log, level, payload budget and EOS
+policy are required in this mode. `--eos` is the caller's stop-token policy;
+a non-vocabulary sentinel may deliberately disable EOS stopping. No tokenizer
+or BitNet stop token is inferred. `--native-only` optionally rejects emulated
+tensor execution; the default allows the shared loader's explicit emulated tier.
+
+`--tokens` remains exact IDs in/out and does not consult tokenizer assets.
+Use `--prompt "text"` instead only when C carries a valid `tokenizer.json` and
+`tokenizer_config.json`; the shared text loader validates vocabulary before
+upload. Missing text capability rejects, with no fallback tokenizer. Both
+paths use the common CPU runner and greedy decoder. Sampling is unsupported.
+Legacy GGUF/SALT generation keeps its existing defaults and behavior; it does
+not automatically unwrap `.trit` or infer ancestry from adjacent files.
+
+This adapter supports only architectures admitted by the common standard
+graph. It does not establish official hybrid-Qwen/MTP coverage, GPU speed,
+streaming/mmap, standalone distribution, serving integration or model quality.
+Keep B and the required logs with C for cold reproduction. CLI lifecycle logs
+remain summaries, not independently qualified model-execution receipts.
+
 For storage or transfer, wrap an existing fixed-codec artifact without changing
 runtime accounting:
 

@@ -1,27 +1,26 @@
 //! Filesystem inputs for the actual shared model conversion engine (ADR0063).
 //! No fitting, identities, package assembly or publication logic lives here.
+use crate::stage_input::{StageArgs, read_bounded, regular_file};
 use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
 use std::{
     borrow::Cow,
     collections::BTreeMap,
     fs::File,
-    io::Read,
     path::{Path, PathBuf},
 };
 use tritium_evidence::{
     CALIBRATED_LEVELS_FITTED_REGISTRATION, CALIBRATED_QUANTIZATION_COMPLETED_REGISTRATION,
     CALIBRATED_QUANTIZATION_STARTED_REGISTRATION, DIRECT_LEVELS_FITTED_REGISTRATION,
     EvidenceRecorder, QUANTIZATION_COMPLETED_REGISTRATION, QUANTIZATION_STARTED_REGISTRATION,
-    VerifiedLog, verify_jsonl,
 };
 use tritium_quantize::engine::{
     DirectoryTensorSink, Engine, QuantEngineError, QuantizedModel, SafeTensorsWeightSource,
-    StagedSalienceSource, TritCalibrationSource, WeightSource,
+    TritCalibrationSource, WeightSource,
 };
 use tritium_schema::{
     CalibratedQuantPlan, DirectFitMetric, ModelQuantPlan, QuantActionRef, QuantPlan,
-    QuantSourceTensor, SalienceConversionLimits, SalienceStageLimits,
+    QuantSourceTensor,
 };
 
 const DEFAULT_MAX_PLAN_BYTES: u64 = 16 * 1024 * 1024;
@@ -68,27 +67,8 @@ pub(crate) struct PlanArgs {
     /// Positive physical JSON plan bound (default 16MiB); not a process-RSS bound.
     #[arg(long, requires = "conversion_plan")]
     max_plan_bytes: Option<u64>,
-    /// Immutable original-captured B .trit stage; no raw source or implicit ancestry upgrade.
-    #[arg(long, requires_all = ["calibrated_plan", "transform_evidence", "original_salience_evidence", "capture_evidence", "stage_limits", "conversion_limits"])]
-    original_captured_stage: Option<PathBuf>,
-    /// Complete canonical A-to-B transform JSONL log.
-    #[arg(long, requires = "original_captured_stage")]
-    transform_evidence: Option<PathBuf>,
-    /// Complete original-A salience capture JSONL log.
-    #[arg(long, requires = "original_captured_stage")]
-    original_salience_evidence: Option<PathBuf>,
-    /// Complete actual B next-token capture JSONL log.
-    #[arg(long, requires = "original_captured_stage")]
-    capture_evidence: Option<PathBuf>,
-    /// Strict Rust SalienceStageLimits JSON; independent receiving byte ceilings.
-    #[arg(long, requires = "original_captured_stage")]
-    stage_limits: Option<PathBuf>,
-    /// Strict Rust SalienceConversionLimits JSON; physical C and manifest ceilings.
-    #[arg(long, requires = "original_captured_stage")]
-    conversion_limits: Option<PathBuf>,
-    /// Positive aggregate bound on the three input logs (default 16MiB), not RSS.
-    #[arg(long, requires = "original_captured_stage")]
-    max_evidence_bytes: Option<u64>,
+    #[command(flatten)]
+    stage: StageArgs,
 }
 impl PlanArgs {
     pub(crate) fn enabled(&self) -> bool {
@@ -132,46 +112,6 @@ fn inventory<'a>(
         "{kind} input inventory does not match plan"
     );
     Ok(())
-}
-
-fn regular_file(path: &Path) -> Result<File> {
-    ensure!(
-        std::fs::metadata(path)
-            .with_context(|| format!("inspect {}", path.display()))?
-            .is_file(),
-        "input must be a regular file: {}",
-        path.display()
-    );
-    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    ensure!(
-        file.metadata()?.is_file(),
-        "opened input is not a regular file: {}",
-        path.display()
-    );
-    Ok(file)
-}
-fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>> {
-    let mut file = regular_file(path)?;
-    let len = file.metadata()?.len();
-    ensure!(
-        len <= max,
-        "input {} exceeds byte limit {max}",
-        path.display()
-    );
-    let len = usize::try_from(len).context("file size exceeds platform limit")?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(len)
-        .context("reserve bounded input")?;
-    bytes.resize(len, 0);
-    file.read_exact(&mut bytes)
-        .with_context(|| format!("read {}", path.display()))?;
-    ensure!(
-        file.read(&mut [0])? == 0,
-        "input grew during read: {}",
-        path.display()
-    );
-    Ok(bytes)
 }
 
 // Real file-backed raw Grams are loaded only when requested by the common engine;
@@ -303,7 +243,7 @@ pub(crate) fn run(args: &PlanArgs, output: &Path) -> Result<()> {
         .context("missing --conversion-run-id")?;
     ensure!(!run.is_empty(), "--conversion-run-id must not be empty");
     let recorder = recorder(run)?;
-    if args.original_captured_stage.is_some() {
+    if args.stage.enabled() {
         let Request::Calibrated(plan) = request else {
             bail!("original-captured stage requires a calibrated plan");
         };
@@ -363,13 +303,6 @@ fn recorder(run: &str) -> Result<EvidenceRecorder> {
     )?)
 }
 
-fn read_evidence(path: &Path, remaining: &mut u64) -> Result<VerifiedLog> {
-    let bytes = read_bounded(path, *remaining)?;
-    *remaining -= u64::try_from(bytes.len()).context("evidence platform size")?;
-    let text = std::str::from_utf8(&bytes).context("evidence must be UTF-8 JSONL")?;
-    verify_jsonl(text).with_context(|| format!("verify evidence {}", path.display()))
-}
-
 fn run_stage(
     args: &PlanArgs,
     plan: &CalibratedQuantPlan,
@@ -382,47 +315,16 @@ fn run_stage(
         args.source_shard.is_empty() && args.asset.is_empty() && args.input_gram.is_empty(),
         "original-captured stage conflicts with raw source inputs"
     );
-    let required = |path: &Option<PathBuf>| path.clone().context("missing required stage input");
-    let stage_limits: SalienceStageLimits =
-        serde_json::from_slice(&read_bounded(&required(&args.stage_limits)?, max_json)?)
-            .context("parse Rust SalienceStageLimits")?;
-    ensure!(
-        [
-            stage_limits.max_package_bytes,
-            stage_limits.max_manifest_bytes,
-            stage_limits.max_tensor_bytes,
-            stage_limits.max_asset_bytes,
-            stage_limits.max_statistics_bytes,
-        ]
-        .into_iter()
-        .all(|limit| limit > 0),
-        "stage limits must be positive"
-    );
-    let conversion_limits: SalienceConversionLimits = serde_json::from_slice(&read_bounded(
-        &required(&args.conversion_limits)?,
-        max_json,
-    )?)
-    .context("parse Rust SalienceConversionLimits")?;
-    conversion_limits.validate()?;
-    let mut remaining = args.max_evidence_bytes.unwrap_or(DEFAULT_MAX_PLAN_BYTES);
-    ensure!(remaining > 0, "--max-evidence-bytes must be positive");
-    let transform = read_evidence(&required(&args.transform_evidence)?, &mut remaining)?;
-    let original = read_evidence(&required(&args.original_salience_evidence)?, &mut remaining)?;
-    let capture = read_evidence(&required(&args.capture_evidence)?, &mut remaining)?;
-    let bytes = read_bounded(
-        &required(&args.original_captured_stage)?,
-        stage_limits.max_package_bytes,
-    )?;
-    let mut stage =
-        StagedSalienceSource::open_original_captured(&bytes, &transform, &original, stage_limits)?;
+    let inputs = args.stage.read(max_json)?;
+    let mut stage = inputs.open()?;
     Ok(Engine::run_original_captured_salience(
         plan,
         &mut stage,
-        &capture,
+        &inputs.capture,
         &mut TritCalibrationSource::new(caches)?,
         &mut DirectoryTensorSink::new(output),
         recorder,
-        conversion_limits,
+        inputs.conversion_limits,
     )?)
 }
 

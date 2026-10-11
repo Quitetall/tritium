@@ -5,6 +5,9 @@ use tritium_nn::calibrate::{
     SourceCalibrationModel, StagedCalibrationLimits, StagedCalibrationModel,
 };
 
+#[path = "original_stage/generate.rs"]
+mod generation;
+
 fn stage_limits() -> SalienceStageLimits {
     SalienceStageLimits {
         max_package_bytes: 1_000_000,
@@ -118,8 +121,36 @@ struct Fixture {
 }
 impl Fixture {
     fn new(precision: ScalePrecision) -> Self {
+        Self::from_raw(raw(precision))
+    }
+    fn with_tokenizer() -> Self {
+        let mut source = raw(ScalePrecision::Bf16);
+        let vocab = [
+            "[UNK]", "hello", "partner", "[EOS]", "[BOS]", "t5", "t6", "t7", "t8", "t9",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(id, word)| (word.to_owned(), u32::try_from(id).unwrap()))
+        .collect();
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("[UNK]".into())
+            .build()
+            .unwrap();
+        let mut tokenizer = tokenizers::Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(tokenizers::pre_tokenizers::whitespace::Whitespace));
+        source.assets.insert(
+            "tokenizer.json".into(),
+            tokenizer.to_string(false).unwrap().into_bytes(),
+        );
+        source.assets.insert(
+            "tokenizer_config.json".into(),
+            br#"{"bos_token":"[BOS]","eos_token":{"content":"[EOS]"}}"#.to_vec(),
+        );
+        Self::from_raw(source)
+    }
+    fn from_raw(mut raw: InMemoryWeightSource) -> Self {
         let dir = Scratch::new();
-        let mut raw = raw(precision);
         let request = QuantPlan {
             architecture: "qwen3".into(),
             tensors: raw

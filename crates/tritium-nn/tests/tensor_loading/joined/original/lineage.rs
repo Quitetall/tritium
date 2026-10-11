@@ -19,7 +19,9 @@ use tritium_nn::calibrate::{
     RecordedOriginalSalienceCapture, StagedCalibrationModel, replay_staged_capture,
     verify_original_captured_stage,
 };
-use tritium_quantize::engine::{DirectoryTensorSink, InMemoryCalibrationSource};
+use tritium_quantize::engine::{
+    DirectoryTensorSink, InMemoryCalibrationSource, PublicationWarning,
+};
 
 fn transform_recorder() -> EvidenceRecorder {
     EvidenceRecorder::new(
@@ -143,7 +145,19 @@ fn actual_original_captured_chain_cold_replays_and_decodes_in_all_precisions() {
             let mut sink = DirectoryTensorSink::new(&destination);
             let published = recorded.publish_stage(stage_limits(), &mut sink).unwrap();
             assert_eq!(published.package_id, package_id);
-            assert!(published.warnings.is_empty());
+            // As in the shared sink's existing publication tests, directory
+            // sync is an observed OS/filesystem capability, not guaranteed by
+            // a successful no-clobber commit. Other warnings still reject.
+            let expected_warnings = if std::fs::File::open(&destination)
+                .and_then(|directory| directory.sync_all())
+                .is_err()
+            {
+                vec![PublicationWarning::DirectorySync]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(published.warnings, expected_warnings);
+            assert!(!destination.join(".pending.trit").exists());
             assert_eq!(std::fs::read(destination.join("model.trit")).unwrap(), b);
             assert_eq!(
                 std::fs::read_to_string(destination.join("evidence.jsonl")).unwrap(),
