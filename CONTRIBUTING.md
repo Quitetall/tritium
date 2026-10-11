@@ -62,6 +62,13 @@ index or branch, never inspects unrelated working-tree WIP, and fails closed
 when a required checker is unavailable. For explicit local tiers, run
 `./scripts/verify-gates.sh prepush`, `ci`, or `release`.
 
+These explicit tiers also run strict workspace Clippy for Windows GNU when the
+target and MinGW compiler are installed (excluding the Python extension). This
+checks non-Unix code and Windows-specific layout lints without linking or running
+Windows executables. Missing prerequisites are explicitly skipped; native Windows
+CI still proves the platform test/lint result. A plain cross-target `cargo check`
+does not catch those lints.
+
 It checks the commit being pushed, not your working tree, so uncommitted work
 never affects the verdict. `TRITIUM_PREPUSH_FMT_ONLY=1 git push` runs just the
 format check; `git push --no-verify` bypasses the hook entirely (CI still runs

@@ -166,8 +166,10 @@ run_model_acceptance() {
 # 51 of its 64 cfg(unix) functions still have no `not(unix)` twin, so the class is one ungated
 # caller away from recurring, and NO amount of Linux checking sees it.
 #
-# `cargo check` does not link, so the gnu target needs only mingw for blake3's C build. The msvc
-# target fails earlier for want of an MSVC compiler -- use gnu.
+# Clippy's check-only compilation does not link, so the gnu target needs only mingw for
+# blake3's C build. It also catches Windows-layout-only lints (the typed convert arguments
+# triggered large_enum_variant on Windows while Linux lint and Windows cargo check passed).
+# The msvc target needs an MSVC compiler; native Windows CI remains authoritative.
 verify_workflows() {
     if ! command -v actionlint >/dev/null 2>&1; then
         echo "SKIPPED workflow lint: install actionlint (CI runs it; a push can still go red)" >&2
@@ -196,8 +198,8 @@ verify_non_unix_cfg() {
     fi
     run env CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc \
         AR_x86_64_pc_windows_gnu=x86_64-w64-mingw32-ar \
-        cargo check --locked --workspace --exclude tritium-py --all-targets \
-        --target x86_64-pc-windows-gnu
+        cargo clippy --locked --workspace --exclude tritium-py --all-targets \
+        --target x86_64-pc-windows-gnu -- -D warnings
 }
 
 verify_no_std_foundations() {

@@ -211,7 +211,7 @@ enum Command {
         model: Option<PathBuf>,
         /// Explicit typed-plan conversion through the shared engine (ADR0063 candidate).
         #[command(flatten)]
-        plan: convert_plan::PlanArgs,
+        plan: Box<convert_plan::PlanArgs>,
         /// New output directory: legacy files, or model.trit + evidence.jsonl with --plan.
         #[arg(long, alias = "output")]
         out: PathBuf,
