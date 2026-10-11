@@ -31,6 +31,8 @@ use tritium_train::nn::attention_heads_traced;
 use tritium_train::tape::ValueId;
 
 use crate::{Mlp, ModelRunner, Projection};
+use tritium_quantize::engine::SaliencePair;
+pub use tritium_quantize::engine::{SalienceFoldError, divide_rows, scale_cols, smooth_scales};
 
 /// Dims + fp 1D norms for the tape forward (the parts held fp, not quantized/trained).
 #[derive(Debug, Clone)]
@@ -561,39 +563,9 @@ pub fn calibrate(weights: &[Vec<f32>], a: &Arch, tokens: &[u32], c: &mut Calib) 
     c.rows += seq;
 }
 
-/// AWQ's salience scale: `s_j = (rms_j / geomean(rms))^α`, normalised by the geometric mean so the
-/// fold neither inflates nor shrinks the matrix overall (α=0 ⇒ all ones ⇒ exactly today's fitter).
-pub fn smooth_scales(acc: &[f64], rows: usize, alpha: f64) -> Vec<f32> {
-    let rms: Vec<f64> = acc
-        .iter()
-        .map(|&s| (s / rows as f64).sqrt().max(1e-8))
-        .collect();
-    let gm = (rms.iter().map(|r| r.ln()).sum::<f64>() / rms.len() as f64).exp();
-    rms.iter().map(|&r| (r / gm).powf(alpha) as f32).collect()
-}
-
-/// Multiply every column `j` of a row-major `[rows, cols]` matrix by `s[j]` — the weight half of
-/// the fold.
-pub fn scale_cols(w: &mut [f32], cols: usize, s: &[f32]) {
-    for row in w.chunks_mut(cols) {
-        for (v, &sj) in row.iter_mut().zip(s) {
-            *v *= sj;
-        }
-    }
-}
-
-/// Divide every row `r` by `s[r]` — the norm half of the fold, applied to the *preceding* norm so
-/// the product with [`scale_cols`] is the identity.
-pub fn divide_rows(w: &mut [f32], cols: usize, s: &[f32]) {
-    for (r, row) in w.chunks_mut(cols).enumerate() {
-        for v in row {
-            *v /= s[r];
-        }
-    }
-}
-
 /// Apply the salience fold. Returns the rebalanced weights plus the `Arch` whose fp norms absorb
-/// the inverse — together an exact reparameterisation of the same function.
+/// the inverse. Cancellation is algebraic, not a bit-identical finite-precision logit claim.
+/// Panics on invalid input; use [`try_fold`] for fallible conversion.
 ///
 /// # The two projections this deliberately does not fold
 ///
@@ -622,35 +594,102 @@ pub fn fold(
     c: &Calib,
     alpha: f64,
 ) -> (Vec<Vec<f32>>, Arch) {
+    try_fold(fp, shapes, a, c, alpha).expect("invalid model-aware paired salience fold")
+}
+
+/// Checked graph adapter to the shared paired salience numerical module.
+///
+/// Valid legacy results keep their exact ordered f32 operations. The caller's
+/// weights/architecture remain unchanged on any error. This currently clones
+/// the dense model, as the legacy path did; it is not out-of-core/RSS admission.
+/// # Errors
+/// Malformed tied-head SwiGLU inventory, statistics, alpha or nonfinite values.
+pub fn try_fold(
+    fp: &[Vec<f32>],
+    shapes: &[(usize, usize)],
+    a: &Arch,
+    c: &Calib,
+    alpha: f64,
+) -> Result<(Vec<Vec<f32>>, Arch), SalienceFoldError> {
+    if c.rows == 0 {
+        return Err(SalienceFoldError::EmptyStatistics);
+    }
+    if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
+        return Err(SalienceFoldError::Alpha);
+    }
+    let count = a.n_layers.checked_mul(7).and_then(|n| n.checked_add(1));
+    let q_rows = a.n_head.checked_mul(a.head_dim);
+    let kv_rows = a.n_head_kv.checked_mul(a.head_dim);
+    if count != Some(fp.len())
+        || shapes.len() != fp.len()
+        || a.attn_norms.len() != a.n_layers
+        || a.ffn_norms.len() != a.n_layers
+        || c.attn_in.len() != a.n_layers
+        || c.ffn_in.len() != a.n_layers
+        || c.down_in.len() != a.n_layers
+        || a.n_embd == 0
+        || a.ff == 0
+        || a.n_layers == 0
+        || a.vocab == 0
+        || q_rows.is_none_or(|n| n == 0)
+        || kv_rows.is_none_or(|n| n == 0)
+        || shapes.first() != Some(&(a.vocab, a.n_embd))
+        || a.out_norm.len() != a.n_embd
+        || shapes.iter().zip(fp).any(|(&(rows, cols), values)| {
+            rows == 0 || cols == 0 || rows.checked_mul(cols) != Some(values.len())
+        })
+    {
+        return Err(SalienceFoldError::Geometry);
+    }
     let mut w = fp.to_vec();
     let mut arch = a.clone();
     for li in 0..a.n_layers {
         let base = 1 + 7 * li;
-
-        // q, k, v — inverse into attn_norm.
-        let sa = smooth_scales(&c.attn_in[li], c.rows, alpha);
-        for k in 0..3 {
-            scale_cols(&mut w[base + k], shapes[base + k].1, &sa);
+        if c.attn_in[li].len() != a.n_embd
+            || c.ffn_in[li].len() != a.n_embd
+            || c.down_in[li].len() != a.ff
+            || Some(shapes[base].0) != q_rows
+            || Some(shapes[base + 1].0) != kv_rows
+            || Some(shapes[base + 2].0) != kv_rows
+            || (0..3).any(|k| shapes[base + k].1 != a.n_embd)
+            || shapes[base + 3].0 != a.n_embd
+            || Some(shapes[base + 3].1) != q_rows
+            || shapes[base + 4] != (a.ff, a.n_embd)
+            || shapes[base + 5] != (a.ff, a.n_embd)
+            || shapes[base + 6] != (a.n_embd, a.ff)
+        {
+            return Err(SalienceFoldError::Geometry);
         }
-        for (n, &s) in arch.attn_norms[li].iter_mut().zip(&sa) {
-            *n /= s;
+        let [q, k, v, _o, gate, up, down] = &mut w[base..base + 7] else {
+            unreachable!("validated layer inventory")
+        };
+        {
+            let mut projections = [q.as_mut_slice(), k.as_mut_slice(), v.as_mut_slice()];
+            SaliencePair {
+                projections: &mut projections,
+                inverse: &mut arch.attn_norms[li],
+                inverse_columns: 1,
+            }
+            .apply(&c.attn_in[li], c.rows, alpha)?;
         }
-
-        // gate, up — inverse into ffn_norm.
-        let sf = smooth_scales(&c.ffn_in[li], c.rows, alpha);
-        for k in 4..6 {
-            scale_cols(&mut w[base + k], shapes[base + k].1, &sf);
+        {
+            let mut projections = [gate.as_mut_slice(), up.as_mut_slice()];
+            SaliencePair {
+                projections: &mut projections,
+                inverse: &mut arch.ffn_norms[li],
+                inverse_columns: 1,
+            }
+            .apply(&c.ffn_in[li], c.rows, alpha)?;
         }
-        for (n, &s) in arch.ffn_norms[li].iter_mut().zip(&sf) {
-            *n /= s;
+        let mut projections = [down.as_mut_slice()];
+        SaliencePair {
+            projections: &mut projections,
+            inverse: up,
+            inverse_columns: a.n_embd,
         }
-
-        // down — inverse into up's output rows (`gated = silu(gate) ⊙ up` is linear in up).
-        let sd = smooth_scales(&c.down_in[li], c.rows, alpha);
-        scale_cols(&mut w[base + 6], shapes[base + 6].1, &sd);
-        divide_rows(&mut w[base + 5], shapes[base + 5].1, &sd);
+        .apply(&c.down_in[li], c.rows, alpha)?;
     }
-    (w, arch)
+    Ok((w, arch))
 }
 
 #[cfg(test)]

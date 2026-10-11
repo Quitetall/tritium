@@ -13,8 +13,11 @@ mod direct;
 mod joint_feedback;
 mod ladder;
 mod model;
+mod salience;
 mod sinks;
 mod sources;
+
+pub use salience::{SalienceFoldError, SaliencePair, divide_rows, scale_cols, smooth_scales};
 
 pub use model::{
     Engine, PublicationWarning, QuantEngineError, QuantizedModel, TensorSink, WeightSource,
