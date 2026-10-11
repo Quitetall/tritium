@@ -123,6 +123,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     project!(tritium_schema::DirectFitMetric, "direct-fit-metric");
     project!(tritium_schema::DirectFitOutput, "direct-fit-output");
     project!(tritium_schema::DirectLevelsFitted, "direct-levels-fitted");
+    project!(tritium_schema::CalibratedFitPlan, "calibrated-fit-plan");
+    project!(
+        tritium_schema::CalibratedLevelsFitted,
+        "calibrated-levels-fitted"
+    );
     project!(tritium_schema::QuantSourceTensor, "quant-source-tensor");
     project!(tritium_schema::QuantAction, "quant-action");
     project!(tritium_schema::QuantTensorPlan, "quant-tensor-plan");

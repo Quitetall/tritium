@@ -4,7 +4,7 @@ use super::{
     EventRegistration, EvidenceEnvelope, EvidenceError, EvidenceEvent, EvidenceRecorder,
     VerifiedLog, verify_log,
 };
-use tritium_schema::DirectLevelsFitted;
+use tritium_schema::{DirectFitOutput, DirectFitPlan, DirectLevelsFitted};
 
 impl EvidenceEvent for DirectLevelsFitted {
     const SCHEMA_ID: &'static str = "tritium.quantize.direct_levels_fitted";
@@ -61,11 +61,7 @@ impl DirectFitReceiptView {
         // JCS intentionally canonicalizes 1.0 to 1. A recorded and replayed
         // view must expose the same wire representation, not serde's transient
         // integer-vs-float Number distinction. Never change the hashed meaning.
-        let mut envelope = event.clone();
-        let canonical = serde_json_canonicalizer::to_string(&envelope.payload)
-            .map_err(|_| invalid_payload("payload canonicalization failed"))?;
-        envelope.payload = serde_json::from_str(&canonical)
-            .map_err(|_| invalid_payload("canonical payload decoding failed"))?;
+        let envelope = canonical_envelope(event).map_err(invalid_payload)?;
         let observation = serde_json::from_value(envelope.payload.clone())
             .map_err(|error| invalid_payload(&format!("{:?}", error.classify())))?;
         validate_bindings(&observation)?;
@@ -84,33 +80,55 @@ fn invalid_payload(detail: &str) -> EvidenceError {
 }
 
 fn validate_bindings(observation: &DirectLevelsFitted) -> Result<(), EvidenceError> {
+    validate_fit_outputs(
+        &observation.tensor,
+        &observation.plan,
+        observation.rayon_threads,
+        &observation.outputs,
+    )
+    .map_err(invalid_payload)
+}
+
+pub(crate) fn canonical_envelope(
+    event: &EvidenceEnvelope,
+) -> Result<EvidenceEnvelope, &'static str> {
+    let mut envelope = event.clone();
+    let canonical = serde_json_canonicalizer::to_string(&envelope.payload)
+        .map_err(|_| "payload canonicalization failed")?;
+    envelope.payload =
+        serde_json::from_str(&canonical).map_err(|_| "canonical payload decoding failed")?;
+    Ok(envelope)
+}
+
+pub(crate) fn validate_fit_outputs(
+    tensor: &str,
+    plan: &DirectFitPlan,
+    rayon_threads: u32,
+    outputs: &[DirectFitOutput],
+) -> Result<(), &'static str> {
     let valid_name =
         |name: &str| !name.is_empty() && name.len() <= 4096 && !name.chars().any(char::is_control);
-    if !valid_name(&observation.tensor) || observation.rayon_threads == 0 {
-        return Err(invalid_payload("invalid tensor name or Rayon pool size"));
+    if !valid_name(tensor) || rayon_threads == 0 {
+        return Err("invalid tensor name or Rayon pool size");
     }
-    let levels = &observation.plan.levels;
-    if levels.is_empty() || levels.len() != observation.outputs.len() {
-        return Err(invalid_payload("incomplete output inventory"));
+    let levels = &plan.levels;
+    if levels.is_empty() || levels.len() != outputs.len() {
+        return Err("incomplete output inventory");
     }
     let mut names = std::collections::BTreeSet::new();
-    for (level, output) in levels.iter().zip(&observation.outputs) {
+    for (level, output) in levels.iter().zip(outputs) {
         if !valid_name(&level.name)
             || !names.insert(&level.name)
             || level.planes == 0
-            || level.planes > observation.plan.layout.max_planes
+            || level.planes > plan.layout.max_planes
             || output.level != level.name
             || output.planes != level.planes
         {
-            return Err(invalid_payload("output does not match requested level"));
+            return Err("output does not match requested level");
         }
     }
     // This is structural replay, not numerical profile admission or a refit.
-    observation
-        .plan
-        .layout
-        .validate()
-        .map_err(|_| invalid_payload("invalid layout"))?;
+    plan.layout.validate().map_err(|_| "invalid layout")?;
     Ok(())
 }
 

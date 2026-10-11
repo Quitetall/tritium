@@ -23,6 +23,9 @@ pub use model_load::{MODEL_LOADED_REGISTRATION, ModelLoadReceiptView};
 mod direct_fit;
 pub use direct_fit::{DIRECT_LEVELS_FITTED_REGISTRATION, DirectFitReceiptView};
 
+mod calibrated_fit;
+pub use calibrated_fit::{CALIBRATED_LEVELS_FITTED_REGISTRATION, CalibratedFitReceiptView};
+
 mod original_source;
 mod quantization;
 pub use original_source::original_source_id;

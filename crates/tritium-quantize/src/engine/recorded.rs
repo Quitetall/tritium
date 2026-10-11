@@ -80,17 +80,7 @@ pub fn fit_direct_levels_recorded(
             content: gram_digest(plan.layout.cols, values),
         },
     };
-    let outputs = levels
-        .iter()
-        .map(|level| {
-            Ok(DirectFitOutput {
-                level: level.level.clone(),
-                planes: level.tensor.plane_count(),
-                content: additive_semantic_digest(&level.tensor)
-                    .map_err(RecordedDirectFitError::Semantic)?,
-            })
-        })
-        .collect::<Result<Vec<_>, RecordedDirectFitError>>()?;
+    let outputs = fit_outputs(&levels).map_err(RecordedDirectFitError::Semantic)?;
     let observation = recorder
         .emit_direct_levels_fitted(
             span,
@@ -110,6 +100,21 @@ pub fn fit_direct_levels_recorded(
         levels,
         observation,
     })
+}
+
+pub(super) fn fit_outputs(
+    levels: &[DirectTensorFit],
+) -> Result<Vec<DirectFitOutput>, TritModelError> {
+    levels
+        .iter()
+        .map(|level| {
+            Ok(DirectFitOutput {
+                level: level.level.clone(),
+                planes: level.tensor.plane_count(),
+                content: additive_semantic_digest(&level.tensor)?,
+            })
+        })
+        .collect()
 }
 
 pub(super) fn source_digest(rows: u64, cols: u64, weights: &[f32]) -> FitInputDigest {

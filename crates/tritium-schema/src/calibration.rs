@@ -299,6 +299,28 @@ pub struct CalibrationCacheManifest {
     /// Ordered declared model-context lengths, not physical replay chunks.
     pub window_samples: Vec<u64>,
 }
+impl CalibrationCacheBinding {
+    /// Construct the common original-basis request used by actual cache replay.
+    /// Validation and byte verification remain the consumer's obligations.
+    #[must_use]
+    pub fn reduction_plan(
+        &self,
+        partition: CalibrationPartition,
+        damping: f64,
+        max_numeric_bytes: u64,
+    ) -> CalibrationPlan {
+        CalibrationPlan {
+            tensor: self.request.tensor.clone(),
+            source: self.source,
+            partition,
+            output: self.request.output,
+            consumer: self.request.consumer,
+            sample_start: self.request.sample_start,
+            damping,
+            max_numeric_bytes,
+        }
+    }
+}
 impl CalibrationCacheManifest {
     /// Check structural counts and both producer and receiving logical admission.
     /// This does not verify payloads, identities or full process RSS.

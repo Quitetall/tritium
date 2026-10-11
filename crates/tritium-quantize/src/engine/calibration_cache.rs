@@ -9,8 +9,8 @@ use super::{
 };
 use tritium_schema::{
     BlobId, CalibrationCacheBinding, CalibrationCacheId, CalibrationCacheRequest,
-    CalibrationConsumer, CalibrationOutput, CalibrationPartition, CalibrationPlan,
-    CalibrationPlanError, CalibrationSource, FitInputDigest, ScalePrecision,
+    CalibrationConsumer, CalibrationOutput, CalibrationPartition, CalibrationPlanError,
+    CalibrationSource, FitInputDigest, ScalePrecision,
 };
 
 /// Cache admission/capture/replay failure; no fallback is performed.
@@ -400,16 +400,11 @@ impl CalibrationCache {
             .map_err(|_| CalibrationCacheError::Allocation)?;
         let columns = usize::try_from(request.tensor.shape[1])
             .map_err(|_| CalibrationCacheError::Allocation)?;
-        let mut collector = CalibrationCollector::new(CalibrationPlan {
-            tensor: request.tensor.clone(),
-            source: self.binding.source,
+        let mut collector = CalibrationCollector::new(self.binding.reduction_plan(
             partition,
-            output: request.output,
-            consumer: request.consumer,
-            sample_start: request.sample_start,
             damping,
             max_numeric_bytes,
-        })?;
+        ))?;
         for window in &self.windows {
             for start in (0..window.tokens.len()).step_by(max_batch_samples) {
                 let count = max_batch_samples.min(window.tokens.len() - start);
