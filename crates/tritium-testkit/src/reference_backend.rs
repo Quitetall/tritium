@@ -120,6 +120,9 @@ impl TernaryBackend for ReferenceBackend {
     fn upload_tensor(&self, tensor: TensorView<'_>) -> Result<Box<dyn DeviceBuffer>, BackendError> {
         match tensor {
             TensorView::Additive(view) => {
+                if view.tile_counts().is_some() {
+                    return Err(BackendError::UnsupportedTensor);
+                }
                 let tensor = AdditiveTensor::from_view(view).map_err(|error| {
                     BackendError::InvalidInput(format!("invalid additive tensor: {error:?}"))
                 })?;

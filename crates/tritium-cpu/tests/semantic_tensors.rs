@@ -32,12 +32,10 @@ fn compact_and_all_pruned_views_cannot_enter_uniform_cpu_storage() {
             cpu.upload_tensor(TensorView::Additive(view)),
             Err(tritium_spec::BackendError::UnsupportedTensor)
         ));
-        assert_eq!(
-            AdditiveTensor::from_view(view),
-            Err(tritium_format::AdditiveTensorError::InvalidView(
-                tritium_core::AdditiveError::UnsupportedAllocation
-            ))
-        );
+        let owned = AdditiveTensor::from_view(view).unwrap();
+        assert_eq!(owned.tile_counts(), Some(counts.as_slice()));
+        assert_eq!(owned.trits(), view.trits());
+        assert_eq!(owned.scales(), view.scales());
     }
 }
 

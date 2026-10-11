@@ -1,11 +1,12 @@
 //! Owned, validated additive-ternary tensors.
 
 use half::{bf16, f16};
-use tritium_core::{AdditiveError, AdditiveView, Trit};
+use tritium_core::{AdditiveError, AdditiveView, OwnedPerTileIndex, PerTilePlan, Trit};
 use tritium_schema::{AdditiveLayout, PlaneCodec, PlaneRelation, ScaleAnchor, ScalePrecision};
 
 use crate::salt_v2::{
-    SaltV2Codec, SaltV2CodecError, pack_b3, pack_d2, pack_s34, unpack_b3, unpack_d2, unpack_s34,
+    SaltV2Codec, SaltV2CodecError, unpack_b3, unpack_b3_into, unpack_d2, unpack_d2_into,
+    unpack_s34, unpack_s34_into,
 };
 
 /// Failure constructing an owned [`AdditiveTensor`].
@@ -46,6 +47,7 @@ pub struct AdditiveTensor {
     plane_count: u8,
     trits: Vec<Trit>,
     scales: Vec<f32>,
+    per_tile: Option<OwnedPerTileIndex>,
 }
 
 impl AdditiveTensor {
@@ -67,6 +69,13 @@ impl AdditiveTensor {
             plane_count: planes,
             trits: copy_payload(view.trits())?,
             scales: copy_payload(view.scales())?,
+            per_tile: view
+                .tile_counts()
+                .map(|counts| {
+                    OwnedPerTileIndex::new(view.layout(), copy_payload(counts)?)
+                        .map_err(AdditiveTensorError::InvalidView)
+                })
+                .transpose()?,
         })
     }
 
@@ -85,6 +94,33 @@ impl AdditiveTensor {
             plane_count,
             trits,
             scales,
+            per_tile: None,
+        })
+    }
+
+    /// Own compact payloads and counts under the shared checked index geometry.
+    ///
+    /// No dense weights are materialized. All-pruned counts require empty
+    /// coefficients/scales. Exact stored-scale precision is enforced as usual.
+    pub fn new_per_tile(
+        layout: AdditiveLayout,
+        counts: Vec<u8>,
+        trits: Vec<Trit>,
+        scales: Vec<f32>,
+    ) -> Result<Self, AdditiveTensorError> {
+        let index =
+            OwnedPerTileIndex::new(layout, counts).map_err(AdditiveTensorError::InvalidView)?;
+        let view = AdditiveView::new_per_tile(index.as_index(), &trits, &scales)
+            .map_err(AdditiveTensorError::InvalidView)?;
+        Self::validate_view(view)?;
+        let plane_count =
+            u8::try_from(view.plane_count()).map_err(|_| AdditiveTensorError::LengthOverflow)?;
+        Ok(Self {
+            layout,
+            plane_count,
+            trits,
+            scales,
+            per_tile: Some(index),
         })
     }
 
@@ -92,13 +128,6 @@ impl AdditiveTensor {
     ///
     /// Used by capability queries and before reservations in [`Self::from_view`].
     pub fn validate_view(view: AdditiveView<'_>) -> Result<(), AdditiveTensorError> {
-        // Owned storage/codec still have uniform geometry. Never drop compact
-        // counts while copying a view or later reconstruct a panicking view.
-        if view.layout().allocation != tritium_schema::PlaneAllocation::Uniform {
-            return Err(AdditiveTensorError::InvalidView(
-                AdditiveError::UnsupportedAllocation,
-            ));
-        }
         for (index, scale) in view.scales().iter().copied().enumerate() {
             if scale.to_bits() & 0x8000_0000 != 0 {
                 return Err(AdditiveTensorError::InvalidView(
@@ -130,30 +159,41 @@ impl AdditiveTensor {
         if !matches!(self.layout.transport, tritium_schema::Transport::Raw) {
             return Err(AdditiveTensorError::UnsupportedTransport);
         }
-        let coefficients = tensor_coefficients(self.layout)?;
+        let view = self.view();
         let codec = salt_codec(self.layout.codec)?;
-        let plane_bytes = encoded_plane_len(codec, coefficients)?;
+        let mut encoded_planes = 0usize;
+        for plane in 0..view.plane_count() {
+            let coefficients = view
+                .plane_trits(plane)
+                .map_err(AdditiveTensorError::InvalidView)?
+                .len();
+            encoded_planes = encoded_planes
+                .checked_add(encoded_plane_len(codec, coefficients)?)
+                .ok_or(AdditiveTensorError::LengthOverflow)?;
+        }
         let scale_bytes = self
             .scales
             .len()
             .checked_mul(scale_width(self.layout.law.precision)?)
             .ok_or(AdditiveTensorError::LengthOverflow)?;
-        let total = plane_bytes
-            .checked_mul(usize::from(self.plane_count))
-            .and_then(|bytes| bytes.checked_add(scale_bytes))
+        let total = encoded_planes
+            .checked_add(scale_bytes)
             .ok_or(AdditiveTensorError::LengthOverflow)?;
         let mut payload = Vec::new();
         payload
             .try_reserve_exact(total)
             .map_err(|_| AdditiveTensorError::AllocationFailed { requested: total })?;
-        for plane in self.trits.chunks_exact(coefficients) {
-            let encoded = match codec {
-                SaltV2Codec::D2 => pack_d2(plane),
-                SaltV2Codec::B3 => pack_b3(plane),
-                SaltV2Codec::S34 => pack_s34(plane),
-            }
-            .map_err(AdditiveTensorError::Codec)?;
-            payload.extend_from_slice(&encoded);
+        payload.resize(encoded_planes, 0);
+        let mut cursor = 0;
+        for plane in 0..view.plane_count() {
+            let trits = view
+                .plane_trits(plane)
+                .map_err(AdditiveTensorError::InvalidView)?;
+            let len = encoded_plane_len(codec, trits.len())?;
+            codec
+                .pack_into(trits, &mut payload[cursor..cursor + len])
+                .map_err(AdditiveTensorError::Codec)?;
+            cursor += len;
         }
         match self.layout.law.precision {
             ScalePrecision::F16 => payload.extend(
@@ -189,6 +229,11 @@ impl AdditiveTensor {
         layout.validate().map_err(|error| {
             AdditiveTensorError::InvalidView(AdditiveError::InvalidLayout(error))
         })?;
+        if layout.allocation != tritium_schema::PlaneAllocation::Uniform {
+            return Err(AdditiveTensorError::InvalidView(
+                AdditiveError::UnsupportedAllocation,
+            ));
+        }
         if plane_count == 0 || plane_count > layout.max_planes {
             return Err(AdditiveTensorError::InvalidView(
                 AdditiveError::InvalidPlaneCount,
@@ -245,31 +290,73 @@ impl AdditiveTensor {
                 requested: scale_count,
             }
         })?;
-        match layout.law.precision {
-            ScalePrecision::F16 => scales.extend(
-                scale_data
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|bytes| f16::from_bits(u16::from_le_bytes(*bytes)).to_f32()),
-            ),
-            ScalePrecision::Bf16 => scales.extend(
-                scale_data
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|bytes| bf16::from_bits(u16::from_le_bytes(*bytes)).to_f32()),
-            ),
-            ScalePrecision::F32 => scales.extend(
-                scale_data
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|bytes| f32::from_bits(u32::from_le_bytes(*bytes))),
-            ),
-            _ => return Err(AdditiveTensorError::LengthOverflow),
-        }
+        extend_scales(layout.law.precision, scale_data, &mut scales)?;
         Self::new(layout, plane_count, trits, scales)
+    }
+
+    /// Decode compact canonical plane payloads under externally bound counts.
+    ///
+    /// Count metadata is not embedded here; model packages must authenticate it.
+    /// Checked preflight rejects wrong physical length before buffer/index
+    /// reservations. Shared codecs enforce codes and terminal padding. One
+    /// fallibly reserved scratch plane is reused; no dense tensor is allocated.
+    pub fn decode_per_tile_payload(
+        layout: AdditiveLayout,
+        counts: &[u8],
+        payload: &[u8],
+    ) -> Result<Self, AdditiveTensorError> {
+        if !matches!(layout.transport, tritium_schema::Transport::Raw) {
+            return Err(AdditiveTensorError::UnsupportedTransport);
+        }
+        let plan = PerTilePlan::new(layout, counts).map_err(AdditiveTensorError::InvalidView)?;
+        let codec = salt_codec(layout.codec)?;
+        let mut encoded_planes = 0usize;
+        let mut largest_plane = 0;
+        for plane in 0..plan.plane_count() {
+            let coefficients = plan
+                .plane_trit_count(plane)
+                .map_err(AdditiveTensorError::InvalidView)?;
+            largest_plane = largest_plane.max(coefficients);
+            encoded_planes = encoded_planes
+                .checked_add(encoded_plane_len(codec, coefficients)?)
+                .ok_or(AdditiveTensorError::LengthOverflow)?;
+        }
+        let scale_len = plan
+            .scale_count()
+            .checked_mul(scale_width(layout.law.precision)?)
+            .ok_or(AdditiveTensorError::LengthOverflow)?;
+        let expected = encoded_planes
+            .checked_add(scale_len)
+            .ok_or(AdditiveTensorError::LengthOverflow)?;
+        if payload.len() != expected {
+            return Err(AdditiveTensorError::PayloadLength {
+                expected,
+                got: payload.len(),
+            });
+        }
+        let mut trits = reserved_payload(plan.trit_count())?;
+        let mut scratch = reserved_payload(largest_plane)?;
+        let mut cursor = 0;
+        for plane in 0..plan.plane_count() {
+            let coefficients = plan
+                .plane_trit_count(plane)
+                .map_err(AdditiveTensorError::InvalidView)?;
+            let len = encoded_plane_len(codec, coefficients)?;
+            let packed = &payload[cursor..cursor + len];
+            match codec {
+                SaltV2Codec::D2 => unpack_d2_into(packed, coefficients, &mut scratch),
+                SaltV2Codec::B3 => unpack_b3_into(packed, coefficients, &mut scratch),
+                SaltV2Codec::S34 => unpack_s34_into(packed, coefficients, &mut scratch),
+            }
+            .map_err(AdditiveTensorError::Codec)?;
+            trits.extend_from_slice(&scratch);
+            cursor += len;
+        }
+        drop(scratch);
+        let scale_data = &payload[encoded_planes..];
+        let mut scales = reserved_payload(plan.scale_count())?;
+        extend_scales(layout.law.precision, scale_data, &mut scales)?;
+        Self::new_per_tile(layout, copy_payload(counts)?, trits, scales)
     }
 
     /// Return the tensor's validated semantic layout.
@@ -296,13 +383,63 @@ impl AdditiveTensor {
         &self.scales
     }
 
+    /// Borrow row-major compact counts, or `None` for uniform allocation.
+    #[must_use]
+    pub fn tile_counts(&self) -> Option<&[u8]> {
+        self.per_tile.as_ref().map(OwnedPerTileIndex::tile_counts)
+    }
+
     /// Create a zero-copy semantic view over this owned tensor.
     #[must_use]
     pub fn view(&self) -> AdditiveView<'_> {
         // Constructor established all invariants and fields are immutable.
-        AdditiveView::new(self.layout, self.plane_count, &self.trits, &self.scales)
-            .expect("AdditiveTensor invariants are immutable after construction")
+        let view = if let Some(index) = &self.per_tile {
+            AdditiveView::new_per_tile(index.as_index(), &self.trits, &self.scales)
+        } else {
+            AdditiveView::new(self.layout, self.plane_count, &self.trits, &self.scales)
+        };
+        view.expect("AdditiveTensor invariants are immutable after construction")
     }
+}
+
+fn extend_scales(
+    precision: ScalePrecision,
+    data: &[u8],
+    scales: &mut Vec<f32>,
+) -> Result<(), AdditiveTensorError> {
+    match precision {
+        ScalePrecision::F16 => scales.extend(
+            data.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|bytes| f16::from_bits(u16::from_le_bytes(*bytes)).to_f32()),
+        ),
+        ScalePrecision::Bf16 => scales.extend(
+            data.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|bytes| bf16::from_bits(u16::from_le_bytes(*bytes)).to_f32()),
+        ),
+        ScalePrecision::F32 => scales.extend(
+            data.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_bits(u32::from_le_bytes(*bytes))),
+        ),
+        _ => return Err(AdditiveTensorError::LengthOverflow),
+    }
+    Ok(())
+}
+
+fn reserved_payload<T>(count: usize) -> Result<Vec<T>, AdditiveTensorError> {
+    let requested = count
+        .checked_mul(core::mem::size_of::<T>())
+        .ok_or(AdditiveTensorError::LengthOverflow)?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| AdditiveTensorError::AllocationFailed { requested })?;
+    Ok(values)
 }
 
 fn copy_payload<T: Copy>(values: &[T]) -> Result<Vec<T>, AdditiveTensorError> {

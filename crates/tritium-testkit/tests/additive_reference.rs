@@ -35,7 +35,7 @@ fn reference_adapter_does_not_discard_compact_counts_on_upload() {
         );
         assert!(matches!(
             backend.upload_tensor(TensorView::Additive(view)),
-            Err(tritium_spec::BackendError::InvalidInput(_))
+            Err(tritium_spec::BackendError::UnsupportedTensor)
         ));
     }
 }

@@ -45,7 +45,9 @@ pub use error::TritError;
 #[cfg(feature = "std")]
 pub use feedback::auto_feedback_decay;
 pub use feedback::{FeedbackDecay, FeedbackDecayError};
-pub use per_tile::{PerTileIndex, PerTileRowSpan};
+#[cfg(feature = "alloc")]
+pub use per_tile::OwnedPerTileIndex;
+pub use per_tile::{PerTileIndex, PerTilePlan, PerTileRowSpan};
 pub use reference::{reference_conv1d, reference_fsq, reference_mpgemm};
 pub use scale::{ScaleGranularity, absmean};
 pub use shape::{ConvShape, GemmShape};

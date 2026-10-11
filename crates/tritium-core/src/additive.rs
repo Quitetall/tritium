@@ -96,6 +96,11 @@ pub enum AdditiveError {
     InvalidScale,
     /// A dimension product cannot be represented on this target.
     SizeOverflow,
+    /// Fallible owned index storage could not be reserved.
+    AllocationFailed {
+        /// Requested buffer size in bytes.
+        requested: usize,
+    },
     /// A requested matrix row is outside the tensor.
     RowOutOfRange,
     /// The output buffer length disagrees with tensor geometry.

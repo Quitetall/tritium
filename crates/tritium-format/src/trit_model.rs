@@ -397,6 +397,13 @@ pub fn additive_semantic_digest(
     tensor: &AdditiveTensor,
 ) -> Result<SemanticTensorDigest, TritModelError> {
     let layout = tensor.layout();
+    // Model metadata/identity handling is still uniform-only. Never promote a
+    // valid compact tensor by hashing its count array as Uniform metadata.
+    if tensor.tile_counts().is_some() {
+        return Err(TritModelError::UnsupportedFeature(
+            "per-tile semantic digest",
+        ));
+    }
     let metadata = TensorSemanticMeta::Additive {
         rows: layout.rows,
         cols: layout.cols,

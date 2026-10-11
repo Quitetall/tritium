@@ -14,7 +14,7 @@ pub struct PerTileRowSpan {
     scale: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Geometry {
     rows: usize,
     cols: usize,
@@ -23,6 +23,139 @@ struct Geometry {
     trits: usize,
     scales: usize,
     slots: usize,
+}
+
+/// Allocation-free preflight for compact payload and index sizing.
+///
+/// Uses the same geometry validator as the runtime index. A format decoder can
+/// check its physical ledger before reserving coefficient or index buffers.
+#[derive(Clone, Copy, Debug)]
+pub struct PerTilePlan<'a> {
+    layout: AdditiveLayout,
+    counts: &'a [u8],
+    geometry: Geometry,
+}
+
+impl<'a> PerTilePlan<'a> {
+    /// Validate the layout and exact row-major counts without allocating.
+    pub fn new(layout: AdditiveLayout, counts: &'a [u8]) -> Result<Self, AdditiveError> {
+        Ok(Self {
+            layout,
+            counts,
+            geometry: geometry(layout, counts)?,
+        })
+    }
+
+    /// Exact required row span count.
+    #[must_use]
+    pub const fn index_len(&self) -> usize {
+        self.geometry.slots
+    }
+
+    /// Exact total compact coefficient count.
+    #[must_use]
+    pub const fn trit_count(&self) -> usize {
+        self.geometry.trits
+    }
+
+    /// Exact stored scale count.
+    #[must_use]
+    pub const fn scale_count(&self) -> usize {
+        self.geometry.scales
+    }
+
+    /// Actual maximum tile count, possibly zero.
+    #[must_use]
+    pub const fn plane_count(&self) -> usize {
+        self.geometry.planes
+    }
+
+    /// Logical coefficient count for one present compact plane.
+    ///
+    /// Scans borrowed counts without allocating. This preflight is for codecs,
+    /// not a replacement for the O(1) row lookup of a built runtime index.
+    pub fn plane_trit_count(&self, plane: usize) -> Result<usize, AdditiveError> {
+        if plane >= self.geometry.planes {
+            return Err(AdditiveError::InvalidPlaneCount);
+        }
+        let mut total = 0;
+        for (tile, &count) in self.counts.iter().enumerate() {
+            if usize::from(count) > plane {
+                total += (self.geometry.cols - (tile % self.geometry.tiles) * 256).min(256);
+            }
+        }
+        Ok(total) // Bounded by the checked total coefficient count.
+    }
+
+    /// Populate exact caller-owned storage after preflight, without allocation.
+    pub fn build(
+        self,
+        storage: &'a mut [PerTileRowSpan],
+    ) -> Result<PerTileIndex<'a>, AdditiveError> {
+        PerTileIndex::build_validated(self.layout, self.counts, storage, self.geometry)
+    }
+}
+
+/// Fallibly constructed owned compact index; never self-referential.
+///
+/// Its immutable buffers yield a sealed borrowed index without geometry scans.
+#[cfg(feature = "alloc")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnedPerTileIndex {
+    layout: AdditiveLayout,
+    geometry: Geometry,
+    counts: alloc::vec::Vec<u8>,
+    spans: alloc::vec::Vec<PerTileRowSpan>,
+}
+
+#[cfg(feature = "alloc")]
+impl OwnedPerTileIndex {
+    /// Validate owned counts and fallibly reserve exactly sized row-span storage.
+    pub fn new(layout: AdditiveLayout, counts: alloc::vec::Vec<u8>) -> Result<Self, AdditiveError> {
+        let plan = PerTilePlan::new(layout, &counts)?;
+        let geometry = plan.geometry;
+        let requested = geometry
+            .slots
+            .checked_mul(core::mem::size_of::<PerTileRowSpan>())
+            .ok_or(AdditiveError::SizeOverflow)?;
+        let mut spans = alloc::vec::Vec::new();
+        spans
+            .try_reserve_exact(geometry.slots)
+            .map_err(|_| AdditiveError::AllocationFailed { requested })?;
+        spans.resize(geometry.slots, PerTileRowSpan::default());
+        plan.build(&mut spans)?;
+        Ok(Self {
+            layout,
+            geometry,
+            counts,
+            spans,
+        })
+    }
+
+    /// Borrow the sealed runtime index with no allocation or geometry rescan.
+    #[must_use]
+    pub fn as_index(&self) -> PerTileIndex<'_> {
+        PerTileIndex {
+            layout: self.layout,
+            geometry: self.geometry,
+            counts: &self.counts,
+            spans: &self.spans,
+        }
+    }
+
+    /// Borrow immutable row-major tile counts without rebuilding a view.
+    #[must_use]
+    pub fn tile_counts(&self) -> &[u8] {
+        &self.counts
+    }
+
+    /// Retained count and row-span buffer capacities in bytes.
+    ///
+    /// Excludes struct/allocator overhead and is not full process RSS.
+    #[must_use]
+    pub fn storage_bytes(&self) -> usize {
+        self.counts.capacity() + self.spans.capacity() * core::mem::size_of::<PerTileRowSpan>()
+    }
 }
 
 /// Validated borrowed index for row-aligned compact additive payloads.
@@ -43,7 +176,7 @@ pub struct PerTileIndex<'a> {
 impl<'a> PerTileIndex<'a> {
     /// Exact number of caller-owned row spans, after validating counts/geometry.
     pub fn required_storage(layout: AdditiveLayout, counts: &[u8]) -> Result<usize, AdditiveError> {
-        Ok(geometry(layout, counts)?.slots)
+        Ok(PerTilePlan::new(layout, counts)?.index_len())
     }
 
     /// Build the index without allocating, changing storage only after preflight.
@@ -55,7 +188,15 @@ impl<'a> PerTileIndex<'a> {
         counts: &'a [u8],
         storage: &'a mut [PerTileRowSpan],
     ) -> Result<Self, AdditiveError> {
-        let geometry = geometry(layout, counts)?;
+        PerTilePlan::new(layout, counts)?.build(storage)
+    }
+
+    fn build_validated(
+        layout: AdditiveLayout,
+        counts: &'a [u8],
+        storage: &'a mut [PerTileRowSpan],
+        geometry: Geometry,
+    ) -> Result<Self, AdditiveError> {
         if storage.len() != geometry.slots {
             return Err(AdditiveError::IndexStorageLength {
                 expected: geometry.slots,
