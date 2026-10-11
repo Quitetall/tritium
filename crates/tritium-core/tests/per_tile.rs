@@ -27,6 +27,49 @@ fn layout(
     }
 }
 
+#[test]
+fn logical_prefix_uses_retained_coordinates_and_stored_bits_not_dense_equivalence() {
+    let layout = layout(1, 257, ADMITTED_LAWS[0], 128);
+    let parent_counts = [1, 2];
+    let child_counts = [0, 2];
+    let mut parent_storage = vec![PerTileRowSpan::default(); 2];
+    let mut child_storage = vec![PerTileRowSpan::default(); 2];
+    let parent_index = PerTileIndex::build(layout, &parent_counts, &mut parent_storage).unwrap();
+    let child_index = PerTileIndex::build(layout, &child_counts, &mut child_storage).unwrap();
+    let mut parent_trits = vec![Trit::POS; 258];
+    parent_trits[256] = Trit::NEG;
+    let child_trits = [Trit::NEG, Trit::POS];
+    let parent_scales = [0.125, 0.25, 0.5, 1.0];
+    let child_scales = [0.5, 1.0];
+    let parent = AdditiveView::new_per_tile(parent_index, &parent_trits, &parent_scales).unwrap();
+    let child = AdditiveView::new_per_tile(child_index, &child_trits, &child_scales).unwrap();
+    assert!(!parent.trits().starts_with(child.trits()));
+    assert!(child.is_logical_prefix_of(parent));
+    assert!(!parent.is_logical_prefix_of(child));
+
+    let zero_parent_scales = [0.0; 4];
+    let zero_child_scales = [0.0; 2];
+    let changed_trits = [Trit::POS; 2];
+    let parent =
+        AdditiveView::new_per_tile(parent_index, &parent_trits, &zero_parent_scales).unwrap();
+    let child =
+        AdditiveView::new_per_tile(child_index, &changed_trits, &zero_child_scales).unwrap();
+    let mut parent_row = [1.0; 257];
+    let mut child_row = [1.0; 257];
+    parent.dequant_row_into(0, &mut parent_row).unwrap();
+    child.dequant_row_into(0, &mut child_row).unwrap();
+    assert_eq!(parent_row, child_row);
+    assert!(!child.is_logical_prefix_of(parent));
+
+    // The core accepts signed zero; canonical format scales reject it. The
+    // logical comparator still distinguishes stored bits without widening rules.
+    let signed_zero_scales = [0.0, 0.0, -0.0, 0.0];
+    let parent =
+        AdditiveView::new_per_tile(parent_index, &parent_trits, &signed_zero_scales).unwrap();
+    let child = AdditiveView::new_per_tile(child_index, &child_trits, &zero_child_scales).unwrap();
+    assert!(!child.is_logical_prefix_of(parent));
+}
+
 // Reorder/mask fixture data only. Both numerical oracles are the actual shared
 // production references; no quantizer, basis transform or dot formula is copied.
 fn compare_to_uniform(layout: AdditiveLayout, counts: &[u8]) {

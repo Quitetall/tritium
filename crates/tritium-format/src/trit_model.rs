@@ -390,26 +390,32 @@ fn frame_length(length: usize) -> Result<[u8; 8], TritModelError> {
 ///
 /// Hashes canonical Rust-derived metadata, plane-major trits and exact stored
 /// scale bits with bounded staging. Does not materialize a dense tensor/preimage.
-/// Unused maximum capacity is excluded. Profile remains proposed (ADR 0054).
+/// Binds exact Uniform/PerTile counts, excluding unused capacity and derived
+/// runtime indexes. Profile remains proposed (ADRs 0054 and 0066).
 /// # Errors
-/// Metadata encoding or unsupported scale precision.
+/// Count reservation, metadata encoding or unsupported scale precision.
 pub fn additive_semantic_digest(
     tensor: &AdditiveTensor,
 ) -> Result<SemanticTensorDigest, TritModelError> {
     let layout = tensor.layout();
-    // Model metadata/identity handling is still uniform-only. Never promote a
-    // valid compact tensor by hashing its count array as Uniform metadata.
-    if tensor.tile_counts().is_some() {
-        return Err(TritModelError::UnsupportedFeature(
-            "per-tile semantic digest",
-        ));
-    }
+    let planes = if let Some(counts) = tensor.tile_counts() {
+        let mut owned = Vec::new();
+        owned.try_reserve_exact(counts.len()).map_err(|_| {
+            TritModelError::Additive(AdditiveTensorError::AllocationFailed {
+                requested: counts.len(),
+            })
+        })?;
+        owned.extend_from_slice(counts);
+        PlaneCounts::PerTile(owned)
+    } else {
+        PlaneCounts::Uniform(tensor.plane_count())
+    };
     let metadata = TensorSemanticMeta::Additive {
         rows: layout.rows,
         cols: layout.cols,
         tile: layout.tile,
         group: layout.group,
-        planes: PlaneCounts::Uniform(tensor.plane_count()),
+        planes,
         law: layout.law,
         basis: layout.basis,
     };
@@ -518,12 +524,14 @@ fn decode_additive(meta: &TensorMeta, bytes: &[u8]) -> Result<AdditiveTensor, Tr
     if !matches!(layout.transport, Transport::Raw) {
         return Err(TritModelError::UnsupportedFeature("entropy model payloads"));
     }
-    let PlaneCounts::Uniform(count) = planes else {
-        return Err(TritModelError::UnsupportedFeature(
-            "per-tile model payloads",
-        ));
-    };
-    AdditiveTensor::decode_payload(*layout, *count, bytes).map_err(TritModelError::Additive)
+    match planes {
+        PlaneCounts::Uniform(count) => AdditiveTensor::decode_payload(*layout, *count, bytes),
+        PlaneCounts::PerTile(counts) => {
+            AdditiveTensor::decode_per_tile_payload(*layout, counts, bytes)
+        }
+        _ => return Err(TritModelError::UnsupportedFeature("plane allocation")),
+    }
+    .map_err(TritModelError::Additive)
 }
 
 /// Validate original raw dense bytes without changing precision or bit patterns.
@@ -635,18 +643,15 @@ fn is_prefix(
             let mut normalized = *p;
             normalized.max_planes = c.max_planes;
             normalized.codec = c.codec;
+            // Cross-allocation prefixes use logical coordinates, not physical
+            // offsets. Preserve every other prior layout/capacity constraint.
+            normalized.allocation = c.allocation;
             if normalized != *c || c.max_planes > p.max_planes {
                 return Ok(false);
             }
             let child = decode_additive(child, child_bytes)?;
             let parent = decode_additive(parent, parent_bytes)?;
-            Ok(parent.trits().starts_with(child.trits())
-                && parent
-                    .scales()
-                    .iter()
-                    .map(|s| s.to_bits())
-                    .take(child.scales().len())
-                    .eq(child.scales().iter().map(|s| s.to_bits())))
+            Ok(child.view().is_logical_prefix_of(parent.view()))
         }
         _ => Ok(false),
     }

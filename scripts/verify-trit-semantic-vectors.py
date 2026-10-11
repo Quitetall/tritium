@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent CBOR/preimage implementation of ADR 0054 candidate vectors.
+"""Independent CBOR/preimage implementation of ADR 0054/0066 candidate vectors.
 
 Requires cbor2 and blake3 in the selected Python environment. This verifies
 synthetic candidate hash bytes, not owner acceptance or release qualification.
@@ -59,8 +59,28 @@ def vectors():
     tied.update(tied_trits)
     tied.update(struct.pack("<Q", len(tied_scales)))
     tied.update(tied_scales)
+    compact = {}
+    for name, cols, counts, trit_count, scale_count, relation in [
+        ("compact", 512, [1, 0, 1, 0], 512, 4, "Free"),
+        ("compact_tied", 257, [1, 3, 2, 0], 771, 5, {"Tied": {"num": 1, "den": 3}}),
+        ("compact_pruned", 257, [0, 0, 0, 0], 0, 0, "Free"),
+    ]:
+        value = {"Additive": {
+            "rows": 2, "cols": cols, "tile": 256, "group": 128,
+            "planes": {"PerTile": counts},
+            "law": {"anchor": "Group", "relation": relation, "precision": "F16"},
+            "basis": "Identity",
+        }}
+        digest = metadata_hash("tritium.trit.additive.v1", value)
+        compact_trits = bytes([1]) * trit_count
+        compact_scales = struct.pack("<" + "e" * scale_count, *([0.5] * scale_count))
+        digest.update(struct.pack("<Q", len(compact_trits)))
+        digest.update(compact_trits)
+        digest.update(struct.pack("<Q", len(compact_scales)))
+        digest.update(compact_scales)
+        compact[name] = digest.hexdigest()
     return {"additive": tensor_digest.hex(), "model": model.hexdigest(),
-            "dense": dense.hexdigest(), "tied": tied.hexdigest()}
+            "dense": dense.hexdigest(), "tied": tied.hexdigest(), **compact}
 
 
 if __name__ == "__main__":
@@ -70,9 +90,12 @@ if __name__ == "__main__":
         "dense": "b19646f6931fcd0dab8b73d14f624cdc542865cddd9a6a40d9c798727fa7a568",
         "model": "a396a7331dadad1cf59f96df549cf551784ca5a19f5c6e9990c1f66d6fcbaf5f",
         "tied": "54b0d7099eb3e68572e14a45160b666e70e9d945a827d685f0d331bbe599bdf4",
+        "compact": "470b29d42f3c920c4607e6e6f52d6d56d0e9cbe9faba52a682f91faa604dad38",
+        "compact_tied": "033c3c21362004d35f3e8bef90197b1080be442e8f596e899729351e69fbf6fa",
+        "compact_pruned": "613f6359e9c50727588ff82539f2edbb1e34d0748583dbe9dd709204573c51f1",
     }
     if actual != expected:
         raise ValueError(f"candidate vector mismatch: {actual}")
-    print(json.dumps({"profile": "ADR-0054-proposed", "status": "candidate-vector-PASS", "vectors": actual,
+    print(json.dumps({"profile": "ADR-0054-0066-proposed", "status": "candidate-vector-PASS", "vectors": actual,
                       "libraries": {name: importlib.metadata.version(name)
                                     for name in ["blake3", "cbor2"]}}, sort_keys=True))

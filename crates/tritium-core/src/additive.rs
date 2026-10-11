@@ -8,6 +8,7 @@ use tritium_schema::{
     AdditiveLayout, Basis, LayoutError, PlaneAllocation, PlaneRelation, ScaleAnchor,
 };
 
+use crate::per_tile::{ActiveTile, ActiveTiles};
 use crate::{PerTileIndex, Trit};
 
 /// Consumer marker: rotate activations before additive matrix multiplication.
@@ -291,6 +292,74 @@ impl<'a> AdditiveView<'a> {
         self.scales
     }
 
+    /// Compare retained logical planes and exact stored scales with a parent.
+    ///
+    /// Requires identical shape, tile/group geometry, law and basis. Each child
+    /// tile must have no more planes than its parent, and all retained trits and
+    /// stored scale bits must match. Missing/pruned child tiles are not compared.
+    /// Allocation, codec, transport and unused capacity are representation details;
+    /// a model profile may impose additional metadata constraints before calling.
+    /// This allocates nothing and scans paired row/tile cursors monotonically,
+    /// without expanding compact tensors or rescanning preceding rows.
+    #[must_use]
+    pub fn is_logical_prefix_of(&self, parent: AdditiveView<'_>) -> bool {
+        let child_layout = self.layout();
+        let parent_layout = parent.layout();
+        if child_layout.rows != parent_layout.rows
+            || child_layout.cols != parent_layout.cols
+            || child_layout.tile != parent_layout.tile
+            || child_layout.group != parent_layout.group
+            || child_layout.law != parent_layout.law
+            || child_layout.basis != parent_layout.basis
+            || self.plane_count() > parent.plane_count()
+        {
+            return false;
+        }
+        for plane in 0..self.plane_count() {
+            for row in 0..child_layout.rows as usize {
+                let mut parents = parent.row_tiles(plane, row);
+                for child in self.row_tiles(plane, row) {
+                    let Some(retained) = parents.find(|tile| tile.col >= child.col) else {
+                        return false;
+                    };
+                    if retained.col != child.col
+                        || self.trits[child.trit..child.trit + child.len]
+                            != parent.trits[retained.trit..retained.trit + retained.len]
+                    {
+                        return false;
+                    }
+                    let scales = if child_layout.law.anchor == ScaleAnchor::Group {
+                        child.len.div_ceil(usize::from(child_layout.group))
+                    } else {
+                        1
+                    };
+                    if !self.scales[child.scale..child.scale + scales]
+                        .iter()
+                        .map(|scale| scale.to_bits())
+                        .eq(parent.scales[retained.scale..retained.scale + scales]
+                            .iter()
+                            .map(|scale| scale.to_bits()))
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn row_tiles(&self, plane: usize, row: usize) -> RowTiles<'_, 'a> {
+        match self.allocation {
+            Allocation::PerTile(index) => RowTiles::PerTile(index.row_tiles(plane, row)),
+            Allocation::Uniform { .. } => RowTiles::Uniform {
+                view: self,
+                plane,
+                row,
+                col: 0,
+            },
+        }
+    }
+
     /// Bind this tensor to matmul, whose activations use the forward basis.
     #[must_use]
     pub const fn bind_matmul(self) -> BasisBound<Self, Matmul> {
@@ -470,6 +539,56 @@ impl<'a> AdditiveView<'a> {
             }
         }
         Ok(sum)
+    }
+}
+
+// One logical row cursor for each existing allocation. Compact offsets remain
+// owned by the sealed index; uniform offsets retain the existing scale order.
+enum RowTiles<'v, 'a> {
+    PerTile(ActiveTiles<'a>),
+    Uniform {
+        view: &'v AdditiveView<'a>,
+        plane: usize,
+        row: usize,
+        col: usize,
+    },
+}
+
+impl Iterator for RowTiles<'_, '_> {
+    type Item = ActiveTile;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::PerTile(tiles) => tiles.next(),
+            Self::Uniform {
+                view,
+                plane,
+                row,
+                col,
+            } => {
+                let layout = view.layout();
+                let cols = layout.cols as usize;
+                if *col >= cols {
+                    return None;
+                }
+                let Allocation::Uniform { scale_units, .. } = view.allocation else {
+                    unreachable!("uniform row cursor over compact allocation")
+                };
+                let unit = view.scale_unit(*row, *col).expect("validated scale anchor");
+                let tile = ActiveTile {
+                    col: *col,
+                    len: (cols - *col).min(usize::from(layout.tile)),
+                    trit: (*plane * layout.rows as usize + *row) * cols + *col,
+                    scale: if layout.law.relation == PlaneRelation::Free {
+                        *plane * scale_units + unit
+                    } else {
+                        unit
+                    },
+                };
+                *col += tile.len;
+                Some(tile)
+            }
+        }
     }
 }
 

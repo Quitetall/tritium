@@ -976,23 +976,10 @@ fn direct_fit_requires_canonical_nonempty_ancestry_not_a_verdict() {
 #[test]
 fn unsupported_payload_capabilities_are_representable_but_not_silently_loaded() {
     let (meta, bytes) = additive(PlaneCodec::D2, ScalePrecision::F32, Basis::Identity, 3);
-    for capability in [
-        "per-tile model payloads",
-        "entropy model payloads",
-        "sharded model payloads",
-    ] {
+    for capability in ["entropy model payloads", "sharded model payloads"] {
         let mut manifest = fixture();
         manifest.levels[0].tensors[0] = meta.clone();
         match capability {
-            "per-tile model payloads" => {
-                let TensorStorage::Additive { layout, planes } =
-                    &mut manifest.levels[0].tensors[0].storage
-                else {
-                    unreachable!()
-                };
-                layout.allocation = PlaneAllocation::PerTile;
-                *planes = PlaneCounts::PerTile(vec![0, 3]);
-            }
             "entropy model payloads" => {
                 let TensorStorage::Additive { layout, .. } =
                     &mut manifest.levels[0].tensors[0].storage

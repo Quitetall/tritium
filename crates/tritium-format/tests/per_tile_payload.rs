@@ -208,9 +208,26 @@ fn structured_codec_preserves_constraints_without_automatic_admission() {
 }
 
 #[test]
-fn model_semantic_digest_cannot_mislabel_compact_counts_as_uniform() {
-    let owned = tensor(layout(ADMITTED_LAWS[0], 257, PlaneCodec::D2), &[1, 3, 2, 0]);
-    assert!(tritium_format::trit_model::additive_semantic_digest(&owned).is_err());
+fn model_semantic_digest_binds_compact_allocation_instead_of_uniform() {
+    let compact = tensor(layout(ADMITTED_LAWS[0], 257, PlaneCodec::D2), &[3; 4]);
+    let uniform = AdditiveTensor::new(
+        AdditiveLayout {
+            allocation: PlaneAllocation::Uniform,
+            ..compact.layout()
+        },
+        3,
+        compact.trits().to_vec(),
+        compact.scales().to_vec(),
+    )
+    .unwrap();
+    assert_eq!(
+        compact.encode_payload().unwrap(),
+        uniform.encode_payload().unwrap()
+    );
+    assert_ne!(
+        tritium_format::trit_model::additive_semantic_digest(&compact).unwrap(),
+        tritium_format::trit_model::additive_semantic_digest(&uniform).unwrap()
+    );
 }
 
 #[test]
