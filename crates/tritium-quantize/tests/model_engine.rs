@@ -173,8 +173,10 @@ fn both_sources_preserve_original_bits_fit_each_level_and_replay() {
         let mut memory = source(precision);
         let originals = memory.clone();
         let request = plan(&memory);
+        let observed_source = Engine::observe_source(&request, &mut memory).unwrap();
         let mut sink = MemoryTensorSink::default();
         let result = Engine::run(&request, &mut memory, &mut sink, recorder()).unwrap();
+        assert_eq!(result.source_id, observed_source);
         assert!(result.warnings.is_empty());
         assert_eq!(
             originals.tensors["norm"].bytes,
@@ -221,6 +223,10 @@ fn both_sources_preserve_original_bits_fit_each_level_and_replay() {
         }
         assert_eq!(result.evidence.root(), evidence.root());
         assert_eq!(
+            QuantizationReceiptView::fold(evidence.log()).unwrap()[0].source_id(),
+            observed_source
+        );
+        assert_eq!(
             QuantizationReceiptView::fold(evidence.log()).unwrap().len(),
             1
         );
@@ -244,10 +250,77 @@ fn both_sources_preserve_original_bits_fit_each_level_and_replay() {
                 .unwrap();
         let mut seek_sink = MemoryTensorSink::default();
         let other = Engine::run(&request, &mut seek, &mut seek_sink, recorder()).unwrap();
+        assert_eq!(other.source_id, result.source_id);
         assert_eq!(other.package_id, result.package_id);
         assert_eq!(other.evidence, result.evidence);
         assert_eq!(seek_sink.artifact().unwrap().0, package);
     }
+}
+
+#[test]
+fn original_source_identity_is_independent_of_fitting_but_detects_actual_byte_changes() {
+    let mut input = source(ScalePrecision::F32);
+    let request = plan(&input);
+    let original = Engine::observe_source(&request, &mut input).unwrap();
+    let mut dense_request = request.clone();
+    dense_request.levels = vec!["dense".into()];
+    for tensor in &mut dense_request.tensors {
+        tensor.action = QuantAction::KeepDense;
+    }
+    let dense = Engine::run(
+        &dense_request,
+        &mut input,
+        &mut MemoryTensorSink::default(),
+        recorder(),
+    )
+    .unwrap();
+    assert_eq!(dense.source_id, original);
+    let fitted = Engine::run(
+        &request,
+        &mut input,
+        &mut MemoryTensorSink::default(),
+        recorder(),
+    )
+    .unwrap();
+    assert_eq!(fitted.source_id, original);
+    assert_ne!(dense.package_id, fitted.package_id);
+    // Exact bits matter even when numeric +0 and -0 are equal.
+    input.tensors.get_mut("norm").unwrap().bytes[..4].copy_from_slice(&0f32.to_le_bytes());
+    assert_ne!(
+        Engine::observe_source(&request, &mut input).unwrap(),
+        original
+    );
+    input = source(ScalePrecision::F32);
+    input.assets.insert("config.json".into(), b"{ }".to_vec());
+    assert_ne!(
+        Engine::observe_source(&request, &mut input).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn original_source_observation_enforces_inventory_payload_and_logical_limits() {
+    let mut input = source(ScalePrecision::F32);
+    let request = plan(&input);
+    let mut limited = request.clone();
+    limited.limits.max_source_bytes = 1;
+    assert!(matches!(
+        Engine::observe_source(&limited, &mut input),
+        Err(QuantEngineError::Limit("source bytes"))
+    ));
+    limited = request.clone();
+    limited.limits.max_asset_bytes = 1;
+    assert!(Engine::observe_source(&limited, &mut input).is_err());
+    input.tensors.get_mut("norm").unwrap().bytes.pop();
+    assert!(Engine::observe_source(&request, &mut input).is_err());
+    input = source(ScalePrecision::F32);
+    input.assets.insert("extra.json".into(), vec![]);
+    assert!(matches!(
+        Engine::observe_source(&request, &mut input),
+        Err(QuantEngineError::Binding(
+            "complete original inventory changed"
+        ))
+    ));
 }
 
 #[test]

@@ -10,8 +10,8 @@ use tritium_format::trit_model::{
 };
 use tritium_format::{TritBlob, TritBlobKind, TritPackageError, write_trit_package_bounded};
 use tritium_schema::{
-    BlobId, BlobReference, DirectFitMetric, ModelId, NamedAssetDigest, PackageId, PlaneCounts,
-    QuantAction, QuantOutputLevel, QuantPlan, QuantPlanError, QuantSourceBinding,
+    BlobId, BlobReference, DirectFitMetric, ModelId, NamedAssetDigest, OriginalSourceId, PackageId,
+    PlaneCounts, QuantAction, QuantOutputLevel, QuantPlan, QuantPlanError, QuantSourceBinding,
     QuantSourceTensor, QuantizationCompleted, QuantizationStarted, ScalePrecision, TensorMeta,
     TensorStorage,
 };
@@ -114,6 +114,8 @@ impl From<std::io::Error> for QuantEngineError {
 /// Does not claim model quality, architecture execution, speed, RSS or release clearance.
 #[derive(Debug)]
 pub struct QuantizedModel {
+    /// Candidate identity of actual original bytes, not fitted semantics or a source lock.
+    pub source_id: OriginalSourceId,
     /// Exact complete package bytes identity.
     pub package_id: PackageId,
     /// Checked semantic identity of every complete level.
@@ -128,6 +130,56 @@ pub struct QuantizedModel {
 #[derive(Debug)]
 pub struct Engine;
 impl Engine {
+    /// Observe the complete original model identity before calibration, without fitting.
+    ///
+    /// Reads actual assets and raw tensors through the same source seam and validates
+    /// their requested complete inventory/interpretation. Original payloads are not
+    /// widened or retained by the engine. Logical source/asset limits apply; this
+    /// does not lock mutable source files or admit caller/adapter/full-process RSS.
+    /// A subsequent conversion must compare its actual identity; this observation
+    /// alone does not bind calibration to a package or establish release provenance.
+    /// # Errors
+    /// Invalid plan, changed inventory, source I/O/payload or logical byte limits.
+    pub fn observe_source(
+        plan: &QuantPlan,
+        source: &mut dyn WeightSource,
+    ) -> Result<OriginalSourceId, QuantEngineError> {
+        plan.validate().map_err(QuantEngineError::Plan)?;
+        check_source_inventory(plan, source)?;
+        let total = plan.tensors.iter().try_fold(0u64, |total, tensor| {
+            total
+                .checked_add(tensor.source.byte_len().map_err(QuantEngineError::Plan)?)
+                .ok_or(QuantEngineError::Limit("source bytes"))
+        })?;
+        bound(total, plan.limits.max_source_bytes, "source bytes")?;
+        let mut assets = Vec::new();
+        let mut asset_bytes = 0u64;
+        for name in &plan.assets {
+            let remaining = plan.limits.max_asset_bytes - asset_bytes;
+            let bytes = source.asset(name, platform(remaining, "asset bytes")?)?;
+            bound(bytes.len() as u64, remaining, "asset bytes")?;
+            asset_bytes += bytes.len() as u64;
+            assets.push(NamedAssetDigest {
+                name: name.clone(),
+                content: BlobId::from_bytes(*blake3::hash(&bytes).as_bytes()),
+            });
+        }
+        let mut tensors = Vec::new();
+        for request in &plan.tensors {
+            let original = &request.source;
+            let bytes = source.tensor(
+                &original.name,
+                platform(
+                    original.byte_len().map_err(QuantEngineError::Plan)?,
+                    "source bytes",
+                )?,
+            )?;
+            tensors.push(source_binding(original, &bytes)?);
+        }
+        tritium_evidence::original_source_id(&plan.architecture, &tensors, &assets)
+            .map_err(QuantEngineError::Plan)
+    }
+
     /// Fit complete levels from original sources, seal evidence, write and check
     /// a canonical package, then publish through the sink.
     ///
@@ -168,18 +220,7 @@ impl Engine {
             }
         }
         bound(total, plan.limits.max_source_bytes, "source bytes")?;
-        if source.inventory()?
-            != plan
-                .tensors
-                .iter()
-                .map(|t| t.source.clone())
-                .collect::<Vec<_>>()
-            || source.asset_names() != plan.assets
-        {
-            return Err(QuantEngineError::Binding(
-                "complete original inventory changed",
-            ));
-        }
+        check_source_inventory(plan, source)?;
         recorder.emit(
             "quantize",
             None,
@@ -222,11 +263,7 @@ impl Engine {
                     "source bytes",
                 )?,
             )?;
-            validate_dense_payload(&original.name, &original.shape, original.precision, &bytes)?;
-            sources.push(QuantSourceBinding {
-                source: original.clone(),
-                content: BlobId::from_bytes(*blake3::hash(&bytes).as_bytes()),
-            });
+            sources.push(source_binding(original, &bytes)?);
             match &request.action {
                 QuantAction::KeepDense => {
                     let kind = match original.precision {
@@ -343,12 +380,41 @@ impl Engine {
             .collect::<Result<BTreeMap<_, _>, TritModelError>>()?;
         let warnings = sink.publish(&package, &evidence)?;
         Ok(QuantizedModel {
+            source_id: view.source_id(),
             package_id,
             model_ids,
             evidence,
             warnings,
         })
     }
+}
+
+fn check_source_inventory(
+    plan: &QuantPlan,
+    source: &dyn WeightSource,
+) -> Result<(), QuantEngineError> {
+    if source
+        .inventory()?
+        .iter()
+        .ne(plan.tensors.iter().map(|t| &t.source))
+        || source.asset_names() != plan.assets
+    {
+        return Err(QuantEngineError::Binding(
+            "complete original inventory changed",
+        ));
+    }
+    Ok(())
+}
+
+fn source_binding(
+    original: &QuantSourceTensor,
+    bytes: &[u8],
+) -> Result<QuantSourceBinding, QuantEngineError> {
+    validate_dense_payload(&original.name, &original.shape, original.precision, bytes)?;
+    Ok(QuantSourceBinding {
+        source: original.clone(),
+        content: BlobId::from_bytes(*blake3::hash(bytes).as_bytes()),
+    })
 }
 
 /// Verify a real typed package against a complete actual fit log.

@@ -217,6 +217,39 @@ pub struct QuantSourceBinding {
     pub content: BlobId,
 }
 
+/// Validate canonical original-source hash inputs without reading payloads.
+///
+/// Inventories must already be complete, sorted and unique. This validates
+/// structure, not the truth of content digests or completeness against a source.
+/// Asset presence/architecture execution admission remains a producer obligation.
+/// # Errors
+/// Invalid names, inventory ordering/counts or original tensor geometry.
+pub fn validate_original_source_inventory(
+    architecture: &str,
+    tensors: &[QuantSourceBinding],
+    assets: &[NamedAssetDigest],
+) -> Result<(), QuantPlanError> {
+    use QuantPlanError as E;
+    crate::model::name(architecture, false).map_err(E::Manifest)?;
+    if tensors.is_empty() || tensors.len() > 1_000_000 || assets.len() > 4096 {
+        return Err(E::InvalidCount);
+    }
+    crate::model::sorted(
+        tensors.iter().map(|t| t.source.name.as_str()),
+        "original tensors",
+    )
+    .map_err(E::Manifest)?;
+    crate::model::sorted(assets.iter().map(|a| a.name.as_str()), "original assets")
+        .map_err(E::Manifest)?;
+    for tensor in tensors {
+        tensor.source.byte_len()?;
+    }
+    for asset in assets {
+        crate::model::name(&asset.name, true).map_err(E::Manifest)?;
+    }
+    Ok(())
+}
+
 /// Complete output bindings before provenance is added to the package manifest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]

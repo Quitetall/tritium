@@ -438,6 +438,10 @@ digest_id!(
 digest_id!(PackageId, "Content identity for a Tritium package.");
 digest_id!(BlobId, "Content identity for stored tensor or asset bytes.");
 digest_id!(
+    OriginalSourceId,
+    "Candidate identity of original named tensor/asset content, not fitted content or provenance."
+);
+digest_id!(
     SemanticTensorDigest,
     "Identity for a tensor's semantic values independent of its container."
 );

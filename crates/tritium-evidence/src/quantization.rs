@@ -6,8 +6,9 @@ use super::{
 };
 use std::collections::BTreeMap;
 use tritium_schema::{
-    BlobReference, EvidenceReference, Level, LevelFit, ManifestAsset, ModelManifest, PlaneCounts,
-    QuantAction, QuantizationCompleted, QuantizationStarted, SchemaId, TensorStorage,
+    BlobReference, EvidenceReference, Level, LevelFit, ManifestAsset, ModelManifest,
+    OriginalSourceId, PlaneCounts, QuantAction, QuantizationCompleted, QuantizationStarted,
+    SchemaId, TensorStorage,
 };
 
 impl EvidenceEvent for QuantizationStarted {
@@ -36,9 +37,16 @@ pub struct QuantizationReceiptView {
     completed: QuantizationCompleted,
     fits: Vec<DirectFitReceiptView>,
     manifest: ModelManifest,
+    source_id: OriginalSourceId,
 }
 
 impl QuantizationReceiptView {
+    /// Candidate identity derived from the actual recorded original inventory.
+    /// This verifies recorded bindings, not independently observed source bytes.
+    #[must_use]
+    pub fn source_id(&self) -> OriginalSourceId {
+        self.source_id
+    }
     /// Actual original request.
     #[must_use]
     pub fn started(&self) -> &QuantizationStarted {
@@ -251,11 +259,18 @@ impl QuantizationReceiptView {
             manifest
                 .validate()
                 .map_err(|_| invalid("invalid complete manifest"))?;
+            let source_id = super::original_source_id(
+                &start.plan.architecture,
+                &completed.sources,
+                &completed.assets,
+            )
+            .map_err(|_| invalid("invalid original source identity inventory"))?;
             views.push(Self {
                 start,
                 completed,
                 fits: selected,
                 manifest,
+                source_id,
             });
         }
         Ok(views)

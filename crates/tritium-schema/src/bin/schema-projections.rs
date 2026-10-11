@@ -46,6 +46,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     project!(EvidenceEnvelope<serde_json::Value>, "evidence-envelope");
     project!(LayoutError, "layout-error");
     project!(ModelId, "model-id");
+    project!(tritium_schema::OriginalSourceId, "original-source-id");
     project!(PackageId, "package-id");
     project!(PlaneAllocation, "plane-allocation");
     project!(PlaneCodec, "plane-codec");
