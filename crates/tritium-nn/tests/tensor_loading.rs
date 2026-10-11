@@ -546,6 +546,53 @@ fn hf_complete_inventory_preflight_rejects_before_backend_upload() {
 }
 
 #[test]
+fn hf_and_typed_inventory_adapters_reject_the_same_graph_mismatches_before_upload() {
+    for arch in ["llama", "qwen2", "qwen3"] {
+        for tied in [false, true] {
+            for bad in ["missing-down", "shape", "extra", "vector-shape"] {
+                let hf = HfFixture::new(arch, tied, 6, Some(bad));
+                let fixture = TritFixture::new(&hf, None);
+                let bytes = fixture.bytes();
+                for source in [
+                    tritium_nn::ModelSource::HuggingFace(&hf.dir),
+                    tritium_nn::ModelSource::Trit {
+                        bytes: &bytes,
+                        level: "standard",
+                    },
+                ] {
+                    let budget = TensorPayloadBudget::new(u64::MAX);
+                    let mut recorder = EvidenceRecorder::new(
+                        "shared-inventory-reject",
+                        [TENSOR_UPLOADED_REGISTRATION],
+                    )
+                    .unwrap();
+                    let (backend, uploads) = upload_probe();
+                    assert!(
+                        ModelRunner::from_source_admitted(
+                            source,
+                            backend,
+                            TensorUploadPolicy::default(),
+                            &budget,
+                            TensorUploadContext {
+                                recorder: &mut recorder,
+                                span: "load",
+                                parent: None,
+                                logical_time: 0,
+                            },
+                        )
+                        .is_err(),
+                        "{arch}/{tied}/{bad}"
+                    );
+                    assert_eq!(uploads.load(std::sync::atomic::Ordering::SeqCst), 0);
+                    assert!(recorder.events().is_empty());
+                    assert_eq!(budget.used_bytes(), 0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn one_source_loader_keeps_existing_hf_execution_and_budget() {
     let fixture = HfFixture::new("qwen3", true, 6, None);
     let budget = TensorPayloadBudget::new(fixture.payload_bytes);

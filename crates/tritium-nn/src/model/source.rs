@@ -20,7 +20,7 @@ use super::{
         open_hf_standard, resolve_optional_attention_names,
     },
     hf_shards::HfShardSet,
-    standard::StandardModelPlan,
+    standard::{StandardModelPlan, TensorGeometry},
 };
 use crate::{ArchSpec, ModelConfig, NnError, Projection, TensorLoader, TokenEmbedding};
 
@@ -123,24 +123,15 @@ impl<'a> PreparedSource<'a> {
                     ));
                 }
                 let plan = StandardModelPlan::new(&config, &spec, NameSchema::Hf, vocab)?;
-                for request in plan.tensors() {
-                    let actual = inventory
-                        .get(request.name.as_str())
-                        .ok_or_else(|| NnError::MissingTensor(request.name.clone()))?;
-                    if actual.shape != request.shape
-                        || !matches!(actual.dtype, "F32" | "F16" | "BF16")
-                    {
-                        return Err(NnError::MissingTensor(format!(
-                            "{} has incompatible shape or storage",
-                            request.name
-                        )));
-                    }
-                }
-                if inventory.len() != plan.tensors().count() {
-                    return Err(NnError::MissingTensor(
-                        "unexpected tensor in the complete HF source".into(),
-                    ));
-                }
+                plan.admit_inventory(inventory.len(), |name| {
+                    inventory.get(name).map(|actual| {
+                        if matches!(actual.dtype, "F32" | "F16" | "BF16") {
+                            TensorGeometry::Native(actual.shape)
+                        } else {
+                            TensorGeometry::Unsupported
+                        }
+                    })
+                })?;
                 Ok(Self::Hf {
                     #[cfg(feature = "tokenizer")]
                     path,
@@ -553,36 +544,16 @@ fn prepare_trit(
         .iter()
         .map(|t| (t.name.as_str(), t))
         .collect();
-    for request in plan.tensors() {
-        let meta = inventory
-            .get(request.name.as_str())
-            .ok_or_else(|| NnError::MissingTensor(request.name.clone()))?;
-        let matches = match &meta.storage {
-            TensorStorage::Dense { shape, .. } => {
-                shape.len() == request.shape.len()
-                    && shape
-                        .iter()
-                        .zip(&request.shape)
-                        .all(|(&a, &b)| usize::try_from(a) == Ok(b))
-            }
-            TensorStorage::Additive { .. } => {
-                request.shape.len() == 2
-                    && matrix_shape(meta)? == (request.shape[0], request.shape[1])
-            }
-            _ => false,
-        };
-        if !matches {
-            return Err(NnError::MissingTensor(format!(
-                "{} has incompatible tensor geometry",
-                request.name
-            )));
-        }
-    }
-    if inventory.len() != plan.tensors().count() {
-        return Err(NnError::MissingTensor(
-            "unexpected tensor in the selected complete level".into(),
-        ));
-    }
+    plan.admit_inventory(inventory.len(), |name| {
+        inventory.get(name).map(|meta| match &meta.storage {
+            TensorStorage::Dense { shape, .. } => TensorGeometry::Stored(shape),
+            TensorStorage::Additive { layout, .. } => TensorGeometry::Matrix {
+                rows: layout.rows,
+                cols: layout.cols,
+            },
+            _ => TensorGeometry::Unsupported,
+        })
+    })?;
     Ok((config, spec, plan))
 }
 

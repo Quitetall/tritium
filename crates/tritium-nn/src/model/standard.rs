@@ -9,6 +9,37 @@ use crate::{
     TransformerBlock,
 };
 
+/// Borrowed geometry from either a native HF header or stored package metadata.
+/// No payload decoding or second inventory/schema is needed for admission.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum TensorGeometry<'a> {
+    Native(&'a [usize]),
+    Stored(&'a [u64]),
+    Matrix { rows: u64, cols: u64 },
+    Unsupported,
+}
+
+impl TensorGeometry<'_> {
+    fn matches(self, expected: &[usize]) -> bool {
+        match self {
+            Self::Native(shape) => shape == expected,
+            Self::Stored(shape) => {
+                shape.len() == expected.len()
+                    && shape
+                        .iter()
+                        .zip(expected)
+                        .all(|(&actual, &expected)| usize::try_from(actual) == Ok(expected))
+            }
+            Self::Matrix { rows, cols } => {
+                expected.len() == 2
+                    && usize::try_from(rows) == Ok(expected[0])
+                    && usize::try_from(cols) == Ok(expected[1])
+            }
+            Self::Unsupported => false,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct TensorRequest {
     pub(super) name: String,
@@ -185,6 +216,32 @@ impl StandardModelPlan {
 
     pub(super) fn vocab(&self) -> usize {
         self.embedding.shape[0]
+    }
+
+    /// Complete name/rank/geometry/storage coverage before any matrix allocation.
+    /// The source adapter supplies borrowed geometry only; this plan owns the
+    /// expected graph and exact complete-inventory rule for every source.
+    pub(super) fn admit_inventory<'a>(
+        &self,
+        count: usize,
+        lookup: impl Fn(&str) -> Option<TensorGeometry<'a>>,
+    ) -> Result<(), NnError> {
+        for request in self.tensors() {
+            let actual = lookup(&request.name)
+                .ok_or_else(|| NnError::MissingTensor(request.name.clone()))?;
+            if !actual.matches(&request.shape) {
+                return Err(NnError::MissingTensor(format!(
+                    "{} has incompatible tensor geometry or storage",
+                    request.name
+                )));
+            }
+        }
+        if count != self.tensors().count() {
+            return Err(NnError::MissingTensor(
+                "unexpected tensor in the complete source".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn assemble(
