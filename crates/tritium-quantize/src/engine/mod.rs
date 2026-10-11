@@ -8,6 +8,7 @@ mod activation_aware;
 mod calibrated_fit;
 mod calibration;
 mod calibration_cache;
+mod calibration_sources;
 mod direct;
 mod joint_feedback;
 mod ladder;
@@ -28,6 +29,9 @@ pub use calibration::{
     CalibrationOutputBatch,
 };
 pub use calibration_cache::{CalibrationCache, CalibrationCacheBuilder, CalibrationCacheError};
+pub use calibration_sources::{
+    CalibrationSource, InMemoryCalibrationSource, TritCalibrationSource,
+};
 
 pub use direct::{DirectFitError, DirectTensorFit, fit_direct_levels};
 

@@ -1,19 +1,26 @@
 //! Complete model fitting through one source/sink seam (ADR 0058 candidate).
 
-use super::{DirectFitError, RecordedDirectFitError, fit_direct_levels_recorded};
+use super::{
+    CalibrationCacheError, CalibrationSource, DirectFitError, RecordedCalibratedFitError,
+    RecordedDirectFitError, fit_calibrated_levels_recorded, fit_direct_levels_recorded,
+};
 use std::{borrow::Cow, collections::BTreeMap};
 use tritium_core::DType;
-use tritium_evidence::{EvidenceError, EvidenceRecorder, QuantizationReceiptView, SealedEvidence};
+use tritium_evidence::{
+    CalibratedQuantizationReceiptView, EvidenceError, EvidenceRecorder, QuantizationReceiptView,
+    SealedEvidence,
+};
 use tritium_format::trit_model::{
     TritModelError, decode_dense_f32, encode_model_manifest, read_trit_model,
     validate_dense_payload,
 };
 use tritium_format::{TritBlob, TritBlobKind, TritPackageError, write_trit_package_bounded};
 use tritium_schema::{
-    BlobId, BlobReference, DirectFitMetric, ModelId, NamedAssetDigest, OriginalSourceId, PackageId,
-    PlaneCounts, QuantAction, QuantOutputLevel, QuantPlan, QuantPlanError, QuantSourceBinding,
-    QuantSourceTensor, QuantizationCompleted, QuantizationStarted, ScalePrecision, TensorMeta,
-    TensorStorage,
+    BlobId, BlobReference, CalibratedQuantPlan, CalibratedQuantizationCompleted,
+    CalibratedQuantizationStarted, DirectFitMetric, ModelId, ModelQuantPlan, NamedAssetDigest,
+    OriginalSourceId, PackageId, PlaneCounts, QuantActionRef, QuantOutputLevel, QuantPlan,
+    QuantPlanError, QuantSourceBinding, QuantSourceTensor, QuantizationCompleted,
+    QuantizationStarted, ScalePrecision, TensorMeta, TensorStorage,
 };
 
 /// Original byte provider; adapters never supply trusted input digests.
@@ -64,6 +71,10 @@ pub enum QuantEngineError {
     Admission(DirectFitError),
     /// Existing recorded fitter failed.
     Fit(RecordedDirectFitError),
+    /// Actual cache loading/reduction failed.
+    Cache(CalibrationCacheError),
+    /// Actual recorded calibrated controller failed.
+    CalibratedFit(RecordedCalibratedFitError),
     /// Actual evidence integrity or typed-fold failure.
     Evidence(EvidenceError),
     /// Existing typed model/payload reader failed.
@@ -145,7 +156,7 @@ impl Engine {
         source: &mut dyn WeightSource,
     ) -> Result<OriginalSourceId, QuantEngineError> {
         plan.validate().map_err(QuantEngineError::Plan)?;
-        check_source_inventory(plan, source)?;
+        check_source_inventory(ModelQuantPlan::Uncalibrated(plan), source)?;
         let total = plan.tensors.iter().try_fold(0u64, |total, tensor| {
             total
                 .checked_add(tensor.source.byte_len().map_err(QuantEngineError::Plan)?)
@@ -193,7 +204,14 @@ impl Engine {
         sink: &mut dyn TensorSink,
         recorder: EvidenceRecorder,
     ) -> Result<QuantizedModel, QuantEngineError> {
-        Self::run_impl(plan, source, sink, recorder, None)
+        Self::run_impl(
+            ModelQuantPlan::Uncalibrated(plan),
+            source,
+            None,
+            sink,
+            recorder,
+            None,
+        )
     }
 
     /// Convert only if the actual complete original inventory matches preparation.
@@ -217,12 +235,43 @@ impl Engine {
         recorder: EvidenceRecorder,
         expected_source: OriginalSourceId,
     ) -> Result<QuantizedModel, QuantEngineError> {
-        Self::run_impl(plan, source, sink, recorder, Some(expected_source))
+        Self::run_impl(
+            ModelQuantPlan::Uncalibrated(plan),
+            source,
+            None,
+            sink,
+            recorder,
+            Some(expected_source),
+        )
+    }
+
+    /// Fit a complete calibrated model through the same source/package/publication path.
+    /// Actual consumed original identity must equal the model/cache expectation before
+    /// successful completion or publication. No source reread, metric fallback or
+    /// fabricated v1 lifecycle. Logical bounds are not total RSS or recipe truth.
+    /// # Errors
+    /// Invalid source/cache/plan/recorder, actual fit, output binding or publication.
+    pub fn run_calibrated(
+        plan: &CalibratedQuantPlan,
+        source: &mut dyn WeightSource,
+        caches: &mut dyn CalibrationSource,
+        sink: &mut dyn TensorSink,
+        recorder: EvidenceRecorder,
+    ) -> Result<QuantizedModel, QuantEngineError> {
+        Self::run_impl(
+            ModelQuantPlan::Calibrated(plan),
+            source,
+            Some(caches),
+            sink,
+            recorder,
+            Some(plan.original_source),
+        )
     }
 
     fn run_impl(
-        plan: &QuantPlan,
+        plan: ModelQuantPlan<'_>,
         source: &mut dyn WeightSource,
+        mut caches: Option<&mut dyn CalibrationSource>,
         sink: &mut dyn TensorSink,
         mut recorder: EvidenceRecorder,
         expected_source: Option<OriginalSourceId>,
@@ -233,14 +282,39 @@ impl Engine {
                 "engine requires a fresh recorder",
             ));
         }
-        recorder.check_emit::<QuantizationStarted>("quantize", None, 0)?;
-        recorder.check_emit::<QuantizationCompleted>("quantize", None, 1)?;
+        match plan {
+            ModelQuantPlan::Uncalibrated(_) => {
+                recorder.check_emit::<QuantizationStarted>("quantize", None, 0)?;
+                recorder.check_emit::<QuantizationCompleted>("quantize", None, 1)?;
+            }
+            ModelQuantPlan::Calibrated(_) => {
+                recorder.check_emit::<CalibratedQuantizationStarted>("quantize", None, 0)?;
+                recorder.check_emit::<CalibratedQuantizationCompleted>("quantize", None, 1)?;
+                let names = plan
+                    .tensors()
+                    .filter(|t| matches!(t.action, QuantActionRef::CalibratedFit(_)))
+                    .map(|t| t.source.name.clone())
+                    .collect::<Vec<_>>();
+                if caches
+                    .as_deref()
+                    .ok_or(QuantEngineError::Binding("calibration source absent"))?
+                    .names()
+                    != names
+                {
+                    return Err(QuantEngineError::Binding(
+                        "complete calibration inventory changed",
+                    ));
+                }
+            }
+            _ => return Err(QuantEngineError::Binding("unsupported model request")),
+        }
+        let limits = plan.limits();
         let mut total = 0u64;
-        for (index, tensor) in plan.tensors.iter().enumerate() {
+        for (index, tensor) in plan.tensors().enumerate() {
             total = total
                 .checked_add(tensor.source.byte_len().map_err(QuantEngineError::Plan)?)
                 .ok_or(QuantEngineError::Limit("source bytes"))?;
-            if let QuantAction::Fit { plan, metric } = &tensor.action {
+            if let QuantActionRef::Fit { plan, metric } = tensor.action {
                 super::direct::admit_plan(
                     plan,
                     matches!(metric, DirectFitMetric::InputGramF64 { .. }),
@@ -252,21 +326,42 @@ impl Engine {
                     0,
                 )?;
             }
+            if let QuantActionRef::CalibratedFit(plan) = tensor.action {
+                super::direct::admit_plan(&plan.direct, true)
+                    .map_err(QuantEngineError::Admission)?;
+                recorder.check_emit::<tritium_schema::CalibratedLevelsFitted>(
+                    &format!("tensor-{index}"),
+                    Some("quantize"),
+                    0,
+                )?;
+            }
         }
-        bound(total, plan.limits.max_source_bytes, "source bytes")?;
+        bound(total, limits.max_source_bytes, "source bytes")?;
         check_source_inventory(plan, source)?;
-        recorder.emit(
-            "quantize",
-            None,
-            0,
-            &QuantizationStarted { plan: plan.clone() },
-        )?;
-        let mut blobs = BlobStore::new(plan.limits.max_retained_blob_bytes);
+        match plan {
+            ModelQuantPlan::Uncalibrated(plan) => {
+                recorder.emit(
+                    "quantize",
+                    None,
+                    0,
+                    &QuantizationStarted { plan: plan.clone() },
+                )?;
+            }
+            ModelQuantPlan::Calibrated(plan) => {
+                recorder.emit(
+                    "quantize",
+                    None,
+                    0,
+                    &CalibratedQuantizationStarted { plan: plan.clone() },
+                )?;
+            }
+            _ => return Err(QuantEngineError::Binding("unsupported model request")),
+        }
+        let mut blobs = BlobStore::new(limits.max_retained_blob_bytes);
         let mut assets = Vec::new();
         let mut asset_bytes = 0u64;
-        for name in &plan.assets {
-            let remaining = plan
-                .limits
+        for name in plan.assets() {
+            let remaining = limits
                 .max_asset_bytes
                 .checked_sub(asset_bytes)
                 .ok_or(QuantEngineError::Limit("asset bytes"))?;
@@ -281,15 +376,15 @@ impl Engine {
         }
         let mut sources = Vec::new();
         let mut levels = plan
-            .levels
+            .levels()
             .iter()
             .map(|name| QuantOutputLevel {
                 name: name.clone(),
                 tensors: Vec::new(),
             })
             .collect::<Vec<_>>();
-        for (index, request) in plan.tensors.iter().enumerate() {
-            let original = &request.source;
+        for (index, request) in plan.tensors().enumerate() {
+            let original = request.source;
             let bytes = source.tensor(
                 &original.name,
                 platform(
@@ -298,8 +393,8 @@ impl Engine {
                 )?,
             )?;
             sources.push(source_binding(original, &bytes)?);
-            match &request.action {
-                QuantAction::KeepDense => {
+            match request.action {
+                QuantActionRef::KeepDense => {
                     let kind = match original.precision {
                         ScalePrecision::F16 => TritBlobKind::DenseTensor(DType::F16),
                         ScalePrecision::Bf16 => TritBlobKind::DenseTensor(DType::BF16),
@@ -318,7 +413,7 @@ impl Engine {
                         });
                     }
                 }
-                QuantAction::Fit { plan, metric } => {
+                action if action.direct().is_some() => {
                     let weights = decode_dense_f32(
                         &original.name,
                         &original.shape,
@@ -326,38 +421,70 @@ impl Engine {
                         &bytes,
                     )?;
                     drop(bytes);
-                    let gram = match metric {
-                        DirectFitMetric::Identity => None,
-                        DirectFitMetric::InputGramF64 { content } => {
-                            let count = plan
-                                .layout
-                                .cols
-                                .checked_mul(plan.layout.cols)
-                                .ok_or(QuantEngineError::Limit("input Gram"))?;
-                            let values = source
-                                .input_gram(&original.name, platform(count, "input Gram")?)?;
-                            if values.len() as u64 != count
-                                || super::recorded::gram_digest(plan.layout.cols, &values)
-                                    != *content
-                            {
-                                return Err(QuantEngineError::Binding("requested Gram changed"));
-                            }
-                            Some(values)
+                    let fitted = match action {
+                        QuantActionRef::Fit { plan, metric } => {
+                            let gram = match metric {
+                                DirectFitMetric::Identity => None,
+                                DirectFitMetric::InputGramF64 { content } => {
+                                    let count = plan
+                                        .layout
+                                        .cols
+                                        .checked_mul(plan.layout.cols)
+                                        .ok_or(QuantEngineError::Limit("input Gram"))?;
+                                    let values = source.input_gram(
+                                        &original.name,
+                                        platform(count, "input Gram")?,
+                                    )?;
+                                    if values.len() as u64 != count
+                                        || super::recorded::gram_digest(plan.layout.cols, &values)
+                                            != *content
+                                    {
+                                        return Err(QuantEngineError::Binding(
+                                            "requested Gram changed",
+                                        ));
+                                    }
+                                    Some(values)
+                                }
+                                _ => return Err(QuantEngineError::Binding("unsupported metric")),
+                            };
+                            fit_direct_levels_recorded(
+                                &original.name,
+                                plan,
+                                &weights,
+                                gram.as_deref(),
+                                &mut recorder,
+                                &format!("tensor-{index}"),
+                                Some("quantize"),
+                                0,
+                            )
+                            .map_err(QuantEngineError::Fit)?
+                            .levels
                         }
-                        _ => return Err(QuantEngineError::Binding("unsupported metric")),
+                        QuantActionRef::CalibratedFit(request) => {
+                            let ModelQuantPlan::Calibrated(model) = plan else {
+                                return Err(QuantEngineError::Binding(
+                                    "calibrated model request absent",
+                                ));
+                            };
+                            let cache = caches
+                                .as_deref_mut()
+                                .ok_or(QuantEngineError::Binding("calibration source absent"))?
+                                .cache(&request.cache, model.max_cache_package_bytes)?;
+                            fit_calibrated_levels_recorded(
+                                request,
+                                &weights,
+                                cache,
+                                &mut recorder,
+                                &format!("tensor-{index}"),
+                                Some("quantize"),
+                                0,
+                            )
+                            .map_err(QuantEngineError::CalibratedFit)?
+                            .levels
+                        }
+                        _ => return Err(QuantEngineError::Binding("unsupported fit request")),
                     };
-                    let fitted = fit_direct_levels_recorded(
-                        &original.name,
-                        plan,
-                        &weights,
-                        gram.as_deref(),
-                        &mut recorder,
-                        &format!("tensor-{index}"),
-                        Some("quantize"),
-                        0,
-                    )
-                    .map_err(QuantEngineError::Fit)?;
-                    for fitted in fitted.levels {
+                    for fitted in fitted {
                         let bytes = fitted
                             .tensor
                             .encode_payload()
@@ -380,18 +507,38 @@ impl Engine {
                 _ => return Err(QuantEngineError::Binding("unsupported action")),
             }
         }
-        recorder.emit(
-            "quantize",
-            None,
-            1,
-            &QuantizationCompleted {
-                sources,
-                assets,
-                levels,
-            },
-        )?;
+        let actual_source =
+            tritium_evidence::original_source_id(plan.architecture(), &sources, &assets)
+                .map_err(QuantEngineError::Plan)?;
+        let completed = QuantizationCompleted {
+            sources,
+            assets,
+            levels,
+        };
+        match plan {
+            ModelQuantPlan::Uncalibrated(_) => {
+                recorder.emit("quantize", None, 1, &completed)?;
+            }
+            ModelQuantPlan::Calibrated(request) => {
+                if actual_source != request.original_source {
+                    return Err(QuantEngineError::Binding(
+                        "actual original source differs from calibration",
+                    ));
+                }
+                recorder.emit(
+                    "quantize",
+                    None,
+                    1,
+                    &CalibratedQuantizationCompleted {
+                        original_source: actual_source,
+                        output: completed,
+                    },
+                )?;
+            }
+            _ => return Err(QuantEngineError::Binding("unsupported model request")),
+        }
         let evidence = recorder.seal()?;
-        let views = QuantizationReceiptView::fold(evidence.log())?;
+        let views = conversion_views(evidence.log())?;
         if views.len() != 1 {
             return Err(QuantEngineError::Binding(
                 "expected exactly one completed conversion",
@@ -408,12 +555,12 @@ impl Engine {
         let package = write_trit_package_bounded(
             &manifest,
             &records,
-            platform(plan.limits.max_package_bytes, "package bytes")?,
+            platform(limits.max_package_bytes, "package bytes")?,
         )?;
         let model = bound_package(&package, evidence.log())?;
         let package_id = PackageId::from_bytes(*model.package_id().as_bytes());
         let model_ids = plan
-            .levels
+            .levels()
             .iter()
             .map(|name| Ok((name.clone(), model.model_id(name)?)))
             .collect::<Result<BTreeMap<_, _>, TritModelError>>()?;
@@ -429,14 +576,14 @@ impl Engine {
 }
 
 fn check_source_inventory(
-    plan: &QuantPlan,
+    plan: ModelQuantPlan<'_>,
     source: &dyn WeightSource,
 ) -> Result<(), QuantEngineError> {
     if source
         .inventory()?
         .iter()
-        .ne(plan.tensors.iter().map(|t| &t.source))
-        || source.asset_names() != plan.assets
+        .ne(plan.tensors().map(|t| t.source))
+        || source.asset_names() != plan.assets()
     {
         return Err(QuantEngineError::Binding(
             "complete original inventory changed",
@@ -472,7 +619,7 @@ fn bound_package<'a>(
     package: &'a [u8],
     log: &tritium_evidence::VerifiedLog,
 ) -> Result<tritium_format::trit_model::TritModel<'a>, QuantEngineError> {
-    let views = QuantizationReceiptView::fold(log)?;
+    let views = conversion_views(log)?;
     if views.len() != 1 {
         return Err(QuantEngineError::Binding(
             "expected exactly one completed conversion",
@@ -492,7 +639,64 @@ fn bound_package<'a>(
             }
         }
     }
+    for fit in view.calibrated_fits() {
+        let observation = fit.observation();
+        for output in &observation.outputs {
+            if model.tensor_digest(&output.level, &observation.plan.cache.request.tensor.name)?
+                != output.content
+            {
+                return Err(QuantEngineError::Binding(
+                    "calibrated semantic output changed",
+                ));
+            }
+        }
+    }
     Ok(model)
+}
+
+enum ConversionView {
+    Plain(QuantizationReceiptView),
+    Calibrated(CalibratedQuantizationReceiptView),
+}
+impl ConversionView {
+    fn manifest(&self) -> &tritium_schema::ModelManifest {
+        match self {
+            Self::Plain(v) => v.manifest(),
+            Self::Calibrated(v) => v.manifest(),
+        }
+    }
+    fn source_id(&self) -> OriginalSourceId {
+        match self {
+            Self::Plain(v) => v.source_id(),
+            Self::Calibrated(v) => v.source_id(),
+        }
+    }
+    fn fits(&self) -> &[tritium_evidence::DirectFitReceiptView] {
+        match self {
+            Self::Plain(v) => v.fits(),
+            Self::Calibrated(v) => v.fits(),
+        }
+    }
+    fn calibrated_fits(&self) -> &[tritium_evidence::CalibratedFitReceiptView] {
+        match self {
+            Self::Plain(_) => &[],
+            Self::Calibrated(v) => v.calibrated_fits(),
+        }
+    }
+}
+fn conversion_views(
+    log: &tritium_evidence::VerifiedLog,
+) -> Result<Vec<ConversionView>, EvidenceError> {
+    let mut views = QuantizationReceiptView::fold(log)?
+        .into_iter()
+        .map(ConversionView::Plain)
+        .collect::<Vec<_>>();
+    views.extend(
+        CalibratedQuantizationReceiptView::fold(log)?
+            .into_iter()
+            .map(ConversionView::Calibrated),
+    );
+    Ok(views)
 }
 
 fn local(id: BlobId) -> BlobReference {

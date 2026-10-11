@@ -1122,133 +1122,252 @@ fn check_text_load(
 #[test]
 fn engine_produced_ternary_model_executes_through_actual_text_loader() {
     use tritium_evidence::{
-        DIRECT_LEVELS_FITTED_REGISTRATION, QUANTIZATION_COMPLETED_REGISTRATION,
-        QUANTIZATION_STARTED_REGISTRATION,
+        CALIBRATED_LEVELS_FITTED_REGISTRATION, CALIBRATED_QUANTIZATION_COMPLETED_REGISTRATION,
+        CALIBRATED_QUANTIZATION_STARTED_REGISTRATION, DIRECT_LEVELS_FITTED_REGISTRATION,
+        QUANTIZATION_COMPLETED_REGISTRATION, QUANTIZATION_STARTED_REGISTRATION,
     };
     use tritium_quantize::engine::{
-        Engine, MemoryTensorSink, SafeTensorsWeightSource, WeightSource,
+        CalibrationBatch, CalibrationCacheBuilder, CalibrationCollector, CalibrationInput,
+        CalibrationOutputBatch, Engine, InMemoryCalibrationSource, MemoryTensorSink,
+        SafeTensorsWeightSource, WeightSource,
     };
     use tritium_schema::{
-        DirectFitLevel, DirectFitLimits, DirectFitMetric, DirectFitPlan, DirectFitProfile,
-        JointGroupFitOptions, QuantAction, QuantLimits, QuantPlan, QuantTensorPlan,
+        CalibratedFitPlan, CalibratedQuantAction, CalibratedQuantPlan, CalibratedQuantTensorPlan,
+        CalibrationCacheLimits, CalibrationCacheRequest, CalibrationConsumer, CalibrationOutput,
+        CalibrationPartition, DirectFitLevel, DirectFitLimits, DirectFitMetric, DirectFitPlan,
+        DirectFitProfile, JointGroupFitOptions, QuantAction, QuantLimits, QuantPlan,
+        QuantTensorPlan,
     };
-    let fixture = HfFixture::new("qwen3", true, 6, None);
-    let (tokenizer, tokenizer_config) = tokenizer_assets(false);
-    let assets = std::collections::BTreeMap::from([
-        (
-            "config.json".into(),
-            std::fs::read(fixture.dir.join("config.json")).unwrap(),
-        ),
-        ("tokenizer.json".into(), tokenizer),
-        ("tokenizer_config.json".into(), tokenizer_config),
-    ]);
-    let readers = ["weights.safetensors", "vectors.safetensors"]
-        .map(|name| std::fs::File::open(fixture.dir.join(name)).unwrap());
-    let mut source =
-        SafeTensorsWeightSource::new(readers, assets, std::collections::BTreeMap::new()).unwrap();
-    let plan = QuantPlan {
-        architecture: "qwen3".into(),
-        assets: source.asset_names(),
-        levels: vec!["full".into()],
-        limits: QuantLimits {
-            max_source_bytes: 100_000,
-            max_asset_bytes: 100_000,
-            max_retained_blob_bytes: 100_000,
-            max_package_bytes: 1_000_000,
-        },
-        tensors: source
-            .inventory()
-            .unwrap()
-            .into_iter()
-            .map(|source| {
-                let action = if source.shape.len() == 2 {
-                    QuantAction::Fit {
-                        metric: DirectFitMetric::Identity,
-                        plan: Box::new(DirectFitPlan {
-                            layout: AdditiveLayout {
-                                rows: source.shape[0],
-                                cols: source.shape[1],
-                                tile: 256,
-                                group: 32,
-                                max_planes: 3,
-                                law: ADMITTED_LAWS[1].law,
-                                allocation: PlaneAllocation::Uniform,
-                                codec: PlaneCodec::B3,
-                                basis: Basis::Identity,
-                                transport: Transport::Raw,
-                            },
-                            profile: DirectFitProfile::JointIndependentGroups(
-                                JointGroupFitOptions {
-                                    max_iterations: 8,
-                                    ridge: 1e-8,
-                                    em_restarts: 2,
-                                    ridge_condition_limit: 1e6,
-                                    softened_relay: false,
-                                    modulated_relay: false,
+    for calibrated in [false, true] {
+        let fixture = HfFixture::new("qwen3", true, 6, None);
+        let (tokenizer, tokenizer_config) = tokenizer_assets(false);
+        let assets = std::collections::BTreeMap::from([
+            (
+                "config.json".into(),
+                std::fs::read(fixture.dir.join("config.json")).unwrap(),
+            ),
+            ("tokenizer.json".into(), tokenizer),
+            ("tokenizer_config.json".into(), tokenizer_config),
+        ]);
+        let readers = ["weights.safetensors", "vectors.safetensors"]
+            .map(|name| std::fs::File::open(fixture.dir.join(name)).unwrap());
+        let mut source =
+            SafeTensorsWeightSource::new(readers, assets, std::collections::BTreeMap::new())
+                .unwrap();
+        let plan = QuantPlan {
+            architecture: "qwen3".into(),
+            assets: source.asset_names(),
+            levels: vec!["full".into()],
+            limits: QuantLimits {
+                max_source_bytes: 100_000,
+                max_asset_bytes: 100_000,
+                max_retained_blob_bytes: 100_000,
+                max_package_bytes: 1_000_000,
+            },
+            tensors: source
+                .inventory()
+                .unwrap()
+                .into_iter()
+                .map(|source| {
+                    let action = if source.shape.len() == 2 {
+                        QuantAction::Fit {
+                            metric: DirectFitMetric::Identity,
+                            plan: Box::new(DirectFitPlan {
+                                layout: AdditiveLayout {
+                                    rows: source.shape[0],
+                                    cols: source.shape[1],
+                                    tile: 256,
+                                    group: 32,
+                                    max_planes: 3,
+                                    law: ADMITTED_LAWS[1].law,
+                                    allocation: PlaneAllocation::Uniform,
+                                    codec: PlaneCodec::B3,
+                                    basis: Basis::Identity,
+                                    transport: Transport::Raw,
                                 },
-                            ),
-                            levels: vec![DirectFitLevel {
-                                name: "full".into(),
-                                planes: 3,
-                            }],
-                            limits: DirectFitLimits {
-                                max_weights: 100_000,
-                                max_metric_entries: 10_000,
-                                max_output_trits: 300_000,
-                            },
-                        }),
-                    }
-                } else {
-                    QuantAction::KeepDense
-                };
-                QuantTensorPlan { source, action }
-            })
-            .collect(),
-    };
-    let mut sink = MemoryTensorSink::default();
-    let fitted = Engine::run(
-        &plan,
-        &mut source,
-        &mut sink,
-        EvidenceRecorder::new(
-            "nn-model-fit",
-            [
-                DIRECT_LEVELS_FITTED_REGISTRATION,
-                QUANTIZATION_STARTED_REGISTRATION,
-                QUANTIZATION_COMPLETED_REGISTRATION,
-            ],
+                                profile: DirectFitProfile::JointIndependentGroups(
+                                    JointGroupFitOptions {
+                                        max_iterations: 8,
+                                        ridge: 1e-8,
+                                        em_restarts: 2,
+                                        ridge_condition_limit: 1e6,
+                                        softened_relay: false,
+                                        modulated_relay: false,
+                                    },
+                                ),
+                                levels: vec![DirectFitLevel {
+                                    name: "full".into(),
+                                    planes: 3,
+                                }],
+                                limits: DirectFitLimits {
+                                    max_weights: 100_000,
+                                    max_metric_entries: 10_000,
+                                    max_output_trits: 300_000,
+                                },
+                            }),
+                        }
+                    } else {
+                        QuantAction::KeepDense
+                    };
+                    QuantTensorPlan { source, action }
+                })
+                .collect(),
+        };
+        let mut sink = MemoryTensorSink::default();
+        let fitted = if calibrated {
+            let original_source = Engine::observe_source(&plan, &mut source).unwrap();
+            let selected = plan
+                .tensors
+                .iter()
+                .find(|t| t.source.name.contains("q_proj.weight"))
+                .unwrap();
+            let rows = selected.source.shape[0] as usize;
+            let cols = selected.source.shape[1] as usize;
+            let mut input = vec![0.; cols * cols];
+            for i in 0..cols {
+                input[i * cols + i] = 1.;
+            }
+            let tokenizer = source
+                .asset("tokenizer.json", 100_000)
+                .unwrap()
+                .into_owned();
+            let mut builder = CalibrationCacheBuilder::new(
+                CalibrationCacheRequest {
+                    tensor: selected.source.clone(),
+                    model: original_source,
+                    consumer: CalibrationConsumer::Matmul,
+                    output: CalibrationOutput::DenseFisher,
+                    sample_start: 0,
+                    limits: CalibrationCacheLimits {
+                        max_payload_bytes: 100_000,
+                        max_samples: 100,
+                        max_windows: 4,
+                    },
+                },
+                &tokenizer,
+                b"declared NN fixture objective",
+            )
+            .unwrap();
+            builder
+                .capture(
+                    &(0..cols as u32).collect::<Vec<_>>(),
+                    CalibrationBatch {
+                        samples: cols,
+                        input: CalibrationInput::Activations(&input),
+                        output: CalibrationOutputBatch::Dense(&vec![0.5; cols * rows]),
+                        weights: None,
+                        mask: None,
+                    },
+                )
+                .unwrap();
+            let cache = builder.finish().unwrap();
+            let QuantAction::Fit { plan: direct, .. } = &selected.action else {
+                unreachable!()
+            };
+            let mut fit = CalibratedFitPlan {
+                direct: (**direct).clone(),
+                cache: cache.binding().clone(),
+                partition: CalibrationPartition::Groups { columns: 4 },
+                damping: 0.01,
+                max_numeric_bytes: 1,
+            };
+            fit.max_numeric_bytes =
+                CalibrationCollector::required_numeric_bytes(&fit.calibration_plan().unwrap())
+                    .unwrap()
+                    + cache.binding().payload_bytes;
+            let request = CalibratedQuantPlan {
+                architecture: plan.architecture.clone(),
+                original_source,
+                assets: plan.assets.clone(),
+                levels: plan.levels.clone(),
+                limits: plan.limits,
+                max_cache_payload_bytes: 100_000,
+                max_cache_package_bytes: 100_000,
+                tensors: plan
+                    .tensors
+                    .iter()
+                    .map(|t| CalibratedQuantTensorPlan {
+                        source: t.source.clone(),
+                        action: if t.source == selected.source {
+                            CalibratedQuantAction::CalibratedFit {
+                                plan: Box::new(fit.clone()),
+                            }
+                        } else {
+                            match &t.action {
+                                QuantAction::KeepDense => CalibratedQuantAction::KeepDense,
+                                QuantAction::Fit { plan, metric } => CalibratedQuantAction::Fit {
+                                    plan: plan.clone(),
+                                    metric: metric.clone(),
+                                },
+                                _ => unreachable!(),
+                            }
+                        },
+                    })
+                    .collect(),
+            };
+            Engine::run_calibrated(
+                &request,
+                &mut source,
+                &mut InMemoryCalibrationSource::new([cache]).unwrap(),
+                &mut sink,
+                EvidenceRecorder::new(
+                    "nn-model-fit",
+                    [
+                        DIRECT_LEVELS_FITTED_REGISTRATION,
+                        CALIBRATED_LEVELS_FITTED_REGISTRATION,
+                        CALIBRATED_QUANTIZATION_STARTED_REGISTRATION,
+                        CALIBRATED_QUANTIZATION_COMPLETED_REGISTRATION,
+                    ],
+                )
+                .unwrap(),
+            )
+        } else {
+            Engine::run(
+                &plan,
+                &mut source,
+                &mut sink,
+                EvidenceRecorder::new(
+                    "nn-model-fit",
+                    [
+                        DIRECT_LEVELS_FITTED_REGISTRATION,
+                        QUANTIZATION_STARTED_REGISTRATION,
+                        QUANTIZATION_COMPLETED_REGISTRATION,
+                    ],
+                )
+                .unwrap(),
+            )
+        }
+        .unwrap();
+        let bytes = sink.artifact().unwrap().0;
+        tritium_quantize::engine::verify_package_with_fit_log(bytes, fitted.evidence.log())
+            .unwrap();
+        let mut recorder =
+            EvidenceRecorder::new("nn-engine-oracle", [TENSOR_UPLOADED_REGISTRATION]).unwrap();
+        let oracle = ModelRunner::from_source_admitted(
+            tritium_nn::ModelSource::Trit {
+                bytes,
+                level: "full",
+            },
+            Box::new(tritium_testkit::ReferenceBackend::new()),
+            TensorUploadPolicy::default(),
+            &TensorPayloadBudget::new(1_000_000),
+            TensorUploadContext {
+                recorder: &mut recorder,
+                span: "load",
+                parent: None,
+                logical_time: 0,
+            },
         )
-        .unwrap(),
-    )
-    .unwrap();
-    let bytes = sink.artifact().unwrap().0;
-    tritium_quantize::engine::verify_package_with_fit_log(bytes, fitted.evidence.log()).unwrap();
-    let mut recorder =
-        EvidenceRecorder::new("nn-engine-oracle", [TENSOR_UPLOADED_REGISTRATION]).unwrap();
-    let oracle = ModelRunner::from_source_admitted(
-        tritium_nn::ModelSource::Trit {
-            bytes,
-            level: "full",
-        },
-        Box::new(tritium_testkit::ReferenceBackend::new()),
-        TensorUploadPolicy::default(),
-        &TensorPayloadBudget::new(1_000_000),
-        TensorUploadContext {
-            recorder: &mut recorder,
-            span: "load",
-            parent: None,
-            logical_time: 0,
-        },
-    )
-    .unwrap();
-    check_text_load(
-        tritium_nn::ModelSource::Trit {
-            bytes,
-            level: "full",
-        },
-        oracle,
-        Box::new(tritium_cpu::CpuBackend::new()),
-    );
+        .unwrap();
+        check_text_load(
+            tritium_nn::ModelSource::Trit {
+                bytes,
+                level: "full",
+            },
+            oracle,
+            Box::new(tritium_cpu::CpuBackend::new()),
+        );
+    }
 }
 
 #[cfg(feature = "tokenizer")]

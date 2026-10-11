@@ -8,8 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::{Subcommand, ValueEnum};
 use serde::Serialize;
 use tritium_evidence::{
-    CalibratedFitReceiptView, DirectFitReceiptView, EventRegistration, EvidenceEvent,
-    EvidenceRecorder, ModelLoadReceiptView, QuantizationReceiptView, verify_jsonl,
+    CalibratedFitReceiptView, CalibratedQuantizationReceiptView, DirectFitReceiptView,
+    EventRegistration, EvidenceEvent, EvidenceRecorder, ModelLoadReceiptView,
+    QuantizationReceiptView, verify_jsonl,
 };
 
 /// Evidence detail level for a CLI invocation.
@@ -199,6 +200,9 @@ pub(crate) fn run(command: EvidenceCommand) -> anyhow::Result<()> {
     })?;
     QuantizationReceiptView::fold(&verified)
         .map_err(|error| anyhow::anyhow!("verify quantization view {}: {error}", path.display()))?;
+    CalibratedQuantizationReceiptView::fold(&verified).map_err(|error| {
+        anyhow::anyhow!("verify calibrated model view {}: {error}", path.display())
+    })?;
     if view {
         println!("{}", serde_json::to_string_pretty(&verified.events)?);
     } else {
@@ -329,6 +333,59 @@ mod tests {
         let cleanup = std::fs::remove_file(path);
         cleanup.expect("remove temporary log");
         result.expect("CLI verification succeeds");
+    }
+
+    #[test]
+    fn verify_and_view_reject_invalid_calibrated_model_payloads_with_valid_hashes() {
+        #[derive(Serialize)]
+        struct InvalidStart {
+            release_approved: bool,
+        }
+        impl EvidenceEvent for InvalidStart {
+            const SCHEMA_ID: &'static str = "tritium.quantize.calibrated_model_started";
+            const VERSION: u16 = 1;
+        }
+        #[derive(Serialize)]
+        struct InvalidCompletion {
+            release_approved: bool,
+        }
+        impl EvidenceEvent for InvalidCompletion {
+            const SCHEMA_ID: &'static str = "tritium.quantize.calibrated_model_completed";
+            const VERSION: u16 = 1;
+        }
+        fn reject<E: EvidenceEvent>(event: &E) {
+            let mut recorder = EvidenceRecorder::new(
+                "invalid-calibrated-model",
+                [EventRegistration {
+                    schema: E::SCHEMA_ID,
+                    version: E::VERSION,
+                }],
+            )
+            .unwrap();
+            recorder.emit("quantize", None, 0, event).unwrap();
+            let path = temp_log();
+            std::fs::write(&path, recorder.to_jsonl().unwrap()).unwrap();
+            let verify = run(EvidenceCommand::Verify { path: path.clone() });
+            let view = run(EvidenceCommand::View { path: path.clone() });
+            std::fs::remove_file(path).unwrap();
+            assert!(
+                verify
+                    .unwrap_err()
+                    .to_string()
+                    .contains("calibrated model view")
+            );
+            assert!(
+                view.unwrap_err()
+                    .to_string()
+                    .contains("calibrated model view")
+            );
+        }
+        reject(&InvalidStart {
+            release_approved: true,
+        });
+        reject(&InvalidCompletion {
+            release_approved: true,
+        });
     }
 
     #[test]

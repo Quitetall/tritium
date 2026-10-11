@@ -133,6 +133,23 @@ fn main() -> Result<(), Box<dyn Error>> {
     project!(tritium_schema::QuantTensorPlan, "quant-tensor-plan");
     project!(tritium_schema::QuantLimits, "quant-limits");
     project!(tritium_schema::QuantPlan, "quant-plan");
+    project!(
+        tritium_schema::CalibratedQuantAction,
+        "calibrated-quant-action"
+    );
+    project!(
+        tritium_schema::CalibratedQuantTensorPlan,
+        "calibrated-quant-tensor-plan"
+    );
+    project!(tritium_schema::CalibratedQuantPlan, "calibrated-quant-plan");
+    project!(
+        tritium_schema::CalibratedQuantizationStarted,
+        "calibrated-quantization-started"
+    );
+    project!(
+        tritium_schema::CalibratedQuantizationCompleted,
+        "calibrated-quantization-completed"
+    );
     project!(tritium_schema::QuantSourceBinding, "quant-source-binding");
     project!(tritium_schema::QuantOutputLevel, "quant-output-level");
     project!(tritium_schema::QuantizationStarted, "quantization-started");

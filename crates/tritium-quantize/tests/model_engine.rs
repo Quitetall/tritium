@@ -1,4 +1,6 @@
 //! Actual raw source -> shared fitter -> sealed log -> checked package -> sinks.
+#[path = "model_engine/calibrated.rs"]
+mod calibrated;
 use std::{collections::BTreeMap, io::Cursor};
 use tritium_evidence::{
     DIRECT_LEVELS_FITTED_REGISTRATION, EvidenceRecorder, QUANTIZATION_COMPLETED_REGISTRATION,

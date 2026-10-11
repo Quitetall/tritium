@@ -33,6 +33,12 @@ pub use quantization::{
     QUANTIZATION_COMPLETED_REGISTRATION, QUANTIZATION_STARTED_REGISTRATION, QuantizationReceiptView,
 };
 
+mod calibrated_quantization;
+pub use calibrated_quantization::{
+    CALIBRATED_QUANTIZATION_COMPLETED_REGISTRATION, CALIBRATED_QUANTIZATION_STARTED_REGISTRATION,
+    CalibratedQuantizationReceiptView,
+};
+
 const EVENT_DOMAIN: &[u8] = b"tritium.evidence.event.v1\0";
 const ROOT_DOMAIN: &[u8] = b"tritium.evidence.run-root.v1\0";
 const ZERO_DIGEST: [u8; 32] = [0; 32];

@@ -134,6 +134,8 @@ pub enum QuantPlanError {
     FitBinding,
     /// Required config/tokenizer asset was omitted.
     MissingAsset,
+    /// Calibrated model/source/cache context or logical admission is inconsistent.
+    CalibrationBinding,
 }
 
 impl core::fmt::Display for QuantPlanError {
@@ -149,56 +151,7 @@ impl QuantPlan {
     /// # Errors
     /// Invalid structure; success is not numerical/model/release admission.
     pub fn validate(&self) -> Result<(), QuantPlanError> {
-        use QuantPlanError as E;
-        crate::model::name(&self.architecture, false).map_err(E::Manifest)?;
-        if self.tensors.is_empty()
-            || self.tensors.len() > 1_000_000
-            || self.levels.is_empty()
-            || self.levels.len() > 1024
-            || self.assets.len() > 4096
-        {
-            return Err(E::InvalidCount);
-        }
-        crate::model::sorted(
-            self.tensors.iter().map(|t| t.source.name.as_str()),
-            "quant tensors",
-        )
-        .map_err(E::Manifest)?;
-        crate::model::sorted(self.assets.iter().map(String::as_str), "quant assets")
-            .map_err(E::Manifest)?;
-        crate::model::sorted(self.levels.iter().map(String::as_str), "quant levels")
-            .map_err(E::Manifest)?;
-        for name in &self.assets {
-            crate::model::name(name, true).map_err(E::Manifest)?;
-        }
-        for name in &self.levels {
-            crate::model::name(name, false).map_err(E::Manifest)?;
-        }
-        if !["config.json", "tokenizer.json"]
-            .iter()
-            .all(|required| self.assets.iter().any(|n| n == required))
-        {
-            return Err(E::MissingAsset);
-        }
-        for tensor in &self.tensors {
-            tensor.source.byte_len()?;
-            if let QuantAction::Fit { plan, .. } = &tensor.action {
-                if tensor.source.shape.as_slice() != [plan.layout.rows, plan.layout.cols] {
-                    return Err(E::FitBinding);
-                }
-                plan.layout.validate().map_err(|_| E::FitBinding)?;
-                let mut names = plan
-                    .levels
-                    .iter()
-                    .map(|l| l.name.as_str())
-                    .collect::<Vec<_>>();
-                names.sort_unstable();
-                if names != self.levels.iter().map(String::as_str).collect::<Vec<_>>() {
-                    return Err(E::FitBinding);
-                }
-            }
-        }
-        Ok(())
+        crate::ModelQuantPlan::Uncalibrated(self).validate()
     }
 }
 
