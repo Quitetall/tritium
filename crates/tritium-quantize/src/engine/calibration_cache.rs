@@ -19,6 +19,8 @@ use tritium_schema::{
 pub enum CalibrationCacheError {
     /// Existing canonical package or typed manifest verification failed.
     Transport(String),
+    /// Common writer admission or I/O failed; I/O may leave partial caller output.
+    Write(tritium_format::TritPackageWriteError),
     /// Actual reconstructed content differs from the expected or stored binding.
     Binding,
     /// Invalid declared context or budget.
@@ -39,7 +41,14 @@ impl core::fmt::Display for CalibrationCacheError {
         write!(f, "calibration cache rejected: {self:?}")
     }
 }
-impl std::error::Error for CalibrationCacheError {}
+impl std::error::Error for CalibrationCacheError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Write(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 impl From<CalibrationError> for CalibrationCacheError {
     fn from(error: CalibrationError) -> Self {
         Self::Calibration(error)

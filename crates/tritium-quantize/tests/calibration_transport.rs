@@ -2,10 +2,13 @@ use std::io::{Read, Write};
 use tritium_format::trit_calibration::{
     decode_calibration_cache_manifest, encode_calibration_cache_manifest,
 };
-use tritium_format::{TritBlob, TritBlobKind, read_trit_package, write_trit_package};
+use tritium_format::{
+    PackageHasher, PackageId, TritBlob, TritBlobKind, TritPackageWriteError, read_trit_package,
+    write_trit_package,
+};
 use tritium_quantize::engine::{
-    CalibrationBatch, CalibrationCache, CalibrationCacheBuilder, CalibrationInput,
-    CalibrationOutputBatch,
+    CalibrationBatch, CalibrationCache, CalibrationCacheBuilder, CalibrationCacheError,
+    CalibrationInput, CalibrationOutputBatch,
 };
 use tritium_schema::*;
 
@@ -108,6 +111,140 @@ fn durable_roundtrip_all_encodings_preserves_bits_identity_and_common_replay() {
             }
         }
     }
+}
+
+struct ShortWriter {
+    bytes: Vec<u8>,
+    step: usize,
+    interrupted: bool,
+}
+impl Write for ShortWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if !self.interrupted {
+            self.interrupted = true;
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        let n = bytes.len().min(self.step);
+        self.bytes.extend_from_slice(&bytes[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        panic!("cache writer must not flush the caller's destination")
+    }
+}
+
+#[test]
+fn writer_export_matches_buffered_identity_for_every_cache_encoding() {
+    for (consumer, output) in [
+        (CalibrationConsumer::Matmul, CalibrationOutput::DenseFisher),
+        (
+            CalibrationConsumer::Matmul,
+            CalibrationOutput::IndexedFisher,
+        ),
+        (CalibrationConsumer::Matmul, CalibrationOutput::None),
+        (
+            CalibrationConsumer::GatherIdentity,
+            CalibrationOutput::IndexedFisher,
+        ),
+    ] {
+        let c = cache(consumer, output);
+        let expected = c.encode_package(1_000_000).unwrap();
+        for step in [1, 3, 255, 4096] {
+            let mut writer = ShortWriter {
+                bytes: Vec::new(),
+                step,
+                interrupted: false,
+            };
+            let id = c.write_package_to(expected.len(), &mut writer).unwrap();
+            assert_eq!(writer.bytes, expected);
+            assert_eq!(id, PackageId::from_package_bytes(&expected));
+            let decoded = read(&c, &writer.bytes).unwrap();
+            assert_eq!(decoded.binding(), c.binding());
+        }
+    }
+}
+
+struct FaultWriter {
+    bytes: Vec<u8>,
+    remaining: usize,
+    zero: bool,
+}
+impl Write for FaultWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return if self.zero {
+                Ok(0)
+            } else {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            };
+        }
+        let n = bytes.len().min(self.remaining);
+        self.bytes.extend_from_slice(&bytes[..n]);
+        self.remaining -= n;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        panic!("cache writer must not flush the caller's destination")
+    }
+}
+
+#[test]
+fn writer_admission_is_nonmutating_and_io_failure_exposes_actual_prefix() {
+    let c = cache(CalibrationConsumer::Matmul, CalibrationOutput::DenseFisher);
+    let expected = c.encode_package(1_000_000).unwrap();
+    for limit in [
+        0,
+        c.binding().payload_bytes as usize - 1,
+        expected.len() - 1,
+    ] {
+        let mut destination = vec![9, 8, 7];
+        assert!(c.write_package_to(limit, &mut destination).is_err());
+        assert_eq!(destination, [9, 8, 7]);
+    }
+    for zero in [false, true] {
+        for stop in [0, 7, 64, 257, expected.len() - 1] {
+            let mut writer = FaultWriter {
+                bytes: Vec::new(),
+                remaining: stop,
+                zero,
+            };
+            let error = c.write_package_to(expected.len(), &mut writer).unwrap_err();
+            let CalibrationCacheError::Write(TritPackageWriteError::Io(io)) = error else {
+                panic!("expected typed partial-output I/O failure");
+            };
+            assert_eq!(
+                io.kind(),
+                if zero {
+                    std::io::ErrorKind::WriteZero
+                } else {
+                    std::io::ErrorKind::BrokenPipe
+                }
+            );
+            assert_eq!(writer.bytes, expected[..stop]);
+        }
+    }
+}
+
+#[test]
+fn writer_export_supports_a_nonretaining_destination() {
+    struct HashWriter(PackageHasher, usize);
+    impl Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            self.1 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            panic!("cache writer must not flush the caller's destination")
+        }
+    }
+    let c = cache(CalibrationConsumer::Matmul, CalibrationOutput::DenseFisher);
+    let expected = c.encode_package(1_000_000).unwrap();
+    let mut writer = HashWriter(PackageHasher::new(), 0);
+    let id = c.write_package_to(expected.len(), &mut writer).unwrap();
+    assert_eq!(writer.1, expected.len());
+    assert_eq!(writer.0.finalize(), id);
+    assert_eq!(id, PackageId::from_package_bytes(&expected));
 }
 
 fn rewrite(
@@ -290,7 +427,8 @@ fn actual_file_roundtrip_uses_owned_scratch_and_removes_it() {
         .open(&path)
         .unwrap();
     let guard = FileGuard(path.clone());
-    file.write_all(&bytes).unwrap();
+    let package_id = c.write_package_to(bytes.len(), &mut file).unwrap();
+    assert_eq!(package_id, PackageId::from_package_bytes(&bytes));
     file.sync_all().unwrap();
     drop(file);
     let mut disk = Vec::new();
@@ -299,6 +437,7 @@ fn actual_file_roundtrip_uses_owned_scratch_and_removes_it() {
         .take(1_000_001)
         .read_to_end(&mut disk)
         .unwrap();
+    assert_eq!(disk, bytes);
     assert_eq!(read(&c, &disk).unwrap().id(), c.id());
     drop(guard);
     assert!(!path.exists());

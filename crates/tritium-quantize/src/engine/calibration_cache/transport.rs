@@ -1,10 +1,14 @@
-//! Whole-package transport, not streaming/spooled/mmap or complete RSS admission.
+//! Common package preparation for buffered/writer export and owned reconstruction.
+//! Scalar staging and decoded caches remain owned; not spooled/mmap or full RSS admission.
 use super::*;
 use std::collections::BTreeMap;
 use tritium_format::trit_calibration::{
     decode_calibration_cache_manifest, encode_calibration_cache_manifest,
 };
-use tritium_format::{TritBlob, TritBlobKind, read_trit_package, write_trit_package_bounded};
+use tritium_format::{
+    PackageId, TritBlob, TritBlobKind, read_trit_package, write_trit_package_bounded,
+    write_trit_package_to,
+};
 use tritium_schema::{CalibrationCacheLimits, CalibrationCacheManifest};
 
 impl CalibrationCache {
@@ -16,6 +20,36 @@ impl CalibrationCache {
         &self,
         max_package_bytes: usize,
     ) -> Result<Vec<u8>, CalibrationCacheError> {
+        self.with_package(max_package_bytes, |manifest, blobs| {
+            write_trit_package_bounded(manifest, blobs, max_package_bytes).map_err(transport)
+        })
+    }
+
+    /// Emit the same immutable package through the common bounded writer.
+    ///
+    /// Does not retain a complete output package, but retains this cache and scalar
+    /// staging buffers/metadata. This is not spooled input, mmap or full RSS admission.
+    /// Writes at the current destination position; never seeks, flushes, syncs or
+    /// publishes. Use a caller-owned pending destination before no-clobber publication.
+    /// # Errors
+    /// Admission completes before any destination write. I/O failure may leave a
+    /// prefix and returns `CalibrationCacheError::Write` without a success identity.
+    pub fn write_package_to(
+        &self,
+        max_package_bytes: usize,
+        destination: &mut impl std::io::Write,
+    ) -> Result<PackageId, CalibrationCacheError> {
+        self.with_package(max_package_bytes, |manifest, blobs| {
+            write_trit_package_to(manifest, blobs, max_package_bytes, destination)
+                .map_err(CalibrationCacheError::Write)
+        })
+    }
+
+    fn with_package<R>(
+        &self,
+        max_package_bytes: usize,
+        emit: impl FnOnce(&[u8], &[TritBlob<'_>]) -> Result<R, CalibrationCacheError>,
+    ) -> Result<R, CalibrationCacheError> {
         if self.binding.payload_bytes > max_package_bytes as u64 {
             return Err(CalibrationCacheError::Limit);
         }
@@ -93,7 +127,7 @@ impl CalibrationCache {
             kind: TritBlobKind::Asset(name.clone()),
             bytes,
         }));
-        write_trit_package_bounded(&manifest, &blobs, max_package_bytes).map_err(transport)
+        emit(&manifest, &blobs)
     }
 
     /// Verify a complete borrowed `.trit` package, then reconstruct actual immutable cache.
