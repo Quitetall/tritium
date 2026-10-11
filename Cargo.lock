@@ -4773,6 +4773,7 @@ dependencies = [
  "tritium-rocm",
  "tritium-runtime",
  "tritium-salt",
+ "tritium-schema",
  "tritium-spec",
  "tritium-testkit",
  "tritium-train",

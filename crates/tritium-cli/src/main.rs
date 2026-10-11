@@ -49,6 +49,7 @@ mod campaign_artifact;
 #[cfg(feature = "nccl")]
 mod campaign_world;
 mod convert;
+mod convert_plan;
 mod evidence;
 mod generate;
 #[cfg(feature = "cuda")]
@@ -198,11 +199,20 @@ enum Command {
     /// fold (`--calib`) — the lever every published SALT number was measured under — and it writes
     /// the folded norms alongside the bundle. Writing only a bundle would produce a model whose
     /// weights carry the fold and whose norms do not.
+    #[command(group(clap::ArgGroup::new("conversion_plan")
+        .args(["plan", "calibrated_plan"])
+        .multiple(false)
+        .conflicts_with_all(["model", "calib", "calib_tokens", "fold_alpha",
+            "no_rotation", "activation_aware", "gptq_decay", "gptq_scale_refit",
+            "gptq_decay_ramp", "dense_container", "planes", "group", "grid"])))]
     Convert {
         /// Hugging Face model directory (config.json + safetensors shards).
-        #[arg(long, alias = "input")]
-        model: PathBuf,
-        /// Output directory: config.json + model.safetensors (folded norms) + model.tslb.
+        #[arg(long, alias = "input", required_unless_present = "conversion_plan")]
+        model: Option<PathBuf>,
+        /// Explicit typed-plan conversion through the shared engine (ADR0063 candidate).
+        #[command(flatten)]
+        plan: convert_plan::PlanArgs,
+        /// New output directory: legacy files, or model.trit + evidence.jsonl with --plan.
         #[arg(long, alias = "output")]
         out: PathBuf,
         /// Calibration corpus for the salience fold: either a corpus JSON with a `train_ids`
@@ -689,6 +699,7 @@ fn main() -> anyhow::Result<()> {
             },
             Command::Convert {
                 model,
+                plan,
                 out,
                 calib,
                 calib_tokens,
@@ -702,29 +713,39 @@ fn main() -> anyhow::Result<()> {
                 planes,
                 group,
                 grid,
-            } => convert::run(
-                &model,
-                &out,
-                &convert::ConvertConfig {
-                    calib,
-                    calib_tokens,
-                    fold_alpha,
-                    ladder: quantize_ladder::LadderConfig {
-                        planes,
-                        group,
-                        grid,
-                        rotate: !no_rotation,
-                    },
-                    dense_container,
-                    activation_aware,
-                    gptq_decay: gptq_decay.0,
-                    gptq_scale_refit: match gptq_scale_refit {
-                        ScaleRefitArg::PostPass => tritium_nn::salt_fit::ScaleRefitMode::PostPass,
-                        ScaleRefitArg::InLoop => tritium_nn::salt_fit::ScaleRefitMode::InLoop,
-                    },
-                    gptq_decay_ramp,
-                },
-            )?,
+            } => {
+                if plan.enabled() {
+                    convert_plan::run(&plan, &out)?;
+                } else {
+                    convert::run(
+                        model.as_deref().expect("clap requires legacy --model"),
+                        &out,
+                        &convert::ConvertConfig {
+                            calib,
+                            calib_tokens,
+                            fold_alpha,
+                            ladder: quantize_ladder::LadderConfig {
+                                planes,
+                                group,
+                                grid,
+                                rotate: !no_rotation,
+                            },
+                            dense_container,
+                            activation_aware,
+                            gptq_decay: gptq_decay.0,
+                            gptq_scale_refit: match gptq_scale_refit {
+                                ScaleRefitArg::PostPass => {
+                                    tritium_nn::salt_fit::ScaleRefitMode::PostPass
+                                }
+                                ScaleRefitArg::InLoop => {
+                                    tritium_nn::salt_fit::ScaleRefitMode::InLoop
+                                }
+                            },
+                            gptq_decay_ramp,
+                        },
+                    )?;
+                }
+            }
             Command::Quantize {
                 input,
                 output,
@@ -804,6 +825,68 @@ enum ScaleRefitArg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_convert_requires_bindings_and_refuses_every_legacy_override() {
+        let base = [
+            "tritium",
+            "convert",
+            "--plan",
+            "plan.json",
+            "--source-shard",
+            "weights.safetensors",
+            "--conversion-run-id",
+            "stable",
+            "--out",
+            "out",
+        ];
+        let cli = Cli::try_parse_from(base).expect("typed convert");
+        assert!(
+            matches!(cli.command, Command::Convert { model: None, plan, .. } if plan.enabled())
+        );
+        for extra in [
+            vec!["--model", "model"],
+            vec!["--calib", "corpus"],
+            vec!["--calib-tokens", "4096"],
+            vec!["--fold-alpha", "0.75"],
+            vec!["--no-rotation"],
+            vec!["--activation-aware"],
+            vec!["--gptq-decay", "auto"],
+            vec!["--gptq-scale-refit", "post-pass"],
+            vec!["--gptq-decay-ramp"],
+            vec!["--dense-container"],
+            vec!["--planes", "4"],
+            vec!["--group", "256"],
+            vec!["--grid", "16"],
+            vec!["--calibrated-plan", "cal.json"],
+            vec!["--calibration-cache", "weight=cache.trit"],
+        ] {
+            assert!(
+                Cli::try_parse_from(base.into_iter().chain(extra.iter().copied())).is_err(),
+                "typed plan accepted forbidden legacy arguments: {extra:?}"
+            );
+        }
+        for missing in ["--source-shard", "--conversion-run-id"] {
+            let mut args = base.to_vec();
+            let i = args.iter().position(|a| *a == missing).unwrap();
+            args.drain(i..i + 2);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        for extra in [
+            vec!["--asset", "config.json=config.json"],
+            vec!["--max-plan-bytes", "10"],
+            vec!["--input-gram", "weight=gram.bin"],
+        ] {
+            assert!(
+                Cli::try_parse_from(
+                    ["tritium", "convert", "--model", "model", "--out", "out"]
+                        .into_iter()
+                        .chain(extra)
+                )
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn convert_cli_accepts_explicit_gptq_scale_refit_mode() {
