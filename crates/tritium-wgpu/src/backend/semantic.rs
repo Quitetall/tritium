@@ -147,7 +147,9 @@ impl SemanticExecutor {
             }
             TensorView::Additive(additive) => {
                 let layout = additive.layout();
-                if !admitted_execution_group(layout.law, layout.group) {
+                if additive.tile_counts().is_some()
+                    || !admitted_execution_group(layout.law, layout.group)
+                {
                     return Ok(None);
                 }
                 AdditiveTensor::validate_view(additive)

@@ -37,7 +37,9 @@ impl CpuTensor {
     pub(crate) fn caps(view: TensorView<'_>) -> Result<Option<TensorCaps>, BackendError> {
         let payload_bytes = if let TensorView::Additive(additive) = view {
             let layout = additive.layout();
-            if !admitted_execution_group(layout.law, layout.group) {
+            if layout.allocation != tritium_schema::PlaneAllocation::Uniform
+                || !admitted_execution_group(layout.law, layout.group)
+            {
                 return Ok(None);
             }
             AdditiveTensor::validate_view(additive).map_err(|e| {

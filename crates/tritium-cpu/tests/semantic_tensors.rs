@@ -9,6 +9,38 @@ use tritium_schema::{
 };
 use tritium_spec::{TensorMatmul, TensorView, TernaryBackend};
 
+#[test]
+fn compact_and_all_pruned_views_cannot_enter_uniform_cpu_storage() {
+    let cpu = CpuBackend::new();
+    let mut layout = layout(Basis::Identity, PlaneCodec::D2);
+    layout.allocation = PlaneAllocation::PerTile;
+    for counts in [[1, 0], [0, 0]] {
+        let mut spans = vec![
+            tritium_core::PerTileRowSpan::default();
+            tritium_core::PerTileIndex::required_storage(layout, &counts).unwrap()
+        ];
+        let index = tritium_core::PerTileIndex::build(layout, &counts, &mut spans).unwrap();
+        let trits = vec![Trit::POS; index.trit_count()];
+        let scales = vec![0.5; index.scale_count()];
+        let view = AdditiveView::new_per_tile(index, &trits, &scales).unwrap();
+        assert!(
+            cpu.tensor_caps(TensorView::Additive(view))
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            cpu.upload_tensor(TensorView::Additive(view)),
+            Err(tritium_spec::BackendError::UnsupportedTensor)
+        ));
+        assert_eq!(
+            AdditiveTensor::from_view(view),
+            Err(tritium_format::AdditiveTensorError::InvalidView(
+                tritium_core::AdditiveError::UnsupportedAllocation
+            ))
+        );
+    }
+}
+
 fn layout(basis: Basis, codec: PlaneCodec) -> AdditiveLayout {
     AdditiveLayout {
         rows: 2,

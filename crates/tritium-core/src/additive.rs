@@ -8,7 +8,7 @@ use tritium_schema::{
     AdditiveLayout, Basis, LayoutError, PlaneAllocation, PlaneRelation, ScaleAnchor,
 };
 
-use crate::Trit;
+use crate::{PerTileIndex, Trit};
 
 /// Consumer marker: rotate activations before additive matrix multiplication.
 #[derive(Clone, Copy, Debug)]
@@ -51,10 +51,33 @@ pub struct BasisBound<T, C> {
 pub enum AdditiveError {
     /// The layout failed its schema-level validation.
     InvalidLayout(LayoutError),
-    /// The selected reference path does not yet support per-tile plane counts.
+    /// The selected constructor or consumer does not support this allocation.
     UnsupportedAllocation,
     /// The actual plane count is zero or exceeds the tensor/law maximum.
     InvalidPlaneCount,
+    /// The row-major tile count array disagrees with tensor geometry.
+    TileCountMismatch {
+        /// Expected number of tile counts.
+        expected: usize,
+        /// Supplied number of tile counts.
+        got: usize,
+    },
+    /// A tile count exceeds its layout/law maximum.
+    InvalidTilePlaneCount {
+        /// Row-major tile index.
+        tile: usize,
+        /// Supplied tile count.
+        count: u8,
+        /// Maximum permitted by this layout.
+        max: u8,
+    },
+    /// Caller-owned index storage has the wrong length.
+    IndexStorageLength {
+        /// Required row span count.
+        expected: usize,
+        /// Supplied row span count.
+        got: usize,
+    },
     /// The decoded ternary buffer length disagrees with tensor geometry.
     TritCountMismatch {
         /// Expected number of ternary coefficients.
@@ -95,13 +118,23 @@ pub enum AdditiveError {
 /// For `Free` laws, scales are plane-major and follow the selected anchor; for
 /// `Tied` laws, only the base-plane scale set is stored. Scales have already
 /// been widened losslessly to `f32` from the precision named in the layout.
+/// Per-tile views omit absent tiles and bind their compact order explicitly
+/// through [`Self::new_per_tile`]; uniform construction never infers counts.
 #[derive(Clone, Copy, Debug)]
 pub struct AdditiveView<'a> {
-    layout: AdditiveLayout,
-    plane_count: usize,
-    scale_units: usize,
+    allocation: Allocation<'a>,
     trits: &'a [Trit],
     scales: &'a [f32],
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Allocation<'a> {
+    Uniform {
+        layout: AdditiveLayout,
+        planes: usize,
+        scale_units: usize,
+    },
+    PerTile(PerTileIndex<'a>),
 }
 
 impl<'a> AdditiveView<'a> {
@@ -156,44 +189,89 @@ impl<'a> AdditiveView<'a> {
                 got: scales.len(),
             });
         }
-        if scales
-            .iter()
-            .any(|scale| !scale.is_finite() || *scale < 0.0)
-        {
-            return Err(AdditiveError::InvalidScale);
-        }
-        if let PlaneRelation::Tied { num, den } = layout.law.relation {
-            let ratio = num as f32 / den as f32;
-            for &base_scale in scales {
-                let mut plane_scale = base_scale;
-                for _ in 1..usize::from(plane_count) {
-                    plane_scale *= ratio;
-                    if !plane_scale.is_finite() {
-                        return Err(AdditiveError::InvalidScale);
-                    }
-                }
-            }
-        }
+        validate_scales(layout, usize::from(plane_count), scales)?;
 
         Ok(Self {
-            layout,
-            plane_count: usize::from(plane_count),
-            scale_units,
+            allocation: Allocation::Uniform {
+                layout,
+                planes: usize::from(plane_count),
+                scale_units,
+            },
             trits,
             scales,
         })
     }
 
+    /// Bind a checked per-tile index to its exact compact coefficients/scales.
+    ///
+    /// Borrows all storage and allocates nothing. An all-pruned index binds
+    /// empty payloads with zero present planes, while retaining normal shape and
+    /// basis validation. This does not imply native backend support.
+    pub fn new_per_tile(
+        index: PerTileIndex<'a>,
+        trits: &'a [Trit],
+        scales: &'a [f32],
+    ) -> Result<Self, AdditiveError> {
+        if trits.len() != index.trit_count() {
+            return Err(AdditiveError::TritCountMismatch {
+                expected: index.trit_count(),
+                got: trits.len(),
+            });
+        }
+        if scales.len() != index.scale_count() {
+            return Err(AdditiveError::ScaleCountMismatch {
+                expected: index.scale_count(),
+                got: scales.len(),
+            });
+        }
+        validate_scales(index.layout, index.plane_count(), scales)?;
+        Ok(Self {
+            allocation: Allocation::PerTile(index),
+            trits,
+            scales,
+        })
+    }
+
+    /// Validated row-major counts, or `None` for uniform allocation.
+    #[must_use]
+    pub fn tile_counts(&self) -> Option<&'a [u8]> {
+        match self.allocation {
+            Allocation::Uniform { .. } => None,
+            Allocation::PerTile(index) => Some(index.counts()),
+        }
+    }
+
+    /// Coefficients for one present plane in canonical payload order.
+    pub fn plane_trits(&self, plane: usize) -> Result<&'a [Trit], AdditiveError> {
+        if plane >= self.plane_count() {
+            return Err(AdditiveError::InvalidPlaneCount);
+        }
+        let range = if let Allocation::PerTile(index) = self.allocation {
+            index.plane_range(plane)
+        } else {
+            let coefficients = self.layout().rows as usize * self.layout().cols as usize;
+            plane * coefficients..(plane + 1) * coefficients
+        };
+        Ok(&self.trits[range])
+    }
+
     /// Return the layout carried by this validated view.
     #[must_use]
     pub const fn layout(&self) -> AdditiveLayout {
-        self.layout
+        match self.allocation {
+            Allocation::Uniform { layout, .. } => layout,
+            Allocation::PerTile(index) => index.layout,
+        }
     }
 
-    /// Number of stored planes present in this view.
+    /// Number of present planes; the actual maximum count for per-tile views.
+    /// May be zero for an all-pruned per-tile tensor.
     #[must_use]
     pub const fn plane_count(&self) -> usize {
-        self.plane_count
+        match self.allocation {
+            Allocation::Uniform { planes, .. } => planes,
+            Allocation::PerTile(index) => index.plane_count(),
+        }
     }
 
     /// Return the validated plane-major ternary coefficients.
@@ -231,8 +309,8 @@ impl<'a> AdditiveView<'a> {
     /// This returns the stored-basis row, not an original-coordinate embedding.
     /// Embedding consumers must use [`Self::bind_gather`] and [`reference_embed`].
     pub fn dequant_row_into(&self, row: usize, out: &mut [f32]) -> Result<(), AdditiveError> {
-        let rows = usize::try_from(self.layout.rows).map_err(|_| AdditiveError::SizeOverflow)?;
-        let cols = usize::try_from(self.layout.cols).map_err(|_| AdditiveError::SizeOverflow)?;
+        let rows = usize::try_from(self.layout().rows).map_err(|_| AdditiveError::SizeOverflow)?;
+        let cols = usize::try_from(self.layout().cols).map_err(|_| AdditiveError::SizeOverflow)?;
         if row >= rows {
             return Err(AdditiveError::RowOutOfRange);
         }
@@ -243,7 +321,25 @@ impl<'a> AdditiveView<'a> {
             });
         }
         out.fill(0.0);
-        for plane in 0..self.plane_count {
+        if let Allocation::PerTile(index) = self.allocation {
+            let group = usize::from(self.layout().group);
+            for plane in 0..self.plane_count() {
+                for tile in index.row_tiles(plane, row) {
+                    for offset in 0..tile.len {
+                        let scale_index = tile.scale
+                            + if self.layout().law.anchor == ScaleAnchor::Group {
+                                offset / group
+                            } else {
+                                0
+                            };
+                        out[tile.col + offset] += self.trits[tile.trit + offset].to_f32()
+                            * self.stored_scale(plane, scale_index)?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        for plane in 0..self.plane_count() {
             let trit_start = plane * rows * cols + row * cols;
             for (col, value) in out.iter_mut().enumerate() {
                 let scale = self.scale(plane, self.scale_unit(row, col)?)?;
@@ -254,11 +350,11 @@ impl<'a> AdditiveView<'a> {
     }
 
     fn scale_unit(&self, row: usize, col: usize) -> Result<usize, AdditiveError> {
-        match self.layout.law.anchor {
+        match self.layout().law.anchor {
             ScaleAnchor::Group => {
-                let cols = self.layout.cols as usize;
-                let groups_per_row = cols.div_ceil(usize::from(self.layout.group));
-                Ok(row * groups_per_row + col / usize::from(self.layout.group))
+                let cols = self.layout().cols as usize;
+                let groups_per_row = cols.div_ceil(usize::from(self.layout().group));
+                Ok(row * groups_per_row + col / usize::from(self.layout().group))
             }
             ScaleAnchor::Row | ScaleAnchor::Channel => Ok(row),
             ScaleAnchor::Tensor => Ok(0),
@@ -267,11 +363,23 @@ impl<'a> AdditiveView<'a> {
     }
 
     fn scale(&self, plane: usize, unit: usize) -> Result<f32, AdditiveError> {
-        match self.layout.law.relation {
-            PlaneRelation::Free => Ok(self.scales[plane * self.scale_units + unit]),
+        let Allocation::Uniform { scale_units, .. } = self.allocation else {
+            unreachable!("uniform scale lookup on a compact view")
+        };
+        let stored = if self.layout().law.relation == PlaneRelation::Free {
+            plane * scale_units + unit
+        } else {
+            unit
+        };
+        self.stored_scale(plane, stored)
+    }
+
+    fn stored_scale(&self, plane: usize, stored: usize) -> Result<f32, AdditiveError> {
+        match self.layout().law.relation {
+            PlaneRelation::Free => Ok(self.scales[stored]),
             PlaneRelation::Tied { num, den } => {
                 let ratio = num as f32 / den as f32;
-                let mut scale = self.scales[unit];
+                let mut scale = self.scales[stored];
                 for _ in 0..plane {
                     scale *= ratio;
                 }
@@ -286,17 +394,20 @@ impl<'a> AdditiveView<'a> {
     }
 
     fn dot_row(&self, row: usize, activation: &[f32]) -> Result<f32, AdditiveError> {
-        let cols = self.layout.cols as usize;
-        let rows = self.layout.rows as usize;
-        let group = usize::from(self.layout.group);
-        let group_anchor = self.layout.law.anchor == ScaleAnchor::Group;
+        if let Allocation::PerTile(index) = self.allocation {
+            return self.dot_compact_row(index, row, activation);
+        }
+        let cols = self.layout().cols as usize;
+        let rows = self.layout().rows as usize;
+        let group = usize::from(self.layout().group);
+        let group_anchor = self.layout().law.anchor == ScaleAnchor::Group;
         let groups = if group_anchor {
             cols.div_ceil(group)
         } else {
             1
         };
         let mut sum = 0.0f32;
-        for plane in 0..self.plane_count {
+        for plane in 0..self.plane_count() {
             let plane_start = plane * rows * cols + row * cols;
             for unit in 0..groups {
                 let start = if group_anchor { unit * group } else { 0 };
@@ -318,6 +429,69 @@ impl<'a> AdditiveView<'a> {
         }
         Ok(sum)
     }
+
+    fn dot_compact_row(
+        &self,
+        index: PerTileIndex<'_>,
+        row: usize,
+        activation: &[f32],
+    ) -> Result<f32, AdditiveError> {
+        let group = usize::from(self.layout().group);
+        let tensor_anchor = self.layout().law.anchor == ScaleAnchor::Tensor;
+        let mut sum = 0.0f32;
+        for plane in 0..self.plane_count() {
+            let mut tensor_partial = 0.0f32;
+            for tile in index.row_tiles(plane, row) {
+                let width = if tensor_anchor { tile.len } else { group };
+                for start in (0..tile.len).step_by(width) {
+                    let end = (start + width).min(tile.len);
+                    let mut partial = if tensor_anchor { tensor_partial } else { 0.0 };
+                    for offset in start..end {
+                        match self.trits[tile.trit + offset].get() {
+                            1 => partial += activation[tile.col + offset],
+                            -1 => partial -= activation[tile.col + offset],
+                            _ => {}
+                        }
+                    }
+                    if tensor_anchor {
+                        tensor_partial = partial;
+                    } else {
+                        sum += partial * self.stored_scale(plane, tile.scale + start / group)?;
+                    }
+                }
+            }
+            if tensor_anchor {
+                sum += tensor_partial * self.stored_scale(plane, plane)?;
+            }
+        }
+        Ok(sum)
+    }
+}
+
+fn validate_scales(
+    layout: AdditiveLayout,
+    planes: usize,
+    scales: &[f32],
+) -> Result<(), AdditiveError> {
+    if scales
+        .iter()
+        .any(|scale| !scale.is_finite() || *scale < 0.0)
+    {
+        return Err(AdditiveError::InvalidScale);
+    }
+    if let PlaneRelation::Tied { num, den } = layout.law.relation {
+        let ratio = num as f32 / den as f32;
+        for &base_scale in scales {
+            let mut plane_scale = base_scale;
+            for _ in 1..planes {
+                plane_scale *= ratio;
+                if !plane_scale.is_finite() {
+                    return Err(AdditiveError::InvalidScale);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Apply the declared forward basis to one activation vector in place.
@@ -384,8 +558,8 @@ pub fn reference_embed(
     out: &mut [f32],
 ) -> Result<(), AdditiveError> {
     let weights = &weights.tensor;
-    let rows = usize::try_from(weights.layout.rows).map_err(|_| AdditiveError::SizeOverflow)?;
-    let cols = usize::try_from(weights.layout.cols).map_err(|_| AdditiveError::SizeOverflow)?;
+    let rows = usize::try_from(weights.layout().rows).map_err(|_| AdditiveError::SizeOverflow)?;
+    let cols = usize::try_from(weights.layout().cols).map_err(|_| AdditiveError::SizeOverflow)?;
     let expected = ids
         .len()
         .checked_mul(cols)
@@ -401,7 +575,7 @@ pub fn reference_embed(
     }
     for (&row, output) in ids.iter().zip(out.chunks_exact_mut(cols)) {
         weights.dequant_row_into(row, output)?;
-        apply_inverse_basis(output, weights.layout.basis)?;
+        apply_inverse_basis(output, weights.layout().basis)?;
     }
     Ok(())
 }
@@ -419,8 +593,8 @@ pub fn reference_ternary_matmul(
     out: &mut [f32],
 ) -> Result<(), AdditiveError> {
     let weights = &weights.tensor;
-    let rows = usize::try_from(weights.layout.rows).map_err(|_| AdditiveError::SizeOverflow)?;
-    let cols = usize::try_from(weights.layout.cols).map_err(|_| AdditiveError::SizeOverflow)?;
+    let rows = usize::try_from(weights.layout().rows).map_err(|_| AdditiveError::SizeOverflow)?;
+    let cols = usize::try_from(weights.layout().cols).map_err(|_| AdditiveError::SizeOverflow)?;
     let activation_count = batch.checked_mul(cols).ok_or(AdditiveError::SizeOverflow)?;
     let output_count = batch.checked_mul(rows).ok_or(AdditiveError::SizeOverflow)?;
     if activations.len() != activation_count
@@ -431,7 +605,7 @@ pub fn reference_ternary_matmul(
     }
     transformed_activations.copy_from_slice(activations);
     for activation in transformed_activations.chunks_exact_mut(cols) {
-        apply_basis(activation, weights.layout.basis)?;
+        apply_basis(activation, weights.layout().basis)?;
     }
     for batch_row in 0..batch {
         let activation = &transformed_activations[batch_row * cols..(batch_row + 1) * cols];

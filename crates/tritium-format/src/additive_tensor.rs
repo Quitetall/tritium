@@ -92,6 +92,13 @@ impl AdditiveTensor {
     ///
     /// Used by capability queries and before reservations in [`Self::from_view`].
     pub fn validate_view(view: AdditiveView<'_>) -> Result<(), AdditiveTensorError> {
+        // Owned storage/codec still have uniform geometry. Never drop compact
+        // counts while copying a view or later reconstruct a panicking view.
+        if view.layout().allocation != tritium_schema::PlaneAllocation::Uniform {
+            return Err(AdditiveTensorError::InvalidView(
+                AdditiveError::UnsupportedAllocation,
+            ));
+        }
         for (index, scale) in view.scales().iter().copied().enumerate() {
             if scale.to_bits() & 0x8000_0000 != 0 {
                 return Err(AdditiveTensorError::InvalidView(

@@ -100,7 +100,9 @@ impl TernaryBackend for ReferenceBackend {
     fn tensor_caps(&self, tensor: TensorView<'_>) -> Result<Option<TensorCaps>, BackendError> {
         if let TensorView::Additive(view) = tensor {
             let layout = view.layout();
-            if !admitted_execution_group(layout.law, layout.group) {
+            if layout.allocation != tritium_schema::PlaneAllocation::Uniform
+                || !admitted_execution_group(layout.law, layout.group)
+            {
                 return Ok(None);
             }
             AdditiveTensor::validate_view(view).map_err(|e| {

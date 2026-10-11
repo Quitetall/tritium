@@ -10,6 +10,36 @@ use tritium_schema::{
 };
 use tritium_spec::{TensorMatmul, TensorView, TernaryBackend};
 
+#[test]
+fn reference_adapter_does_not_discard_compact_counts_on_upload() {
+    let backend = tritium_testkit::ReferenceBackend::new();
+    let mut layout = layout(
+        Basis::Identity,
+        law(ScaleAnchor::Group, PlaneRelation::Free),
+    );
+    layout.allocation = PlaneAllocation::PerTile;
+    for counts in [[2], [0]] {
+        let mut spans = vec![
+            tritium_core::PerTileRowSpan::default();
+            tritium_core::PerTileIndex::required_storage(layout, &counts).unwrap()
+        ];
+        let index = tritium_core::PerTileIndex::build(layout, &counts, &mut spans).unwrap();
+        let trits = vec![Trit::POS; index.trit_count()];
+        let scales = vec![0.5; index.scale_count()];
+        let view = AdditiveView::new_per_tile(index, &trits, &scales).unwrap();
+        assert!(
+            backend
+                .tensor_caps(TensorView::Additive(view))
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            backend.upload_tensor(TensorView::Additive(view)),
+            Err(tritium_spec::BackendError::InvalidInput(_))
+        ));
+    }
+}
+
 fn layout(basis: Basis, law: ScaleLaw) -> AdditiveLayout {
     AdditiveLayout {
         rows: 1,
