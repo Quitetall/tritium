@@ -9,6 +9,7 @@ fn actual_fold_keeps_untouched_tensors_and_exports_bits_when_requested() {
         let a = Arch {
             attn_norms: vec![vec![1.125; 8]; layers],
             ffn_norms: vec![vec![0.875; 8]; layers],
+            qk_norms: vec![None; layers],
             out_norm: vec![1.5; 8],
             n_embd: 8,
             n_head: 4,

@@ -81,6 +81,15 @@ pub struct AttentionTrace {
     pub heads: ValueId,
 }
 
+/// Learned per-head Q/K RMSNorm values on the caller's tape.
+/// Each weight has `head_dim` finite entries; epsilon is finite and positive.
+#[derive(Clone, Copy, Debug)]
+pub struct AttentionQkNorm {
+    pub query: ValueId,
+    pub key: ValueId,
+    pub eps: f32,
+}
+
 /// The same actual attention implementation, exposing original projection IDs.
 /// The caller owns the tape and may inspect gradients after its own objective.
 /// Shape/ownership contracts and arithmetic are identical to [`attention_heads`].
@@ -98,10 +107,46 @@ pub fn attention_heads_traced(
     head_dim: usize,
     theta: f32,
 ) -> AttentionTrace {
+    attention_heads_traced_with_qk_norm(
+        t, x, wq, wk, wv, seq, n_embd, n_head, n_kv_head, head_dim, theta, None,
+    )
+}
+
+/// Shared traced attention with optional learned Q/K RMSNorm before RoPE.
+/// Trace outputs remain the original linear projections **before** normalization.
+/// Normalization and its backward pass use [`Tape::rmsnorm`] per head; absent
+/// normalization executes the same arithmetic as [`attention_heads_traced`].
+///
+/// # Panics
+/// Panics on invalid head geometry, norm lengths, nonfinite norm weights, or
+/// nonpositive/nonfinite norm epsilon, before recording new attention operations.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_heads_traced_with_qk_norm(
+    t: &mut Tape,
+    x: ValueId,
+    wq: ValueId,
+    wk: ValueId,
+    wv: ValueId,
+    seq: usize,
+    n_embd: usize,
+    n_head: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+    theta: f32,
+    norm: Option<AttentionQkNorm>,
+) -> AttentionTrace {
+    assert!(n_head > 0 && n_kv_head > 0 && head_dim > 0);
     assert!(
         n_head.is_multiple_of(n_kv_head),
         "n_head {n_head} must be a multiple of n_kv_head {n_kv_head}"
     );
+    if let Some(norm) = norm {
+        assert!(norm.eps.is_finite() && norm.eps > 0.0);
+        for id in [norm.query, norm.key] {
+            assert_eq!(t.value(id).len(), head_dim);
+            assert!(t.value(id).iter().all(|v| v.is_finite()));
+        }
+    }
     let qd = n_head * head_dim;
     let kvd = n_kv_head * head_dim;
     let group = n_head / n_kv_head;
@@ -114,6 +159,14 @@ pub fn attention_heads_traced(
     let query = q;
     let key = k;
     let value = v;
+    let (q, k) = if let Some(norm) = norm {
+        (
+            t.rmsnorm(q, norm.query, seq * n_head, head_dim, norm.eps),
+            t.rmsnorm(k, norm.key, seq * n_kv_head, head_dim, norm.eps),
+        )
+    } else {
+        (q, k)
+    };
     let q = t.rope(q, pos.clone(), n_head, head_dim, theta);
     let k = t.rope(k, pos.clone(), n_kv_head, head_dim, theta);
 

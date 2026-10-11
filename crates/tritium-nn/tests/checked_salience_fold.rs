@@ -5,6 +5,7 @@ fn graph_geometry_and_late_pair_errors_preserve_caller_inputs() {
     let a = Arch {
         attn_norms: vec![vec![1.0; 4]; 2],
         ffn_norms: vec![vec![1.0; 4]; 2],
+        qk_norms: vec![None; 2],
         out_norm: vec![1.0; 4],
         n_embd: 4,
         n_head: 2,

@@ -14,6 +14,7 @@ fn fixture() -> (Arch, Vec<Vec<f32>>) {
     let a = Arch {
         attn_norms: vec![vec![1.; 6]; 2],
         ffn_norms: vec![vec![1.; 6]; 2],
+        qk_norms: vec![None; 2],
         out_norm: vec![1.; 6],
         n_embd: 6,
         n_head: 2,

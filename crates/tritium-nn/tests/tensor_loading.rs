@@ -15,6 +15,9 @@ use tritium_spec::{TensorExecution, TensorView, TernaryBackend};
 #[path = "tensor_loading/joined.rs"]
 mod joined;
 
+#[path = "tensor_loading/calibration.rs"]
+mod calibration;
+
 #[derive(Debug)]
 struct UploadProbe(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 

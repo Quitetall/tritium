@@ -27,18 +27,27 @@
 //! skips `o_proj` and the tied head for its unchanged structural reasons.
 
 use tritium_train::Tape;
-use tritium_train::nn::attention_heads_traced;
+use tritium_train::nn::{AttentionQkNorm, attention_heads_traced_with_qk_norm};
 use tritium_train::tape::ValueId;
 
 use crate::{Mlp, ModelRunner, Projection};
 use tritium_quantize::engine::SaliencePair;
 pub use tritium_quantize::engine::{SalienceFoldError, divide_rows, scale_cols, smooth_scales};
 
+/// Learned per-head query/key RMSNorm weights, held fp in the calibration graph.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QkNorm {
+    pub query: Vec<f32>,
+    pub key: Vec<f32>,
+}
+
 /// Dims + fp 1D norms for the tape forward (the parts held fp, not quantized/trained).
 #[derive(Debug, Clone)]
 pub struct Arch {
     pub attn_norms: Vec<Vec<f32>>,
     pub ffn_norms: Vec<Vec<f32>>,
+    /// Exactly one optional pair per layer; weights each have `head_dim` entries.
+    pub qk_norms: Vec<Option<QkNorm>>,
     pub out_norm: Vec<f32>,
     pub n_embd: usize,
     pub n_head: usize,
@@ -77,6 +86,22 @@ pub fn extract(runner: &ModelRunner) -> (Arch, Vec<Vec<f32>>, Vec<(usize, usize)
     let arch = Arch {
         attn_norms: w.layers.iter().map(|b| b.attn_norm.clone()).collect(),
         ffn_norms: w.layers.iter().map(|b| b.ffn_norm.clone()).collect(),
+        qk_norms: w
+            .layers
+            .iter()
+            .map(|b| {
+                if b.q_norm.is_empty() && b.k_norm.is_empty() {
+                    None
+                } else {
+                    assert_eq!(b.q_norm.len(), cfg.head_dim() as usize);
+                    assert_eq!(b.k_norm.len(), cfg.head_dim() as usize);
+                    Some(QkNorm {
+                        query: b.q_norm.clone(),
+                        key: b.k_norm.clone(),
+                    })
+                }
+            })
+            .collect(),
         out_norm: w.output_norm.clone(),
         n_embd: cfg.n_embd as usize,
         n_head: cfg.n_head as usize,
@@ -146,6 +171,10 @@ pub fn norm_tensors(a: &Arch) -> Vec<(String, &[f32])> {
     for li in 0..a.n_layers {
         out.push((schema.layer(li, "attn_norm"), a.attn_norms[li].as_slice()));
         out.push((schema.layer(li, "ffn_norm"), a.ffn_norms[li].as_slice()));
+        if let Some(norm) = &a.qk_norms[li] {
+            out.push((schema.layer(li, "q_norm"), norm.query.as_slice()));
+            out.push((schema.layer(li, "k_norm"), norm.key.as_slice()));
+        }
     }
     out.push((schema.top("output_norm").to_owned(), a.out_norm.as_slice()));
     out
@@ -383,6 +412,13 @@ fn forward_impl(
     hooks: &mut ForwardHooks<'_, '_>,
 ) -> ValueId {
     let seq = tokens.len();
+    assert_eq!(a.qk_norms.len(), a.n_layers);
+    for norm in a.qk_norms.iter().flatten() {
+        assert_eq!(norm.query.len(), a.head_dim);
+        assert_eq!(norm.key.len(), a.head_dim);
+        assert!(norm.query.iter().chain(&norm.key).all(|v| v.is_finite()));
+        assert!(a.eps.is_finite() && a.eps > 0.0);
+    }
     let mut hidden = t.embed_gather(wids[0], tokens, a.vocab, a.n_embd);
     (hooks.projection)(
         t,
@@ -405,7 +441,12 @@ fn forward_impl(
         let an = t.leaf(a.attn_norms[li].clone());
         let xn = t.rmsnorm(hidden, an, seq, a.n_embd, a.eps);
         let xn = hooks.input(t, xn, Tap::AttnIn, li, seq, a.n_embd);
-        let trace = attention_heads_traced(
+        let qk_norm = a.qk_norms[li].as_ref().map(|norm| AttentionQkNorm {
+            query: t.leaf(norm.query.clone()),
+            key: t.leaf(norm.key.clone()),
+            eps: a.eps,
+        });
+        let trace = attention_heads_traced_with_qk_norm(
             t,
             xn,
             wids[base],
@@ -417,6 +458,7 @@ fn forward_impl(
             a.n_head_kv,
             a.head_dim,
             a.theta,
+            qk_norm,
         );
         for (offset, role, output, rows) in [
             (0, ProjectionRole::Query, trace.query, qd),
@@ -700,6 +742,7 @@ mod tests {
         Arch {
             attn_norms: vec![vec![1.0; 4]; n_layers],
             ffn_norms: vec![vec![1.0; 4]; n_layers],
+            qk_norms: vec![None; n_layers],
             out_norm: vec![1.0; 4],
             n_embd: 4,
             n_head: 2,
