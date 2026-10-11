@@ -1,5 +1,7 @@
 //! Complete model fitting through one source/sink seam (ADR 0058 candidate).
 
+use super::StagedSalienceSource;
+use super::salience_model::SalienceProductionContext;
 use super::{
     CalibrationCacheError, CalibrationSource, DirectFitError, RecordedCalibratedFitError,
     RecordedDirectFitError, fit_calibrated_levels_recorded, fit_direct_levels_recorded,
@@ -20,7 +22,7 @@ use tritium_schema::{
     CalibratedQuantizationStarted, DirectFitMetric, ModelId, ModelQuantPlan, NamedAssetDigest,
     OriginalSourceId, PackageId, PlaneCounts, QuantActionRef, QuantOutputLevel, QuantPlan,
     QuantPlanError, QuantSourceBinding, QuantSourceTensor, QuantizationCompleted,
-    QuantizationStarted, ScalePrecision, TensorMeta, TensorStorage,
+    QuantizationStarted, SalienceConversionLimits, ScalePrecision, TensorMeta, TensorStorage,
 };
 
 /// Original byte provider; adapters never supply trusted input digests.
@@ -211,6 +213,7 @@ impl Engine {
             sink,
             recorder,
             None,
+            None,
         )
     }
 
@@ -242,6 +245,7 @@ impl Engine {
             sink,
             recorder,
             Some(expected_source),
+            None,
         )
     }
 
@@ -265,6 +269,61 @@ impl Engine {
             sink,
             recorder,
             Some(plan.original_source),
+            None,
+        )
+    }
+
+    /// Convert an actual admitted immutable B stage into mandatory joined C.
+    /// Uses the same fitter, writer and publication path as ordinary conversion.
+    /// Structural lineage is not captured-graph, numerical replay or qualification.
+    /// # Errors
+    /// Stage/request/source/output/root disagreement, limits or ordinary conversion failure.
+    pub fn run_salience(
+        plan: &QuantPlan,
+        stage: &mut StagedSalienceSource<'_>,
+        sink: &mut dyn TensorSink,
+        recorder: EvidenceRecorder,
+        limits: SalienceConversionLimits,
+    ) -> Result<QuantizedModel, QuantEngineError> {
+        let context = SalienceProductionContext::from_stage(stage, limits)?;
+        let expected = stage.source_id();
+        Self::run_impl(
+            ModelQuantPlan::Uncalibrated(plan),
+            stage,
+            None,
+            sink,
+            recorder,
+            Some(expected),
+            Some(context),
+        )
+    }
+
+    /// Fit actual B-bound caches through the same mandatory joined C path.
+    /// Does not rescale or relabel A caches, rerun graph capture or clone dense B.
+    /// # Errors
+    /// Foreign original/cache binding, limits or ordinary calibrated conversion failure.
+    pub fn run_calibrated_salience(
+        plan: &CalibratedQuantPlan,
+        stage: &mut StagedSalienceSource<'_>,
+        caches: &mut dyn CalibrationSource,
+        sink: &mut dyn TensorSink,
+        recorder: EvidenceRecorder,
+        limits: SalienceConversionLimits,
+    ) -> Result<QuantizedModel, QuantEngineError> {
+        if plan.original_source != stage.source_id() {
+            return Err(QuantEngineError::Binding(
+                "calibrated request differs from actual B stage",
+            ));
+        }
+        let context = SalienceProductionContext::from_stage(stage, limits)?;
+        Self::run_impl(
+            ModelQuantPlan::Calibrated(plan),
+            stage,
+            Some(caches),
+            sink,
+            recorder,
+            Some(plan.original_source),
+            Some(context),
         )
     }
 
@@ -275,6 +334,7 @@ impl Engine {
         sink: &mut dyn TensorSink,
         mut recorder: EvidenceRecorder,
         expected_source: Option<OriginalSourceId>,
+        salience: Option<SalienceProductionContext>,
     ) -> Result<QuantizedModel, QuantEngineError> {
         plan.validate().map_err(QuantEngineError::Plan)?;
         if !recorder.events().is_empty() {
@@ -550,14 +610,25 @@ impl Engine {
                 "actual original source differs from preparation",
             ));
         }
-        let manifest = encode_model_manifest(view.manifest())?;
+        let manifest = match &salience {
+            Some(context) => context.manifest_bytes(view)?,
+            None => encode_model_manifest(view.manifest())?,
+        };
+        let max_package_bytes = salience
+            .as_ref()
+            .map_or(limits.max_package_bytes, |context| {
+                limits.max_package_bytes.min(context.max_package_bytes())
+            });
         let records = blobs.records();
         let package = write_trit_package_bounded(
             &manifest,
             &records,
-            platform(limits.max_package_bytes, "package bytes")?,
+            platform(max_package_bytes, "package bytes")?,
         )?;
-        let model = bound_package(&package, evidence.log())?;
+        let model = match &salience {
+            Some(context) => context.open(&package, evidence.log())?.into_model(),
+            None => bound_package(&package, evidence.log())?,
+        };
         let package_id = PackageId::from_bytes(*model.package_id().as_bytes());
         let model_ids = plan
             .levels()
@@ -627,6 +698,14 @@ fn bound_package<'a>(
     }
     let view = &views[0];
     let model = read_trit_model(package)?;
+    verify_conversion_model(&model, view)?;
+    Ok(model)
+}
+
+pub(super) fn verify_conversion_model(
+    model: &tritium_format::trit_model::TritModel<'_>,
+    view: &ConversionView,
+) -> Result<(), QuantEngineError> {
     if model.manifest() != view.manifest() {
         return Err(QuantEngineError::Binding(
             "manifest differs from sealed fit stage",
@@ -651,40 +730,52 @@ fn bound_package<'a>(
             }
         }
     }
-    Ok(model)
+    Ok(())
 }
 
-enum ConversionView {
+pub(super) enum ConversionView {
     Plain(QuantizationReceiptView),
     Calibrated(CalibratedQuantizationReceiptView),
 }
 impl ConversionView {
-    fn manifest(&self) -> &tritium_schema::ModelManifest {
+    pub(super) fn reference(&self) -> &tritium_schema::EvidenceReference {
+        match self {
+            Self::Plain(v) => v.reference(),
+            Self::Calibrated(v) => v.reference(),
+        }
+    }
+    pub(super) fn completed(&self) -> &QuantizationCompleted {
+        match self {
+            Self::Plain(v) => v.completed(),
+            Self::Calibrated(v) => &v.completed().output,
+        }
+    }
+    pub(super) fn manifest(&self) -> &tritium_schema::ModelManifest {
         match self {
             Self::Plain(v) => v.manifest(),
             Self::Calibrated(v) => v.manifest(),
         }
     }
-    fn source_id(&self) -> OriginalSourceId {
+    pub(super) fn source_id(&self) -> OriginalSourceId {
         match self {
             Self::Plain(v) => v.source_id(),
             Self::Calibrated(v) => v.source_id(),
         }
     }
-    fn fits(&self) -> &[tritium_evidence::DirectFitReceiptView] {
+    pub(super) fn fits(&self) -> &[tritium_evidence::DirectFitReceiptView] {
         match self {
             Self::Plain(v) => v.fits(),
             Self::Calibrated(v) => v.fits(),
         }
     }
-    fn calibrated_fits(&self) -> &[tritium_evidence::CalibratedFitReceiptView] {
+    pub(super) fn calibrated_fits(&self) -> &[tritium_evidence::CalibratedFitReceiptView] {
         match self {
             Self::Plain(_) => &[],
             Self::Calibrated(v) => v.calibrated_fits(),
         }
     }
 }
-fn conversion_views(
+pub(super) fn conversion_views(
     log: &tritium_evidence::VerifiedLog,
 ) -> Result<Vec<ConversionView>, EvidenceError> {
     let mut views = QuantizationReceiptView::fold(log)?

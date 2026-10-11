@@ -177,6 +177,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     project!(tritium_schema::SalienceStageLimits, "salience-stage-limits");
     project!(
+        tritium_schema::SalienceConversionManifest,
+        "salience-conversion-manifest"
+    );
+    project!(
+        tritium_schema::SalienceConversionLimits,
+        "salience-conversion-limits"
+    );
+    project!(
         tritium_schema::CalibratedQuantAction,
         "calibrated-quant-action"
     );

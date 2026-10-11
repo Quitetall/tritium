@@ -40,9 +40,16 @@ pub struct QuantizationReceiptView {
     fits: Vec<DirectFitReceiptView>,
     manifest: ModelManifest,
     source_id: OriginalSourceId,
+    reference: EvidenceReference,
 }
 
 impl QuantizationReceiptView {
+    /// Actual complete conversion run/span/run-root, including dense-only stages.
+    /// Integrity and recorded agreement are not independent numerical qualification.
+    #[must_use]
+    pub fn reference(&self) -> &EvidenceReference {
+        &self.reference
+    }
     /// Candidate identity derived from the actual recorded original inventory.
     /// This verifies recorded bindings, not independently observed source bytes.
     #[must_use]
@@ -88,6 +95,7 @@ impl QuantizationReceiptView {
                     fits: stage.fits,
                     manifest: stage.manifest,
                     source_id: stage.source_id,
+                    reference: stage.reference,
                 })
             })
             .collect()
@@ -113,6 +121,7 @@ struct StageView {
     calibrated: Vec<CalibratedFitReceiptView>,
     manifest: ModelManifest,
     source_id: OriginalSourceId,
+    reference: EvidenceReference,
 }
 pub(crate) fn fold_calibrated(
     log: &VerifiedLog,
@@ -133,6 +142,7 @@ pub(crate) fn fold_calibrated(
                 calibrated: stage.calibrated,
                 manifest: stage.manifest,
                 source_id: stage.source_id,
+                reference: stage.reference,
             })
         })
         .collect()
@@ -407,6 +417,7 @@ fn fold_stages(log: &VerifiedLog, calibrated: bool) -> Result<Vec<StageView>, Ev
             calibrated: selected_calibrated,
             manifest,
             source_id,
+            reference: ancestry,
         });
     }
     Ok(views)

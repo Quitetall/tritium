@@ -200,6 +200,31 @@ impl<'a> TritModel<'a> {
         )
     }
 
+    /// Require every physical directory entry to be used by typed model metadata.
+    /// Shared/deduplicated references remain valid. Ordinary compatibility readers
+    /// need not require this; mandatory joined readers do.
+    /// # Errors
+    /// Missing typed binding or any unreferenced physical entry.
+    pub fn validate_complete_payload_inventory(&self) -> Result<(), TritModelError> {
+        let mut referenced = vec![false; self.package.blobs().len()];
+        for asset in &self.manifest.assets {
+            referenced[self.payload_index(
+                asset.blob.id,
+                &TritBlobKind::Asset(asset.name.clone()),
+                &asset.name,
+            )?] = true;
+        }
+        for level in &self.manifest.levels {
+            for tensor in &level.tensors {
+                referenced[self.tensor_index(tensor)?] = true;
+            }
+        }
+        if referenced.contains(&false) {
+            return Err(TritModelError::Schema("unreferenced model payload".into()));
+        }
+        Ok(())
+    }
+
     fn level(&self, name: &str) -> Result<&Level, TritModelError> {
         Ok(&self.manifest.levels[self.level_index(name)?])
     }
@@ -217,8 +242,18 @@ impl<'a> TritModel<'a> {
         kind: &TritBlobKind,
         name: &str,
     ) -> Result<&'a [u8], TritModelError> {
-        let index = self
-            .index
+        Ok(self
+            .package
+            .indexed_blob(self.payload_index(id, kind, name)?)?)
+    }
+
+    fn payload_index(
+        &self,
+        id: BlobId,
+        kind: &TritBlobKind,
+        name: &str,
+    ) -> Result<usize, TritModelError> {
+        self.index
             .get(id.as_bytes())
             .and_then(|indices| {
                 indices
@@ -226,11 +261,14 @@ impl<'a> TritModel<'a> {
                     .copied()
                     .find(|&i| &self.package.blobs()[i].kind == kind)
             })
-            .ok_or_else(|| TritModelError::MissingOrWrongBlob(name.into()))?;
-        Ok(self.package.indexed_blob(index)?)
+            .ok_or_else(|| TritModelError::MissingOrWrongBlob(name.into()))
     }
 
     fn tensor_payload(&self, meta: &TensorMeta) -> Result<&'a [u8], TritModelError> {
+        Ok(self.package.indexed_blob(self.tensor_index(meta)?)?)
+    }
+
+    fn tensor_index(&self, meta: &TensorMeta) -> Result<usize, TritModelError> {
         let kind = match &meta.storage {
             TensorStorage::Dense { precision, .. } => TritBlobKind::DenseTensor(match precision {
                 ScalePrecision::F16 => DType::F16,
@@ -241,7 +279,7 @@ impl<'a> TritModel<'a> {
             TensorStorage::Additive { .. } => TritBlobKind::AdditiveTensor,
             _ => return Err(TritModelError::UnsupportedFeature("tensor storage")),
         };
-        self.payload(meta.blob.id, &kind, &meta.name)
+        self.payload_index(meta.blob.id, &kind, &meta.name)
     }
 }
 
@@ -257,6 +295,20 @@ impl<'a> TritModel<'a> {
 pub fn read_trit_model(bytes: &[u8]) -> Result<TritModel<'_>, TritModelError> {
     let package = read_trit_package(bytes)?;
     let manifest = decode_model_manifest(package.manifest())?;
+    bind_trit_model_payloads(package, manifest)
+}
+
+/// Bind a decoded typed manifest through the shared model payload validator.
+/// Does not decode/admit the package's mandatory metadata profile or external logs.
+/// Ordinary and joined readers must admit their profile before calling this seam.
+/// The package remains borrowed; no encoded package or dense model clone is made.
+/// # Errors
+/// Invalid typed metadata, named payload/semantics/prefix or unsupported capability.
+pub fn bind_trit_model_payloads<'a>(
+    package: TritPackage<'a>,
+    manifest: ModelManifest,
+) -> Result<TritModel<'a>, TritModelError> {
+    manifest.validate()?;
     if !manifest.shards.is_empty() {
         return Err(TritModelError::UnsupportedFeature("sharded model payloads"));
     }

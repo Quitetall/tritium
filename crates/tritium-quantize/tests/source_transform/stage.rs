@@ -29,7 +29,7 @@ pub(super) fn limits() -> SalienceStageLimits {
     }
 }
 
-fn recorded() -> (
+pub(super) fn recorded() -> (
     InMemoryWeightSource,
     RecordedSalienceSource,
     BTreeMap<String, DeclaredSalienceStatistics>,
@@ -41,7 +41,7 @@ fn recorded() -> (
     (a, recorded, stats)
 }
 
-fn entries(bytes: &[u8]) -> Vec<(TritBlobKind, Vec<u8>)> {
+pub(super) fn entries(bytes: &[u8]) -> Vec<(TritBlobKind, Vec<u8>)> {
     let package = read_trit_package(bytes).unwrap();
     package
         .blobs()
@@ -50,7 +50,7 @@ fn entries(bytes: &[u8]) -> Vec<(TritBlobKind, Vec<u8>)> {
         .collect()
 }
 
-fn repack(manifest: &[u8], entries: &[(TritBlobKind, Vec<u8>)]) -> Vec<u8> {
+pub(super) fn repack(manifest: &[u8], entries: &[(TritBlobKind, Vec<u8>)]) -> Vec<u8> {
     let blobs: Vec<_> = entries
         .iter()
         .map(|(kind, bytes)| TritBlob {

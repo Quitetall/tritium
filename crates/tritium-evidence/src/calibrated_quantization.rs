@@ -4,7 +4,8 @@ use crate::{
     EvidenceEvent, VerifiedLog,
 };
 use tritium_schema::{
-    CalibratedQuantizationCompleted, CalibratedQuantizationStarted, ModelManifest, OriginalSourceId,
+    CalibratedQuantizationCompleted, CalibratedQuantizationStarted, EvidenceReference,
+    ModelManifest, OriginalSourceId,
 };
 
 impl EvidenceEvent for CalibratedQuantizationStarted {
@@ -35,8 +36,14 @@ pub struct CalibratedQuantizationReceiptView {
     pub(crate) calibrated: Vec<CalibratedFitReceiptView>,
     pub(crate) manifest: ModelManifest,
     pub(crate) source_id: OriginalSourceId,
+    pub(crate) reference: EvidenceReference,
 }
 impl CalibratedQuantizationReceiptView {
+    /// Actual complete conversion run/span/run-root, not an independently executed fit.
+    #[must_use]
+    pub fn reference(&self) -> &EvidenceReference {
+        &self.reference
+    }
     /// Actual typed complete model request.
     #[must_use]
     pub fn started(&self) -> &CalibratedQuantizationStarted {

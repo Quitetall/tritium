@@ -14,12 +14,14 @@ mod joint_feedback;
 mod ladder;
 mod model;
 mod salience;
+mod salience_model;
 mod sinks;
 mod source_stage;
 mod source_transform;
 mod sources;
 
 pub use salience::{SalienceFoldError, SaliencePair, divide_rows, scale_cols, smooth_scales};
+pub use salience_model::JoinedSalienceModel;
 
 pub use model::{
     Engine, PublicationWarning, QuantEngineError, QuantizedModel, TensorSink, WeightSource,

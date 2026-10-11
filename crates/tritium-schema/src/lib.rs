@@ -52,6 +52,11 @@ mod salience_stage;
 pub use salience_stage::*;
 
 #[cfg(feature = "alloc")]
+mod salience_conversion;
+#[cfg(feature = "alloc")]
+pub use salience_conversion::*;
+
+#[cfg(feature = "alloc")]
 mod calibration;
 #[cfg(feature = "alloc")]
 pub use calibration::*;

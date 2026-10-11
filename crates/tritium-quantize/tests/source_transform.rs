@@ -17,6 +17,8 @@ use tritium_quantize::engine::{
 };
 use tritium_schema::*;
 
+#[path = "source_transform/joined.rs"]
+mod joined;
 #[path = "source_transform/stage.rs"]
 mod stage;
 

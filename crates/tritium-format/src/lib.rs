@@ -76,6 +76,7 @@ pub mod trit_calibration;
 pub mod trit_model;
 mod trit_package;
 pub mod trit_salience;
+pub mod trit_salience_conversion;
 
 pub use additive_tensor::{AdditiveTensor, AdditiveTensorError};
 pub use artifact::{
