@@ -141,6 +141,9 @@ fn short_reads_and_original_visitor_failures_use_the_same_named_model_seam() {
     assert!(reader.model_id("missing").is_err());
     assert!(reader.tensor_meta("child", "missing").is_err());
     assert!(reader.tensor_digest("child", "missing").is_err());
+    assert!(reader.tensor_byte_len("child", "missing").is_err());
+    assert!(reader.tensor_byte_len("missing", "weight").is_err());
+    assert!(reader.asset_byte_len("absent.json").is_err());
     reader.verify().unwrap();
 }
 

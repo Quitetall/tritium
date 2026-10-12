@@ -42,6 +42,10 @@ pub(super) fn assert_matches(bytes: &[u8]) {
                     let (meta, expected) = model.tensor(&level.name, &tensor.name).unwrap();
                     assert_eq!(reader.tensor_meta(&level.name, &tensor.name).unwrap(), meta);
                     assert_eq!(
+                        reader.tensor_byte_len(&level.name, &tensor.name).unwrap(),
+                        expected.len() as u64
+                    );
+                    assert_eq!(
                         reader.tensor_digest(&level.name, &tensor.name).unwrap(),
                         model.tensor_digest(&level.name, &tensor.name).unwrap()
                     );
@@ -59,6 +63,10 @@ pub(super) fn assert_matches(bytes: &[u8]) {
             }
             for asset in &model.manifest().assets {
                 let expected = model.asset(&asset.name).unwrap();
+                assert_eq!(
+                    reader.asset_byte_len(&asset.name).unwrap(),
+                    expected.len() as u64
+                );
                 let mut at = 0;
                 reader
                     .visit_asset(&asset.name, |chunk| -> Result<(), ()> {

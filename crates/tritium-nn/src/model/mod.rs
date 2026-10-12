@@ -18,6 +18,7 @@ mod qwen35_mtp;
 mod qwen35_mtp_oracle;
 mod qwen35_reference;
 mod qwen35_salt_v2;
+mod qwen35_trit;
 mod runner;
 #[cfg(feature = "cuda")]
 mod salt_v2;
@@ -65,6 +66,7 @@ pub use qwen35_reference::{QWEN35_REFERENCE_STATE_MAX_BYTES, Qwen35ReferenceStat
 pub use qwen35_salt_v2::{
     Qwen35SaltV2BundleAdmission, Qwen35SaltV2LanguageMtpModel, Qwen35SaltV2LoadReceipt,
 };
+pub use qwen35_trit::Qwen35TritReadLimits;
 pub use runner::{ForwardDump, ModelRunner};
 #[cfg(feature = "cuda")]
 pub use salt_v2::{

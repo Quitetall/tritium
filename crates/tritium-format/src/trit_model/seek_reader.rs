@@ -147,6 +147,22 @@ impl<R: Read + Seek> TritModelReader<R> {
     pub fn tensor_meta(&self, level: &str, name: &str) -> Result<&TensorMeta, TritModelError> {
         self.binding.tensor_meta(level, name)
     }
+    /// Exact admitted directory byte length, without reading or decoding payloads.
+    /// This is an encoded ledger, not process memory or current source verification.
+    /// # Errors
+    /// Absent level/tensor or original binding failure.
+    pub fn tensor_byte_len(&self, level: &str, name: &str) -> Result<u64, TritModelError> {
+        let meta = self.binding.tensor_meta(level, name)?;
+        let index = self.binding.tensor_index(meta, self.package.blobs())?;
+        Ok(self.package.blobs()[index].length)
+    }
+    /// Exact admitted asset directory byte length; does not authenticate current bytes.
+    /// # Errors
+    /// Absent asset or original binding failure.
+    pub fn asset_byte_len(&self, name: &str) -> Result<u64, TritModelError> {
+        let index = self.binding.asset_index(name, self.package.blobs())?;
+        Ok(self.package.blobs()[index].length)
+    }
     /// Require every physical directory entry to be referenced by typed metadata.
     /// # Errors
     /// Missing typed binding or any unreferenced physical entry.

@@ -398,7 +398,7 @@ fn format_error(error: tritium_format::trit_model::TritModelError) -> NnError {
     NnError::InvalidArtifact(format!("typed .trit model: {error}"))
 }
 
-fn dense_values(meta: &TensorMeta, bytes: &[u8]) -> Result<Vec<f32>, NnError> {
+pub(super) fn dense_values(meta: &TensorMeta, bytes: &[u8]) -> Result<Vec<f32>, NnError> {
     let TensorStorage::Dense { precision, .. } = &meta.storage else {
         return Err(NnError::MissingTensor(format!(
             "{} must be a dense vector",
@@ -441,7 +441,7 @@ fn dense_values(meta: &TensorMeta, bytes: &[u8]) -> Result<Vec<f32>, NnError> {
     Ok(values)
 }
 
-fn matrix_shape(meta: &TensorMeta) -> Result<(usize, usize), NnError> {
+pub(super) fn matrix_shape(meta: &TensorMeta) -> Result<(usize, usize), NnError> {
     let dims = match &meta.storage {
         TensorStorage::Dense { shape, .. } if shape.len() == 2 => (shape[0], shape[1]),
         TensorStorage::Additive { layout, .. } => (layout.rows, layout.cols),
@@ -459,7 +459,7 @@ fn matrix_shape(meta: &TensorMeta) -> Result<(usize, usize), NnError> {
     Ok((rows, cols))
 }
 
-fn upload_matrix(
+pub(super) fn upload_matrix(
     loader: &mut TensorLoader<'_>,
     meta: &TensorMeta,
     bytes: &[u8],
