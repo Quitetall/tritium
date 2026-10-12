@@ -4,8 +4,9 @@ use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::rc::Rc;
 use tritium_core::DType;
 use tritium_format::{
-    PackageId, TritBlob, TritBlobKind, TritPackageError, TritPackageWriteError, TritSpoolBlob,
-    read_trit_package, write_trit_package, write_trit_package_from_spool,
+    PackageId, TritBlob, TritBlobKind, TritPackageError, TritPackageReadLimits, TritPackageReader,
+    TritPackageWriteError, TritSpoolBlob, read_trit_package, write_trit_package,
+    write_trit_package_from_spool,
 };
 use tritium_schema::BlobId;
 
@@ -125,6 +126,28 @@ fn spool_matches_borrowed_bytes_kinds_dedup_empty_order_and_short_io() {
         for info in parsed.blobs() {
             parsed.blob(info).unwrap();
         }
+        let mut reopened = TritPackageReader::open(
+            Cursor::new(out.0.as_slice()),
+            TritPackageReadLimits {
+                max_source_bytes: out.0.len() as u64,
+                max_manifest_bytes: MANIFEST.len(),
+                max_directory_bytes: 1024,
+            },
+        )
+        .unwrap();
+        assert_eq!(reopened.package_id(), id);
+        assert_eq!(reopened.blobs(), parsed.blobs());
+        for (index, info) in parsed.blobs().iter().enumerate() {
+            let mut hash = blake3::Hasher::new();
+            reopened
+                .visit_blob(index, |chunk| -> Result<(), ()> {
+                    hash.update(chunk);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(hash.finalize().as_bytes(), info.id.as_bytes());
+        }
+        reopened.verify().unwrap();
     }
     let expected = write_trit_package(MANIFEST, &[]).unwrap();
     let mut out = Vec::new();

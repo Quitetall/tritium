@@ -10,6 +10,11 @@ use tritium_schema::BlobId;
 use crate::artifact::{PackageHasher, PackageId};
 
 mod cbor;
+mod seek_reader;
+
+pub use seek_reader::{
+    TritBlobVisitError, TritPackageReadError, TritPackageReadLimits, TritPackageReader,
+};
 
 /// `.trit` file magic.
 pub const TRIT_MAGIC: [u8; 8] = *b"TRITIUM\0";
@@ -717,29 +722,71 @@ pub fn read_trit_package_with_manifest_limit(
     if bytes.len() < TRIT_HEADER_BYTES + FOOTER_BYTES {
         return Err(TritPackageError::Truncated);
     }
-    if bytes[..8] != TRIT_MAGIC
-        || bytes[bytes.len() - FOOTER_BYTES..bytes.len() - FOOTER_BYTES + 8] != TRIT_FOOTER_MAGIC
+    let footer = &bytes[bytes.len() - FOOTER_BYTES..];
+    let layout = read_layout(
+        bytes.len(),
+        &bytes[..TRIT_HEADER_BYTES],
+        footer,
+        max_manifest_bytes,
+        MAX_DIRECTORY_BYTES,
+    )?;
+    let manifest = bytes
+        .get(layout.manifest.clone())
+        .ok_or(TritPackageError::Truncated)?;
+    let directory = bytes
+        .get(layout.directory.clone())
+        .ok_or(TritPackageError::Truncated)?;
+    validate_metadata_digests(manifest, directory, footer)?;
+    validate_canonical_manifest(manifest)?;
+    let blobs = decode_directory(directory)?;
+    let mut ranges = bytes;
+    validate_blob_ranges(&mut ranges, layout.manifest.start, &blobs)?;
+    Ok(TritPackage {
+        bytes,
+        manifest,
+        blobs,
+    })
+}
+
+struct PackageReadLayout {
+    manifest: core::ops::Range<usize>,
+    directory: core::ops::Range<usize>,
+}
+
+fn read_layout(
+    length: usize,
+    header: &[u8],
+    footer: &[u8],
+    max_manifest_bytes: usize,
+    max_directory_bytes: usize,
+) -> Result<PackageReadLayout, TritPackageError> {
+    if length < TRIT_HEADER_BYTES + FOOTER_BYTES
+        || header.len() != TRIT_HEADER_BYTES
+        || footer.len() != FOOTER_BYTES
     {
+        return Err(TritPackageError::Truncated);
+    }
+    if header[..8] != TRIT_MAGIC || footer[..8] != TRIT_FOOTER_MAGIC {
         return Err(TritPackageError::BadMagic);
     }
-    let major = read_u16(bytes, 8)?;
-    let minor = read_u16(bytes, 10)?;
+    let major = read_u16(header, 8)?;
+    let minor = read_u16(header, 10)?;
     if major != TRIT_PACKAGE_MAJOR || minor != TRIT_PACKAGE_MINOR {
         return Err(TritPackageError::UnsupportedVersion { major, minor });
     }
-    let features = read_u32(bytes, 12)?;
+    let features = read_u32(header, 12)?;
     if features != 0 {
         return Err(TritPackageError::UnknownRequiredFeatures(features));
     }
-    if bytes[48..TRIT_HEADER_BYTES].iter().any(|byte| *byte != 0) {
+    if header[48..TRIT_HEADER_BYTES].iter().any(|byte| *byte != 0) {
         return Err(TritPackageError::NonZeroReserved);
     }
-    let manifest_offset = as_usize(read_u64(bytes, 16)?)?;
-    let manifest_len = as_usize(read_u64(bytes, 24)?)?;
-    let directory_offset = as_usize(read_u64(bytes, 32)?)?;
-    let directory_len = as_usize(read_u64(bytes, 40)?)?;
+    let manifest_offset = as_usize(read_u64(header, 16)?)?;
+    let manifest_len = as_usize(read_u64(header, 24)?)?;
+    let directory_offset = as_usize(read_u64(header, 32)?)?;
+    let directory_len = as_usize(read_u64(header, 40)?)?;
     if manifest_len > MAX_MANIFEST_BYTES.min(max_manifest_bytes)
-        || directory_len > MAX_DIRECTORY_BYTES
+        || directory_len > MAX_DIRECTORY_BYTES.min(max_directory_bytes)
     {
         return Err(TritPackageError::MetadataLimitExceeded);
     }
@@ -749,40 +796,59 @@ pub fn read_trit_package_with_manifest_limit(
     let directory_end = directory_offset
         .checked_add(directory_len)
         .ok_or(TritPackageError::LengthOverflow)?;
-    let footer_offset = bytes.len() - FOOTER_BYTES;
+    let footer_offset = length - FOOTER_BYTES;
     if manifest_offset < TRIT_HEADER_BYTES
         || manifest_end != directory_offset
         || directory_end != footer_offset
     {
         return Err(TritPackageError::InvalidDirectory);
     }
-    let manifest = bytes
-        .get(manifest_offset..manifest_end)
-        .ok_or(TritPackageError::Truncated)?;
-    let directory = bytes
-        .get(directory_offset..directory_end)
-        .ok_or(TritPackageError::Truncated)?;
-    let footer = &bytes[footer_offset + 8..];
-    if blake3::hash(manifest).as_bytes() != &footer[..32]
-        || blake3::hash(directory).as_bytes() != &footer[32..]
-    {
-        return Err(TritPackageError::DigestMismatch);
-    }
-    validate_canonical_manifest(manifest)?;
-    let blobs = decode_directory(directory)?;
-    validate_blob_ranges(bytes, manifest_offset, &blobs)?;
-    Ok(TritPackage {
-        bytes,
-        manifest,
-        blobs,
+    Ok(PackageReadLayout {
+        manifest: manifest_offset..manifest_end,
+        directory: directory_offset..directory_end,
     })
 }
 
-fn validate_blob_ranges(
-    package: &[u8],
+fn validate_metadata_digests(
+    manifest: &[u8],
+    directory: &[u8],
+    footer: &[u8],
+) -> Result<(), TritPackageError> {
+    if blake3::hash(manifest).as_bytes() != &footer[8..40]
+        || blake3::hash(directory).as_bytes() != &footer[40..]
+    {
+        return Err(TritPackageError::DigestMismatch);
+    }
+    Ok(())
+}
+
+// One invariant owner, with borrowed and seek-backed range adapters. Neither
+// adapter defines independent directory, geometry or identity semantics.
+trait PackageRanges {
+    type Error: From<TritPackageError>;
+    fn digest(&mut self, range: core::ops::Range<usize>) -> Result<[u8; 32], Self::Error>;
+    fn is_zero(&mut self, range: core::ops::Range<usize>) -> Result<bool, Self::Error>;
+}
+
+impl PackageRanges for &[u8] {
+    type Error = TritPackageError;
+
+    fn digest(&mut self, range: core::ops::Range<usize>) -> Result<[u8; 32], Self::Error> {
+        let payload = self.get(range).ok_or(TritPackageError::InvalidDirectory)?;
+        Ok(*blake3::hash(payload).as_bytes())
+    }
+
+    fn is_zero(&mut self, range: core::ops::Range<usize>) -> Result<bool, Self::Error> {
+        let padding = self.get(range).ok_or(TritPackageError::InvalidDirectory)?;
+        Ok(padding.iter().all(|byte| *byte == 0))
+    }
+}
+
+fn validate_blob_ranges<S: PackageRanges>(
+    package: &mut S,
     manifest_offset: usize,
     blobs: &[TritBlobInfo],
-) -> Result<(), TritPackageError> {
+) -> Result<(), S::Error> {
     let mut unique = BTreeMap::<[u8; 32], (usize, usize)>::new();
     for blob in blobs {
         let offset = as_usize(blob.offset)?;
@@ -792,34 +858,28 @@ fn validate_blob_ranges(
             .ok_or(TritPackageError::LengthOverflow)?;
         if offset < TRIT_HEADER_BYTES || offset % TRIT_BLOB_ALIGNMENT != 0 || end > manifest_offset
         {
-            return Err(TritPackageError::InvalidDirectory);
+            return Err(TritPackageError::InvalidDirectory.into());
         }
         if let Some(previous) = unique.insert(*blob.id.as_bytes(), (offset, end))
             && previous != (offset, end)
         {
-            return Err(TritPackageError::InvalidDirectory);
+            return Err(TritPackageError::InvalidDirectory.into());
         }
-        let payload = package
-            .get(offset..end)
-            .ok_or(TritPackageError::InvalidDirectory)?;
-        if blake3::hash(payload).as_bytes() != blob.id.as_bytes() {
-            return Err(TritPackageError::BlobDigestMismatch(blob.id));
+        if &package.digest(offset..end)? != blob.id.as_bytes() {
+            return Err(TritPackageError::BlobDigestMismatch(blob.id).into());
         }
     }
     let mut ranges: Vec<(usize, usize)> = unique.values().copied().collect();
     ranges.sort_unstable();
     let mut previous_end = TRIT_HEADER_BYTES;
     for (start, end) in ranges {
-        if start < previous_end || package[previous_end..start].iter().any(|byte| *byte != 0) {
-            return Err(TritPackageError::InvalidDirectory);
+        if start < previous_end || !package.is_zero(previous_end..start)? {
+            return Err(TritPackageError::InvalidDirectory.into());
         }
         previous_end = end;
     }
-    if package[previous_end..manifest_offset]
-        .iter()
-        .any(|byte| *byte != 0)
-    {
-        return Err(TritPackageError::InvalidDirectory);
+    if !package.is_zero(previous_end..manifest_offset)? {
+        return Err(TritPackageError::InvalidDirectory.into());
     }
     Ok(())
 }

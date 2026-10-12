@@ -169,7 +169,8 @@ pub use tqidx::{ShardEntry, TQIDX_MAGIC, TQIDX_VERSION, TqIndex, read_tqidx, wri
 pub use training_salt::{PackedTrainingSaltSnapshot, TernaryStructure, TrainingSaltPlane};
 pub use trit_package::{
     TRIT_BLOB_ALIGNMENT, TRIT_HEADER_BYTES, TRIT_MAGIC, TRIT_PACKAGE_MAJOR, TritBlob, TritBlobInfo,
-    TritBlobKind, TritPackage, TritPackageError, TritPackageWriteError, TritSpoolBlob,
+    TritBlobKind, TritBlobVisitError, TritPackage, TritPackageError, TritPackageReadError,
+    TritPackageReadLimits, TritPackageReader, TritPackageWriteError, TritSpoolBlob,
     read_trit_package, read_trit_package_with_manifest_limit, write_trit_package,
     write_trit_package_bounded, write_trit_package_from_spool, write_trit_package_to,
 };
