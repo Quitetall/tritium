@@ -10,6 +10,8 @@ use tritium_schema::BlobId;
 use crate::artifact::{PackageHasher, PackageId};
 
 mod cbor;
+#[cfg(test)]
+mod directory_tests;
 mod seek_reader;
 
 pub use seek_reader::{
@@ -905,6 +907,62 @@ fn encode_directory(blobs: &[TritBlobInfo]) -> Result<Vec<u8>, TritPackageError>
 }
 
 fn decode_directory(bytes: &[u8]) -> Result<Vec<TritBlobInfo>, TritPackageError> {
+    if let Some(blobs) = decode_borrowed_directory(bytes)? {
+        return Ok(blobs);
+    }
+    // Preserve the reference codec's original diagnostic precedence for
+    // oversized, malformed or outside-fast-profile inputs. This optimization
+    // does not claim complete adversarial metadata allocation admission.
+    decode_reference_directory(bytes)
+}
+
+fn decode_borrowed_directory(bytes: &[u8]) -> Result<Option<Vec<TritBlobInfo>>, TritPackageError> {
+    let Ok(mut entries) = cbor::Directory::new(bytes) else {
+        return Ok(None);
+    };
+    if entries.len() > MAX_BLOBS {
+        return Ok(None);
+    }
+    let mut blobs = Vec::new();
+    blobs
+        .try_reserve_exact(entries.len())
+        .map_err(|_| TritPackageError::AllocationFailed {
+            requested: entries.len(),
+        })?;
+    loop {
+        let entry = match entries.next() {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(_) => return Ok(None),
+        };
+        let kind = match (entry.kind, entry.aux) {
+            (0, None) => TritBlobKind::AdditiveTensor,
+            (1, Some(name)) => match dtype_from_str(name) {
+                Ok(dtype) => TritBlobKind::DenseTensor(dtype),
+                Err(_) => return Ok(None),
+            },
+            (2, Some(name)) if !name.is_empty() => TritBlobKind::Asset(name.into()),
+            _ => return Ok(None),
+        };
+        blobs.push(TritBlobInfo {
+            id: BlobId::from_bytes(*entry.id),
+            kind,
+            offset: entry.offset,
+            length: entry.length,
+        });
+    }
+    if blobs
+        .windows(2)
+        .any(|pair| compare_blob_entries(&pair[0], &pair[1]).is_ge())
+    {
+        return Ok(None);
+    }
+    // Complete canonical preflight and the exact directory tuple/kind grammar
+    // establish the reference re-encoding, without allocating those bytes.
+    Ok(Some(blobs))
+}
+
+fn decode_reference_directory(bytes: &[u8]) -> Result<Vec<TritBlobInfo>, TritPackageError> {
     let value: Value =
         ciborium::de::from_reader(bytes).map_err(|_| TritPackageError::InvalidDirectory)?;
     if encode_cbor_value(&value)? != bytes {

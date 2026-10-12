@@ -184,6 +184,102 @@ pub(super) fn validate_with_limit(bytes: &[u8], limit: usize) -> Result<()> {
     Ok(())
 }
 
+/// Borrowed traversal of the existing canonical directory tuples. These are
+/// internal views over wire ranges, not a second owned metadata vocabulary.
+pub(super) struct Directory<'a> {
+    bytes: &'a [u8],
+    at: usize,
+    remaining: usize,
+}
+
+pub(super) struct DirectoryEntry<'a> {
+    pub id: &'a [u8; 32],
+    pub kind: u64,
+    pub aux: Option<&'a str>,
+    pub offset: u64,
+    pub length: u64,
+}
+
+impl<'a> Directory<'a> {
+    pub(super) fn new(bytes: &'a [u8]) -> Result<Self> {
+        validate_with_limit(bytes, super::MAX_DIRECTORY_BYTES)?;
+        let mut at = 0;
+        let root = head(bytes, &mut at)?;
+        if root.major != 4 || root.argument != 2 {
+            return Err(ScanError::Invalid);
+        }
+        if unsigned(bytes, &mut at)? != super::DIRECTORY_VERSION {
+            return Err(ScanError::Invalid);
+        }
+        let entries = head(bytes, &mut at)?;
+        if entries.major != 4 {
+            return Err(ScanError::Invalid);
+        }
+        let remaining = count(entries.argument, bytes.len() - at, 1)?;
+        Ok(Self {
+            bytes,
+            at,
+            remaining,
+        })
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.remaining
+    }
+
+    pub(super) fn next(&mut self) -> Result<Option<DirectoryEntry<'a>>> {
+        if self.remaining == 0 {
+            return if self.at == self.bytes.len() {
+                Ok(None)
+            } else {
+                Err(ScanError::Invalid)
+            };
+        }
+        let fields = head(self.bytes, &mut self.at)?;
+        if fields.major != 4 || fields.argument != 5 {
+            return Err(ScanError::Invalid);
+        }
+        let id = head(self.bytes, &mut self.at)?;
+        if id.major != 2 || id.argument != 32 {
+            return Err(ScanError::Invalid);
+        }
+        let id = take(self.bytes, &mut self.at, 32)?
+            .try_into()
+            .map_err(|_| ScanError::Invalid)?;
+        let kind = unsigned(self.bytes, &mut self.at)?;
+        let aux = head(self.bytes, &mut self.at)?;
+        let aux = match (aux.major, aux.argument) {
+            (7, 22) => None,
+            (3, length) => {
+                let length = count(length, self.bytes.len() - self.at, 1)?;
+                Some(
+                    std::str::from_utf8(take(self.bytes, &mut self.at, length)?)
+                        .map_err(|_| ScanError::Invalid)?,
+                )
+            }
+            _ => return Err(ScanError::Invalid),
+        };
+        let offset = unsigned(self.bytes, &mut self.at)?;
+        let length = unsigned(self.bytes, &mut self.at)?;
+        self.remaining -= 1;
+        Ok(Some(DirectoryEntry {
+            id,
+            kind,
+            aux,
+            offset,
+            length,
+        }))
+    }
+}
+
+fn unsigned(bytes: &[u8], at: &mut usize) -> Result<u64> {
+    let value = head(bytes, at)?;
+    if value.major != 0 {
+        return Err(ScanError::Invalid);
+    }
+    Ok(value.argument)
+}
+
 struct Entry {
     start: usize,
     key_end: usize,

@@ -3,7 +3,8 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs::{self, File};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tritium_format::{
-    TritBlob, TritBlobKind, TritPackageReadLimits, TritPackageReader, write_trit_package_to,
+    TritBlob, TritBlobKind, TritPackageReadLimits, TritPackageReader, read_trit_package,
+    write_trit_package, write_trit_package_to,
 };
 
 struct TrackingAllocator;
@@ -97,5 +98,48 @@ fn actual_file_open_visit_and_terminal_verify_do_not_allocate_payload_sized_buff
     assert_eq!(
         requests[0], requests[1],
         "payload growth must not grow reader heap requests"
+    );
+    // Isolated process and one test: the cumulative allocator window cannot
+    // overlap another test. Prepared source/asset metadata is excluded.
+    let blobs: Vec<_> = (0..4096)
+        .map(|index| TritBlob {
+            kind: TritBlobKind::Asset(format!("asset-{index:06}")),
+            bytes: &[],
+        })
+        .collect();
+    let bytes = write_trit_package(&[0xa0], &blobs).unwrap();
+    let expected = tritium_format::PackageId::from_package_bytes(&bytes);
+    ALLOCATED.store(0, Ordering::Relaxed);
+    TRACK.store(true, Ordering::Relaxed);
+    let package = read_trit_package(&bytes).unwrap();
+    TRACK.store(false, Ordering::Relaxed);
+    let requested = ALLOCATED.load(Ordering::Relaxed);
+    assert_eq!(package.package_id(), expected);
+    assert_eq!(package.blobs().len(), blobs.len());
+    eprintln!(
+        "DIRECTORY_MEMORY entries=4096 adapter=borrowed cumulative_heap_requests={requested}"
+    );
+    assert!(
+        requested < 512 * 1024,
+        "directory requested {requested} heap bytes"
+    );
+    drop(package);
+    let limits = TritPackageReadLimits {
+        max_source_bytes: bytes.len() as u64,
+        max_manifest_bytes: 1,
+        max_directory_bytes: bytes.len(),
+    };
+    ALLOCATED.store(0, Ordering::Relaxed);
+    TRACK.store(true, Ordering::Relaxed);
+    let mut reader = TritPackageReader::open(std::io::Cursor::new(bytes), limits).unwrap();
+    reader.verify().unwrap();
+    TRACK.store(false, Ordering::Relaxed);
+    let requested = ALLOCATED.load(Ordering::Relaxed);
+    assert_eq!(reader.package_id(), expected);
+    assert_eq!(reader.blobs().len(), blobs.len());
+    eprintln!("DIRECTORY_MEMORY entries=4096 adapter=seek cumulative_heap_requests={requested}");
+    assert!(
+        requested < 1024 * 1024,
+        "seek directory requested {requested} heap bytes"
     );
 }
