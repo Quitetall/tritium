@@ -2,18 +2,20 @@
 //!
 //! Backend registry and dispatch. Execution backends (`tritium-cpu`,
 //! `tritium-cuda`, …) **self-register** through the [`BACKENDS`] `linkme`
-//! distributed slice, so wiring a new backend into the runtime needs no central
+//! distributed slice on host targets, so wiring a new backend into the runtime needs no central
 //! edit here — the linker collects every entry at link time and [`Registry::init`]
 //! discovers them at startup.
 //!
-//! This crate uses [`tritium_spec`], typed [`tritium_evidence`] and `linkme`; it never references a
-//! concrete backend, which keeps the dependency graph acyclic and lets backends be
-//! built (and the runtime linked) in any order.
+//! This crate uses the shared schema/core/format/spec and typed evidence. It
+//! contains the built-in [`ReferenceBackend`], but never depends on a hardware
+//! backend. Hardware adapters remain independently linked and discovered.
+//! WebAssembly uses explicit [`Registry::with_entries`] registration instead of
+//! unsupported linker sections; its default registry still has the reference.
 //!
 //! ## Registering a backend (downstream pattern)
 //!
 //! A backend crate pushes one [`BackendEntry`] into the slice. The `#[used]`
-//! semantics of [`linkme::distributed_slice`] keep the entry alive even though
+//! semantics of `linkme::distributed_slice` keep the entry alive even though
 //! nothing names it directly — but the backend crate must actually be linked into
 //! the final binary (e.g. a `use tritium_cpu as _;` in the binary, or a normal
 //! dependency that pulls in a referenced symbol) for its entry to appear.
@@ -41,6 +43,7 @@
 //! }
 //!
 //! #[allow(unsafe_code)]
+//! #[cfg(not(target_arch = "wasm32"))]
 //! #[linkme::distributed_slice(BACKENDS)]
 //! static CPU: BackendEntry = BackendEntry {
 //!     name: "cpu",
@@ -60,8 +63,10 @@ use std::sync::OnceLock;
 
 use tritium_spec::{BackendError, DeviceCaps, TernaryBackend};
 
+mod reference;
 mod tensor_budget;
 mod tensor_upload;
+pub use reference::ReferenceBackend;
 pub use tensor_budget::TensorPayloadBudget;
 pub use tensor_upload::{
     TensorUploadContext, TensorUploadError, upload_tensor_logged, upload_tensor_logged_admitted,
@@ -113,8 +118,16 @@ impl core::fmt::Debug for BackendEntry {
 /// central registration list. See the [crate docs](crate) for the registration
 /// example.
 #[allow(unsafe_code)]
+#[cfg(not(target_arch = "wasm32"))]
 #[linkme::distributed_slice]
 pub static BACKENDS: [BackendEntry] = [..];
+
+/// WebAssembly has no linker-discovered registrations.
+///
+/// Use [`Registry::with_entries`] for explicit adapters. [`Registry::init`]
+/// still registers the shared semantic reference, never a host-only fallback.
+#[cfg(target_arch = "wasm32")]
+pub static BACKENDS: &[BackendEntry] = &[];
 
 /// A live set of successfully-initialised backends.
 ///
@@ -149,12 +162,31 @@ impl Registry {
     /// remaining backends continues regardless. The returned `Registry` therefore
     /// contains exactly the backends that initialised cleanly, in slice order.
     ///
-    /// This never fails: an empty `Registry` (no backends available) is a valid
-    /// result, not an error.
+    /// The built-in semantic reference is appended after hardware providers.
+    /// Its reserved name `reference` cannot be overridden by an external entry.
+    /// This never fails because a missing accelerator does not remove the
+    /// reference provider. It does not silently replace a selected hardware ID.
     #[must_use]
     pub fn init() -> Self {
+        Self::with_entries(&BACKENDS)
+    }
+
+    /// Initialise explicit adapters in supplied order, then the built-in reference.
+    ///
+    /// This is the portable std registration path, including WebAssembly. Failed
+    /// constructors are skipped as in [`Self::init`]. The reserved `reference`
+    /// name is skipped without calling its external constructor; no chosen
+    /// device is silently substituted. This does not provide a no_std registry.
+    #[must_use]
+    pub fn with_entries(entries: &[BackendEntry]) -> Self {
         let mut backends: Vec<(String, Box<dyn TernaryBackend>)> = Vec::new();
-        for entry in BACKENDS {
+        for entry in entries {
+            if entry.name == "reference" {
+                eprintln!(
+                    "tritium-runtime: skipping external entry with reserved name `reference`"
+                );
+                continue;
+            }
             match (entry.init)() {
                 Ok(backend) => backends.push((entry.name.to_owned(), backend)),
                 Err(err) => {
@@ -169,6 +201,7 @@ impl Registry {
                 }
             }
         }
+        backends.push(("reference".to_owned(), Box::new(ReferenceBackend::new())));
         Self { backends }
     }
 
@@ -233,7 +266,7 @@ pub fn init_global() -> &'static Registry {
     global()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use core::any::Any;
@@ -304,6 +337,70 @@ mod tests {
         name: "failing",
         init: init_always_fails,
     };
+
+    static RESERVED_INIT_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    fn init_reserved() -> Result<Box<dyn TernaryBackend>, BackendError> {
+        RESERVED_INIT_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        init_dummy()
+    }
+    #[allow(unsafe_code)]
+    #[linkme::distributed_slice(BACKENDS)]
+    static RESERVED: BackendEntry = BackendEntry {
+        name: "reference",
+        init: init_reserved,
+    };
+
+    #[test]
+    fn reference_is_available_without_linking_a_hardware_backend() {
+        let reg = Registry::init();
+        let reference = reg
+            .get("reference")
+            .expect("built-in semantic reference must register");
+        assert_eq!(reference.device_id(), "reference");
+        assert_eq!(
+            reference.capabilities().device_name,
+            "shared core semantic reference"
+        );
+        assert!(
+            reg.enumerate()
+                .iter()
+                .any(|caps| caps.backend == "reference")
+        );
+        assert_eq!(
+            RESERVED_INIT_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            reg.enumerate()
+                .iter()
+                .filter(|caps| caps.backend == "reference")
+                .count(),
+            1
+        );
+        assert_eq!(reg.enumerate().last().unwrap().backend, "reference");
+    }
+
+    #[test]
+    fn explicit_registration_preserves_order_and_protects_reference() {
+        let registry = Registry::with_entries(&[FAILING, DUMMY, RESERVED]);
+        assert!(registry.get("failing").is_none());
+        assert_eq!(
+            registry
+                .enumerate()
+                .iter()
+                .map(|caps| caps.backend.as_str())
+                .collect::<Vec<_>>(),
+            ["dummy", "reference"]
+        );
+        assert_eq!(
+            RESERVED_INIT_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let default = Registry::with_entries(&[]);
+        assert_eq!(default.len(), 1);
+        assert_eq!(default.get("reference").unwrap().device_id(), "reference");
+    }
 
     #[test]
     fn registry_finds_dummy_and_skips_failing() {

@@ -27,17 +27,50 @@ fn reference_adapter_does_not_discard_compact_counts_on_upload() {
         let trits = vec![Trit::POS; index.trit_count()];
         let scales = vec![0.5; index.scale_count()];
         let view = AdditiveView::new_per_tile(index, &trits, &scales).unwrap();
-        assert!(
-            backend
-                .tensor_caps(TensorView::Additive(view))
-                .unwrap()
-                .is_none()
+        let caps = backend
+            .tensor_caps(TensorView::Additive(view))
+            .unwrap()
+            .unwrap();
+        assert_eq!(caps.execution, tritium_spec::TensorExecution::Native);
+        assert_eq!(
+            caps.payload_bytes,
+            (trits.len() + scales.len() * 4 + index.buffer_len_bytes().unwrap()) as u64
         );
-        assert!(matches!(
-            backend.upload_tensor(TensorView::Additive(view)),
-            Err(tritium_spec::BackendError::UnsupportedTensor)
-        ));
+        let uploaded = backend.upload_tensor(TensorView::Additive(view)).unwrap();
+        assert_eq!(uploaded.len_bytes() as u64, caps.payload_bytes);
+        let mut rows = [99.; 4];
+        backend.embed_rows(&*uploaded, &[0], &mut rows).unwrap();
+        assert_eq!(rows, [f32::from(counts[0]) * 0.5; 4]);
     }
+}
+
+#[test]
+fn production_reference_passes_the_compact_candidate_corpus() {
+    for backend in [
+        &tritium_runtime::ReferenceBackend::new() as &dyn TernaryBackend,
+        &tritium_testkit::ReferenceBackend::new() as &dyn TernaryBackend,
+    ] {
+        assert_eq!(
+            tritium_testkit::assert_candidate_per_tile_conformance(
+                backend,
+                tritium_spec::TensorExecution::Native
+            ),
+            624
+        );
+    }
+}
+
+#[test]
+fn production_reference_preserves_frozen_uniform_conformance_and_rejections() {
+    let backend = tritium_runtime::ReferenceBackend::new();
+    assert_eq!(
+        tritium_testkit::assert_additive_tensor_conformance(
+            &backend,
+            tritium_spec::TensorExecution::Native
+        ),
+        180
+    );
+    tritium_testkit::assert_additive_upload_rejections(&backend);
 }
 
 fn layout(basis: Basis, law: ScaleLaw) -> AdditiveLayout {

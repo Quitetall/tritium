@@ -9,17 +9,13 @@
 
 use core::any::Any;
 
-use tritium_core::{
-    DenseView, GemmShape, TernaryFormat, Trit, reference_embed, reference_mpgemm,
-    reference_ternary_matmul,
-};
-use tritium_format::AdditiveTensor;
+use tritium_core::{GemmShape, TernaryFormat, Trit, reference_mpgemm};
 use tritium_format::{
     TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row, unpack_tq2_0_row,
 };
 use tritium_spec::{
-    BackendError, DeviceBuffer, DeviceCaps, MpGemm, TensorCaps, TensorExecution, TensorMatmul,
-    TensorView, TernaryBackend, admitted_execution_group,
+    BackendError, DeviceBuffer, DeviceCaps, MpGemm, TensorCaps, TensorMatmul, TensorView,
+    TernaryBackend,
 };
 
 /// Device buffer for [`ReferenceBackend`]: the unpacked trits plus the shape they
@@ -42,41 +38,10 @@ impl DeviceBuffer for RefBuffer {
     }
 }
 
-/// Owned semantic additive tensor held by the additive reference path.
-#[derive(Debug)]
-struct RefAdditiveBuffer {
-    tensor: AdditiveTensor,
-}
-
-impl DeviceBuffer for RefAdditiveBuffer {
-    fn len_bytes(&self) -> usize {
-        self.tensor.trits().len() + core::mem::size_of_val(self.tensor.scales())
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-/// Owned dense f32 tensor held by the reference backend.
-#[derive(Debug)]
-struct RefDenseBuffer {
-    rows: usize,
-    cols: usize,
-    values: Vec<f32>,
-}
-
-impl DeviceBuffer for RefDenseBuffer {
-    fn len_bytes(&self) -> usize {
-        self.values.len() * core::mem::size_of::<f32>()
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-/// A reference backend: unpacks with `tritium-format`, runs `reference_mpgemm`.
+/// Conformance compatibility adapter with the production semantic reference.
+///
+/// Only the harness's unit-block legacy TQ path is implemented here. Semantic
+/// ownership, admission, matmul and gather all use `tritium-runtime` directly.
 #[derive(Debug, Default)]
 pub struct ReferenceBackend;
 
@@ -98,77 +63,15 @@ impl TernaryBackend for ReferenceBackend {
     }
 
     fn tensor_caps(&self, tensor: TensorView<'_>) -> Result<Option<TensorCaps>, BackendError> {
-        if let TensorView::Additive(view) = tensor {
-            let layout = view.layout();
-            if layout.allocation != tritium_schema::PlaneAllocation::Uniform
-                || !admitted_execution_group(layout.law, layout.group)
-            {
-                return Ok(None);
-            }
-            AdditiveTensor::validate_view(view).map_err(|e| {
-                BackendError::InvalidInput(format!(
-                    "reference additive capability input failed: {e:?}"
-                ))
-            })?;
-        }
-        Ok(Some(TensorCaps {
-            execution: TensorExecution::Native,
-            payload_bytes: tensor.decoded_payload_bytes()?,
-        }))
+        tritium_runtime::ReferenceBackend::new().tensor_caps(tensor)
     }
 
     fn upload_tensor(&self, tensor: TensorView<'_>) -> Result<Box<dyn DeviceBuffer>, BackendError> {
-        match tensor {
-            TensorView::Additive(view) => {
-                if view.tile_counts().is_some() {
-                    return Err(BackendError::UnsupportedTensor);
-                }
-                let tensor = AdditiveTensor::from_view(view).map_err(|error| {
-                    BackendError::InvalidInput(format!("invalid additive tensor: {error:?}"))
-                })?;
-                Ok(Box::new(RefAdditiveBuffer { tensor }))
-            }
-            TensorView::Dense { rows, cols, values } => {
-                let expected = rows.checked_mul(cols).ok_or_else(|| {
-                    BackendError::InvalidInput("dense tensor dimensions overflow".into())
-                })?;
-                if values.len() != expected {
-                    return Err(BackendError::ShapeMismatch {
-                        expected,
-                        got: values.len(),
-                    });
-                }
-                Ok(Box::new(RefDenseBuffer {
-                    rows,
-                    cols,
-                    values: values.to_vec(),
-                }))
-            }
-        }
+        tritium_runtime::ReferenceBackend::new().upload_tensor(tensor)
     }
 
     fn matmul(&self, p: TensorMatmul<'_>) -> Result<(), BackendError> {
-        if let Some(buf) = p.tensor.as_any().downcast_ref::<RefAdditiveBuffer>() {
-            let view = buf.tensor.view();
-            return reference_ternary_matmul(
-                p.act,
-                &view.bind_matmul(),
-                p.batch,
-                p.transformed_act,
-                p.out,
-            )
-            .map_err(|e| BackendError::InvalidInput(format!("reference matmul failed: {e:?}")));
-        }
-        let buf = p
-            .tensor
-            .as_any()
-            .downcast_ref::<RefDenseBuffer>()
-            .ok_or_else(|| BackendError::InvalidInput("unknown reference tensor kind".into()))?;
-        DenseView::new(buf.rows, buf.cols, &buf.values)
-            .and_then(|view| view.matmul(p.act, p.batch, p.transformed_act, p.out))
-            .map_err(|e| {
-                BackendError::InvalidInput(format!("reference dense matmul failed: {e:?}"))
-            })
+        tritium_runtime::ReferenceBackend::new().matmul(p)
     }
 
     fn embed_rows(
@@ -177,20 +80,7 @@ impl TernaryBackend for ReferenceBackend {
         ids: &[usize],
         out: &mut [f32],
     ) -> Result<(), BackendError> {
-        if let Some(buf) = tensor.as_any().downcast_ref::<RefAdditiveBuffer>() {
-            return reference_embed(&buf.tensor.view().bind_gather(), ids, out).map_err(|e| {
-                BackendError::InvalidInput(format!("reference gather failed: {e:?}"))
-            });
-        }
-        let buf = tensor
-            .as_any()
-            .downcast_ref::<RefDenseBuffer>()
-            .ok_or_else(|| BackendError::InvalidInput("unknown reference tensor kind".into()))?;
-        DenseView::new(buf.rows, buf.cols, &buf.values)
-            .and_then(|view| view.embed(ids, out))
-            .map_err(|e| {
-                BackendError::InvalidInput(format!("reference dense gather failed: {e:?}"))
-            })
+        tritium_runtime::ReferenceBackend::new().embed_rows(tensor, ids, out)
     }
 
     fn upload_weights(

@@ -3,9 +3,7 @@
 
 use half::f16;
 use rayon::prelude::*;
-use tritium_core::{
-    AdditiveView, OwnedPerTileIndex, PerTilePlan, apply_basis, apply_inverse_basis,
-};
+use tritium_core::{AdditiveView, OwnedPerTileIndex, apply_basis, apply_inverse_basis};
 use tritium_format::salt_v2::SaltV2Codec;
 use tritium_schema::{AdditiveLayout, PlaneCodec, PlaneRelation, ScaleAnchor, ScalePrecision};
 use tritium_spec::{BackendError, TensorMatmul};
@@ -82,11 +80,8 @@ impl PackedAdditive {
             .len()
             .checked_mul(Self::scale_width(view.layout())?)
             .ok_or_else(|| invalid("scale size overflow"))?;
-        if let Some(counts) = view.tile_counts() {
-            let index_bytes = PerTilePlan::new(view.layout(), counts)
-                .map_err(invalid)?
-                .buffer_len_bytes()
-                .map_err(invalid)?;
+        if view.tile_counts().is_some() {
+            let index_bytes = view.auxiliary_buffer_len_bytes().map_err(invalid)?;
             let starts = view
                 .plane_count()
                 .checked_mul(core::mem::size_of::<PlaneStart>())

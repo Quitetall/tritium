@@ -4991,6 +4991,8 @@ dependencies = [
  "linkme",
  "tritium-core",
  "tritium-evidence",
+ "tritium-format",
+ "tritium-schema",
  "tritium-spec",
 ]
 
@@ -5075,6 +5077,7 @@ dependencies = [
  "serde_json",
  "tritium-core",
  "tritium-format",
+ "tritium-runtime",
  "tritium-schema",
  "tritium-spec",
 ]

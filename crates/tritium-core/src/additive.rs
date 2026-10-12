@@ -247,6 +247,18 @@ impl<'a> AdditiveView<'a> {
         }
     }
 
+    /// Checked logical lengths of auxiliary count/index buffers, without scans.
+    ///
+    /// Uniform returns zero. Compact allocation borrows the sealed index's
+    /// lengths; capacity slack/handles/allocator overhead and scalar payloads
+    /// are excluded. This is not full memory admission or process RSS.
+    pub fn auxiliary_buffer_len_bytes(&self) -> Result<usize, AdditiveError> {
+        match self.allocation {
+            Allocation::Uniform { .. } => Ok(0),
+            Allocation::PerTile(index) => index.buffer_len_bytes(),
+        }
+    }
+
     /// Coefficients for one present plane in canonical payload order.
     pub fn plane_trits(&self, plane: usize) -> Result<&'a [Trit], AdditiveError> {
         if plane >= self.plane_count() {

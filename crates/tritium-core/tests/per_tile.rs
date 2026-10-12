@@ -39,6 +39,10 @@ fn public_row_cursor_and_buffer_lengths_share_checked_geometry() {
     let mut spans = vec![PerTileRowSpan::default(); plan.index_len()];
     let index = plan.build(&mut spans).unwrap();
     assert_eq!(index.buffer_len_bytes().unwrap(), expected);
+    let trits = vec![Trit::POS; index.trit_count()];
+    let scales = vec![0.5; index.scale_count()];
+    let view = AdditiveView::new_per_tile(index, &trits, &scales).unwrap();
+    assert_eq!(view.auxiliary_buffer_len_bytes().unwrap(), expected);
     let tiles: Vec<_> = index
         .tiles_in_row(1, 0)
         .unwrap()
@@ -62,10 +66,17 @@ fn public_row_cursor_and_buffer_lengths_share_checked_geometry() {
     let plan = tritium_core::PerTilePlan::new(layout, &[0; 4]).unwrap();
     assert_eq!(plan.buffer_len_bytes().unwrap(), 4);
     let index = plan.build(&mut []).unwrap();
+    let view = AdditiveView::new_per_tile(index, &[], &[]).unwrap();
+    assert_eq!(view.auxiliary_buffer_len_bytes().unwrap(), 4);
     assert!(matches!(
         index.tiles_in_row(0, 0),
         Err(AdditiveError::InvalidPlaneCount)
     ));
+    let mut uniform_layout = layout;
+    uniform_layout.allocation = PlaneAllocation::Uniform;
+    let trits = vec![Trit::POS; 514];
+    let view = AdditiveView::new(uniform_layout, 1, &trits, &[0.5; 6]).unwrap();
+    assert_eq!(view.auxiliary_buffer_len_bytes().unwrap(), 0);
 }
 
 #[test]
