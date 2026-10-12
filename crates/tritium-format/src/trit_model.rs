@@ -4,8 +4,10 @@
 
 mod binding;
 mod seek_reader;
+mod stage;
 
 pub use seek_reader::{TritModelReadError, TritModelReader, TritModelVisitError};
+pub use stage::{TritModelStageError, stage_trit_model_from_spool};
 
 use ciborium::value::Value;
 use half::{bf16, f16};

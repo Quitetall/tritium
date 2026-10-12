@@ -844,15 +844,27 @@ fn actual_file_staging_uses_bounded_codec_buffers_and_cleans_up() {
 
 #[test]
 fn staged_legacy_tensor_dense_and_assets_reopen_as_one_imported_typed_package() {
-    use tritium_format::trit_model::{encode_model_manifest, read_trit_model};
-    use tritium_format::{TritBlobKind, TritSpoolBlob, write_trit_package_from_spool};
+    use tritium_format::trit_model::{
+        TritModelStageError, encode_model_manifest, read_trit_model, stage_trit_model_from_spool,
+    };
+    use tritium_format::{
+        TritBlobKind, TritPackageReadLimits, TritSpoolBlob, write_trit_package_from_spool,
+    };
     use tritium_schema::{
         BlobId, BlobReference, LegacyModelIdentity, Level, LevelFit, ManifestAsset, ModelManifest,
         PlaneCounts, SchemaId, TensorMeta, TensorStorage,
     };
     let source = tensor(2, 257, &[1, 1, 1]);
-    let mut reader =
-        SaltV2PackageReader::new_strict(Cursor::new(encoded(&source, SaltV2Codec::B3))).unwrap();
+    let original = Rc::new(RefCell::new(Cursor::new(encoded(&source, SaltV2Codec::B3))));
+    let mut reader = SaltV2PackageReader::new_strict(SharedSource {
+        cursor: Rc::clone(&original),
+        armed: Rc::new(Cell::new(false)),
+        zero_seeks: Rc::new(Cell::new(0)),
+        max_request: Rc::new(Cell::new(0)),
+        fail_fill: false,
+        replacement: None,
+    })
+    .unwrap();
     let legacy = reader.package_id().to_string();
     let mut spool = Cursor::new(Vec::new());
     let target = AdditiveLayout {
@@ -919,8 +931,25 @@ fn staged_legacy_tensor_dense_and_assets_reopen_as_one_imported_typed_package() 
             level: "imported".into(),
         }],
     };
-    reader.verify_unchanged().unwrap(); // model caller, once before publication
-    drop(reader);
+    let receiving = TritPackageReadLimits {
+        max_source_bytes: 1_000_000,
+        max_manifest_bytes: 64 * 1024,
+        max_directory_bytes: 64 * 1024,
+    };
+    let calls = Cell::new(0);
+    let mut staged_model = stage_trit_model_from_spool(
+        &manifest,
+        &blobs,
+        &mut spool,
+        receiving,
+        Cursor::new(Vec::new()),
+        || {
+            calls.set(calls.get() + 1);
+            reader.verify_unchanged() // original strict source, once before staged success
+        },
+    )
+    .unwrap();
+    assert_eq!(calls.get(), 1);
     let mut output = Vec::new();
     let id = write_trit_package_from_spool(
         &encode_model_manifest(&manifest).unwrap(),
@@ -931,6 +960,24 @@ fn staged_legacy_tensor_dense_and_assets_reopen_as_one_imported_typed_package() 
     )
     .unwrap();
     let model = read_trit_model(&output).unwrap();
+    assert_eq!(staged_model.package_id(), id);
+    assert_eq!(staged_model.manifest(), model.manifest());
+    assert_eq!(
+        staged_model.model_id("imported").unwrap(),
+        model.model_id("imported").unwrap()
+    );
+    let mut staged_payload = Vec::new();
+    staged_model
+        .visit_tensor("imported", "weight", |chunk| -> Result<(), ()> {
+            staged_payload.extend_from_slice(chunk);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        staged_payload,
+        model.tensor("imported", "weight").unwrap().1
+    );
+    staged_model.verify().unwrap();
     model.validate_complete_payload_inventory().unwrap();
     assert_eq!(model.package_id(), id);
     assert_eq!(model.manifest().legacy_ids[0].id, legacy);
@@ -949,6 +996,21 @@ fn staged_legacy_tensor_dense_and_assets_reopen_as_one_imported_typed_package() 
     };
     let recovered = AdditiveTensor::decode_per_tile_payload(*layout, counts, payload).unwrap();
     check(&source, &recovered);
+    let altered = encoded(&changed(&source), SaltV2Codec::B3);
+    original.borrow_mut().get_mut().copy_from_slice(&altered);
+    assert!(matches!(
+        stage_trit_model_from_spool(
+            &manifest,
+            &blobs,
+            &mut spool,
+            receiving,
+            Cursor::new(Vec::new()),
+            || reader.verify_unchanged(),
+        ),
+        Err(TritModelStageError::Guard(
+            SaltV2PackageReadError::PackageChanged
+        ))
+    ));
     // Tiny structural assets do not claim runnable architecture/Qwen/release gates.
 }
 
