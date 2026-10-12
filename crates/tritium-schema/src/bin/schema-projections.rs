@@ -143,6 +143,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     project!(LevelFit, "level-fit");
     project!(ManifestAsset, "manifest-asset");
     project!(ModelManifest, "model-manifest");
+    project!(
+        tritium_schema::LegacyModelImportPrepared,
+        "legacy-model-import-prepared"
+    );
     project!(ModelShard, "model-shard");
     project!(PlaneCounts, "plane-counts");
     project!(TensorMeta, "tensor-meta");

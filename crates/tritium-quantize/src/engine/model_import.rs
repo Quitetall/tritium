@@ -1,0 +1,388 @@
+//! Whole legacy matrix model caller; codecs/source/publication remain shared.
+use super::model::platform;
+use super::{
+    DirectoryTensorSink, ObservedWeightSource, PublicationWarning, QuantEngineError,
+    TritModelPublicationError, WeightSource,
+};
+use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom, Write},
+};
+use tritium_core::DType;
+use tritium_evidence::{
+    EvidenceError, EvidenceRecorder, LegacyModelImportView, SealedEvidence, VerifiedLog,
+};
+use tritium_format::salt_v2_package::{
+    SaltV2PackageReadError, SaltV2PackageReader, SaltV2Transform,
+};
+use tritium_format::trit_model::{TritModelReadError, TritModelReader};
+use tritium_format::{
+    SaltTensorSpoolError, SaltTensorSpoolLimits, TritBlobKind, TritPackageReadLimits,
+    TritSpoolBlob, import_salt_v2_tensor_to_spool,
+};
+use tritium_schema::*;
+
+/// Explicit complete legacy import request, not a fitting or model quality plan.
+#[derive(Clone, Debug)]
+pub struct SaltV2ModelImportRequest {
+    /// Single-level KeepDense plan for actual preserved tensors and all assets.
+    /// Existing raw-source identity requires at least one companion tensor.
+    pub companions: QuantPlan,
+    /// Canonical raw D2/B3 target, not a newly admitted execution profile.
+    pub codec: PlaneCodec,
+    /// Explicit target scale group, subject to exact original scale-bit proof.
+    pub group: u16,
+    /// Existing per-tensor importer logical source/working/output limits.
+    pub tensor_limits: SaltTensorSpoolLimits,
+    /// Complete canonical tensor/dense/asset spool bytes, not aggregate heap/RSS.
+    pub max_spool_bytes: u64,
+    /// Complete typed package receiving/output caps, not aggregate heap/RSS.
+    pub receiving: TritPackageReadLimits,
+}
+
+/// Published ordinary Imported model, original prepared log and explicit warnings.
+#[derive(Debug)]
+pub struct ImportedSaltV2Model {
+    /// Retained admitted output File; no whole package/legacy master Vec required.
+    pub model: TritModelReader<File>,
+    /// Actual sealed prepared-input log, not a fit/publication/quality receipt.
+    pub evidence: SealedEvidence,
+    /// Existing successful-commit cleanup/durability caveats.
+    pub warnings: Vec<PublicationWarning>,
+}
+
+/// Original whole-source error at the publisher's once-only terminal guard.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SaltV2ModelGuardError {
+    /// Original strict legacy source changed or failed.
+    Legacy(SaltV2PackageReadError),
+    /// Original observed raw companion source changed or failed.
+    Companion(QuantEngineError),
+}
+impl core::fmt::Display for SaltV2ModelGuardError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Legacy(e) => e.fmt(f),
+            Self::Companion(e) => e.fmt(f),
+        }
+    }
+}
+impl std::error::Error for SaltV2ModelGuardError {}
+
+/// No new fit/source/published success follows from an import refusal.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SaltV2ModelImportError {
+    /// Request, observed raw companion, metadata or logical cap refused.
+    Companion(QuantEngineError),
+    /// Existing tile-wise canonical legacy importer refused.
+    Tensor(SaltTensorSpoolError),
+    /// Original strict legacy metadata/count read failed.
+    Legacy(SaltV2PackageReadError),
+    /// Caller-owned spool I/O failed; an unpublished tail may remain.
+    Io(std::io::Error),
+    /// Actual prepared evidence registration/sealing/fold failed.
+    Evidence(EvidenceError),
+    /// Existing typed model/log replay refused.
+    Replay(TritModelReadError),
+    /// Shared typed staging or directory publication refused before commit.
+    Publication(TritModelPublicationError<SaltV2ModelGuardError>),
+}
+impl core::fmt::Display for SaltV2ModelImportError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Companion(e) => e.fmt(f),
+            Self::Tensor(e) => e.fmt(f),
+            Self::Legacy(e) => e.fmt(f),
+            Self::Io(e) => e.fmt(f),
+            Self::Evidence(e) => e.fmt(f),
+            Self::Replay(e) => e.fmt(f),
+            Self::Publication(e) => e.fmt(f),
+        }
+    }
+}
+impl std::error::Error for SaltV2ModelImportError {}
+impl From<QuantEngineError> for SaltV2ModelImportError {
+    fn from(e: QuantEngineError) -> Self {
+        Self::Companion(e)
+    }
+}
+impl From<std::io::Error> for SaltV2ModelImportError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+impl From<EvidenceError> for SaltV2ModelImportError {
+    fn from(e: EvidenceError) -> Self {
+        Self::Evidence(e)
+    }
+}
+
+/// Import all actual legacy matrices plus observed companions through shared modules.
+///
+/// Derives shapes/counts/legacy ID from the original strict reader, preserves
+/// exact dense precision/shape/assets and declares Imported, never Direct/prefix.
+/// Refuses non-matrix ternary shapes rather than losing original axes. Requires
+/// an empty caller-owned spool and fresh registered recorder. Fills one legacy
+/// tensor at a time, retains metadata/counts, and reuses typed staging/publication.
+/// Original strict legacy and observed companions are terminal-guarded once.
+///
+/// Caller owns immutable source/spool/parent custody, failed spool-tail cleanup,
+/// source completeness against architecture/config, original official identity,
+/// aggregate memory, bit/runtime/security/power-loss/distribution qualification.
+/// Companion WeightSource can own one bounded raw dense tensor; encoded caps do
+/// not cover that allocation, retained metadata, capacity slack or whole RSS.
+/// # Errors
+/// Invalid/unsupported request, changed source, caps/I/O/evidence/staging or
+/// no-clobber commit failure. No alternate fitter/transform/provenance is inferred.
+pub fn import_salt_v2_model<R: Read + Seek, S: Read + Write + Seek>(
+    request: &SaltV2ModelImportRequest,
+    legacy: &mut SaltV2PackageReader<R>,
+    companions: &mut dyn WeightSource,
+    spool: &mut S,
+    destination: &mut DirectoryTensorSink,
+    mut recorder: EvidenceRecorder,
+) -> Result<ImportedSaltV2Model, SaltV2ModelImportError> {
+    use SaltV2ModelImportError as E;
+    let plan = &request.companions;
+    plan.validate().map_err(QuantEngineError::Plan)?;
+    if plan.levels.len() != 1
+        || plan
+            .tensors
+            .iter()
+            .any(|t| t.action != QuantAction::KeepDense)
+    {
+        return Err(refusal("import companions must be one KeepDense level"));
+    }
+    if !recorder.events().is_empty() {
+        return Err(refusal("import needs a fresh recorder"));
+    }
+    recorder.check_emit::<LegacyModelImportPrepared>("migration", None, 0)?;
+    if spool.seek(SeekFrom::End(0))? != 0 || spool.seek(SeekFrom::Start(0))? != 0 {
+        return Err(refusal("model import spool must be empty"));
+    }
+    if legacy.is_empty() {
+        return Err(refusal("legacy matrix inventory is empty"));
+    }
+    let mut matrices = Vec::new();
+    for name in legacy.tensor_names() {
+        if plan
+            .tensors
+            .binary_search_by(|t| t.source.name.as_str().cmp(name))
+            .is_ok()
+        {
+            return Err(refusal("legacy and companion tensor names collide"));
+        }
+        let info = legacy
+            .tensor_info(name)
+            .ok_or_else(|| refusal("legacy metadata missing"))?;
+        let [rows, cols] = info.dims() else {
+            return Err(refusal("legacy model import requires rank-two matrices"));
+        };
+        if info.transform() != SaltV2Transform::None {
+            return Err(refusal(
+                "legacy model transform lacks an admitted exact basis",
+            ));
+        }
+        let maximum = legacy
+            .tensor_plane_counts(name)
+            .map_err(E::Legacy)?
+            .max()
+            .ok_or_else(|| refusal("legacy counts absent"))?;
+        let layout = AdditiveLayout {
+            rows: *rows,
+            cols: *cols,
+            tile: 256,
+            group: request.group,
+            max_planes: u8::try_from(maximum).map_err(|_| refusal("legacy plane count"))?,
+            allocation: PlaneAllocation::PerTile,
+            codec: request.codec,
+            law: ScaleLaw {
+                anchor: ScaleAnchor::Group,
+                relation: PlaneRelation::Free,
+                precision: ScalePrecision::F16,
+            },
+            basis: Basis::Identity,
+            transport: Transport::Raw,
+        };
+        layout.validate().map_err(|_| refusal("import layout"))?;
+        matrices.push((name.to_owned(), layout));
+    }
+    let mut observed = ObservedWeightSource::new(plan, companions)?;
+    let mut blobs = Vec::new();
+    let mut tensors = Vec::new();
+    for (name, layout) in matrices {
+        let mut limits = request.tensor_limits;
+        limits.max_payload_bytes = limits
+            .max_payload_bytes
+            .min(remaining(spool, request.max_spool_bytes)?);
+        let staged = import_salt_v2_tensor_to_spool(legacy, &name, layout, limits, spool)
+            .map_err(E::Tensor)?;
+        tensors.push(TensorMeta {
+            name,
+            blob: reference(staged.blob.id),
+            storage: TensorStorage::Additive {
+                layout,
+                planes: PlaneCounts::PerTile(staged.tile_counts),
+            },
+        });
+        blobs.push(staged.blob);
+    }
+    for tensor in &plan.tensors {
+        let source = &tensor.source;
+        let length = source.byte_len().map_err(QuantEngineError::Plan)?;
+        let bytes = observed.tensor(&source.name, platform(length, "import companion bytes")?)?;
+        let dtype = match source.precision {
+            ScalePrecision::F16 => DType::F16,
+            ScalePrecision::Bf16 => DType::BF16,
+            ScalePrecision::F32 => DType::F32,
+            _ => return Err(refusal("import dense precision")),
+        };
+        let blob = append(
+            spool,
+            TritBlobKind::DenseTensor(dtype),
+            &bytes,
+            request.max_spool_bytes,
+        )?;
+        tensors.push(TensorMeta {
+            name: source.name.clone(),
+            blob: reference(blob.id),
+            storage: TensorStorage::Dense {
+                shape: source.shape.clone(),
+                precision: source.precision,
+            },
+        });
+        blobs.push(blob);
+    }
+    let mut assets = Vec::new();
+    for name in &plan.assets {
+        let bytes = observed.asset(
+            name,
+            platform(plan.limits.max_asset_bytes, "import asset bytes")?,
+        )?;
+        let blob = append(
+            spool,
+            TritBlobKind::Asset(name.clone()),
+            &bytes,
+            request.max_spool_bytes,
+        )?;
+        assets.push(ManifestAsset {
+            name: name.clone(),
+            blob: reference(blob.id),
+        });
+        blobs.push(blob);
+    }
+    tensors.sort_by(|a, b| a.name.cmp(&b.name));
+    let level = plan.levels[0].clone();
+    let legacy_id = legacy.package_id().to_string();
+    let manifest = ModelManifest {
+        schema: SchemaId { major: 1, minor: 0 },
+        architecture: plan.architecture.clone(),
+        assets,
+        levels: vec![Level {
+            name: level.clone(),
+            fit: LevelFit::Imported,
+            tensors,
+        }],
+        shards: vec![],
+        legacy_ids: vec![LegacyModelIdentity {
+            id: legacy_id.clone(),
+            level,
+        }],
+    };
+    let preparation = LegacyModelImportPrepared {
+        legacy_id,
+        companion_source: observed.source_id(),
+        companion_tensors: observed.tensor_bindings().to_vec(),
+        companion_assets: observed.asset_bindings().to_vec(),
+        manifest,
+    };
+    recorder.emit("migration", None, 0, &preparation)?;
+    let evidence = recorder.seal()?;
+    let views = LegacyModelImportView::fold(evidence.log())?;
+    if views.len() != 1 || views[0].observation() != &preparation {
+        return Err(refusal("prepared import log binding"));
+    }
+    let (model, warnings) = destination
+        .publish_spooled_model(
+            &preparation.manifest,
+            &blobs,
+            spool,
+            request.receiving,
+            &evidence,
+            || {
+                observed
+                    .revalidate()
+                    .map_err(SaltV2ModelGuardError::Companion)?;
+                // Original legacy check follows every companion read as well.
+                legacy
+                    .verify_unchanged()
+                    .map_err(SaltV2ModelGuardError::Legacy)
+            },
+        )
+        .map_err(E::Publication)?;
+    Ok(ImportedSaltV2Model {
+        model,
+        evidence,
+        warnings,
+    })
+}
+
+/// Reverify an actual retained package against recorded import preparation.
+/// No independent original-source replay, fit or release verdict is inferred.
+/// # Errors
+/// Missing/ambiguous/mismatched import log, inventory/payload or terminal identity.
+pub fn verify_imported_model_with_log<R: Read + Seek>(
+    model: &mut TritModelReader<R>,
+    log: &VerifiedLog,
+) -> Result<LegacyModelImportView, SaltV2ModelImportError> {
+    let mut views = LegacyModelImportView::fold(log)?;
+    if views.len() != 1 {
+        return Err(refusal("exactly one imported preparation required"));
+    }
+    let view = views.remove(0);
+    if &view.observation().manifest != model.manifest() {
+        return Err(refusal("import log/model manifest mismatch"));
+    }
+    model
+        .validate_complete_payload_inventory()
+        .map_err(QuantEngineError::Model)?;
+    model.verify().map_err(SaltV2ModelImportError::Replay)?;
+    Ok(view)
+}
+fn refusal(detail: &'static str) -> SaltV2ModelImportError {
+    QuantEngineError::Binding(detail).into()
+}
+fn reference(id: BlobId) -> BlobReference {
+    BlobReference { id, shard: None }
+}
+fn remaining<S: Seek>(spool: &mut S, cap: u64) -> Result<u64, SaltV2ModelImportError> {
+    let position = spool.stream_position()?;
+    if spool.seek(SeekFrom::End(0))? != position {
+        return Err(refusal("import spool cursor must be at its end"));
+    }
+    cap.checked_sub(position)
+        .ok_or_else(|| refusal("complete import spool cap"))
+}
+fn append<S: Write + Seek>(
+    spool: &mut S,
+    kind: TritBlobKind,
+    bytes: &[u8],
+    cap: u64,
+) -> Result<TritSpoolBlob, SaltV2ModelImportError> {
+    let left = remaining(spool, cap)?;
+    if bytes.len() as u64 > left {
+        return Err(refusal("complete import spool cap"));
+    }
+    let blob = TritSpoolBlob {
+        kind,
+        id: BlobId::from_bytes(*blake3::hash(bytes).as_bytes()),
+        offset: spool.stream_position()?,
+        length: bytes.len() as u64,
+    };
+    for chunk in bytes.chunks(64 * 1024) {
+        spool.write_all(chunk)?;
+    }
+    Ok(blob)
+}

@@ -20,6 +20,9 @@ pub use tritium_schema::{
 mod model_load;
 pub use model_load::{MODEL_LOADED_REGISTRATION, ModelLoadReceiptView};
 
+mod model_import;
+pub use model_import::{LEGACY_MODEL_IMPORT_PREPARED_REGISTRATION, LegacyModelImportView};
+
 mod direct_fit;
 pub use direct_fit::{DIRECT_LEVELS_FITTED_REGISTRATION, DirectFitReceiptView};
 

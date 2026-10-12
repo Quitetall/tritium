@@ -13,6 +13,7 @@ mod direct;
 mod joint_feedback;
 mod ladder;
 mod model;
+mod model_import;
 mod observed_source;
 mod original_capture;
 mod salience;
@@ -29,6 +30,10 @@ pub use salience_model::JoinedSalienceModel;
 pub use model::{
     Engine, PublicationWarning, QuantEngineError, QuantizedModel, TensorSink, WeightSource,
     verify_package_with_fit_log,
+};
+pub use model_import::{
+    ImportedSaltV2Model, SaltV2ModelGuardError, SaltV2ModelImportError, SaltV2ModelImportRequest,
+    import_salt_v2_model, verify_imported_model_with_log,
 };
 pub use sinks::{DirectoryTensorSink, MemoryTensorSink, TritModelPublicationError};
 pub use source_stage::{PublishedSalienceStage, StagedSalienceSource};

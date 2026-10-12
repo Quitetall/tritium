@@ -17,6 +17,11 @@ mod model;
 pub use model::*;
 
 #[cfg(feature = "alloc")]
+mod model_import;
+#[cfg(feature = "alloc")]
+pub use model_import::*;
+
+#[cfg(feature = "alloc")]
 mod semantic;
 #[cfg(feature = "alloc")]
 pub use semantic::*;
