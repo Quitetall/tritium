@@ -14,6 +14,7 @@ categories.workspace = true
 [dependencies]
 tritium-core = { workspace = true }
 tritium-spec = { workspace = true }
+tritium-schema = { workspace = true }
 tritium-runtime = { workspace = true }
 # `tritium-format` is only needed by the GPU host path (packed-row byte sizing),
 # so it is pulled in solely by the `cuda` feature to keep the default build lean.

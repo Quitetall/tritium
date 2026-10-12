@@ -1,7 +1,7 @@
-//! Device-owned dense and explicitly emulated additive execution.
+//! Device-owned dense and native packed additive execution.
 //!
-//! Additive coefficients expand once at upload in their stored basis. Matmul
-//! transforms activations and gather undoes that basis using the shared core.
+//! Additive plane/scale bytes stay packed; no dense weight shadow is created.
+//! Matmul transforms activations and gather undoes that basis using shared core.
 //! Existing packed/resident kernels are unchanged. No host shadow is retained.
 
 use super::{CudaBackend, alloc_or_backend, driver_err};
@@ -14,12 +14,15 @@ use tritium_spec::{
     BackendError, Basis, DeviceBuffer, TensorCaps, TensorExecution, TensorMatmul, TensorView,
     admitted_execution_group,
 };
+mod packed;
+use packed::PackedAdditive;
 
 pub(super) struct CudaTensor {
     rows: usize,
     cols: usize,
     basis: Basis,
     values: Option<CudaSlice<f32>>,
+    packed: Option<PackedAdditive>,
     // Retain the context and identify the exact owning backend stream. A device
     // ordinal/string alone cannot prove that a handle belongs to this adapter.
     owner: Arc<CudaStream>,
@@ -27,6 +30,9 @@ pub(super) struct CudaTensor {
 
 impl DeviceBuffer for CudaTensor {
     fn len_bytes(&self) -> usize {
+        if let Some(packed) = &self.packed {
+            return packed.len_bytes();
+        }
         self.values
             .as_ref()
             .map_or(0, |values| values.len() * core::mem::size_of::<f32>())
@@ -55,18 +61,18 @@ impl CudaTensor {
             }
             TensorView::Additive(additive) => {
                 let layout = additive.layout();
-                if additive.tile_counts().is_some()
-                    || !admitted_execution_group(layout.law, layout.group)
-                {
+                if !admitted_execution_group(layout.law, layout.group) {
                     return Ok(None);
                 }
-                AdditiveTensor::validate_view(additive)
-                    .map_err(|e| invalid(&format!("CUDA additive capability input: {e:?}")))?;
-                (
-                    usize::try_from(layout.rows).map_err(|_| invalid("row count overflows"))?,
-                    usize::try_from(layout.cols).map_err(|_| invalid("column count overflows"))?,
-                    TensorExecution::Emulated,
-                )
+                let bytes = match PackedAdditive::payload_bytes(additive) {
+                    Ok(bytes) => bytes,
+                    Err(BackendError::UnsupportedTensor) => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+                return Ok(Some(TensorCaps {
+                    execution: TensorExecution::Native,
+                    payload_bytes: bytes as u64,
+                }));
             }
         };
         let payload_bytes = product(product(rows, cols)?, core::mem::size_of::<f32>())? as u64;
@@ -84,35 +90,21 @@ impl CudaTensor {
         view: TensorView<'_>,
     ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
         let caps = Self::caps(view)?.ok_or(BackendError::UnsupportedTensor)?;
-        // Keep dense inputs borrowed; only additive uploads need a temporary
-        // decoded allocation. It is dropped after transfer, never retained.
-        let mut decoded = Vec::new();
-        let (rows, cols, basis, values) = match view {
-            TensorView::Dense { rows, cols, values } => (rows, cols, Basis::Identity, values),
-            TensorView::Additive(additive) => {
-                let layout = additive.layout();
-                let rows = layout.rows as usize; // Checked by caps above.
-                let cols = layout.cols as usize;
-                let count = product(rows, cols)?;
-                decoded
-                    .try_reserve_exact(count)
-                    .map_err(|_| BackendError::OutOfMemory {
-                        requested: caps.payload_bytes as usize,
-                    })?;
-                decoded.resize(count, 0.);
-                for (row, output) in decoded.chunks_exact_mut(cols).enumerate() {
-                    additive
-                        .dequant_row_into(row, output)
-                        .map_err(|e| invalid(&format!("decode CUDA additive row: {e:?}")))?;
-                }
-                if decoded.iter().any(|value| !value.is_finite()) {
-                    return Err(invalid(
-                        "CUDA additive expansion produced nonfinite weights",
-                    ));
-                }
-                (rows, cols, layout.basis, decoded.as_slice())
-            }
+        if let TensorView::Additive(additive) = view {
+            let layout = additive.layout();
+            return Ok(Box::new(Self {
+                rows: layout.rows as usize,
+                cols: layout.cols as usize,
+                basis: layout.basis,
+                values: None,
+                packed: Some(PackedAdditive::upload(backend, additive)?),
+                owner: Arc::clone(&backend.stream),
+            }));
+        }
+        let TensorView::Dense { rows, cols, values } = view else {
+            unreachable!("additive upload returns above")
         };
+        let basis = Basis::Identity;
         let device = if values.is_empty() {
             None // Do not make a zero-sized driver allocation.
         } else {
@@ -129,6 +121,7 @@ impl CudaTensor {
             cols,
             basis,
             values: device,
+            packed: None,
             owner: Arc::clone(&backend.stream),
         }))
     }
@@ -149,6 +142,9 @@ impl CudaTensor {
 
     pub(super) fn matmul(backend: &CudaBackend, p: TensorMatmul<'_>) -> Result<(), BackendError> {
         let tensor = Self::checked(backend, p.tensor)?;
+        if let Some(packed) = &tensor.packed {
+            return packed.matmul(backend, p, tensor.rows, tensor.cols, tensor.basis);
+        }
         let inputs = product(p.batch, tensor.cols)?;
         let outputs = product(p.batch, tensor.rows)?;
         if p.act.len() != inputs || p.transformed_act.len() != inputs || p.out.len() != outputs {
@@ -228,6 +224,9 @@ impl CudaTensor {
         out: &mut [f32],
     ) -> Result<(), BackendError> {
         let tensor = Self::checked(backend, tensor)?;
+        if let Some(packed) = &tensor.packed {
+            return packed.embed(backend, ids, out, tensor.rows, tensor.cols, tensor.basis);
+        }
         let expected = product(ids.len(), tensor.cols)?;
         if out.len() != expected || ids.iter().any(|&row| row >= tensor.rows) {
             return Err(invalid("CUDA semantic gather shape or row ID is invalid"));

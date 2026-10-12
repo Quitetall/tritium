@@ -804,6 +804,8 @@ pub struct CudaBackend {
     /// Gated DeltaNet recurrent-step PTX kept alive for `func_deltanet_step`.
     pub(super) _deltanet_module: Arc<CudaModule>,
     pub(super) func_deltanet_step: CudaFunction,
+    pub(super) func_semantic_additive_matmul: CudaFunction,
+    pub(super) func_semantic_additive_gather: CudaFunction,
     /// Scalar-correct D2/B3/S34 forward. The first fast API aliases this handle.
     pub(super) func_salt_v2_exact: CudaFunction,
     /// Shared-activation D2/B3/S34 forward used for prefill-shaped launches.
@@ -1431,6 +1433,18 @@ impl CudaBackend {
         let func_deltanet_step = deltanet_module
             .load_function(KERNEL_NAME_DELTANET_STEP)
             .map_err(|e| driver_err("resolve qwen35_deltanet_recurrent_step kernel", &e))?;
+        let semantic_module = ctx
+            .load_module(Ptx::from_src(include_str!(concat!(
+                env!("OUT_DIR"),
+                "/semantic_additive.ptx"
+            ))))
+            .map_err(|e| driver_err("load semantic additive ptx", &e))?;
+        let func_semantic_additive_matmul = semantic_module
+            .load_function("semantic_additive_matmul")
+            .map_err(|e| driver_err("resolve semantic additive matmul", &e))?;
+        let func_semantic_additive_gather = semantic_module
+            .load_function("semantic_additive_gather")
+            .map_err(|e| driver_err("resolve semantic additive gather", &e))?;
 
         let device_name = ctx
             .name()
@@ -1460,6 +1474,8 @@ impl CudaBackend {
             _salt_v2_module: salt_v2_module,
             _deltanet_module: deltanet_module,
             func_deltanet_step,
+            func_semantic_additive_matmul,
+            func_semantic_additive_gather,
             func_salt_v2_exact,
             func_salt_v2_tiled,
             func_salt_v2_warp,

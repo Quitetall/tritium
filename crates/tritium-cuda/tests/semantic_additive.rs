@@ -1,4 +1,4 @@
-//! Physical GPU emulation must execute, not self-skip without a device.
+//! Physical packed GPU execution must not self-skip without a device.
 #![cfg(feature = "cuda")]
 
 use tritium_cuda::CudaBackend;
@@ -11,38 +11,27 @@ use tritium_spec::{
 };
 
 #[test]
-fn gpu_additive_emulation_executes_shared_frozen_vectors() {
+fn gpu_additive_native_executes_shared_frozen_vectors() {
     let backend = CudaBackend::new(0).expect("requires physical CUDA device 0");
     assert_eq!(
-        tritium_testkit::assert_additive_tensor_conformance(&backend, TensorExecution::Emulated),
+        tritium_testkit::assert_additive_tensor_conformance(&backend, TensorExecution::Native),
         180
     );
     tritium_testkit::assert_additive_upload_rejections(&backend);
 }
 
 #[test]
-fn gpu_emulation_policy_evidence_and_owned_basis_are_explicit() {
+fn gpu_native_policy_evidence_and_owned_basis_are_explicit() {
     let backend = CudaBackend::new(0).expect("requires physical CUDA device 0");
     let fixture = tritium_testkit::additive_upload_fixture();
     let view = TensorView::Additive(fixture.view());
     let mut recorder =
-        EvidenceRecorder::new("cuda-emulation-fixture", [TENSOR_UPLOADED_REGISTRATION]).unwrap();
-    for (policy, native) in [
-        (
-            TensorUploadPolicy {
-                native_only: true,
-                max_payload_bytes: Some(32),
-            },
-            true,
-        ),
-        (
-            TensorUploadPolicy {
-                native_only: false,
-                max_payload_bytes: Some(31),
-            },
-            false,
-        ),
-    ] {
+        EvidenceRecorder::new("cuda-native-fixture", [TENSOR_UPLOADED_REGISTRATION]).unwrap();
+    for native_only in [true, false] {
+        let policy = TensorUploadPolicy {
+            native_only,
+            max_payload_bytes: Some(69),
+        };
         let rejected = upload_tensor_logged(
             &backend,
             view,
@@ -55,32 +44,23 @@ fn gpu_emulation_policy_evidence_and_owned_basis_are_explicit() {
                 logical_time: 0,
             },
         );
-        if native {
-            assert!(matches!(
-                rejected,
-                Err(TensorUploadError::Backend(
-                    BackendError::NativeTensorRequired
-                ))
-            ));
-        } else {
-            assert!(matches!(
-                rejected,
-                Err(TensorUploadError::Backend(
-                    BackendError::TensorPayloadBudgetExceeded {
-                        requested: 32,
-                        limit: 31
-                    }
-                ))
-            ));
-        }
+        assert!(matches!(
+            rejected,
+            Err(TensorUploadError::Backend(
+                BackendError::TensorPayloadBudgetExceeded {
+                    requested: 70,
+                    limit: 69
+                }
+            ))
+        ));
         assert!(recorder.events().is_empty());
     }
     let (tensor, caps) = upload_tensor_logged(
         &backend,
         view,
         TensorUploadPolicy {
-            native_only: false,
-            max_payload_bytes: Some(32),
+            native_only: true,
+            max_payload_bytes: Some(70),
         },
         "embedding",
         TensorUploadContext {
@@ -91,18 +71,18 @@ fn gpu_emulation_policy_evidence_and_owned_basis_are_explicit() {
         },
     )
     .unwrap();
-    assert_eq!(caps.execution, TensorExecution::Emulated);
-    assert_eq!(caps.payload_bytes, 32);
-    assert_eq!(tensor.len_bytes(), 32);
+    assert_eq!(caps.execution, TensorExecution::Native);
+    assert_eq!(caps.payload_bytes, 70);
+    assert_eq!(tensor.len_bytes(), 70);
     // Successful upload observations replay deterministically on this backend.
     let mut replay =
-        EvidenceRecorder::new("cuda-emulation-fixture", [TENSOR_UPLOADED_REGISTRATION]).unwrap();
+        EvidenceRecorder::new("cuda-native-fixture", [TENSOR_UPLOADED_REGISTRATION]).unwrap();
     let _replayed = upload_tensor_logged(
         &backend,
         view,
         TensorUploadPolicy {
-            native_only: false,
-            max_payload_bytes: Some(32),
+            native_only: true,
+            max_payload_bytes: Some(70),
         },
         "embedding",
         TensorUploadContext {
@@ -157,8 +137,8 @@ fn gpu_emulation_policy_evidence_and_owned_basis_are_explicit() {
     assert_eq!(scratch, [99.; 4]);
     let event = &recorder.events()[0];
     assert_eq!(event.schema, "tritium.runtime.tensor_uploaded");
-    assert_eq!(event.payload["caps"]["execution"], "Emulated");
-    assert_eq!(event.payload["caps"]["payload_bytes"], 32);
+    assert_eq!(event.payload["caps"]["execution"], "Native");
+    assert_eq!(event.payload["caps"]["payload_bytes"], 70);
     assert_eq!(event.payload["decoded_source_bytes"], 16);
     assert_eq!(event.payload["backend"], backend.device_id());
     let typed: tritium_evidence::TensorUploaded =
@@ -176,7 +156,7 @@ fn gpu_emulation_policy_evidence_and_owned_basis_are_explicit() {
 }
 
 #[test]
-fn gpu_additive_expansion_overflow_is_rejected_before_device_upload() {
+fn gpu_additive_decoded_overflow_is_rejected_before_device_upload() {
     let backend = CudaBackend::new(0).expect("requires physical CUDA device 0");
     let fixture = tritium_testkit::additive_upload_fixture();
     let mut layout = fixture.view().layout();
@@ -195,4 +175,31 @@ fn gpu_additive_expansion_overflow_is_rejected_before_device_upload() {
         ),
         Err(BackendError::InvalidInput(_))
     ));
+
+    // A conservative scale bound may overflow even when actual planes cancel.
+    // Such valid finite weights must not be rejected by the fast bound check.
+    let cancelling = tritium_format::AdditiveTensor::new(
+        layout,
+        3,
+        [tritium_core::Trit::POS; 8]
+            .into_iter()
+            .chain([tritium_core::Trit::NEG; 8])
+            .chain([tritium_core::Trit::ZERO; 8])
+            .collect(),
+        vec![f32::MAX; 6],
+    )
+    .unwrap();
+    let (handle, caps) = backend
+        .upload_tensor_checked(
+            TensorView::Additive(cancelling.view()),
+            TensorUploadPolicy {
+                native_only: true,
+                max_payload_bytes: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(caps.execution, TensorExecution::Native);
+    let mut out = [99.; 8];
+    backend.embed_rows(&*handle, &[0, 1], &mut out).unwrap();
+    assert_eq!(out, [0.; 8]);
 }
