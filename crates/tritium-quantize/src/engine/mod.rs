@@ -30,7 +30,7 @@ pub use model::{
     Engine, PublicationWarning, QuantEngineError, QuantizedModel, TensorSink, WeightSource,
     verify_package_with_fit_log,
 };
-pub use sinks::{DirectoryTensorSink, MemoryTensorSink};
+pub use sinks::{DirectoryTensorSink, MemoryTensorSink, TritModelPublicationError};
 pub use source_stage::{PublishedSalienceStage, StagedSalienceSource};
 pub use source_transform::{
     DeclaredSalienceStatistics, DerivedSalienceSource, RecordedSalienceSource, SalienceSourceError,

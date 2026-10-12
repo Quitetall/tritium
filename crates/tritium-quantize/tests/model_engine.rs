@@ -3,6 +3,8 @@
 mod calibrated;
 #[path = "model_engine/observed.rs"]
 mod observed;
+#[path = "model_engine/spool_publish.rs"]
+mod spool_publish;
 use std::{collections::BTreeMap, io::Cursor};
 use tritium_evidence::{
     DIRECT_LEVELS_FITTED_REGISTRATION, EvidenceRecorder, QUANTIZATION_COMPLETED_REGISTRATION,

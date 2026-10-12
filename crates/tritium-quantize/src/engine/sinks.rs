@@ -2,10 +2,51 @@
 use super::{PublicationWarning, QuantEngineError, TensorSink};
 use std::{
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Seek, Write},
     path::PathBuf,
 };
 use tritium_evidence::SealedEvidence;
+use tritium_format::trit_model::{
+    TritModelReader, TritModelStageError, stage_trit_model_from_spool,
+};
+use tritium_format::{TritPackageReadLimits, TritSpoolBlob};
+use tritium_schema::ModelManifest;
+
+/// Original typed staging refusal or failure before the no-clobber commit.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum TritModelPublicationError<E> {
+    /// Shared model/spool/output validation or original source guard failure.
+    Staging(TritModelStageError<E>),
+    /// Existing directory publication error; post-commit caveats are warnings.
+    Publication(QuantEngineError),
+}
+impl<E: core::fmt::Display> core::fmt::Display for TritModelPublicationError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Staging(error) => error.fmt(f),
+            Self::Publication(error) => error.fmt(f),
+        }
+    }
+}
+impl<E: std::error::Error + 'static> std::error::Error for TritModelPublicationError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Staging(error) => Some(error),
+            Self::Publication(error) => Some(error),
+        }
+    }
+}
+
+enum WriteFailure<E> {
+    Emitter(E),
+    Publication(QuantEngineError),
+}
+impl<E> From<std::io::Error> for WriteFailure<E> {
+    fn from(error: std::io::Error) -> Self {
+        Self::Publication(QuantEngineError::Io(error))
+    }
+}
 
 /// Owned in-memory destination, refusing a second publication.
 #[derive(Debug, Default)]
@@ -65,12 +106,59 @@ impl DirectoryTensorSink {
         evidence: &SealedEvidence,
         emit: impl FnOnce(&mut File) -> Result<R, QuantEngineError>,
     ) -> Result<(R, Vec<PublicationWarning>), QuantEngineError> {
+        self.publish_with_emitter(evidence, false, emit)
+            .map_err(|error| match error {
+                WriteFailure::Emitter(error) | WriteFailure::Publication(error) => error,
+            })
+    }
+
+    /// Validate bounded spool output before the existing sync/no-clobber commit.
+    ///
+    /// Uses the same publisher as ordinary/recorded-stage writers and the format
+    /// module's shared typed staging seam. Retains a clone of the owned pending
+    /// File handle, not its pathname or a complete package Vec. Original typed
+    /// staging/source guard errors stay distinct from filesystem errors.
+    ///
+    /// Caller must admit the actual sealed log/model/source binding and immutable
+    /// source/spool/parent-directory custody. This sink does not authenticate fit
+    /// provenance, admit joined profiles, create an atomic external-writer snapshot,
+    /// authorize distribution or clear quality/security/power-loss/RSS gates.
+    /// Successful publication with post-commit trouble returns explicit warnings.
+    /// # Errors
+    /// Existing destination, staging/source/guard failure or pre-commit filesystem
+    /// failure; common cleanup removes only owned log/pending paths.
+    pub fn publish_spooled_model<S: Read + Seek, E>(
+        &mut self,
+        manifest: &ModelManifest,
+        blobs: &[TritSpoolBlob],
+        spool: &mut S,
+        limits: TritPackageReadLimits,
+        evidence: &SealedEvidence,
+        source_guard: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(TritModelReader<File>, Vec<PublicationWarning>), TritModelPublicationError<E>>
+    {
+        self.publish_with_emitter(evidence, true, |file| {
+            let destination = file.try_clone().map_err(TritModelStageError::Destination)?;
+            stage_trit_model_from_spool(manifest, blobs, spool, limits, destination, source_guard)
+        })
+        .map_err(|error| match error {
+            WriteFailure::Emitter(error) => TritModelPublicationError::Staging(error),
+            WriteFailure::Publication(error) => TritModelPublicationError::Publication(error),
+        })
+    }
+
+    fn publish_with_emitter<R, E>(
+        &mut self,
+        evidence: &SealedEvidence,
+        readable: bool,
+        emit: impl FnOnce(&mut File) -> Result<R, E>,
+    ) -> Result<(R, Vec<PublicationWarning>), WriteFailure<E>> {
         fs::create_dir(&self.directory).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
+            WriteFailure::Publication(if e.kind() == std::io::ErrorKind::AlreadyExists {
                 QuantEngineError::DestinationExists
             } else {
                 QuantEngineError::Io(e)
-            }
+            })
         })?;
         let log = self.directory.join("evidence.jsonl");
         let pending = self.directory.join(".pending.trit");
@@ -83,14 +171,15 @@ impl DirectoryTensorSink {
             file.write_all(evidence.jsonl().as_bytes())?;
             file.sync_all()?;
             let mut file = OpenOptions::new()
+                .read(readable)
                 .write(true)
                 .create_new(true)
                 .open(&pending)?;
             owned_pending = true;
-            let value = emit(&mut file)?;
+            let value = emit(&mut file).map_err(WriteFailure::Emitter)?;
             file.sync_all()?;
             fs::hard_link(&pending, &model)?;
-            Ok::<R, QuantEngineError>(value)
+            Ok::<R, WriteFailure<E>>(value)
         })();
         let value = match result {
             Ok(value) => value,
