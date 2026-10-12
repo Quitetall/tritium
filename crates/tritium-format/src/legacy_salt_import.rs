@@ -1,6 +1,9 @@
 //! Lossless logical SALT import; container identity/basis/provenance belong to its caller.
 mod v2;
-pub use v2::import_salt_v2_tensor;
+pub use v2::{
+    SaltTensorSpoolError, SaltTensorSpoolImport, SaltTensorSpoolLimits, import_salt_v2_tensor,
+    import_salt_v2_tensor_to_spool,
+};
 
 use half::f16;
 use tritium_core::{PerTilePlan, Trit};

@@ -110,7 +110,8 @@ pub use i2s_int8::{
     I2sInt8Weights, IMMA_K, IMMA_N, IMMA_WTILE_BYTES, convert_i2s_to_int8, convert_i2s_to_tq2_0,
 };
 pub use legacy_salt_import::{
-    SaltTensorImportError, SaltTensorImportLimits, import_salt_rows, import_salt_v2_tensor,
+    SaltTensorImportError, SaltTensorImportLimits, SaltTensorSpoolError, SaltTensorSpoolImport,
+    SaltTensorSpoolLimits, import_salt_rows, import_salt_v2_tensor, import_salt_v2_tensor_to_spool,
 };
 pub use q2_0::{
     Q2_0_BLOCK_BYTES, Q2_0_GROUP_SIZE, pack_q2_0_block, pack_q2_0_row, q2_0_num_blocks,

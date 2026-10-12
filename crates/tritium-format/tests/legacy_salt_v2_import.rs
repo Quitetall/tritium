@@ -1,10 +1,11 @@
 use std::cell::{Cell, RefCell};
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::rc::Rc;
 
 use half::f16;
 use tritium_format::{
-    AdditiveTensor, SaltTensorImportError as Error, SaltTensorImportLimits, import_salt_v2_tensor,
+    AdditiveTensor, SaltTensorImportError as Error, SaltTensorImportLimits, SaltTensorSpoolError,
+    SaltTensorSpoolLimits, import_salt_v2_tensor, import_salt_v2_tensor_to_spool,
     salt_v2::SaltV2Codec,
     salt_v2_package::{
         SaltV2Package, SaltV2PackageReadError, SaltV2PackageReader, SaltV2Plane, SaltV2Tensor,
@@ -23,6 +24,40 @@ fn limits() -> SaltTensorImportLimits {
         max_scales: 1_000_000,
         max_owned_bytes: 1_000_000,
     }
+}
+
+fn spool_limits() -> SaltTensorSpoolLimits {
+    SaltTensorSpoolLimits {
+        max_source_bytes: 1_000_000,
+        max_trits: 1_000_000,
+        max_scales: 1_000_000,
+        max_working_bytes: 2_000_000,
+        max_payload_bytes: 1_000_000,
+    }
+}
+
+fn check_spooled<R: Read + Seek>(reader: &mut SaltV2PackageReader<R>, migrated: &AdditiveTensor) {
+    let mut spool = Cursor::new(vec![42; 17]);
+    spool.set_position(17);
+    let staged = import_salt_v2_tensor_to_spool(
+        reader,
+        "weight",
+        migrated.layout(),
+        spool_limits(),
+        &mut spool,
+    )
+    .unwrap();
+    assert_eq!(
+        staged.tile_counts.as_slice(),
+        migrated.tile_counts().unwrap()
+    );
+    assert_eq!(staged.blob.offset, 17);
+    let bytes = &spool.get_ref()[17..];
+    assert_eq!(staged.blob.length, bytes.len() as u64);
+    assert_eq!(bytes, migrated.encode_payload().unwrap());
+    assert_eq!(staged.blob.id.as_bytes(), blake3::hash(bytes).as_bytes());
+    assert_eq!(&spool.get_ref()[..17], &[42; 17]);
+    assert_eq!(spool.position(), spool.get_ref().len() as u64);
 }
 
 fn layout(rows: u64, cols: u64) -> AdditiveLayout {
@@ -205,6 +240,7 @@ fn every_source_codec_and_scale_group_preserves_exact_ragged_and_variable_data()
                             )
                             .unwrap();
                             check(&source, &migrated);
+                            check_spooled(&mut reader, &migrated);
                             reader.verify_unchanged().unwrap();
                             assert_eq!(before, reader.package_id());
                             drop(reader);
@@ -457,6 +493,463 @@ fn short_reads_and_fill_pass_failures_do_not_return_unverified_output() {
         }
         assert!(max_request.get() <= 64 * 1024);
     }
+}
+
+#[test]
+fn spooled_source_fill_faults_and_changes_do_not_return_a_blob() {
+    let source = tensor(2, 256, &[1, 3]);
+    for action in ["unchanged", "fail-fill", "change-fill"] {
+        let cursor = Rc::new(RefCell::new(Cursor::new(encoded(&source, SaltV2Codec::D2))));
+        let armed = Rc::new(Cell::new(false));
+        let zero_seeks = Rc::new(Cell::new(0));
+        let mut reader = SaltV2PackageReader::new_strict(SharedSource {
+            cursor,
+            armed: armed.clone(),
+            zero_seeks: zero_seeks.clone(),
+            max_request: Rc::new(Cell::new(0)),
+            fail_fill: action == "fail-fill",
+            replacement: (action == "change-fill")
+                .then(|| encoded(&changed(&source), SaltV2Codec::D2)),
+        })
+        .unwrap();
+        armed.set(true);
+        let mut spool = Cursor::new(vec![42; 17]);
+        spool.set_position(17);
+        let result = import_salt_v2_tensor_to_spool(
+            &mut reader,
+            "weight",
+            layout(2, 256),
+            spool_limits(),
+            &mut spool,
+        );
+        assert_eq!(zero_seeks.get(), 2);
+        if action == "unchanged" {
+            result.unwrap();
+        } else {
+            assert!(matches!(
+                result,
+                Err(SaltTensorSpoolError::Import(Error::Read(_)))
+            ));
+        }
+        assert_eq!(&spool.get_ref()[..17], &[42; 17]);
+    }
+}
+
+#[test]
+fn spooled_caps_partitions_and_append_admission_do_not_change_existing_bytes() {
+    for (source, target, cap) in [
+        (tensor(2, 257, &[1, 2, 3]), layout(2, 257), spool_limits()),
+        (
+            fixture(&[2, 257], &[1, 1, 1], 128, true, true),
+            layout(2, 257),
+            spool_limits(),
+        ),
+        (
+            tensor(2, 256, &[1, 3]),
+            layout(2, 256),
+            SaltTensorSpoolLimits {
+                max_source_bytes: 1,
+                ..spool_limits()
+            },
+        ),
+        (
+            tensor(2, 256, &[1, 3]),
+            layout(2, 256),
+            SaltTensorSpoolLimits {
+                max_trits: 1,
+                ..spool_limits()
+            },
+        ),
+        (
+            tensor(2, 256, &[1, 3]),
+            layout(2, 256),
+            SaltTensorSpoolLimits {
+                max_scales: 1,
+                ..spool_limits()
+            },
+        ),
+        (
+            tensor(2, 256, &[1, 3]),
+            layout(2, 256),
+            SaltTensorSpoolLimits {
+                max_working_bytes: 1,
+                ..spool_limits()
+            },
+        ),
+        (
+            tensor(2, 256, &[1, 3]),
+            layout(2, 256),
+            SaltTensorSpoolLimits {
+                max_payload_bytes: 1,
+                ..spool_limits()
+            },
+        ),
+    ] {
+        let mut reader =
+            SaltV2PackageReader::new_strict(Cursor::new(encoded(&source, SaltV2Codec::B3)))
+                .unwrap();
+        let mut spool = Cursor::new(vec![42; 17]);
+        spool.set_position(17);
+        assert!(
+            import_salt_v2_tensor_to_spool(&mut reader, "weight", target, cap, &mut spool).is_err()
+        );
+        assert_eq!(spool.into_inner(), vec![42; 17]);
+    }
+    let mut reader = SaltV2PackageReader::new_strict(Cursor::new(encoded(
+        &tensor(2, 256, &[1, 3]),
+        SaltV2Codec::B3,
+    )))
+    .unwrap();
+    let mut spool = Cursor::new(vec![42; 17]);
+    spool.set_position(3);
+    assert!(matches!(
+        import_salt_v2_tensor_to_spool(
+            &mut reader,
+            "weight",
+            layout(2, 256),
+            spool_limits(),
+            &mut spool
+        ),
+        Err(SaltTensorSpoolError::Import(Error::Unsupported(
+            "spool must append at its current end"
+        )))
+    ));
+    assert_eq!(spool.into_inner(), vec![42; 17]);
+}
+
+#[test]
+fn spool_exact_conservative_caps_pass_and_one_byte_short_refuses_before_writes() {
+    let source = tensor(2, 256, &[1, 3]);
+    let mut reader =
+        SaltV2PackageReader::new_strict(Cursor::new(encoded(&source, SaltV2Codec::D2))).unwrap();
+    let owned = import_salt_v2_tensor(&mut reader, "weight", layout(2, 256), limits()).unwrap();
+    let info = reader.tensor_info("weight").unwrap();
+    let mut caps = SaltTensorSpoolLimits {
+        max_source_bytes: info.encoded_payload_bytes() + info.encoded_scale_bytes(),
+        max_trits: owned.trits().len() as u64,
+        max_scales: owned.scales().len() as u64,
+        max_payload_bytes: owned.encode_payload().unwrap().len() as u64,
+        max_working_bytes: 1000,
+    };
+    let mut empty = Cursor::new(Vec::new());
+    let error =
+        import_salt_v2_tensor_to_spool(&mut reader, "weight", layout(2, 256), caps, &mut empty)
+            .unwrap_err();
+    let SaltTensorSpoolError::Import(Error::Limit {
+        resource: "spool working bytes",
+        required,
+        ..
+    }) = error
+    else {
+        panic!("exact working admission")
+    };
+    assert!(empty.into_inner().is_empty());
+    caps.max_working_bytes = required;
+    import_salt_v2_tensor_to_spool(
+        &mut reader,
+        "weight",
+        layout(2, 256),
+        caps,
+        &mut Cursor::new(Vec::new()),
+    )
+    .unwrap();
+    for cap in [
+        SaltTensorSpoolLimits {
+            max_source_bytes: caps.max_source_bytes - 1,
+            ..caps
+        },
+        SaltTensorSpoolLimits {
+            max_trits: caps.max_trits - 1,
+            ..caps
+        },
+        SaltTensorSpoolLimits {
+            max_scales: caps.max_scales - 1,
+            ..caps
+        },
+        SaltTensorSpoolLimits {
+            max_working_bytes: caps.max_working_bytes - 1,
+            ..caps
+        },
+        SaltTensorSpoolLimits {
+            max_payload_bytes: caps.max_payload_bytes - 1,
+            ..caps
+        },
+    ] {
+        let mut spool = Cursor::new(vec![42; 17]);
+        spool.set_position(17);
+        assert!(matches!(
+            import_salt_v2_tensor_to_spool(&mut reader, "weight", layout(2, 256), cap, &mut spool),
+            Err(SaltTensorSpoolError::Import(Error::Limit { .. }))
+        ));
+        assert_eq!(spool.into_inner(), vec![42; 17]);
+    }
+}
+
+#[test]
+fn spooled_variable_tiles_and_partial_words_are_not_padded_between_rows() {
+    for (cols, counts) in [
+        (1, vec![1]),
+        (256, vec![1, 3]),
+        (257, vec![1, 1, 1]),
+        (512, vec![1, 3, 2, 1]),
+        (3, vec![1]),
+        (255, vec![3]),
+    ] {
+        let rows = if cols == 255 || cols == 3 { 1 } else { 2 };
+        let source = tensor(rows, cols, &counts);
+        for codec in [PlaneCodec::D2, PlaneCodec::B3] {
+            let mut reader =
+                SaltV2PackageReader::new_strict(Cursor::new(encoded(&source, SaltV2Codec::B3)))
+                    .unwrap();
+            let target = AdditiveLayout {
+                codec,
+                ..layout(rows as u64, cols as u64)
+            };
+            let owned = import_salt_v2_tensor(&mut reader, "weight", target, limits()).unwrap();
+            check_spooled(&mut reader, &owned);
+        }
+    }
+}
+
+struct FaultSpool {
+    cursor: Cursor<Vec<u8>>,
+    mode: &'static str,
+    wrote: usize,
+}
+impl Read for FaultSpool {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        assert!(out.len() <= 65536);
+        if self.mode == "read" {
+            return Err(std::io::Error::other("spool read fault"));
+        }
+        let len = out.len().min(7);
+        self.cursor.read(&mut out[..len])
+    }
+}
+impl Write for FaultSpool {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.mode == "write" && self.wrote >= 7 {
+            return Err(std::io::Error::other("spool write fault"));
+        }
+        if self.mode == "zero" {
+            return Ok(0);
+        }
+        let len = bytes.len().min(7);
+        let n = self.cursor.write(&bytes[..len])?;
+        if self.mode == "corrupt" && n != 0 {
+            let index = self.cursor.position() as usize - n;
+            self.cursor.get_mut()[index] ^= 1;
+        }
+        self.wrote += n;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        panic!("caller owns flush/sync")
+    }
+}
+impl Seek for FaultSpool {
+    fn seek(&mut self, at: SeekFrom) -> std::io::Result<u64> {
+        if self.mode == "seek" && matches!(at, SeekFrom::Start(_)) {
+            return Err(std::io::Error::other("spool seek fault"));
+        }
+        self.cursor.seek(at)
+    }
+}
+
+#[test]
+fn spool_io_or_corruption_returns_no_blob_and_preserves_prior_ranges() {
+    for mode in ["short", "write", "zero", "read", "seek", "corrupt"] {
+        let mut reader = SaltV2PackageReader::new_strict(Cursor::new(encoded(
+            &tensor(2, 256, &[1, 3]),
+            SaltV2Codec::D2,
+        )))
+        .unwrap();
+        let mut spool = FaultSpool {
+            cursor: Cursor::new(vec![42; 17]),
+            mode,
+            wrote: 0,
+        };
+        spool.cursor.set_position(17);
+        let result = import_salt_v2_tensor_to_spool(
+            &mut reader,
+            "weight",
+            layout(2, 256),
+            spool_limits(),
+            &mut spool,
+        );
+        match mode {
+            "short" => {
+                result.unwrap();
+            }
+            "corrupt" => assert!(matches!(result, Err(SaltTensorSpoolError::DigestMismatch))),
+            _ => assert!(matches!(result, Err(SaltTensorSpoolError::Io(_)))),
+        }
+        assert_eq!(&spool.cursor.get_ref()[..17], &[42; 17]);
+    }
+}
+
+#[test]
+fn actual_file_staging_uses_bounded_codec_buffers_and_cleans_up() {
+    struct Guard(std::path::PathBuf);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let path = std::env::temp_dir().join(format!("tritium-v2-spool-{}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    let guard = Guard(path.clone());
+    file.write_all(&[42; 17]).unwrap();
+    // Force both coefficient and scale buffers to flush before finalization.
+    let source = tensor(1, 256 * 65536, &vec![3; 65536]);
+    let bytes = encoded(&source, SaltV2Codec::B3);
+    let mut reader = SaltV2PackageReader::new_strict(Cursor::new(bytes)).unwrap();
+    let caps = SaltTensorSpoolLimits {
+        max_source_bytes: 100_000_000,
+        max_trits: 100_000_000,
+        max_scales: 10_000_000,
+        max_payload_bytes: 100_000_000,
+        ..spool_limits()
+    };
+    let result = import_salt_v2_tensor_to_spool(
+        &mut reader,
+        "weight",
+        layout(1, 256 * 65536),
+        caps,
+        &mut file,
+    )
+    .unwrap();
+    drop(reader);
+    file.seek(SeekFrom::Start(17)).unwrap();
+    let mut actual = Vec::new();
+    file.read_to_end(&mut actual).unwrap();
+    assert_eq!(actual.len() as u64, result.blob.length);
+    assert_eq!(blake3::hash(&actual).as_bytes(), result.blob.id.as_bytes());
+    let decoded = AdditiveTensor::decode_per_tile_payload(
+        layout(1, 256 * 65536),
+        &result.tile_counts,
+        &actual,
+    )
+    .unwrap();
+    check(&source, &decoded);
+    drop(file);
+    drop(guard);
+    assert!(!path.exists());
+}
+
+#[test]
+fn staged_legacy_tensor_dense_and_assets_reopen_as_one_imported_typed_package() {
+    use tritium_format::trit_model::{encode_model_manifest, read_trit_model};
+    use tritium_format::{TritBlobKind, TritSpoolBlob, write_trit_package_from_spool};
+    use tritium_schema::{
+        BlobId, BlobReference, LegacyModelIdentity, Level, LevelFit, ManifestAsset, ModelManifest,
+        PlaneCounts, SchemaId, TensorMeta, TensorStorage,
+    };
+    let source = tensor(2, 257, &[1, 1, 1]);
+    let mut reader =
+        SaltV2PackageReader::new_strict(Cursor::new(encoded(&source, SaltV2Codec::B3))).unwrap();
+    let legacy = reader.package_id().to_string();
+    let mut spool = Cursor::new(Vec::new());
+    let target = AdditiveLayout {
+        codec: PlaneCodec::B3,
+        ..layout(2, 257)
+    };
+    let staged =
+        import_salt_v2_tensor_to_spool(&mut reader, "weight", target, spool_limits(), &mut spool)
+            .unwrap();
+    let reference = |id| BlobReference { id, shard: None };
+    let additive = TensorMeta {
+        name: "weight".into(),
+        blob: reference(staged.blob.id),
+        storage: TensorStorage::Additive {
+            layout: target,
+            planes: PlaneCounts::PerTile(staged.tile_counts),
+        },
+    };
+    let mut blobs = vec![staged.blob];
+    let dense_bytes = half::f16::from_f32(1.).to_bits().to_le_bytes();
+    let dense = TritSpoolBlob {
+        kind: TritBlobKind::DenseTensor(tritium_core::DType::F16),
+        id: BlobId::from_bytes(*blake3::hash(&dense_bytes).as_bytes()),
+        offset: spool.position(),
+        length: 2,
+    };
+    spool.write_all(&dense_bytes).unwrap();
+    let dense_meta = TensorMeta {
+        name: "preserved".into(),
+        blob: reference(dense.id),
+        storage: TensorStorage::Dense {
+            shape: vec![1],
+            precision: ScalePrecision::F16,
+        },
+    };
+    blobs.push(dense);
+    let mut assets = Vec::new();
+    for name in ["config.json", "tokenizer.json"] {
+        let asset = TritSpoolBlob {
+            kind: TritBlobKind::Asset(name.into()),
+            id: BlobId::from_bytes(*blake3::hash(b"{}").as_bytes()),
+            offset: spool.position(),
+            length: 2,
+        };
+        spool.write_all(b"{}").unwrap();
+        assets.push(ManifestAsset {
+            name: name.into(),
+            blob: reference(asset.id),
+        });
+        blobs.push(asset);
+    }
+    let manifest = ModelManifest {
+        schema: SchemaId { major: 1, minor: 0 },
+        architecture: "llama".into(),
+        assets,
+        levels: vec![Level {
+            name: "imported".into(),
+            fit: LevelFit::Imported,
+            tensors: vec![additive, dense_meta],
+        }],
+        shards: vec![],
+        legacy_ids: vec![LegacyModelIdentity {
+            id: legacy.clone(),
+            level: "imported".into(),
+        }],
+    };
+    reader.verify_unchanged().unwrap(); // model caller, once before publication
+    drop(reader);
+    let mut output = Vec::new();
+    let id = write_trit_package_from_spool(
+        &encode_model_manifest(&manifest).unwrap(),
+        &blobs,
+        &mut spool,
+        1_000_000,
+        &mut output,
+    )
+    .unwrap();
+    let model = read_trit_model(&output).unwrap();
+    model.validate_complete_payload_inventory().unwrap();
+    assert_eq!(model.package_id(), id);
+    assert_eq!(model.manifest().legacy_ids[0].id, legacy);
+    assert_eq!(model.manifest().levels[0].fit, LevelFit::Imported);
+    assert_eq!(
+        model.tensor("imported", "preserved").unwrap().1,
+        &dense_bytes
+    );
+    let (meta, payload) = model.tensor("imported", "weight").unwrap();
+    let TensorStorage::Additive {
+        layout,
+        planes: PlaneCounts::PerTile(counts),
+    } = &meta.storage
+    else {
+        panic!("actual compact metadata")
+    };
+    let recovered = AdditiveTensor::decode_per_tile_payload(*layout, counts, payload).unwrap();
+    check(&source, &recovered);
+    // Tiny structural assets do not claim runnable architecture/Qwen/release gates.
 }
 
 #[test]
