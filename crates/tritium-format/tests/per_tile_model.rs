@@ -6,7 +6,10 @@ use tritium_format::trit_model::{
     TritModelError, additive_semantic_digest, decode_additive_payload, encode_model_manifest,
     read_trit_model,
 };
-use tritium_format::{AdditiveTensor, TritBlob, TritBlobKind, write_trit_package};
+use tritium_format::{
+    AdditiveTensor, TritBlob, TritBlobKind, TritSpoolBlob, read_trit_package, write_trit_package,
+    write_trit_package_from_spool,
+};
 use tritium_schema::{
     ADMITTED_LAWS, AdditiveLayout, Basis, BlobId, BlobReference, Level, LevelFit, ManifestAsset,
     ModelManifest, PlaneAllocation, PlaneCodec, PlaneCounts, PlaneRelation, ScaleAnchor, SchemaId,
@@ -187,6 +190,81 @@ fn complete_compact_packages_bind_exact_counts_and_reuse_real_payloads() {
                     assert_eq!(model.manifest().levels[0].fit, LevelFit::Imported);
                     let again = one(&decoded);
                     assert_eq!(again, source);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn seekable_sources_preserve_complete_typed_model_bytes_ids_and_scale_bits() {
+    for &law in ADMITTED_LAWS {
+        for group in [32, 128] {
+            for cols in [1, 257, 512] {
+                for codec in [PlaneCodec::D2, PlaneCodec::B3] {
+                    let l = AdditiveLayout {
+                        codec,
+                        ..layout(law, cols, group)
+                    };
+                    let counts: Vec<_> = (0..2 * (cols as usize).div_ceil(256))
+                        .map(|i| (i % (usize::from(law.max_planes) + 1)) as u8)
+                        .collect();
+                    for counts in [counts, vec![0; 2 * (cols as usize).div_ceil(256)]] {
+                        let original = tensor(l, Some(&counts), 0);
+                        let source = one(&original);
+                        let package = read_trit_package(&source).unwrap();
+                        let ranges: Vec<_> = package
+                            .blobs()
+                            .iter()
+                            .map(|blob| TritSpoolBlob {
+                                kind: blob.kind.clone(),
+                                id: blob.id,
+                                offset: blob.offset,
+                                length: blob.length,
+                            })
+                            .collect();
+                        let mut output = Vec::new();
+                        let id = write_trit_package_from_spool(
+                            package.manifest(),
+                            &ranges,
+                            &mut std::io::Cursor::new(source.as_slice()),
+                            source.len(),
+                            &mut output,
+                        )
+                        .unwrap();
+                        assert_eq!(output, source);
+                        assert_eq!(id, package.package_id());
+                        let model = read_trit_model(&output).unwrap();
+                        model.validate_complete_payload_inventory().unwrap();
+                        assert_eq!(model.manifest().levels[0].fit, LevelFit::Imported);
+                        let (_, payload) = model.tensor("imported", NAME).unwrap();
+                        let decoded =
+                            AdditiveTensor::decode_per_tile_payload(l, &counts, payload).unwrap();
+                        assert_eq!(decoded.trits(), original.trits());
+                        assert_eq!(
+                            decoded
+                                .scales()
+                                .iter()
+                                .map(|x| x.to_bits())
+                                .collect::<Vec<_>>(),
+                            original
+                                .scales()
+                                .iter()
+                                .map(|x| x.to_bits())
+                                .collect::<Vec<_>>()
+                        );
+                        assert_eq!(
+                            model.tensor_digest("imported", NAME).unwrap(),
+                            additive_semantic_digest(&original).unwrap()
+                        );
+                        assert_eq!(
+                            model.model_id("imported").unwrap(),
+                            read_trit_model(&source)
+                                .unwrap()
+                                .model_id("imported")
+                                .unwrap()
+                        );
+                    }
                 }
             }
         }

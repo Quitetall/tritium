@@ -46,6 +46,22 @@ pub struct TritBlob<'a> {
     pub bytes: &'a [u8],
 }
 
+/// A content-addressed blob range in a caller-owned seekable staging spool.
+/// The writer checks the declared identity against actual bytes; metadata alone
+/// is not trusted. Offsets are relative to the start of the source, not its
+/// current cursor. Bytes outside referenced ranges are not package inputs.
+#[derive(Clone, Debug)]
+pub struct TritSpoolBlob {
+    /// Semantic kind recorded in the package directory.
+    pub kind: TritBlobKind,
+    /// Expected BLAKE3 identity of the exact range.
+    pub id: BlobId,
+    /// Source byte offset.
+    pub offset: u64,
+    /// Exact source byte length.
+    pub length: u64,
+}
+
 /// Indexed package entry for one blob kind.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TritBlobInfo {
@@ -235,10 +251,15 @@ pub fn write_trit_package_bounded(
         .map_err(|_| TritPackageError::AllocationFailed {
             requested: plan.size,
         })?;
-    let result: Result<(), core::convert::Infallible> = plan.emit(|bytes| {
-        output.extend_from_slice(bytes);
-        Ok(())
-    });
+    let result: Result<(), core::convert::Infallible> = plan.emit(
+        &mut (),
+        |bytes| {
+            output.extend_from_slice(bytes);
+            Ok(())
+        },
+        |index, _, chunk| chunk(blobs[index].bytes),
+        |_| Ok(()),
+    );
     match result {
         Ok(()) => Ok(output),
         Err(never) => match never {},
@@ -249,16 +270,19 @@ pub fn write_trit_package_bounded(
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum TritPackageWriteError {
-    /// Invalid package input or complete physical byte bound, before any write.
+    /// Invalid package input or bound; spool mutation may be detected after writes.
     Package(TritPackageError),
     /// Destination failed after zero or more bytes; no success identity is returned.
     Io(std::io::Error),
+    /// Seekable staging source failed; pending destination bytes may remain.
+    Source(std::io::Error),
 }
 impl fmt::Display for TritPackageWriteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Package(e) => e.fmt(f),
             Self::Io(e) => write!(f, "trit package destination failed: {e}"),
+            Self::Source(e) => write!(f, "trit package staging source failed: {e}"),
         }
     }
 }
@@ -267,6 +291,7 @@ impl std::error::Error for TritPackageWriteError {
         match self {
             Self::Package(e) => Some(e),
             Self::Io(e) => Some(e),
+            Self::Source(e) => Some(e),
         }
     }
 }
@@ -292,33 +317,208 @@ pub fn write_trit_package_to(
     let plan =
         prepare_write(manifest_cbor, blobs, max_bytes).map_err(TritPackageWriteError::Package)?;
     let mut hash = PackageHasher::new();
-    plan.emit(|bytes| {
-        destination.write_all(bytes)?;
-        hash.update(bytes);
-        Ok(())
-    })
+    plan.emit(
+        &mut (),
+        |bytes| {
+            destination.write_all(bytes)?;
+            hash.update(bytes);
+            Ok(())
+        },
+        |index, _, chunk| chunk(blobs[index].bytes),
+        |_| Ok(()),
+    )
     .map_err(TritPackageWriteError::Io)?;
     Ok(hash.finalize())
 }
 
+const SPOOL_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Write the identical canonical package from bounded seekable spool ranges.
+///
+/// Complete size/metadata/range admission and every source digest and duplicate
+/// byte comparison finish before destination writes. Unique payloads are hashed
+/// again while emitting, and all ranges are re-verified before the footer. Source
+/// payload reads use at most two fixed 64 KiB buffers, independent of model size;
+/// directory/manifest metadata is still retained under its existing limits.
+///
+/// The caller owns spool immutability, aggregate memory/disk admission and an
+/// unpublished destination. This does not create an atomic source snapshot,
+/// seek/flush/sync the destination or publish it. Source cursor position changes.
+/// # Errors
+/// Admission errors leave the destination untouched. Later source mutation or
+/// source/destination I/O may leave partial bytes, never a success PackageId.
+pub fn write_trit_package_from_spool(
+    manifest_cbor: &[u8],
+    blobs: &[TritSpoolBlob],
+    source: &mut (impl std::io::Read + std::io::Seek),
+    max_bytes: usize,
+    destination: &mut impl std::io::Write,
+) -> Result<PackageId, TritPackageWriteError> {
+    let entries = blob_metadata(manifest_cbor, blobs.len(), |index| {
+        let blob = &blobs[index];
+        Ok(BlobMetadata {
+            id: blob.id,
+            kind: blob.kind.clone(),
+            length: as_usize(blob.length)?,
+        })
+    })
+    .map_err(TritPackageWriteError::Package)?;
+    let plan = prepare_layout(manifest_cbor, &entries, max_bytes)
+        .map_err(TritPackageWriteError::Package)?;
+    let source_len = source
+        .seek(std::io::SeekFrom::End(0))
+        .map_err(TritPackageWriteError::Source)?;
+    for blob in blobs {
+        let end = blob
+            .offset
+            .checked_add(blob.length)
+            .ok_or(TritPackageWriteError::Package(
+                TritPackageError::LengthOverflow,
+            ))?;
+        if end > source_len {
+            return Err(TritPackageWriteError::Package(TritPackageError::Truncated));
+        }
+    }
+    // Allocate no blob-size buffer. Both buffers also serve collision comparisons.
+    let mut state = (source, ([0u8; SPOOL_CHUNK_BYTES], [0u8; SPOOL_CHUNK_BYTES]));
+    verify_spool(state.0, blobs, &mut state.1)?;
+    let mut hash = PackageHasher::new();
+    plan.emit(
+        &mut state,
+        |bytes| {
+            destination
+                .write_all(bytes)
+                .map_err(TritPackageWriteError::Io)?;
+            hash.update(bytes);
+            Ok(())
+        },
+        |index, state, chunk| visit_spool_blob(state.0, &blobs[index], &mut state.1.0, chunk),
+        |state| {
+            // Include non-emitted aliases. A mutation there must not be hidden by dedup.
+            verify_spool(state.0, blobs, &mut state.1)
+        },
+    )?;
+    Ok(hash.finalize())
+}
+
+fn seek_spool(source: &mut impl std::io::Seek, offset: u64) -> Result<(), TritPackageWriteError> {
+    let actual = source
+        .seek(std::io::SeekFrom::Start(offset))
+        .map_err(TritPackageWriteError::Source)?;
+    if actual != offset {
+        return Err(TritPackageWriteError::Package(
+            TritPackageError::InvalidDirectory,
+        ));
+    }
+    Ok(())
+}
+
+fn visit_spool_blob(
+    source: &mut (impl std::io::Read + std::io::Seek),
+    blob: &TritSpoolBlob,
+    scratch: &mut [u8; SPOOL_CHUNK_BYTES],
+    mut chunk: impl FnMut(&[u8]) -> Result<(), TritPackageWriteError>,
+) -> Result<(), TritPackageWriteError> {
+    seek_spool(source, blob.offset)?;
+    let mut remaining = blob.length;
+    let mut hash = blake3::Hasher::new();
+    while remaining != 0 {
+        let count = remaining.min(SPOOL_CHUNK_BYTES as u64) as usize;
+        let bytes = &mut scratch[..count];
+        source
+            .read_exact(bytes)
+            .map_err(TritPackageWriteError::Source)?;
+        hash.update(bytes);
+        chunk(bytes)?;
+        remaining -= count as u64;
+    }
+    if hash.finalize().as_bytes() != blob.id.as_bytes() {
+        return Err(TritPackageWriteError::Package(
+            TritPackageError::BlobDigestMismatch(blob.id),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_spool(
+    source: &mut (impl std::io::Read + std::io::Seek),
+    blobs: &[TritSpoolBlob],
+    scratch: &mut ([u8; SPOOL_CHUNK_BYTES], [u8; SPOOL_CHUNK_BYTES]),
+) -> Result<(), TritPackageWriteError> {
+    let mut unique = BTreeMap::<[u8; 32], usize>::new();
+    for (index, blob) in blobs.iter().enumerate() {
+        visit_spool_blob(source, blob, &mut scratch.0, |_| Ok(()))?;
+        if let Some(&other) = unique.get(blob.id.as_bytes()) {
+            let other = &blobs[other];
+            if other.length != blob.length {
+                return Err(TritPackageWriteError::Package(
+                    TritPackageError::BlobIdentityCollision,
+                ));
+            }
+            if other.offset == blob.offset {
+                continue;
+            }
+            let mut position = 0;
+            while position < blob.length {
+                let count = (blob.length - position).min(SPOOL_CHUNK_BYTES as u64) as usize;
+                seek_spool(source, other.offset + position)?;
+                source
+                    .read_exact(&mut scratch.0[..count])
+                    .map_err(TritPackageWriteError::Source)?;
+                seek_spool(source, blob.offset + position)?;
+                source
+                    .read_exact(&mut scratch.1[..count])
+                    .map_err(TritPackageWriteError::Source)?;
+                if scratch.0[..count] != scratch.1[..count] {
+                    return Err(TritPackageWriteError::Package(
+                        TritPackageError::BlobIdentityCollision,
+                    ));
+                }
+                position += count as u64;
+            }
+        } else {
+            unique.insert(*blob.id.as_bytes(), index);
+        }
+    }
+    Ok(())
+}
+
+struct BlobMetadata {
+    id: BlobId,
+    kind: TritBlobKind,
+    length: usize,
+}
+
+struct PayloadPlan {
+    padding: usize,
+    index: usize,
+}
+
 struct PackageWritePlan<'a> {
     header: [u8; TRIT_HEADER_BYTES],
-    payloads: Vec<(usize, &'a [u8])>,
+    payloads: Vec<PayloadPlan>,
     manifest: &'a [u8],
     directory: Vec<u8>,
     footer: [u8; FOOTER_BYTES],
     size: usize,
 }
 impl PackageWritePlan<'_> {
-    fn emit<E>(&self, mut chunk: impl FnMut(&[u8]) -> Result<(), E>) -> Result<(), E> {
+    fn emit<S, E, C: FnMut(&[u8]) -> Result<(), E>>(
+        &self,
+        source: &mut S,
+        mut chunk: C,
+        mut payload: impl FnMut(usize, &mut S, &mut C) -> Result<(), E>,
+        finish: impl FnOnce(&mut S) -> Result<(), E>,
+    ) -> Result<(), E> {
         chunk(&self.header)?;
         let padding = [0u8; TRIT_BLOB_ALIGNMENT];
-        for (pad, payload) in &self.payloads {
-            chunk(&padding[..*pad])?;
-            chunk(payload)?;
+        for entry in &self.payloads {
+            chunk(&padding[..entry.padding])?;
+            payload(entry.index, source, &mut chunk)?;
         }
         chunk(self.manifest)?;
         chunk(&self.directory)?;
+        finish(source)?;
         chunk(&self.footer)
     }
 }
@@ -328,42 +528,77 @@ fn prepare_write<'a>(
     blobs: &[TritBlob<'a>],
     max_bytes: usize,
 ) -> Result<PackageWritePlan<'a>, TritPackageError> {
-    if manifest_cbor.len() > MAX_MANIFEST_BYTES || blobs.len() > MAX_BLOBS {
+    let entries = blob_metadata(manifest_cbor, blobs.len(), |index| {
+        let blob = &blobs[index];
+        Ok(BlobMetadata {
+            id: BlobId::from_bytes(*blake3::hash(blob.bytes).as_bytes()),
+            kind: blob.kind.clone(),
+            length: blob.bytes.len(),
+        })
+    })?;
+    let mut unique = BTreeMap::<[u8; 32], &[u8]>::new();
+    for (entry, blob) in entries.iter().zip(blobs) {
+        if let Some(existing) = unique.insert(*entry.id.as_bytes(), blob.bytes)
+            && existing != blob.bytes
+        {
+            return Err(TritPackageError::BlobIdentityCollision);
+        }
+    }
+    prepare_layout(manifest_cbor, &entries, max_bytes)
+}
+
+fn blob_metadata(
+    manifest_cbor: &[u8],
+    count: usize,
+    mut entry: impl FnMut(usize) -> Result<BlobMetadata, TritPackageError>,
+) -> Result<Vec<BlobMetadata>, TritPackageError> {
+    if manifest_cbor.len() > MAX_MANIFEST_BYTES || count > MAX_BLOBS {
         return Err(TritPackageError::MetadataLimitExceeded);
     }
     validate_canonical_manifest(manifest_cbor)?;
-    for blob in blobs {
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(count)
+        .map_err(|_| TritPackageError::AllocationFailed { requested: count })?;
+    for index in 0..count {
+        let blob = entry(index)?;
         if let TritBlobKind::Asset(name) = &blob.kind
             && name.is_empty()
         {
             return Err(TritPackageError::EmptyAssetName);
         }
+        entries.push(blob);
     }
+    Ok(entries)
+}
 
-    let mut unique = BTreeMap::<[u8; 32], (&[u8], u64)>::new();
-    for blob in blobs {
-        let digest = *blake3::hash(blob.bytes).as_bytes();
-        let length =
-            u64::try_from(blob.bytes.len()).map_err(|_| TritPackageError::LengthOverflow)?;
-        if let Some((existing, _)) = unique.get(&digest) {
-            if *existing != blob.bytes {
+fn prepare_layout<'a>(
+    manifest_cbor: &'a [u8],
+    blobs: &[BlobMetadata],
+    max_bytes: usize,
+) -> Result<PackageWritePlan<'a>, TritPackageError> {
+    let mut unique = BTreeMap::<[u8; 32], (usize, usize)>::new();
+    for (index, blob) in blobs.iter().enumerate() {
+        let digest = *blob.id.as_bytes();
+        if let Some((_, length)) = unique.get(&digest) {
+            if *length != blob.length {
                 return Err(TritPackageError::BlobIdentityCollision);
             }
         } else {
-            unique.insert(digest, (blob.bytes, length));
+            unique.insert(digest, (index, blob.length));
         }
     }
 
     let mut offsets = BTreeMap::<[u8; 32], u64>::new();
     let mut cursor = TRIT_HEADER_BYTES;
-    for (digest, (payload, _)) in &unique {
+    for (digest, (_, length)) in &unique {
         cursor = align_up(cursor)?;
         offsets.insert(
             *digest,
             u64::try_from(cursor).map_err(|_| TritPackageError::LengthOverflow)?,
         );
         cursor = cursor
-            .checked_add(payload.len())
+            .checked_add(*length)
             .ok_or(TritPackageError::LengthOverflow)?;
     }
     let manifest_offset = cursor;
@@ -378,13 +613,12 @@ fn prepare_write<'a>(
             requested: blobs.len(),
         })?;
     for blob in blobs {
-        let id = *blake3::hash(blob.bytes).as_bytes();
+        let id = *blob.id.as_bytes();
         directory_entries.push(TritBlobInfo {
             id: BlobId::from_bytes(id),
             kind: blob.kind.clone(),
             offset: offsets[&id],
-            length: u64::try_from(blob.bytes.len())
-                .map_err(|_| TritPackageError::LengthOverflow)?,
+            length: u64::try_from(blob.length).map_err(|_| TritPackageError::LengthOverflow)?,
         });
     }
     directory_entries.sort_by(|left, right| {
@@ -416,7 +650,7 @@ fn prepare_write<'a>(
             requested: unique.len(),
         })?;
     let mut position = TRIT_HEADER_BYTES;
-    for (digest, (payload, _)) in unique {
+    for (digest, (index, length)) in unique {
         let expected_offset =
             usize::try_from(offsets[&digest]).map_err(|_| TritPackageError::LengthOverflow)?;
         let pad = expected_offset
@@ -425,9 +659,12 @@ fn prepare_write<'a>(
         if pad >= TRIT_BLOB_ALIGNMENT {
             return Err(TritPackageError::InvalidDirectory);
         }
-        payloads.push((pad, payload));
+        payloads.push(PayloadPlan {
+            padding: pad,
+            index,
+        });
         position = expected_offset
-            .checked_add(payload.len())
+            .checked_add(length)
             .ok_or(TritPackageError::LengthOverflow)?;
     }
     if position != manifest_offset {
