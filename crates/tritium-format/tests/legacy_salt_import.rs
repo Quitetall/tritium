@@ -10,6 +10,9 @@ use tritium_schema::{
     ScalePrecision, Transport,
 };
 
+#[path = "legacy_salt_import/compact_rows.rs"]
+mod compact_rows;
+
 fn layout(width: usize, planes: u8, group: u16, codec: PlaneCodec) -> AdditiveLayout {
     AdditiveLayout {
         rows: 2,
