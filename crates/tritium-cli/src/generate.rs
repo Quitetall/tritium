@@ -43,17 +43,17 @@ use tritium_nn::{GgufBpeTokenizer, HfJsonTokenizer, ModelRunner, Runner, Tokeniz
 
 // Private bridge for legacy GGUF/SALT commands until their loader migration.
 enum CliRunner {
-    Legacy(ModelRunner),
-    Shared(Runner),
+    Legacy(Box<ModelRunner>),
+    Shared(Box<Runner>),
 }
 impl From<ModelRunner> for CliRunner {
     fn from(runner: ModelRunner) -> Self {
-        Self::Legacy(runner)
+        Self::Legacy(Box::new(runner))
     }
 }
 impl From<Runner> for CliRunner {
     fn from(runner: Runner) -> Self {
-        Self::Shared(runner)
+        Self::Shared(Box::new(runner))
     }
 }
 impl CliRunner {
@@ -158,7 +158,7 @@ pub(crate) fn run_joined(
         let backend = Box::new(tritium_cpu::CpuBackend::new());
         let result = match prompt {
             Prompt::Ids(_) => (
-                CliRunner::Legacy(ModelRunner::from_source_admitted(
+                CliRunner::from(ModelRunner::from_source_admitted(
                     source, backend, policy, &budget, context,
                 )?),
                 None,
@@ -166,7 +166,7 @@ pub(crate) fn run_joined(
             Prompt::Text(_) => {
                 let loaded = tritium_nn::load(source, backend, policy, &budget, context)?;
                 (
-                    CliRunner::Shared(loaded.runner),
+                    CliRunner::from(loaded.runner),
                     Some(Box::new(loaded.tokenizer) as Box<dyn Tokenizer>),
                 )
             }
@@ -351,6 +351,12 @@ fn load(model_path: &Path) -> anyhow::Result<(ModelRunner, Option<Box<dyn Tokeni
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runner_bridge_does_not_embed_backend_resident_state() {
+        // Neither graph owner should be copied into every CLI bridge value.
+        assert!(std::mem::size_of::<CliRunner>() <= 2 * std::mem::size_of::<usize>());
+    }
 
     #[test]
     fn render_output_is_json_then_lines() {
