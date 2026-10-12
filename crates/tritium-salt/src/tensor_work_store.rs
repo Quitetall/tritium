@@ -177,6 +177,23 @@ pub struct TensorRecordReceipt {
 }
 
 impl TensorRecordReceipt {
+    /// Synthetic descriptor fixture for codec tests only; no record is published.
+    ///
+    /// The IDs deliberately describe test data, not a durable tensor record.
+    /// Publication, payload hashing and verified reopening are tested separately
+    /// through `TensorWorkStore::put`, without replacing its durability checks.
+    #[cfg(test)]
+    pub(crate) fn fixture_for_codec_test(spec: &TensorRecordSpec) -> Self {
+        let mut descriptor = b"synthetic tensor receipt codec fixture\0".to_vec();
+        encode_info(&mut descriptor, &spec.0).expect("valid fixture descriptor");
+        Self {
+            record_id: ContentId::of_bytes(&descriptor),
+            record_bytes: exact_record_bytes(&spec.0).expect("valid fixture record length"),
+            payload_digest: *blake3::hash(b"synthetic codec fixture payload").as_bytes(),
+            info: spec.0.clone(),
+        }
+    }
+
     /// Content identity of the complete exact record bytes.
     #[must_use]
     pub const fn record_id(&self) -> ContentId {
