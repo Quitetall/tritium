@@ -217,14 +217,13 @@ pub struct Qwen35DeltaNetCache {
     conv_staging: Vec<f32>,
     recurrent_current: Vec<f32>,
     recurrent_staging: Vec<f32>,
-    /// The recurrence, resident on a CUDA device, when that path is in use.
+    /// The recurrence owned by an optional backend executor.
     ///
-    /// Allocated lazily on the first staged forward that sees a CUDA backend,
+    /// Allocated lazily on the first staged forward that accepts residency,
     /// because the cache is constructed without one. While this is `Some`, the
     /// device holds the authoritative state and the host `recurrent_*` buffers
     /// are not maintained -- see [`Qwen35DeltaNetCache::recurrent_state`].
-    #[cfg(feature = "cuda")]
-    device: Option<tritium_cuda::DeltaNetResidentState>,
+    device: Option<Box<dyn tritium_spec::ResidentDeltaNet>>,
 }
 
 impl Qwen35DeltaNetCache {
@@ -299,21 +298,15 @@ impl Qwen35DeltaNetCache {
         &self.recurrent_current
     }
 
-    /// Whether the recurrence lives on a CUDA device rather than in
+    /// Whether a backend executor owns the recurrence rather than
     /// [`Self::recurrent_state`].
     #[must_use]
     pub fn is_device_resident(&self) -> bool {
-        #[cfg(feature = "cuda")]
-        {
-            self.device.is_some()
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            false
-        }
+        self.device.is_some()
     }
 
-    /// Start a fresh contiguous stream without freeing state allocations.
+    /// Start a fresh contiguous stream, retaining host allocations and dropping
+    /// any backend-owned recurrence. The next resident forward reallocates it.
     pub fn reset(&mut self) {
         self.len = 0;
         self.staged_len = None;
@@ -321,13 +314,9 @@ impl Qwen35DeltaNetCache {
         self.conv_staging.fill(0.0);
         self.recurrent_current.fill(0.0);
         self.recurrent_staging.fill(0.0);
-        // Releasing the device allocation is how the device path resets: this
-        // accessor holds no backend to issue a memset with, and the next staged
-        // forward reallocates zeroed.
-        #[cfg(feature = "cuda")]
-        {
-            self.device = None;
-        }
+        // Reset stays infallible: dropping the owner requires no memset and
+        // removes the previous backend binding as well as the stream prefix.
+        self.device = None;
     }
 
     /// Pending committed length, used to preflight a whole-model transaction.
@@ -344,7 +333,6 @@ impl Qwen35DeltaNetCache {
         if let Some(staged_len) = self.staged_len.take() {
             std::mem::swap(&mut self.conv_current, &mut self.conv_staging);
             std::mem::swap(&mut self.recurrent_current, &mut self.recurrent_staging);
-            #[cfg(feature = "cuda")]
             if let Some(device) = self.device.as_mut() {
                 device.commit();
             }
@@ -534,7 +522,6 @@ impl Qwen35DeltaNet {
                 self.spec.recurrent_state_len,
                 "staged recurrent state",
             )?,
-            #[cfg(feature = "cuda")]
             device: None,
         })
     }
@@ -668,8 +655,7 @@ impl Qwen35DeltaNet {
 
         cache.conv_staging.copy_from_slice(&cache.conv_current);
         self.depthwise_causal_conv(&raw_qkv, sequence, &mut cache.conv_staging, &mut convolved);
-        #[cfg(feature = "cuda")]
-        let ran_on_device = self.recurrent_forward_cuda(
+        let ran_on_device = self.recurrent_forward_resident(
             backend,
             &convolved,
             &z,
@@ -681,8 +667,6 @@ impl Qwen35DeltaNet {
             &mut normalized_core,
             observer,
         )?;
-        #[cfg(not(feature = "cuda"))]
-        let ran_on_device = false;
         if !ran_on_device {
             cache
                 .recurrent_staging
@@ -778,11 +762,12 @@ impl Qwen35DeltaNet {
         }
     }
 
-    /// Run the recurrence on a CUDA device when one is available and enabled.
+    /// Run the recurrence through an owning backend executor when supported.
     ///
     /// Returns `false` when the caller must fall back to
-    /// [`Self::recurrent_forward`]: a non-CUDA backend, the opt-in flag unset,
-    /// or a geometry the kernel does not accept.
+    /// [`Self::recurrent_forward`]: the backend has no resident capability,
+    /// the legacy opt-out is set, or valid geometry is explicitly unsupported.
+    /// Once resident state exists, owner/opt-out changes are errors until reset.
     ///
     /// Every scalar that needs a transcendental is computed here, on the host,
     /// and handed to the kernel already folded: `kk` and `qq` carry their L2
@@ -794,9 +779,8 @@ impl Qwen35DeltaNet {
     /// The gated RMSNorm tail stays on the host: it touches
     /// `value_heads * value_head_dim` values per token, against the state's
     /// `value_heads * key_head_dim * value_head_dim`.
-    #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
-    fn recurrent_forward_cuda(
+    fn recurrent_forward_resident(
         &self,
         backend: &dyn TernaryBackend,
         convolved: &[f32],
@@ -810,31 +794,57 @@ impl Qwen35DeltaNet {
         observer: &mut RecurrentStateObserver<'_>,
     ) -> Result<bool, NnError> {
         if !deltanet_cuda_enabled() {
+            if cache.device.is_some() {
+                return Err(NnError::Backend(
+                    "reset DeltaNet cache before disabling resident execution".into(),
+                ));
+            }
             return Ok(false);
         }
-        let Some(cuda) = backend
-            .as_concrete()
-            .and_then(|concrete| concrete.downcast_ref::<tritium_cuda::CudaBackend>())
-        else {
-            return Ok(false);
-        };
 
         let group_size = self.spec.num_value_heads / self.spec.num_key_heads;
         let dk = self.spec.key_head_dim;
         let dv = self.spec.value_head_dim;
+        let geometry = tritium_spec::DeltaNetGeometry {
+            value_heads: self.spec.num_value_heads,
+            key_head_dim: dk,
+            value_head_dim: dv,
+            group_size,
+        };
         if cache.device.is_none() {
-            match cuda.new_deltanet_state(self.spec.num_value_heads, dk, dv, group_size) {
-                Ok(state) => cache.device = Some(state),
-                // A geometry this kernel cannot serve is not an error; the host
-                // reduction handles every shape.
-                Err(_) => return Ok(false),
+            let Some(mut state) = backend
+                .resident_deltanet(geometry)
+                .map_err(|error| NnError::Backend(error.to_string()))?
+            else {
+                return Ok(false);
+            };
+            state
+                .validate_owner(backend)
+                .map_err(|error| NnError::Backend(error.to_string()))?;
+            if state.geometry() != geometry {
+                return Err(NnError::Backend(
+                    "resident DeltaNet geometry differs from requested layout".into(),
+                ));
             }
+            // A host prefix may already exist. Transfer it exactly once before
+            // publishing ownership, never silently restart recurrence at zero.
+            if cache.len != 0 {
+                state
+                    .write_staged(&cache.recurrent_current)
+                    .map_err(|error| NnError::Backend(error.to_string()))?;
+                state.commit();
+            }
+            cache.device = Some(state);
         }
         let device = cache
             .device
             .as_mut()
             .expect("device state was just allocated");
-        cuda.deltanet_stage(device)
+        device
+            .validate_owner(backend)
+            .map_err(|error| NnError::Backend(error.to_string()))?;
+        device
+            .stage()
             .map_err(|error| NnError::Backend(error.to_string()))?;
 
         let query_scale = 1.0 / (dk as f32).sqrt();
@@ -882,20 +892,21 @@ impl Qwen35DeltaNet {
                 decay[value_head] = g.exp();
             }
 
-            cuda.deltanet_recurrent_step(
-                device,
-                &kk,
-                &qq,
-                value,
-                &beta,
-                &decay,
-                &mut core[value_base..value_base + self.spec.value_width],
-            )
-            .map_err(|error| NnError::Backend(error.to_string()))?;
+            device
+                .step(tritium_spec::DeltaNetStep {
+                    key: &kk,
+                    query: &qq,
+                    value,
+                    beta: &beta,
+                    decay: &decay,
+                    output: &mut core[value_base..value_base + self.spec.value_width],
+                })
+                .map_err(|error| NnError::Backend(error.to_string()))?;
 
             self.gated_rms_norm(z, value_base, core, normalized_core);
             if !observer.positions.is_empty() && observer.observes(token) {
-                cuda.deltanet_read_staged(device, &mut observed_state)
+                device
+                    .read_staged(&mut observed_state)
                     .map_err(|error| NnError::Backend(error.to_string()))?;
                 observer.report(token, &observed_state);
             }
@@ -904,7 +915,6 @@ impl Qwen35DeltaNet {
     }
 
     /// Per-head gated RMSNorm over one token's recurrent output.
-    #[cfg(feature = "cuda")]
     fn gated_rms_norm(
         &self,
         z: &[f32],
@@ -1040,15 +1050,12 @@ fn replace_projection(
     Ok(std::mem::replace(slot, replacement))
 }
 
-/// Whether the device recurrence is enabled. On by default when the backend is
-/// CUDA; `TRITIUM_DELTANET_CUDA=0` forces the host reduction.
+/// Compatibility host opt-out for the optional resident recurrence.
 ///
-/// Default-on because it is a relocation rather than a reimplementation:
-/// `qwen35_deltanet_cuda::device_recurrence_matches_the_host_reduction_bit_for_bit`
-/// asserts equality, not a tolerance, and the same holds end to end on
-/// Qwen3.6-27B. It is worth 145 ms of every 270 ms decode token. The escape
-/// hatch stays because the host path is the reference the golden vectors pin.
-#[cfg(feature = "cuda")]
+/// The legacy CUDA-named switch remains, but capability selection belongs to
+/// the backend. `0` requests host execution; disabling an already-owned stream
+/// requires cache reset so stale host state cannot be used. Physical device
+/// parity is exercised separately by the CUDA conformance test.
 fn deltanet_cuda_enabled() -> bool {
     match std::env::var("TRITIUM_DELTANET_CUDA") {
         Ok(value) if value == "1" => true,
@@ -1145,9 +1152,14 @@ fn invalid_config(reason: impl Into<String>) -> NnError {
 }
 
 #[cfg(test)]
+#[path = "../../tests/fixtures/resident_deltanet.rs"]
+mod resident_test_adapter;
+
+#[cfg(test)]
 mod tests {
     use tritium_cpu::CpuBackend;
 
+    use super::resident_test_adapter::{Adapter, READ};
     use super::*;
     use crate::layers::DenseLinear;
     use crate::qwen35_config::{
@@ -1353,6 +1365,81 @@ mod tests {
             assert_eq!(cache.staged_len(), None);
             assert!(cache.is_empty());
         }
+    }
+
+    #[test]
+    fn resident_observations_only_read_selected_rows_and_abort_preserves_prefix() {
+        let backend = Adapter::new();
+        let layer = tiny_layer();
+        let mut cache = layer.new_cache().unwrap();
+        let inputs = [1.0, -0.5, -0.25, 0.75, 0.4, 0.2];
+        let mut output = [0.0; 6];
+        let mut snapshots = Vec::new();
+        let mut callback = |position, state: &[f32]| snapshots.push((position, state.to_vec()));
+        let mut observer = RecurrentStateObserver::new(&[0, 2], &mut callback);
+        layer
+            .stage_forward_with_state_observer(
+                &backend,
+                &inputs,
+                3,
+                &mut cache,
+                &mut output,
+                &mut observer,
+            )
+            .unwrap();
+        assert_eq!(snapshots, vec![(0, vec![1.0]), (2, vec![3.0])]);
+        assert_eq!(backend.record.lock().unwrap().reads, 2);
+        assert_eq!(cache.len(), 0);
+        assert!(backend.record.lock().unwrap().committed.is_empty());
+        cache.abort_staged();
+        layer
+            .forward(&backend, &[1.0, -0.5], 1, &mut cache, &mut output[..2])
+            .unwrap();
+        assert_eq!(cache.len(), 1);
+        assert_eq!(backend.record.lock().unwrap().committed, vec![1.0]);
+        assert_eq!(backend.record.lock().unwrap().reads, 2);
+    }
+
+    #[test]
+    fn resident_readback_error_does_not_commit_and_retry_overwrites_dirty_stage() {
+        use std::sync::atomic::Ordering;
+        let backend = Adapter::new();
+        let layer = tiny_layer();
+        let mut cache = layer.new_cache().unwrap();
+        let mut output = [0.0; 2];
+        layer
+            .forward(&backend, &[1.0, -0.5], 1, &mut cache, &mut output)
+            .unwrap();
+        let conv = cache.conv_state().to_vec();
+        backend.fault.store(READ, Ordering::SeqCst);
+        output.fill(123.0);
+        let mut called = false;
+        let mut callback = |_, _: &[f32]| called = true;
+        let mut observer = RecurrentStateObserver::new(&[0], &mut callback);
+        assert!(
+            layer
+                .stage_forward_with_state_observer(
+                    &backend,
+                    &[-0.25, 0.75],
+                    1,
+                    &mut cache,
+                    &mut output,
+                    &mut observer,
+                )
+                .is_err()
+        );
+        assert!(!called);
+        assert_eq!(cache.staged_len(), None);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.conv_state(), conv);
+        assert_eq!(output, [123.0; 2]);
+        assert_eq!(backend.record.lock().unwrap().committed, vec![1.0]);
+        backend.fault.store(0, Ordering::SeqCst);
+        layer
+            .forward(&backend, &[-0.25, 0.75], 1, &mut cache, &mut output)
+            .unwrap();
+        assert_eq!(cache.len(), 2);
+        assert_eq!(backend.record.lock().unwrap().committed, vec![2.0]);
     }
 }
 

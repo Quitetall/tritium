@@ -34,6 +34,8 @@ pub use tritium_schema::{
 
 mod caps;
 pub use caps::DeviceCaps;
+mod deltanet;
+pub use deltanet::{DeltaNetGeometry, DeltaNetStep, ResidentDeltaNet};
 mod train_backend;
 pub use train_backend::{
     TrainAttributeV1, TrainAttributeValueV1, TrainBackendError, TrainBackendV1,
@@ -271,6 +273,23 @@ pub trait TernaryBackend: Send + Sync {
 
     /// What this device can do — used by the runtime to pick a backend.
     fn capabilities(&self) -> DeviceCaps;
+
+    /// Create a zeroed backend-owned transactional DeltaNet recurrence.
+    ///
+    /// `None` means unsupported backend/geometry, not an allocation failure.
+    /// The executor owns resource lifetimes; callers validate its owner before
+    /// each segment. This optional module does not imply whole-model residency.
+    ///
+    /// # Errors
+    /// Malformed geometry and allocation/driver failures are errors, never
+    /// permission to silently continue with stale host state.
+    fn resident_deltanet(
+        &self,
+        geometry: DeltaNetGeometry,
+    ) -> Result<Option<Box<dyn ResidentDeltaNet>>, BackendError> {
+        geometry.elements()?;
+        Ok(None)
+    }
 
     /// Query support for this exact law/basis/plane/group combination.
     ///

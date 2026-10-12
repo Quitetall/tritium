@@ -9085,6 +9085,63 @@ pub(super) enum AddKernel {
 }
 
 impl TernaryBackend for CudaBackend {
+    fn resident_deltanet(
+        &self,
+        geometry: tritium_spec::DeltaNetGeometry,
+    ) -> Result<Option<Box<dyn tritium_spec::ResidentDeltaNet>>, BackendError> {
+        geometry.elements()?;
+        // Unsupported valid geometry differs from allocation/driver failures.
+        if geometry.value_head_dim > 1024
+            || [
+                geometry.value_heads,
+                geometry.key_head_dim,
+                geometry.group_size,
+            ]
+            .into_iter()
+            .any(|n| u32::try_from(n).is_err())
+            || geometry.key_head_dim > u32::MAX as usize / (2 * core::mem::size_of::<f32>())
+        {
+            return Ok(None);
+        }
+        let threads = self
+            .func_deltanet_step
+            .max_threads_per_block()
+            .map_err(|error| driver_err("query DeltaNet block limit", &error))?;
+        let shared = self
+            .stream
+            .context()
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)
+            .map_err(|error| driver_err("query DeltaNet shared memory limit", &error))?;
+        let static_shared = self
+            .func_deltanet_step
+            .shared_size_bytes()
+            .map_err(|error| driver_err("query DeltaNet static shared memory", &error))?;
+        let grid = self
+            .stream
+            .context()
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X)
+            .map_err(|error| driver_err("query DeltaNet grid limit", &error))?;
+        if threads <= 0 || shared < 0 || static_shared < 0 || grid <= 0 {
+            return Err(BackendError::Backend(
+                "invalid DeltaNet kernel/device limits".into(),
+            ));
+        }
+        if geometry.value_head_dim > threads as usize
+            || geometry.value_heads > grid as usize
+            || 2 * geometry.key_head_dim * core::mem::size_of::<f32>() + static_shared as usize
+                > shared as usize
+        {
+            return Ok(None);
+        }
+        self.new_deltanet_state(
+            geometry.value_heads,
+            geometry.key_head_dim,
+            geometry.value_head_dim,
+            geometry.group_size,
+        )
+        .map(|state| Some(Box::new(state) as Box<dyn tritium_spec::ResidentDeltaNet>))
+    }
+
     fn tensor_caps(
         &self,
         tensor: tritium_spec::TensorView<'_>,
