@@ -407,6 +407,111 @@ fn typed_manifest_has_one_canonical_encoding_and_strict_roundtrip() {
     assert!(encode_model_manifest(&bad).is_err());
 }
 
+#[test]
+fn borrowed_sorted_metadata_matches_reference_bytes_and_package_identity() {
+    let mut variants = vec![fixture()];
+    for codec in [PlaneCodec::D2, PlaneCodec::B3, PlaneCodec::S34] {
+        // Bf16 is admitted for dense storage, not Group/Free additive laws.
+        for precision in [ScalePrecision::F16, ScalePrecision::F32] {
+            for basis in [
+                Basis::Identity,
+                Basis::Hadamard { block: 4 },
+                Basis::SignedRht {
+                    block: 4,
+                    seed: 7,
+                    domain: 9,
+                },
+            ] {
+                let (meta, _) = additive(codec, precision, basis, 2);
+                let mut manifest = fixture();
+                manifest.levels[0].tensors[0] = meta;
+                variants.push(manifest);
+            }
+        }
+    }
+    for precision in [
+        ScalePrecision::F16,
+        ScalePrecision::Bf16,
+        ScalePrecision::F32,
+    ] {
+        let mut manifest = fixture();
+        manifest.levels[0].tensors[0].storage = TensorStorage::Dense {
+            shape: vec![2, 4],
+            precision,
+        };
+        variants.push(manifest);
+    }
+    for admitted in tritium_schema::ADMITTED_LAWS {
+        let (mut meta, _) = additive(PlaneCodec::D2, ScalePrecision::F32, Basis::Identity, 2);
+        let TensorStorage::Additive { layout, planes } = &mut meta.storage else {
+            unreachable!()
+        };
+        layout.law = admitted.law;
+        layout.max_planes = admitted.max_planes;
+        *planes = PlaneCounts::Uniform(admitted.max_planes);
+        let mut manifest = fixture();
+        manifest.levels[0].tensors[0] = meta;
+        variants.push(manifest);
+    }
+    let mut variable = fixture();
+    let (mut meta, _) = additive(PlaneCodec::B3, ScalePrecision::F16, Basis::Identity, 3);
+    let TensorStorage::Additive { layout, planes } = &mut meta.storage else {
+        unreachable!()
+    };
+    layout.allocation = PlaneAllocation::PerTile;
+    *planes = PlaneCounts::PerTile(vec![0, 3]);
+    variable.levels[0].tensors[0] = meta;
+    variants.push(variable.clone());
+    let TensorStorage::Additive { planes, .. } = &mut variable.levels[0].tensors[0].storage else {
+        unreachable!()
+    };
+    *planes = PlaneCounts::PerTile(vec![0, 0]);
+    variants.push(variable);
+    let mut ancestry = fixture();
+    ancestry.shards.push(ModelShard {
+        name: "weights.trit".into(),
+        package: PackageId::from_bytes([7; 32]),
+    });
+    ancestry.levels[0].tensors[0].blob.shard = Some("weights.trit".into());
+    ancestry.legacy_ids.push(LegacyModelIdentity {
+        id: "old:fixture".into(),
+        level: "imported".into(),
+    });
+    ancestry.levels[0].fit = LevelFit::Direct {
+        evidence: vec![EvidenceReference {
+            run: "run-a".into(),
+            span: "fit".into(),
+            root: [3; 32],
+        }],
+    };
+    let mut prefix = ancestry.levels[0].clone();
+    prefix.name = "prefix".into();
+    prefix.fit = LevelFit::ImportedPrefixOf {
+        level: "imported".into(),
+    };
+    ancestry.levels.push(prefix);
+    variants.push(ancestry);
+    for manifest in variants {
+        manifest.validate().unwrap();
+        // Frozen Rust-derived reference encoding, not a new manifest vocabulary.
+        let reference = cbor(Value::serialized(&manifest).unwrap());
+        let actual = encode_model_manifest(&manifest).unwrap();
+        assert_eq!(actual, reference);
+        let actual_package = write_trit_package(&actual, &[]).unwrap();
+        let reference_package = write_trit_package(&reference, &[]).unwrap();
+        assert_eq!(actual_package, reference_package);
+        assert_eq!(
+            read_trit_package(&actual_package).unwrap().package_id(),
+            read_trit_package(&reference_package).unwrap().package_id()
+        );
+        assert_eq!(decode_model_manifest(&actual).unwrap(), manifest);
+        let mut unsorted = manifest;
+        unsorted.assets.reverse();
+        unsorted.levels.reverse();
+        assert_eq!(encode_model_manifest(&unsorted).unwrap(), reference);
+    }
+}
+
 fn package(manifest: &ModelManifest, tensors: &[TritBlob<'_>]) -> Vec<u8> {
     let mut blobs = vec![
         TritBlob {

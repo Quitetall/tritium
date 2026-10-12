@@ -9,6 +9,8 @@ use tritium_schema::BlobId;
 
 use crate::artifact::{PackageHasher, PackageId};
 
+mod cbor;
+
 /// `.trit` file magic.
 pub const TRIT_MAGIC: [u8; 8] = *b"TRITIUM\0";
 const TRIT_FOOTER_MAGIC: [u8; 8] = *b"TRITEND\0";
@@ -935,7 +937,36 @@ fn dtype_from_str(name: &str) -> Result<DType, TritPackageError> {
 }
 
 pub(crate) fn validate_canonical_manifest(bytes: &[u8]) -> Result<(), TritPackageError> {
-    parse_canonical_manifest(bytes).map(|_| ())
+    match cbor::validate(bytes) {
+        Ok(()) => Ok(()),
+        // Preserve the reference codec's tag and compound-key semantics. Typed
+        // model metadata has neither; its count arrays take the borrowed path.
+        Err(cbor::ScanError::Reference) => parse_canonical_manifest(bytes).map(|_| ()),
+        Err(cbor::ScanError::Invalid) => Err(TritPackageError::NonCanonicalManifest),
+    }
+}
+
+/// Serialize through the schema's derived serializer, without a Value per item.
+/// Only checked map spans are retained during in-place canonical ordering.
+pub(crate) fn encode_borrowed_manifest<T: serde::Serialize>(
+    manifest: &T,
+) -> Result<Option<Vec<u8>>, TritPackageError> {
+    let mut output = cbor::CappedOutput::default();
+    if ciborium::ser::into_writer(manifest, &mut output).is_err() {
+        return Err(if output.exceeded {
+            TritPackageError::NonCanonicalManifest
+        } else {
+            TritPackageError::InvalidDirectory
+        });
+    }
+    match cbor::canonicalize(&mut output.bytes) {
+        Ok(()) => {
+            validate_canonical_manifest(&output.bytes)?;
+            Ok(Some(output.bytes))
+        }
+        Err(cbor::ScanError::Reference) => Ok(None),
+        Err(cbor::ScanError::Invalid) => Err(TritPackageError::NonCanonicalManifest),
+    }
 }
 
 pub(crate) fn parse_canonical_manifest(bytes: &[u8]) -> Result<Value, TritPackageError> {

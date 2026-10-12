@@ -14,7 +14,8 @@ use tritium_schema::{
 };
 
 use crate::trit_package::{
-    canonicalize_value, encode_cbor_value, parse_canonical_manifest, validate_canonical_manifest,
+    canonicalize_value, encode_borrowed_manifest, encode_cbor_value, parse_canonical_manifest,
+    validate_canonical_manifest,
 };
 use crate::{
     AdditiveTensor, AdditiveTensorError, TritBlobKind, TritPackage, TritPackageError,
@@ -68,10 +69,22 @@ impl From<ModelManifestError> for TritModelError {
 ///
 /// Duplicate names are rejected, not collapsed. No handwritten model encoder or
 /// parallel manifest vocabulary is used. This profile has no floating metadata.
+/// Already sorted inventories borrow the schema and reorder encoded map spans,
+/// without cloning PerTile counts or constructing a Value per count. Unsorted
+/// compatibility normalization still clones metadata; output capacity and typed
+/// decoding remain separate from this encoder's temporary-storage behavior.
 ///
 /// # Errors
 /// Structural, serde or canonical-envelope errors.
 pub fn encode_model_manifest(manifest: &ModelManifest) -> Result<Vec<u8>, TritModelError> {
+    // Migration builds sorted inventories. Borrow them directly: a PerTile
+    // count array must not become a cloned Vec or a Value for every integer.
+    // Compatibility normalization of unsorted inputs stays on the old path.
+    if manifest.validate().is_ok()
+        && let Some(bytes) = encode_borrowed_manifest(manifest)?
+    {
+        return Ok(bytes);
+    }
     let mut canonical = manifest.clone();
     canonical.assets.sort_by(|a, b| a.name.cmp(&b.name));
     canonical.levels.sort_by(|a, b| a.name.cmp(&b.name));
