@@ -11,20 +11,32 @@ pub(super) enum ScanError {
 }
 type Result<T> = std::result::Result<T, ScanError>;
 
-#[derive(Default)]
 pub(super) struct CappedOutput {
     pub bytes: Vec<u8>,
     pub exceeded: bool,
+    limit: usize,
+}
+impl Default for CappedOutput {
+    fn default() -> Self {
+        Self::with_limit(MAX_MANIFEST_BYTES)
+    }
 }
 impl Write for CappedOutput {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.append(bytes, MAX_MANIFEST_BYTES)
+        self.append(bytes, self.limit)
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
 impl CappedOutput {
+    pub(super) fn with_limit(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            exceeded: false,
+            limit,
+        }
+    }
     fn append(&mut self, bytes: &[u8], limit: usize) -> io::Result<usize> {
         if bytes.len() > limit.saturating_sub(self.bytes.len()) {
             self.exceeded = true;
@@ -158,7 +170,10 @@ fn item(bytes: &[u8], at: &mut usize, depth: usize) -> Result<()> {
     Ok(())
 }
 pub(super) fn validate(bytes: &[u8]) -> Result<()> {
-    if bytes.is_empty() || bytes.len() > MAX_MANIFEST_BYTES {
+    validate_with_limit(bytes, MAX_MANIFEST_BYTES)
+}
+pub(super) fn validate_with_limit(bytes: &[u8], limit: usize) -> Result<()> {
+    if bytes.is_empty() || bytes.len() > limit {
         return Err(ScanError::Invalid);
     }
     let mut at = 0;
@@ -242,7 +257,10 @@ fn order(bytes: &mut [u8], at: &mut usize, depth: usize) -> Result<()> {
     Ok(())
 }
 pub(super) fn canonicalize(bytes: &mut [u8]) -> Result<()> {
-    if bytes.is_empty() || bytes.len() > MAX_MANIFEST_BYTES {
+    canonicalize_with_limit(bytes, MAX_MANIFEST_BYTES)
+}
+pub(super) fn canonicalize_with_limit(bytes: &mut [u8], limit: usize) -> Result<()> {
+    if bytes.is_empty() || bytes.len() > limit {
         return Err(ScanError::Invalid);
     }
     let mut at = 0;

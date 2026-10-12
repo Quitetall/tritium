@@ -951,17 +951,32 @@ pub(crate) fn validate_canonical_manifest(bytes: &[u8]) -> Result<(), TritPackag
 pub(crate) fn encode_borrowed_manifest<T: serde::Serialize>(
     manifest: &T,
 ) -> Result<Option<Vec<u8>>, TritPackageError> {
-    let mut output = cbor::CappedOutput::default();
-    if ciborium::ser::into_writer(manifest, &mut output).is_err() {
+    encode_borrowed_metadata(manifest, MAX_MANIFEST_BYTES)
+}
+
+// Semantic metadata historically has no manifest-size ceiling. Callers select
+// the existing limit, without widening package or typed-manifest admission.
+pub(crate) fn encode_borrowed_metadata<T: serde::Serialize>(
+    metadata: &T,
+    limit: usize,
+) -> Result<Option<Vec<u8>>, TritPackageError> {
+    let mut output = cbor::CappedOutput::with_limit(limit);
+    if ciborium::ser::into_writer(metadata, &mut output).is_err() {
         return Err(if output.exceeded {
             TritPackageError::NonCanonicalManifest
         } else {
             TritPackageError::InvalidDirectory
         });
     }
-    match cbor::canonicalize(&mut output.bytes) {
+    let canonical = if limit == MAX_MANIFEST_BYTES {
+        cbor::canonicalize(&mut output.bytes)
+    } else {
+        cbor::canonicalize_with_limit(&mut output.bytes, limit)
+    };
+    match canonical {
         Ok(()) => {
-            validate_canonical_manifest(&output.bytes)?;
+            cbor::validate_with_limit(&output.bytes, limit)
+                .map_err(|_| TritPackageError::NonCanonicalManifest)?;
             Ok(Some(output.bytes))
         }
         Err(cbor::ScanError::Reference) => Ok(None),

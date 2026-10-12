@@ -14,11 +14,12 @@ use tritium_schema::{
 };
 
 use crate::trit_package::{
-    canonicalize_value, encode_borrowed_manifest, encode_cbor_value, validate_canonical_manifest,
+    canonicalize_value, encode_borrowed_manifest, encode_borrowed_metadata, encode_cbor_value,
+    validate_canonical_manifest,
 };
 use crate::{
-    AdditiveTensor, AdditiveTensorError, TritBlobKind, TritPackage, TritPackageError,
-    read_trit_package,
+    AdditivePayload, AdditiveTensor, AdditiveTensorError, TritBlobKind, TritPackage,
+    TritPackageError, read_trit_package,
 };
 
 /// Typed metadata/payload failure; unsupported capabilities are explicit.
@@ -350,10 +351,13 @@ pub fn bind_trit_model_payloads<'a>(
                     validate_dense(&tensor.name, shape, *precision, bytes)?;
                     digests.push(dense_digest(shape, *precision, bytes)?);
                 }
-                TensorStorage::Additive { .. } => {
-                    digests.push(additive_semantic_digest(&decode_additive_payload(
-                        tensor, bytes,
-                    )?)?);
+                TensorStorage::Additive { layout, planes } => {
+                    if !matches!(layout.transport, Transport::Raw) {
+                        return Err(TritModelError::UnsupportedFeature("entropy model payloads"));
+                    }
+                    let payload = AdditivePayload::new(*layout, planes, bytes)
+                        .map_err(TritModelError::Additive)?;
+                    digests.push(borrowed_additive_digest(&payload)?);
                 }
                 _ => return Err(TritModelError::UnsupportedFeature("tensor storage")),
             }
@@ -387,10 +391,14 @@ fn metadata_hasher<T: serde::Serialize>(
     context: &str,
     metadata: &T,
 ) -> Result<blake3::Hasher, TritModelError> {
-    let mut value =
-        Value::serialized(metadata).map_err(|e| TritModelError::Schema(e.to_string()))?;
-    canonicalize_value(&mut value, 0)?;
-    let bytes = encode_cbor_value(&value)?;
+    let bytes = if let Some(bytes) = encode_borrowed_metadata(metadata, usize::MAX)? {
+        bytes
+    } else {
+        let mut value =
+            Value::serialized(metadata).map_err(|e| TritModelError::Schema(e.to_string()))?;
+        canonicalize_value(&mut value, 0)?;
+        encode_cbor_value(&value)?
+    };
     let mut hash = blake3::Hasher::new_derive_key(context);
     hash.update(&frame_length(bytes.len())?);
     hash.update(&bytes);
@@ -401,6 +409,52 @@ fn frame_length(length: usize) -> Result<[u8; 8], TritModelError> {
     u64::try_from(length)
         .map(u64::to_le_bytes)
         .map_err(|_| TritModelError::Schema("semantic frame length exceeds u64".into()))
+}
+
+fn borrowed_additive_digest(
+    payload: &AdditivePayload<'_>,
+) -> Result<SemanticTensorDigest, TritModelError> {
+    let layout = payload.layout();
+    let planes = if let Some(counts) = payload.tile_counts() {
+        let mut owned = Vec::new();
+        owned.try_reserve_exact(counts.len()).map_err(|_| {
+            TritModelError::Additive(AdditiveTensorError::AllocationFailed {
+                requested: counts.len(),
+            })
+        })?;
+        owned.extend_from_slice(counts);
+        PlaneCounts::PerTile(owned)
+    } else {
+        PlaneCounts::Uniform(
+            u8::try_from(payload.plane_count())
+                .map_err(|_| TritModelError::Schema("semantic plane count exceeds u8".into()))?,
+        )
+    };
+    let metadata = TensorSemanticMeta::Additive {
+        rows: layout.rows,
+        cols: layout.cols,
+        tile: layout.tile,
+        group: layout.group,
+        planes,
+        law: layout.law,
+        basis: layout.basis,
+    };
+    let mut hash = metadata_hasher("tritium.trit.additive.v1", &metadata)?;
+    hash.update(&frame_length(payload.trit_count())?);
+    let mut staging = [0u8; 640];
+    payload
+        .visit_trits(|chunk| {
+            for (byte, trit) in staging.iter_mut().zip(chunk) {
+                *byte = (trit.get() + 1) as u8;
+            }
+            hash.update(&staging[..chunk.len()]);
+        })
+        .map_err(TritModelError::Additive)?;
+    hash.update(&frame_length(payload.scale_bytes().len())?);
+    hash.update(payload.scale_bytes());
+    Ok(SemanticTensorDigest::from_bytes(
+        *hash.finalize().as_bytes(),
+    ))
 }
 
 /// Candidate codec/transport-independent digest of validated logical content.

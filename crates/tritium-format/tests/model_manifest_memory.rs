@@ -2,8 +2,11 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tritium_format::trit_model::{decode_model_manifest, encode_model_manifest};
-use tritium_format::{PackageHasher, TritBlob, TritBlobKind, write_trit_package_to};
+use tritium_format::trit_model::{decode_model_manifest, encode_model_manifest, read_trit_model};
+use tritium_format::{
+    AdditivePayload, AdditiveTensor, PackageHasher, TritBlob, TritBlobKind, write_trit_package,
+    write_trit_package_to,
+};
 use tritium_schema::{
     ADMITTED_LAWS, AdditiveLayout, Basis, BlobId, BlobReference, Level, LevelFit, ManifestAsset,
     ModelManifest, PlaneAllocation, PlaneCodec, PlaneCounts, SchemaId, TensorMeta, TensorStorage,
@@ -168,6 +171,92 @@ fn sorted_manifest_encode_decode_and_envelope_do_not_allocate_value_per_tile() {
             allocated < 65536,
             "envelope requested {allocated} heap bytes for {} encoded metadata bytes",
             bytes.len()
+        );
+        let package = write_trit_package(&bytes, &blobs).unwrap();
+        ALLOCATED.store(0, Ordering::Relaxed);
+        TRACK.store(true, Ordering::SeqCst);
+        let result = read_trit_model(&package);
+        TRACK.store(false, Ordering::SeqCst);
+        let allocated = ALLOCATED.load(Ordering::Relaxed);
+        result.unwrap();
+        println!(
+            "{tiles} all-pruned counts: full typed model reader requested {allocated} heap bytes"
+        );
+        assert!(
+            allocated < bytes.len() * 20 + 65536,
+            "generic semantic count tree allocation: {allocated}"
+        );
+    }
+    for coefficients in [1024 * 1024, 16 * 1024 * 1024] {
+        let planes = PlaneCounts::Uniform(3);
+        let layout = AdditiveLayout {
+            rows: 1,
+            cols: coefficients as u64,
+            tile: 256,
+            group: 128,
+            max_planes: ADMITTED_LAWS[0].max_planes,
+            allocation: PlaneAllocation::Uniform,
+            codec: PlaneCodec::B3,
+            law: ADMITTED_LAWS[0].law,
+            basis: Basis::Identity,
+            transport: Transport::Raw,
+        };
+        let owned = AdditiveTensor::new(
+            layout,
+            3,
+            vec![tritium_core::Trit::ZERO; coefficients * 3],
+            vec![0.5; coefficients / 128 * 3],
+        )
+        .unwrap();
+        let payload = owned.encode_payload().unwrap();
+        drop(owned);
+        let mut manifest = manifest(1);
+        manifest.levels[0].tensors[0].blob = reference(&payload);
+        manifest.levels[0].tensors[0].storage = TensorStorage::Additive {
+            layout,
+            planes: planes.clone(),
+        };
+        let blobs = [
+            TritBlob {
+                kind: TritBlobKind::AdditiveTensor,
+                bytes: &payload,
+            },
+            TritBlob {
+                kind: TritBlobKind::Asset("config.json".into()),
+                bytes: b"{}",
+            },
+            TritBlob {
+                kind: TritBlobKind::Asset("tokenizer.json".into()),
+                bytes: b"{}",
+            },
+        ];
+        let package =
+            write_trit_package(&encode_model_manifest(&manifest).unwrap(), &blobs).unwrap();
+        ALLOCATED.store(0, Ordering::Relaxed);
+        TRACK.store(true, Ordering::SeqCst);
+        let result = AdditivePayload::new(layout, &planes, &payload);
+        TRACK.store(false, Ordering::SeqCst);
+        result.unwrap();
+        let allocated = ALLOCATED.load(Ordering::Relaxed);
+        println!(
+            "{coefficients} coefficients per plane: borrowed view requested {allocated} heap bytes"
+        );
+        assert!(
+            allocated < 4096,
+            "borrowed view retained master: {allocated}"
+        );
+        ALLOCATED.store(0, Ordering::Relaxed);
+        TRACK.store(true, Ordering::SeqCst);
+        let result = read_trit_model(&package);
+        TRACK.store(false, Ordering::SeqCst);
+        result.unwrap();
+        let allocated = ALLOCATED.load(Ordering::Relaxed);
+        println!(
+            "{coefficients} coefficients per plane: full typed model reader requested {allocated} heap bytes"
+        );
+        assert!(
+            allocated < 128 * 1024,
+            "model reader retained master: {allocated}"
         );
     }
 }
