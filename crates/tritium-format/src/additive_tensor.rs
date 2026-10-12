@@ -110,9 +110,20 @@ impl AdditiveTensor {
     ) -> Result<Self, AdditiveTensorError> {
         let index =
             OwnedPerTileIndex::new(layout, counts).map_err(AdditiveTensorError::InvalidView)?;
+        Self::from_per_tile_index(index, trits, scales)
+    }
+
+    // Transfers a previously admitted shared index; no duplicate index buffer
+    // during streaming migration. Public constructors retain the same checks.
+    pub(crate) fn from_per_tile_index(
+        index: OwnedPerTileIndex,
+        trits: Vec<Trit>,
+        scales: Vec<f32>,
+    ) -> Result<Self, AdditiveTensorError> {
         let view = AdditiveView::new_per_tile(index.as_index(), &trits, &scales)
             .map_err(AdditiveTensorError::InvalidView)?;
         Self::validate_view(view)?;
+        let layout = view.layout();
         let plane_count =
             u8::try_from(view.plane_count()).map_err(|_| AdditiveTensorError::LengthOverflow)?;
         Ok(Self {

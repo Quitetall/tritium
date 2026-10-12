@@ -1,4 +1,7 @@
 //! Lossless logical SALT import; container identity/basis/provenance belong to its caller.
+mod v2;
+pub use v2::import_salt_v2_tensor;
+
 use half::f16;
 use tritium_core::{PerTilePlan, Trit};
 use tritium_schema::{
@@ -14,7 +17,8 @@ use crate::{
 /// Explicit logical input/output bounds; not process RSS or container admission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SaltTensorImportLimits {
-    /// Aggregate actual packed plane bytes, including canonical block padding.
+    /// Actual packed coefficient/scale bytes, including canonical codec/block padding.
+    /// Container metadata is excluded; existing row-import accounting is unchanged.
     pub max_source_bytes: u64,
     /// Retained logical trit count across every plane.
     pub max_trits: u64,
@@ -48,6 +52,8 @@ pub enum SaltTensorImportError {
     },
     /// The shared decoder rejected a physical block.
     Format(FormatError),
+    /// Strict seek-backed SALT V2 access or selected-tensor integrity failed.
+    Read(crate::salt_v2_package::SaltV2PackageReadError),
     /// Stored scale is negative, negative zero or nonfinite.
     Scale,
     /// Logical row padding contains nonzero trits.
