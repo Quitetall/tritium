@@ -3,6 +3,47 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
+__device__ __forceinline__ uint64_t semantic_splitmix(uint64_t value) {
+    value = (value ^ (value >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)) * UINT64_C(0x94d049bb133111eb);
+    return value ^ (value >> 31);
+}
+__device__ __forceinline__ bool semantic_negative(uint64_t seed, uint64_t domain, uint32_t col) {
+    uint64_t tagged = semantic_splitmix(seed ^ UINT64_C(0x5452495449554d31));
+    uint64_t keyed = semantic_splitmix(tagged ^ domain);
+    return semantic_splitmix(keyed ^ (uint64_t(col) * UINT64_C(0x9e3779b97f4a7c15))) & 1;
+}
+extern "C" __global__ void semantic_basis_sign(
+    float *values, uint32_t count, uint32_t cols, uint64_t seed, uint64_t domain
+) {
+    uint64_t at = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (at < count && semantic_negative(seed, domain, uint32_t(at % cols))) values[at] = -values[at];
+}
+extern "C" __global__ void semantic_basis_butterfly(
+    float *values, uint32_t pairs, uint32_t cols, uint32_t block, uint32_t width
+) {
+    uint64_t at = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (at >= pairs) return;
+    uint32_t row_pairs = cols / 2, block_pairs = block / 2;
+    uint32_t pair = at % row_pairs, local = pair % block_pairs;
+    uint64_t left = (at / row_pairs) * cols + (pair / block_pairs) * block
+        + (local / width) * (2 * width) + local % width;
+    uint64_t right = left + width;
+    float a = values[left], b = values[right];
+    values[left] = a + b;
+    values[right] = a - b;
+}
+extern "C" __global__ void semantic_basis_finish(
+    float *values, uint32_t count, uint32_t cols, float normalization,
+    uint32_t inverse_sign, uint64_t seed, uint64_t domain
+) {
+    uint64_t at = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (at >= count) return;
+    float value = values[at] * normalization;
+    if (inverse_sign && semantic_negative(seed, domain, uint32_t(at % cols))) value = -value;
+    values[at] = value;
+}
+
 __device__ __forceinline__ uint32_t u32le(const uint8_t *p) {
     return uint32_t(p[0]) | (uint32_t(p[1]) << 8) |
         (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);

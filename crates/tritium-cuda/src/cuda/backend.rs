@@ -806,6 +806,9 @@ pub struct CudaBackend {
     pub(super) func_deltanet_step: CudaFunction,
     pub(super) func_semantic_additive_matmul: CudaFunction,
     pub(super) func_semantic_additive_gather: CudaFunction,
+    pub(super) func_semantic_basis_sign: CudaFunction,
+    pub(super) func_semantic_basis_butterfly: CudaFunction,
+    pub(super) func_semantic_basis_finish: CudaFunction,
     /// Scalar-correct D2/B3/S34 forward. The first fast API aliases this handle.
     pub(super) func_salt_v2_exact: CudaFunction,
     /// Shared-activation D2/B3/S34 forward used for prefill-shaped launches.
@@ -1445,6 +1448,15 @@ impl CudaBackend {
         let func_semantic_additive_gather = semantic_module
             .load_function("semantic_additive_gather")
             .map_err(|e| driver_err("resolve semantic additive gather", &e))?;
+        let func_semantic_basis_sign = semantic_module
+            .load_function("semantic_basis_sign")
+            .map_err(|e| driver_err("resolve semantic basis signs", &e))?;
+        let func_semantic_basis_butterfly = semantic_module
+            .load_function("semantic_basis_butterfly")
+            .map_err(|e| driver_err("resolve semantic basis butterfly", &e))?;
+        let func_semantic_basis_finish = semantic_module
+            .load_function("semantic_basis_finish")
+            .map_err(|e| driver_err("resolve semantic basis normalization", &e))?;
 
         let device_name = ctx
             .name()
@@ -1476,6 +1488,9 @@ impl CudaBackend {
             func_deltanet_step,
             func_semantic_additive_matmul,
             func_semantic_additive_gather,
+            func_semantic_basis_sign,
+            func_semantic_basis_butterfly,
+            func_semantic_basis_finish,
             func_salt_v2_exact,
             func_salt_v2_tiled,
             func_salt_v2_warp,

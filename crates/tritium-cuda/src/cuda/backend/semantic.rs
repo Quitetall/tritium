@@ -14,6 +14,7 @@ use tritium_spec::{
     BackendError, Basis, DeviceBuffer, TensorCaps, TensorExecution, TensorMatmul, TensorView,
     admitted_execution_group,
 };
+mod basis;
 mod packed;
 use packed::PackedAdditive;
 

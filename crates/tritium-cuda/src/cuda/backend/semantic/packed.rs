@@ -303,22 +303,27 @@ impl PackedAdditive {
         if outputs != 0 && cols != 0 {
             CudaBackend::check_grad_launch_bounds(p.batch, rows, cols)?;
         }
-        p.transformed_act.copy_from_slice(p.act);
-        if cols != 0 {
-            for row in p.transformed_act.chunks_exact_mut(cols) {
-                apply_basis(row, basis)
-                    .map_err(|_| invalid("CUDA packed semantic basis failed"))?;
-            }
-        }
         if outputs == 0 || cols == 0 {
+            p.transformed_act.copy_from_slice(p.act);
             p.out.fill(0.0);
             return Ok(());
         }
         let batch = narrow(p.batch)?;
-        let input = backend
+        let mut input = backend
             .stream
-            .clone_htod(p.transformed_act)
+            .clone_htod(p.act)
             .map_err(|e| driver_err("upload packed semantic activations", &e))?;
+        super::basis::apply(backend, &mut input, cols, basis, false)?;
+        if basis == Basis::Identity {
+            p.transformed_act.copy_from_slice(p.act);
+        } else {
+            // This explicit host-slice contract observes transformed scratch.
+            // A future graph-resident caller can retain this same device input.
+            backend
+                .stream
+                .memcpy_dtoh(&input, p.transformed_act)
+                .map_err(|e| driver_err("read packed semantic basis scratch", &e))?;
+        }
         let requested = product(outputs, 4)?;
         let mut output = backend
             .stream
@@ -394,14 +399,12 @@ impl PackedAdditive {
         // each thread writes one selected-row lane, never the weight payload.
         unsafe { launch.launch(cfg) }
             .map_err(|e| driver_err("launch packed semantic gather", &e))?;
+        drop(launch);
+        super::basis::apply(backend, &mut output, cols, basis, true)?;
         backend
             .stream
             .memcpy_dtoh(&output, out)
             .map_err(|e| driver_err("read packed gather output", &e))?;
-        for row in out.chunks_exact_mut(cols) {
-            apply_inverse_basis(row, basis)
-                .map_err(|_| invalid("CUDA packed gather inverse basis failed"))?;
-        }
         Ok(())
     }
 }
