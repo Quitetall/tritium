@@ -3,8 +3,8 @@
 use std::fmt;
 
 use crate::generator::{
-    CancellationCapabilitiesV1, CancellationCheckpoint, FinishReason, GenError, GenRequest,
-    Generator, Sampling, Step, top_logprobs,
+    CancellationCapabilitiesV1, CancellationCheckpoint, GenError, GenRequest, Generator, Step,
+    stream_steps,
 };
 
 /// Generator owning one content-bound Qwen language-plus-MTP bundle.
@@ -18,18 +18,6 @@ impl QwenGenerator {
     #[must_use]
     pub const fn new(model: tritium_nn::Qwen35SaltV2LanguageMtpModel, eos: u32) -> Self {
         Self { model, eos }
-    }
-
-    fn sample(logits: &[f32], sampling: &Sampling, step: u64) -> Option<u32> {
-        match *sampling {
-            Sampling::Greedy => tritium_nn::sample_greedy(logits),
-            Sampling::TopK { k, temp, seed } => {
-                tritium_nn::sample_top_k(logits, k, temp, seed.wrapping_add(step))
-            }
-            Sampling::TopP { p, temp, seed } => {
-                tritium_nn::sample_top_p(logits, p, temp, seed.wrapping_add(step))
-            }
-        }
     }
 }
 
@@ -84,46 +72,26 @@ impl Generator for QwenGenerator {
         let mut cache = runner
             .new_cache(capacity)
             .map_err(|error| GenError::Backend(error.to_string()))?;
-        let Some(mut output) = runner
+        let Some(output) = runner
             .forward_cancellable(&request.prompt_tokens, &mut cache, is_cancelled)
             .map_err(|error| GenError::Backend(error.to_string()))?
         else {
             return Ok(());
         };
-        for index in 0..max_new {
-            if is_cancelled() {
-                return Ok(());
-            }
-            let logits = output.last_logits();
-            let token = Self::sample(logits, &request.sampling, index as u64)
-                .ok_or_else(|| GenError::Backend("sampler produced no token".into()))?;
-            let eos = request.stop_eos && token == self.eos;
-            let last = eos || index + 1 == max_new;
-            let keep_going = on_step(Step {
-                token,
-                finished: last,
-                finish_reason: if eos {
-                    Some(FinishReason::Stop)
-                } else if last {
-                    Some(FinishReason::Length)
-                } else {
-                    None
-                },
-                logprobs: request
-                    .logprobs
-                    .map(|count| top_logprobs(logits, token, count)),
-            });
-            if last || !keep_going {
-                break;
-            }
-            let next_output = runner
-                .forward_cancellable(&[token], &mut cache, is_cancelled)
-                .map_err(|error| GenError::Backend(error.to_string()))?;
-            let Some(next_output) = next_output else {
-                return Ok(());
-            };
-            output = next_output;
-        }
+        stream_steps(
+            output.into_last_logits(),
+            request,
+            max_new,
+            self.eos,
+            on_step,
+            is_cancelled,
+            |token, _position| {
+                runner
+                    .forward_cancellable(&[token], &mut cache, is_cancelled)
+                    .map(|output| output.map(tritium_nn::Qwen35TextOutput::into_last_logits))
+                    .map_err(|error| GenError::Backend(error.to_string()))
+            },
+        )?;
         Ok(())
     }
 

@@ -9,7 +9,52 @@ exact byte accounting and receipt-backed benchmarks.
 See the [repository README](https://github.com/Quitetall/tritium#readme) and the
 [book](https://github.com/Quitetall/tritium/tree/main/docs/book) for usage.
 
-## Local converted models
+## Typed portable candidates
+
+`--typed /absolute/path/load.json` loads a complete selected `.trit` level through
+the common `tritium_nn::load` interface and streams its standard or hybrid
+language graph through `RunnerGenerator`. It uses the real embedded tokenizer,
+not a raw-ID substitute. `TRITIUM_TYPED` and the strict launch config's `typed`
+key select the same source. Exactly one source is allowed.
+
+The separate load JSON uses snake_case and requires every field below. These
+are illustrative ceilings, not a capacity recommendation for any model:
+
+```json
+{
+  "path": "/models/example/model.trit",
+  "level": "imported",
+  "max_source_bytes": 1073741824,
+  "max_manifest_bytes": 1048576,
+  "max_directory_bytes": 1048576,
+  "max_config_bytes": 1048576,
+  "max_tensor_bytes": 33554432,
+  "max_decoded_tensor_bytes": 134217728,
+  "max_payload_bytes": 4294967296,
+  "native_only": false
+}
+```
+
+```bash
+tritium-serve --typed /models/example/load.json --backend cpu --port 8099
+```
+
+The load JSON is capped at 16KiB and rejects missing/unknown fields, nonpositive
+limits, relative model paths and absent explicit levels before backend init.
+The backend payload cap is not a total RSS/KV/tokenizer/concurrency ledger;
+`native_only` rejects backend-declared emulation, not all dense tensors. Choose
+ceilings from the actual package and separately assess machine capacity.
+
+This route is loopback-only and unqualified. It rejects raw-token mode, spec,
+draft, batching and KV-pool options. Hybrid MTP remains privately Unverified,
+with no draft/tree authority. Qwen3.5 hybrid uses the existing QwenIm template;
+standard graphs use Concat. Strict schema-v3 bundle admission is unchanged.
+Compatibility readiness means worker liveness: `production_artifact` is false,
+`startup_receipt` is null, and it is not public-release clearance. Resident
+execution, typed production readiness, complete memory admission and remaining
+thin-surface migrations are still owed.
+
+## Local converted models (legacy)
 
 `tritium convert` directories can be served locally with the same OpenAI wire
 contract. This path loads `model.tslb`, `config.json`, and the copied HF

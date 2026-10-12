@@ -5039,6 +5039,7 @@ dependencies = [
  "opentelemetry_sdk",
  "serde",
  "serde_json",
+ "tokenizers 0.23.1",
  "tokio",
  "tower",
  "tracing",
@@ -5049,9 +5050,11 @@ dependencies = [
  "tritium-core",
  "tritium-cpu",
  "tritium-cuda",
+ "tritium-evidence",
  "tritium-format",
  "tritium-nn",
  "tritium-runtime",
+ "tritium-schema",
  "tritium-spec",
 ]
 

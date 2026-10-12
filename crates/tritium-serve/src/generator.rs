@@ -722,7 +722,7 @@ impl Generator for MockGenerator {
 /// prefill + per-step `forward` decode loop (the runner's `generate` returns all
 /// tokens at once and is greedy-only, so serve owns this) with per-step sampling,
 /// a per-step seed advance, and a context guard.
-pub struct RunnerGenerator {
+pub(crate) struct LegacyRunnerGenerator {
     runner: tritium_nn::ModelRunner,
     eos: u32,
     /// True between a successful [`Generator::open_tree_session`] and the next
@@ -756,9 +756,9 @@ pub struct RunnerGenerator {
     draft_fed: Vec<u32>,
 }
 
-impl fmt::Debug for RunnerGenerator {
+impl fmt::Debug for LegacyRunnerGenerator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RunnerGenerator")
+        f.debug_struct("LegacyRunnerGenerator")
             .field("eos", &self.eos)
             .finish_non_exhaustive()
     }
@@ -791,7 +791,74 @@ pub(crate) fn top_logprobs(logits: &[f32], sampled: u32, k: usize) -> Vec<(u32, 
     out
 }
 
-impl RunnerGenerator {
+pub(crate) fn sample(logits: &[f32], sampling: &Sampling, step: u64) -> Option<u32> {
+    match *sampling {
+        Sampling::Greedy => tritium_nn::sample_greedy(logits),
+        Sampling::TopK { k, temp, seed } => {
+            tritium_nn::sample_top_k(logits, k, temp, seed.wrapping_add(step))
+        }
+        Sampling::TopP { p, temp, seed } => {
+            tritium_nn::sample_top_p(logits, p, temp, seed.wrapping_add(step))
+        }
+    }
+}
+#[derive(PartialEq, Eq)]
+pub(crate) enum StreamEnd {
+    Completed,
+    Stopped,
+    Cancelled,
+}
+
+// One streaming policy; each numerical adapter supplies its actual forward.
+pub(crate) fn stream_steps(
+    mut logits: Vec<f32>,
+    request: &GenRequest,
+    max_new: usize,
+    eos: u32,
+    on_step: &mut dyn FnMut(Step) -> bool,
+    is_cancelled: &dyn Fn() -> bool,
+    mut forward: impl FnMut(u32, usize) -> Result<Option<Vec<f32>>, GenError>,
+) -> Result<StreamEnd, GenError> {
+    for index in 0..max_new {
+        if is_cancelled() {
+            return Ok(StreamEnd::Cancelled);
+        }
+        let token = sample(&logits, &request.sampling, index as u64)
+            .ok_or_else(|| GenError::Backend("sampler produced no token".into()))?;
+        let is_eos = request.stop_eos && token == eos;
+        let last = is_eos || index + 1 == max_new;
+        let keep_going = on_step(Step {
+            token,
+            finished: last,
+            finish_reason: if is_eos {
+                Some(FinishReason::Stop)
+            } else if last {
+                Some(FinishReason::Length)
+            } else {
+                None
+            },
+            logprobs: request.logprobs.map(|k| top_logprobs(&logits, token, k)),
+        });
+        if !keep_going {
+            return Ok(StreamEnd::Stopped);
+        }
+        if last {
+            return Ok(StreamEnd::Completed);
+        }
+        let position = request
+            .prompt_tokens
+            .len()
+            .checked_add(index)
+            .ok_or(GenError::ContextOverflow)?;
+        let Some(next) = forward(token, position)? else {
+            return Ok(StreamEnd::Cancelled);
+        };
+        logits = next;
+    }
+    Ok(StreamEnd::Completed)
+}
+
+impl LegacyRunnerGenerator {
     fn reset_cancelled_generation(&mut self) {
         self.runner.reset();
         if let Some(draft) = self.draft.as_mut() {
@@ -804,7 +871,7 @@ impl RunnerGenerator {
 
     /// Wrap a loaded runner, using `eos` as the stop token.
     #[must_use]
-    pub fn new(runner: tritium_nn::ModelRunner, eos: u32) -> Self {
+    pub(crate) fn new(runner: tritium_nn::ModelRunner, eos: u32) -> Self {
         Self {
             runner,
             eos,
@@ -820,7 +887,7 @@ impl RunnerGenerator {
     /// Enables the spec path for greedy/sampled requests; `--spec lookup`'s
     /// prompt-lookup remains the drafter when no model is attached.
     #[must_use]
-    pub fn with_draft_model(mut self, draft: tritium_nn::ModelRunner) -> Self {
+    pub(crate) fn with_draft_model(mut self, draft: tritium_nn::ModelRunner) -> Self {
         self.draft = Some(Box::new(draft));
         self
     }
@@ -829,23 +896,9 @@ impl RunnerGenerator {
     /// the CUDA device-resident decoder at generate time; silently falls back
     /// to plain stepping otherwise).
     #[must_use]
-    pub fn with_spec_lookup(mut self, on: bool) -> Self {
+    pub(crate) fn with_spec_lookup(mut self, on: bool) -> Self {
         self.spec_lookup = on;
         self
-    }
-
-    fn sample(logits: &[f32], s: &Sampling, step: u64) -> Option<u32> {
-        match *s {
-            Sampling::Greedy => tritium_nn::sample_greedy(logits),
-            // Advance the seed per step so a stochastic decode actually varies (the
-            // samplers take the seed per call and would otherwise repeat).
-            Sampling::TopK { k, temp, seed } => {
-                tritium_nn::sample_top_k(logits, k, temp, seed.wrapping_add(step))
-            }
-            Sampling::TopP { p, temp, seed } => {
-                tritium_nn::sample_top_p(logits, p, temp, seed.wrapping_add(step))
-            }
-        }
     }
 }
 
@@ -1263,13 +1316,13 @@ impl SpecGovernor {
 /// Draft up to `max_draft` tokens with `draft` (greedy), starting after
 /// `history` (whose last element is the pending token). Syncs the draft's KV
 /// to `history` first by re-feeding the gap — see `draft_pos`/`draft_fed` on
-/// [`RunnerGenerator`] for why that is always correct. Stops early at the
+/// [`LegacyRunnerGenerator`] for why that is always correct. Stops early at the
 /// draft's own EOS. Returns `[]` on any draft error (caller falls back to a
 /// plain step; drafting must never break generation).
 ///
 /// Free function (not a method) so the batched worker's I0 solo-spec path
 /// (ADR 0032 L3 I0, `batch.rs`) can share the exact reconcile + chain logic
-/// with [`RunnerGenerator::model_draft`] — this is the single source of truth.
+/// with [`LegacyRunnerGenerator::model_draft`] — this is the single source of truth.
 #[cfg(all(feature = "cuda", test))]
 #[allow(clippy::too_many_arguments)] // shared drafter state and borrowed query
 pub(crate) fn draft_greedy_tokens(
@@ -1470,7 +1523,7 @@ pub(crate) fn draft_greedy_tokens_cancellable(
     Some(out)
 }
 
-impl RunnerGenerator {
+impl LegacyRunnerGenerator {
     /// Draft continuation via prompt lookup: find the LONGEST match (up to an
     /// 8-gram, at least a 2-gram — 1-gram matches draft noise and measured
     /// below break-even) of `history`'s tail against an earlier position, and
@@ -1753,7 +1806,7 @@ impl RunnerGenerator {
     }
 }
 
-impl RunnerGenerator {
+impl LegacyRunnerGenerator {
     /// The truncated, renormalized distribution the plain sampler draws from
     /// for `s`, as parallel `(indices, probs)` (see `tritium_nn::truncated_*`
     /// — the samplers are thin wrappers over these, so this IS the plain
@@ -2029,7 +2082,7 @@ impl RunnerGenerator {
     }
 }
 
-impl Generator for RunnerGenerator {
+impl Generator for LegacyRunnerGenerator {
     fn cancellation_capabilities(&self) -> CancellationCapabilitiesV1 {
         use CancellationCheckpoint::{CooperativeBoundaries, CooperativeIfAvailable, NotEnabled};
         #[cfg(feature = "cuda")]
@@ -2087,7 +2140,7 @@ impl Generator for RunnerGenerator {
         self.tree_session_open = false;
         self.runner.reset();
         let positions: Vec<usize> = (0..prompt_len).collect();
-        let Some(mut logits) = self
+        let Some(logits) = self
             .runner
             .forward_cancellable(&req.prompt_tokens, &positions, is_cancelled)
             .map_err(|e| GenError::Backend(e.to_string()))?
@@ -2151,44 +2204,21 @@ impl Generator for RunnerGenerator {
             }
         }
 
-        for i in 0..max_new {
-            if is_cancelled() {
-                self.reset_cancelled_generation();
-                return Ok(());
-            }
-            let next = Self::sample(&logits, &req.sampling, i as u64)
-                .ok_or_else(|| GenError::Backend("sampler produced no token".into()))?;
-            let is_eos = req.stop_eos && next == self.eos;
-            let last = is_eos || i + 1 == max_new;
-            let finish_reason = if is_eos {
-                Some(FinishReason::Stop)
-            } else if last {
-                Some(FinishReason::Length)
-            } else {
-                None
-            };
-            let cont = on_step(Step {
-                token: next,
-                finished: last,
-                finish_reason,
-                logprobs: req.logprobs.map(|k| top_logprobs(&logits, next, k)),
-            });
-            if last || !cont {
-                if !cont {
-                    self.reset_cancelled_generation();
-                }
-                break;
-            }
-            let pos = prompt_len + i;
-            let next = self
-                .runner
-                .forward_cancellable(&[next], &[pos], is_cancelled)
-                .map_err(|e| GenError::Backend(e.to_string()))?;
-            let Some(next) = next else {
-                self.reset_cancelled_generation();
-                return Ok(());
-            };
-            logits = next;
+        let end = stream_steps(
+            logits,
+            req,
+            max_new,
+            self.eos,
+            on_step,
+            is_cancelled,
+            |token, position| {
+                self.runner
+                    .forward_cancellable(&[token], &[position], is_cancelled)
+                    .map_err(|e| GenError::Backend(e.to_string()))
+            },
+        )?;
+        if end != StreamEnd::Completed {
+            self.reset_cancelled_generation();
         }
         Ok(())
     }
@@ -2383,8 +2413,8 @@ mod tests {
     #[test]
     fn cancellation_capabilities_cpu_runner_does_not_claim_native_routes() {
         use super::*;
-        let generator =
-            RunnerGenerator::new(tiny_legacy_runner(), 3).with_draft_model(tiny_legacy_runner());
+        let generator = LegacyRunnerGenerator::new(tiny_legacy_runner(), 3)
+            .with_draft_model(tiny_legacy_runner());
         let before: Vec<_> = generator.runner.kv.iter().map(|cache| cache.len).collect();
         let caps = generator.cancellation_capabilities();
         assert_eq!(
@@ -2414,7 +2444,7 @@ mod tests {
         let Some(runner) = crate::test_support::tiny_cuda_runner(16) else {
             return;
         };
-        let generator = RunnerGenerator::new(runner, 7);
+        let generator = LegacyRunnerGenerator::new(runner, 7);
         let caps = generator.cancellation_capabilities();
         assert_eq!(caps.generation, CooperativeBoundaries);
         assert_eq!(caps.tree_session_open, CooperativeIfAvailable);
@@ -2466,7 +2496,7 @@ mod tests {
                 let Some(runner) = crate::test_support::tiny_cuda_runner(64) else {
                     return;
                 };
-                let mut generator = RunnerGenerator::new(runner, 7).with_spec_lookup(true);
+                let mut generator = LegacyRunnerGenerator::new(runner, 7).with_spec_lookup(true);
                 if model_draft {
                     let Some(draft) = crate::test_support::tiny_cuda_runner(64) else {
                         return;
@@ -2643,7 +2673,7 @@ mod tests {
             let Some(runner) = crate::test_support::tiny_cuda_runner(context) else {
                 return;
             };
-            let mut generator = RunnerGenerator::new(runner, 7);
+            let mut generator = LegacyRunnerGenerator::new(runner, 7);
             let polls = Cell::new(0);
             let expected = generator
                 .open_tree_session_cancellable(&[0, 1, 2], &|| {
@@ -2767,7 +2797,7 @@ mod tests {
             let Some(runner) = crate::test_support::tiny_cuda_runner(64) else {
                 return;
             };
-            let mut baseline = RunnerGenerator::new(runner, 7).with_spec_lookup(true);
+            let mut baseline = LegacyRunnerGenerator::new(runner, 7).with_spec_lookup(true);
             let mut expected = Vec::new();
             baseline
                 .generate(&request, &mut |step| {
@@ -2789,7 +2819,7 @@ mod tests {
             let Some(runner) = crate::test_support::tiny_cuda_runner(64) else {
                 return;
             };
-            let mut generator = RunnerGenerator::new(runner, 7).with_spec_lookup(true);
+            let mut generator = LegacyRunnerGenerator::new(runner, 7).with_spec_lookup(true);
             let cancelled = std::cell::Cell::new(false);
             let mut emitted = Vec::new();
             generator
@@ -2844,7 +2874,7 @@ mod tests {
         let Some(runner) = crate::test_support::tiny_cuda_runner(16) else {
             return;
         };
-        let mut generator = RunnerGenerator::new(runner, 7);
+        let mut generator = LegacyRunnerGenerator::new(runner, 7);
         let expected = generator.open_tree_session(&[0, 1, 2]).unwrap();
         let polls = std::cell::Cell::new(0);
         assert!(
@@ -2877,7 +2907,7 @@ mod tests {
         let Some(runner) = crate::test_support::tiny_cuda_runner(16) else {
             return;
         };
-        let mut generator = RunnerGenerator::new(runner, 7);
+        let mut generator = LegacyRunnerGenerator::new(runner, 7);
         let pending = generator.open_tree_session(&[0, 1, 2]).unwrap();
         let before = crate::test_support::prefix_bytes(&mut generator.runner);
         let polls = std::cell::Cell::new(0);
@@ -3399,8 +3429,8 @@ mod tests {
         for &d in &[10u32, 13, 99] {
             let mut counts = std::collections::HashMap::<u32, usize>::new();
             for t in 0..trials {
-                let u = RunnerGenerator::spec_uniform(0xC0FFEE, t as u64);
-                let got = match RunnerGenerator::spec_accept_step(
+                let u = LegacyRunnerGenerator::spec_uniform(0xC0FFEE, t as u64);
+                let got = match LegacyRunnerGenerator::spec_accept_step(
                     &idx,
                     &probs,
                     d,
@@ -3642,7 +3672,7 @@ mod tests {
     #[cfg(feature = "serve")]
     #[test]
     fn legacy_runner_generator_cancels_native_prefill_and_recovers() {
-        let mut generator = RunnerGenerator::new(tiny_legacy_runner(), 7);
+        let mut generator = LegacyRunnerGenerator::new(tiny_legacy_runner(), 7);
         let request = GenRequest {
             prompt_tokens: vec![0, 1],
             max_new: 2,
@@ -3678,7 +3708,7 @@ mod tests {
             })
             .unwrap();
         let mut expected = Vec::new();
-        RunnerGenerator::new(tiny_legacy_runner(), 7)
+        LegacyRunnerGenerator::new(tiny_legacy_runner(), 7)
             .generate(&request, &mut |step| {
                 expected.push(step.token);
                 true

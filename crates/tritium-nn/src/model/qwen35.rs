@@ -298,8 +298,11 @@ impl Qwen35TextOutput {
         &self.last_logits
     }
 
-    #[cfg(feature = "tokenizer")]
-    pub(crate) fn into_last_logits(self) -> Vec<f32> {
+    /// Consume the output and transfer its logits buffer without copying it.
+    /// Hidden states and their MTP input view are discarded; no draft authority
+    /// is granted by extracting ordinary language logits.
+    #[must_use]
+    pub fn into_last_logits(self) -> Vec<f32> {
         self.last_logits
     }
 

@@ -1,17 +1,20 @@
 //! The `tritium-serve` binary: load a strict schema-v3 Qwen bundle, a converted
 //! Hugging Face SALT directory, or an explicitly legacy GGUF model and serve
-//! OpenAI HTTP/SSE.
+//! OpenAI HTTP/SSE. Explicit typed .trit candidates use the common portable loader.
 //!
 //! Production usage: `tritium-serve --bundle <schema-v3-dir> --profile
 //! compact-v1 [--backend cpu|cuda]`. `--converted <dir>` serves local
 //! `tritium convert` output; `--model <path.gguf>` retains compatibility
 //! serving but neither local path satisfies production readiness.
+//! `--typed <load-json>` is an explicitly bounded, loopback-only candidate source,
+//! not schema-v3 production admission or public-release authority.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Deserialize;
 mod telemetry;
+mod typed_source;
 
 use tritium_serve::{
     AdmissionPolicy, IdPassthroughTokenizer, PrincipalRateLimit, RequestLimits, RunnerGenerator,
@@ -31,6 +34,7 @@ const DESTRUCTIVE_CUDA_LOSS_ENV: &str = "TRITIUM_DESTRUCTIVE_CUDA_LOSS_QUALIFICA
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct FileConfig {
+    typed: Option<String>,
     model: Option<String>,
     converted: Option<String>,
     bundle: Option<String>,
@@ -61,6 +65,7 @@ struct FileConfig {
 
 #[derive(Debug)]
 struct LaunchConfig {
+    typed_path: Option<String>,
     model_path: Option<String>,
     converted_path: Option<String>,
     bundle_path: Option<String>,
@@ -92,6 +97,7 @@ struct LaunchConfig {
 impl Default for LaunchConfig {
     fn default() -> Self {
         Self {
+            typed_path: None,
             model_path: None,
             converted_path: None,
             bundle_path: None,
@@ -181,6 +187,9 @@ fn parse_env_bool(name: &str) -> Result<Option<bool>, Box<dyn std::error::Error>
 }
 
 fn apply_file_config(config: FileConfig, launch: &mut LaunchConfig) {
+    if let Some(value) = config.typed {
+        launch.typed_path = Some(value);
+    }
     if let Some(value) = config.model {
         launch.model_path = Some(value);
     }
@@ -283,6 +292,7 @@ fn apply_env_config(launch: &mut LaunchConfig) -> Result<(), Box<dyn std::error:
     env_string!("TRITIUM_MODEL", launch.model_path);
     env_string!("TRITIUM_CONVERTED", launch.converted_path);
     env_string!("TRITIUM_BUNDLE", launch.bundle_path);
+    env_string!("TRITIUM_TYPED", launch.typed_path);
     env_value!(
         "TRITIUM_ALLOW_INCOMPLETE_BUNDLE",
         launch.allow_incomplete_bundle
@@ -377,10 +387,11 @@ fn validate_bind_addresses(
 const HELP: &str = "\
 tritium-serve — OpenAI-compatible HTTP/SSE server for Tritium ternary models
 
-usage: tritium-serve (--bundle <schema-v3-dir> | --model <legacy.gguf> | --converted <dir>) [options]
+usage: tritium-serve (--bundle <schema-v3-dir> | --model <legacy.gguf> | --converted <dir> | --typed <load-json>) [options]
 
 model source (exactly one):
   --bundle <dir>            strict schema-v3 Qwen bundle (production path)
+  --typed <load-json>       bounded retained .trit candidate (loopback only; TRITIUM_TYPED)
   --model <path.gguf>       legacy GGUF model (compatibility serving)
   --converted <dir>         directory written by `tritium convert` (local path)
 
@@ -481,6 +492,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     apply_file_config(read_config(&raw_args)?, &mut launch);
     apply_env_config(&mut launch)?;
     let LaunchConfig {
+        mut typed_path,
         mut model_path,
         mut converted_path,
         mut bundle_path,
@@ -531,6 +543,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--model" => model_path = Some(val::<String>(args.next(), "--model")?),
             "--converted" => converted_path = Some(val::<String>(args.next(), "--converted")?),
             "--bundle" => bundle_path = Some(val::<String>(args.next(), "--bundle")?),
+            "--typed" => typed_path = Some(val::<String>(args.next(), "--typed")?),
             "--profile" => profile = val::<String>(args.next(), "--profile")?,
             "--backend" => backend_name = val::<String>(args.next(), "--backend")?,
             "--spec" => spec = Some(val::<String>(args.next(), "--spec")?),
@@ -582,6 +595,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let source_count = [
+        typed_path.is_some(),
         model_path.is_some(),
         converted_path.is_some(),
         bundle_path.is_some(),
@@ -591,7 +605,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .count();
     if source_count != 1 {
         return Err(
-            "provide exactly one of --bundle <schema-v3-dir>, --model <legacy.gguf>, or --converted <dir>".into(),
+            "provide exactly one of --bundle <schema-v3-dir>, --model <legacy.gguf>, --converted <dir>, or --typed <load-json>".into(),
         );
     }
     if allow_incomplete_bundle && bundle_path.is_none() {
@@ -638,6 +652,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if allow_incomplete_bundle && !host_ip.is_loopback() {
         return Err("--allow-incomplete-bundle requires loopback --host".into());
     }
+    let typed_config = if let Some(path) = typed_path {
+        if !host_ip.is_loopback() {
+            return Err("--typed candidates require loopback --host".into());
+        }
+        if raw_tokens
+            || spec.is_some()
+            || draft_model.is_some()
+            || batch_slots != 1
+            || kv_pool_tokens.is_some()
+        {
+            return Err("--typed forbids --raw-tokens, --spec, --draft-model, --batch-slots != 1, and --kv-pool-tokens".into());
+        }
+        Some(typed_source::TypedConfig::read(std::path::Path::new(
+            &path,
+        ))?)
+    } else {
+        None
+    };
     // Resolve the named backend from the runtime registry (the same owned-init
     // pattern the acceptance tests use). `cpu` is always linked; `cuda` needs
     // the `cuda` cargo feature and a working device.
@@ -662,6 +694,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(other) => return Err(format!("--spec: unknown mode {other:?} (try `lookup`)").into()),
     };
     enum LoadedModel {
+        Portable(Box<tritium_nn::Runner>),
         Legacy(Box<tritium_nn::ModelRunner>),
         Production {
             model: Box<tritium_nn::Qwen35SaltV2LanguageMtpModel>,
@@ -672,7 +705,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         LoadedModel,
         Arc<dyn tritium_nn::Tokenizer + Send + Sync>,
         tritium_serve::ChatTemplate,
-    ) = if let Some(bundle) = bundle_path {
+    ) = if let Some(config) = typed_config {
+        let backend =
+            init().map_err(|error| format!("backend `{backend_name}` failed to init: {error}"))?;
+        let model = config.load(backend)?;
+        eos = tritium_nn::Tokenizer::eos(&model.tokenizer);
+        let template = if model.runner.architecture().name() == "qwen3_5" {
+            tritium_serve::ChatTemplate::QwenIm
+        } else {
+            tritium_serve::ChatTemplate::Concat
+        };
+        (
+            LoadedModel::Portable(Box::new(model.runner)),
+            Arc::new(model.tokenizer),
+            template,
+        )
+    } else if let Some(bundle) = bundle_path {
         if raw_tokens
             || spec_lookup
             || draft_model.is_some()
@@ -870,6 +918,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let target_vocab = match &loaded {
                 LoadedModel::Legacy(runner) => runner.weights.vocab,
                 LoadedModel::Production { .. } => unreachable!("bundle rejected draft model"),
+                LoadedModel::Portable(_) => unreachable!("typed source rejected draft model"),
             };
             if d.weights.vocab != target_vocab {
                 return Err(format!(
@@ -883,6 +932,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let (router, draining) = match loaded {
+        LoadedModel::Portable(runner) => tritium_serve::build_router_governed(
+            Box::new(RunnerGenerator::from_runner(*runner, eos)),
+            tok,
+            cfg,
+            request_limits,
+            admission,
+        )?,
         LoadedModel::Production {
             model,
             physical_device,

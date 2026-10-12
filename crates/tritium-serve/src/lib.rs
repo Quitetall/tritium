@@ -34,6 +34,7 @@ pub mod tokenizer_passthrough;
 mod admission;
 #[cfg(feature = "cuda")]
 mod batch;
+mod portable_generator;
 #[cfg(feature = "serve")]
 mod router;
 #[cfg(feature = "serve")]
@@ -45,8 +46,9 @@ mod worker;
 
 pub use generator::{
     CancellationCapabilitiesV1, CancellationCheckpoint, FinishReason, GenError, GenRequest,
-    Generator, MockGenerator, RunnerGenerator, Sampling, Step, TreeOpError,
+    Generator, MockGenerator, Sampling, Step, TreeOpError,
 };
+pub use portable_generator::RunnerGenerator;
 pub use qwen_generator::QwenGenerator;
 pub use tokenizer_passthrough::IdPassthroughTokenizer;
 
