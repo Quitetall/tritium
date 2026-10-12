@@ -1,4 +1,7 @@
 //! Shared retained-reader assembly and real migration caller. Toy graph evidence only.
+#[cfg(feature = "tokenizer")]
+#[path = "typed/unified.rs"]
+mod unified;
 use super::*;
 use std::{
     fs::File,
@@ -500,6 +503,8 @@ fn actual_salt_import_files_feed_shared_qwen_graph_without_refitting() {
                     ]),
                     grams: BTreeMap::new(),
                 };
+                #[cfg(feature = "tokenizer")]
+                unified::add_text_assets(&mut companions);
                 let request = SaltV2ModelImportRequest {
                     companions: QuantPlan {
                         architecture: "qwen3_5".into(),
@@ -586,6 +591,8 @@ fn actual_salt_import_files_feed_shared_qwen_graph_without_refitting() {
                             }
                         ))
                 );
+                #[cfg(feature = "tokenizer")]
+                unified::check_imported_text_file(&root.0.join(&label).join("model.trit"), &label);
                 compare(
                     imported.model,
                     "imported",

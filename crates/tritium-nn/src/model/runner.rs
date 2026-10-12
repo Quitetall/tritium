@@ -24,7 +24,7 @@ use crate::layers::{BlockDump, BlockScratch, TensorLoader};
 #[cfg(feature = "cuda")]
 use crate::model::SaltV2ModelAllocationReceipt;
 use crate::model::weights::ModelWeights;
-use crate::ops::{rmsnorm, sample_greedy};
+use crate::ops::rmsnorm;
 use tritium_format::GgufFile;
 
 /// Per-stage activations for the fidelity ladder, captured by
@@ -1272,27 +1272,9 @@ impl ModelRunner {
         eos: u32,
     ) -> Result<Vec<u32>, NnError> {
         self.reset();
-        if prompt.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Prefill the whole prompt at positions 0..len.
-        let positions: Vec<usize> = (0..prompt.len()).collect();
-        let mut logits = self.forward(prompt, &positions)?;
-        let mut out = Vec::with_capacity(max_new);
-
-        for pos in (prompt.len()..).take(max_new) {
-            let next = sample_greedy(&logits).ok_or(NnError::Shape {
-                expected: 1,
-                got: 0,
-            })?;
-            if next == eos {
-                break;
-            }
-            out.push(next);
-            logits = self.forward(&[next], &[pos])?;
-        }
-        Ok(out)
+        super::unified::generate_greedy(prompt, max_new, eos, |tokens, positions| {
+            self.forward(tokens, positions)
+        })
     }
 }
 

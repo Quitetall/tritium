@@ -26,12 +26,13 @@ const MAX_TOKENIZER_JSON_BYTES: u64 = 256 * 1024 * 1024;
 #[cfg(feature = "tokenizer")]
 const MAX_TOKENIZER_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Supported sources for the shared admitted standard-model loading path.
+/// Sources for shared admitted loading; retained files require the text loader.
 ///
 /// Typed `.trit` is a proposed profile. Validated raw Uniform/PerTile additive
 /// matrices use the shared tensor decoder and selected backend's explicit tier.
-/// Shards/entropy and hybrid/MTP require later reader/architecture support,
-/// not a silent fallback or independent compact profile acceptance.
+/// The common text loader also admits complete typed hybrid language/MTP graphs.
+/// Shards/entropy and HF hybrid graphs still require later support, not a silent
+/// fallback or independent compact-profile acceptance.
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub enum ModelSource<'a> {
@@ -43,6 +44,17 @@ pub enum ModelSource<'a> {
         bytes: &'a [u8],
         /// Explicit level name; never infer a compact prefix or choose a default.
         level: &'a str,
+    },
+    /// Complete retained-file source for the common text loader (ADR0068).
+    TritFile {
+        /// Actual container path, opened once; external immutable custody required.
+        path: &'a Path,
+        /// Explicit complete selected level.
+        level: &'a str,
+        /// Total source/manifest/directory admission before retained-reader allocation.
+        receiving: tritium_format::TritPackageReadLimits,
+        /// Positive config/encoded/logical-decode limits; not total RSS.
+        limits: super::Qwen35TritReadLimits,
     },
     /// Mandatory lineage carrier already admitted against the actual B stage
     /// and both logs by the shared joined verifier (proposed ADR 0064).
@@ -147,6 +159,9 @@ impl<'a> PreparedSource<'a> {
             ModelSource::JoinedSalience { model, level } => {
                 Self::typed(PreparedTrit::Joined(model.model()), level)
             }
+            ModelSource::TritFile { .. } => Err(NnError::MissingConfig(
+                "retained file graphs require the common text load entrypoint".into(),
+            )),
         }
     }
 
@@ -299,12 +314,12 @@ impl ModelWeights {
 #[cfg(feature = "tokenizer")]
 #[allow(missing_debug_implementations)]
 pub struct LoadedModel {
-    /// Shared standard-model runner; config and one weights owner live here.
-    pub runner: super::ModelRunner,
+    /// Common language-stream runner, owning its actual graph and private cache.
+    pub runner: super::Runner,
     /// Parsed real tokenizer and special-token contract.
     pub tokenizer: super::HfJsonTokenizer,
-    /// Architecture variation data used by the same model builder.
-    pub architecture: ArchSpec,
+    /// Initial architecture snapshot; the runner's immutable accessor is authoritative.
+    pub architecture: super::ArchitectureSpec,
     /// Immutable view of the registered initial-load observation.
     pub receipt: tritium_evidence::ModelLoadReceiptView,
 }
@@ -317,8 +332,11 @@ pub struct LoadedModel {
 /// once; no filesystem extraction or retained dense model shadow is introduced.
 /// Tokenizer JSON is bounded to 256 MiB and its config to 16 MiB; these are
 /// source limits, not an accounting of parsed tokenizer or total model memory.
-/// This is standard Attention/SwiGLU/Relu2 execution, not hybrid/MTP, resident
-/// executor, full-memory or release qualification. Typed sources bind candidate
+/// Standard and complete typed hybrid language graphs share the portable runner.
+/// Hybrid MTP is privately bound but Unverified, not executable draft authority.
+/// This is not resident-executor, full-memory or release qualification. File
+/// sources require explicit receiving and per-tensor read/decode caps, and keep
+/// one source handle through final source verification. Typed sources bind candidate
 /// model/package IDs; HF identity remains explicitly unavailable. Final load
 /// event recording still validates the actual payload and drops the unpublished
 /// runner and payload leases on failure. HF numerical payload checks remain
@@ -349,6 +367,22 @@ pub fn load(
             context.logical_time,
         )
         .map_err(|error| NnError::Backend(format!("tensor upload evidence: {error}")))?;
+    match source {
+        ModelSource::TritFile {
+            path,
+            level,
+            receiving,
+            limits,
+        } => {
+            return super::retained::load_file(
+                path, level, receiving, limits, backend, policy, budget, context,
+            );
+        }
+        ModelSource::Trit { bytes, level } => {
+            return super::retained::load_bytes(bytes, level, backend, policy, budget, context);
+        }
+        _ => {}
+    }
     let source = PreparedSource::new(source)?;
     let identity = source.identity()?;
     let tokenizer = source.tokenizer()?;
@@ -376,7 +410,11 @@ pub fn load(
             .map_err(|_| NnError::Backend("model vocabulary exceeds u64".into()))?,
         layer_count: u64::from(config.n_layers),
     };
-    let runner = super::ModelRunner::try_from_weights(config, weights, backend)?;
+    let runner = super::Runner::standard(
+        super::ModelRunner::try_from_weights(config, weights, backend)?,
+        architecture,
+    );
+    let architecture = runner.architecture().clone();
     let receipt = context
         .recorder
         .emit_model_loaded(
@@ -498,6 +536,14 @@ fn prepare_trit(
     level: &str,
 ) -> Result<(ModelConfig, ArchSpec, StandardModelPlan), NnError> {
     let config_bytes = model.asset("config.json").map_err(format_error)?;
+    prepare_trit_metadata(model.manifest(), level, config_bytes)
+}
+
+pub(super) fn prepare_trit_metadata(
+    manifest: &tritium_schema::ModelManifest,
+    level: &str,
+    config_bytes: &[u8],
+) -> Result<(ModelConfig, ArchSpec, StandardModelPlan), NnError> {
     if u64::try_from(config_bytes.len()).unwrap_or(u64::MAX) > MAX_CONFIG_JSON_BYTES {
         return Err(NnError::MissingConfig(
             "config.json exceeds source size limit".into(),
@@ -506,15 +552,14 @@ fn prepare_trit(
     let text = std::str::from_utf8(config_bytes)
         .map_err(|e| NnError::MissingConfig(format!("config.json: {e}")))?;
     let (config, mut spec) = ModelConfig::from_hf_config(text)?;
-    if model.manifest().architecture != config.arch {
+    if manifest.architecture != config.arch {
         return Err(NnError::MissingConfig(
             "manifest/config architecture mismatch".into(),
         ));
     }
     let json = serde_json::from_str(text)
         .map_err(|e| NnError::MissingConfig(format!("config.json: {e}")))?;
-    let selected = model
-        .manifest()
+    let selected = manifest
         .levels
         .iter()
         .find(|l| l.name == level)
@@ -524,9 +569,11 @@ fn prepare_trit(
         &json,
         selected.tensors.iter().map(|t| t.name.as_str()),
     )?;
-    let (meta, _) = model
-        .tensor(level, NameSchema::Hf.top("token_embd"))
-        .map_err(format_error)?;
+    let meta = selected
+        .tensors
+        .iter()
+        .find(|t| t.name == NameSchema::Hf.top("token_embd"))
+        .ok_or_else(|| NnError::MissingTensor("embedding absent".into()))?;
     let (vocab, columns) = matrix_shape(meta)?;
     if columns != config.n_embd as usize || declared_vocab_size(&json)?.is_some_and(|n| n != vocab)
     {

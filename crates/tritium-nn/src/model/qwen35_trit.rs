@@ -132,13 +132,13 @@ impl Qwen35TextWeights {
 fn invalid(error: impl std::fmt::Display) -> NnError {
     NnError::InvalidArtifact(format!("typed Qwen assembly: {error}"))
 }
-fn check(actual: u64, maximum: u64, what: &str) -> Result<(), NnError> {
+pub(super) fn check(actual: u64, maximum: u64, what: &str) -> Result<(), NnError> {
     if actual > maximum {
         return Err(invalid(format!("{what} {actual} exceeds {maximum}")));
     }
     Ok(())
 }
-fn decoded_bytes(meta: &TensorMeta) -> Result<u64, NnError> {
+pub(super) fn decoded_bytes(meta: &TensorMeta) -> Result<u64, NnError> {
     match &meta.storage {
         TensorStorage::Dense { shape, .. } => shape.iter().try_fold(4u64, |n, d| {
             n.checked_mul(*d)
@@ -173,7 +173,7 @@ fn decoded_bytes(meta: &TensorMeta) -> Result<u64, NnError> {
     }
 }
 type Visitor<'a> = &'a mut dyn FnMut(&[u8]) -> Result<(), NnError>;
-fn collect(
+pub(super) fn collect(
     length: u64,
     mut read: impl FnMut(Visitor<'_>) -> Result<(), NnError>,
 ) -> Result<Vec<u8>, NnError> {

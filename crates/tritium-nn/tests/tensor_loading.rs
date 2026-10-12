@@ -1105,6 +1105,23 @@ fn check_text_load(
     use tritium_evidence::{MODEL_LOADED_REGISTRATION, ModelLoadReceiptView};
     use tritium_nn::Tokenizer;
     let expected_source = match source {
+        tritium_nn::ModelSource::TritFile {
+            path,
+            level,
+            receiving,
+            ..
+        } => {
+            let model = tritium_format::trit_model::TritModelReader::open(
+                std::fs::File::open(path).unwrap(),
+                receiving,
+            )
+            .unwrap();
+            tritium_schema::LoadedSourceIdentity::Trit {
+                package_id: tritium_schema::PackageId::from_bytes(*model.package_id().as_bytes()),
+                model_id: model.model_id(level).unwrap(),
+                level: level.into(),
+            }
+        }
         tritium_nn::ModelSource::Trit { bytes, level } => {
             let model = tritium_format::trit_model::read_trit_model(bytes).unwrap();
             tritium_schema::LoadedSourceIdentity::Trit {
@@ -1154,7 +1171,7 @@ fn check_text_load(
     assert_eq!(loaded.tokenizer.decode(&[1, 2]).unwrap(), "hello partner");
     assert_eq!(loaded.tokenizer.bos(), 4);
     assert_eq!(loaded.tokenizer.eos(), 3);
-    assert_eq!(loaded.runner.config.arch, "qwen3");
+    assert_eq!(loaded.runner.architecture().name(), "qwen3");
     assert_eq!(loaded.receipt.observation().source, expected_source);
     assert_eq!(loaded.receipt.observation().backend, expected_backend);
     assert_eq!(
@@ -1163,15 +1180,41 @@ fn check_text_load(
     );
     assert_eq!(
         loaded.receipt.observation().architecture,
-        loaded.runner.config.arch
+        loaded.runner.architecture().name()
     );
     assert_eq!(loaded.receipt.observation().vocab_size, 10);
     assert_eq!(
         loaded.receipt.observation().layer_count,
-        u64::from(loaded.runner.config.n_layers)
+        loaded.runner.architecture().layer_count() as u64
     );
     assert_eq!(Some(loaded.receipt.envelope()), recorder.events().last());
     let prompt = loaded.tokenizer.encode("hello partner").unwrap();
+    let close = |actual: &[f32], expected: &[f32]| {
+        assert_eq!(actual.len(), expected.len());
+        for (&a, &e) in actual.iter().zip(expected) {
+            assert!(a.is_finite() && e.is_finite() && (a - e).abs() <= 1e-5 * e.abs().max(1.));
+        }
+    };
+    assert!(loaded.runner.step(1).is_err());
+    let actual = loaded.runner.prefill(&prompt).unwrap();
+    oracle.reset();
+    close(&actual, &oracle.forward(&prompt, &[0, 1]).unwrap());
+    assert_eq!(loaded.runner.cache_len(), 2);
+    assert!(loaded.runner.prefill(&prompt).is_err());
+    assert!(loaded.runner.forward(&[1], &[0]).is_err());
+    assert!(loaded.runner.step(10).is_err());
+    assert!(
+        loaded
+            .runner
+            .forward_cancellable(&[], &[], &|| true)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(loaded.runner.cache_len(), 2);
+    close(
+        &loaded.runner.step(1).unwrap(),
+        &oracle.forward(&[1], &[2]).unwrap(),
+    );
     assert_eq!(
         loaded
             .runner
@@ -1472,6 +1515,33 @@ fn text_source_loads_real_tokenizers_and_generates_with_shared_runner() {
         fixture.asset("tokenizer.json", tokenizer.clone());
         fixture.asset("tokenizer_config.json", config.clone());
         let bytes = fixture.bytes();
+        let path = hf.dir.join("model.trit");
+        std::fs::write(&path, &bytes).unwrap();
+        for cpu in [true, false] {
+            let backend: Box<dyn TernaryBackend> = if cpu {
+                Box::new(tritium_cpu::CpuBackend::new())
+            } else {
+                Box::new(tritium_testkit::ReferenceBackend::new())
+            };
+            check_text_load(
+                tritium_nn::ModelSource::TritFile {
+                    path: &path,
+                    level: "standard",
+                    receiving: tritium_format::TritPackageReadLimits {
+                        max_source_bytes: 1_000_000,
+                        max_manifest_bytes: 128_000,
+                        max_directory_bytes: 128_000,
+                    },
+                    limits: tritium_nn::Qwen35TritReadLimits {
+                        max_config_bytes: 16_000,
+                        max_tensor_bytes: 64_000,
+                        max_decoded_tensor_bytes: 64_000,
+                    },
+                },
+                fixture.dense_oracle(),
+                backend,
+            );
+        }
         check_text_load(
             tritium_nn::ModelSource::Trit {
                 bytes: &bytes,

@@ -19,6 +19,8 @@ mod qwen35_mtp_oracle;
 mod qwen35_reference;
 mod qwen35_salt_v2;
 mod qwen35_trit;
+#[cfg(feature = "tokenizer")]
+mod retained;
 mod runner;
 #[cfg(feature = "cuda")]
 mod salt_v2;
@@ -27,6 +29,7 @@ mod staged_calibration;
 mod standard;
 mod tokenizer;
 mod training_salt;
+mod unified;
 mod weights;
 
 #[cfg(feature = "tokenizer")]
@@ -85,4 +88,5 @@ pub use training_salt::{
     TRAINING_SALT_UNTIED_FORMAT_VALUE, TrainingSaltArtifactMetadata, TrainingSaltGrowthReceipt,
     parse_training_salt_artifact_metadata,
 };
+pub use unified::{ArchitectureSpec, LayerKind, Runner};
 pub use weights::{LayerWeights, ModelWeights};

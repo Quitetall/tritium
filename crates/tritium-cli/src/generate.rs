@@ -39,7 +39,36 @@ use std::path::{Path, PathBuf};
 use crate::stage_input::{DEFAULT_MAX_JSON_BYTES, StageArgs, read_bounded, required};
 use anyhow::{Context as _, bail};
 use clap::Args;
-use tritium_nn::{GgufBpeTokenizer, HfJsonTokenizer, ModelRunner, Tokenizer};
+use tritium_nn::{GgufBpeTokenizer, HfJsonTokenizer, ModelRunner, Runner, Tokenizer};
+
+// Private bridge for legacy GGUF/SALT commands until their loader migration.
+enum CliRunner {
+    Legacy(ModelRunner),
+    Shared(Runner),
+}
+impl From<ModelRunner> for CliRunner {
+    fn from(runner: ModelRunner) -> Self {
+        Self::Legacy(runner)
+    }
+}
+impl From<Runner> for CliRunner {
+    fn from(runner: Runner) -> Self {
+        Self::Shared(runner)
+    }
+}
+impl CliRunner {
+    fn generate(
+        &mut self,
+        prompt: &[u32],
+        max_new: usize,
+        eos: u32,
+    ) -> Result<Vec<u32>, tritium_nn::NnError> {
+        match self {
+            Self::Legacy(runner) => runner.generate(prompt, max_new, eos),
+            Self::Shared(runner) => runner.generate(prompt, max_new, eos),
+        }
+    }
+}
 
 #[derive(Args, Debug)]
 pub(crate) struct JoinedArgs {
@@ -129,13 +158,15 @@ pub(crate) fn run_joined(
         let backend = Box::new(tritium_cpu::CpuBackend::new());
         let result = match prompt {
             Prompt::Ids(_) => (
-                ModelRunner::from_source_admitted(source, backend, policy, &budget, context)?,
+                CliRunner::Legacy(ModelRunner::from_source_admitted(
+                    source, backend, policy, &budget, context,
+                )?),
                 None,
             ),
             Prompt::Text(_) => {
                 let loaded = tritium_nn::load(source, backend, policy, &budget, context)?;
                 (
-                    loaded.runner,
+                    CliRunner::Shared(loaded.runner),
                     Some(Box::new(loaded.tokenizer) as Box<dyn Tokenizer>),
                 )
             }
@@ -218,13 +249,14 @@ pub(crate) fn run(
 }
 
 fn decode_and_print(
-    mut runner: ModelRunner,
+    runner: impl Into<CliRunner>,
     tokenizer: Option<Box<dyn Tokenizer>>,
     model_path: &Path,
     prompt: &Prompt<'_>,
     max_new: usize,
     eos: u32,
 ) -> anyhow::Result<()> {
+    let mut runner = runner.into();
     let tokens = match prompt {
         Prompt::Ids(ids) => (*ids).to_vec(),
         Prompt::Text(text) => {

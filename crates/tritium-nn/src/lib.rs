@@ -45,6 +45,7 @@ pub use layers::{
     Qwen35FullAttentionWeights, Relu2Mlp, SaltLinear, SwiGluMlp, TensorLoader, TernaryLinear,
     TokenEmbedding, TransformerBlock,
 };
+pub use model::{ArchitectureSpec, LayerKind, Runner};
 pub use model::{
     ForwardDump, LayerWeights, ModelRunner, ModelSource, ModelWeights,
     QWEN35_HF_SOURCE_ARCHITECTURE, QWEN35_MTP_UNVERIFIED_REASON, QWEN35_MTP_VLLM_ORACLE_REVISION,

@@ -298,6 +298,11 @@ impl Qwen35TextOutput {
         &self.last_logits
     }
 
+    #[cfg(feature = "tokenizer")]
+    pub(crate) fn into_last_logits(self) -> Vec<f32> {
+        self.last_logits
+    }
+
     pub(crate) fn runner_identity(&self) -> &Arc<RunnerIdentity> {
         &self.runner_identity
     }
