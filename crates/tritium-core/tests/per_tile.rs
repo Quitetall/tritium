@@ -7,6 +7,70 @@ use tritium_schema::{
     Transport,
 };
 
+#[test]
+fn uniform_preflight_and_cursor_match_shared_compact_geometry() {
+    for &law in ADMITTED_LAWS {
+        for group in [32, 64, 128, 256] {
+            for cols in [1, 255, 256, 257, 1281] {
+                let compact = layout(3, cols, law, group);
+                let counts = vec![law.max_planes; 3 * cols.div_ceil(256)];
+                let plan = tritium_core::PerTilePlan::new(compact, &counts).unwrap();
+                let mut spans = vec![PerTileRowSpan::default(); plan.index_len()];
+                let index = plan.build(&mut spans).unwrap();
+                let uniform = tritium_core::UniformPlan::new(
+                    AdditiveLayout {
+                        allocation: PlaneAllocation::Uniform,
+                        ..compact
+                    },
+                    law.max_planes,
+                )
+                .unwrap();
+                assert_eq!(uniform.trit_count(), plan.trit_count());
+                assert_eq!(uniform.scale_count(), plan.scale_count());
+                assert_eq!(uniform.plane_count(), plan.plane_count());
+                for plane in 0..plan.plane_count() {
+                    for row in 0..3 {
+                        let fields = |tile: tritium_core::PerTileActiveTile| {
+                            (tile.columns(), tile.trit_offset(), tile.scale_offset())
+                        };
+                        assert_eq!(
+                            uniform
+                                .tiles_in_row(plane, row)
+                                .unwrap()
+                                .map(fields)
+                                .collect::<Vec<_>>(),
+                            index
+                                .tiles_in_row(plane, row)
+                                .unwrap()
+                                .map(fields)
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                }
+                assert!(matches!(
+                    uniform.tiles_in_row(0, 3),
+                    Err(AdditiveError::RowOutOfRange)
+                ));
+                assert!(matches!(
+                    uniform.tiles_in_row(uniform.plane_count(), 0),
+                    Err(AdditiveError::InvalidPlaneCount)
+                ));
+                assert!(tritium_core::UniformPlan::new(compact, law.max_planes).is_err());
+                assert!(
+                    tritium_core::UniformPlan::new(
+                        AdditiveLayout {
+                            allocation: PlaneAllocation::Uniform,
+                            ..compact
+                        },
+                        0
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+}
+
 fn layout(
     rows: usize,
     cols: usize,

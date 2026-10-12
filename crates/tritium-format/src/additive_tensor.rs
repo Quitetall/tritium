@@ -353,26 +353,6 @@ fn copy_payload<T: Copy>(values: &[T]) -> Result<Vec<T>, AdditiveTensorError> {
     Ok(owned)
 }
 
-fn tensor_coefficients(layout: AdditiveLayout) -> Result<usize, AdditiveTensorError> {
-    let rows = usize::try_from(layout.rows).map_err(|_| AdditiveTensorError::LengthOverflow)?;
-    let cols = usize::try_from(layout.cols).map_err(|_| AdditiveTensorError::LengthOverflow)?;
-    rows.checked_mul(cols)
-        .ok_or(AdditiveTensorError::LengthOverflow)
-}
-
-fn tensor_scale_units(layout: AdditiveLayout) -> Result<usize, AdditiveTensorError> {
-    let rows = usize::try_from(layout.rows).map_err(|_| AdditiveTensorError::LengthOverflow)?;
-    let cols = usize::try_from(layout.cols).map_err(|_| AdditiveTensorError::LengthOverflow)?;
-    match layout.law.anchor {
-        ScaleAnchor::Group => rows
-            .checked_mul(cols.div_ceil(usize::from(layout.group)))
-            .ok_or(AdditiveTensorError::LengthOverflow),
-        ScaleAnchor::Row | ScaleAnchor::Channel => Ok(rows),
-        ScaleAnchor::Tensor => Ok(1),
-        _ => Err(AdditiveTensorError::LengthOverflow),
-    }
-}
-
 fn salt_codec(codec: PlaneCodec) -> Result<SaltV2Codec, AdditiveTensorError> {
     match codec {
         PlaneCodec::D2 => Ok(SaltV2Codec::D2),

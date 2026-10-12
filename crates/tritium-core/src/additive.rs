@@ -133,6 +133,160 @@ pub struct AdditiveView<'a> {
     scales: &'a [f32],
 }
 
+/// Allocation-free validated uniform geometry, independent of decoded storage.
+///
+/// Uses the same preflight and row cursor as [`AdditiveView`]. This admits
+/// logical geometry only, not packed bytes, scales or backend execution.
+#[derive(Clone, Copy, Debug)]
+pub struct UniformPlan {
+    layout: AdditiveLayout,
+    planes: usize,
+    trit_count: usize,
+    scale_count: usize,
+    scale_units: usize,
+}
+
+impl UniformPlan {
+    /// Validate the uniform layout/count without allocating any payload storage.
+    pub fn new(layout: AdditiveLayout, planes: u8) -> Result<Self, AdditiveError> {
+        let trit_count = uniform_trit_count(layout, planes)?;
+        let (scale_units, scale_count) = uniform_scale_counts(layout, planes)?;
+        Ok(Self {
+            layout,
+            planes: usize::from(planes),
+            trit_count,
+            scale_count,
+            scale_units,
+        })
+    }
+
+    /// Complete plane-major coefficient length.
+    #[must_use]
+    pub const fn trit_count(&self) -> usize {
+        self.trit_count
+    }
+
+    /// Complete stored scale length, excluding derived tied-plane scales.
+    #[must_use]
+    pub const fn scale_count(&self) -> usize {
+        self.scale_count
+    }
+
+    /// Number of present planes.
+    #[must_use]
+    pub const fn plane_count(&self) -> usize {
+        self.planes
+    }
+
+    /// Iterate one checked logical row, with absolute trit/stored-scale offsets.
+    pub fn tiles_in_row(&self, plane: usize, row: usize) -> Result<UniformTiles, AdditiveError> {
+        if row >= self.layout.rows as usize {
+            return Err(AdditiveError::RowOutOfRange);
+        }
+        if plane >= self.planes {
+            return Err(AdditiveError::InvalidPlaneCount);
+        }
+        Ok(self.row_tiles(plane, row))
+    }
+
+    fn row_tiles(self, plane: usize, row: usize) -> UniformTiles {
+        UniformTiles {
+            plan: self,
+            plane,
+            row,
+            col: 0,
+        }
+    }
+}
+
+/// Sealed allocation-free cursor over one validated uniform row and plane.
+#[derive(Debug)]
+pub struct UniformTiles {
+    plan: UniformPlan,
+    plane: usize,
+    row: usize,
+    col: usize,
+}
+
+impl Iterator for UniformTiles {
+    type Item = ActiveTile;
+    fn next(&mut self) -> Option<Self::Item> {
+        let layout = self.plan.layout;
+        let cols = layout.cols as usize;
+        if self.col >= cols {
+            return None;
+        }
+        let unit = uniform_scale_unit(layout, self.row, self.col).expect("validated scale anchor");
+        let tile = ActiveTile {
+            col: self.col,
+            len: (cols - self.col).min(usize::from(layout.tile)),
+            trit: (self.plane * layout.rows as usize + self.row) * cols + self.col,
+            scale: if layout.law.relation == PlaneRelation::Free {
+                self.plane * self.plan.scale_units + unit
+            } else {
+                unit
+            },
+        };
+        self.col += tile.len;
+        Some(tile)
+    }
+}
+
+fn uniform_trit_count(layout: AdditiveLayout, planes: u8) -> Result<usize, AdditiveError> {
+    layout.validate().map_err(AdditiveError::InvalidLayout)?;
+    if layout.allocation != PlaneAllocation::Uniform {
+        return Err(AdditiveError::UnsupportedAllocation);
+    }
+    if planes == 0 || planes > layout.max_planes {
+        return Err(AdditiveError::InvalidPlaneCount);
+    }
+    let rows = usize::try_from(layout.rows).map_err(|_| AdditiveError::SizeOverflow)?;
+    let cols = usize::try_from(layout.cols).map_err(|_| AdditiveError::SizeOverflow)?;
+    rows.checked_mul(cols)
+        .and_then(|count| count.checked_mul(usize::from(planes)))
+        .ok_or(AdditiveError::SizeOverflow)
+}
+
+fn uniform_scale_counts(
+    layout: AdditiveLayout,
+    planes: u8,
+) -> Result<(usize, usize), AdditiveError> {
+    let rows = usize::try_from(layout.rows).map_err(|_| AdditiveError::SizeOverflow)?;
+    let cols = usize::try_from(layout.cols).map_err(|_| AdditiveError::SizeOverflow)?;
+    let units = match layout.law.anchor {
+        ScaleAnchor::Group => rows
+            .checked_mul(cols.div_ceil(usize::from(layout.group)))
+            .ok_or(AdditiveError::SizeOverflow)?,
+        ScaleAnchor::Row | ScaleAnchor::Channel => rows,
+        ScaleAnchor::Tensor => 1,
+        _ => return Err(AdditiveError::InvalidLayout(LayoutError::UnsupportedLaw)),
+    };
+    let count = match layout.law.relation {
+        PlaneRelation::Free => units
+            .checked_mul(usize::from(planes))
+            .ok_or(AdditiveError::SizeOverflow)?,
+        PlaneRelation::Tied { .. } => units,
+        _ => return Err(AdditiveError::InvalidLayout(LayoutError::UnsupportedLaw)),
+    };
+    Ok((units, count))
+}
+
+fn uniform_scale_unit(
+    layout: AdditiveLayout,
+    row: usize,
+    col: usize,
+) -> Result<usize, AdditiveError> {
+    match layout.law.anchor {
+        ScaleAnchor::Group => Ok(
+            row * (layout.cols as usize).div_ceil(usize::from(layout.group))
+                + col / usize::from(layout.group),
+        ),
+        ScaleAnchor::Row | ScaleAnchor::Channel => Ok(row),
+        ScaleAnchor::Tensor => Ok(0),
+        _ => Err(AdditiveError::InvalidLayout(LayoutError::UnsupportedLaw)),
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Allocation<'a> {
     Uniform {
@@ -151,20 +305,7 @@ impl<'a> AdditiveView<'a> {
         trits: &'a [Trit],
         scales: &'a [f32],
     ) -> Result<Self, AdditiveError> {
-        layout.validate().map_err(AdditiveError::InvalidLayout)?;
-        if layout.allocation != PlaneAllocation::Uniform {
-            return Err(AdditiveError::UnsupportedAllocation);
-        }
-        if plane_count == 0 || plane_count > layout.max_planes {
-            return Err(AdditiveError::InvalidPlaneCount);
-        }
-
-        let rows = usize::try_from(layout.rows).map_err(|_| AdditiveError::SizeOverflow)?;
-        let cols = usize::try_from(layout.cols).map_err(|_| AdditiveError::SizeOverflow)?;
-        let coefficients = rows.checked_mul(cols).ok_or(AdditiveError::SizeOverflow)?;
-        let expected_trits = coefficients
-            .checked_mul(usize::from(plane_count))
-            .ok_or(AdditiveError::SizeOverflow)?;
+        let expected_trits = uniform_trit_count(layout, plane_count)?;
         if trits.len() != expected_trits {
             return Err(AdditiveError::TritCountMismatch {
                 expected: expected_trits,
@@ -172,23 +313,7 @@ impl<'a> AdditiveView<'a> {
             });
         }
 
-        let scale_units = match layout.law.anchor {
-            ScaleAnchor::Group => {
-                let groups_per_row = cols.div_ceil(usize::from(layout.group));
-                rows.checked_mul(groups_per_row)
-                    .ok_or(AdditiveError::SizeOverflow)?
-            }
-            ScaleAnchor::Row | ScaleAnchor::Channel => rows,
-            ScaleAnchor::Tensor => 1,
-            _ => return Err(AdditiveError::InvalidLayout(LayoutError::UnsupportedLaw)),
-        };
-        let expected_scales = match layout.law.relation {
-            PlaneRelation::Free => scale_units
-                .checked_mul(usize::from(plane_count))
-                .ok_or(AdditiveError::SizeOverflow)?,
-            PlaneRelation::Tied { .. } => scale_units,
-            _ => return Err(AdditiveError::InvalidLayout(LayoutError::UnsupportedLaw)),
-        };
+        let (scale_units, expected_scales) = uniform_scale_counts(layout, plane_count)?;
         if scales.len() != expected_scales {
             return Err(AdditiveError::ScaleCountMismatch {
                 expected: expected_scales,
@@ -360,15 +485,23 @@ impl<'a> AdditiveView<'a> {
         true
     }
 
-    fn row_tiles(&self, plane: usize, row: usize) -> RowTiles<'_, 'a> {
+    fn row_tiles(&self, plane: usize, row: usize) -> RowTiles<'a> {
         match self.allocation {
             Allocation::PerTile(index) => RowTiles::PerTile(index.row_tiles(plane, row)),
-            Allocation::Uniform { .. } => RowTiles::Uniform {
-                view: self,
-                plane,
-                row,
-                col: 0,
-            },
+            Allocation::Uniform {
+                layout,
+                planes,
+                scale_units,
+            } => RowTiles::Uniform(
+                UniformPlan {
+                    layout,
+                    planes,
+                    scale_units,
+                    trit_count: self.trits.len(),
+                    scale_count: self.scales.len(),
+                }
+                .row_tiles(plane, row),
+            ),
         }
     }
 
@@ -436,16 +569,7 @@ impl<'a> AdditiveView<'a> {
     }
 
     fn scale_unit(&self, row: usize, col: usize) -> Result<usize, AdditiveError> {
-        match self.layout().law.anchor {
-            ScaleAnchor::Group => {
-                let cols = self.layout().cols as usize;
-                let groups_per_row = cols.div_ceil(usize::from(self.layout().group));
-                Ok(row * groups_per_row + col / usize::from(self.layout().group))
-            }
-            ScaleAnchor::Row | ScaleAnchor::Channel => Ok(row),
-            ScaleAnchor::Tensor => Ok(0),
-            _ => Err(AdditiveError::InvalidLayout(LayoutError::UnsupportedLaw)),
-        }
+        uniform_scale_unit(self.layout(), row, col)
     }
 
     fn scale(&self, plane: usize, unit: usize) -> Result<f32, AdditiveError> {
@@ -556,50 +680,18 @@ impl<'a> AdditiveView<'a> {
 
 // One logical row cursor for each existing allocation. Compact offsets remain
 // owned by the sealed index; uniform offsets retain the existing scale order.
-enum RowTiles<'v, 'a> {
+enum RowTiles<'a> {
     PerTile(ActiveTiles<'a>),
-    Uniform {
-        view: &'v AdditiveView<'a>,
-        plane: usize,
-        row: usize,
-        col: usize,
-    },
+    Uniform(UniformTiles),
 }
 
-impl Iterator for RowTiles<'_, '_> {
+impl Iterator for RowTiles<'_> {
     type Item = ActiveTile;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::PerTile(tiles) => tiles.next(),
-            Self::Uniform {
-                view,
-                plane,
-                row,
-                col,
-            } => {
-                let layout = view.layout();
-                let cols = layout.cols as usize;
-                if *col >= cols {
-                    return None;
-                }
-                let Allocation::Uniform { scale_units, .. } = view.allocation else {
-                    unreachable!("uniform row cursor over compact allocation")
-                };
-                let unit = view.scale_unit(*row, *col).expect("validated scale anchor");
-                let tile = ActiveTile {
-                    col: *col,
-                    len: (cols - *col).min(usize::from(layout.tile)),
-                    trit: (*plane * layout.rows as usize + *row) * cols + *col,
-                    scale: if layout.law.relation == PlaneRelation::Free {
-                        *plane * scale_units + unit
-                    } else {
-                        unit
-                    },
-                };
-                *col += tile.len;
-                Some(tile)
-            }
+            Self::Uniform(tiles) => tiles.next(),
         }
     }
 }

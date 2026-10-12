@@ -258,5 +258,105 @@ fn sorted_manifest_encode_decode_and_envelope_do_not_allocate_value_per_tile() {
             allocated < 128 * 1024,
             "model reader retained master: {allocated}"
         );
+        // Group128 divides each256-column row, preserving the physical payload
+        // when reshaping these zero coefficients/exact scales to tall matrices.
+        let rows = coefficients / 256;
+        let child_layout = AdditiveLayout {
+            max_planes: 1,
+            rows: rows as u64,
+            cols: 256,
+            ..layout
+        };
+        let child = AdditiveTensor::new(
+            child_layout,
+            1,
+            vec![tritium_core::Trit::ZERO; coefficients],
+            vec![0.5; coefficients / 128],
+        )
+        .unwrap();
+        let child_payload = child.encode_payload().unwrap();
+        drop(child);
+        for child_compact in [false, true] {
+            for parent_compact in [false, true] {
+                let allocation = |compact| {
+                    if compact {
+                        PlaneAllocation::PerTile
+                    } else {
+                        PlaneAllocation::Uniform
+                    }
+                };
+                let counts = |compact, planes| {
+                    if compact {
+                        PlaneCounts::PerTile(vec![planes; rows])
+                    } else {
+                        PlaneCounts::Uniform(planes)
+                    }
+                };
+                let mut prefix_manifest = manifest.clone();
+                prefix_manifest.levels[0].name = "near".into();
+                prefix_manifest.levels[0].tensors[0].storage = TensorStorage::Additive {
+                    layout: AdditiveLayout {
+                        rows: rows as u64,
+                        cols: 256,
+                        allocation: allocation(parent_compact),
+                        ..layout
+                    },
+                    planes: counts(parent_compact, 3),
+                };
+                prefix_manifest.levels.insert(
+                    0,
+                    Level {
+                        name: "compact".into(),
+                        fit: LevelFit::ImportedPrefixOf {
+                            level: "near".into(),
+                        },
+                        tensors: vec![TensorMeta {
+                            name: "weight".into(),
+                            blob: reference(&child_payload),
+                            storage: TensorStorage::Additive {
+                                layout: AdditiveLayout {
+                                    allocation: allocation(child_compact),
+                                    ..child_layout
+                                },
+                                planes: counts(child_compact, 1),
+                            },
+                        }],
+                    },
+                );
+                let prefix_blobs = [
+                    blobs[0].clone(),
+                    TritBlob {
+                        kind: TritBlobKind::AdditiveTensor,
+                        bytes: &child_payload,
+                    },
+                    blobs[1].clone(),
+                    blobs[2].clone(),
+                ];
+                let prefix_package = write_trit_package(
+                    &encode_model_manifest(&prefix_manifest).unwrap(),
+                    &prefix_blobs,
+                )
+                .unwrap();
+                ALLOCATED.store(0, Ordering::Relaxed);
+                TRACK.store(true, Ordering::SeqCst);
+                let result = read_trit_model(&prefix_package);
+                TRACK.store(false, Ordering::SeqCst);
+                result.unwrap();
+                let allocated = ALLOCATED.load(Ordering::Relaxed);
+                // Explicit row indexes, returned metadata and hash allowance,
+                // not a claim of constant compact memory or physical RSS.
+                let slots = rows * (usize::from(child_compact) + 3 * usize::from(parent_compact));
+                let index_bytes = slots * core::mem::size_of::<tritium_core::PerTileRowSpan>();
+                let count_allowance =
+                    rows * 32 * (usize::from(child_compact) + usize::from(parent_compact));
+                println!(
+                    "{rows}x256 prefix child_compact={child_compact} parent_compact={parent_compact}: requested {allocated} heap bytes; row-index allowance {index_bytes}"
+                );
+                assert!(
+                    allocated < index_bytes + count_allowance + 256 * 1024,
+                    "prefix retained decoded master: {allocated}"
+                );
+            }
+        }
     }
 }

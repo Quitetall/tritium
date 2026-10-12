@@ -724,7 +724,16 @@ fn is_prefix(
         (TensorStorage::Dense { .. }, TensorStorage::Dense { .. }) => {
             Ok(child.storage == parent.storage && child_bytes == parent_bytes)
         }
-        (TensorStorage::Additive { layout: c, .. }, TensorStorage::Additive { layout: p, .. }) => {
+        (
+            TensorStorage::Additive {
+                layout: c,
+                planes: child_planes,
+            },
+            TensorStorage::Additive {
+                layout: p,
+                planes: parent_planes,
+            },
+        ) => {
             let mut normalized = *p;
             normalized.max_planes = c.max_planes;
             normalized.codec = c.codec;
@@ -734,9 +743,13 @@ fn is_prefix(
             if normalized != *c || c.max_planes > p.max_planes {
                 return Ok(false);
             }
-            let child = decode_additive_payload(child, child_bytes)?;
-            let parent = decode_additive_payload(parent, parent_bytes)?;
-            Ok(child.view().is_logical_prefix_of(parent.view()))
+            let child = AdditivePayload::new(*c, child_planes, child_bytes)
+                .map_err(TritModelError::Additive)?;
+            let parent = AdditivePayload::new(*p, parent_planes, parent_bytes)
+                .map_err(TritModelError::Additive)?;
+            child
+                .is_logical_prefix_of(&parent)
+                .map_err(TritModelError::Additive)
         }
         _ => Ok(false),
     }

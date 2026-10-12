@@ -2,7 +2,10 @@
 
 use super::*;
 use crate::salt_v2::{B3_TRITS_PER_BYTE, D2_TRITS_PER_BYTE, S34_TRITS_PER_GROUP};
-use tritium_schema::{PlaneAllocation, PlaneCounts};
+use tritium_core::UniformPlan;
+use tritium_schema::PlaneCounts;
+
+mod prefix;
 
 // Every nonterminal chunk ends at a byte boundary for all three codecs.
 const SCRATCH_TRITS: usize = D2_TRITS_PER_BYTE * B3_TRITS_PER_BYTE * (8 * S34_TRITS_PER_GROUP);
@@ -65,31 +68,16 @@ impl<'a> AdditivePayload<'a> {
         }
         let (count, trit_count, scale_count, compact) = match allocation {
             Allocation::Uniform(count) => {
-                layout.validate().map_err(|e| {
-                    AdditiveTensorError::InvalidView(AdditiveError::InvalidLayout(e))
+                let plan = UniformPlan::new(layout, count).map_err(|error| match error {
+                    AdditiveError::SizeOverflow => AdditiveTensorError::LengthOverflow,
+                    other => AdditiveTensorError::InvalidView(other),
                 })?;
-                if layout.allocation != PlaneAllocation::Uniform {
-                    return Err(AdditiveTensorError::InvalidView(
-                        AdditiveError::UnsupportedAllocation,
-                    ));
-                }
-                if count == 0 || count > layout.max_planes {
-                    return Err(AdditiveTensorError::InvalidView(
-                        AdditiveError::InvalidPlaneCount,
-                    ));
-                }
-                let trits = tensor_coefficients(layout)?
-                    .checked_mul(usize::from(count))
-                    .ok_or(AdditiveTensorError::LengthOverflow)?;
-                let units = tensor_scale_units(layout)?;
-                let scales = match layout.law.relation {
-                    PlaneRelation::Free => units
-                        .checked_mul(usize::from(count))
-                        .ok_or(AdditiveTensorError::LengthOverflow)?,
-                    PlaneRelation::Tied { .. } => units,
-                    _ => return Err(AdditiveTensorError::LengthOverflow),
-                };
-                (usize::from(count), trits, scales, None)
+                (
+                    plan.plane_count(),
+                    plan.trit_count(),
+                    plan.scale_count(),
+                    None,
+                )
             }
             Allocation::PerTile(counts) => {
                 let plan =
@@ -110,7 +98,7 @@ impl<'a> AdditivePayload<'a> {
                 plan.plane_trit_count(plane)
                     .map_err(AdditiveTensorError::InvalidView)?
             } else {
-                tensor_coefficients(layout)?
+                trit_count / count
             };
             let len = encoded_plane_len(codec, trits)?;
             planes.push(Plane {
