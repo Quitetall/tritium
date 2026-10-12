@@ -18,6 +18,9 @@ mod joined;
 #[path = "tensor_loading/calibration.rs"]
 mod calibration;
 
+#[path = "tensor_loading/compact.rs"]
+mod compact;
+
 #[derive(Debug)]
 struct UploadProbe(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
@@ -223,6 +226,17 @@ struct HfFixture {
 
 impl HfFixture {
     fn new(arch: &str, tied: bool, head_dim: usize, bad: Option<&str>) -> Self {
+        Self::with_dimensions(arch, tied, head_dim, 8, 16, bad)
+    }
+
+    fn with_dimensions(
+        arch: &str,
+        tied: bool,
+        head_dim: usize,
+        width: usize,
+        ff: usize,
+        bad: Option<&str>,
+    ) -> Self {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir =
@@ -250,27 +264,27 @@ impl HfFixture {
             }
             tensors.push((name.to_owned(), shape.to_vec(), values));
         };
-        add("model.embed_tokens.weight", &[10, 8]);
+        add("model.embed_tokens.weight", &[10, width]);
         for name in [
             "model.norm.weight",
             "model.layers.0.input_layernorm.weight",
             "model.layers.0.post_attention_layernorm.weight",
         ] {
-            add(name, &[8]);
+            add(name, &[width]);
         }
         for (name, rows, cols) in [
-            ("self_attn.q_proj.weight", 2 * head_dim, 8),
-            ("self_attn.k_proj.weight", head_dim, 8),
-            ("self_attn.v_proj.weight", head_dim, 8),
-            ("self_attn.o_proj.weight", 8, 2 * head_dim),
-            ("mlp.gate_proj.weight", 16, 8),
-            ("mlp.up_proj.weight", 16, 8),
-            ("mlp.down_proj.weight", 8, 16),
+            ("self_attn.q_proj.weight", 2 * head_dim, width),
+            ("self_attn.k_proj.weight", head_dim, width),
+            ("self_attn.v_proj.weight", head_dim, width),
+            ("self_attn.o_proj.weight", width, 2 * head_dim),
+            ("mlp.gate_proj.weight", ff, width),
+            ("mlp.up_proj.weight", ff, width),
+            ("mlp.down_proj.weight", width, ff),
         ] {
             add(&format!("model.layers.0.{name}"), &[rows, cols]);
         }
         if !tied {
-            add("lm_head.weight", &[10, 8]);
+            add("lm_head.weight", &[10, width]);
         }
         if arch == "qwen2" {
             for (name, n) in [("q", 2 * head_dim), ("k", head_dim), ("v", head_dim)] {
@@ -300,7 +314,7 @@ impl HfFixture {
                 .iter_mut()
                 .find(|(name, _, _)| name == "model.norm.weight")
                 .unwrap();
-            *shape = vec![1, 8];
+            *shape = vec![1, width];
         }
         if bad == Some("extra") {
             tensors.push(("unexpected.weight".into(), vec![1], vec![0.]));
@@ -356,9 +370,9 @@ impl HfFixture {
         std::fs::write(
             fixture.dir.join("config.json"),
             serde_json::to_vec(&serde_json::json!({
-                "model_type":arch, "hidden_size":8, "num_hidden_layers":1,
+                "model_type":arch, "hidden_size":width, "num_hidden_layers":1,
                 "num_attention_heads":2, "num_key_value_heads":1, "head_dim":head_dim,
-                "intermediate_size":16, "max_position_embeddings":16,
+                "intermediate_size":ff, "max_position_embeddings":16,
                 "rms_norm_eps":1e-5, "hidden_act":"silu", "tie_word_embeddings":tied,
                 "rope_theta":10000., "vocab_size":10,
             }))
@@ -808,7 +822,7 @@ impl TritFixture {
                 }
                 tritium_schema::TensorStorage::Additive { layout, .. } => {
                     let tensor =
-                        tritium_format::AdditiveTensor::decode_payload(*layout, 3, payload)
+                        tritium_format::trit_model::decode_additive_payload(tensor, payload)
                             .unwrap();
                     let ids = (0..layout.rows as usize).collect::<Vec<_>>();
                     let mut values = vec![0.; (layout.rows * layout.cols) as usize];

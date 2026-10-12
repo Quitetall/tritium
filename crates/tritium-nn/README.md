@@ -32,6 +32,18 @@ the loaded C package/selected semantic model identity. Both use the same config,
 complete tensor-inventory and backend-upload implementation. Ordinary `.trit`
 loading rejects the mandatory joined carrier; it cannot silently ignore lineage.
 
+Raw additive matrices may use either Uniform counts or the proposed ADR 0066
+PerTile compact allocation, including pruned tiles and row-aligned ragged tails.
+Both use the typed format decoder and the same checked/logged tensor uploader;
+the selected backend must explicitly support the declared law, basis and codec.
+Packed CPU and the production reference own their uploaded data, so the runner
+can outlive the borrowed source bytes. `native_only` and lifetime-bound shared
+payload admission remain enforced. Host norm/bias vectors, source bytes, transient
+decode/index capacity, KV and scratch are outside that payload ledger. This is
+not full RSS admission, profile freeze, physical speed or pretrained-model quality
+qualification. Sharded/entropy payloads and resident hybrid/MTP require additional
+reader/executor support rather than a silent fallback.
+
 The admitted joined view borrows C, not the dense B stage. B and its logs may be
 released after joined admission; the resulting runner owns uploaded handles and
 may outlive C. Structural lineage admission is not actual A-to-B numerical replay,

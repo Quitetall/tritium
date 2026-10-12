@@ -3,7 +3,8 @@
 
 use tritium_core::Trit;
 use tritium_format::trit_model::{
-    TritModelError, additive_semantic_digest, encode_model_manifest, read_trit_model,
+    TritModelError, additive_semantic_digest, decode_additive_payload, encode_model_manifest,
+    read_trit_model,
 };
 use tritium_format::{AdditiveTensor, TritBlob, TritBlobKind, write_trit_package};
 use tritium_schema::{
@@ -451,4 +452,59 @@ fn compact_packages_reject_wrong_payload_counts_and_rehashed_invalid_bytes() {
         *planes = PlaneCounts::PerTile(counts);
         assert!(encode_model_manifest(&m).is_err());
     }
+}
+
+#[test]
+fn shared_payload_decoder_owns_both_allocations_but_does_not_authenticate_blob_ids() {
+    for counts in [None, Some([1, 3, 2, 0])] {
+        let original = tensor(
+            layout(ADMITTED_LAWS[0], 257, 128),
+            counts.as_ref().map(|c| c.as_slice()),
+            3,
+        );
+        let payload = original.encode_payload().unwrap();
+        let mut meta = metadata(&original, &payload);
+        // Raw decode is deliberately not container authentication. The complete
+        // reader still checks physical identity before any model upload.
+        meta.blob.id = BlobId::from_bytes([0; 32]);
+        let decoded = decode_additive_payload(&meta, &payload).unwrap();
+        drop(payload);
+        assert_eq!(decoded, original);
+    }
+}
+
+#[test]
+fn shared_payload_decoder_preserves_typed_errors_before_model_admission() {
+    let original = tensor(layout(ADMITTED_LAWS[0], 257, 128), Some(&[1, 3, 2, 0]), 0);
+    let payload = original.encode_payload().unwrap();
+    let original_meta = metadata(&original, &payload);
+    for counts in [vec![1, 3, 2], vec![1, 4, 2, 0], vec![0; 4]] {
+        let mut meta = original_meta.clone();
+        let TensorStorage::Additive { planes, .. } = &mut meta.storage else {
+            unreachable!()
+        };
+        *planes = PlaneCounts::PerTile(counts);
+        assert!(matches!(
+            decode_additive_payload(&meta, &payload),
+            Err(TritModelError::Additive(_))
+        ));
+    }
+    let mut meta = original_meta.clone();
+    meta.storage = TensorStorage::Dense {
+        shape: vec![2, 257],
+        precision: tritium_schema::ScalePrecision::F32,
+    };
+    assert!(matches!(
+        decode_additive_payload(&meta, &payload),
+        Err(TritModelError::UnsupportedFeature("not additive"))
+    ));
+    let mut meta = original_meta;
+    let TensorStorage::Additive { layout, .. } = &mut meta.storage else {
+        unreachable!()
+    };
+    layout.transport = Transport::JointHuffman { block: 256 };
+    assert!(matches!(
+        decode_additive_payload(&meta, &payload),
+        Err(TritModelError::UnsupportedFeature("entropy model payloads"))
+    ));
 }

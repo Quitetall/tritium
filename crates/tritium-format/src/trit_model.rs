@@ -336,7 +336,9 @@ pub fn bind_trit_model_payloads<'a>(
                     digests.push(dense_digest(shape, *precision, bytes)?);
                 }
                 TensorStorage::Additive { .. } => {
-                    digests.push(additive_semantic_digest(&decode_additive(tensor, bytes)?)?);
+                    digests.push(additive_semantic_digest(&decode_additive_payload(
+                        tensor, bytes,
+                    )?)?);
                 }
                 _ => return Err(TritModelError::UnsupportedFeature("tensor storage")),
             }
@@ -517,7 +519,21 @@ fn model_digest(
     ))
 }
 
-fn decode_additive(meta: &TensorMeta, bytes: &[u8]) -> Result<AdditiveTensor, TritModelError> {
+/// Decode a declared raw additive payload with its Uniform or PerTile counts.
+///
+/// Reuses the same canonical decoder as typed model validation and prefix checks.
+/// Reservations are fallible and no dense matrix is materialized. This validates
+/// payload/layout/count structure, not blob, package, model or provenance identity;
+/// a model loader must authenticate the complete source through [`read_trit_model`]
+/// first. The metadata's count variant is never inferred from the physical bytes.
+///
+/// # Errors
+/// Non-additive metadata, unsupported transport/allocation, invalid layout/counts,
+/// malformed physical payload/codes/padding/scales or allocation failure.
+pub fn decode_additive_payload(
+    meta: &TensorMeta,
+    bytes: &[u8],
+) -> Result<AdditiveTensor, TritModelError> {
     let TensorStorage::Additive { layout, planes } = &meta.storage else {
         return Err(TritModelError::UnsupportedFeature("not additive"));
     };
@@ -649,8 +665,8 @@ fn is_prefix(
             if normalized != *c || c.max_planes > p.max_planes {
                 return Ok(false);
             }
-            let child = decode_additive(child, child_bytes)?;
-            let parent = decode_additive(parent, parent_bytes)?;
+            let child = decode_additive_payload(child, child_bytes)?;
+            let parent = decode_additive_payload(parent, parent_bytes)?;
             Ok(child.view().is_logical_prefix_of(parent.view()))
         }
         _ => Ok(false),

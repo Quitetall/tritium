@@ -3,14 +3,11 @@
 use std::{cell::RefCell, collections::BTreeMap, path::Path};
 
 use half::{bf16, f16};
-use tritium_format::{
-    AdditiveTensor,
-    trit_model::{TritModel, read_trit_model},
-};
+use tritium_format::trit_model::{TritModel, decode_additive_payload, read_trit_model};
 use tritium_quantize::engine::JoinedSalienceModel;
 #[cfg(feature = "tokenizer")]
 use tritium_schema::{LoadedSourceIdentity, ModelLoaded, UnknownReason};
-use tritium_schema::{PlaneCounts, ScalePrecision, TensorMeta, TensorStorage};
+use tritium_schema::{ScalePrecision, TensorMeta, TensorStorage};
 use tritium_spec::TensorView;
 
 use super::{
@@ -31,8 +28,10 @@ const MAX_TOKENIZER_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Supported sources for the shared admitted standard-model loading path.
 ///
-/// Typed `.trit` is a proposed profile. Shards/per-tile/entropy and hybrid/MTP
-/// execution require later reader/architecture support, not a silent fallback.
+/// Typed `.trit` is a proposed profile. Validated raw Uniform/PerTile additive
+/// matrices use the shared tensor decoder and selected backend's explicit tier.
+/// Shards/entropy and hybrid/MTP require later reader/architecture support,
+/// not a silent fallback or independent compact profile acceptance.
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub enum ModelSource<'a> {
@@ -485,12 +484,9 @@ fn upload_matrix(
                 },
             )
         }
-        TensorStorage::Additive {
-            layout,
-            planes: PlaneCounts::Uniform(count),
-        } => {
-            let tensor = AdditiveTensor::decode_payload(*layout, *count, bytes)
-                .map_err(|e| NnError::InvalidArtifact(format!("{}: {e:?}", meta.name)))?;
+        TensorStorage::Additive { .. } => {
+            let tensor = decode_additive_payload(meta, bytes)
+                .map_err(|e| NnError::InvalidArtifact(format!("{}: {e}", meta.name)))?;
             loader.upload(&meta.name, TensorView::Additive(tensor.view()))
         }
         _ => Err(NnError::Backend("unsupported model tensor payload".into())),
