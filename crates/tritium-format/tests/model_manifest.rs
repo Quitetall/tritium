@@ -505,6 +505,7 @@ fn borrowed_sorted_metadata_matches_reference_bytes_and_package_identity() {
             read_trit_package(&reference_package).unwrap().package_id()
         );
         assert_eq!(decode_model_manifest(&actual).unwrap(), manifest);
+        assert_decode_matches_value_reference(&actual);
         let mut unsorted = manifest;
         unsorted.assets.reverse();
         unsorted.levels.reverse();
@@ -597,6 +598,136 @@ fn cbor(mut value: Value) -> Vec<u8> {
     let mut bytes = vec![];
     ciborium::ser::into_writer(&value, &mut bytes).unwrap();
     bytes
+}
+
+// Previous typed decoder's Value -> schema -> validate -> exact re-encode
+// workflow. Test-only oracle; production still has one model vocabulary.
+fn decode_value_reference(bytes: &[u8]) -> Result<ModelManifest, ()> {
+    fn supported(value: &Value, depth: usize) -> bool {
+        if depth > 64 {
+            return false;
+        }
+        match value {
+            Value::Float(_) => false,
+            Value::Array(items) => items.iter().all(|v| supported(v, depth + 1)),
+            Value::Map(items) => items
+                .iter()
+                .all(|(k, v)| supported(k, depth + 1) && supported(v, depth + 1)),
+            Value::Tag(_, item) => supported(item, depth + 1),
+            _ => true,
+        }
+    }
+    let value: Value = ciborium::de::from_reader(bytes).map_err(|_| ())?;
+    if !supported(&value, 0) || cbor(value.clone()) != bytes {
+        return Err(());
+    }
+    let manifest: ModelManifest = value.deserialized().map_err(|_| ())?;
+    manifest.validate().map_err(|_| ())?;
+    if encode_model_manifest(&manifest).map_err(|_| ())? != bytes {
+        return Err(());
+    }
+    Ok(manifest)
+}
+
+fn assert_decode_matches_value_reference(bytes: &[u8]) {
+    let expected = decode_value_reference(bytes);
+    let actual = decode_model_manifest(bytes);
+    match (actual, expected) {
+        (Ok(actual), Ok(expected)) => assert_eq!(actual, expected),
+        (Err(_), Err(())) => {}
+        (actual, expected) => panic!("typed/reference disagreement: {actual:?} / {expected:?}"),
+    }
+}
+
+#[test]
+fn direct_typed_decode_matches_value_reference_for_hostile_schema_variants() {
+    let original = Value::serialized(&fixture()).unwrap();
+    let mut variants = vec![
+        original.clone(),
+        Value::Tag(123, Box::new(original.clone())),
+    ];
+    for name in [
+        "schema",
+        "architecture",
+        "assets",
+        "levels",
+        "shards",
+        "legacy_ids",
+    ] {
+        let mut value = original.clone();
+        let Value::Map(fields) = &mut value else {
+            unreachable!()
+        };
+        fields.retain(|(key, _)| *key != Value::Text(name.into()));
+        variants.push(value);
+        for wrong in [
+            Value::Null,
+            Value::Bool(true),
+            Value::Integer((-1).into()),
+            Value::Integer(u64::MAX.into()),
+            Value::Text("unknown".into()),
+            Value::Bytes(vec![0, 1]),
+            Value::Array(vec![]),
+            Value::Map(vec![]),
+            Value::Float(1.0),
+        ] {
+            let mut value = original.clone();
+            *field(&mut value, name) = wrong;
+            variants.push(value);
+        }
+    }
+    let mut omitted_optional = original.clone();
+    let Value::Array(assets) = field(&mut omitted_optional, "assets") else {
+        unreachable!()
+    };
+    let Value::Map(blob) = field(&mut assets[0], "blob") else {
+        unreachable!()
+    };
+    blob.retain(|(key, _)| *key != Value::Text("shard".into()));
+    variants.push(omitted_optional);
+    let mut unknown_nested = original.clone();
+    let Value::Map(schema) = field(&mut unknown_nested, "schema") else {
+        unreachable!()
+    };
+    schema.push((Value::Text("unknown".into()), Value::Integer(1.into())));
+    variants.push(unknown_nested);
+    let mut tagged_schema = original.clone();
+    let schema = field(&mut tagged_schema, "schema");
+    *schema = Value::Tag(123, Box::new(schema.clone()));
+    variants.push(tagged_schema);
+    let mut reversed = original.clone();
+    let Value::Array(assets) = field(&mut reversed, "assets") else {
+        unreachable!()
+    };
+    assets.reverse();
+    variants.push(reversed);
+    let mut duplicate = original.clone();
+    let Value::Map(fields) = &mut duplicate else {
+        unreachable!()
+    };
+    fields.push(fields[0].clone());
+    variants.push(duplicate);
+    for value in variants {
+        let bytes = cbor(value);
+        assert_decode_matches_value_reference(&bytes);
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_decode_matches_value_reference(&trailing);
+        for cut in [0, bytes.len() / 2, bytes.len().saturating_sub(1)] {
+            assert_decode_matches_value_reference(&bytes[..cut]);
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+    #[test]
+    fn mutated_typed_bytes_match_value_reference(offset in any::<usize>(), replacement in any::<u8>()) {
+        let mut bytes = cbor(Value::serialized(&fixture()).unwrap());
+        let index = offset % bytes.len();
+        bytes[index] = replacement;
+        assert_decode_matches_value_reference(&bytes);
+    }
 }
 
 fn field<'a>(value: &'a mut Value, key: &str) -> &'a mut Value {

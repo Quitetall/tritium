@@ -2,7 +2,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tritium_format::trit_model::encode_model_manifest;
+use tritium_format::trit_model::{decode_model_manifest, encode_model_manifest};
 use tritium_format::{PackageHasher, TritBlob, TritBlobKind, write_trit_package_to};
 use tritium_schema::{
     ADMITTED_LAWS, AdditiveLayout, Basis, BlobId, BlobReference, Level, LevelFit, ManifestAsset,
@@ -102,7 +102,7 @@ fn manifest(tiles: usize) -> ModelManifest {
 }
 
 #[test]
-fn sorted_manifest_and_envelope_do_not_allocate_value_per_tile() {
+fn sorted_manifest_encode_decode_and_envelope_do_not_allocate_value_per_tile() {
     for tiles in [16 * 1024, 1024 * 1024] {
         let manifest = manifest(tiles);
         manifest.validate().unwrap();
@@ -122,6 +122,21 @@ fn sorted_manifest_and_envelope_do_not_allocate_value_per_tile() {
             "encoder requested {allocated} heap bytes for {} encoded bytes",
             bytes.len()
         );
+
+        ALLOCATED.store(0, Ordering::Relaxed);
+        TRACK.store(true, Ordering::SeqCst);
+        let result = decode_model_manifest(&bytes);
+        TRACK.store(false, Ordering::SeqCst);
+        let allocated = ALLOCATED.load(Ordering::Relaxed);
+        println!("{tiles} tile counts: typed decoder requested {allocated} heap bytes");
+        let decoded = result.unwrap();
+        assert_eq!(decoded, manifest);
+        assert!(
+            allocated < bytes.len() * 10 + 65536,
+            "typed decoder requested {allocated} heap bytes for {} encoded bytes",
+            bytes.len()
+        );
+        drop(decoded);
 
         let blobs = [
             TritBlob {

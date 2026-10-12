@@ -14,8 +14,7 @@ use tritium_schema::{
 };
 
 use crate::trit_package::{
-    canonicalize_value, encode_borrowed_manifest, encode_cbor_value, parse_canonical_manifest,
-    validate_canonical_manifest,
+    canonicalize_value, encode_borrowed_manifest, encode_cbor_value, validate_canonical_manifest,
 };
 use crate::{
     AdditiveTensor, AdditiveTensorError, TritBlobKind, TritPackage, TritPackageError,
@@ -106,14 +105,17 @@ pub fn encode_model_manifest(manifest: &ModelManifest) -> Result<Vec<u8>, TritMo
 }
 
 /// Decode only the canonical typed encoding; unknown/duplicate fields fail closed.
+/// Ordinary metadata is deserialized directly into the schema after borrowed
+/// envelope validation, without a generic Value per count. Returned metadata
+/// owns its inventories; exact re-encoding temporarily retains encoded bytes.
+/// This does not qualify complete-model or process memory admission.
 ///
 /// # Errors
 /// Unknown versions/tags/fields, invalid structure or noncanonical byte/order data.
 pub fn decode_model_manifest(bytes: &[u8]) -> Result<ModelManifest, TritModelError> {
-    let value = parse_canonical_manifest(bytes)?;
-    let manifest: ModelManifest = value
-        .deserialized()
-        .map_err(|e| TritModelError::Schema(e.to_string()))?;
+    validate_canonical_manifest(bytes)?;
+    let manifest: ModelManifest =
+        ciborium::de::from_reader(bytes).map_err(|e| TritModelError::Schema(e.to_string()))?;
     manifest.validate()?;
     if encode_model_manifest(&manifest)? != bytes {
         return Err(TritModelError::NonCanonical);
