@@ -148,6 +148,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         "legacy-model-import-prepared"
     );
     project!(ModelShard, "model-shard");
+    project!(
+        tritium_schema::LegacySaltV2BundleDescriptor,
+        "legacy-salt-v2-bundle-descriptor"
+    );
     project!(PlaneCounts, "plane-counts");
     project!(TensorMeta, "tensor-meta");
     project!(TensorStorage, "tensor-storage");

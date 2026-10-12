@@ -1,6 +1,6 @@
 //! The `tritium` command-line tool.
 //!
-//! One binary, fourteen subcommands, grouped by concern:
+//! One binary, fifteen subcommands, grouped by concern:
 //! - **inspect / list-backends / generate** — parse a GGUF and print its
 //!   metadata + tensor table, enumerate the discovered compute backends,
 //!   greedily decode from a reproducible JSON token file.
@@ -57,6 +57,7 @@ mod generate;
 mod hestia_gate;
 mod hex;
 mod inspect;
+mod migrate;
 #[cfg(feature = "cuda")]
 mod nvml_probe;
 mod pull;
@@ -99,6 +100,11 @@ struct Cli {
 /// The `tritium` subcommands.
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Import legacy originals and replay their actual prepared evidence.
+    Migrate {
+        #[command(subcommand)]
+        migrate: migrate::MigrateCommand,
+    },
     /// Parse a GGUF file and print its version, metadata, and tensor table.
     Inspect {
         /// Path to the `.gguf` file to inspect.
@@ -406,6 +412,7 @@ impl Command {
     fn evidence_name(&self) -> &'static str {
         match self {
             Self::Inspect { .. } => "inspect",
+            Self::Migrate { .. } => "migrate",
             Self::ListBackends => "list-backends",
             Self::Campaign { .. } => "campaign",
             Self::Salt { .. } => "salt",
@@ -609,6 +616,7 @@ fn main() -> anyhow::Result<()> {
     let command_result = (|| -> anyhow::Result<()> {
         match cli.command {
             Command::Inspect { path } => inspect::run(&path)?,
+            Command::Migrate { migrate: command } => migrate::run(command)?,
             Command::ListBackends => backends::run(),
             Command::Campaign { campaign: command } => campaign::run(command)?,
             Command::Salt { salt: command } => salt::run(command)?,

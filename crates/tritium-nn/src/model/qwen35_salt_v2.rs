@@ -11,13 +11,16 @@ use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Arc;
 
-use serde::Deserialize;
 use tritium_format::{
     PackageHasher, SafeTensorsReader,
     salt_v2::SaltV2Codec,
     salt_v2_package::{
         SaltV2PackageReader, SaltV2ScaleUpdate, SaltV2ScaleUpdateChild, SaltV2Transform,
     },
+};
+use tritium_schema::{
+    LEGACY_SALT_V2_HF_ASSETS as HF_ASSET_SPECS, LegacySaltV2AssetDescriptor as HfAssetManifest,
+    LegacySaltV2BundleDescriptor as BundleManifest,
 };
 use tritium_spec::TernaryBackend;
 
@@ -33,78 +36,13 @@ use crate::model::{Qwen35TextRunner, UnverifiedQwen35Mtp};
 use crate::qwen35_config::Qwen35CheckpointConfig;
 
 const CONFIG_FILE: &str = "config.json";
+#[cfg(test)]
 const PRESERVED_FILE: &str = "preserved.safetensors";
+#[cfg(test)]
+const ARTIFACT_KIND: &str = "qwen3.6-language-mtp-salt-v2-hf-bundle";
 const MANIFEST_FILE: &str = "tritium.json";
-const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_PRESERVED_BYTES: u64 = 64 * 1024 * 1024;
-const ARTIFACT_KIND: &str = "qwen3.6-language-mtp-salt-v2-hf-bundle";
-const HF_ASSET_SPECS: [(&str, u64); 8] = [
-    ("chat_template.jinja", 1_048_576),
-    (CONFIG_FILE, MAX_CONFIG_BYTES),
-    ("configuration.json", 65_536),
-    ("generation_config.json", 1_048_576),
-    ("merges.txt", 8_388_608),
-    ("tokenizer.json", 33_554_432),
-    ("tokenizer_config.json", 1_048_576),
-    ("vocab.json", 16_777_216),
-];
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BundleManifest {
-    schema_version: u8,
-    artifact_kind: String,
-    complete_model: bool,
-    packing: String,
-    completion_id: String,
-    campaign_id: String,
-    admission_id: String,
-    selection_id: String,
-    source_model_id: String,
-    source_revision: String,
-    source_identity_status: String,
-    official_payload_authenticated: bool,
-    preserved: PreservedManifest,
-    hf_assets: Vec<HfAssetManifest>,
-    profiles: ProfileManifestSet,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PreservedManifest {
-    file: String,
-    package_id: String,
-    tensors: u64,
-    payload_bytes: u64,
-    serialized_bytes: u64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HfAssetManifest {
-    file: String,
-    package_id: String,
-    bytes: u64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProfileManifestSet {
-    #[serde(rename = "compact-v1")]
-    compact: ProfileManifest,
-    #[serde(rename = "near-lossless-v1")]
-    near_lossless: ProfileManifest,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProfileManifest {
-    file: String,
-    package_id: String,
-    serialized_bytes: u64,
-    resident_bytes: u64,
-}
 
 /// Exact coverage and physical identity consumed by a packed Qwen load.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1186,60 +1124,9 @@ fn hash_bytes(bytes: &[u8]) -> String {
 }
 
 fn validate_manifest(manifest: &BundleManifest) -> Result<(), NnError> {
-    if manifest.schema_version != 3
-        || manifest.artifact_kind != ARTIFACT_KIND
-        || manifest.complete_model
-        || manifest.source_revision != QWEN36_27B_REVISION
-        || !matches!(manifest.packing.as_str(), "d2" | "b3" | "s34")
-    {
-        return Err(NnError::InvalidArtifact(
-            "manifest is not the pinned schema-v3 Qwen3.6 language/MTP bundle".into(),
-        ));
-    }
-    for (field, value) in [
-        ("completion_id", manifest.completion_id.as_str()),
-        ("campaign_id", manifest.campaign_id.as_str()),
-        ("admission_id", manifest.admission_id.as_str()),
-        ("selection_id", manifest.selection_id.as_str()),
-        ("source_model_id", manifest.source_model_id.as_str()),
-        (
-            "source_identity_status",
-            manifest.source_identity_status.as_str(),
-        ),
-    ] {
-        if value.is_empty() {
-            return Err(NnError::InvalidArtifact(format!(
-                "manifest `{field}` must be non-empty"
-            )));
-        }
-    }
-    if manifest.preserved.file != PRESERVED_FILE
-        || manifest.preserved.package_id.is_empty()
-        || manifest.preserved.tensors == 0
-        || manifest.preserved.payload_bytes == 0
-        || manifest.preserved.serialized_bytes == 0
-        || manifest.preserved.serialized_bytes > MAX_PRESERVED_BYTES
-    {
-        return Err(NnError::InvalidArtifact(
-            "manifest preserved-tensor descriptor is not canonical".into(),
-        ));
-    }
-    validate_profile_manifest(&manifest.profiles.compact, "compact.tsalt2")?;
-    validate_profile_manifest(&manifest.profiles.near_lossless, "near-lossless.tsalt2")?;
-    Ok(())
-}
-
-fn validate_profile_manifest(profile: &ProfileManifest, file: &str) -> Result<(), NnError> {
-    if profile.file != file
-        || profile.package_id.is_empty()
-        || profile.serialized_bytes == 0
-        || profile.resident_bytes == 0
-    {
-        return Err(NnError::InvalidArtifact(format!(
-            "manifest profile `{file}` is not canonical"
-        )));
-    }
-    Ok(())
+    manifest
+        .validate(QWEN36_27B_REVISION)
+        .map_err(|message| NnError::InvalidArtifact(message.into()))
 }
 
 fn verify_hf_assets(
