@@ -1,5 +1,4 @@
-//! Borrowed canonical payloads; geometry and codecs are shared with owned tensors.
-
+//! Borrowed canonical payloads and the shared bounded range-validation plan.
 use super::*;
 use crate::salt_v2::{B3_TRITS_PER_BYTE, D2_TRITS_PER_BYTE, S34_TRITS_PER_GROUP};
 use tritium_core::UniformPlan;
@@ -7,11 +6,46 @@ use tritium_schema::PlaneCounts;
 
 mod prefix;
 
-// Every nonterminal chunk ends at a byte boundary for all three codecs.
 const SCRATCH_TRITS: usize = D2_TRITS_PER_BYTE * B3_TRITS_PER_BYTE * (8 * S34_TRITS_PER_GROUP);
+pub(crate) const RANGE_BYTES: usize = 64 * 1024;
+
+/// Internal range seam; source custody is owned by the enclosing package reader.
+pub(crate) trait PayloadSource {
+    type Error: From<AdditiveTensorError>;
+    fn read_range(&mut self, blob: usize, offset: usize, out: &mut [u8])
+    -> Result<(), Self::Error>;
+}
+
+pub(crate) struct SlicePayloads<'a, E, const N: usize> {
+    slices: [&'a [u8]; N],
+    error: core::marker::PhantomData<E>,
+}
+impl<'a, E, const N: usize> SlicePayloads<'a, E, N> {
+    pub(crate) fn new(slices: [&'a [u8]; N]) -> Self {
+        Self {
+            slices,
+            error: core::marker::PhantomData,
+        }
+    }
+}
+impl<E: From<AdditiveTensorError>, const N: usize> PayloadSource for SlicePayloads<'_, E, N> {
+    type Error = E;
+    fn read_range(&mut self, blob: usize, offset: usize, out: &mut [u8]) -> Result<(), E> {
+        let end = offset
+            .checked_add(out.len())
+            .ok_or(AdditiveTensorError::LengthOverflow)?;
+        let bytes = self
+            .slices
+            .get(blob)
+            .and_then(|bytes| bytes.get(offset..end))
+            .ok_or(AdditiveTensorError::LengthOverflow)?;
+        out.copy_from_slice(bytes);
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
-pub(super) enum Allocation<'a> {
+pub(crate) enum Allocation<'a> {
     Uniform(u8),
     PerTile(&'a [u8]),
 }
@@ -23,28 +57,22 @@ struct Plane {
     trits: usize,
 }
 
-/// Validated borrowed canonical raw additive payload, not a decoded tensor master.
-///
-/// Counts and bytes stay borrowed. Validation and visits use fixed codec scratch
-/// plus at most one range per plane; no coefficient or scale master is allocated.
-/// This establishes payload structure, not provenance or execution capability.
+/// Shared geometry/codec/scale interpretation; retains no payload or master.
 #[derive(Debug)]
-pub struct AdditivePayload<'a> {
+pub(crate) struct PayloadPlan<'a> {
     layout: AdditiveLayout,
     allocation: Allocation<'a>,
     planes: Vec<Plane>,
     trit_count: usize,
     scale_count: usize,
     scale_offset: usize,
-    bytes: &'a [u8],
+    length: usize,
 }
-
-impl<'a> AdditivePayload<'a> {
-    /// Validate bytes under externally authenticated layout and count metadata.
-    pub fn new(
+impl<'a> PayloadPlan<'a> {
+    pub(crate) fn new(
         layout: AdditiveLayout,
         planes: &'a PlaneCounts,
-        bytes: &'a [u8],
+        length: usize,
     ) -> Result<Self, AdditiveTensorError> {
         let allocation = match planes {
             PlaneCounts::Uniform(count) => Allocation::Uniform(*count),
@@ -55,13 +83,13 @@ impl<'a> AdditivePayload<'a> {
                 ));
             }
         };
-        Self::with_allocation(layout, allocation, bytes)
+        Self::with_allocation(layout, allocation, length)
     }
 
-    pub(super) fn with_allocation(
+    fn with_allocation(
         layout: AdditiveLayout,
         allocation: Allocation<'a>,
-        bytes: &'a [u8],
+        length: usize,
     ) -> Result<Self, AdditiveTensorError> {
         if !matches!(layout.transport, tritium_schema::Transport::Raw) {
             return Err(AdditiveTensorError::UnsupportedTransport);
@@ -100,14 +128,14 @@ impl<'a> AdditivePayload<'a> {
             } else {
                 trit_count / count
             };
-            let len = encoded_plane_len(codec, trits)?;
+            let bytes = encoded_plane_len(codec, trits)?;
             planes.push(Plane {
                 offset,
-                bytes: len,
+                bytes,
                 trits,
             });
             offset = offset
-                .checked_add(len)
+                .checked_add(bytes)
                 .ok_or(AdditiveTensorError::LengthOverflow)?;
         }
         let scale_len = scale_count
@@ -116,82 +144,66 @@ impl<'a> AdditivePayload<'a> {
         let expected = offset
             .checked_add(scale_len)
             .ok_or(AdditiveTensorError::LengthOverflow)?;
-        if bytes.len() != expected {
+        if length != expected {
             return Err(AdditiveTensorError::PayloadLength {
                 expected,
-                got: bytes.len(),
+                got: length,
             });
         }
-        let view = Self {
+        Ok(Self {
             layout,
             allocation,
             planes,
             trit_count,
             scale_count,
             scale_offset: offset,
-            bytes,
-        };
-        view.visit_trits(|_| {})?;
-        view.validate_scales()?;
-        Ok(view)
+            length,
+        })
     }
 
-    /// The externally bound, validated semantic layout.
-    #[must_use]
-    pub const fn layout(&self) -> AdditiveLayout {
-        self.layout
-    }
-
-    /// Number of stored planes, zero only for all-pruned compact payloads.
-    #[must_use]
-    pub fn plane_count(&self) -> usize {
-        self.planes.len()
-    }
-
-    /// Complete decoded coefficient count, without allocating the coefficients.
-    #[must_use]
-    pub const fn trit_count(&self) -> usize {
+    pub(crate) const fn trit_count(&self) -> usize {
         self.trit_count
     }
-
-    /// Exact stored little-endian scale bytes in canonical order.
-    #[must_use]
-    pub fn scale_bytes(&self) -> &'a [u8] {
-        &self.bytes[self.scale_offset..]
+    pub(crate) fn scale_len(&self) -> usize {
+        self.length - self.scale_offset
     }
 
-    /// Borrow compact row-major counts; uniform allocation returns `None`.
-    #[must_use]
-    pub const fn tile_counts(&self) -> Option<&'a [u8]> {
-        match self.allocation {
-            Allocation::Uniform(_) => None,
-            Allocation::PerTile(counts) => Some(counts),
-        }
+    pub(crate) fn validate<S: PayloadSource>(
+        &self,
+        source: &mut S,
+        blob: usize,
+    ) -> Result<(), S::Error> {
+        self.visit_trits(source, blob, |_| Ok(()))?;
+        self.visit_scale_bytes(source, blob, |bytes| {
+            validate_scale_chunk(self.layout, self.planes.len(), bytes).map_err(Into::into)
+        })
     }
 
-    /// Visit validated logical coefficients in canonical plane-major order.
-    ///
-    /// Chunks contain at most 640 trits. The callback cannot retain scratch.
-    pub fn visit_trits(&self, mut visit: impl FnMut(&[Trit])) -> Result<(), AdditiveTensorError> {
+    pub(crate) fn visit_trits<S: PayloadSource>(
+        &self,
+        source: &mut S,
+        blob: usize,
+        mut visit: impl FnMut(&[Trit]) -> Result<(), S::Error>,
+    ) -> Result<(), S::Error> {
         let codec = salt_codec(self.layout.codec)?;
         let mut scratch = reserved_payload(SCRATCH_TRITS)?;
+        let mut packed = [0u8; SCRATCH_TRITS];
         for plane in &self.planes {
             let mut trit_offset = 0;
             let mut byte_offset = 0;
             while trit_offset < plane.trits {
                 let trits = (plane.trits - trit_offset).min(SCRATCH_TRITS);
                 let len = encoded_plane_len(codec, trits)?;
-                let start = plane.offset + byte_offset;
-                let packed = &self.bytes[start..start + len];
-                let result = match codec {
-                    SaltV2Codec::D2 => unpack_d2_into(packed, trits, &mut scratch),
-                    SaltV2Codec::B3 => unpack_b3_into(packed, trits, &mut scratch),
-                    SaltV2Codec::S34 => unpack_s34_into(packed, trits, &mut scratch),
-                };
-                result.map_err(|error| {
-                    AdditiveTensorError::Codec(shift_error(error, trit_offset, byte_offset))
-                })?;
-                visit(&scratch);
+                source.read_range(blob, plane.offset + byte_offset, &mut packed[..len])?;
+                decode_window(
+                    codec,
+                    &packed[..len],
+                    trits,
+                    &mut scratch,
+                    trit_offset,
+                    byte_offset,
+                )?;
+                visit(&scratch)?;
                 trit_offset += trits;
                 byte_offset += len;
             }
@@ -200,54 +212,172 @@ impl<'a> AdditivePayload<'a> {
         Ok(())
     }
 
-    /// Explicitly allocate a decoded owned tensor using the same validated plan.
-    pub fn to_owned(&self) -> Result<AdditiveTensor, AdditiveTensorError> {
-        let mut trits = reserved_payload(self.trit_count)?;
-        self.visit_trits(|chunk| trits.extend_from_slice(chunk))?;
-        let mut scales = reserved_payload(self.scale_count)?;
-        extend_scales(self.layout.law.precision, self.scale_bytes(), &mut scales)?;
-        match self.allocation {
-            Allocation::Uniform(count) => AdditiveTensor::new(self.layout, count, trits, scales),
-            Allocation::PerTile(counts) => {
-                AdditiveTensor::new_per_tile(self.layout, copy_payload(counts)?, trits, scales)
+    pub(crate) fn visit_scale_bytes<S: PayloadSource>(
+        &self,
+        source: &mut S,
+        blob: usize,
+        mut visit: impl FnMut(&[u8]) -> Result<(), S::Error>,
+    ) -> Result<(), S::Error> {
+        let mut scratch = [0u8; RANGE_BYTES];
+        let mut at = self.scale_offset;
+        while at < self.length {
+            let count = (self.length - at).min(scratch.len());
+            source.read_range(blob, at, &mut scratch[..count])?;
+            visit(&scratch[..count])?;
+            at += count;
+        }
+        Ok(())
+    }
+}
+
+fn validate_scale_chunk(
+    layout: AdditiveLayout,
+    planes: usize,
+    bytes: &[u8],
+) -> Result<(), AdditiveTensorError> {
+    let width = scale_width(layout.law.precision)?;
+    for bytes in bytes.chunks_exact(width) {
+        let scale = match layout.law.precision {
+            ScalePrecision::F16 => {
+                f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32()
+            }
+            ScalePrecision::Bf16 => {
+                bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32()
+            }
+            ScalePrecision::F32 => {
+                f32::from_bits(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            }
+            _ => return Err(AdditiveTensorError::LengthOverflow),
+        };
+        if !scale.is_finite() || scale.is_sign_negative() {
+            return Err(AdditiveTensorError::InvalidView(
+                AdditiveError::InvalidScale,
+            ));
+        }
+        if let PlaneRelation::Tied { num, den } = layout.law.relation {
+            let ratio = num as f32 / den as f32;
+            let mut derived = scale;
+            for _ in 1..planes {
+                derived *= ratio;
+                if !derived.is_finite() {
+                    return Err(AdditiveTensorError::InvalidView(
+                        AdditiveError::InvalidScale,
+                    ));
+                }
             }
         }
     }
+    Ok(())
+}
 
-    fn validate_scales(&self) -> Result<(), AdditiveTensorError> {
-        let width = scale_width(self.layout.law.precision)?;
-        for bytes in self.scale_bytes().chunks_exact(width) {
-            let scale = match self.layout.law.precision {
-                ScalePrecision::F16 => {
-                    f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32()
-                }
-                ScalePrecision::Bf16 => {
-                    bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32()
-                }
-                ScalePrecision::F32 => {
-                    f32::from_bits(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-                }
-                _ => return Err(AdditiveTensorError::LengthOverflow),
-            };
-            if !scale.is_finite() || scale.is_sign_negative() {
-                return Err(AdditiveTensorError::InvalidView(
-                    AdditiveError::InvalidScale,
-                ));
+fn decode_window(
+    codec: SaltV2Codec,
+    packed: &[u8],
+    trits: usize,
+    scratch: &mut Vec<Trit>,
+    trit_offset: usize,
+    byte_offset: usize,
+) -> Result<(), AdditiveTensorError> {
+    match codec {
+        SaltV2Codec::D2 => unpack_d2_into(packed, trits, scratch),
+        SaltV2Codec::B3 => unpack_b3_into(packed, trits, scratch),
+        SaltV2Codec::S34 => unpack_s34_into(packed, trits, scratch),
+    }
+    .map_err(|error| AdditiveTensorError::Codec(shift_error(error, trit_offset, byte_offset)))
+}
+
+/// Validated borrowed canonical raw additive payload, not a decoded tensor master.
+///
+/// Counts and bytes stay borrowed. Shared plan validation and visits use fixed
+/// codec scratch plus at most one range per plane, never a decoded master.
+#[derive(Debug)]
+pub struct AdditivePayload<'a> {
+    plan: PayloadPlan<'a>,
+    bytes: &'a [u8],
+}
+impl<'a> AdditivePayload<'a> {
+    /// Validate bytes under externally authenticated layout and count metadata.
+    pub fn new(
+        layout: AdditiveLayout,
+        planes: &'a PlaneCounts,
+        bytes: &'a [u8],
+    ) -> Result<Self, AdditiveTensorError> {
+        let plan = PayloadPlan::new(layout, planes, bytes.len())?;
+        Self::from_plan(plan, bytes)
+    }
+    pub(super) fn with_allocation(
+        layout: AdditiveLayout,
+        allocation: Allocation<'a>,
+        bytes: &'a [u8],
+    ) -> Result<Self, AdditiveTensorError> {
+        let plan = PayloadPlan::with_allocation(layout, allocation, bytes.len())?;
+        Self::from_plan(plan, bytes)
+    }
+    fn from_plan(plan: PayloadPlan<'a>, bytes: &'a [u8]) -> Result<Self, AdditiveTensorError> {
+        plan.validate(
+            &mut SlicePayloads::<AdditiveTensorError, 1>::new([bytes]),
+            0,
+        )?;
+        Ok(Self { plan, bytes })
+    }
+
+    /// The externally bound, validated semantic layout.
+    #[must_use]
+    pub const fn layout(&self) -> AdditiveLayout {
+        self.plan.layout
+    }
+    /// Stored planes, zero only for all-pruned compact payloads.
+    #[must_use]
+    pub fn plane_count(&self) -> usize {
+        self.plan.planes.len()
+    }
+    /// Complete decoded coefficient count, without allocating coefficients.
+    #[must_use]
+    pub const fn trit_count(&self) -> usize {
+        self.plan.trit_count
+    }
+    /// Exact stored little-endian scale bytes in canonical order.
+    #[must_use]
+    pub fn scale_bytes(&self) -> &'a [u8] {
+        &self.bytes[self.plan.scale_offset..]
+    }
+    /// Borrow compact row-major counts; uniform allocation returns None.
+    #[must_use]
+    pub const fn tile_counts(&self) -> Option<&'a [u8]> {
+        match self.plan.allocation {
+            Allocation::Uniform(_) => None,
+            Allocation::PerTile(counts) => Some(counts),
+        }
+    }
+    /// Visit canonical plane-major coefficients in chunks of at most640 trits.
+    pub fn visit_trits(&self, mut visit: impl FnMut(&[Trit])) -> Result<(), AdditiveTensorError> {
+        self.plan.visit_trits(
+            &mut SlicePayloads::<AdditiveTensorError, 1>::new([self.bytes]),
+            0,
+            |trits| {
+                visit(trits);
+                Ok(())
+            },
+        )
+    }
+    /// Explicitly allocate a decoded owned tensor using the same validated plan.
+    pub fn to_owned(&self) -> Result<AdditiveTensor, AdditiveTensorError> {
+        let mut trits = reserved_payload(self.plan.trit_count)?;
+        self.visit_trits(|chunk| trits.extend_from_slice(chunk))?;
+        let mut scales = reserved_payload(self.plan.scale_count)?;
+        extend_scales(
+            self.plan.layout.law.precision,
+            self.scale_bytes(),
+            &mut scales,
+        )?;
+        match self.plan.allocation {
+            Allocation::Uniform(count) => {
+                AdditiveTensor::new(self.plan.layout, count, trits, scales)
             }
-            if let PlaneRelation::Tied { num, den } = self.layout.law.relation {
-                let ratio = num as f32 / den as f32;
-                let mut derived = scale;
-                for _ in 1..self.planes.len() {
-                    derived *= ratio;
-                    if !derived.is_finite() {
-                        return Err(AdditiveTensorError::InvalidView(
-                            AdditiveError::InvalidScale,
-                        ));
-                    }
-                }
+            Allocation::PerTile(counts) => {
+                AdditiveTensor::new_per_tile(self.plan.layout, copy_payload(counts)?, trits, scales)
             }
         }
-        Ok(())
     }
 }
 

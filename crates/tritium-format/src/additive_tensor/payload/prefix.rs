@@ -1,4 +1,4 @@
-//! Prefix comparison over shared sealed geometry and bounded codec windows.
+//! Prefix comparison over shared sealed geometry and bounded range windows.
 use super::*;
 use tritium_core::{
     PerTileActiveTile as ActiveTile, PerTileActiveTiles as ActiveTiles, PerTileIndex,
@@ -6,17 +6,31 @@ use tritium_core::{
 };
 
 impl AdditivePayload<'_> {
-    /// Compare logical retained coefficients and exact stored scales to a parent.
-    ///
-    /// Uses the core logical-prefix contract, independent of physical codec and
-    /// unused capacity. Both payloads were completely validated at construction.
-    /// Counts/bytes stay borrowed; temporary storage is compact row spans plus
-    /// two fixed codec windows, not decoded coefficient/scale masters. This does
-    /// not admit direct-fit lineage, aggregate memory or backend execution.
+    /// Compare retained logical coefficients and exact stored scales to a parent.
+    /// Both payloads are completely validated; uses shared geometry and two fixed
+    /// codec windows, not decoded masters or physical flat-buffer prefixes.
     pub fn is_logical_prefix_of(
         &self,
         parent: &AdditivePayload<'_>,
     ) -> Result<bool, AdditiveTensorError> {
+        self.plan.is_logical_prefix_of(
+            0,
+            &parent.plan,
+            1,
+            &mut SlicePayloads::<AdditiveTensorError, 2>::new([self.bytes, parent.bytes]),
+        )
+    }
+}
+
+impl PayloadPlan<'_> {
+    /// Plans must have undergone complete payload validation at the model seam.
+    pub(crate) fn is_logical_prefix_of<S: PayloadSource>(
+        &self,
+        child_blob: usize,
+        parent: &PayloadPlan<'_>,
+        parent_blob: usize,
+        source: &mut S,
+    ) -> Result<bool, S::Error> {
         let c = self.layout;
         let p = parent.layout;
         if c.rows != p.rows
@@ -25,7 +39,7 @@ impl AdditivePayload<'_> {
             || c.group != p.group
             || c.law != p.law
             || c.basis != p.basis
-            || self.plane_count() > parent.plane_count()
+            || self.planes.len() > parent.planes.len()
         {
             return Ok(false);
         }
@@ -34,7 +48,9 @@ impl AdditivePayload<'_> {
         let child_index = index(self, &mut child_spans)?;
         let parent_index = index(parent, &mut parent_spans)?;
         let width = scale_width(c.law.precision)?;
-        for plane in 0..self.plane_count() {
+        let mut child_scales = [0u8; 256 * 4];
+        let mut parent_scales = [0u8; 256 * 4];
+        for plane in 0..self.planes.len() {
             let mut child_window = Window::new(self, plane)?;
             let mut parent_window = Window::new(parent, plane)?;
             for row in 0..c.rows as usize {
@@ -53,8 +69,8 @@ impl AdditivePayload<'_> {
                     let mut child_at = child.trit_offset() - child_window.logical_start;
                     let mut parent_at = retained.trit_offset() - parent_window.logical_start;
                     while remaining != 0 {
-                        let child_data = child_window.at(child_at)?;
-                        let parent_data = parent_window.at(parent_at)?;
+                        let child_data = child_window.at(child_at, child_blob, source)?;
+                        let parent_data = parent_window.at(parent_at, parent_blob, source)?;
                         let count = remaining.min(child_data.len()).min(parent_data.len());
                         if child_data[..count] != parent_data[..count] {
                             return Ok(false);
@@ -68,12 +84,24 @@ impl AdditivePayload<'_> {
                     } else {
                         1
                     };
-                    let child_start = child.scale_offset() * width;
-                    let parent_start = retained.scale_offset() * width;
                     let len = scales * width;
-                    if self.scale_bytes()[child_start..child_start + len]
-                        != parent.scale_bytes()[parent_start..parent_start + len]
-                    {
+                    let child_data = child_scales
+                        .get_mut(..len)
+                        .ok_or(AdditiveTensorError::LengthOverflow)?;
+                    let parent_data = parent_scales
+                        .get_mut(..len)
+                        .ok_or(AdditiveTensorError::LengthOverflow)?;
+                    source.read_range(
+                        child_blob,
+                        self.scale_offset + child.scale_offset() * width,
+                        child_data,
+                    )?;
+                    source.read_range(
+                        parent_blob,
+                        parent.scale_offset + retained.scale_offset() * width,
+                        parent_data,
+                    )?;
+                    if child_data != parent_data {
                         return Ok(false);
                     }
                 }
@@ -83,7 +111,7 @@ impl AdditivePayload<'_> {
     }
 }
 
-fn spans(payload: &AdditivePayload<'_>) -> Result<Vec<PerTileRowSpan>, AdditiveTensorError> {
+fn spans(payload: &PayloadPlan<'_>) -> Result<Vec<PerTileRowSpan>, AdditiveTensorError> {
     let count = match payload.allocation {
         Allocation::Uniform(_) => 0,
         Allocation::PerTile(counts) => PerTilePlan::new(payload.layout, counts)
@@ -94,7 +122,6 @@ fn spans(payload: &AdditivePayload<'_>) -> Result<Vec<PerTileRowSpan>, AdditiveT
     spans.resize(count, PerTileRowSpan::default());
     Ok(spans)
 }
-
 enum TileIndex<'a> {
     Uniform(UniformPlan),
     Compact(PerTileIndex<'a>),
@@ -122,7 +149,7 @@ impl TileIndex<'_> {
     }
 }
 fn index<'a>(
-    payload: &'a AdditivePayload<'_>,
+    payload: &'a PayloadPlan<'_>,
     spans: &'a mut [PerTileRowSpan],
 ) -> Result<TileIndex<'a>, AdditiveTensorError> {
     match payload.allocation {
@@ -136,20 +163,20 @@ fn index<'a>(
     .map_err(AdditiveTensorError::InvalidView)
 }
 
-struct Window<'a> {
+struct Window {
     codec: SaltV2Codec,
-    data: &'a [u8],
+    offset: usize,
     logical_start: usize,
     trit_count: usize,
     scratch: Vec<Trit>,
     loaded: Option<usize>,
 }
-impl<'a> Window<'a> {
-    fn new(payload: &AdditivePayload<'a>, plane: usize) -> Result<Self, AdditiveTensorError> {
+impl Window {
+    fn new(payload: &PayloadPlan<'_>, plane: usize) -> Result<Self, AdditiveTensorError> {
         let range = &payload.planes[plane];
         Ok(Self {
             codec: salt_codec(payload.layout.codec)?,
-            data: &payload.bytes[range.offset..range.offset + range.bytes],
+            offset: range.offset,
             logical_start: payload.planes[..plane]
                 .iter()
                 .map(|plane| plane.trits)
@@ -159,22 +186,30 @@ impl<'a> Window<'a> {
             loaded: None,
         })
     }
-    fn at(&mut self, offset: usize) -> Result<&[Trit], AdditiveTensorError> {
+    fn at<S: PayloadSource>(
+        &mut self,
+        offset: usize,
+        blob: usize,
+        source: &mut S,
+    ) -> Result<&[Trit], S::Error> {
         if offset >= self.trit_count {
-            return Err(AdditiveTensorError::LengthOverflow);
+            return Err(AdditiveTensorError::LengthOverflow.into());
         }
         let start = offset / SCRATCH_TRITS * SCRATCH_TRITS;
         if self.loaded != Some(start) {
             let count = (self.trit_count - start).min(SCRATCH_TRITS);
             let byte_offset = encoded_plane_len(self.codec, start)?;
             let len = encoded_plane_len(self.codec, count)?;
-            let bytes = &self.data[byte_offset..byte_offset + len];
-            match self.codec {
-                SaltV2Codec::D2 => unpack_d2_into(bytes, count, &mut self.scratch),
-                SaltV2Codec::B3 => unpack_b3_into(bytes, count, &mut self.scratch),
-                SaltV2Codec::S34 => unpack_s34_into(bytes, count, &mut self.scratch),
-            }
-            .map_err(|error| AdditiveTensorError::Codec(shift_error(error, start, byte_offset)))?;
+            let mut bytes = [0u8; SCRATCH_TRITS];
+            source.read_range(blob, self.offset + byte_offset, &mut bytes[..len])?;
+            decode_window(
+                self.codec,
+                &bytes[..len],
+                count,
+                &mut self.scratch,
+                start,
+                byte_offset,
+            )?;
             self.loaded = Some(start);
         }
         Ok(&self.scratch[offset - start..])

@@ -2,6 +2,8 @@
 use tritium_core::Trit;
 use tritium_format::trit_model::{encode_model_manifest, read_trit_model};
 use tritium_format::{AdditivePayload, AdditiveTensor, TritBlob, TritBlobKind, write_trit_package};
+#[path = "support/seek_model_parity.rs"]
+mod seek_model_parity;
 use tritium_schema::{
     ADMITTED_LAWS, AdditiveLayout, Basis, BlobId, BlobReference, Level, LevelFit, ManifestAsset,
     ModelManifest, PlaneAllocation, PlaneCodec, PlaneCounts, PlaneRelation, ScaleAnchor, SchemaId,
@@ -127,7 +129,9 @@ fn actual_model(child: &AdditiveTensor, parent: &AdditiveTensor) -> bool {
         },
     ];
     let manifest = encode_model_manifest(&manifest).unwrap();
-    read_trit_model(&write_trit_package(&manifest, &blobs).unwrap()).is_ok()
+    let bytes = write_trit_package(&manifest, &blobs).unwrap();
+    seek_model_parity::assert_matches(&bytes);
+    read_trit_model(&bytes).is_ok()
 }
 fn compare(child: &AdditiveTensor, parent: &AdditiveTensor, model: bool) -> bool {
     let cp = child

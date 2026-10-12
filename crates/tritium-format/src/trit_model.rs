@@ -2,7 +2,10 @@
 //! This proposed profile proves metadata/payload consistency, not model execution,
 //! external evidence, owner acceptance of candidate identities, quality or release admission.
 
-use std::collections::BTreeMap;
+mod binding;
+mod seek_reader;
+
+pub use seek_reader::{TritModelReadError, TritModelReader, TritModelVisitError};
 
 use ciborium::value::Value;
 use half::{bf16, f16};
@@ -18,8 +21,8 @@ use crate::trit_package::{
     validate_canonical_manifest,
 };
 use crate::{
-    AdditivePayload, AdditiveTensor, AdditiveTensorError, TritBlobKind, TritPackage,
-    TritPackageError, read_trit_package,
+    AdditiveTensor, AdditiveTensorError, TritBlobKind, TritPackage, TritPackageError,
+    read_trit_package,
 };
 
 /// Typed metadata/payload failure; unsupported capabilities are explicit.
@@ -57,6 +60,11 @@ impl std::error::Error for TritModelError {}
 impl From<TritPackageError> for TritModelError {
     fn from(error: TritPackageError) -> Self {
         Self::Package(error)
+    }
+}
+impl From<AdditiveTensorError> for TritModelError {
+    fn from(error: AdditiveTensorError) -> Self {
+        Self::Additive(error)
     }
 }
 impl From<ModelManifestError> for TritModelError {
@@ -124,184 +132,61 @@ pub fn decode_model_manifest(bytes: &[u8]) -> Result<ModelManifest, TritModelErr
     Ok(manifest)
 }
 
-/// Borrowed model package with checked named references and payload interpretation.
-///
-/// Candidate logical identities are bound during validation, not inferred model
-/// execution/provenance/qualification. Source bytes remain borrowed. Per-binding
-/// digests are retained; additive validation temporarily decodes one tensor
-/// (two for prefix checks), not an entire retained dense model.
+/// Borrowed model with shared typed bindings and bounded payload validation.
+/// Successful parsing is not execution, provenance or release qualification.
 #[derive(Debug)]
 pub struct TritModel<'a> {
     package: TritPackage<'a>,
-    manifest: ModelManifest,
-    index: BTreeMap<[u8; 32], Vec<usize>>,
-    tensor_digests: Vec<Vec<SemanticTensorDigest>>,
-    model_ids: Vec<ModelId>,
+    binding: binding::ModelBindings,
 }
-
 impl<'a> TritModel<'a> {
-    /// Immutable validated metadata; successful parsing is not model qualification.
+    /// Immutable validated metadata, not model qualification.
     #[must_use]
     pub const fn manifest(&self) -> &ModelManifest {
-        &self.manifest
+        &self.binding.manifest
     }
-
-    /// Exact stored package identity, never substituted for a semantic model id.
+    /// Exact stored package identity, not a semantic ModelId.
     #[must_use]
     pub fn package_id(&self) -> crate::PackageId {
         self.package.package_id()
     }
-
-    /// Candidate per-level content identity, independent of physical packaging.
-    ///
-    /// ADR 0054 remains proposed: matching IDs do not verify fit provenance,
-    /// legacy identity resolution, architecture/tokenizer execution or release.
-    /// # Errors
-    /// Absent level.
+    /// Candidate level identity; absent levels are rejected.
     pub fn model_id(&self, level: &str) -> Result<ModelId, TritModelError> {
-        Ok(self.model_ids[self.level_index(level)?])
+        self.binding.model_id(level)
     }
-
-    /// Candidate logical tensor digest bound during validated payload reading.
-    ///
-    /// Excludes physical codec/transport, not basis/law/geometry/exact scale bits.
-    /// # Errors
-    /// Absent level/tensor.
+    /// Candidate logical tensor digest; absent bindings are rejected.
     pub fn tensor_digest(
         &self,
         level: &str,
         name: &str,
     ) -> Result<SemanticTensorDigest, TritModelError> {
-        let index = self.level_index(level)?;
-        let tensor = self.manifest.levels[index]
-            .tensors
-            .binary_search_by(|t| t.name.as_str().cmp(name))
-            .map_err(|_| TritModelError::MissingBinding(name.into()))?;
-        Ok(self.tensor_digests[index][tensor])
+        self.binding.tensor_digest(level, name)
     }
-
-    /// Borrow a tensor's exact stored bytes from a named complete level.
-    ///
-    /// # Errors
-    /// Absent level/tensor or incompatible directory binding.
+    /// Borrow exact stored tensor bytes from a named complete level.
     pub fn tensor(
         &self,
         level: &str,
         name: &str,
     ) -> Result<(&TensorMeta, &'a [u8]), TritModelError> {
-        let level = self.level(level)?;
-        let index = level
-            .tensors
-            .binary_search_by(|t| t.name.as_str().cmp(name))
-            .map_err(|_| TritModelError::MissingBinding(name.into()))?;
-        let meta = &level.tensors[index];
-        Ok((meta, self.tensor_payload(meta)?))
+        let meta = self.binding.tensor_meta(level, name)?;
+        let index = self.binding.tensor_index(meta, self.package.blobs())?;
+        Ok((meta, self.package.indexed_blob(index)?))
     }
-
-    /// Borrow an asset by its declared safe basename, without filesystem extraction.
-    ///
-    /// # Errors
-    /// Absent asset or mismatched kind/name/reference.
+    /// Borrow a declared asset without filesystem extraction.
     pub fn asset(&self, name: &str) -> Result<&'a [u8], TritModelError> {
-        let index = self
-            .manifest
-            .assets
-            .binary_search_by(|a| a.name.as_str().cmp(name))
-            .map_err(|_| TritModelError::MissingBinding(name.into()))?;
-        let asset = &self.manifest.assets[index];
-        self.payload(
-            asset.blob.id,
-            &TritBlobKind::Asset(asset.name.clone()),
-            name,
-        )
+        let index = self.binding.asset_index(name, self.package.blobs())?;
+        Ok(self.package.indexed_blob(index)?)
     }
-
-    /// Require every physical directory entry to be used by typed model metadata.
-    /// Shared/deduplicated references remain valid. Ordinary compatibility readers
-    /// need not require this; mandatory joined readers do.
-    /// # Errors
-    /// Missing typed binding or any unreferenced physical entry.
+    /// Require every physical directory record to be referenced by the model.
     pub fn validate_complete_payload_inventory(&self) -> Result<(), TritModelError> {
-        let mut referenced = vec![false; self.package.blobs().len()];
-        for asset in &self.manifest.assets {
-            referenced[self.payload_index(
-                asset.blob.id,
-                &TritBlobKind::Asset(asset.name.clone()),
-                &asset.name,
-            )?] = true;
-        }
-        for level in &self.manifest.levels {
-            for tensor in &level.tensors {
-                referenced[self.tensor_index(tensor)?] = true;
-            }
-        }
-        if referenced.contains(&false) {
-            return Err(TritModelError::Schema("unreferenced model payload".into()));
-        }
-        Ok(())
-    }
-
-    fn level(&self, name: &str) -> Result<&Level, TritModelError> {
-        Ok(&self.manifest.levels[self.level_index(name)?])
-    }
-
-    fn level_index(&self, name: &str) -> Result<usize, TritModelError> {
-        self.manifest
-            .levels
-            .binary_search_by(|l| l.name.as_str().cmp(name))
-            .map_err(|_| TritModelError::MissingBinding(name.into()))
-    }
-
-    fn payload(
-        &self,
-        id: BlobId,
-        kind: &TritBlobKind,
-        name: &str,
-    ) -> Result<&'a [u8], TritModelError> {
-        Ok(self
-            .package
-            .indexed_blob(self.payload_index(id, kind, name)?)?)
-    }
-
-    fn payload_index(
-        &self,
-        id: BlobId,
-        kind: &TritBlobKind,
-        name: &str,
-    ) -> Result<usize, TritModelError> {
-        self.index
-            .get(id.as_bytes())
-            .and_then(|indices| {
-                indices
-                    .iter()
-                    .copied()
-                    .find(|&i| &self.package.blobs()[i].kind == kind)
-            })
-            .ok_or_else(|| TritModelError::MissingOrWrongBlob(name.into()))
-    }
-
-    fn tensor_payload(&self, meta: &TensorMeta) -> Result<&'a [u8], TritModelError> {
-        Ok(self.package.indexed_blob(self.tensor_index(meta)?)?)
-    }
-
-    fn tensor_index(&self, meta: &TensorMeta) -> Result<usize, TritModelError> {
-        let kind = match &meta.storage {
-            TensorStorage::Dense { precision, .. } => TritBlobKind::DenseTensor(match precision {
-                ScalePrecision::F16 => DType::F16,
-                ScalePrecision::Bf16 => DType::BF16,
-                ScalePrecision::F32 => DType::F32,
-                _ => return Err(TritModelError::UnsupportedFeature("dense precision")),
-            }),
-            TensorStorage::Additive { .. } => TritBlobKind::AdditiveTensor,
-            _ => return Err(TritModelError::UnsupportedFeature("tensor storage")),
-        };
-        self.payload_index(meta.blob.id, &kind, &meta.name)
+        self.binding
+            .validate_complete_payload_inventory(self.package.blobs())
     }
 }
 
 /// Validate all complete levels and their payloads before publishing a typed view.
 ///
-/// The current reader explicitly rejects sharded/per-tile/entropy payloads rather
+/// The current reader explicitly rejects sharded/entropy payloads rather
 /// than treating structurally valid declarations as supported execution. Their
 /// metadata is representable for later capability-gated reader work. Architecture
 /// completeness, tokenizer semantics and external evidence admission are later gates.
@@ -324,67 +209,8 @@ pub fn bind_trit_model_payloads<'a>(
     package: TritPackage<'a>,
     manifest: ModelManifest,
 ) -> Result<TritModel<'a>, TritModelError> {
-    manifest.validate()?;
-    if !manifest.shards.is_empty() {
-        return Err(TritModelError::UnsupportedFeature("sharded model payloads"));
-    }
-    let mut index = BTreeMap::<_, Vec<_>>::new();
-    for (i, blob) in package.blobs().iter().enumerate() {
-        index.entry(*blob.id.as_bytes()).or_default().push(i);
-    }
-    let mut model = TritModel {
-        package,
-        manifest,
-        index,
-        tensor_digests: Vec::new(),
-        model_ids: Vec::new(),
-    };
-    for asset in &model.manifest.assets {
-        model.asset(&asset.name)?;
-    }
-    for level in &model.manifest.levels {
-        let mut digests = Vec::new();
-        for tensor in &level.tensors {
-            let bytes = model.tensor_payload(tensor)?;
-            match &tensor.storage {
-                TensorStorage::Dense { shape, precision } => {
-                    validate_dense(&tensor.name, shape, *precision, bytes)?;
-                    digests.push(dense_digest(shape, *precision, bytes)?);
-                }
-                TensorStorage::Additive { layout, planes } => {
-                    if !matches!(layout.transport, Transport::Raw) {
-                        return Err(TritModelError::UnsupportedFeature("entropy model payloads"));
-                    }
-                    let payload = AdditivePayload::new(*layout, planes, bytes)
-                        .map_err(TritModelError::Additive)?;
-                    digests.push(borrowed_additive_digest(&payload)?);
-                }
-                _ => return Err(TritModelError::UnsupportedFeature("tensor storage")),
-            }
-        }
-        model.tensor_digests.push(digests);
-        if let LevelFit::ImportedPrefixOf { level: parent } = &level.fit {
-            let parent = model.level(parent)?;
-            for (child, parent) in level.tensors.iter().zip(&parent.tensors) {
-                if !is_prefix(
-                    child,
-                    model.tensor_payload(child)?,
-                    parent,
-                    model.tensor_payload(parent)?,
-                )? {
-                    return Err(TritModelError::InvalidPrefix(level.name.clone()));
-                }
-            }
-        }
-    }
-    model.model_ids = model
-        .manifest
-        .levels
-        .iter()
-        .zip(&model.tensor_digests)
-        .map(|(level, digests)| model_digest(&model.manifest, level, digests))
-        .collect::<Result<_, _>>()?;
-    Ok(model)
+    let binding = binding::validate_bindings(manifest, &mut binding::BorrowedSource(&package))?;
+    Ok(TritModel { package, binding })
 }
 
 fn metadata_hasher<T: serde::Serialize>(
@@ -409,52 +235,6 @@ fn frame_length(length: usize) -> Result<[u8; 8], TritModelError> {
     u64::try_from(length)
         .map(u64::to_le_bytes)
         .map_err(|_| TritModelError::Schema("semantic frame length exceeds u64".into()))
-}
-
-fn borrowed_additive_digest(
-    payload: &AdditivePayload<'_>,
-) -> Result<SemanticTensorDigest, TritModelError> {
-    let layout = payload.layout();
-    let planes = if let Some(counts) = payload.tile_counts() {
-        let mut owned = Vec::new();
-        owned.try_reserve_exact(counts.len()).map_err(|_| {
-            TritModelError::Additive(AdditiveTensorError::AllocationFailed {
-                requested: counts.len(),
-            })
-        })?;
-        owned.extend_from_slice(counts);
-        PlaneCounts::PerTile(owned)
-    } else {
-        PlaneCounts::Uniform(
-            u8::try_from(payload.plane_count())
-                .map_err(|_| TritModelError::Schema("semantic plane count exceeds u8".into()))?,
-        )
-    };
-    let metadata = TensorSemanticMeta::Additive {
-        rows: layout.rows,
-        cols: layout.cols,
-        tile: layout.tile,
-        group: layout.group,
-        planes,
-        law: layout.law,
-        basis: layout.basis,
-    };
-    let mut hash = metadata_hasher("tritium.trit.additive.v1", &metadata)?;
-    hash.update(&frame_length(payload.trit_count())?);
-    let mut staging = [0u8; 640];
-    payload
-        .visit_trits(|chunk| {
-            for (byte, trit) in staging.iter_mut().zip(chunk) {
-                *byte = (trit.get() + 1) as u8;
-            }
-            hash.update(&staging[..chunk.len()]);
-        })
-        .map_err(TritModelError::Additive)?;
-    hash.update(&frame_length(payload.scale_bytes().len())?);
-    hash.update(payload.scale_bytes());
-    Ok(SemanticTensorDigest::from_bytes(
-        *hash.finalize().as_bytes(),
-    ))
 }
 
 /// Candidate codec/transport-independent digest of validated logical content.
@@ -534,23 +314,6 @@ pub fn additive_semantic_digest(
         }
         hash.update(&staging[..chunk.len() * width]);
     }
-    Ok(SemanticTensorDigest::from_bytes(
-        *hash.finalize().as_bytes(),
-    ))
-}
-
-fn dense_digest(
-    shape: &[u64],
-    precision: ScalePrecision,
-    bytes: &[u8],
-) -> Result<SemanticTensorDigest, TritModelError> {
-    let metadata = TensorSemanticMeta::Dense {
-        shape: shape.to_vec(),
-        precision,
-    };
-    let mut hash = metadata_hasher("tritium.trit.dense.v1", &metadata)?;
-    hash.update(&frame_length(bytes.len())?);
-    hash.update(bytes);
     Ok(SemanticTensorDigest::from_bytes(
         *hash.finalize().as_bytes(),
     ))
@@ -678,19 +441,34 @@ fn validate_dense(
     precision: ScalePrecision,
     bytes: &[u8],
 ) -> Result<(), TritModelError> {
+    validate_dense_length(name, shape, precision, bytes.len())?;
+    if !dense_finite(precision, bytes) {
+        return Err(TritModelError::DensePayload(name.into()));
+    }
+    Ok(())
+}
+fn validate_dense_length(
+    name: &str,
+    shape: &[u64],
+    precision: ScalePrecision,
+    length: usize,
+) -> Result<(), TritModelError> {
     let width: u64 = match precision {
         ScalePrecision::F16 | ScalePrecision::Bf16 => 2,
         ScalePrecision::F32 => 4,
-        _ => return Err(TritModelError::UnsupportedFeature("dense precision")),
+        _ => return Err(TritModelError::DensePayload(name.into())),
     };
     let expected = shape
         .iter()
         .try_fold(width, |n, &d| n.checked_mul(d))
         .and_then(|n| usize::try_from(n).ok());
-    if expected != Some(bytes.len()) {
+    if expected != Some(length) {
         return Err(TritModelError::DensePayload(name.into()));
     }
-    let finite = match precision {
+    Ok(())
+}
+fn dense_finite(precision: ScalePrecision, bytes: &[u8]) -> bool {
+    match precision {
         ScalePrecision::F16 => bytes
             .as_chunks::<2>()
             .0
@@ -707,50 +485,5 @@ fn validate_dense(
             .iter()
             .all(|b| f32::from_le_bytes(*b).is_finite()),
         _ => false,
-    };
-    if !finite {
-        return Err(TritModelError::DensePayload(name.into()));
-    }
-    Ok(())
-}
-
-fn is_prefix(
-    child: &TensorMeta,
-    child_bytes: &[u8],
-    parent: &TensorMeta,
-    parent_bytes: &[u8],
-) -> Result<bool, TritModelError> {
-    match (&child.storage, &parent.storage) {
-        (TensorStorage::Dense { .. }, TensorStorage::Dense { .. }) => {
-            Ok(child.storage == parent.storage && child_bytes == parent_bytes)
-        }
-        (
-            TensorStorage::Additive {
-                layout: c,
-                planes: child_planes,
-            },
-            TensorStorage::Additive {
-                layout: p,
-                planes: parent_planes,
-            },
-        ) => {
-            let mut normalized = *p;
-            normalized.max_planes = c.max_planes;
-            normalized.codec = c.codec;
-            // Cross-allocation prefixes use logical coordinates, not physical
-            // offsets. Preserve every other prior layout/capacity constraint.
-            normalized.allocation = c.allocation;
-            if normalized != *c || c.max_planes > p.max_planes {
-                return Ok(false);
-            }
-            let child = AdditivePayload::new(*c, child_planes, child_bytes)
-                .map_err(TritModelError::Additive)?;
-            let parent = AdditivePayload::new(*p, parent_planes, parent_bytes)
-                .map_err(TritModelError::Additive)?;
-            child
-                .is_logical_prefix_of(&parent)
-                .map_err(TritModelError::Additive)
-        }
-        _ => Ok(false),
     }
 }

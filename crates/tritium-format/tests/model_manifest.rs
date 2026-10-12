@@ -19,6 +19,8 @@ use tritium_schema::{
 
 const TENSOR: &str = "model.embed_tokens.weight";
 const ASSET: &[u8] = b"{}"; // Structural fixture, not an executable model config/tokenizer.
+#[path = "support/seek_model_parity.rs"]
+mod seek_model_parity;
 
 #[test]
 fn candidate_semantic_ids_ignore_physical_codec_and_level_aliases() {
@@ -525,7 +527,9 @@ fn package(manifest: &ModelManifest, tensors: &[TritBlob<'_>]) -> Vec<u8> {
         },
     ];
     blobs.extend_from_slice(tensors);
-    write_trit_package(&encode_model_manifest(manifest).unwrap(), &blobs).unwrap()
+    let bytes = write_trit_package(&encode_model_manifest(manifest).unwrap(), &blobs).unwrap();
+    seek_model_parity::assert_matches(&bytes);
+    bytes
 }
 
 fn additive(

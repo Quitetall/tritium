@@ -18,6 +18,8 @@ use tritium_schema::{
 
 const NAME: &str = "model.embed_tokens.weight";
 const ASSET: &[u8] = b"{}";
+#[path = "support/seek_model_parity.rs"]
+mod seek_model_parity;
 
 fn layout(law: tritium_schema::AdmittedLaw, cols: u64, group: u16) -> AdditiveLayout {
     AdditiveLayout {
@@ -128,7 +130,9 @@ fn package(manifest: &ModelManifest, payloads: &[Vec<u8>]) -> Vec<u8> {
         kind: TritBlobKind::AdditiveTensor,
         bytes,
     }));
-    write_trit_package(&encode_model_manifest(manifest).unwrap(), &blobs).unwrap()
+    let bytes = write_trit_package(&encode_model_manifest(manifest).unwrap(), &blobs).unwrap();
+    seek_model_parity::assert_matches(&bytes);
+    bytes
 }
 
 fn one(tensor: &AdditiveTensor) -> Vec<u8> {

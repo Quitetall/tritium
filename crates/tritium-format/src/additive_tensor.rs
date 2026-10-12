@@ -10,6 +10,7 @@ use crate::salt_v2::{
 
 mod payload;
 pub use payload::AdditivePayload;
+pub(crate) use payload::{PayloadPlan, PayloadSource, RANGE_BYTES};
 
 /// Failure constructing an owned [`AdditiveTensor`].
 #[derive(Clone, Debug, PartialEq)]

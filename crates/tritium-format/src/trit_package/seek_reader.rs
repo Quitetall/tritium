@@ -258,6 +258,31 @@ impl<R: Read + Seek> TritPackageReader<R> {
         }
         Ok(())
     }
+
+    // Only typed validators in this crate can read an admitted blob subrange.
+    // It does not create a new authenticated identity for a subrange. Enclosing
+    // typed admission must verify the complete retained package before success.
+    pub(crate) fn read_blob_range(
+        &mut self,
+        index: usize,
+        offset: usize,
+        bytes: &mut [u8],
+    ) -> Result<(), TritPackageReadError> {
+        let blob = self
+            .blobs
+            .get(index)
+            .ok_or(TritPackageError::InvalidDirectory)?;
+        let end = offset
+            .checked_add(bytes.len())
+            .ok_or(TritPackageError::LengthOverflow)?;
+        if end > as_usize(blob.length)? {
+            return Err(TritPackageError::InvalidDirectory.into());
+        }
+        let start = as_usize(blob.offset)?
+            .checked_add(offset)
+            .ok_or(TritPackageError::LengthOverflow)?;
+        read_at(&mut self.source, start, bytes)
+    }
 }
 
 fn source_io(operation: &'static str, source: io::Error) -> TritPackageReadError {
