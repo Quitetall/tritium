@@ -246,11 +246,7 @@ fn load_reader<R: Read + Seek>(
                     .map(Projection::Tensor)
             };
             let weights = plan.assemble(&config, &spec, embedding, vectors, projections)?;
-            Runner::standard(
-                super::ModelRunner::try_from_weights(config, weights, backend)?,
-                spec,
-                admission,
-            )
+            Runner::standard(config, weights, backend, spec, admission)?
         } else {
             let (config, weights, mtp_weights) =
                 Qwen35TextWeights::load_trit_admitted(&mut model, level, &mut loader, limits)?;

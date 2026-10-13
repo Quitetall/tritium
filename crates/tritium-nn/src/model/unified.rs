@@ -1,7 +1,7 @@
 //! Common portable text execution. Internal numerical adapters, not resident clearance.
 use super::CacheAdmission;
 #[cfg(feature = "tokenizer")]
-use super::{ModelRunner, Qwen35TextCache, Qwen35TextRunner, UnverifiedQwen35Mtp};
+use super::{ModelWeights, Qwen35TextRunner, UnverifiedQwen35Mtp, host::HostExecutor};
 use crate::{
     ArchSpec, ModelConfig, NnError, Qwen35CheckpointConfig, Qwen35LayerType, Qwen35MtpStatus,
 };
@@ -80,11 +80,13 @@ impl ArchitectureSpec {
     }
 }
 
-// Internal host port: both numerical adapters already exist and own real caches.
+// Internal executor port: the common host implementation owns one weights
+// aggregate/cache table and receives the runner's authoritative architecture.
 // Backend-owned resident/batched/tree execution is a subsequent contract migration.
-trait Executor: Send {
+pub(super) trait Executor: Send {
     fn forward(
         &mut self,
+        architecture: &ArchitectureSpec,
         tokens: &[u32],
         positions: &[usize],
         cancelled: &dyn Fn() -> bool,
@@ -93,63 +95,6 @@ trait Executor: Send {
     fn len(&self) -> usize;
     fn mtp_status(&self) -> Option<Qwen35MtpStatus> {
         None
-    }
-}
-#[cfg(feature = "tokenizer")]
-struct StandardExecutor {
-    runner: ModelRunner,
-    cursor: usize,
-}
-#[cfg(feature = "tokenizer")]
-impl Executor for StandardExecutor {
-    fn forward(
-        &mut self,
-        tokens: &[u32],
-        positions: &[usize],
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<Option<Vec<f32>>, NnError> {
-        let result = self
-            .runner
-            .forward_cancellable(tokens, positions, cancelled)?;
-        if result.is_some() {
-            self.cursor += tokens.len();
-        }
-        Ok(result)
-    }
-    fn reset(&mut self) {
-        self.runner.reset();
-        self.cursor = 0;
-    }
-    fn len(&self) -> usize {
-        self.cursor
-    }
-}
-#[cfg(feature = "tokenizer")]
-struct HybridExecutor {
-    runner: Qwen35TextRunner,
-    cache: Qwen35TextCache,
-    mtp: UnverifiedQwen35Mtp,
-}
-#[cfg(feature = "tokenizer")]
-impl Executor for HybridExecutor {
-    fn forward(
-        &mut self,
-        tokens: &[u32],
-        _positions: &[usize],
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<Option<Vec<f32>>, NnError> {
-        self.runner
-            .forward_cancellable(tokens, &mut self.cache, cancelled)
-            .map(|result| result.map(super::Qwen35TextOutput::into_last_logits))
-    }
-    fn reset(&mut self) {
-        self.cache.reset();
-    }
-    fn len(&self) -> usize {
-        self.cache.len()
-    }
-    fn mtp_status(&self) -> Option<Qwen35MtpStatus> {
-        Some(self.mtp.status())
     }
 }
 
@@ -165,26 +110,24 @@ pub struct Runner {
 impl Runner {
     #[cfg(feature = "tokenizer")]
     pub(super) fn standard(
-        mut runner: ModelRunner,
+        config: ModelConfig,
+        weights: ModelWeights,
+        backend: Box<dyn tritium_spec::TernaryBackend>,
         variation: ArchSpec,
         admission: Option<CacheAdmission>,
-    ) -> Self {
-        runner.reset();
-        if let Some(admission) = admission {
-            for cache in &mut runner.kv {
-                cache.max_ctx = admission.limits().max_context;
-            }
-        }
+    ) -> Result<Self, NnError> {
         let architecture = ArchitectureSpec::Standard {
-            config: runner.config.clone(),
+            config,
             variation,
-            vocab_size: runner.weights.vocab,
+            vocab_size: weights.vocab,
         };
-        Self {
+        let context = admission.map_or(architecture.max_context(), |a| a.limits().max_context);
+        let executor = HostExecutor::standard(&architecture, weights, backend, context)?;
+        Ok(Self {
             architecture,
-            executor: Box::new(StandardExecutor { runner, cursor: 0 }),
+            executor: Box::new(executor),
             admission,
-        }
+        })
     }
     #[cfg(feature = "tokenizer")]
     pub(super) fn hybrid(
@@ -196,10 +139,19 @@ impl Runner {
         let capacity = admission.map_or(config.text.max_position_embeddings as usize, |a| {
             a.limits().max_context
         });
-        let cache = runner.new_cache(capacity)?;
+        let imported = runner.into_common_weights()?;
+        let architecture = ArchitectureSpec::Hybrid(config);
+        let executor = HostExecutor::hybrid(
+            &architecture,
+            imported.weights,
+            imported.backend,
+            capacity,
+            mtp,
+            imported.identity,
+        )?;
         Ok(Self {
-            architecture: ArchitectureSpec::Hybrid(config),
-            executor: Box::new(HybridExecutor { runner, cache, mtp }),
+            architecture,
+            executor: Box::new(executor),
             admission,
         })
     }
@@ -298,7 +250,8 @@ impl Runner {
                 "token {id} outside model vocabulary"
             )));
         }
-        self.executor.forward(tokens, positions, cancelled)
+        self.executor
+            .forward(&self.architecture, tokens, positions, cancelled)
     }
 
     fn check_extent(&self, base: usize, count: usize) -> Result<(), NnError> {

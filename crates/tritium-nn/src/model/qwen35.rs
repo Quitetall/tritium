@@ -161,7 +161,7 @@ impl Qwen35TextMixer {
     }
 }
 
-struct Qwen35TextLayer {
+pub(super) struct Qwen35TextLayer {
     input_norm: Vec<f32>,
     mixer: Qwen35TextMixer,
     post_attention_norm: Vec<f32>,
@@ -169,7 +169,7 @@ struct Qwen35TextLayer {
 }
 
 #[derive(Debug)]
-enum Qwen35TextLayerCache {
+pub(super) enum Qwen35TextLayerCache {
     DeltaNet(Qwen35DeltaNetCache),
     FullAttention(Qwen35FullAttentionCache),
 }
@@ -182,18 +182,117 @@ impl Qwen35TextLayerCache {
         }
     }
 
-    const fn committed_len(&self) -> usize {
+    pub(super) const fn committed_len(&self) -> usize {
         match self {
             Self::DeltaNet(cache) => cache.len(),
             Self::FullAttention(cache) => cache.committed_len(),
         }
     }
 
-    fn reset(&mut self) {
+    pub(super) fn reset(&mut self) {
         match self {
             Self::DeltaNet(cache) => cache.reset(),
             Self::FullAttention(cache) => cache.reset(),
         }
+    }
+
+    pub(super) fn staged_for(&self, end: usize) -> bool {
+        match self {
+            Self::DeltaNet(cache) => cache.staged_len() == Some(end),
+            Self::FullAttention(cache) => cache.committed_len() == end,
+        }
+    }
+    pub(super) fn commit(&mut self) {
+        if let Self::DeltaNet(cache) = self {
+            cache.commit_staged();
+        }
+    }
+    pub(super) fn rollback(&mut self, base: usize) {
+        match self {
+            Self::DeltaNet(cache) => cache.abort_staged(),
+            Self::FullAttention(cache) => cache.rollback_to(base),
+        }
+    }
+}
+
+impl Qwen35TextLayer {
+    #[cfg(feature = "tokenizer")]
+    pub(super) const fn is_delta(&self) -> bool {
+        matches!(self.mixer, Qwen35TextMixer::DeltaNet(_))
+    }
+    pub(super) fn cache_valid(&self, cache: &Qwen35TextLayerCache, base: usize) -> bool {
+        self.mixer.kind() == cache.kind()
+            && cache.committed_len() == base
+            && !matches!(cache, Qwen35TextLayerCache::DeltaNet(c) if c.staged_len().is_some())
+    }
+    pub(super) fn new_cache(&self, context: usize) -> Result<Qwen35TextLayerCache, NnError> {
+        match &self.mixer {
+            Qwen35TextMixer::DeltaNet(mixer) => {
+                mixer.new_cache().map(Qwen35TextLayerCache::DeltaNet)
+            }
+            Qwen35TextMixer::FullAttention(mixer) => mixer
+                .new_cache(context)
+                .map(Qwen35TextLayerCache::FullAttention),
+        }
+    }
+
+    // One numerical layer implementation for legacy observations and the common
+    // host executor. Existing state observers/checkpoints retain their order.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn stage<E>(
+        &self,
+        backend: &dyn TernaryBackend,
+        positions: &[usize],
+        cache: &mut Qwen35TextLayerCache,
+        residual: &mut [f32],
+        normalized: &mut [f32],
+        branch: &mut [f32],
+        hidden_size: usize,
+        epsilon: f32,
+        state_positions: &[usize],
+        report_state: &mut impl FnMut(usize, &[f32]),
+        checkpoint: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<(), Qwen35TextForwardError<E>> {
+        checkpoint().map_err(Qwen35TextForwardError::Observer)?;
+        normalize_rows(residual, &self.input_norm, epsilon, hidden_size, normalized)?;
+        checkpoint().map_err(Qwen35TextForwardError::Observer)?;
+        match (&self.mixer, cache) {
+            (Qwen35TextMixer::DeltaNet(mixer), Qwen35TextLayerCache::DeltaNet(cache)) => {
+                let mut observer = RecurrentStateObserver::new(state_positions, report_state);
+                mixer.stage_forward_with_state_observer(
+                    backend,
+                    normalized,
+                    positions.len(),
+                    cache,
+                    branch,
+                    &mut observer,
+                )?;
+            }
+            (Qwen35TextMixer::FullAttention(mixer), Qwen35TextLayerCache::FullAttention(cache)) => {
+                mixer.forward(backend, normalized, positions, cache, branch)?;
+            }
+            _ => {
+                return Err(NnError::Backend(
+                    "Qwen3.5 cache layer kind changed after preflight".into(),
+                )
+                .into());
+            }
+        }
+        checkpoint().map_err(Qwen35TextForwardError::Observer)?;
+        add_in_place(residual, branch);
+        normalize_rows(
+            residual,
+            &self.post_attention_norm,
+            epsilon,
+            hidden_size,
+            normalized,
+        )?;
+        checkpoint().map_err(Qwen35TextForwardError::Observer)?;
+        self.mlp
+            .forward(backend, normalized, positions.len(), branch)?;
+        checkpoint().map_err(Qwen35TextForwardError::Observer)?;
+        add_in_place(residual, branch);
+        Ok(())
     }
 }
 
@@ -497,6 +596,20 @@ fn replace_projection_slot(
 }
 
 impl Qwen35TextRunner {
+    #[cfg(feature = "tokenizer")]
+    pub(super) fn into_common_weights(self) -> Result<super::host::HybridImport, NnError> {
+        let weights = super::host::Weights::hybrid(
+            self.embedding,
+            self.layers,
+            self.final_norm,
+            self.lm_head,
+        )?;
+        Ok(super::host::HybridImport {
+            backend: self.backend,
+            weights,
+            identity: self.identity,
+        })
+    }
     /// Recompute one named projection over a bounded row-major activation window.
     ///
     /// This measurement seam lets PTQ compare the exact deployed projection
@@ -1171,14 +1284,7 @@ impl Qwen35TextRunner {
                 ))
             })?;
         for layer in &self.layers {
-            layers.push(match &layer.mixer {
-                Qwen35TextMixer::DeltaNet(mixer) => {
-                    Qwen35TextLayerCache::DeltaNet(mixer.new_cache()?)
-                }
-                Qwen35TextMixer::FullAttention(mixer) => {
-                    Qwen35TextLayerCache::FullAttention(mixer.new_cache(max_context)?)
-                }
-            });
+            layers.push(layer.new_cache(max_context)?);
         }
         Ok(Qwen35TextCache {
             runner_identity: Arc::clone(&self.identity),
@@ -1435,9 +1541,7 @@ impl Qwen35TextRunner {
             return Err(error.into());
         }
         for layer in &mut cache.layers {
-            if let Qwen35TextLayerCache::DeltaNet(cache) = layer {
-                cache.commit_staged();
-            }
+            layer.commit();
         }
         cache.committed_len = new_len;
         Ok(output)
@@ -1463,61 +1567,25 @@ impl Qwen35TextRunner {
         for (block_index, (layer, layer_cache)) in
             self.layers.iter().zip(&mut cache.layers).enumerate()
         {
-            checkpoint().map_err(Qwen35TextForwardError::Observer)?;
             let block_index = u32::try_from(block_index).map_err(|_| {
                 Qwen35TextForwardError::Runtime(NnError::ResourceExhausted(
                     "Qwen3.5 block index exceeds u32".to_owned(),
                 ))
             })?;
-            normalize_rows(
+            let mut report = |position, state: &[f32]| state_observer(block_index, position, state);
+            layer.stage(
+                backend,
+                positions,
+                layer_cache,
                 residual,
-                &layer.input_norm,
-                self.rms_norm_eps,
-                self.hidden_size,
                 normalized,
-            )?;
-            checkpoint().map_err(Qwen35TextForwardError::Observer)?;
-            match (&layer.mixer, layer_cache) {
-                (Qwen35TextMixer::DeltaNet(mixer), Qwen35TextLayerCache::DeltaNet(cache)) => {
-                    let mut report_state = |position: usize, state: &[f32]| {
-                        state_observer(block_index, position, state);
-                    };
-                    let mut recurrent_observer =
-                        RecurrentStateObserver::new(state_positions, &mut report_state);
-                    mixer.stage_forward_with_state_observer(
-                        backend,
-                        normalized,
-                        sequence,
-                        cache,
-                        branch,
-                        &mut recurrent_observer,
-                    )?
-                }
-                (
-                    Qwen35TextMixer::FullAttention(mixer),
-                    Qwen35TextLayerCache::FullAttention(cache),
-                ) => mixer.forward(backend, normalized, positions, cache, branch)?,
-                _ => {
-                    return Err(NnError::Backend(
-                        "Qwen3.5 cache layer kind changed after preflight".to_owned(),
-                    )
-                    .into());
-                }
-            }
-            checkpoint().map_err(Qwen35TextForwardError::Observer)?;
-            add_in_place(residual, branch);
-
-            normalize_rows(
-                residual,
-                &layer.post_attention_norm,
-                self.rms_norm_eps,
+                branch,
                 self.hidden_size,
-                normalized,
+                self.rms_norm_eps,
+                state_positions,
+                &mut report,
+                checkpoint,
             )?;
-            checkpoint().map_err(Qwen35TextForwardError::Observer)?;
-            layer.mlp.forward(backend, normalized, sequence, branch)?;
-            checkpoint().map_err(Qwen35TextForwardError::Observer)?;
-            add_in_place(residual, branch);
             observer(block_index, position_start, &input_token_ids, residual)
                 .map_err(Qwen35TextForwardError::Observer)?;
         }
@@ -1612,13 +1680,7 @@ impl Qwen35TextRunner {
             ));
         }
         for (index, (layer, layer_cache)) in self.layers.iter().zip(&cache.layers).enumerate() {
-            if layer.mixer.kind() != layer_cache.kind()
-                || layer_cache.committed_len() != cache.committed_len
-                || matches!(
-                    layer_cache,
-                    Qwen35TextLayerCache::DeltaNet(cache) if cache.staged_len().is_some()
-                )
-            {
+            if !layer.cache_valid(layer_cache, cache.committed_len) {
                 return Err(NnError::Backend(format!(
                     "Qwen3.5 text cache layer {index} is inconsistent with the global cursor"
                 )));
@@ -1629,11 +1691,7 @@ impl Qwen35TextRunner {
 
     fn preflight_commit(&self, cache: &Qwen35TextCache, new_len: usize) -> Result<(), NnError> {
         for (index, layer) in cache.layers.iter().enumerate() {
-            let valid = match layer {
-                Qwen35TextLayerCache::DeltaNet(cache) => cache.staged_len() == Some(new_len),
-                Qwen35TextLayerCache::FullAttention(cache) => cache.committed_len() == new_len,
-            };
-            if !valid {
+            if !layer.staged_for(new_len) {
                 return Err(NnError::Backend(format!(
                     "Qwen3.5 text layer {index} failed global commit preflight"
                 )));
@@ -1644,10 +1702,7 @@ impl Qwen35TextRunner {
 
     fn abort_and_rollback(&self, cache: &mut Qwen35TextCache, base: usize) {
         for layer in &mut cache.layers {
-            match layer {
-                Qwen35TextLayerCache::DeltaNet(cache) => cache.abort_staged(),
-                Qwen35TextLayerCache::FullAttention(cache) => cache.rollback_to(base),
-            }
+            layer.rollback(base);
         }
     }
 }
@@ -1743,7 +1798,7 @@ fn validate_finite(values: &[f32], expected: usize, name: &str) -> Result<(), Nn
     Ok(())
 }
 
-fn normalize_rows(
+pub(super) fn normalize_rows(
     input: &[f32],
     weights: &[f32],
     epsilon: f32,

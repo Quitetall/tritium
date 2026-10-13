@@ -10,6 +10,8 @@ mod hf;
 #[cfg(feature = "tokenizer")]
 mod hf_json_tokenizer;
 mod hf_shards;
+#[cfg(feature = "tokenizer")]
+mod host;
 mod limits;
 mod qwen35;
 mod qwen35_execution;

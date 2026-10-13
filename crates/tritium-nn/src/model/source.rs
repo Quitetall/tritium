@@ -460,11 +460,7 @@ fn load_impl(
             .map_err(|_| NnError::Backend("model vocabulary exceeds u64".into()))?,
         layer_count: u64::from(config.n_layers),
     };
-    let runner = super::Runner::standard(
-        super::ModelRunner::try_from_weights(config, weights, backend)?,
-        architecture,
-        admission,
-    );
+    let runner = super::Runner::standard(config, weights, backend, architecture, admission)?;
     let architecture = runner.architecture().clone();
     let receipt = context
         .recorder

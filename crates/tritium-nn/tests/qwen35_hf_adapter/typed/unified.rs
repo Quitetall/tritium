@@ -9,6 +9,81 @@ use tritium_nn::{LayerKind, ModelSource, Tokenizer};
 #[path = "unified/stream_limits.rs"]
 mod stream_limits;
 
+#[test]
+fn common_owned_graph_matches_legacy_typed_hybrid_logits_bit_for_bit() {
+    for uniform in [false, true] {
+        let bytes = text_package(uniform, false).bytes();
+        for reference in [false, true] {
+            let backend = || -> Box<dyn TernaryBackend> {
+                if reference {
+                    Box::new(tritium_testkit::ReferenceBackend::new())
+                } else {
+                    Box::new(tritium_cpu::CpuBackend::new())
+                }
+            };
+            let budget = TensorPayloadBudget::new(1_000_000);
+            let mut loaded = load(
+                ModelSource::Trit {
+                    bytes: &bytes,
+                    level: "typed",
+                },
+                backend(),
+                &budget,
+                &mut recorder(),
+            )
+            .unwrap();
+            let legacy_backend = backend();
+            let mut evidence = recorder();
+            let mut reader = TritModelReader::open(Cursor::new(&bytes), receiving()).unwrap();
+            let (config, weights, mtp_weights) = {
+                let mut loader = TensorLoader::new(
+                    legacy_backend.as_ref(),
+                    TensorUploadPolicy::default(),
+                    &budget,
+                    TensorUploadContext {
+                        recorder: &mut evidence,
+                        span: "load",
+                        parent: None,
+                        logical_time: 0,
+                    },
+                );
+                Qwen35TextWeights::load_trit_admitted(&mut reader, "typed", &mut loader, limits())
+                    .unwrap()
+            };
+            let legacy = Qwen35TextRunner::new(&config.text, weights, legacy_backend).unwrap();
+            let mtp = UnverifiedQwen35Mtp::new(&legacy, mtp_weights).unwrap();
+            assert_eq!(loaded.runner.mtp_status(), Some(mtp.status()));
+            let mut cache = legacy.new_cache(32).unwrap();
+            for tokens in [&[1, 2][..], &[4][..], &[5][..]] {
+                let at = loaded.runner.cache_len();
+                let positions: Vec<_> = (at..at + tokens.len()).collect();
+                let actual = loaded.runner.forward(tokens, &positions).unwrap();
+                let expected = legacy.forward(tokens, &mut cache).unwrap();
+                assert_eq!(
+                    actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    expected
+                        .last_logits()
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    "uniform={uniform} reference={reference}"
+                );
+                assert_eq!(loaded.runner.cache_len(), cache.len());
+            }
+            loaded.runner.reset();
+            cache.reset();
+            assert_eq!(
+                loaded.runner.prefill(&[1, 2]).unwrap(),
+                legacy.forward(&[1, 2], &mut cache).unwrap().last_logits()
+            );
+            drop(loaded);
+            drop(legacy);
+            drop(mtp);
+            assert_eq!(budget.used_bytes(), 0);
+        }
+    }
+}
+
 fn asset(package: &mut Package, name: &str, bytes: Vec<u8>) {
     let blob = BlobReference {
         id: BlobId::from_bytes(*blake3::hash(&bytes).as_bytes()),
@@ -332,6 +407,7 @@ fn public_loader_unifies_file_and_borrowed_hybrid_prefill_decode_generation() {
 struct ExecutionProbe {
     work: Arc<AtomicUsize>,
     fail: Arc<AtomicBool>,
+    fail_at: Option<Arc<AtomicUsize>>,
 }
 impl TernaryBackend for ExecutionProbe {
     fn device_id(&self) -> &str {
@@ -350,7 +426,12 @@ impl TernaryBackend for ExecutionProbe {
         tritium_cpu::CpuBackend::new().upload_tensor(t)
     }
     fn matmul(&self, p: tritium_spec::TensorMatmul<'_>) -> Result<(), BackendError> {
-        if self.fail.swap(false, Ordering::SeqCst) {
+        if self.fail.swap(false, Ordering::SeqCst)
+            || self
+                .fail_at
+                .as_ref()
+                .is_some_and(|at| at.load(Ordering::SeqCst) == self.work.load(Ordering::SeqCst) + 1)
+        {
             return Err(BackendError::Backend("injected decode fault".into()));
         }
         tritium_cpu::CpuBackend::new().matmul(p)?;
@@ -392,6 +473,7 @@ fn public_hybrid_execution_failure_and_mid_forward_cancel_preserve_prefix() {
         Box::new(ExecutionProbe {
             work: work.clone(),
             fail: fail.clone(),
+            fail_at: None,
         }),
         &budget,
         &mut evidence,
@@ -444,6 +526,71 @@ fn public_hybrid_execution_failure_and_mid_forward_cancel_preserve_prefix() {
     close(
         &loaded.runner.prefill(&[6, 1]).unwrap(),
         &oracle.runner.prefill(&[6, 1]).unwrap(),
+    );
+    drop(loaded);
+    drop(oracle);
+    assert_eq!(budget.used_bytes(), 0);
+}
+
+#[test]
+fn language_head_failure_rolls_back_every_mixer_before_exact_retry() {
+    let bytes = text_package(true, false).bytes();
+    let source = ModelSource::Trit {
+        bytes: &bytes,
+        level: "typed",
+    };
+    let budget = TensorPayloadBudget::new(1_000_000);
+    let work = Arc::new(AtomicUsize::new(0));
+    let failure = Arc::new(AtomicUsize::new(usize::MAX));
+    let mut loaded = load(
+        source,
+        Box::new(ExecutionProbe {
+            work: work.clone(),
+            fail: Arc::new(AtomicBool::new(false)),
+            fail_at: Some(failure.clone()),
+        }),
+        &budget,
+        &mut recorder(),
+    )
+    .unwrap();
+    let mut oracle = load(
+        source,
+        Box::new(tritium_cpu::CpuBackend::new()),
+        &budget,
+        &mut recorder(),
+    )
+    .unwrap();
+    assert_eq!(
+        loaded.runner.prefill(&[1, 2]).unwrap(),
+        oracle.runner.prefill(&[1, 2]).unwrap()
+    );
+    let calls = work.load(Ordering::SeqCst);
+    assert!(calls > 1);
+    // Same projection schedule for each segment: the last matrix is the head,
+    // after GDN has staged and the attention layer has appended its KV rows.
+    failure.store(calls * 2, Ordering::SeqCst);
+    assert!(
+        loaded
+            .runner
+            .step(4)
+            .unwrap_err()
+            .to_string()
+            .contains("injected decode fault")
+    );
+    assert_eq!(work.load(Ordering::SeqCst), calls * 2 - 1);
+    assert_eq!(loaded.runner.cache_len(), 2);
+    failure.store(usize::MAX, Ordering::SeqCst);
+    for token in [4, 5] {
+        assert_eq!(
+            loaded.runner.step(token).unwrap(),
+            oracle.runner.step(token).unwrap()
+        );
+    }
+    loaded.runner.reset();
+    oracle.runner.reset();
+    assert_eq!(
+        loaded.runner.prefill(&[1, 2]).unwrap(),
+        oracle.runner.prefill(&[1, 2]).unwrap()
     );
     drop(loaded);
     drop(oracle);
