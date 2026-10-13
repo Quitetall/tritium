@@ -36,6 +36,8 @@ mod caps;
 pub use caps::DeviceCaps;
 mod deltanet;
 pub use deltanet::{DeltaNetGeometry, DeltaNetStep, ResidentDeltaNet};
+mod attention;
+pub use attention::{AttentionGeometry, AttentionLimits, AttentionSegment, ResidentAttention};
 mod train_backend;
 pub use train_backend::{
     TrainAttributeV1, TrainAttributeValueV1, TrainBackendError, TrainBackendV1,
@@ -301,6 +303,21 @@ pub trait TernaryBackend: Send + Sync {
 
     /// What this device can do — used by the runtime to pick a backend.
     fn capabilities(&self) -> DeviceCaps;
+
+    /// Explicitly request bounded backend-owned causal attention (device-f32).
+    /// `None` is unsupported, never a successful fallback. Existing host model
+    /// dispatch remains unchanged; this does not imply whole-model residency.
+    ///
+    /// # Errors
+    /// Invalid geometry/limits, payload rejection and allocation/driver failures.
+    fn resident_attention(
+        &self,
+        geometry: AttentionGeometry,
+        limits: AttentionLimits,
+    ) -> Result<Option<Box<dyn ResidentAttention>>, BackendError> {
+        geometry.payload_bytes(limits)?;
+        Ok(None)
+    }
 
     /// Create a zeroed backend-owned transactional DeltaNet recurrence.
     ///

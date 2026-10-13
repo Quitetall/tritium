@@ -11,6 +11,7 @@ use tritium_format::salt_v2_package::{
     pack_salt_v2_plane, unpack_salt_v2_plane_into,
 };
 
+mod attention;
 pub(super) mod deltanet;
 mod salt_v2_reader_upload;
 mod salt_v2_runtime;
@@ -810,6 +811,7 @@ pub struct CudaBackend {
     pub(super) func_semantic_basis_butterfly: CudaFunction,
     pub(super) func_semantic_basis_finish: CudaFunction,
     pub(super) func_semantic_swiglu: CudaFunction,
+    pub(super) func_semantic_attention: CudaFunction,
     /// Scalar-correct D2/B3/S34 forward. The first fast API aliases this handle.
     pub(super) func_salt_v2_exact: CudaFunction,
     /// Shared-activation D2/B3/S34 forward used for prefill-shaped launches.
@@ -1474,6 +1476,9 @@ impl CudaBackend {
         let func_semantic_swiglu = semantic_module
             .load_function("semantic_swiglu")
             .map_err(|e| driver_err("resolve semantic SwiGLU", &e))?;
+        let func_semantic_attention = semantic_module
+            .load_function("semantic_causal_attention")
+            .map_err(|e| driver_err("resolve semantic causal attention", &e))?;
 
         let device_name = ctx
             .name()
@@ -1509,6 +1514,7 @@ impl CudaBackend {
             func_semantic_basis_butterfly,
             func_semantic_basis_finish,
             func_semantic_swiglu,
+            func_semantic_attention,
             func_salt_v2_exact,
             func_salt_v2_tiled,
             func_salt_v2_warp,
@@ -9212,6 +9218,14 @@ impl TernaryBackend for CudaBackend {
     }
     fn try_tensor_swiglu(&self, p: tritium_spec::TensorSwiGlu<'_>) -> Result<bool, BackendError> {
         semantic::swiglu::forward(self, p)
+    }
+
+    fn resident_attention(
+        &self,
+        geometry: tritium_spec::AttentionGeometry,
+        limits: tritium_spec::AttentionLimits,
+    ) -> Result<Option<Box<dyn tritium_spec::ResidentAttention>>, BackendError> {
+        attention::create(self, geometry, limits)
     }
 
     fn embed_rows(

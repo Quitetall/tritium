@@ -3,6 +3,51 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
+// Explicit device-f32 profile. Online softmax uses O(head_dim) block scratch;
+// no [query, context] score matrix and no KV host readback. Default host graph
+// and existing exact matrix/basis/legacy-resident kernels remain unchanged.
+extern "C" __global__ void semantic_causal_attention(
+    const float *query, const float *key, const float *value, float *output,
+    uint32_t query_heads, uint32_t kv_heads, uint32_t dim, uint32_t offset, float scale
+) {
+    extern __shared__ float shared[];
+    const uint32_t lane = threadIdx.x;
+    const uint32_t head = blockIdx.x % query_heads;
+    const uint32_t row = blockIdx.x / query_heads;
+    const uint32_t kv_head = head / (query_heads / kv_heads);
+    const uint64_t q_at = (uint64_t(row) * query_heads + head) * dim;
+    const float q = lane < dim ? query[q_at + lane] : 0.0f;
+    float accumulator = 0.0f;
+    float maximum = -INFINITY, denominator = 0.0f;
+    for (uint32_t token = 0; token <= offset + row; ++token) {
+        const uint64_t kv_at = (uint64_t(token) * kv_heads + kv_head) * dim;
+        shared[lane] = lane < dim ? q * key[kv_at + lane] : 0.0f;
+        __syncthreads();
+        for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (lane < stride) shared[lane] += shared[lane + stride];
+            __syncthreads();
+        }
+        if (lane == 0) {
+            float score = shared[0] * scale;
+            float next_max = fmaxf(maximum, score);
+            float alpha = expf(maximum - next_max);
+            float weight = expf(score - next_max);
+            denominator = denominator * alpha + weight;
+            maximum = next_max;
+            shared[blockDim.x] = alpha;
+            shared[blockDim.x + 1] = weight;
+            shared[blockDim.x + 2] = denominator;
+        }
+        __syncthreads();
+        if (lane < dim) {
+            accumulator = accumulator * shared[blockDim.x]
+                + shared[blockDim.x + 1] * value[kv_at + lane];
+        }
+        __syncthreads();
+    }
+    if (lane < dim) output[q_at + lane] = accumulator / shared[blockDim.x + 2];
+}
+
 extern "C" __global__ void semantic_swiglu(float *gate, const float *up, uint32_t count) {
     uint64_t at = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (at < count) {
