@@ -55,6 +55,12 @@ coverage, not official source authentication or model quality.
 Inspection forbids `--output`, `--spool` and `--import-run-id`, creates neither
 spool nor output, and does not encode bytes or perform target scale-bit proof.
 Its output explicitly excludes container overhead and full physical RSS/VRAM.
+`manifest_lower_bound_bytes` sums exact schema-serialized tensor-storage
+fragments without retaining every count vector or inventing future blob IDs.
+A receiving manifest cap below that bound is rejected before any spool write,
+including for library callers. Names, references, assets, ancestry and other
+manifest fields are omitted: passing this check does **not** admit the full
+manifest, directory or package. Blob deduplication is also not planned.
 Logical caps apply; it never expands them automatically. The selected profile
 is fully read/validated, so inspection is not a cheap header-only probe.
 

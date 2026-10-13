@@ -2,7 +2,7 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use tritium_core::{PerTileIndex, PerTilePlan, PerTileRowSpan, Trit};
-use tritium_schema::{AdditiveLayout, BlobId, PlaneCodec};
+use tritium_schema::{AdditiveLayout, BlobId, PlaneCodec, PlaneCounts, TensorStorage};
 
 use super::{
     E, Prepared, RowCursor, SaltTensorImportLimits, decode, import_bound, locate, prepare,
@@ -100,6 +100,8 @@ pub struct SaltTensorSpoolPlan {
     pub payload_bytes: u64,
     /// Conservative importer count/index/state/packing scratch.
     pub working_bytes: u64,
+    /// Exact target TensorStorage CBOR fragment size; not a whole manifest size.
+    pub storage_metadata_bytes: u64,
 }
 
 struct PayloadPlan {
@@ -195,6 +197,13 @@ pub fn inspect_salt_v2_tensor_spool<R: Read + Seek>(
         planes: plan.plane_count(),
         payload_bytes: payload.total as u64,
         working_bytes: payload.working as u64,
+        storage_metadata_bytes: crate::trit_model::tensor_storage_cbor_bytes(
+            &TensorStorage::Additive {
+                layout,
+                planes: PlaneCounts::PerTile(p.counts),
+            },
+        )
+        .map_err(|_| E::Overflow)?,
     })
 }
 

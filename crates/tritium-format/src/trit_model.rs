@@ -75,6 +75,100 @@ impl From<ModelManifestError> for TritModelError {
     }
 }
 
+/// Exact encoded length of one storage fragment in a typed model manifest.
+///
+/// Uses the schema's actual serializer without allocating encoded bytes or
+/// cloning counts. Canonical ordering only rearranges this primitive-key,
+/// integer-only schema and cannot change its length. This is not structural
+/// validation, a complete manifest estimate or payload/import qualification.
+/// A manifest includes every storage fragment, so their sum is a lower bound.
+/// # Errors
+/// Serializer failure or checked byte-counter overflow.
+pub fn tensor_storage_cbor_bytes(storage: &TensorStorage) -> Result<u64, TritModelError> {
+    let mut output = CountOutput(0);
+    ciborium::ser::into_writer(storage, &mut output)
+        .map_err(|e| TritModelError::Schema(e.to_string()))?;
+    Ok(output.0)
+}
+
+struct CountOutput(u64);
+impl std::io::Write for CountOutput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| std::io::Error::other("metadata size overflow"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod sizing_tests {
+    use super::*;
+    use tritium_schema::{
+        AdditiveLayout, Basis, PlaneAllocation, PlaneCodec, PlaneRelation, ScaleAnchor, ScaleLaw,
+    };
+
+    fn check(storage: TensorStorage) {
+        let mut reference = Value::serialized(&storage).unwrap();
+        canonicalize_value(&mut reference, 0).unwrap();
+        let bytes = encode_cbor_value(&reference).unwrap();
+        assert_eq!(
+            tensor_storage_cbor_bytes(&storage).unwrap(),
+            bytes.len() as u64
+        );
+    }
+
+    #[test]
+    fn storage_size_matches_reference_across_cbor_widths() {
+        for n in [1, 23, 24, 255, 256, 65_535, 65_536] {
+            for precision in [
+                ScalePrecision::F16,
+                ScalePrecision::Bf16,
+                ScalePrecision::F32,
+            ] {
+                check(TensorStorage::Dense {
+                    shape: vec![n, 3],
+                    precision,
+                });
+            }
+        }
+        for len in [1, 23, 24, 255, 256, 65_535, 65_536] {
+            let layout = AdditiveLayout {
+                rows: len,
+                cols: 256,
+                tile: 256,
+                group: 128,
+                max_planes: 3,
+                allocation: PlaneAllocation::PerTile,
+                codec: PlaneCodec::B3,
+                law: ScaleLaw {
+                    anchor: ScaleAnchor::Group,
+                    relation: PlaneRelation::Free,
+                    precision: ScalePrecision::F16,
+                },
+                basis: Basis::Identity,
+                transport: Transport::Raw,
+            };
+            check(TensorStorage::Additive {
+                layout,
+                planes: PlaneCounts::PerTile((0..len).map(|i| (i % 4) as u8).collect()),
+            });
+        }
+    }
+
+    #[test]
+    fn checked_counter_rejects_overflow_without_mutation() {
+        use std::io::Write;
+        let mut output = CountOutput(u64::MAX);
+        assert!(output.write(&[0]).is_err());
+        assert_eq!(output.0, u64::MAX);
+    }
+}
+
 /// Derive canonical CBOR from the Rust schema, normalizing named inventory order.
 ///
 /// Duplicate names are rejected, not collapsed. No handwritten model encoder or

@@ -390,6 +390,40 @@ fn spool_package_metadata_and_companion_caps_refuse_without_published_success() 
     }
 }
 
+#[test]
+fn library_manifest_lower_bound_refuses_before_any_spool_write() {
+    let root = Scratch::new("manifest-bound");
+    let mut reader = SaltV2PackageReader::new_strict(Cursor::new(legacy(
+        SaltV2Codec::B3,
+        vec![tensor("weight", vec![2, 256], SaltV2Transform::None)],
+    )))
+    .unwrap();
+    let mut companions = originals(ScalePrecision::F32);
+    let mut plan = request(&companions, PlaneCodec::B3, 128);
+    let inspected = inspect_salt_v2_model_import(&plan, &reader, &mut companions).unwrap();
+    assert!(inspected.manifest_lower_bound_bytes > 1);
+    plan.receiving.max_manifest_bytes = (inspected.manifest_lower_bound_bytes - 1) as usize;
+    let mut spool = Cursor::new(Vec::new());
+    let out = root.0.join("output");
+    let mut sink = DirectoryTensorSink::new(&out);
+    let error = import_salt_v2_model(
+        &plan,
+        &mut reader,
+        &mut companions,
+        &mut spool,
+        &mut sink,
+        recorder(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("manifest storage lower bound exceeds receiving cap")
+    );
+    assert!(spool.get_ref().is_empty());
+    assert!(!out.exists());
+}
+
 struct ChangingCompanion {
     inner: InMemoryWeightSource,
     reads: usize,

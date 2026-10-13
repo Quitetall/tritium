@@ -383,6 +383,8 @@ fn import(args: &BundleArgs) -> Result<()> {
                 "qwen_language_mtp_inventory":if qwen_inventory_matches {"matches-config-metadata-only"} else {"unknown-generic-architecture"},
                 "additive_payload_bytes":inspection.additive_payload_bytes,"dense_payload_bytes":inspection.dense_payload_bytes,
                 "asset_payload_bytes":inspection.asset_payload_bytes,"spool_payload_bytes":inspection.spool_payload_bytes,
+                "manifest_lower_bound_bytes":inspection.manifest_lower_bound_bytes,
+                "manifest_size":"storage-fragment-lower-bound-only",
                 "maximum_tensor_trits":inspection.matrices.iter().map(|m|m.spool.trits).max(),
                 "maximum_tensor_scales":inspection.matrices.iter().map(|m|m.spool.scales).max(),
                 "maximum_tensor_payload_bytes":inspection.matrices.iter().map(|m|m.spool.payload_bytes).max(),

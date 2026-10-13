@@ -16,7 +16,7 @@ use tritium_format::{
         SaltV2Package, SaltV2PackageReader, SaltV2Plane, SaltV2Tensor, SaltV2Tile, SaltV2Transform,
         write_salt_v2_package,
     },
-    trit_model::TritModelReader,
+    trit_model::{TritModelReader, encode_model_manifest, tensor_storage_cbor_bytes},
 };
 use tritium_schema::{LEGACY_SALT_V2_HF_ASSETS, LevelFit, PlaneCounts, TensorStorage};
 
@@ -123,6 +123,7 @@ fn readonly_inspection_matches_actual_import_payloads_without_output_or_spool() 
                 );
                 assert_eq!(report["scale_representability"], "not-checked");
                 assert_eq!(report["physical_memory"], "not-covered");
+                assert_eq!(report["manifest_size"], "storage-fragment-lower-bound-only");
                 assert_eq!(report["complete_model"], false);
                 assert_eq!(report["official_payload_authenticated"], false);
                 assert!(!root.0.join("output").exists() && !root.0.join("spool").exists());
@@ -141,6 +142,13 @@ fn readonly_inspection_matches_actual_import_payloads_without_output_or_spool() 
                     },
                 )
                 .unwrap();
+                let bound = model.manifest().levels[0]
+                    .tensors
+                    .iter()
+                    .map(|t| tensor_storage_cbor_bytes(&t.storage).unwrap())
+                    .sum::<u64>();
+                assert_eq!(report["manifest_lower_bound_bytes"], bound);
+                assert!(bound < encode_model_manifest(model.manifest()).unwrap().len() as u64);
                 let mut matrix_bytes = 0u64;
                 model
                     .visit_tensor("imported", "proj", |c| -> Result<(), ()> {
@@ -204,6 +212,68 @@ fn inspection_caps_and_write_options_reject_and_import_preflight_preserves_exist
     let error = String::from_utf8_lossy(&rejected.stderr);
     assert!(!error.contains("create new import spool"), "{error}");
     assert_eq!(fs::read(root.0.join("spool")).unwrap(), b"owner sentinel");
+    assert!(!root.0.join("output").exists());
+}
+
+#[test]
+fn manifest_lower_bound_refuses_before_create_and_is_not_full_manifest_admission() {
+    let root = Scratch::new();
+    fixture(&root.0, SaltV2Codec::B3);
+    let observed = inspect(&root.0, "compact-v1", "b3", &[]);
+    assert!(observed.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&observed.stdout).unwrap();
+    let bound = report["manifest_lower_bound_bytes"].as_u64().unwrap();
+    assert!(bound > 1);
+    let too_small = (bound - 1).to_string();
+    fs::write(root.0.join("spool"), b"owner sentinel").unwrap();
+    for result in [
+        inspect(
+            &root.0,
+            "compact-v1",
+            "b3",
+            &["--max-manifest-bytes", &too_small],
+        ),
+        invoke(
+            &root.0,
+            "compact-v1",
+            "b3",
+            &["--max-manifest-bytes", &too_small],
+        ),
+    ] {
+        assert!(!result.status.success());
+        let error = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            error.contains("manifest storage lower bound exceeds receiving cap"),
+            "{error}"
+        );
+        assert!(!error.contains("create new import spool"), "{error}");
+        assert_eq!(fs::read(root.0.join("spool")).unwrap(), b"owner sentinel");
+        assert!(!root.0.join("output").exists());
+    }
+    fs::remove_file(root.0.join("spool")).unwrap();
+    // Equality fits the known fragments, but references and envelope also cost
+    // bytes. The actual publisher must still refuse its larger full manifest.
+    let equal = bound.to_string();
+    assert!(
+        inspect(
+            &root.0,
+            "compact-v1",
+            "b3",
+            &["--max-manifest-bytes", &equal]
+        )
+        .status
+        .success()
+    );
+    assert!(
+        !invoke(
+            &root.0,
+            "compact-v1",
+            "b3",
+            &["--max-manifest-bytes", &equal]
+        )
+        .status
+        .success()
+    );
     assert!(!root.0.join("output").exists());
 }
 

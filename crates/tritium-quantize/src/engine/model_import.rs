@@ -15,7 +15,7 @@ use tritium_evidence::{
 use tritium_format::salt_v2_package::{
     SaltV2PackageReadError, SaltV2PackageReader, SaltV2Transform,
 };
-use tritium_format::trit_model::{TritModelReadError, TritModelReader};
+use tritium_format::trit_model::{TritModelReadError, TritModelReader, tensor_storage_cbor_bytes};
 use tritium_format::{
     SaltTensorSpoolError, SaltTensorSpoolLimits, SaltTensorSpoolPlan, TritBlobKind,
     TritPackageReadLimits, TritSpoolBlob, import_salt_v2_tensor_to_spool,
@@ -64,6 +64,9 @@ pub struct SaltV2ModelImportPlan {
     pub asset_payload_bytes: u64,
     /// Exact logical raw spool payload sum, excluding container/log overhead.
     pub spool_payload_bytes: u64,
+    /// Sum of exact storage fragments, excluding all other manifest fields.
+    /// A lower bound only: passing it does not admit the full manifest/package.
+    pub manifest_lower_bound_bytes: u64,
 }
 
 fn matrix_inventory<R: Read + Seek>(
@@ -136,7 +139,8 @@ fn matrix_inventory<R: Read + Seek>(
 /// Inspect through shared strict metadata/count/encoder sizing before any writes.
 /// Asset bytes are bounded observations; companion data bytes and target scale-bit
 /// representability are not proved. This is not prepared-import evidence, source
-/// official authentication, container/RSS admission or publication permission.
+/// official authentication, full container/RSS admission or publication permission.
+/// Rejects a manifest receiving cap below the guaranteed storage-fragment bound.
 /// # Errors
 /// Invalid/mismatched inventory, unsupported layout, logical caps or source errors.
 pub fn inspect_salt_v2_model_import<R: Read + Seek>(
@@ -167,10 +171,12 @@ pub fn inspect_salt_v2_model_import<R: Read + Seek>(
         .try_reserve_exact(inventory.len())
         .map_err(|_| refusal("inspection allocation"))?;
     let mut additive_payload_bytes = 0;
+    let mut manifest_lower_bound_bytes = 0;
     for (name, layout) in inventory {
         let spool = inspect_salt_v2_tensor_spool(legacy, &name, layout, request.tensor_limits)
             .map_err(SaltV2ModelImportError::Tensor)?;
         additive_payload_bytes = sum(additive_payload_bytes, spool.payload_bytes)?;
+        manifest_lower_bound_bytes = sum(manifest_lower_bound_bytes, spool.storage_metadata_bytes)?;
         matrices.push(SaltV2MatrixImportPlan {
             name,
             layout,
@@ -184,6 +190,20 @@ pub fn inspect_salt_v2_model_import<R: Read + Seek>(
             return Err(refusal("inspection dense source exceeds cap"));
         }
         dense_payload_bytes = sum(dense_payload_bytes, bytes)?;
+        let storage = TensorStorage::Dense {
+            shape: t.source.shape.clone(),
+            precision: t.source.precision,
+        };
+        manifest_lower_bound_bytes = sum(
+            manifest_lower_bound_bytes,
+            tensor_storage_cbor_bytes(&storage)
+                .map_err(|_| refusal("inspection storage metadata serialization"))?,
+        )?;
+    }
+    if manifest_lower_bound_bytes > request.receiving.max_manifest_bytes as u64 {
+        return Err(refusal(
+            "inspection manifest storage lower bound exceeds receiving cap (other manifest fields not covered)",
+        ));
     }
     let mut asset_payload_bytes = 0;
     for name in &plan.assets {
@@ -214,6 +234,7 @@ pub fn inspect_salt_v2_model_import<R: Read + Seek>(
         dense_payload_bytes,
         asset_payload_bytes,
         spool_payload_bytes,
+        manifest_lower_bound_bytes,
     })
 }
 
@@ -339,6 +360,9 @@ pub fn import_salt_v2_model<R: Read + Seek, S: Read + Write + Seek>(
     if spool.seek(SeekFrom::End(0))? != 0 || spool.seek(SeekFrom::Start(0))? != 0 {
         return Err(refusal("model import spool must be empty"));
     }
+    // Public library callers get the same pre-write admission as the CLI.
+    // This lower-bound check never replaces exact staging/receiving validation.
+    inspect_salt_v2_model_import(request, legacy, companions)?;
     let matrices = matrix_inventory(request, legacy)?;
     let mut observed = ObservedWeightSource::new(plan, companions)?;
     let mut blobs = Vec::new();
