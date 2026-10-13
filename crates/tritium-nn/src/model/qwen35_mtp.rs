@@ -274,6 +274,28 @@ pub struct UnverifiedQwen35Mtp {
 }
 
 impl UnverifiedQwen35Mtp {
+    #[cfg(feature = "tokenizer")]
+    pub(super) fn resident_matrices(
+        &self,
+    ) -> Result<Vec<&Arc<dyn tritium_spec::DeviceBuffer>>, NnError> {
+        use super::resident::matrix;
+        let attention = self.core.attention.resident_binding()?;
+        let mut matrices = Vec::new();
+        matrices
+            .try_reserve_exact(8)
+            .map_err(|e| NnError::Backend(format!("MTP retained inventory: {e}")))?;
+        matrices.extend([
+            matrix(&self.core.fc)?,
+            attention.query_gate,
+            attention.key,
+            attention.value,
+            attention.output,
+            matrix(&self.core.mlp.gate)?,
+            matrix(&self.core.mlp.up)?,
+            matrix(&self.core.mlp.down)?,
+        ]);
+        Ok(matrices)
+    }
     /// Assemble and validate the exact one-layer, shared-embedding MTP graph.
     ///
     /// The nested layer owns 11 checkpoint tensors; the two pre-fusion norms,

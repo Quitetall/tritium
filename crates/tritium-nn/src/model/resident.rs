@@ -7,7 +7,7 @@ use tritium_spec::{
     DecoderLimits, DeviceBuffer, ResidentDecoder, TernaryBackend,
 };
 
-fn matrix(projection: &Projection) -> Result<&Arc<dyn DeviceBuffer>, NnError> {
+pub(crate) fn matrix(projection: &Projection) -> Result<&Arc<dyn DeviceBuffer>, NnError> {
     match projection {
         Projection::Tensor(linear) => Ok(linear.device_arc()),
         _ => Err(NnError::Backend(
@@ -108,7 +108,9 @@ pub(super) fn standard(
         embedding,
         head,
         final_norm: &weights.output_norm,
-        layers: &layers,
+        layers: tritium_spec::DecoderLayers::Standard(&layers),
+        semantics: tritium_spec::DecoderSemantics::standard(config.head_dim() as usize),
+        retained_matrices: &[],
     };
     let selected = backend
         .resident_decoder(graph, limits)
@@ -121,9 +123,17 @@ pub(super) fn standard(
             "resident decoder changed admitted limits or initial cursor".into(),
         ));
     }
-    Ok(Some(Box::new(ResidentAdapter(selected))))
+    Ok(Some(Box::new(ResidentAdapter {
+        decoder: selected,
+        mtp: None,
+        _identity: None,
+    })))
 }
-struct ResidentAdapter(Box<dyn ResidentDecoder>);
+struct ResidentAdapter {
+    decoder: Box<dyn ResidentDecoder>,
+    mtp: Option<super::UnverifiedQwen35Mtp>,
+    _identity: Option<Arc<super::qwen35::RunnerIdentity>>,
+}
 impl Executor for ResidentAdapter {
     fn forward(
         &mut self,
@@ -132,20 +142,105 @@ impl Executor for ResidentAdapter {
         positions: &[usize],
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Option<Vec<f32>>, NnError> {
-        self.0
+        self.decoder
             .forward(tokens, positions, cancelled)
             .map_err(|e| NnError::Backend(e.to_string()))
     }
     fn reset(&mut self) {
-        self.0.reset();
+        self.decoder.reset();
     }
     fn len(&self) -> usize {
-        self.0.len()
+        self.decoder.len()
     }
     fn execution(&self) -> DecoderExecution {
         DecoderExecution::ResidentDeviceF32
     }
     fn resident_payload_bytes(&self) -> Option<usize> {
-        Some(self.0.payload_bytes())
+        Some(self.decoder.payload_bytes())
     }
+    fn mtp_status(&self) -> Option<crate::Qwen35MtpStatus> {
+        self.mtp.as_ref().map(super::UnverifiedQwen35Mtp::status)
+    }
+}
+
+pub(super) fn hybrid(
+    architecture: &ArchitectureSpec,
+    weights: &super::host::Weights,
+    backend: Arc<dyn TernaryBackend>,
+    limits: DecoderLimits,
+    mtp: super::UnverifiedQwen35Mtp,
+    identity: Arc<super::qwen35::RunnerIdentity>,
+) -> Result<Box<dyn Executor>, NnError> {
+    let ArchitectureSpec::Hybrid(config) = architecture else {
+        return Err(NnError::Backend(
+            "hybrid graph architecture mismatch".into(),
+        ));
+    };
+    let c = &config.text;
+    if weights.layers.len() != architecture.layer_count()
+        || limits.max_context == 0
+        || limits.max_context > architecture.max_context()
+    {
+        return Err(NnError::Backend(
+            "hybrid graph disagrees with admitted architecture".into(),
+        ));
+    }
+    let embedding = weights
+        .embedding
+        .shared_linear()
+        .ok_or_else(|| NnError::Backend("resident hybrid requires shared embedding".into()))?
+        .device_arc();
+    let head = matrix(
+        weights
+            .head
+            .as_ref()
+            .ok_or_else(|| NnError::Backend("hybrid head missing".into()))?,
+    )?;
+    let mut layers = Vec::new();
+    layers
+        .try_reserve_exact(weights.layers.len())
+        .map_err(|e| NnError::Backend(format!("hybrid graph allocation: {e}")))?;
+    for layer in &weights.layers {
+        let super::host::Layer::Hybrid(layer) = layer else {
+            return Err(NnError::Backend("hybrid graph has standard layer".into()));
+        };
+        layers.push(layer.resident_binding()?);
+    }
+    let retained = mtp.resident_matrices()?;
+    let graph = DecoderGraph {
+        geometry: DecoderGeometry {
+            hidden: c.hidden_size as usize,
+            intermediate: c.intermediate_size as usize,
+            query_heads: c.full_attention.num_heads as usize,
+            kv_heads: c.full_attention.num_key_value_heads as usize,
+            head_dim: c.full_attention.head_dim as usize,
+            vocabulary: c.vocab_size as usize,
+            rms_eps: c.rms_norm_eps as f32,
+            rope_theta: c.rope.theta as f32,
+        },
+        embedding,
+        head,
+        final_norm: &weights.final_norm,
+        layers: tritium_spec::DecoderLayers::Hybrid(&layers),
+        semantics: tritium_spec::DecoderSemantics {
+            zero_centered_norm: true,
+            rotary_dim: c.rope.rotary_dim as usize,
+            qwen_rope_f32: true,
+        },
+        retained_matrices: &retained,
+    };
+    let decoder = backend
+        .resident_decoder(graph, limits)
+        .map_err(|e| NnError::Backend(e.to_string()))?
+        .ok_or_else(|| NnError::Backend("requested hybrid resident decoder declined".into()))?;
+    if decoder.limits() != limits || !decoder.is_empty() {
+        return Err(NnError::Backend(
+            "hybrid executor changed limits or initial cursor".into(),
+        ));
+    }
+    Ok(Box::new(ResidentAdapter {
+        decoder,
+        mtp: Some(mtp),
+        _identity: Some(identity),
+    }))
 }

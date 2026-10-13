@@ -164,12 +164,13 @@ impl Runner {
             imported.weights,
             imported.backend,
             capacity,
+            admission.map_or(capacity, |a| a.limits().max_segment_tokens),
             mtp,
             imported.identity,
         )?;
         Ok(Self {
             architecture,
-            executor: Box::new(executor),
+            executor,
             admission,
         })
     }

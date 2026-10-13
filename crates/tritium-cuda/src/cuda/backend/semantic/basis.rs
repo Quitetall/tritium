@@ -40,11 +40,7 @@ pub(super) fn apply_prefix(
         } => (block, true, seed, domain),
         _ => return Err(BackendError::UnsupportedTensor),
     };
-    if cols == 0
-        || !block.is_power_of_two()
-        || !cols.is_multiple_of(block as usize)
-        || !values.len().is_multiple_of(cols)
-    {
+    if cols == 0 || !block.is_power_of_two() || !cols.is_multiple_of(block as usize) {
         return Err(invalid("CUDA basis buffer geometry mismatch"));
     }
     let count =
@@ -124,7 +120,8 @@ mod tests {
                 return;
             }
         };
-        let original: Vec<f32> = (0..256 * 128)
+        // Shared decoder scratch need not end on this projection's row width.
+        let original: Vec<f32> = (0..256 * 128 + 7)
             .map(|i| ((i * 7 % 31) as f32 - 15.) / 64.)
             .collect();
         for basis in [

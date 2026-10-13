@@ -42,8 +42,9 @@ pub use delta_mixer::{
 };
 mod decoder;
 pub use decoder::{
-    DecoderActivation, DecoderExecution, DecoderGeometry, DecoderGraph, DecoderLayer,
-    DecoderLimits, ResidentDecoder,
+    DecoderActivation, DecoderDeltaNet, DecoderExecution, DecoderFullAttention, DecoderGeometry,
+    DecoderGraph, DecoderHybridLayer, DecoderLayer, DecoderLayers, DecoderLimits, DecoderMixer,
+    DecoderSemantics, ResidentDecoder,
 };
 mod attention;
 pub use attention::{AttentionGeometry, AttentionLimits, AttentionSegment, ResidentAttention};

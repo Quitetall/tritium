@@ -1,5 +1,5 @@
 //! Borrowed shared-weight graph and optional backend-owned decoder execution.
-use crate::{BackendError, DeviceBuffer};
+use crate::{BackendError, DeltaMixerGeometry, DeltaMixerWeights, DeviceBuffer};
 use std::sync::Arc;
 
 /// Actual execution selected by the common language runner, not qualification.
@@ -8,7 +8,7 @@ use std::sync::Arc;
 pub enum DecoderExecution {
     /// Canonical shared host graph.
     Host,
-    /// Explicit device-f32 whole standard decoder graph.
+    /// Explicit device-f32 language graph.
     ResidentDeviceF32,
 }
 
@@ -105,7 +105,101 @@ pub struct DecoderGraph<'a> {
     /// Final RMSNorm.
     pub final_norm: &'a [f32],
     /// Ordered layers.
-    pub layers: &'a [DecoderLayer<'a>],
+    pub layers: DecoderLayers<'a>,
+    /// Normalization and RoPE interpretation; never inferred from tensor names.
+    pub semantics: DecoderSemantics,
+    /// Retained, nonexecuted matrices (e.g. unverified MTP), included in admission.
+    pub retained_matrices: &'a [&'a Arc<dyn DeviceBuffer>],
+}
+
+/// Immutable numerical interpretation compiled from the authoritative graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecoderSemantics {
+    /// Decoder/QK norms use one plus preserved weight, instead of direct weight.
+    pub zero_centered_norm: bool,
+    /// Active even rotary prefix per head.
+    pub rotary_dim: usize,
+    /// Partial RoPE tables use the Qwen fp32 power/reciprocal construction.
+    pub qwen_rope_f32: bool,
+}
+impl DecoderSemantics {
+    /// Standard direct norms and full f64 table construction.
+    #[must_use]
+    pub const fn standard(head_dim: usize) -> Self {
+        Self {
+            zero_centered_norm: false,
+            rotary_dim: head_dim,
+            qwen_rope_f32: false,
+        }
+    }
+}
+/// Actual ordered graph layer family, with no placeholder mixer fields.
+#[allow(missing_debug_implementations)]
+#[non_exhaustive]
+pub enum DecoderLayers<'a> {
+    /// Standard attention blocks with their existing variation settings.
+    Standard(&'a [DecoderLayer<'a>]),
+    /// Explicit hybrid schedule.
+    Hybrid(&'a [DecoderHybridLayer<'a>]),
+}
+/// Shared hybrid decoder norms/MLP and an explicit token mixer.
+#[allow(missing_debug_implementations)]
+pub struct DecoderHybridLayer<'a> {
+    /// Input decoder norm.
+    pub input_norm: &'a [f32],
+    /// Post-mixer decoder norm.
+    pub post_norm: &'a [f32],
+    /// SwiGLU gate projection.
+    pub gate: &'a Arc<dyn DeviceBuffer>,
+    /// SwiGLU up projection.
+    pub up: &'a Arc<dyn DeviceBuffer>,
+    /// SwiGLU down projection.
+    pub down: &'a Arc<dyn DeviceBuffer>,
+    /// Actual mixer kind/bindings.
+    pub mixer: DecoderMixer<'a>,
+}
+/// Typed hybrid mixer bindings.
+#[allow(missing_debug_implementations)]
+#[non_exhaustive]
+pub enum DecoderMixer<'a> {
+    /// Qwen full attention with fused per-head query/gate rows.
+    FullAttention(DecoderFullAttention<'a>),
+    /// Qwen causal convolution and gated DeltaNet recurrence.
+    DeltaNet(DecoderDeltaNet<'a>),
+}
+/// Qwen full-attention immutable shared handles and preserved norms.
+#[allow(missing_debug_implementations)]
+pub struct DecoderFullAttention<'a> {
+    /// `[2 * query_width, hidden]` in per-head query/gate order.
+    pub query_gate: &'a Arc<dyn DeviceBuffer>,
+    /// Key projection.
+    pub key: &'a Arc<dyn DeviceBuffer>,
+    /// Value projection.
+    pub value: &'a Arc<dyn DeviceBuffer>,
+    /// Output projection.
+    pub output: &'a Arc<dyn DeviceBuffer>,
+    /// Zero-centered per-head query norm.
+    pub query_norm: &'a [f32],
+    /// Zero-centered per-head key norm.
+    pub key_norm: &'a [f32],
+}
+/// Qwen DeltaNet immutable shared handles and preserved coefficients.
+#[allow(missing_debug_implementations)]
+pub struct DecoderDeltaNet<'a> {
+    /// Real recurrence/convolution/gated normalization settings.
+    pub geometry: DeltaMixerGeometry,
+    /// Preserved coefficients.
+    pub weights: DeltaMixerWeights<'a>,
+    /// Raw QKV projection.
+    pub qkv: &'a Arc<dyn DeviceBuffer>,
+    /// Output gate projection.
+    pub z: &'a Arc<dyn DeviceBuffer>,
+    /// Beta projection.
+    pub beta: &'a Arc<dyn DeviceBuffer>,
+    /// Decay projection.
+    pub decay: &'a Arc<dyn DeviceBuffer>,
+    /// Output projection.
+    pub output: &'a Arc<dyn DeviceBuffer>,
 }
 
 /// Backend-owned graph execution with atomic language-stream publication.

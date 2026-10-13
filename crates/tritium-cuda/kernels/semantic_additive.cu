@@ -92,7 +92,7 @@ extern "C" __global__ void semantic_decoder_dense_gather(
 }
 // Same 256-slot fold/tree as the canonical host inference RMSNorm; sqrt is the
 // explicit device-f32 profile. In-place writes occur after the reduction barrier.
-extern "C" __global__ void semantic_decoder_norm(float *x, const float *w, uint32_t cols, float eps) {
+extern "C" __global__ void semantic_decoder_norm(float *x, const float *w, uint32_t cols, float eps, uint32_t zero_centered) {
     __shared__ float sum[256];
     uint32_t lane = threadIdx.x;
     uint64_t base = uint64_t(blockIdx.x) * cols;
@@ -105,7 +105,10 @@ extern "C" __global__ void semantic_decoder_norm(float *x, const float *w, uint3
         __syncthreads();
     }
     float inv = 1.0f / sqrtf(sum[0] / float(cols) + eps);
-    for (uint32_t c = lane; c < cols; c += 256) x[base + c] = (x[base + c] * inv) * w[c];
+    for (uint32_t c = lane; c < cols; c += 256) {
+        float weight = zero_centered ? 1.0f + w[c] : w[c];
+        x[base + c] = (x[base + c] * inv) * weight;
+    }
 }
 extern "C" __global__ void semantic_decoder_bias(float *x, const float *bias, uint32_t cols, uint32_t count) {
     uint64_t at = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -120,16 +123,27 @@ extern "C" __global__ void semantic_decoder_relu2(float *gate, const float *up, 
     if (at < count) { float r = fmaxf(gate[at], 0.0f); gate[at] = (r * r) * up[at]; }
 }
 extern "C" __global__ void semantic_decoder_rope(float *x, const float *table,
-    uint32_t heads, uint32_t dim, uint32_t pairs
+    uint32_t heads, uint32_t dim, uint32_t rotary, uint32_t pairs
 ) {
     uint64_t at = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (at >= pairs) return;
-    uint32_t half = dim / 2, token = at / (heads * half), pair = at % half;
+    uint32_t half = rotary / 2, token = at / (heads * half), pair = at % half;
     uint64_t base = (at / half) * dim;
     float a = x[base + pair], b = x[base + pair + half];
-    float c = table[uint64_t(token) * dim + pair], s = table[uint64_t(token) * dim + pair + half];
+    float c = table[uint64_t(token) * rotary + pair], s = table[uint64_t(token) * rotary + pair + half];
     x[base + pair] = a * c - b * s;
     x[base + pair + half] = b * c + a * s;
+}
+extern "C" __global__ void semantic_qwen_query_gate(const float *fused, float *query, float *gate, uint32_t dim, uint32_t count) {
+    uint64_t at = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (at < count) {
+        uint64_t source = (at / dim) * (2 * dim) + at % dim;
+        query[at] = fused[source]; gate[at] = fused[source + dim];
+    }
+}
+extern "C" __global__ void semantic_qwen_attention_gate(float *attention, const float *gate, uint32_t count) {
+    uint64_t at = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (at < count) attention[at] *= 1.0f / (1.0f + expf(-gate[at]));
 }
 
 // Explicit device-f32 profile. Online softmax uses O(head_dim) block scratch;

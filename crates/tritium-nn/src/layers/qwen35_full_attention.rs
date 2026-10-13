@@ -307,6 +307,20 @@ pub struct Qwen35FullAttention {
 struct MixerIdentity;
 
 impl Qwen35FullAttention {
+    #[cfg(feature = "tokenizer")]
+    pub(crate) fn resident_binding(
+        &self,
+    ) -> Result<tritium_spec::DecoderFullAttention<'_>, NnError> {
+        use crate::model::resident::matrix;
+        Ok(tritium_spec::DecoderFullAttention {
+            query_gate: matrix(&self.weights.q_proj)?,
+            key: matrix(&self.weights.k_proj)?,
+            value: matrix(&self.weights.v_proj)?,
+            output: matrix(&self.weights.o_proj)?,
+            query_norm: &self.weights.q_norm,
+            key_norm: &self.weights.k_norm,
+        })
+    }
     #[allow(dead_code)] // Consumed by the B3 bounded projection-window adapter.
     pub(crate) fn projection(&self, name: &str) -> Result<&Projection, NnError> {
         match name {

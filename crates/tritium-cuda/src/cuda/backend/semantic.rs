@@ -65,35 +65,40 @@ impl CudaTensor {
         &self,
         backend: &CudaBackend,
         input: &CudaSlice<f32>,
-        scratch: &mut CudaSlice<f32>,
+        scratch: Option<&mut CudaSlice<f32>>,
         ones: &CudaSlice<f32>,
         output: &mut CudaSlice<f32>,
         batch: usize,
     ) -> Result<(), BackendError> {
         let count = product(batch, self.cols)?;
-        if input.len() < count
-            || scratch.len() < count
-            || output.len() < product(batch, self.rows)?
-            || !scratch.len().is_multiple_of(self.cols)
-        {
+        if input.len() < count || output.len() < product(batch, self.rows)? {
             return Err(invalid("resident projection workspace geometry mismatch"));
         }
-        backend
-            .stream
-            .memcpy_dtod(&input.slice(..count), &mut scratch.slice_mut(..count))
-            .map_err(|e| driver_err("stage resident projection basis", &e))?;
-        basis::apply_prefix(backend, scratch, count, self.cols, self.basis, false)?;
+        let transformed = if matches!(self.basis, Basis::Identity) {
+            input
+        } else {
+            let scratch = scratch.ok_or_else(|| invalid("resident basis scratch missing"))?;
+            if scratch.len() < count {
+                return Err(invalid("resident basis scratch too small"));
+            }
+            backend
+                .stream
+                .memcpy_dtod(&input.slice(..count), &mut scratch.slice_mut(..count))
+                .map_err(|e| driver_err("stage resident projection basis", &e))?;
+            basis::apply_prefix(backend, scratch, count, self.cols, self.basis, false)?;
+            &*scratch
+        };
         if let Some(packed) = &self.packed {
             packed.launch(
                 backend,
-                scratch,
+                transformed,
                 output,
                 batch as u32,
                 product(batch, self.rows)?,
             )
         } else {
             backend.matmul_forward_dev(
-                scratch,
+                transformed,
                 self.values
                     .as_ref()
                     .ok_or_else(|| invalid("missing dense payload"))?,
@@ -106,6 +111,9 @@ impl CudaTensor {
                 output,
             )
         }
+    }
+    pub(super) fn basis(&self) -> Basis {
+        self.basis
     }
 
     pub(super) fn gather_device(

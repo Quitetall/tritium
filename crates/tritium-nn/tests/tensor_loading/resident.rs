@@ -2,7 +2,8 @@
 use super::*;
 use tritium_nn::{ModelSource, StreamLimits};
 use tritium_spec::{
-    DecoderActivation, DecoderExecution, DecoderGeometry, DecoderGraph, DecoderLayer, DecoderLimits,
+    DecoderActivation, DecoderExecution, DecoderGeometry, DecoderGraph, DecoderLayer,
+    DecoderLayers, DecoderLimits, DecoderSemantics,
 };
 
 fn cuda(budget: Option<usize>) -> Option<tritium_cuda::CudaBackend> {
@@ -285,7 +286,9 @@ fn resident_factory_checks_exact_owner_and_deduplicates_shared_payload() {
         embedding: &handle,
         head: &handle,
         final_norm: &norm,
-        layers: &layers,
+        layers: DecoderLayers::Standard(&layers),
+        semantics: DecoderSemantics::standard(8),
+        retained_matrices: &[],
     };
     let limits = DecoderLimits {
         max_context: 4,
@@ -297,7 +300,7 @@ fn resident_factory_checks_exact_owner_and_deduplicates_shared_payload() {
         .resident_decoder(graph(), limits)
         .unwrap()
         .unwrap();
-    assert_eq!(decoder.payload_bytes(), 1544);
+    assert_eq!(decoder.payload_bytes(), 1352);
     let logits = decoder
         .forward(&[1, 2], &[0, 1], &|| false)
         .unwrap()
@@ -356,7 +359,9 @@ fn resident_factory_checks_exact_owner_and_deduplicates_shared_payload() {
                 embedding: &token_table,
                 head: &handle,
                 final_norm: &norm,
-                layers: &fault_layers,
+                layers: DecoderLayers::Standard(&fault_layers),
+                semantics: DecoderSemantics::standard(8),
+                retained_matrices: &[],
             },
             limits,
         )

@@ -19,13 +19,13 @@ pub(super) struct State {
     conv_staging: CudaSlice<f32>,
     recurrent_current: CudaSlice<f32>,
     recurrent_staging: CudaSlice<f32>,
-    convolved: CudaSlice<f32>,
     cursor: usize,
     pending: Option<usize>,
 }
 #[derive(Debug)]
 struct Mixer {
     state: State,
+    convolved: CudaSlice<f32>,
     payload: usize,
     qkv: CudaSlice<f32>,
     z: CudaSlice<f32>,
@@ -38,6 +38,87 @@ fn invalid(message: &str) -> BackendError {
     BackendError::InvalidInput(message.into())
 }
 impl State {
+    pub(super) fn len(&self) -> usize {
+        self.cursor
+    }
+    pub(super) fn staged_len(&self) -> Option<usize> {
+        self.pending
+    }
+    pub(super) fn abort(&mut self) {
+        self.pending = None;
+    }
+    pub(super) fn reset(&mut self) {
+        self.cursor = 0;
+        self.pending = None;
+    }
+    pub(super) fn payload_bytes(
+        geometry: DeltaMixerGeometry,
+        weights: DeltaMixerWeights<'_>,
+        limits: DecoderLimits,
+    ) -> Result<usize, BackendError> {
+        let full = geometry.payload_bytes(weights, limits, usize::MAX)?;
+        let g = geometry.recurrence;
+        let (conv, value) = geometry.widths()?;
+        if g.key_head_dim > 1024
+            || g.value_head_dim > 1024
+            || [
+                g.value_heads,
+                g.group_size,
+                geometry.conv_kernel,
+                limits.max_context,
+                limits.max_segment_tokens * conv,
+                limits.max_segment_tokens * value,
+                limits.max_segment_tokens * g.value_heads,
+            ]
+            .into_iter()
+            .any(|n| u32::try_from(n).is_err())
+        {
+            return Err(BackendError::UnsupportedTensor);
+        }
+        Ok(full - 2 * limits.max_segment_tokens * (conv + value + g.value_heads) * 4)
+    }
+    pub(super) fn new(
+        backend: &CudaBackend,
+        geometry: DeltaMixerGeometry,
+        weights: DeltaMixerWeights<'_>,
+        limits: DecoderLimits,
+    ) -> Result<Self, BackendError> {
+        Self::payload_bytes(geometry, weights, limits)?;
+        let conv = geometry.widths()?.0 * geometry.conv_kernel;
+        let recurrent = geometry.recurrence.elements()?;
+        let alloc = |len| {
+            backend
+                .stream
+                .alloc_zeros::<f32>(len)
+                .map_err(|e| alloc_or_backend("DeltaNet owned state", &e, len * 4))
+        };
+        let upload = |values: &[f32]| {
+            backend.stream.clone_htod(values).map_err(|e| {
+                alloc_or_backend(
+                    "DeltaNet preserved coefficients",
+                    &e,
+                    core::mem::size_of_val(values),
+                )
+            })
+        };
+        Ok(Self {
+            stream: Arc::clone(&backend.stream),
+            convolution_function: backend.func_delta_convolution.clone(),
+            mixer_function: backend.func_delta_mixer.clone(),
+            geometry,
+            limits,
+            convolution: upload(weights.convolution)?,
+            norm: upload(weights.norm)?,
+            dt_bias: upload(weights.dt_bias)?,
+            a_log: upload(weights.a_log)?,
+            conv_current: alloc(conv)?,
+            conv_staging: alloc(conv)?,
+            recurrent_current: alloc(recurrent)?,
+            recurrent_staging: alloc(recurrent)?,
+            cursor: 0,
+            pending: None,
+        })
+    }
     fn extent(&self, tokens: usize) -> Result<usize, BackendError> {
         let end = self
             .cursor
@@ -56,13 +137,12 @@ impl State {
     }
     pub(super) fn stage_device(
         &mut self,
-        qkv: &CudaSlice<f32>,
-        z: &CudaSlice<f32>,
-        beta: &CudaSlice<f32>,
-        decay: &CudaSlice<f32>,
+        inputs: [&CudaSlice<f32>; 4],
+        convolved: &mut CudaSlice<f32>,
         output: &mut CudaSlice<f32>,
         tokens: usize,
     ) -> Result<(), BackendError> {
+        let [qkv, z, beta, decay] = inputs;
         self.pending = None;
         let end = self.extent(tokens)?;
         let g = self.geometry.recurrence;
@@ -73,6 +153,7 @@ impl State {
             (beta, tokens * g.value_heads),
             (decay, tokens * g.value_heads),
             (&*output, tokens * value_width),
+            (&*convolved, tokens * width),
         ] {
             if !Arc::ptr_eq(data.stream(), &self.stream) {
                 return Err(invalid("DeltaNet mixer operand belongs to another stream"));
@@ -107,7 +188,7 @@ impl State {
             .arg(qkv)
             .arg(&self.convolution)
             .arg(&mut self.conv_staging)
-            .arg(&mut self.convolved)
+            .arg(&mut *convolved)
             .arg(&width)
             .arg(&kernel)
             .arg(&tokens);
@@ -125,7 +206,7 @@ impl State {
         let eps = self.geometry.rms_eps;
         let mut mixer = self.stream.launch_builder(&self.mixer_function);
         mixer
-            .arg(&self.convolved)
+            .arg(&*convolved)
             .arg(z)
             .arg(beta)
             .arg(decay)
@@ -155,7 +236,7 @@ impl State {
         self.pending = Some(end);
         Ok(())
     }
-    fn commit(&mut self) {
+    pub(super) fn commit(&mut self) {
         if let Some(end) = self.pending.take() {
             core::mem::swap(&mut self.conv_current, &mut self.conv_staging);
             core::mem::swap(&mut self.recurrent_current, &mut self.recurrent_staging);
@@ -189,22 +270,11 @@ pub(super) fn create(
     {
         return Ok(None);
     }
-    let recurrent = g.elements()?;
-    let conv = conv_width * geometry.conv_kernel;
     let alloc = |len| {
         backend
             .stream
             .alloc_zeros::<f32>(len)
             .map_err(|e| alloc_or_backend("DeltaNet mixer payload", &e, len * 4))
-    };
-    let upload = |values: &[f32]| {
-        backend.stream.clone_htod(values).map_err(|e| {
-            alloc_or_backend(
-                "DeltaNet mixer coefficients",
-                &e,
-                core::mem::size_of_val(values),
-            )
-        })
     };
     let m = limits.max_segment_tokens;
     let mut host_output = Vec::new();
@@ -215,24 +285,8 @@ pub(super) fn create(
         })?;
     host_output.resize(m * value_width, 0.);
     Ok(Some(Box::new(Mixer {
-        state: State {
-            stream: Arc::clone(&backend.stream),
-            convolution_function: backend.func_delta_convolution.clone(),
-            mixer_function: backend.func_delta_mixer.clone(),
-            geometry,
-            limits,
-            convolution: upload(weights.convolution)?,
-            norm: upload(weights.norm)?,
-            dt_bias: upload(weights.dt_bias)?,
-            a_log: upload(weights.a_log)?,
-            conv_current: alloc(conv)?,
-            conv_staging: alloc(conv)?,
-            recurrent_current: alloc(recurrent)?,
-            recurrent_staging: alloc(recurrent)?,
-            convolved: alloc(m * conv_width)?,
-            cursor: 0,
-            pending: None,
-        },
+        state: State::new(backend, geometry, weights, limits)?,
+        convolved: alloc(m * conv_width)?,
         payload,
         qkv: alloc(m * conv_width)?,
         z: alloc(m * value_width)?,
@@ -313,10 +367,8 @@ impl ResidentDeltaMixer for Mixer {
             .map_err(|e| driver_err("upload DeltaNet A", &e))?;
         let result = (|| {
             self.state.stage_device(
-                &self.qkv,
-                &self.z,
-                &self.beta,
-                &self.decay,
+                [&self.qkv, &self.z, &self.beta, &self.decay],
+                &mut self.convolved,
                 &mut self.output,
                 n,
             )?;

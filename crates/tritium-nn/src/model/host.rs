@@ -10,7 +10,7 @@ use crate::{
 use std::sync::Arc;
 use tritium_spec::TernaryBackend;
 
-enum Layer {
+pub(super) enum Layer {
     Standard(TransformerBlock),
     Hybrid(Qwen35TextLayer),
 }
@@ -18,10 +18,10 @@ enum Layer {
 /// Internal common storage. Legacy public weight types remain import adapters
 /// until all artifacts and surfaces migrate; no dense shadow is introduced here.
 pub(super) struct Weights {
-    embedding: TokenEmbedding,
-    layers: Vec<Layer>,
-    final_norm: Vec<f32>,
-    head: Option<Projection>,
+    pub(super) embedding: TokenEmbedding,
+    pub(super) layers: Vec<Layer>,
+    pub(super) final_norm: Vec<f32>,
+    pub(super) head: Option<Projection>,
 }
 
 /// Consuming bridge from the validated hybrid constructor: data and target
@@ -142,22 +142,33 @@ impl HostExecutor {
         weights: Weights,
         backend: Box<dyn TernaryBackend>,
         context: usize,
+        max_segment_tokens: usize,
         mtp: UnverifiedQwen35Mtp,
         identity: Arc<RunnerIdentity>,
-    ) -> Result<Self, NnError> {
+    ) -> Result<Box<dyn Executor>, NnError> {
+        let backend: Arc<dyn TernaryBackend> = Arc::from(backend);
         if backend.resident_decoder_requested() {
-            return Err(NnError::Backend(
-                "resident hybrid decoder is not implemented; no host fallback".into(),
-            ));
+            return super::resident::hybrid(
+                architecture,
+                &weights,
+                backend,
+                tritium_spec::DecoderLimits {
+                    max_context: context,
+                    max_segment_tokens,
+                },
+                mtp,
+                identity,
+            );
         }
         Self::new(
             architecture,
             weights,
-            Arc::from(backend),
+            backend,
             context,
             Some(mtp),
             Some(identity),
         )
+        .map(|executor| Box::new(executor) as Box<dyn Executor>)
     }
     fn new(
         architecture: &ArchitectureSpec,

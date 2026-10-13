@@ -217,6 +217,26 @@ impl Qwen35TextLayerCache {
 
 impl Qwen35TextLayer {
     #[cfg(feature = "tokenizer")]
+    pub(super) fn resident_binding(&self) -> Result<tritium_spec::DecoderHybridLayer<'_>, NnError> {
+        use super::resident::matrix;
+        let mixer = match &self.mixer {
+            Qwen35TextMixer::DeltaNet(layer) => {
+                tritium_spec::DecoderMixer::DeltaNet(layer.resident_binding()?)
+            }
+            Qwen35TextMixer::FullAttention(layer) => {
+                tritium_spec::DecoderMixer::FullAttention(layer.resident_binding()?)
+            }
+        };
+        Ok(tritium_spec::DecoderHybridLayer {
+            input_norm: &self.input_norm,
+            post_norm: &self.post_attention_norm,
+            gate: matrix(&self.mlp.gate)?,
+            up: matrix(&self.mlp.up)?,
+            down: matrix(&self.mlp.down)?,
+            mixer,
+        })
+    }
+    #[cfg(feature = "tokenizer")]
     pub(super) const fn is_delta(&self) -> bool {
         matches!(self.mixer, Qwen35TextMixer::DeltaNet(_))
     }

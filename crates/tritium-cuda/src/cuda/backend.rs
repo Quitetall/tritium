@@ -820,6 +820,8 @@ pub struct CudaBackend {
     pub(super) func_decoder_add: CudaFunction,
     pub(super) func_decoder_relu2: CudaFunction,
     pub(super) func_decoder_rope: CudaFunction,
+    pub(super) func_qwen_query_gate: CudaFunction,
+    pub(super) func_qwen_attention_gate: CudaFunction,
     pub(super) func_delta_convolution: CudaFunction,
     pub(super) func_delta_mixer: CudaFunction,
     /// Scalar-correct D2/B3/S34 forward. The first fast API aliases this handle.
@@ -1512,6 +1514,8 @@ impl CudaBackend {
         let func_decoder_add = decoder_function("semantic_decoder_add")?;
         let func_decoder_relu2 = decoder_function("semantic_decoder_relu2")?;
         let func_decoder_rope = decoder_function("semantic_decoder_rope")?;
+        let func_qwen_query_gate = decoder_function("semantic_qwen_query_gate")?;
+        let func_qwen_attention_gate = decoder_function("semantic_qwen_attention_gate")?;
         let func_delta_convolution = decoder_function("semantic_delta_convolution")?;
         let func_delta_mixer = decoder_function("semantic_delta_mixer")?;
 
@@ -1556,6 +1560,8 @@ impl CudaBackend {
             func_decoder_add,
             func_decoder_relu2,
             func_decoder_rope,
+            func_qwen_query_gate,
+            func_qwen_attention_gate,
             func_delta_convolution,
             func_delta_mixer,
             func_salt_v2_exact,

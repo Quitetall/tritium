@@ -365,6 +365,33 @@ pub struct Qwen35DeltaNet {
 struct MixerIdentity;
 
 impl Qwen35DeltaNet {
+    #[cfg(feature = "tokenizer")]
+    pub(crate) fn resident_binding(&self) -> Result<tritium_spec::DecoderDeltaNet<'_>, NnError> {
+        use crate::model::resident::matrix;
+        Ok(tritium_spec::DecoderDeltaNet {
+            geometry: tritium_spec::DeltaMixerGeometry {
+                recurrence: tritium_spec::DeltaNetGeometry {
+                    value_heads: self.spec.num_value_heads,
+                    key_head_dim: self.spec.key_head_dim,
+                    value_head_dim: self.spec.value_head_dim,
+                    group_size: self.spec.num_value_heads / self.spec.num_key_heads,
+                },
+                conv_kernel: self.spec.conv_kernel_dim,
+                rms_eps: self.spec.rms_norm_eps(),
+            },
+            weights: tritium_spec::DeltaMixerWeights {
+                convolution: &self.weights.conv_weight,
+                norm: &self.weights.norm_weight,
+                dt_bias: &self.weights.dt_bias,
+                a_log: &self.weights.a_log,
+            },
+            qkv: matrix(&self.weights.qkv_proj)?,
+            z: matrix(&self.weights.z_proj)?,
+            beta: matrix(&self.weights.b_proj)?,
+            decay: matrix(&self.weights.a_proj)?,
+            output: matrix(&self.weights.out_proj)?,
+        })
+    }
     #[allow(dead_code)] // Consumed by the B3 bounded projection-window adapter.
     pub(crate) fn projection(&self, name: &str) -> Result<&Projection, NnError> {
         match name {
