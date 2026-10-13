@@ -9,6 +9,41 @@ use tritium_nn::{LayerKind, ModelSource, Tokenizer};
 #[path = "unified/stream_limits.rs"]
 mod stream_limits;
 
+#[cfg(feature = "cuda")]
+#[test]
+fn explicitly_requested_resident_hybrid_rejects_without_host_fallback_or_payload_leak() {
+    let backend = match tritium_cuda::CudaBackend::new(0) {
+        Ok(backend) => backend.with_resident_decoder(1_000_000),
+        Err(error) if std::env::var("TRITIUM_REQUIRE_CUDA").as_deref() == Ok("1") => {
+            panic!("required CUDA: {error}")
+        }
+        Err(error) => {
+            eprintln!("SKIP resident hybrid rejection: {error}");
+            return;
+        }
+    };
+    let bytes = text_package(false, false).bytes();
+    let budget = TensorPayloadBudget::new(1_000_000);
+    let mut evidence = recorder();
+    let result = load(
+        ModelSource::Trit {
+            bytes: &bytes,
+            level: "typed",
+        },
+        Box::new(backend),
+        &budget,
+        &mut evidence,
+    );
+    let error = result.err().expect("requested hybrid silently fell back");
+    assert!(
+        error
+            .to_string()
+            .contains("resident hybrid decoder is not implemented"),
+        "{error}"
+    );
+    assert_eq!(budget.used_bytes(), 0);
+}
+
 #[test]
 fn common_owned_graph_matches_legacy_typed_hybrid_logits_bit_for_bit() {
     for uniform in [false, true] {

@@ -61,6 +61,13 @@ fn rotate_row(row: &mut [f32], group: usize) {
 }
 
 impl TokenEmbedding {
+    #[cfg(feature = "tokenizer")]
+    pub(crate) fn shared_linear(&self) -> Option<&Linear> {
+        match &self.storage {
+            Storage::Tensor(linear) => Some(linear),
+            _ => None,
+        }
+    }
     /// Share an admitted backend tensor between gather and the tied output head.
     /// Geometry and basis were validated at upload; cloning shares its budget lease.
     #[must_use]

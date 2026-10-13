@@ -84,6 +84,12 @@ impl ArchitectureSpec {
 // aggregate/cache table and receives the runner's authoritative architecture.
 // Backend-owned resident/batched/tree execution is a subsequent contract migration.
 pub(super) trait Executor: Send {
+    fn execution(&self) -> tritium_spec::DecoderExecution {
+        tritium_spec::DecoderExecution::Host
+    }
+    fn resident_payload_bytes(&self) -> Option<usize> {
+        None
+    }
     fn forward(
         &mut self,
         architecture: &ArchitectureSpec,
@@ -108,6 +114,16 @@ pub struct Runner {
     admission: Option<CacheAdmission>,
 }
 impl Runner {
+    /// Actual selected graph implementation, not a quality/performance verdict.
+    #[must_use]
+    pub fn execution(&self) -> tritium_spec::DecoderExecution {
+        self.executor.execution()
+    }
+    /// Resident owned matrix/vector/KV/workspace payload, not physical VRAM.
+    #[must_use]
+    pub fn resident_payload_bytes(&self) -> Option<usize> {
+        self.executor.resident_payload_bytes()
+    }
     #[cfg(feature = "tokenizer")]
     pub(super) fn standard(
         config: ModelConfig,
@@ -122,10 +138,12 @@ impl Runner {
             vocab_size: weights.vocab,
         };
         let context = admission.map_or(architecture.max_context(), |a| a.limits().max_context);
-        let executor = HostExecutor::standard(&architecture, weights, backend, context)?;
+        let max_segment = admission.map_or(context, |a| a.limits().max_segment_tokens);
+        let executor =
+            HostExecutor::standard(&architecture, weights, backend, context, max_segment)?;
         Ok(Self {
             architecture,
-            executor: Box::new(executor),
+            executor,
             admission,
         })
     }

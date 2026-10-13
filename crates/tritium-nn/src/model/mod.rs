@@ -23,6 +23,8 @@ mod qwen35_reference;
 mod qwen35_salt_v2;
 mod qwen35_trit;
 #[cfg(feature = "tokenizer")]
+mod resident;
+#[cfg(feature = "tokenizer")]
 mod retained;
 mod runner;
 #[cfg(feature = "cuda")]

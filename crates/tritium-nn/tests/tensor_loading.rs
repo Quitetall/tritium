@@ -25,6 +25,10 @@ mod compact;
 #[path = "tensor_loading/stream_limits.rs"]
 mod stream_limits;
 
+#[cfg(all(feature = "cuda", feature = "tokenizer"))]
+#[path = "tensor_loading/resident.rs"]
+mod resident;
+
 #[derive(Debug)]
 struct UploadProbe(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
@@ -714,7 +718,10 @@ impl TritFixture {
                     .collect();
                 let scales = (0..3)
                     .flat_map(|p| {
-                        (0..shape[0]).map(move |r| (1 + r % 2) as f32 * 0.0625 * 0.5f32.powi(p))
+                        (0..shape[0]).flat_map(move |r| {
+                            (0..shape[1].div_ceil(layout.group as usize))
+                                .map(move |_| (1 + r % 2) as f32 * 0.0625 * 0.5f32.powi(p))
+                        })
                     })
                     .collect();
                 let tensor = tritium_format::AdditiveTensor::new(layout, 3, trits, scales).unwrap();

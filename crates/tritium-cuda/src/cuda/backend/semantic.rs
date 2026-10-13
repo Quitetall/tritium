@@ -6,7 +6,7 @@
 
 use super::{CudaBackend, alloc_or_backend, driver_err};
 use core::any::Any;
-use cudarc::driver::{CudaSlice, CudaStream};
+use cudarc::driver::{CudaSlice, CudaStream, PushKernelArg};
 use std::sync::Arc;
 use tritium_core::{GemmShape, apply_basis, apply_inverse_basis};
 use tritium_format::AdditiveTensor;
@@ -56,6 +56,103 @@ fn product(a: usize, b: usize) -> Result<usize, BackendError> {
 }
 
 impl CudaTensor {
+    pub(super) fn dimensions(&self) -> (usize, usize) {
+        (self.rows, self.cols)
+    }
+
+    /// Existing native matrix kernels and exact basis, on caller-owned storage.
+    pub(super) fn project_device(
+        &self,
+        backend: &CudaBackend,
+        input: &CudaSlice<f32>,
+        scratch: &mut CudaSlice<f32>,
+        ones: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        batch: usize,
+    ) -> Result<(), BackendError> {
+        let count = product(batch, self.cols)?;
+        if input.len() < count
+            || scratch.len() < count
+            || output.len() < product(batch, self.rows)?
+            || !scratch.len().is_multiple_of(self.cols)
+        {
+            return Err(invalid("resident projection workspace geometry mismatch"));
+        }
+        backend
+            .stream
+            .memcpy_dtod(&input.slice(..count), &mut scratch.slice_mut(..count))
+            .map_err(|e| driver_err("stage resident projection basis", &e))?;
+        basis::apply_prefix(backend, scratch, count, self.cols, self.basis, false)?;
+        if let Some(packed) = &self.packed {
+            packed.launch(
+                backend,
+                scratch,
+                output,
+                batch as u32,
+                product(batch, self.rows)?,
+            )
+        } else {
+            backend.matmul_forward_dev(
+                scratch,
+                self.values
+                    .as_ref()
+                    .ok_or_else(|| invalid("missing dense payload"))?,
+                ones,
+                GemmShape {
+                    m: batch,
+                    n: self.rows,
+                    k: self.cols,
+                },
+                output,
+            )
+        }
+    }
+
+    pub(super) fn gather_device(
+        &self,
+        backend: &CudaBackend,
+        ids: &CudaSlice<u32>,
+        output: &mut CudaSlice<f32>,
+        batch: usize,
+    ) -> Result<(), BackendError> {
+        if ids.len() < batch
+            || output.len() < product(batch, self.cols)?
+            || !output.len().is_multiple_of(self.cols)
+        {
+            return Err(invalid("resident gather workspace geometry mismatch"));
+        }
+        if let Some(packed) = &self.packed {
+            packed.gather_device(backend, ids, output, batch, product(batch, self.cols)?)?;
+        } else {
+            let cols = self.cols as u32;
+            let count = (batch * self.cols) as u32;
+            let mut launch = backend
+                .stream
+                .launch_builder(&backend.func_decoder_dense_gather);
+            launch
+                .arg(
+                    self.values
+                        .as_ref()
+                        .ok_or_else(|| invalid("missing dense token table"))?,
+                )
+                .arg(ids)
+                .arg(&mut *output)
+                .arg(&cols)
+                .arg(&count);
+            #[allow(unsafe_code)]
+            // SAFETY: graph/ID preflight and active workspace bounds prove all reads/writes.
+            unsafe { launch.launch(cudarc::driver::LaunchConfig::for_num_elems(count)) }
+                .map_err(|e| driver_err("resident dense embedding", &e))?;
+        }
+        basis::apply_prefix(
+            backend,
+            output,
+            product(batch, self.cols)?,
+            self.cols,
+            self.basis,
+            true,
+        )
+    }
     pub(super) fn caps(view: TensorView<'_>) -> Result<Option<TensorCaps>, BackendError> {
         let (rows, cols, execution) = match view {
             TensorView::Dense { rows, cols, .. } => {

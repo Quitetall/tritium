@@ -12,6 +12,7 @@ use tritium_format::salt_v2_package::{
 };
 
 mod attention;
+mod decoder;
 pub(super) mod deltanet;
 mod salt_v2_reader_upload;
 mod salt_v2_runtime;
@@ -812,6 +813,12 @@ pub struct CudaBackend {
     pub(super) func_semantic_basis_finish: CudaFunction,
     pub(super) func_semantic_swiglu: CudaFunction,
     pub(super) func_semantic_attention: CudaFunction,
+    pub(super) func_decoder_dense_gather: CudaFunction,
+    pub(super) func_decoder_norm: CudaFunction,
+    pub(super) func_decoder_bias: CudaFunction,
+    pub(super) func_decoder_add: CudaFunction,
+    pub(super) func_decoder_relu2: CudaFunction,
+    pub(super) func_decoder_rope: CudaFunction,
     /// Scalar-correct D2/B3/S34 forward. The first fast API aliases this handle.
     pub(super) func_salt_v2_exact: CudaFunction,
     /// Shared-activation D2/B3/S34 forward used for prefill-shaped launches.
@@ -1031,6 +1038,7 @@ pub struct CudaBackend {
     /// retaining these buffers removes a cuMemAlloc/cuMemFree pair per call.
     pub(super) salt_v2_workspace: Mutex<SaltV2Workspace>,
     pub(super) semantic_swiglu_enabled: bool,
+    pub(super) resident_decoder_budget: Option<usize>,
     pub(super) semantic_swiglu_workspace: Mutex<Option<semantic::SwigluWorkspace>>,
 }
 
@@ -1072,6 +1080,17 @@ impl SaltV2Workspace {
 }
 
 impl CudaBackend {
+    /// Explicitly request a whole standard device-f32 decoder before loading.
+    /// The budget covers unique weights/vectors/KV/workspace payload, not driver
+    /// overhead. Unsupported graphs or insufficient budgets fail closed.
+    /// Existing host dispatch is unchanged without this selection.
+    pub fn with_resident_decoder(mut self, max_device_payload_bytes: usize) -> Self {
+        if self.resident_decoder_budget.is_none() {
+            self.device_id.push_str(":decoder-device-f32");
+        }
+        self.resident_decoder_budget = Some(max_device_payload_bytes);
+        self
+    }
     /// Explicitly opt into device-f32 SwiGLU regions before loading a model.
     /// Device expf may differ from host exp. Default arithmetic is unchanged;
     /// this does not qualify model quality/performance. The backend identity
@@ -1479,6 +1498,17 @@ impl CudaBackend {
         let func_semantic_attention = semantic_module
             .load_function("semantic_causal_attention")
             .map_err(|e| driver_err("resolve semantic causal attention", &e))?;
+        let decoder_function = |name| {
+            semantic_module
+                .load_function(name)
+                .map_err(|e| driver_err("resolve resident decoder function", &e))
+        };
+        let func_decoder_dense_gather = decoder_function("semantic_decoder_dense_gather")?;
+        let func_decoder_norm = decoder_function("semantic_decoder_norm")?;
+        let func_decoder_bias = decoder_function("semantic_decoder_bias")?;
+        let func_decoder_add = decoder_function("semantic_decoder_add")?;
+        let func_decoder_relu2 = decoder_function("semantic_decoder_relu2")?;
+        let func_decoder_rope = decoder_function("semantic_decoder_rope")?;
 
         let device_name = ctx
             .name()
@@ -1515,6 +1545,12 @@ impl CudaBackend {
             func_semantic_basis_finish,
             func_semantic_swiglu,
             func_semantic_attention,
+            func_decoder_dense_gather,
+            func_decoder_norm,
+            func_decoder_bias,
+            func_decoder_add,
+            func_decoder_relu2,
+            func_decoder_rope,
             func_salt_v2_exact,
             func_salt_v2_tiled,
             func_salt_v2_warp,
@@ -1629,6 +1665,7 @@ impl CudaBackend {
             tuned_tiles: Mutex::new(HashMap::new()),
             salt_v2_workspace: Mutex::new(SaltV2Workspace::default()),
             semantic_swiglu_enabled: false,
+            resident_decoder_budget: None,
             semantic_swiglu_workspace: Mutex::new(None),
         })
     }
@@ -9142,6 +9179,16 @@ pub(super) enum AddKernel {
 }
 
 impl TernaryBackend for CudaBackend {
+    fn resident_decoder_requested(&self) -> bool {
+        self.resident_decoder_budget.is_some()
+    }
+    fn resident_decoder(
+        self: Arc<Self>,
+        graph: tritium_spec::DecoderGraph<'_>,
+        limits: tritium_spec::DecoderLimits,
+    ) -> Result<Option<Box<dyn tritium_spec::ResidentDecoder>>, BackendError> {
+        decoder::create(self, graph, limits)
+    }
     fn resident_deltanet(
         &self,
         geometry: tritium_spec::DeltaNetGeometry,

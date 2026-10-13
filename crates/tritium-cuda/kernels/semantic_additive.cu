@@ -3,6 +3,54 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
+extern "C" __global__ void semantic_decoder_dense_gather(
+    const float *table, const uint32_t *ids, float *output, uint32_t cols, uint32_t count
+) {
+    uint64_t at = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (at < count) output[at] = table[uint64_t(ids[at / cols]) * cols + at % cols];
+}
+// Same 256-slot fold/tree as the canonical host inference RMSNorm; sqrt is the
+// explicit device-f32 profile. In-place writes occur after the reduction barrier.
+extern "C" __global__ void semantic_decoder_norm(float *x, const float *w, uint32_t cols, float eps) {
+    __shared__ float sum[256];
+    uint32_t lane = threadIdx.x;
+    uint64_t base = uint64_t(blockIdx.x) * cols;
+    float s = 0.0f;
+    for (uint32_t c = lane; c < cols; c += 256) { float v = x[base + c]; s += v * v; }
+    sum[lane] = s;
+    __syncthreads();
+    for (uint32_t width = 128; width > 0; width >>= 1) {
+        if (lane < width) sum[lane] += sum[lane + width];
+        __syncthreads();
+    }
+    float inv = 1.0f / sqrtf(sum[0] / float(cols) + eps);
+    for (uint32_t c = lane; c < cols; c += 256) x[base + c] = (x[base + c] * inv) * w[c];
+}
+extern "C" __global__ void semantic_decoder_bias(float *x, const float *bias, uint32_t cols, uint32_t count) {
+    uint64_t at = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (at < count) x[at] += bias[at % cols];
+}
+extern "C" __global__ void semantic_decoder_add(float *x, const float *delta, uint32_t count) {
+    uint64_t at = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (at < count) x[at] += delta[at];
+}
+extern "C" __global__ void semantic_decoder_relu2(float *gate, const float *up, uint32_t count) {
+    uint64_t at = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (at < count) { float r = fmaxf(gate[at], 0.0f); gate[at] = (r * r) * up[at]; }
+}
+extern "C" __global__ void semantic_decoder_rope(float *x, const float *table,
+    uint32_t heads, uint32_t dim, uint32_t pairs
+) {
+    uint64_t at = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (at >= pairs) return;
+    uint32_t half = dim / 2, token = at / (heads * half), pair = at % half;
+    uint64_t base = (at / half) * dim;
+    float a = x[base + pair], b = x[base + pair + half];
+    float c = table[uint64_t(token) * dim + pair], s = table[uint64_t(token) * dim + pair + half];
+    x[base + pair] = a * c - b * s;
+    x[base + pair + half] = b * c + a * s;
+}
+
 // Explicit device-f32 profile. Online softmax uses O(head_dim) block scratch;
 // no [query, context] score matrix and no KV host readback. Default host graph
 // and existing exact matrix/basis/legacy-resident kernels remain unchanged.

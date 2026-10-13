@@ -96,7 +96,7 @@ impl LayerCache {
 }
 
 pub(super) struct HostExecutor {
-    backend: Box<dyn TernaryBackend>,
+    backend: Arc<dyn TernaryBackend>,
     weights: Weights,
     caches: Vec<LayerCache>,
     cursor: usize,
@@ -113,7 +113,20 @@ impl HostExecutor {
         weights: ModelWeights,
         backend: Box<dyn TernaryBackend>,
         context: usize,
-    ) -> Result<Self, NnError> {
+        max_segment_tokens: usize,
+    ) -> Result<Box<dyn Executor>, NnError> {
+        let backend: Arc<dyn TernaryBackend> = Arc::from(backend);
+        if let Some(executor) = super::resident::standard(
+            architecture,
+            &weights,
+            Arc::clone(&backend),
+            tritium_spec::DecoderLimits {
+                max_context: context,
+                max_segment_tokens,
+            },
+        )? {
+            return Ok(executor);
+        }
         Self::new(
             architecture,
             Weights::standard(weights)?,
@@ -122,6 +135,7 @@ impl HostExecutor {
             None,
             None,
         )
+        .map(|executor| Box::new(executor) as Box<dyn Executor>)
     }
     pub(super) fn hybrid(
         architecture: &ArchitectureSpec,
@@ -131,10 +145,15 @@ impl HostExecutor {
         mtp: UnverifiedQwen35Mtp,
         identity: Arc<RunnerIdentity>,
     ) -> Result<Self, NnError> {
+        if backend.resident_decoder_requested() {
+            return Err(NnError::Backend(
+                "resident hybrid decoder is not implemented; no host fallback".into(),
+            ));
+        }
         Self::new(
             architecture,
             weights,
-            backend,
+            Arc::from(backend),
             context,
             Some(mtp),
             Some(identity),
@@ -143,7 +162,7 @@ impl HostExecutor {
     fn new(
         architecture: &ArchitectureSpec,
         weights: Weights,
-        backend: Box<dyn TernaryBackend>,
+        backend: Arc<dyn TernaryBackend>,
         context: usize,
         mtp: Option<UnverifiedQwen35Mtp>,
         identity: Option<Arc<RunnerIdentity>>,

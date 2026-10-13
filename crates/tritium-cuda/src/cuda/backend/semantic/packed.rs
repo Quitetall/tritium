@@ -329,7 +329,7 @@ impl PackedAdditive {
             .stream
             .alloc_zeros::<f32>(outputs)
             .map_err(|e| alloc_or_backend("allocate packed semantic output", &e, requested))?;
-        self.launch(backend, &input, &mut output, batch)?;
+        self.launch(backend, &input, &mut output, batch, outputs)?;
         backend
             .stream
             .memcpy_dtoh(&output, p.out)
@@ -342,8 +342,12 @@ impl PackedAdditive {
         input: &CudaSlice<f32>,
         output: &mut CudaSlice<f32>,
         batch: u32,
+        outputs: usize,
     ) -> Result<(), BackendError> {
-        let cfg = LaunchConfig::for_num_elems(narrow(output.len())?);
+        if outputs > output.len() {
+            return Err(invalid("packed active output extent exceeds workspace"));
+        }
+        let cfg = LaunchConfig::for_num_elems(narrow(outputs)?);
         let mut launch = backend
             .stream
             .launch_builder(&backend.func_semantic_additive_matmul);
@@ -353,6 +357,29 @@ impl PackedAdditive {
         // output and private canonical bytes/indexing were checked at upload.
         unsafe { launch.launch(cfg) }
             .map_err(|e| driver_err("launch packed semantic matmul", &e))?;
+        Ok(())
+    }
+
+    pub(super) fn gather_device(
+        &self,
+        backend: &CudaBackend,
+        ids: &CudaSlice<u32>,
+        output: &mut CudaSlice<f32>,
+        batch: usize,
+        outputs: usize,
+    ) -> Result<(), BackendError> {
+        let selected = narrow(batch)?;
+        if outputs > output.len() {
+            return Err(invalid("packed active gather extent exceeds workspace"));
+        }
+        let cfg = LaunchConfig::for_num_elems(narrow(outputs)?);
+        let mut launch = backend
+            .stream
+            .launch_builder(&backend.func_semantic_additive_gather);
+        launch.arg(&self.bytes).arg(ids).arg(output).arg(&selected);
+        #[allow(unsafe_code)]
+        // SAFETY: the graph validates row IDs and allocation/ABI extents before launch.
+        unsafe { launch.launch(cfg) }.map_err(|e| driver_err("resident packed embedding", &e))?;
         Ok(())
     }
 

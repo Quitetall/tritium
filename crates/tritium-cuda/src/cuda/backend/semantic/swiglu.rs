@@ -65,7 +65,13 @@ fn project(
     batch: usize,
 ) -> Result<(), BackendError> {
     if let Some(packed) = &tensor.packed {
-        packed.launch(backend, input, output, batch as u32)
+        packed.launch(
+            backend,
+            input,
+            output,
+            batch as u32,
+            product(batch, tensor.rows)?,
+        )
     } else {
         backend.matmul_forward_dev(
             input,

@@ -11,6 +11,25 @@ pub(super) fn apply(
     basis: Basis,
     inverse: bool,
 ) -> Result<(), BackendError> {
+    if matches!(basis, Basis::Identity) {
+        return Ok(());
+    }
+    let active = values.len();
+    apply_prefix(backend, values, active, cols, basis, inverse)
+}
+
+/// Transform only active whole rows of a larger reserved device workspace.
+pub(super) fn apply_prefix(
+    backend: &CudaBackend,
+    values: &mut CudaSlice<f32>,
+    active: usize,
+    cols: usize,
+    basis: Basis,
+    inverse: bool,
+) -> Result<(), BackendError> {
+    if active > values.len() || cols == 0 || !active.is_multiple_of(cols) {
+        return Err(invalid("CUDA active basis prefix geometry mismatch"));
+    }
     let (block, signed, seed, domain) = match basis {
         Basis::Identity => return Ok(()),
         Basis::Hadamard { block } => (block, false, 0_u64, 0_u64),
@@ -28,8 +47,8 @@ pub(super) fn apply(
     {
         return Err(invalid("CUDA basis buffer geometry mismatch"));
     }
-    let count = u32::try_from(values.len())
-        .map_err(|_| invalid("CUDA basis buffer exceeds u32 index ABI"))?;
+    let count =
+        u32::try_from(active).map_err(|_| invalid("CUDA basis buffer exceeds u32 index ABI"))?;
     let cols = u32::try_from(cols).map_err(|_| invalid("CUDA basis columns exceed u32"))?;
     if count == 0 {
         return Ok(());
@@ -87,4 +106,54 @@ pub(super) fn apply(
     // SAFETY: each thread normalizes/signs one checked device coordinate.
     unsafe { launch.launch(cfg) }.map_err(|e| driver_err("CUDA basis normalization", &e))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_prefix_preserves_inactive_reservation_bit_for_bit() {
+        let backend = match CudaBackend::new(0) {
+            Ok(backend) => backend,
+            Err(error) if std::env::var("TRITIUM_REQUIRE_CUDA").as_deref() == Ok("1") => {
+                panic!("required CUDA: {error}")
+            }
+            Err(error) => {
+                eprintln!("SKIP active basis prefix: {error}");
+                return;
+            }
+        };
+        let original: Vec<f32> = (0..256 * 128)
+            .map(|i| ((i * 7 % 31) as f32 - 15.) / 64.)
+            .collect();
+        for basis in [
+            Basis::Identity,
+            Basis::Hadamard { block: 128 },
+            Basis::SignedRht {
+                block: 128,
+                seed: 19,
+                domain: 27,
+            },
+        ] {
+            for inverse in [false, true] {
+                let mut expected = original.clone();
+                if inverse {
+                    apply_inverse_basis(&mut expected[..128], basis).unwrap();
+                } else {
+                    apply_basis(&mut expected[..128], basis).unwrap();
+                }
+                let mut data = backend.stream.clone_htod(&original).unwrap();
+                apply_prefix(&backend, &mut data, 128, 128, basis, inverse).unwrap();
+                let got = backend.stream.clone_dtoh(&data).unwrap();
+                assert_eq!(got, expected);
+                for active in [1, original.len() + 128] {
+                    assert!(
+                        apply_prefix(&backend, &mut data, active, 128, basis, inverse).is_err()
+                    );
+                    assert_eq!(backend.stream.clone_dtoh(&data).unwrap(), got);
+                }
+            }
+        }
+    }
 }

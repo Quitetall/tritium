@@ -144,6 +144,10 @@ impl core::fmt::Debug for Linear {
 }
 
 impl Linear {
+    #[cfg(feature = "tokenizer")]
+    pub(crate) fn device_arc(&self) -> &Arc<dyn DeviceBuffer> {
+        &self.dev
+    }
     pub(crate) fn device(&self) -> &dyn DeviceBuffer {
         self.dev.as_ref()
     }

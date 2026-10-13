@@ -36,6 +36,11 @@ mod caps;
 pub use caps::DeviceCaps;
 mod deltanet;
 pub use deltanet::{DeltaNetGeometry, DeltaNetStep, ResidentDeltaNet};
+mod decoder;
+pub use decoder::{
+    DecoderActivation, DecoderExecution, DecoderGeometry, DecoderGraph, DecoderLayer,
+    DecoderLimits, ResidentDecoder,
+};
 mod attention;
 pub use attention::{AttentionGeometry, AttentionLimits, AttentionSegment, ResidentAttention};
 mod train_backend;
@@ -303,6 +308,28 @@ pub trait TernaryBackend: Send + Sync {
 
     /// What this device can do — used by the runtime to pick a backend.
     fn capabilities(&self) -> DeviceCaps;
+
+    /// Whether the caller selected mandatory resident decoder execution.
+    /// Defaults preserve host dispatch. Selected adapters must reject unsupported
+    /// graphs rather than silently using a host or partial-graph implementation.
+    fn resident_decoder_requested(&self) -> bool {
+        false
+    }
+
+    /// Compile existing shared graph weights into an owned resident executor.
+    /// Default decline leaves common host dispatch unchanged. The owned Arc
+    /// receiver keeps backend resources alive without caller downcasts.
+    ///
+    /// # Errors
+    /// Explicit resident adapters reject unsupported graphs, admission failures
+    /// and allocation/driver errors rather than silently falling back.
+    fn resident_decoder(
+        self: std::sync::Arc<Self>,
+        _graph: DecoderGraph<'_>,
+        _limits: DecoderLimits,
+    ) -> Result<Option<Box<dyn ResidentDecoder>>, BackendError> {
+        Ok(None)
+    }
 
     /// Explicitly request bounded backend-owned causal attention (device-f32).
     /// `None` is unsupported, never a successful fallback. Existing host model

@@ -3,7 +3,7 @@ use super::*;
 use tritium_spec::{AttentionGeometry, AttentionLimits, AttentionSegment, ResidentAttention};
 
 #[derive(Debug)]
-struct Cache {
+pub(super) struct Cache {
     stream: Arc<CudaStream>,
     function: CudaFunction,
     geometry: AttentionGeometry,
@@ -15,6 +15,37 @@ struct Cache {
 }
 
 impl Cache {
+    pub(super) fn new(
+        backend: &CudaBackend,
+        geometry: AttentionGeometry,
+        limits: AttentionLimits,
+    ) -> Result<Self, BackendError> {
+        geometry.payload_bytes(limits)?;
+        let elements = limits.max_context * geometry.widths()?.1;
+        let alloc = || {
+            backend
+                .stream
+                .alloc_zeros::<f32>(elements)
+                .map_err(|e| alloc_or_backend("resident decoder KV", &e, elements * 4))
+        };
+        Ok(Self {
+            stream: Arc::clone(&backend.stream),
+            function: backend.func_semantic_attention.clone(),
+            geometry,
+            limits,
+            key: alloc()?,
+            value: alloc()?,
+            cursor: 0,
+            pending: None,
+        })
+    }
+    pub(super) fn len(&self) -> usize {
+        self.cursor
+    }
+    pub(super) fn publish(&mut self, end: usize) {
+        self.cursor = end;
+        self.pending = None;
+    }
     fn extent(&self, tokens: usize, scale: f32) -> Result<usize, BackendError> {
         let end = self
             .cursor
@@ -34,7 +65,7 @@ impl Cache {
 
     /// Device operands share the exact owning stream. This path never reads KV
     /// or activations back; callers establish completion before publishing end.
-    fn stage_device(
+    pub(super) fn stage_device(
         &mut self,
         query: &CudaSlice<f32>,
         key: &CudaSlice<f32>,

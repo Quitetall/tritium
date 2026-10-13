@@ -3,7 +3,7 @@ use super::*;
 use tritium_evidence::MODEL_LOADED_REGISTRATION;
 use tritium_nn::{ModelSource, StreamLimits};
 
-fn tokenizer() -> Vec<u8> {
+pub(super) fn tokenizer() -> Vec<u8> {
     let vocabulary = (0..10).map(|i| (format!("t{i}"), i as u32)).collect();
     let model = tokenizers::models::wordlevel::WordLevel::builder()
         .vocab(vocabulary)
