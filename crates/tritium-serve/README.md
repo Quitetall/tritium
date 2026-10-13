@@ -45,13 +45,47 @@ The backend payload cap is not a total RSS/KV/tokenizer/concurrency ledger;
 `native_only` rejects backend-declared emulation, not all dense tensors. Choose
 ceilings from the actual package and separately assess machine capacity.
 
+Optional `stream_limits` bounds the selected context, each native forward segment
+and the existing logical host-cache plan. Serving splits longer prompts into
+segments; hybrid DeltaNet continuation stays one token. The selected capacity,
+not the source model's maximum, bounds requests/completions.
+
+Optional `execution` defaults to `{"kind":"host"}`. To request the common CUDA
+device-f32 graph, build with `--features cuda`, use `--backend cuda`, and add both:
+
+```json
+{
+  "stream_limits": {
+    "max_context": 4096,
+    "max_segment_tokens": 128,
+    "max_host_cache_payload_bytes": 1073741824
+  },
+  "execution": {
+    "kind": "resident_device_f32",
+    "max_device_payload_bytes": 17179869184
+  }
+}
+```
+
+These are illustrative fields to merge into the complete load JSON, not a
+standalone load config or model capacity recommendation. Resident mode requires
+explicit positive stream/device limits. Unsupported backends/graphs or exceeded
+bounds fail without host fallback. This arithmetic profile is not host bit-exact
+or independently quality/performance qualified. Weight-upload and resident-graph
+payload caps cover different domains; neither is a complete physical-memory ledger.
+
+`GET /readyz` adds nullable `runtime_info`: actual `execution` (`host` or
+`resident_device_f32`), admitted `max_context`, `max_segment_tokens` and logical
+`resident_payload_bytes` (null for host). Unknown/legacy generators return null.
+This snapshot is descriptive, not a receipt or inference/self-test probe.
+
 This route is loopback-only and unqualified. It rejects raw-token mode, spec,
 draft, batching and KV-pool options. Hybrid MTP remains privately Unverified,
 with no draft/tree authority. Qwen3.5 hybrid uses the existing QwenIm template;
 standard graphs use Concat. Strict schema-v3 bundle admission is unchanged.
 Compatibility readiness means worker liveness: `production_artifact` is false,
 `startup_receipt` is null, and it is not public-release clearance. Resident
-execution, typed production readiness, complete memory admission and remaining
+real-model qualification, typed production readiness, complete memory admission and remaining
 thin-surface migrations are still owed.
 
 ## Local converted models (legacy)

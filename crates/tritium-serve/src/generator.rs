@@ -503,12 +503,31 @@ impl CancellationCapabilitiesV1 {
     }
 }
 
+/// Descriptive common-runner configuration, never release or physical-memory evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunnerRuntimeInfo {
+    /// Actual selected language executor.
+    pub execution: tritium_spec::DecoderExecution,
+    /// Admitted stream capacity, not necessarily source capacity.
+    pub max_context: usize,
+    /// Maximum tokens in one native forward segment.
+    pub max_segment_tokens: usize,
+    /// Logical resident payload, excluding allocator/driver/host overhead.
+    pub resident_payload_bytes: Option<usize>,
+}
+
 /// The inference seam: prefill a prompt and stream decode steps.
 ///
 /// Synchronous and runtime-free by design — the serve-gated worker drives it on a
 /// dedicated thread (the runner is `Send` but `&mut`-exclusive). `on_step`
 /// returning `false` cancels generation (client disconnect / shutdown).
 pub trait Generator: Send {
+    /// Cheap immutable common-runner diagnostics sampled before worker handoff.
+    /// Undeclared/legacy generators return None; this does not infer residency,
+    /// perform inference or grant production startup/quality authority.
+    fn runner_runtime_info(&self) -> Option<RunnerRuntimeInfo> {
+        None
+    }
     /// Declare configured cancellation routes without probing/building models.
     ///
     /// Must be cheap, side-effect-free, nonblocking and non-panicking. The

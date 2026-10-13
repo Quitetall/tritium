@@ -23,27 +23,185 @@ use tritium_serve::{
 mod fixture;
 use fixture::package;
 fn loaded(bytes: &[u8], budget: &tritium_runtime::TensorPayloadBudget) -> tritium_nn::LoadedModel {
+    loaded_bounded(
+        bytes,
+        budget,
+        Box::new(tritium_cpu::CpuBackend::new()),
+        None,
+    )
+}
+fn loaded_bounded(
+    bytes: &[u8],
+    budget: &tritium_runtime::TensorPayloadBudget,
+    backend: Box<dyn tritium_spec::TernaryBackend>,
+    limits: Option<tritium_nn::StreamLimits>,
+) -> tritium_nn::LoadedModel {
     let mut evidence = EvidenceRecorder::new(
         "serve-public-fixture",
         [TENSOR_UPLOADED_REGISTRATION, MODEL_LOADED_REGISTRATION],
     )
     .unwrap();
-    tritium_nn::load(
-        tritium_nn::ModelSource::Trit {
-            bytes,
-            level: "test",
-        },
-        Box::new(tritium_cpu::CpuBackend::new()),
-        TensorUploadPolicy::default(),
-        budget,
-        tritium_runtime::TensorUploadContext {
-            recorder: &mut evidence,
-            span: "load",
-            parent: None,
-            logical_time: 0,
-        },
-    )
+    let source = tritium_nn::ModelSource::Trit {
+        bytes,
+        level: "test",
+    };
+    let context = tritium_runtime::TensorUploadContext {
+        recorder: &mut evidence,
+        span: "load",
+        parent: None,
+        logical_time: 0,
+    };
+    match limits {
+        Some(limits) => tritium_nn::load_with_limits(
+            source,
+            backend,
+            TensorUploadPolicy::default(),
+            budget,
+            limits,
+            context,
+        ),
+        None => tritium_nn::load(
+            source,
+            backend,
+            TensorUploadPolicy::default(),
+            budget,
+            context,
+        ),
+    }
     .unwrap()
+}
+
+#[test]
+fn bounded_common_serving_chunks_prompts_and_enforces_admitted_capacity() {
+    check_bounded_serving(false);
+}
+#[cfg(feature = "cuda")]
+#[test]
+fn resident_common_serving_chunks_prompts_and_resets_cancelled_requests() {
+    match tritium_cuda::CudaBackend::new(0) {
+        Ok(_) => check_bounded_serving(true),
+        Err(e) if std::env::var("TRITIUM_REQUIRE_CUDA").as_deref() == Ok("1") => {
+            panic!("required CUDA: {e}")
+        }
+        Err(e) => eprintln!("SKIP resident serving: {e}"),
+    }
+}
+fn check_bounded_serving(resident: bool) {
+    for hybrid in [false, true] {
+        for additive in [false, true] {
+            let bytes = package(hybrid, additive);
+            let budget = tritium_runtime::TensorPayloadBudget::new(1_000_000);
+            let backend: Box<dyn tritium_spec::TernaryBackend> = if resident {
+                #[cfg(feature = "cuda")]
+                {
+                    let mut b: Box<dyn tritium_spec::TernaryBackend> =
+                        Box::new(tritium_cuda::CudaBackend::new(0).unwrap());
+                    assert!(b.request_resident_decoder(0).is_err());
+                    assert!(!b.resident_decoder_requested());
+                    b.request_resident_decoder(1_000_000).unwrap();
+                    assert!(b.resident_decoder_requested());
+                    assert!(b.request_resident_decoder(0).is_err());
+                    assert!(b.resident_decoder_requested());
+                    b
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    panic!("resident test requires CUDA feature")
+                }
+            } else {
+                Box::new(tritium_cpu::CpuBackend::new())
+            };
+            let bounded = loaded_bounded(
+                &bytes,
+                &budget,
+                backend,
+                Some(tritium_nn::StreamLimits {
+                    max_context: 7,
+                    max_segment_tokens: 2,
+                    max_host_cache_payload_bytes: 1_000_000,
+                }),
+            );
+            let mut generator =
+                RunnerGenerator::from_runner(bounded.runner, bounded.tokenizer.eos());
+            let info = generator.runner_runtime_info().unwrap();
+            assert_eq!(generator.n_ctx(), 7);
+            assert_eq!((info.max_context, info.max_segment_tokens), (7, 2));
+            assert_eq!(info.resident_payload_bytes.is_some(), resident);
+            assert_eq!(
+                info.execution,
+                if resident {
+                    tritium_spec::DecoderExecution::ResidentDeviceF32
+                } else {
+                    tritium_spec::DecoderExecution::Host
+                }
+            );
+            let mut req = request(Sampling::Greedy);
+            req.prompt_tokens = vec![1, 2, 4, 5, 6];
+            req.max_new = 4;
+            let baseline = collect(&mut generator, &req);
+            assert_eq!(baseline.len(), 2);
+            let mut oracle = RunnerGenerator::from_runner(loaded(&bytes, &budget).runner, 3);
+            req.max_new = 2;
+            assert_eq!(
+                baseline.iter().map(|s| s.token).collect::<Vec<_>>(),
+                collect(&mut oracle, &req)
+                    .iter()
+                    .map(|s| s.token)
+                    .collect::<Vec<_>>()
+            );
+            let mut cancellations = 0;
+            for cut in 1..=20 {
+                let calls = std::cell::Cell::new(0);
+                let mut steps = Vec::new();
+                generator
+                    .generate_cancellable(
+                        &req,
+                        &mut |s| {
+                            steps.push(s.token);
+                            true
+                        },
+                        &|| {
+                            calls.set(calls.get() + 1);
+                            calls.get() >= cut
+                        },
+                    )
+                    .unwrap();
+                if steps.len() < baseline.len() {
+                    cancellations += 1;
+                }
+                assert_eq!(
+                    steps,
+                    baseline
+                        .iter()
+                        .take(steps.len())
+                        .map(|s| s.token)
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    collect(&mut generator, &req)
+                        .iter()
+                        .map(|s| s.token)
+                        .collect::<Vec<_>>(),
+                    baseline.iter().map(|s| s.token).collect::<Vec<_>>()
+                );
+            }
+            assert!(cancellations > 0);
+            let mut overflow = req.clone();
+            overflow.prompt_tokens = vec![1; 8];
+            assert!(matches!(
+                generator.generate(&overflow, &mut |_| panic!("overflow published")),
+                Err(tritium_serve::GenError::ContextOverflow)
+            ));
+            req.prompt_tokens = vec![1; 7];
+            assert!(collect(&mut generator, &req).is_empty());
+            drop(oracle);
+            drop(generator);
+            assert_eq!(budget.used_bytes(), 0);
+            eprintln!(
+                "bounded generator resident={resident} hybrid={hybrid} additive={additive}: chunk/cancel/retry/capacity passed; toy only"
+            );
+        }
+    }
 }
 fn request(sampling: Sampling) -> GenRequest {
     GenRequest {

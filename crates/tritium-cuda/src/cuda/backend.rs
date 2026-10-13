@@ -9201,6 +9201,18 @@ impl TernaryBackend for CudaBackend {
     ) -> Result<Option<Box<dyn tritium_spec::ResidentDeltaMixer>>, BackendError> {
         delta_mixer::create(self, geometry, weights, limits, max_device_payload_bytes)
     }
+    fn request_resident_decoder(
+        &mut self,
+        max_device_payload_bytes: usize,
+    ) -> Result<(), BackendError> {
+        if max_device_payload_bytes == 0 {
+            return Err(BackendError::InvalidInput(
+                "resident decoder payload ceiling must be positive".into(),
+            ));
+        }
+        self.resident_decoder_budget = Some(max_device_payload_bytes);
+        Ok(())
+    }
     fn resident_decoder_requested(&self) -> bool {
         self.resident_decoder_budget.is_some()
     }

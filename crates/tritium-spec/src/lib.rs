@@ -330,6 +330,20 @@ pub trait TernaryBackend: Send + Sync {
         Ok(None)
     }
 
+    /// Select mandatory resident decoder execution on a registry-created backend,
+    /// before model construction. Records configuration only; it must not allocate
+    /// a graph or silently accept unsupported execution. Success must make
+    /// [`Self::resident_decoder_requested`] true. The ceiling is logical payload,
+    /// not physical VRAM admission. Defaults reject and preserve host dispatch.
+    /// # Errors
+    /// Unsupported execution or an invalid/nonpositive payload ceiling.
+    fn request_resident_decoder(
+        &mut self,
+        _max_device_payload_bytes: usize,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedTensor)
+    }
+
     /// Whether the caller selected mandatory resident decoder execution.
     /// Defaults preserve host dispatch. Selected adapters must reject unsupported
     /// graphs rather than silently using a host or partial-graph implementation.

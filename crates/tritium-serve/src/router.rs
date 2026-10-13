@@ -549,6 +549,7 @@ struct AppState {
 
 #[derive(Clone)]
 struct RuntimeState {
+    runner_runtime_info: Option<crate::generator::RunnerRuntimeInfo>,
     cancellation: CancellationCapabilitiesV1,
     draining: Arc<AtomicBool>,
     worker_alive: Arc<AtomicBool>,
@@ -603,6 +604,7 @@ pub fn build_router_with_limits(
     let backend_faults = Arc::new(AtomicU64::new(0));
     let telemetry = Arc::new(WorkerTelemetry::default());
     let cancellation = generator.cancellation_capabilities();
+    let runner_runtime_info = generator.runner_runtime_info();
     let jobs = spawn_worker(
         generator,
         WorkerSignals {
@@ -632,6 +634,7 @@ pub fn build_router_with_limits(
             backend_faults,
             telemetry,
             cancellation,
+            runner_runtime_info,
             production: None,
         },
     )
@@ -657,6 +660,7 @@ pub fn build_router_governed(
     let backend_faults = Arc::new(AtomicU64::new(0));
     let telemetry = Arc::new(WorkerTelemetry::default());
     let cancellation = generator.cancellation_capabilities();
+    let runner_runtime_info = generator.runner_runtime_info();
     let jobs = spawn_worker(
         generator,
         WorkerSignals {
@@ -685,6 +689,7 @@ pub fn build_router_governed(
             backend_faults,
             telemetry,
             cancellation,
+            runner_runtime_info,
             production: None,
         },
     ))
@@ -739,6 +744,7 @@ fn build_router_production_mode(
     let backend_faults = Arc::new(AtomicU64::new(0));
     let telemetry = Arc::new(WorkerTelemetry::default());
     let cancellation = generator.cancellation_capabilities();
+    let runner_runtime_info = generator.runner_runtime_info();
     let jobs = spawn_worker(
         generator,
         WorkerSignals {
@@ -767,6 +773,7 @@ fn build_router_production_mode(
             backend_faults,
             telemetry,
             cancellation,
+            runner_runtime_info,
             production: Some(production.clone()),
         },
     );
@@ -925,6 +932,7 @@ fn build_router_batched_inner(
             backend_faults,
             telemetry,
             cancellation,
+            runner_runtime_info: None,
             production: None,
         },
     );
@@ -1702,6 +1710,19 @@ async fn chat_completions(
     }
     let prompt_len = prompt_tokens.len();
     let max_new = req.max_tokens.map_or(st.max_new_default, |m| m as usize);
+    if let Some(info) = st.runtime.runner_runtime_info
+        && prompt_len > info.max_context
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!(
+                "tokenized prompt exceeds admitted model context {}",
+                info.max_context
+            ),
+            Some("messages"),
+        );
+    }
     if prompt_len > st.max_prompt_tokens {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -2253,6 +2274,16 @@ async fn readiness(State(st): State<AppState>) -> Response {
                 "legacy_compatibility"
             },
             "startup_receipt": st.runtime.production.as_ref().map(ProductionReadiness::receipt),
+            "runtime_info": st.runtime.runner_runtime_info.map(|info| serde_json::json!({
+                "execution": match info.execution {
+                    tritium_spec::DecoderExecution::Host => "host",
+                    tritium_spec::DecoderExecution::ResidentDeviceF32 => "resident_device_f32",
+                    _ => "unknown",
+                },
+                "max_context": info.max_context,
+                "max_segment_tokens": info.max_segment_tokens,
+                "resident_payload_bytes": info.resident_payload_bytes,
+            })),
         })),
     )
         .into_response()
@@ -2739,6 +2770,7 @@ mod tests {
                 Arc::new(Admission::legacy(None)),
                 RuntimeState {
                     cancellation: CancellationCapabilitiesV1::default(),
+                    runner_runtime_info: None,
                     draining: Arc::new(AtomicBool::new(false)),
                     worker_alive: Arc::new(AtomicBool::new(fault != 0)),
                     worker_ready: Arc::new(AtomicBool::new(true)),
@@ -3030,6 +3062,7 @@ mod tests {
                 backend_faults,
                 telemetry: telemetry.clone(),
                 cancellation: CancellationCapabilitiesV1::default(),
+                runner_runtime_info: None,
                 production: None,
             },
         )

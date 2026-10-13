@@ -72,7 +72,7 @@ fn model_sources_are_mutually_exclusive() {
 fn typed_source_rejects_bad_launch_and_limits_before_backend_init() {
     let root = Scratch::new("reject");
     let load_path = root.0.join("load.json");
-    for case in 0..11 {
+    for case in 0..19 {
         let mut config = typed_config(&root.0.join("missing.trit"));
         match case {
             0 => config["max_payload_bytes"] = serde_json::json!(0),
@@ -82,6 +82,29 @@ fn typed_source_rejects_bad_launch_and_limits_before_backend_init() {
             2 => config["unknown"] = serde_json::json!(true),
             3 => config["level"] = serde_json::json!(""),
             4 => config["path"] = serde_json::json!("relative.trit"),
+            11 => {
+                config["execution"] = serde_json::json!({"kind":"resident_device_f32","max_device_payload_bytes":1_000_000})
+            }
+            12 => {
+                config["execution"] =
+                    serde_json::json!({"kind":"resident_device_f32","max_device_payload_bytes":0});
+                config["stream_limits"] = stream_config();
+            }
+            13 => {
+                config["stream_limits"] = stream_config();
+                config["stream_limits"]["max_context"] = 0.into();
+            }
+            14 => {
+                config["stream_limits"] = stream_config();
+                config["stream_limits"]["max_segment_tokens"] = 33.into();
+            }
+            15 => config["stream_limits"] = serde_json::json!({"max_context":32}),
+            16 => config["execution"] = serde_json::json!({"kind":"unknown"}),
+            17 => {
+                config["execution"] =
+                    serde_json::json!({"kind":"host","max_device_payload_bytes":1})
+            }
+            18 => config["execution"] = serde_json::Value::Null,
             _ => {}
         }
         std::fs::write(&load_path, config.to_string()).unwrap();
@@ -123,6 +146,32 @@ fn typed_source_rejects_bad_launch_and_limits_before_backend_init() {
     let output = clean_command().arg("--help").output().unwrap();
     assert!(String::from_utf8_lossy(&output.stdout).contains("TRITIUM_TYPED"));
 }
+fn stream_config() -> serde_json::Value {
+    serde_json::json!({"max_context":32,"max_segment_tokens":2,"max_host_cache_payload_bytes":1_000_000})
+}
+#[test]
+fn unsupported_resident_selection_rejects_before_model_access_without_host_fallback() {
+    let root = Scratch::new("resident-unsupported");
+    let path = root.0.join("load.json");
+    let mut config = typed_config(&root.0.join("missing.trit"));
+    config["stream_limits"] = stream_config();
+    config["execution"] =
+        serde_json::json!({"kind":"resident_device_f32","max_device_payload_bytes":1_000_000});
+    std::fs::write(&path, config.to_string()).unwrap();
+    let output = clean_command()
+        .arg("--typed")
+        .arg(&path)
+        .args(["--backend", "cpu"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("resident execution selection on cpu"),
+        "{error}"
+    );
+    assert!(!error.contains("No such file"), "{error}");
+}
 
 struct Server(std::process::Child);
 impl Drop for Server {
@@ -150,13 +199,39 @@ fn http(port: u16, method: &str, path: &str, body: &str) -> std::io::Result<Stri
 }
 #[test]
 fn actual_typed_binary_loads_real_graph_and_serves_chat_on_loopback() {
+    check_actual_typed_binary(false, false);
+}
+#[test]
+fn actual_bounded_typed_binary_prefills_multiple_segments_and_reports_admission() {
+    check_actual_typed_binary(false, true);
+}
+#[cfg(feature = "cuda")]
+#[test]
+fn actual_resident_typed_binary_serves_gpu_chat_and_sse_with_effective_diagnostics() {
+    match tritium_cuda::CudaBackend::new(0) {
+        Ok(_) => check_actual_typed_binary(true, true),
+        Err(e) if std::env::var("TRITIUM_REQUIRE_CUDA").as_deref() == Ok("1") => {
+            panic!("required CUDA: {e}")
+        }
+        Err(e) => eprintln!("SKIP resident typed binary: {e}"),
+    }
+}
+fn check_actual_typed_binary(resident: bool, bounded: bool) {
     for hybrid in [false, true] {
         for additive in [false, true] {
             let root = Scratch::new("binary");
             let model_path = root.0.join("model.trit");
             let load_path = root.0.join("load.json");
             std::fs::write(&model_path, fixture::package(hybrid, additive)).unwrap();
-            std::fs::write(&load_path, typed_config(&model_path).to_string()).unwrap();
+            let mut config = typed_config(&model_path);
+            if bounded {
+                config["stream_limits"] = stream_config();
+                config["stream_limits"]["max_context"] = 16.into();
+            }
+            if resident {
+                config["execution"] = serde_json::json!({"kind":"resident_device_f32","max_device_payload_bytes":1_000_000});
+            }
+            std::fs::write(&load_path, config.to_string()).unwrap();
             let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
             let port = listener.local_addr().unwrap().port();
             drop(listener);
@@ -166,7 +241,7 @@ fn actual_typed_binary_loads_real_graph_and_serves_chat_on_loopback() {
                     .arg(&load_path)
                     .args([
                         "--backend",
-                        "cpu",
+                        if resident { "cuda" } else { "cpu" },
                         "--port",
                         &port.to_string(),
                         "--rate-limit-rpm",
@@ -195,14 +270,58 @@ fn actual_typed_binary_loads_real_graph_and_serves_chat_on_loopback() {
             assert!(ready.starts_with("HTTP/1.1 200"), "{ready}");
             assert!(ready.contains("\"production_artifact\":false"));
             assert!(ready.contains("\"startup_receipt\":null"));
+            let ready_json: serde_json::Value =
+                serde_json::from_str(ready.split_once("\r\n\r\n").unwrap().1).unwrap();
+            let info = &ready_json["runtime_info"];
+            assert_eq!(
+                info["execution"],
+                if resident {
+                    "resident_device_f32"
+                } else {
+                    "host"
+                }
+            );
+            assert_eq!(info["max_context"], if bounded { 16 } else { 32 });
+            assert_eq!(info["max_segment_tokens"], if bounded { 2 } else { 32 });
+            assert_eq!(info["resident_payload_bytes"].as_u64().is_some(), resident);
             let body=serde_json::json!({"model":"tritium","messages":[{"role":"user","content":"hello partner"}],
             "max_tokens":3,"temperature":0,"stream":false}).to_string();
             let response = http(port, "POST", "/v1/chat/completions", &body).unwrap();
             assert!(response.starts_with("HTTP/1.1 200"), "{response}");
             assert!(response.contains("\"choices\""));
             assert!(response.contains("\"finish_reason\""));
+            let streaming: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let mut streaming = streaming;
+            streaming["stream"] = true.into();
+            let sse = http(port, "POST", "/v1/chat/completions", &streaming.to_string()).unwrap();
+            assert!(sse.starts_with("HTTP/1.1 200"), "{sse}");
+            assert!(sse.contains("data: [DONE]"), "{sse}");
+            assert!(
+                sse.contains("\"choices\"") && !sse.contains("\"error\""),
+                "{sse}"
+            );
+            if bounded {
+                let too_long = serde_json::json!({"model":"tritium","messages":[{"role":"user","content":(["hello";20].join(" "))}],"max_tokens":1,"temperature":0,"stream":false});
+                let rejected =
+                    http(port, "POST", "/v1/chat/completions", &too_long.to_string()).unwrap();
+                assert!(
+                    rejected.starts_with("HTTP/1.1 400")
+                        && rejected.contains("admitted model context 16"),
+                    "{rejected}"
+                );
+                let retry = http(port, "POST", "/v1/chat/completions", &body).unwrap();
+                assert!(
+                    retry.starts_with("HTTP/1.1 200") && retry.contains("\"choices\""),
+                    "{retry}"
+                );
+                assert!(
+                    http(port, "GET", "/readyz", "")
+                        .unwrap()
+                        .starts_with("HTTP/1.1 200")
+                );
+            }
             eprintln!(
-                "actual typed binary hybrid={hybrid} additive={additive}: loopback chat returned HTTP 200; unqualified"
+                "actual typed binary resident={resident} bounded={bounded} hybrid={hybrid} additive={additive}: loopback chat/SSE returned HTTP 200; toy unqualified"
             );
             drop(server);
         }

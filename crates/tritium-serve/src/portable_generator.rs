@@ -73,6 +73,19 @@ impl RunnerGenerator {
     }
 }
 impl Generator for RunnerGenerator {
+    fn runner_runtime_info(&self) -> Option<crate::generator::RunnerRuntimeInfo> {
+        match &self.execution {
+            Execution::Legacy(_) => None,
+            Execution::Portable { runner, .. } => Some(crate::generator::RunnerRuntimeInfo {
+                execution: runner.execution(),
+                max_context: runner.max_context(),
+                max_segment_tokens: runner
+                    .cache_admission()
+                    .map_or(runner.max_context(), |a| a.limits().max_segment_tokens),
+                resident_payload_bytes: runner.resident_payload_bytes(),
+            }),
+        }
+    }
     fn cancellation_capabilities(&self) -> CancellationCapabilitiesV1 {
         match &self.execution {
             Execution::Legacy(legacy) => legacy.cancellation_capabilities(),
@@ -113,7 +126,7 @@ impl Generator for RunnerGenerator {
                         "common runner model draft is not enabled".into(),
                     ));
                 }
-                let context = runner.architecture().max_context();
+                let context = runner.max_context();
                 let length = request.prompt_tokens.len();
                 if length == 0 || length > context {
                     return Err(GenError::ContextOverflow);
@@ -128,16 +141,9 @@ impl Generator for RunnerGenerator {
                     ));
                 }
                 let max_new = request.max_new.min(context - length);
-                let mut positions = Vec::new();
-                positions
-                    .try_reserve_exact(length)
-                    .map_err(|e| GenError::Backend(format!("prefill positions: {e}")))?;
-                positions.extend(0..length);
                 runner.reset();
                 let result = (|| {
-                    let Some(logits) = runner
-                        .forward_cancellable(&request.prompt_tokens, &positions, cancelled)
-                        .map_err(|e| GenError::Backend(e.to_string()))?
+                    let Some(logits) = bounded_prefill(runner, &request.prompt_tokens, cancelled)?
                     else {
                         return Ok(StreamEnd::Cancelled);
                     };
@@ -165,7 +171,7 @@ impl Generator for RunnerGenerator {
     fn n_ctx(&self) -> usize {
         match &self.execution {
             Execution::Legacy(legacy) => legacy.n_ctx(),
-            Execution::Portable { runner, .. } => runner.architecture().max_context(),
+            Execution::Portable { runner, .. } => runner.max_context(),
         }
     }
     fn vocab(&self) -> usize {
@@ -217,4 +223,42 @@ impl Generator for RunnerGenerator {
             )),
         }
     }
+}
+
+// The whole prompt is validated before entry. Every segment crosses the same
+// common Runner interface; a hybrid cached continuation is exactly one token.
+fn bounded_prefill(
+    runner: &mut tritium_nn::Runner,
+    tokens: &[u32],
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<Vec<f32>>, GenError> {
+    let segment = runner
+        .cache_admission()
+        .map_or(tokens.len(), |a| a.limits().max_segment_tokens)
+        .min(tokens.len());
+    let single_cached = runner
+        .architecture()
+        .layer_kinds()
+        .any(|k| k == tritium_nn::LayerKind::DeltaNet);
+    let mut positions = Vec::new();
+    positions
+        .try_reserve_exact(segment)
+        .map_err(|e| GenError::Backend(format!("prefill positions: {e}")))?;
+    let mut at = 0;
+    let mut logits = None;
+    while at < tokens.len() {
+        let count = if at != 0 && single_cached { 1 } else { segment };
+        let end = at + count.min(tokens.len() - at);
+        positions.clear();
+        positions.extend(at..end);
+        let Some(next) = runner
+            .forward_cancellable(&tokens[at..end], &positions, cancelled)
+            .map_err(|e| GenError::Backend(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        logits = Some(next);
+        at = end;
+    }
+    Ok(logits)
 }
