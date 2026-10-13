@@ -21,6 +21,10 @@ mod calibration;
 #[path = "tensor_loading/compact.rs"]
 mod compact;
 
+#[cfg(feature = "tokenizer")]
+#[path = "tensor_loading/stream_limits.rs"]
+mod stream_limits;
+
 #[derive(Debug)]
 struct UploadProbe(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 

@@ -1,4 +1,5 @@
 //! Common portable text execution. Internal numerical adapters, not resident clearance.
+use super::CacheAdmission;
 #[cfg(feature = "tokenizer")]
 use super::{ModelRunner, Qwen35TextCache, Qwen35TextRunner, UnverifiedQwen35Mtp};
 use crate::{
@@ -159,11 +160,21 @@ impl Executor for HybridExecutor {
 pub struct Runner {
     architecture: ArchitectureSpec,
     executor: Box<dyn Executor>,
+    admission: Option<CacheAdmission>,
 }
 impl Runner {
     #[cfg(feature = "tokenizer")]
-    pub(super) fn standard(mut runner: ModelRunner, variation: ArchSpec) -> Self {
+    pub(super) fn standard(
+        mut runner: ModelRunner,
+        variation: ArchSpec,
+        admission: Option<CacheAdmission>,
+    ) -> Self {
         runner.reset();
+        if let Some(admission) = admission {
+            for cache in &mut runner.kv {
+                cache.max_ctx = admission.limits().max_context;
+            }
+        }
         let architecture = ArchitectureSpec::Standard {
             config: runner.config.clone(),
             variation,
@@ -172,6 +183,7 @@ impl Runner {
         Self {
             architecture,
             executor: Box::new(StandardExecutor { runner, cursor: 0 }),
+            admission,
         }
     }
     #[cfg(feature = "tokenizer")]
@@ -179,17 +191,36 @@ impl Runner {
         config: Qwen35CheckpointConfig,
         runner: Qwen35TextRunner,
         mtp: UnverifiedQwen35Mtp,
+        admission: Option<CacheAdmission>,
     ) -> Result<Self, NnError> {
-        let cache = runner.new_cache(config.text.max_position_embeddings as usize)?;
+        let capacity = admission.map_or(config.text.max_position_embeddings as usize, |a| {
+            a.limits().max_context
+        });
+        let cache = runner.new_cache(capacity)?;
         Ok(Self {
             architecture: ArchitectureSpec::Hybrid(config),
             executor: Box::new(HybridExecutor { runner, cache, mtp }),
+            admission,
         })
     }
     /// Actual immutable graph/configuration used by this stream.
     #[must_use]
     pub const fn architecture(&self) -> &ArchitectureSpec {
         &self.architecture
+    }
+    /// Actual selected stream capacity, which may be below source architecture capacity.
+    #[must_use]
+    pub const fn max_context(&self) -> usize {
+        match self.admission {
+            Some(a) => a.limits().max_context,
+            None => self.architecture.max_context(),
+        }
+    }
+    /// Immutable selected stream policy and logical host-cache plan, if explicitly admitted.
+    /// This does not qualify total model memory or backend residency.
+    #[must_use]
+    pub const fn cache_admission(&self) -> Option<CacheAdmission> {
+        self.admission
     }
     /// Committed language cursor; cancellation/error does not advance it.
     #[must_use]
@@ -212,6 +243,7 @@ impl Runner {
         if self.cache_len() != 0 {
             return Err(NnError::Backend("prefill requires an empty stream".into()));
         }
+        self.check_extent(0, tokens.len())?;
         let positions = positions(0, tokens.len())?;
         self.forward(tokens, &positions)
     }
@@ -257,12 +289,7 @@ impl Runner {
                 "forward requires nonempty contiguous committed positions".into(),
             ));
         }
-        if end > self.architecture.max_context() {
-            return Err(NnError::Shape {
-                expected: self.architecture.max_context(),
-                got: end,
-            });
-        }
+        self.check_extent(base, tokens.len())?;
         if let Some(id) = tokens
             .iter()
             .find(|&&id| id as usize >= self.architecture.vocab_size())
@@ -272,6 +299,26 @@ impl Runner {
             )));
         }
         self.executor.forward(tokens, positions, cancelled)
+    }
+
+    fn check_extent(&self, base: usize, count: usize) -> Result<(), NnError> {
+        if let Some(admission) = self.admission
+            && count > admission.limits().max_segment_tokens
+        {
+            return Err(NnError::ResourceExhausted(
+                "forward segment exceeds admitted token cap".into(),
+            ));
+        }
+        let end = base
+            .checked_add(count)
+            .ok_or_else(|| NnError::Backend("stream cursor overflow".into()))?;
+        if end > self.max_context() {
+            return Err(NnError::Shape {
+                expected: self.max_context(),
+                got: end,
+            });
+        }
+        Ok(())
     }
     /// Greedy generation with the same loop/reset/EOS behavior as the legacy runner.
     /// # Errors

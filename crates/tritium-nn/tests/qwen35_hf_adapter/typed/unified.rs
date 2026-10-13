@@ -6,6 +6,9 @@ use tritium_evidence::{
 };
 use tritium_nn::{LayerKind, ModelSource, Tokenizer};
 
+#[path = "unified/stream_limits.rs"]
+mod stream_limits;
+
 fn asset(package: &mut Package, name: &str, bytes: Vec<u8>) {
     let blob = BlobReference {
         id: BlobId::from_bytes(*blake3::hash(&bytes).as_bytes()),

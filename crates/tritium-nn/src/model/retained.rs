@@ -31,12 +31,15 @@ pub(super) fn load_file(
     backend: Box<dyn TernaryBackend>,
     policy: TensorUploadPolicy,
     budget: &TensorPayloadBudget,
+    execution: Option<super::StreamLimits>,
     context: TensorUploadContext<'_>,
 ) -> Result<LoadedModel, NnError> {
     positive(limits)?;
     let model =
         TritModelReader::open(File::open(path).map_err(invalid)?, receiving).map_err(invalid)?;
-    load_reader(model, level, limits, backend, policy, budget, context)
+    load_reader(
+        model, level, limits, backend, policy, budget, execution, context,
+    )
 }
 pub(super) fn load_bytes(
     bytes: &[u8],
@@ -44,6 +47,7 @@ pub(super) fn load_bytes(
     backend: Box<dyn TernaryBackend>,
     policy: TensorUploadPolicy,
     budget: &TensorPayloadBudget,
+    execution: Option<super::StreamLimits>,
     context: TensorUploadContext<'_>,
 ) -> Result<LoadedModel, NnError> {
     // Preserve the borrowed source's historical admission envelope. The caller
@@ -68,6 +72,7 @@ pub(super) fn load_bytes(
         backend,
         policy,
         budget,
+        execution,
         context,
     )
 }
@@ -104,6 +109,7 @@ fn tensor<R: Read + Seek>(
         model.visit_tensor(level, name, visit).map_err(invalid)
     })
 }
+#[allow(clippy::too_many_arguments)]
 fn load_reader<R: Read + Seek>(
     mut model: TritModelReader<R>,
     level: &str,
@@ -111,6 +117,7 @@ fn load_reader<R: Read + Seek>(
     backend: Box<dyn TernaryBackend>,
     policy: TensorUploadPolicy,
     budget: &TensorPayloadBudget,
+    execution: Option<super::StreamLimits>,
     context: TensorUploadContext<'_>,
 ) -> Result<LoadedModel, NnError> {
     positive(limits)?;
@@ -135,6 +142,19 @@ fn load_reader<R: Read + Seek>(
     } else {
         None
     };
+    let admission = execution
+        .map(|limits| {
+            if let Some((config, _, _)) = &standard {
+                super::CacheAdmission::standard(config, limits)
+            } else {
+                super::CacheAdmission::hybrid(
+                    qwen.as_ref()
+                        .ok_or_else(|| invalid("missing hybrid config"))?,
+                    limits,
+                )
+            }
+        })
+        .transpose()?;
     let vocab = if let Some(qwen) = &qwen {
         qwen.text.vocab_size as usize
     } else {
@@ -229,13 +249,14 @@ fn load_reader<R: Read + Seek>(
             Runner::standard(
                 super::ModelRunner::try_from_weights(config, weights, backend)?,
                 spec,
+                admission,
             )
         } else {
             let (config, weights, mtp_weights) =
                 Qwen35TextWeights::load_trit_admitted(&mut model, level, &mut loader, limits)?;
             let language = Qwen35TextRunner::new(&config.text, weights, backend)?;
             let mtp = UnverifiedQwen35Mtp::new(&language, mtp_weights)?;
-            Runner::hybrid(config, language, mtp)?
+            Runner::hybrid(config, language, mtp, admission)?
         }
     };
     model.verify().map_err(invalid)?;

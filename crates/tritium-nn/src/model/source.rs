@@ -103,6 +103,19 @@ enum PreparedSource<'a> {
 
 impl<'a> PreparedSource<'a> {
     #[cfg(feature = "tokenizer")]
+    fn admission(
+        &self,
+        limits: Option<super::StreamLimits>,
+    ) -> Result<Option<super::CacheAdmission>, NnError> {
+        limits
+            .map(|limits| match self {
+                Self::Hf { config, .. } | Self::Trit { config, .. } => {
+                    super::CacheAdmission::standard(config, limits)
+                }
+            })
+            .transpose()
+    }
+    #[cfg(feature = "tokenizer")]
     fn identity(&self) -> Result<LoadedSourceIdentity, NnError> {
         match self {
             Self::Hf { .. } => Ok(LoadedSourceIdentity::HuggingFace {
@@ -355,6 +368,40 @@ pub fn load(
     budget: &tritium_runtime::TensorPayloadBudget,
     context: tritium_runtime::TensorUploadContext<'_>,
 ) -> Result<LoadedModel, NnError> {
+    load_impl(source, backend, policy, budget, None, context)
+}
+
+/// Load through the same source/runner with explicit bounded stream admission.
+///
+/// Admits selected context, segment and logical host-cache payload before any
+/// matrix upload or hybrid state allocation. Source config/identities remain
+/// unchanged; inspect the actual runner's immutable admission view for policy.
+/// Model-load receipts alone do not qualify these bounds or total memory.
+///
+/// # Errors
+/// Invalid/overflowing/over-budget stream bounds or the same errors as [`load`].
+#[cfg(feature = "tokenizer")]
+pub fn load_with_limits(
+    source: ModelSource<'_>,
+    backend: Box<dyn tritium_spec::TernaryBackend>,
+    policy: tritium_schema::TensorUploadPolicy,
+    budget: &tritium_runtime::TensorPayloadBudget,
+    limits: super::StreamLimits,
+    context: tritium_runtime::TensorUploadContext<'_>,
+) -> Result<LoadedModel, NnError> {
+    limits.validate()?;
+    load_impl(source, backend, policy, budget, Some(limits), context)
+}
+
+#[cfg(feature = "tokenizer")]
+fn load_impl(
+    source: ModelSource<'_>,
+    backend: Box<dyn tritium_spec::TernaryBackend>,
+    policy: tritium_schema::TensorUploadPolicy,
+    budget: &tritium_runtime::TensorPayloadBudget,
+    execution: Option<super::StreamLimits>,
+    context: tritium_runtime::TensorUploadContext<'_>,
+) -> Result<LoadedModel, NnError> {
     context
         .recorder
         .check_emit::<ModelLoaded>(context.span, context.parent, context.logical_time)
@@ -375,15 +422,18 @@ pub fn load(
             limits,
         } => {
             return super::retained::load_file(
-                path, level, receiving, limits, backend, policy, budget, context,
+                path, level, receiving, limits, backend, policy, budget, execution, context,
             );
         }
         ModelSource::Trit { bytes, level } => {
-            return super::retained::load_bytes(bytes, level, backend, policy, budget, context);
+            return super::retained::load_bytes(
+                bytes, level, backend, policy, budget, execution, context,
+            );
         }
         _ => {}
     }
     let source = PreparedSource::new(source)?;
+    let admission = source.admission(execution)?;
     let identity = source.identity()?;
     let tokenizer = source.tokenizer()?;
     tokenizer.validate_model_vocab(source.vocab())?;
@@ -413,6 +463,7 @@ pub fn load(
     let runner = super::Runner::standard(
         super::ModelRunner::try_from_weights(config, weights, backend)?,
         architecture,
+        admission,
     );
     let architecture = runner.architecture().clone();
     let receipt = context

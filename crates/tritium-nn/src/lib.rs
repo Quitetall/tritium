@@ -45,7 +45,7 @@ pub use layers::{
     Qwen35FullAttentionWeights, Relu2Mlp, SaltLinear, SwiGluMlp, TensorLoader, TernaryLinear,
     TokenEmbedding, TransformerBlock,
 };
-pub use model::{ArchitectureSpec, LayerKind, Runner};
+pub use model::{ArchitectureSpec, CacheAdmission, LayerKind, Runner, StreamLimits};
 pub use model::{
     ForwardDump, LayerWeights, ModelRunner, ModelSource, ModelWeights,
     QWEN35_HF_SOURCE_ARCHITECTURE, QWEN35_MTP_UNVERIFIED_REASON, QWEN35_MTP_VLLM_ORACLE_REVISION,
@@ -64,7 +64,7 @@ pub use model::{
     UnverifiedQwen35Mtp, qwen35_language_mtp_tensor_schema, qwen36_27b_canonical_source_config,
 };
 #[cfg(feature = "tokenizer")]
-pub use model::{GgufBpeTokenizer, HfJsonTokenizer, LoadedModel, load};
+pub use model::{GgufBpeTokenizer, HfJsonTokenizer, LoadedModel, load, load_with_limits};
 #[cfg(feature = "cuda")]
 pub use model::{
     SaltV2LoadedTensorReceipt, SaltV2ModelAllocationReceipt, SaltV2PreservedTensorReceipt,

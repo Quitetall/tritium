@@ -10,6 +10,7 @@ mod hf;
 #[cfg(feature = "tokenizer")]
 mod hf_json_tokenizer;
 mod hf_shards;
+mod limits;
 mod qwen35;
 mod qwen35_execution;
 mod qwen35_hf;
@@ -41,6 +42,7 @@ pub use bpe_tokenizer::GgufBpeTokenizer;
 pub(crate) use hf::NameSchema;
 #[cfg(feature = "tokenizer")]
 pub use hf_json_tokenizer::HfJsonTokenizer;
+pub use limits::{CacheAdmission, StreamLimits};
 pub use qwen35::{
     Qwen35TextCache, Qwen35TextLayerWeights, Qwen35TextMixerWeights, Qwen35TextOutput,
     Qwen35TextRunner, Qwen35TextWeights,
@@ -77,7 +79,7 @@ pub use salt_v2::{
 };
 pub use source::ModelSource;
 #[cfg(feature = "tokenizer")]
-pub use source::{LoadedModel, load};
+pub use source::{LoadedModel, load, load_with_limits};
 pub(crate) use staged_calibration::{dense_source_weights, dense_stage_weights};
 pub use tokenizer::Tokenizer;
 pub use training_salt::{
