@@ -3,6 +3,87 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
+extern "C" __global__ void semantic_delta_convolution(
+    const float *raw, const float *weights, float *history, float *output,
+    uint32_t width, uint32_t kernel, uint32_t tokens
+) {
+    uint64_t channel = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (channel >= width) return;
+    uint64_t base = channel * kernel;
+    for (uint32_t token = 0; token < tokens; ++token) {
+        for (uint32_t tap = 1; tap < kernel; ++tap) history[base + tap - 1] = history[base + tap];
+        history[base + kernel - 1] = raw[uint64_t(token) * width + channel];
+        float sum = 0.0f;
+        for (uint32_t tap = 0; tap < kernel; ++tap) sum += history[base + tap] * weights[base + tap];
+        output[uint64_t(token) * width + channel] = sum / (1.0f + expf(-sum));
+    }
+}
+// Explicit device-f32 profile. Existing exact host-normalized recurrence stays
+// unchanged. A block owns one value head, traversing tokens in order on device.
+extern "C" __global__ void semantic_delta_mixer(
+    const float *qkv, const float *z, const float *beta_logits, const float *decay_logits,
+    const float *a_log, const float *dt_bias, const float *norm,
+    float *state, float *output, uint32_t heads, uint32_t dk, uint32_t dv,
+    uint32_t group, uint32_t tokens, float query_scale, float eps
+) {
+    extern __shared__ float shared[];
+    float *kk = shared, *qq = shared + dk, *core = shared + 2 * dk, *scalars = core + dv;
+    uint32_t head = blockIdx.x, lane = threadIdx.x, key_head = head / group;
+    uint64_t key_width = uint64_t(heads / group) * dk;
+    uint64_t value_width = uint64_t(heads) * dv, conv_width = 2 * key_width + value_width;
+    uint64_t state_base = uint64_t(head) * dk * dv;
+    for (uint32_t token = 0; token < tokens; ++token) {
+        uint64_t raw_base = uint64_t(token) * conv_width;
+        if (lane == 0) {
+            float q_sq = 0.0f, k_sq = 0.0f;
+            for (uint32_t i = 0; i < dk; ++i) {
+                float q = qkv[raw_base + uint64_t(key_head) * dk + i];
+                float k = qkv[raw_base + key_width + uint64_t(key_head) * dk + i];
+                q_sq += q * q; k_sq += k * k;
+            }
+            float q_inv = (1.0f / sqrtf(q_sq + 1e-6f)) * query_scale;
+            float k_inv = 1.0f / sqrtf(k_sq + 1e-6f);
+            for (uint32_t i = 0; i < dk; ++i) {
+                qq[i] = qkv[raw_base + uint64_t(key_head) * dk + i] * q_inv;
+                kk[i] = qkv[raw_base + key_width + uint64_t(key_head) * dk + i] * k_inv;
+            }
+            uint64_t at = uint64_t(token) * heads + head;
+            scalars[0] = 1.0f / (1.0f + expf(-beta_logits[at]));
+            float step = decay_logits[at] + dt_bias[head];
+            float softplus = step > 20.0f ? step : log1pf(expf(step));
+            scalars[1] = expf(-expf(a_log[head]) * softplus);
+        }
+        __syncthreads();
+        uint64_t value_at = uint64_t(token) * value_width + uint64_t(head) * dv + lane;
+        if (lane < dv) {
+            float memory = 0.0f;
+            for (uint32_t i = 0; i < dk; ++i) {
+                uint64_t at = state_base + uint64_t(i) * dv + lane;
+                state[at] *= scalars[1]; memory += kk[i] * state[at];
+            }
+            float delta = scalars[0] * (qkv[raw_base + 2 * key_width + uint64_t(head) * dv + lane] - memory);
+            float mixed = 0.0f;
+            for (uint32_t i = 0; i < dk; ++i) {
+                uint64_t at = state_base + uint64_t(i) * dv + lane;
+                state[at] += kk[i] * delta; mixed += qq[i] * state[at];
+            }
+            core[lane] = mixed;
+        }
+        __syncthreads();
+        if (lane == 0) {
+            float variance = 0.0f;
+            for (uint32_t i = 0; i < dv; ++i) variance += core[i] * core[i];
+            scalars[2] = 1.0f / sqrtf(variance / float(dv) + eps);
+        }
+        __syncthreads();
+        if (lane < dv) {
+            float gate = z[value_at] / (1.0f + expf(-z[value_at]));
+            output[value_at] = ((core[lane] * scalars[2]) * norm[lane]) * gate;
+        }
+        __syncthreads();
+    }
+}
+
 extern "C" __global__ void semantic_decoder_dense_gather(
     const float *table, const uint32_t *ids, float *output, uint32_t cols, uint32_t count
 ) {

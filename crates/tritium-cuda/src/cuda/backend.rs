@@ -13,6 +13,7 @@ use tritium_format::salt_v2_package::{
 
 mod attention;
 mod decoder;
+mod delta_mixer;
 pub(super) mod deltanet;
 mod salt_v2_reader_upload;
 mod salt_v2_runtime;
@@ -819,6 +820,8 @@ pub struct CudaBackend {
     pub(super) func_decoder_add: CudaFunction,
     pub(super) func_decoder_relu2: CudaFunction,
     pub(super) func_decoder_rope: CudaFunction,
+    pub(super) func_delta_convolution: CudaFunction,
+    pub(super) func_delta_mixer: CudaFunction,
     /// Scalar-correct D2/B3/S34 forward. The first fast API aliases this handle.
     pub(super) func_salt_v2_exact: CudaFunction,
     /// Shared-activation D2/B3/S34 forward used for prefill-shaped launches.
@@ -1509,6 +1512,8 @@ impl CudaBackend {
         let func_decoder_add = decoder_function("semantic_decoder_add")?;
         let func_decoder_relu2 = decoder_function("semantic_decoder_relu2")?;
         let func_decoder_rope = decoder_function("semantic_decoder_rope")?;
+        let func_delta_convolution = decoder_function("semantic_delta_convolution")?;
+        let func_delta_mixer = decoder_function("semantic_delta_mixer")?;
 
         let device_name = ctx
             .name()
@@ -1551,6 +1556,8 @@ impl CudaBackend {
             func_decoder_add,
             func_decoder_relu2,
             func_decoder_rope,
+            func_delta_convolution,
+            func_delta_mixer,
             func_salt_v2_exact,
             func_salt_v2_tiled,
             func_salt_v2_warp,
@@ -9179,6 +9186,15 @@ pub(super) enum AddKernel {
 }
 
 impl TernaryBackend for CudaBackend {
+    fn resident_delta_mixer(
+        &self,
+        geometry: tritium_spec::DeltaMixerGeometry,
+        weights: tritium_spec::DeltaMixerWeights<'_>,
+        limits: tritium_spec::DecoderLimits,
+        max_device_payload_bytes: usize,
+    ) -> Result<Option<Box<dyn tritium_spec::ResidentDeltaMixer>>, BackendError> {
+        delta_mixer::create(self, geometry, weights, limits, max_device_payload_bytes)
+    }
     fn resident_decoder_requested(&self) -> bool {
         self.resident_decoder_budget.is_some()
     }

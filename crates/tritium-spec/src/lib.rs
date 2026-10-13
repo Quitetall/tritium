@@ -36,6 +36,10 @@ mod caps;
 pub use caps::DeviceCaps;
 mod deltanet;
 pub use deltanet::{DeltaNetGeometry, DeltaNetStep, ResidentDeltaNet};
+mod delta_mixer;
+pub use delta_mixer::{
+    DeltaMixerGeometry, DeltaMixerSegment, DeltaMixerWeights, ResidentDeltaMixer,
+};
 mod decoder;
 pub use decoder::{
     DecoderActivation, DecoderExecution, DecoderGeometry, DecoderGraph, DecoderLayer,
@@ -308,6 +312,22 @@ pub trait TernaryBackend: Send + Sync {
 
     /// What this device can do — used by the runtime to pick a backend.
     fn capabilities(&self) -> DeviceCaps;
+
+    /// Explicitly request device-f32 causal convolution, gates, recurrence and
+    /// gated normalization over projected operands. None means unsupported,
+    /// never successful host fallback or whole-model residency.
+    /// # Errors
+    /// Geometry/vector/limits/payload rejection and allocation/driver errors.
+    fn resident_delta_mixer(
+        &self,
+        geometry: DeltaMixerGeometry,
+        weights: DeltaMixerWeights<'_>,
+        limits: DecoderLimits,
+        max_device_payload_bytes: usize,
+    ) -> Result<Option<Box<dyn ResidentDeltaMixer>>, BackendError> {
+        geometry.payload_bytes(weights, limits, max_device_payload_bytes)?;
+        Ok(None)
+    }
 
     /// Whether the caller selected mandatory resident decoder execution.
     /// Defaults preserve host dispatch. Selected adapters must reject unsupported
