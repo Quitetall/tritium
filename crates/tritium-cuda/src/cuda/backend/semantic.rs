@@ -16,7 +16,9 @@ use tritium_spec::{
 };
 mod basis;
 mod packed;
+pub(super) mod swiglu;
 use packed::PackedAdditive;
+pub(super) use swiglu::Workspace as SwigluWorkspace;
 
 pub(super) struct CudaTensor {
     rows: usize,
@@ -127,7 +129,7 @@ impl CudaTensor {
         }))
     }
 
-    fn checked<'a>(
+    pub(super) fn checked<'a>(
         backend: &CudaBackend,
         tensor: &'a dyn DeviceBuffer,
     ) -> Result<&'a Self, BackendError> {

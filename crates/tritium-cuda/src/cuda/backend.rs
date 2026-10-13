@@ -809,6 +809,7 @@ pub struct CudaBackend {
     pub(super) func_semantic_basis_sign: CudaFunction,
     pub(super) func_semantic_basis_butterfly: CudaFunction,
     pub(super) func_semantic_basis_finish: CudaFunction,
+    pub(super) func_semantic_swiglu: CudaFunction,
     /// Scalar-correct D2/B3/S34 forward. The first fast API aliases this handle.
     pub(super) func_salt_v2_exact: CudaFunction,
     /// Shared-activation D2/B3/S34 forward used for prefill-shaped launches.
@@ -1027,6 +1028,8 @@ pub struct CudaBackend {
     /// projection path. Qwen prompt/decode invokes hundreds of projections;
     /// retaining these buffers removes a cuMemAlloc/cuMemFree pair per call.
     pub(super) salt_v2_workspace: Mutex<SaltV2Workspace>,
+    pub(super) semantic_swiglu_enabled: bool,
+    pub(super) semantic_swiglu_workspace: Mutex<Option<semantic::SwigluWorkspace>>,
 }
 
 /// Process-local pool for transient SALT V2 activation/output buffers.
@@ -1067,6 +1070,17 @@ impl SaltV2Workspace {
 }
 
 impl CudaBackend {
+    /// Explicitly opt into device-f32 SwiGLU regions before loading a model.
+    /// Device expf may differ from host exp. Default arithmetic is unchanged;
+    /// this does not qualify model quality/performance. The backend identity
+    /// records the selected mode. No runtime/environment toggle is introduced.
+    pub fn with_device_swiglu(mut self) -> Self {
+        if !self.semantic_swiglu_enabled {
+            self.semantic_swiglu_enabled = true;
+            self.device_id.push_str(":swiglu-device-f32");
+        }
+        self
+    }
     /// Open CUDA device `ordinal`, load the TQ2_0 add kernel, and return a backend.
     ///
     /// # Errors
@@ -1457,6 +1471,9 @@ impl CudaBackend {
         let func_semantic_basis_finish = semantic_module
             .load_function("semantic_basis_finish")
             .map_err(|e| driver_err("resolve semantic basis normalization", &e))?;
+        let func_semantic_swiglu = semantic_module
+            .load_function("semantic_swiglu")
+            .map_err(|e| driver_err("resolve semantic SwiGLU", &e))?;
 
         let device_name = ctx
             .name()
@@ -1491,6 +1508,7 @@ impl CudaBackend {
             func_semantic_basis_sign,
             func_semantic_basis_butterfly,
             func_semantic_basis_finish,
+            func_semantic_swiglu,
             func_salt_v2_exact,
             func_salt_v2_tiled,
             func_salt_v2_warp,
@@ -1604,6 +1622,8 @@ impl CudaBackend {
             imma_jit: Mutex::new(HashMap::new()),
             tuned_tiles: Mutex::new(HashMap::new()),
             salt_v2_workspace: Mutex::new(SaltV2Workspace::default()),
+            semantic_swiglu_enabled: false,
+            semantic_swiglu_workspace: Mutex::new(None),
         })
     }
 
@@ -9189,6 +9209,9 @@ impl TernaryBackend for CudaBackend {
 
     fn matmul(&self, p: tritium_spec::TensorMatmul<'_>) -> Result<(), BackendError> {
         semantic::CudaTensor::matmul(self, p)
+    }
+    fn try_tensor_swiglu(&self, p: tritium_spec::TensorSwiGlu<'_>) -> Result<bool, BackendError> {
+        semantic::swiglu::forward(self, p)
     }
 
     fn embed_rows(

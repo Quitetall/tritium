@@ -144,6 +144,9 @@ impl core::fmt::Debug for Linear {
 }
 
 impl Linear {
+    pub(crate) fn device(&self) -> &dyn DeviceBuffer {
+        self.dev.as_ref()
+    }
     /// Number of output rows.
     #[must_use]
     pub const fn n_out(&self) -> usize {

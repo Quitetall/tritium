@@ -961,10 +961,9 @@ fn check_trit_parity(
     assert!(runner.weights.token_embd.as_dense().is_none());
     assert_eq!(recorder.events().len(), fixture.manifest.levels[0].tensors.iter().filter(|t| !matches!(&t.storage, tritium_schema::TensorStorage::Dense { shape, .. } if shape.len() == 1)).count());
     for event in recorder.events() {
-        assert_eq!(
-            event.payload["caps"]["execution"],
-            if native_only { "Native" } else { "Emulated" }
-        );
+        // These CPU/reference/CUDA fixtures are admitted native combinations.
+        // Permitting emulation does not require a native adapter to emulate.
+        assert_eq!(event.payload["caps"]["execution"], "Native");
     }
     for (tokens, positions) in [
         (&[1, 3, 2][..], &[0, 1, 2][..]),
@@ -1962,7 +1961,7 @@ fn typed_packages_execute_on_real_cuda_without_backend_downcasts() {
             check_trit_parity(
                 &fixture,
                 Box::new(tritium_cuda::CudaBackend::new(0).unwrap()),
-                additive.is_none(),
+                true,
                 additive.is_none(),
             );
         }
@@ -1973,7 +1972,7 @@ fn typed_packages_execute_on_real_cuda_without_backend_downcasts() {
     let budget = TensorPayloadBudget::new(100_000);
     let mut recorder =
         EvidenceRecorder::new("nn-trit-native-only", [TENSOR_UPLOADED_REGISTRATION]).unwrap();
-    let result = ModelRunner::from_source_admitted(
+    let runner = ModelRunner::from_source_admitted(
         tritium_nn::ModelSource::Trit {
             bytes: &bytes,
             level: "standard",
@@ -1990,11 +1989,16 @@ fn typed_packages_execute_on_real_cuda_without_backend_downcasts() {
             parent: None,
             logical_time: 0,
         },
-    );
+    )
+    .expect("admitted packed additive CUDA must accept native-only");
+    assert!(budget.used_bytes() > 0);
+    assert!(!recorder.events().is_empty());
     assert!(
-        result.is_err(),
-        "emulated additive CUDA must reject native-only"
+        recorder
+            .events()
+            .iter()
+            .all(|event| event.payload["caps"]["execution"] == "Native")
     );
+    drop(runner);
     assert_eq!(budget.used_bytes(), 0);
-    assert!(recorder.events().is_empty());
 }

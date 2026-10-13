@@ -3,6 +3,14 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
+extern "C" __global__ void semantic_swiglu(float *gate, const float *up, uint32_t count) {
+    uint64_t at = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (at < count) {
+        float z = gate[at];
+        gate[at] = (z / (1.0f + expf(-z))) * up[at];
+    }
+}
+
 __device__ __forceinline__ uint64_t semantic_splitmix(uint64_t value) {
     value = (value ^ (value >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
     value = (value ^ (value >> 27)) * UINT64_C(0x94d049bb133111eb);

@@ -329,24 +329,31 @@ impl PackedAdditive {
             .stream
             .alloc_zeros::<f32>(outputs)
             .map_err(|e| alloc_or_backend("allocate packed semantic output", &e, requested))?;
-        let cfg = LaunchConfig::for_num_elems(narrow(outputs)?);
+        self.launch(backend, &input, &mut output, batch)?;
+        backend
+            .stream
+            .memcpy_dtoh(&output, p.out)
+            .map_err(|e| driver_err("read packed semantic output", &e))
+    }
+
+    pub(super) fn launch(
+        &self,
+        backend: &CudaBackend,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        batch: u32,
+    ) -> Result<(), BackendError> {
+        let cfg = LaunchConfig::for_num_elems(narrow(output.len())?);
         let mut launch = backend
             .stream
             .launch_builder(&backend.func_semantic_additive_matmul);
-        launch
-            .arg(&self.bytes)
-            .arg(&input)
-            .arg(&mut output)
-            .arg(&batch);
+        launch.arg(&self.bytes).arg(input).arg(output).arg(&batch);
         #[allow(unsafe_code)]
         // SAFETY: validated geometry bounds every access; one thread owns each
         // output and private canonical bytes/indexing were checked at upload.
         unsafe { launch.launch(cfg) }
             .map_err(|e| driver_err("launch packed semantic matmul", &e))?;
-        backend
-            .stream
-            .memcpy_dtoh(&output, p.out)
-            .map_err(|e| driver_err("read packed semantic output", &e))
+        Ok(())
     }
 
     pub(super) fn embed(

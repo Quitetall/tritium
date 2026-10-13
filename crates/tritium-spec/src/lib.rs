@@ -235,6 +235,34 @@ impl fmt::Debug for TensorMatmul<'_> {
     }
 }
 
+/// Optional device-f32 SwiGLU region over existing typed weight handles.
+/// `gate`/`up` are `[F,K]`, `down` is `[K,F]`; activations/output are `[batch,K]`.
+/// Device exponential rounding may differ from the ordinary host expression;
+/// an implementation must require explicit numerical-policy opt-in.
+pub struct TensorSwiGlu<'a> {
+    /// Input activations.
+    pub act: &'a [f32],
+    /// Gate projection.
+    pub gate: &'a dyn DeviceBuffer,
+    /// Up projection.
+    pub up: &'a dyn DeviceBuffer,
+    /// Down projection.
+    pub down: &'a dyn DeviceBuffer,
+    /// Number of activation rows.
+    pub batch: usize,
+    /// Final output, unchanged on unsupported/error.
+    pub out: &'a mut [f32],
+}
+impl fmt::Debug for TensorSwiGlu<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TensorSwiGlu")
+            .field("batch", &self.batch)
+            .field("act_len", &self.act.len())
+            .field("out_len", &self.out.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Opaque handle to device-resident memory owned by a backend.
 ///
 /// The runtime treats this as an opaque token; the owning backend downcasts it
@@ -352,6 +380,14 @@ pub trait TernaryBackend: Send + Sync {
             "backend `{}` does not implement semantic tensor matmul",
             self.device_id()
         )))
+    }
+
+    /// Execute an explicitly enabled device-f32 SwiGLU region.
+    /// False is unsupported/disabled, with output untouched. Errors are not
+    /// fallback; successful execution returns true. Default preserves host
+    /// behavior. This does not grant model-quality or whole-graph residency.
+    fn try_tensor_swiglu(&self, _p: TensorSwiGlu<'_>) -> Result<bool, BackendError> {
+        Ok(false)
     }
 
     /// Gather `[ids.len(), K]` original-coordinate rows from an uploaded tensor.
