@@ -84,47 +84,36 @@ impl std::error::Error for SaltTensorSpoolError {
 }
 type Error = SaltTensorSpoolError;
 
-/// Stage the owned importer's identical canonical payload without a decoded master.
-///
-/// Uses the same strict reader, count/scale proof, sealed geometry cursors and
-/// codec. Supported layouts and refusals are identical to import_salt_v2_tensor.
-/// Appends only at the current end of a caller-owned pending seek/read/write
-/// spool; prior bytes are never overwritten. Source proof and explicit limits
-/// precede writes. Fixed per-plane buffers carry packing tails across tiles and
-/// pruned/ragged rows, preserving plane-major payload order and exact scale bits.
-/// Selected-tensor integrity and all stream ledgers must pass, then the range is
-/// re-read/hashed before returning. No flush/sync or publication is performed.
-///
-/// Caller must ensure spool immutability, clean up failed pending tails, verify
-/// the whole legacy source unchanged once after all model reads, preserve model
-/// metadata/assets/identity/lineage and re-open/verify output bits before commit.
-/// The working cap is logical importer storage, not reader/caller/full RSS.
-/// # Errors
-/// Refusal before fill leaves destination bytes untouched (cursor may change).
-/// Fill/source/codec/spool failure may leave partial tail, never a success blob.
-pub fn import_salt_v2_tensor_to_spool<R: Read + Seek, S: Read + Write + Seek>(
-    reader: &mut SaltV2PackageReader<R>,
-    name: &str,
+/// Read-only metadata/count plan, not scale representability or import evidence.
+/// These logical sizes exclude the reader, allocator/slack, page cache and RSS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SaltTensorSpoolPlan {
+    /// Actual indexed coefficient/scale source payload.
+    pub source_bytes: u64,
+    /// Retained logical coefficient count, not a decoded allocation.
+    pub trits: u64,
+    /// Retained logical exact-FP16 scale count.
+    pub scales: u64,
+    /// Maximum active additive plane count.
+    pub planes: usize,
+    /// Canonical encoded coefficient plus scale payload.
+    pub payload_bytes: u64,
+    /// Conservative importer count/index/state/packing scratch.
+    pub working_bytes: u64,
+}
+
+struct PayloadPlan {
+    codec: SaltV2Codec,
+    lengths: [usize; SALT_V2_MAX_PLANES],
+    coefficient_bytes: usize,
+    total: usize,
+    working: usize,
+}
+fn payload_plan(
+    plan: &PerTilePlan<'_>,
     layout: AdditiveLayout,
     limits: SaltTensorSpoolLimits,
-    spool: &mut S,
-) -> Result<SaltTensorSpoolImport, Error> {
-    let Prepared {
-        width,
-        source_group,
-        counts,
-    } = prepare(
-        reader,
-        name,
-        layout,
-        SaltTensorImportLimits {
-            max_source_bytes: limits.max_source_bytes,
-            max_trits: limits.max_trits,
-            max_scales: limits.max_scales,
-            max_owned_bytes: limits.max_working_bytes,
-        },
-    )?;
-    let plan = PerTilePlan::new(layout, &counts).map_err(view_error)?;
+) -> Result<PayloadPlan, Error> {
     import_bound("output trits", plan.trit_count(), limits.max_trits)?;
     import_bound("output scales", plan.scale_count(), limits.max_scales)?;
     let planes = plan.plane_count();
@@ -154,6 +143,100 @@ pub fn import_salt_v2_tensor_to_spool<R: Read + Seek, S: Read + Write + Seek>(
         .and_then(|n| n.checked_add(plan.buffer_len_bytes().ok()?))
         .ok_or(E::Overflow)?;
     import_bound("spool working bytes", working, limits.max_working_bytes)?;
+    Ok(PayloadPlan {
+        codec,
+        lengths,
+        coefficient_bytes,
+        total,
+        working,
+    })
+}
+fn prepared<R: Read + Seek>(
+    reader: &SaltV2PackageReader<R>,
+    name: &str,
+    layout: AdditiveLayout,
+    limits: SaltTensorSpoolLimits,
+) -> Result<Prepared, Error> {
+    Ok(prepare(
+        reader,
+        name,
+        layout,
+        SaltTensorImportLimits {
+            max_source_bytes: limits.max_source_bytes,
+            max_trits: limits.max_trits,
+            max_scales: limits.max_scales,
+            max_owned_bytes: limits.max_working_bytes,
+        },
+    )?)
+}
+
+/// Inspect through the actual import metadata/count/codec planner without writes.
+/// Does not visit payload scales or prove scale-bit representability. The caller
+/// still owns source custody, actual import/replay and full resource qualification.
+/// # Errors
+/// The same layout/count/logical-cap refusals as actual spool staging.
+pub fn inspect_salt_v2_tensor_spool<R: Read + Seek>(
+    reader: &SaltV2PackageReader<R>,
+    name: &str,
+    layout: AdditiveLayout,
+    limits: SaltTensorSpoolLimits,
+) -> Result<SaltTensorSpoolPlan, Error> {
+    let p = prepared(reader, name, layout, limits)?;
+    let plan = PerTilePlan::new(layout, &p.counts).map_err(view_error)?;
+    let payload = payload_plan(&plan, layout, limits)?;
+    let info = reader.tensor_info(name).ok_or(E::Geometry)?;
+    Ok(SaltTensorSpoolPlan {
+        source_bytes: info
+            .encoded_payload_bytes()
+            .checked_add(info.encoded_scale_bytes())
+            .ok_or(E::Overflow)?,
+        trits: plan.trit_count() as u64,
+        scales: plan.scale_count() as u64,
+        planes: plan.plane_count(),
+        payload_bytes: payload.total as u64,
+        working_bytes: payload.working as u64,
+    })
+}
+
+/// Stage the owned importer's identical canonical payload without a decoded master.
+///
+/// Uses the same strict reader, count/scale proof, sealed geometry cursors and
+/// codec. Supported layouts and refusals are identical to import_salt_v2_tensor.
+/// Appends only at the current end of a caller-owned pending seek/read/write
+/// spool; prior bytes are never overwritten. Source proof and explicit limits
+/// precede writes. Fixed per-plane buffers carry packing tails across tiles and
+/// pruned/ragged rows, preserving plane-major payload order and exact scale bits.
+/// Selected-tensor integrity and all stream ledgers must pass, then the range is
+/// re-read/hashed before returning. No flush/sync or publication is performed.
+///
+/// Caller must ensure spool immutability, clean up failed pending tails, verify
+/// the whole legacy source unchanged once after all model reads, preserve model
+/// metadata/assets/identity/lineage and re-open/verify output bits before commit.
+/// The working cap is logical importer storage, not reader/caller/full RSS.
+/// # Errors
+/// Refusal before fill leaves destination bytes untouched (cursor may change).
+/// Fill/source/codec/spool failure may leave partial tail, never a success blob.
+pub fn import_salt_v2_tensor_to_spool<R: Read + Seek, S: Read + Write + Seek>(
+    reader: &mut SaltV2PackageReader<R>,
+    name: &str,
+    layout: AdditiveLayout,
+    limits: SaltTensorSpoolLimits,
+    spool: &mut S,
+) -> Result<SaltTensorSpoolImport, Error> {
+    let Prepared {
+        width,
+        source_group,
+        counts,
+    } = prepared(reader, name, layout, limits)?;
+    let plan = PerTilePlan::new(layout, &counts).map_err(view_error)?;
+    let planes = plan.plane_count();
+    let PayloadPlan {
+        codec,
+        lengths,
+        coefficient_bytes,
+        total,
+        ..
+    } = payload_plan(&plan, layout, limits)?;
     prove_scales(reader, name, width, usize::from(layout.group), source_group)?;
     let offset = spool.stream_position()?;
     if spool.seek(SeekFrom::End(0))? != offset {

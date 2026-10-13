@@ -17,8 +17,9 @@ use tritium_format::salt_v2_package::{
 };
 use tritium_format::trit_model::{TritModelReadError, TritModelReader};
 use tritium_format::{
-    SaltTensorSpoolError, SaltTensorSpoolLimits, TritBlobKind, TritPackageReadLimits,
-    TritSpoolBlob, import_salt_v2_tensor_to_spool,
+    SaltTensorSpoolError, SaltTensorSpoolLimits, SaltTensorSpoolPlan, TritBlobKind,
+    TritPackageReadLimits, TritSpoolBlob, import_salt_v2_tensor_to_spool,
+    inspect_salt_v2_tensor_spool,
 };
 use tritium_schema::*;
 
@@ -38,6 +39,182 @@ pub struct SaltV2ModelImportRequest {
     pub max_spool_bytes: u64,
     /// Complete typed package receiving/output caps, not aggregate heap/RSS.
     pub receiving: TritPackageReadLimits,
+}
+
+/// One strict-indexed matrix's read-only logical import requirements.
+#[derive(Clone, Debug)]
+pub struct SaltV2MatrixImportPlan {
+    /// Original tensor name, never a renamed/fitted source.
+    pub name: String,
+    /// Actual target layout derived by the same model importer.
+    pub layout: AdditiveLayout,
+    /// Count/codec/index requirements; scale representability is not proven.
+    pub spool: SaltTensorSpoolPlan,
+}
+/// Logical model spool planning, not import success, full container/RSS or qualification.
+#[derive(Clone, Debug)]
+pub struct SaltV2ModelImportPlan {
+    /// All actual source matrices in canonical order.
+    pub matrices: Vec<SaltV2MatrixImportPlan>,
+    /// Canonical additive coefficient/scale payload sum.
+    pub additive_payload_bytes: u64,
+    /// Preserved dense payload sum; bytes are not read/proven by inspection.
+    pub dense_payload_bytes: u64,
+    /// Actual observed asset byte sum.
+    pub asset_payload_bytes: u64,
+    /// Exact logical raw spool payload sum, excluding container/log overhead.
+    pub spool_payload_bytes: u64,
+}
+
+fn matrix_inventory<R: Read + Seek>(
+    request: &SaltV2ModelImportRequest,
+    legacy: &SaltV2PackageReader<R>,
+) -> Result<Vec<(String, AdditiveLayout)>, SaltV2ModelImportError> {
+    let plan = &request.companions;
+    plan.validate().map_err(QuantEngineError::Plan)?;
+    if plan.levels.len() != 1
+        || plan
+            .tensors
+            .iter()
+            .any(|t| t.action != QuantAction::KeepDense)
+    {
+        return Err(refusal("import companions must be one KeepDense level"));
+    }
+    if legacy.is_empty() {
+        return Err(refusal("legacy matrix inventory is empty"));
+    }
+    let mut matrices = Vec::new();
+    matrices
+        .try_reserve_exact(legacy.len())
+        .map_err(|_| refusal("import matrix inventory allocation"))?;
+    for name in legacy.tensor_names() {
+        if plan
+            .tensors
+            .binary_search_by(|t| t.source.name.as_str().cmp(name))
+            .is_ok()
+        {
+            return Err(refusal("legacy and companion tensor names collide"));
+        }
+        let info = legacy
+            .tensor_info(name)
+            .ok_or_else(|| refusal("legacy metadata missing"))?;
+        let [rows, cols] = info.dims() else {
+            return Err(refusal("legacy model import requires rank-two matrices"));
+        };
+        if info.transform() != SaltV2Transform::None {
+            return Err(refusal(
+                "legacy model transform lacks an admitted exact basis",
+            ));
+        }
+        let maximum = legacy
+            .tensor_plane_counts(name)
+            .map_err(SaltV2ModelImportError::Legacy)?
+            .max()
+            .ok_or_else(|| refusal("legacy counts absent"))?;
+        let layout = AdditiveLayout {
+            rows: *rows,
+            cols: *cols,
+            tile: 256,
+            group: request.group,
+            max_planes: u8::try_from(maximum).map_err(|_| refusal("legacy plane count"))?,
+            allocation: PlaneAllocation::PerTile,
+            codec: request.codec,
+            law: ScaleLaw {
+                anchor: ScaleAnchor::Group,
+                relation: PlaneRelation::Free,
+                precision: ScalePrecision::F16,
+            },
+            basis: Basis::Identity,
+            transport: Transport::Raw,
+        };
+        layout.validate().map_err(|_| refusal("import layout"))?;
+        matrices.push((name.to_owned(), layout));
+    }
+    Ok(matrices)
+}
+
+/// Inspect through shared strict metadata/count/encoder sizing before any writes.
+/// Asset bytes are bounded observations; companion data bytes and target scale-bit
+/// representability are not proved. This is not prepared-import evidence, source
+/// official authentication, container/RSS admission or publication permission.
+/// # Errors
+/// Invalid/mismatched inventory, unsupported layout, logical caps or source errors.
+pub fn inspect_salt_v2_model_import<R: Read + Seek>(
+    request: &SaltV2ModelImportRequest,
+    legacy: &SaltV2PackageReader<R>,
+    companions: &mut dyn WeightSource,
+) -> Result<SaltV2ModelImportPlan, SaltV2ModelImportError> {
+    let inventory = matrix_inventory(request, legacy)?;
+    let plan = &request.companions;
+    let actual = companions.inventory()?;
+    if actual.len() != plan.tensors.len()
+        || actual
+            .iter()
+            .zip(&plan.tensors)
+            .any(|(a, b)| a != &b.source)
+        || companions.asset_names() != plan.assets
+    {
+        return Err(refusal(
+            "inspection companion inventory disagrees with plan",
+        ));
+    }
+    let sum = |a: u64, b: u64| {
+        a.checked_add(b)
+            .ok_or_else(|| refusal("import planning payload overflow"))
+    };
+    let mut matrices = Vec::new();
+    matrices
+        .try_reserve_exact(inventory.len())
+        .map_err(|_| refusal("inspection allocation"))?;
+    let mut additive_payload_bytes = 0;
+    for (name, layout) in inventory {
+        let spool = inspect_salt_v2_tensor_spool(legacy, &name, layout, request.tensor_limits)
+            .map_err(SaltV2ModelImportError::Tensor)?;
+        additive_payload_bytes = sum(additive_payload_bytes, spool.payload_bytes)?;
+        matrices.push(SaltV2MatrixImportPlan {
+            name,
+            layout,
+            spool,
+        });
+    }
+    let mut dense_payload_bytes = 0;
+    for t in &plan.tensors {
+        let bytes = t.source.byte_len().map_err(QuantEngineError::Plan)?;
+        if bytes > plan.limits.max_source_bytes {
+            return Err(refusal("inspection dense source exceeds cap"));
+        }
+        dense_payload_bytes = sum(dense_payload_bytes, bytes)?;
+    }
+    let mut asset_payload_bytes = 0;
+    for name in &plan.assets {
+        let bytes = companions.asset(
+            name,
+            platform(plan.limits.max_asset_bytes, "inspection asset cap")?,
+        )?;
+        if bytes.len() as u64 > plan.limits.max_asset_bytes {
+            return Err(refusal("inspection asset exceeds cap"));
+        }
+        asset_payload_bytes = sum(asset_payload_bytes, bytes.len() as u64)?;
+    }
+    let spool_payload_bytes = sum(
+        sum(additive_payload_bytes, dense_payload_bytes)?,
+        asset_payload_bytes,
+    )?;
+    if spool_payload_bytes > request.max_spool_bytes
+        || spool_payload_bytes > request.receiving.max_source_bytes
+        || spool_payload_bytes > plan.limits.max_retained_blob_bytes
+    {
+        return Err(refusal(
+            "inspection aggregate raw spool payload exceeds cap (container overhead not covered)",
+        ));
+    }
+    Ok(SaltV2ModelImportPlan {
+        matrices,
+        additive_payload_bytes,
+        dense_payload_bytes,
+        asset_payload_bytes,
+        spool_payload_bytes,
+    })
 }
 
 /// Published ordinary Imported model, original prepared log and explicit warnings.
@@ -162,53 +339,7 @@ pub fn import_salt_v2_model<R: Read + Seek, S: Read + Write + Seek>(
     if spool.seek(SeekFrom::End(0))? != 0 || spool.seek(SeekFrom::Start(0))? != 0 {
         return Err(refusal("model import spool must be empty"));
     }
-    if legacy.is_empty() {
-        return Err(refusal("legacy matrix inventory is empty"));
-    }
-    let mut matrices = Vec::new();
-    for name in legacy.tensor_names() {
-        if plan
-            .tensors
-            .binary_search_by(|t| t.source.name.as_str().cmp(name))
-            .is_ok()
-        {
-            return Err(refusal("legacy and companion tensor names collide"));
-        }
-        let info = legacy
-            .tensor_info(name)
-            .ok_or_else(|| refusal("legacy metadata missing"))?;
-        let [rows, cols] = info.dims() else {
-            return Err(refusal("legacy model import requires rank-two matrices"));
-        };
-        if info.transform() != SaltV2Transform::None {
-            return Err(refusal(
-                "legacy model transform lacks an admitted exact basis",
-            ));
-        }
-        let maximum = legacy
-            .tensor_plane_counts(name)
-            .map_err(E::Legacy)?
-            .max()
-            .ok_or_else(|| refusal("legacy counts absent"))?;
-        let layout = AdditiveLayout {
-            rows: *rows,
-            cols: *cols,
-            tile: 256,
-            group: request.group,
-            max_planes: u8::try_from(maximum).map_err(|_| refusal("legacy plane count"))?,
-            allocation: PlaneAllocation::PerTile,
-            codec: request.codec,
-            law: ScaleLaw {
-                anchor: ScaleAnchor::Group,
-                relation: PlaneRelation::Free,
-                precision: ScalePrecision::F16,
-            },
-            basis: Basis::Identity,
-            transport: Transport::Raw,
-        };
-        layout.validate().map_err(|_| refusal("import layout"))?;
-        matrices.push((name.to_owned(), layout));
-    }
+    let matrices = matrix_inventory(request, legacy)?;
     let mut observed = ObservedWeightSource::new(plan, companions)?;
     let mut blobs = Vec::new();
     let mut tensors = Vec::new();

@@ -32,8 +32,9 @@ pub use model::{
     verify_package_with_fit_log,
 };
 pub use model_import::{
-    ImportedSaltV2Model, SaltV2ModelGuardError, SaltV2ModelImportError, SaltV2ModelImportRequest,
-    import_salt_v2_model, verify_imported_model_with_log,
+    ImportedSaltV2Model, SaltV2MatrixImportPlan, SaltV2ModelGuardError, SaltV2ModelImportError,
+    SaltV2ModelImportPlan, SaltV2ModelImportRequest, import_salt_v2_model,
+    inspect_salt_v2_model_import, verify_imported_model_with_log,
 };
 pub use sinks::{DirectoryTensorSink, MemoryTensorSink, TritModelPublicationError};
 pub use source_stage::{PublishedSalienceStage, StagedSalienceSource};

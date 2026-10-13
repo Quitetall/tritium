@@ -1,8 +1,8 @@
 //! Bounded adaptation of the existing strict flattened SALT V2 reader.
 mod spool;
 pub use spool::{
-    SaltTensorSpoolError, SaltTensorSpoolImport, SaltTensorSpoolLimits,
-    import_salt_v2_tensor_to_spool,
+    SaltTensorSpoolError, SaltTensorSpoolImport, SaltTensorSpoolLimits, SaltTensorSpoolPlan,
+    import_salt_v2_tensor_to_spool, inspect_salt_v2_tensor_spool,
 };
 use std::io::{Read, Seek};
 

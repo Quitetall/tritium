@@ -38,6 +38,31 @@ Typed output is a new `model.trit`/`evidence.jsonl` directory, not a `.tslb` fil
 `--conversion-run-id` keeps its meaning; outer lifecycle summaries identify the
 chosen command and cannot disable the sealed engine log.
 
+Read-only original-bundle migration inspection is available before a large write:
+
+```text
+tritium --evidence off migrate salt-v2-bundle --inspect-only \
+  --bundle /absolute/original-bundle --profile compact-v1 --codec b3 --group 128
+```
+
+It uses the same strict descriptor/HF/preserved/profile reader and shared
+count/codec/index planner. It reports matrix/companion inventory and logical
+trit, scale, working and raw-spool payload requirements. Qwen language/MTP names,
+roles and shapes are compared to the public schema. The original completeness
+and official-source flags remain unchanged; a matching inventory is metadata
+coverage, not official source authentication or model quality.
+
+Inspection forbids `--output`, `--spool` and `--import-run-id`, creates neither
+spool nor output, and does not encode bytes or perform target scale-bit proof.
+Its output explicitly excludes container overhead and full physical RSS/VRAM.
+Logical caps apply; it never expands them automatically. The selected profile
+is fully read/validated, so inspection is not a cheap header-only probe.
+
+Without `--inspect-only`, those three write/run arguments remain required.
+The same logical preflight runs before spool creation; actual import still
+requires exact scale/trit encoding checks, terminal custody and cold log replay.
+This imports existing coefficients without fitting and does not qualify release.
+
 Typed `quantize` rejects legacy `--input`/`--model`, `--bpw`, `--scale-group`,
 `--sensitivity`, `--fisher`, `--format`, `--ladder`, `--planes`, `--group`,
 `--grid` and `--rotate`, even when explicitly set to their legacy defaults.

@@ -15,7 +15,8 @@ use tritium_format::{
 };
 use tritium_quantize::engine::{
     DirectoryTensorSink, QuantEngineError, SafeTensorsWeightSource, SaltV2ModelImportRequest,
-    WeightSource, import_salt_v2_model, verify_imported_model_with_log,
+    WeightSource, import_salt_v2_model, inspect_salt_v2_model_import,
+    verify_imported_model_with_log,
 };
 use tritium_schema::{
     LEGACY_SALT_V2_HF_ASSETS, LegacySaltV2BundleDescriptor, PlaneCodec, QuantAction, QuantLimits,
@@ -42,6 +43,9 @@ enum Codec {
 
 #[derive(Args, Debug)]
 pub(crate) struct BundleArgs {
+    /// Strict read-only source/inventory/logical sizing; no scale proof or output.
+    #[arg(long)]
+    inspect_only: bool,
     /// Original schema-v3 bundle directory; not a downloaded/official source claim.
     #[arg(long)]
     bundle: PathBuf,
@@ -49,14 +53,26 @@ pub(crate) struct BundleArgs {
     #[arg(long, value_enum)]
     profile: Profile,
     /// New destination directory containing model.trit and evidence.jsonl.
-    #[arg(long)]
-    output: PathBuf,
+    #[arg(
+        long,
+        required_unless_present = "inspect_only",
+        conflicts_with = "inspect_only"
+    )]
+    output: Option<PathBuf>,
     /// Explicit new temporary spool file; removed on success or refusal.
-    #[arg(long)]
-    spool: PathBuf,
+    #[arg(
+        long,
+        required_unless_present = "inspect_only",
+        conflicts_with = "inspect_only"
+    )]
+    spool: Option<PathBuf>,
     /// Stable run identity for mandatory prepared evidence, separate from CLI summary.
-    #[arg(long)]
-    import_run_id: String,
+    #[arg(
+        long,
+        required_unless_present = "inspect_only",
+        conflicts_with = "inspect_only"
+    )]
+    import_run_id: Option<String>,
     /// Canonical target plane coding, not an execution-profile admission.
     #[arg(long, value_enum)]
     codec: Codec,
@@ -179,10 +195,20 @@ fn import(args: &BundleArgs) -> Result<()> {
         .all(|n| n > 0),
         "source/spool/working limits must be positive"
     );
-    let recorder = EvidenceRecorder::new(
-        &args.import_run_id,
-        [LEGACY_MODEL_IMPORT_PREPARED_REGISTRATION],
-    )?;
+    let recorder = if args.inspect_only {
+        None
+    } else {
+        ensure!(
+            args.output.is_some() && args.spool.is_some(),
+            "import requires output and spool"
+        );
+        Some(EvidenceRecorder::new(
+            args.import_run_id
+                .as_deref()
+                .context("import requires --import-run-id")?,
+            [LEGACY_MODEL_IMPORT_PREPARED_REGISTRATION],
+        )?)
+    };
     ensure!(
         !fs::symlink_metadata(&args.bundle)?.file_type().is_symlink()
             && fs::metadata(&args.bundle)?.is_dir(),
@@ -275,6 +301,40 @@ fn import(args: &BundleArgs) -> Result<()> {
     guards.push(guard);
     let mut source = GuardedCompanions { inner, guards };
     let inventory = source.inventory()?;
+    let qwen_inventory_matches = if architecture == "qwen3_5" {
+        let config = tritium_nn::Qwen35CheckpointConfig::from_hf_config(std::str::from_utf8(
+            &source
+                .inner
+                .asset("config.json", platform_asset_limit(limits.max_asset_bytes)?)?,
+        )?)?;
+        let schema = tritium_nn::qwen35_language_mtp_tensor_schema(&config.text)?;
+        ensure!(
+            legacy.len().checked_add(inventory.len()) == Some(schema.len()),
+            "original Qwen language/MTP inventory count differs from config"
+        );
+        for expected in schema {
+            let shape = expected.shape.iter().map(|&n| n as u64).collect::<Vec<_>>();
+            match expected.role {
+                tritium_nn::Qwen35TensorSchemaRole::Matrix => ensure!(
+                    legacy
+                        .tensor_info(&expected.name)
+                        .is_some_and(|t| t.dims() == shape),
+                    "original Qwen matrix {} missing or has wrong shape",
+                    expected.name
+                ),
+                tritium_nn::Qwen35TensorSchemaRole::Preserved => ensure!(
+                    inventory
+                        .iter()
+                        .any(|t| t.name == expected.name && t.shape == shape),
+                    "original Qwen preserved tensor {} missing or has wrong shape",
+                    expected.name
+                ),
+            }
+        }
+        true
+    } else {
+        false
+    };
     let request = SaltV2ModelImportRequest {
         companions: QuantPlan {
             architecture,
@@ -309,13 +369,43 @@ fn import(args: &BundleArgs) -> Result<()> {
         max_spool_bytes: limits.max_spool_bytes,
         receiving,
     };
-    let mut spool = OwnedSpool::new(&args.spool)?;
+    let inspection = inspect_salt_v2_model_import(&request, &legacy, &mut source)?;
+    if args.inspect_only {
+        legacy.verify_unchanged()?;
+        source.verify()?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "status":"strict-indexed-plan-not-imported-not-qualified",
+                "legacy_id":legacy.package_id().to_string(),
+                "selected_source_bytes":legacy.ledger().total_bytes,
+                "matrix_tensors":inspection.matrices.len(),"preserved_tensors":request.companions.tensors.len(),
+                "qwen_language_mtp_inventory":if qwen_inventory_matches {"matches-config-metadata-only"} else {"unknown-generic-architecture"},
+                "additive_payload_bytes":inspection.additive_payload_bytes,"dense_payload_bytes":inspection.dense_payload_bytes,
+                "asset_payload_bytes":inspection.asset_payload_bytes,"spool_payload_bytes":inspection.spool_payload_bytes,
+                "maximum_tensor_trits":inspection.matrices.iter().map(|m|m.spool.trits).max(),
+                "maximum_tensor_scales":inspection.matrices.iter().map(|m|m.spool.scales).max(),
+                "maximum_tensor_payload_bytes":inspection.matrices.iter().map(|m|m.spool.payload_bytes).max(),
+                "maximum_tensor_working_bytes":inspection.matrices.iter().map(|m|m.spool.working_bytes).max(),
+                "scale_representability":"not-checked","dense_payload_validation":"not-checked-by-plan",
+                "container_overhead":"not-planned","physical_memory":"not-covered",
+                "complete_model":descriptor.complete_model,"official_payload_authenticated":descriptor.official_payload_authenticated,
+                "source_identity_status":descriptor.source_identity_status,"source_authentication":"not-verified-by-import",
+                "output_created":false,"spool_created":false,
+            })
+        );
+        return Ok(());
+    }
+    let output = args.output.as_ref().context("import requires --output")?;
+    let spool_path = args.spool.as_ref().context("import requires --spool")?;
+    let recorder = recorder.context("import requires prepared recorder")?;
+    let mut spool = OwnedSpool::new(spool_path)?;
     let imported = import_salt_v2_model(
         &request,
         &mut legacy,
         &mut source,
         &mut spool.file,
-        &mut DirectoryTensorSink::new(&args.output),
+        &mut DirectoryTensorSink::new(output),
         recorder,
     )?;
     let mut warnings = imported
@@ -339,6 +429,10 @@ fn import(args: &BundleArgs) -> Result<()> {
         })
     );
     Ok(())
+}
+
+fn platform_asset_limit(cap: u64) -> Result<usize> {
+    usize::try_from(cap).context("asset cap exceeds platform")
 }
 
 fn same_file(a: &Metadata, b: &Metadata) -> bool {
