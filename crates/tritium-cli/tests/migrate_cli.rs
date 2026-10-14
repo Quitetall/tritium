@@ -121,6 +121,8 @@ fn compact_cli_preserves_exact_package_and_cold_replay_without_embedded_manifest
                 assert_eq!(fs::read(root.0.join("output/model.trit")).unwrap(), bytes);
                 let report: serde_json::Value = serde_json::from_slice(&compact.stdout).unwrap();
                 assert_eq!(report["evidence_profile"], "canonical-manifest-bound-v1");
+                assert_eq!(report["source_profile"], profile);
+                assert_eq!(report["levels"], serde_json::json!(["imported"]));
                 assert_eq!(report["complete_model"], false);
                 assert_eq!(report["official_payload_authenticated"], false);
                 let log = verify_jsonl(
@@ -144,7 +146,11 @@ fn compact_cli_preserves_exact_package_and_cold_replay_without_embedded_manifest
                         .len(),
                     1
                 );
-                assert!(verify(&root.0).status.success());
+                let replay = verify(&root.0);
+                assert!(replay.status.success());
+                let replay_report: serde_json::Value =
+                    serde_json::from_slice(&replay.stdout).unwrap();
+                assert_eq!(replay_report["levels"], serde_json::json!(["imported"]));
                 assert!(!root.0.join("spool").exists());
                 let refused = invoke(&root.0, profile, target, &["--compact-evidence"]);
                 assert!(!refused.status.success());
@@ -179,6 +185,8 @@ fn readonly_inspection_matches_actual_import_payloads_without_output_or_spool() 
                     "strict-indexed-plan-not-imported-not-qualified"
                 );
                 assert_eq!(report["matrix_tensors"], 1);
+                assert_eq!(report["source_profile"], profile);
+                assert_eq!(report["levels"], serde_json::json!(["imported"]));
                 assert_eq!(report["preserved_tensors"], 1);
                 assert_eq!(
                     report["qwen_language_mtp_inventory"],
@@ -558,6 +566,8 @@ fn actual_bundle_both_profiles_all_source_codecs_exact_trits_scales_assets_and_r
                 assert!(!scratch.0.join("spool").exists());
                 let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
                 assert_eq!(report["status"], "imported-not-qualified");
+                assert_eq!(report["source_profile"], selection);
+                assert_eq!(report["levels"], serde_json::json!(["imported"]));
                 assert_eq!(report["complete_model"], false);
                 let mut model = TritModelReader::open(
                     fs::File::open(scratch.0.join("output/model.trit")).unwrap(),

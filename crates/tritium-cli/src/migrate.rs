@@ -38,6 +38,14 @@ enum Profile {
     CompactV1,
     NearLosslessV1,
 }
+impl Profile {
+    fn name(self) -> &'static str {
+        match self {
+            Self::CompactV1 => "compact-v1",
+            Self::NearLosslessV1 => "near-lossless-v1",
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Codec {
     D2,
@@ -176,6 +184,7 @@ pub(crate) fn run(command: MigrateCommand) -> Result<()> {
                     "status": "import-consistent-not-qualified",
                     "package_id": model.package_id().to_string(),
                     "legacy_id": view.legacy_id(),
+                    "levels": model_levels(model.manifest()),
                 })
             );
             Ok(())
@@ -388,6 +397,8 @@ fn import(args: &BundleArgs) -> Result<()> {
             serde_json::json!({
                 "status":"strict-indexed-plan-not-imported-not-qualified",
                 "legacy_id":legacy.package_id().to_string(),
+                "source_profile":args.profile.name(),
+                "levels":request.companions.levels,
                 "selected_source_bytes":legacy.ledger().total_bytes,
                 "matrix_tensors":inspection.matrices.len(),"preserved_tensors":request.companions.tensors.len(),
                 "qwen_language_mtp_inventory":if qwen_inventory_matches {"matches-config-metadata-only"} else {"unknown-generic-architecture"},
@@ -445,6 +456,8 @@ fn import(args: &BundleArgs) -> Result<()> {
             "status": "imported-not-qualified",
             "evidence_profile": if args.compact_evidence { "canonical-manifest-bound-v1" } else { "embedded-manifest-v1" },
             "package_id": imported.model.package_id().to_string(),
+            "source_profile": args.profile.name(),
+            "levels": model_levels(imported.model.manifest()),
             "complete_model": descriptor.complete_model,
             "official_payload_authenticated": descriptor.official_payload_authenticated,
             "source_identity_status": descriptor.source_identity_status,
@@ -453,6 +466,14 @@ fn import(args: &BundleArgs) -> Result<()> {
         })
     );
     Ok(())
+}
+
+fn model_levels(manifest: &tritium_schema::ModelManifest) -> Vec<&str> {
+    manifest
+        .levels
+        .iter()
+        .map(|level| level.name.as_str())
+        .collect()
 }
 
 fn platform_asset_limit(cap: u64) -> Result<usize> {
