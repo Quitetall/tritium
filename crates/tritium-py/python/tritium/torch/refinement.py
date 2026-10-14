@@ -1016,23 +1016,35 @@ def refine(
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
     }[config.compute_dtype]
+    training_flags = tuple((module, module.training) for module in teacher.modules())
+    original_bindings = tuple(
+        (module, dict(module._parameters), dict(module._buffers))
+        for module, _ in training_flags
+    )
+    # Retain storage views, not cloned masters. Casting back to the old dtype
+    # cannot recover bits rounded by a lower-precision execution cast. Buffers
+    # and future-overwrite parameters may also be replaced by Module._apply.
     original_tensors = {
-        name: (tensor, tensor.dtype)
-        for name, tensor in (
+        id(tensor): (
+            tensor,
+            tensor.detach(),
+            tensor.grad if isinstance(tensor, nn.Parameter) else None,
+            tensor.grad.detach()
+            if isinstance(tensor, nn.Parameter) and tensor.grad is not None
+            else None,
+        )
+        for _, tensor in (
             *teacher.named_parameters(),
             *teacher.named_buffers(),
         )
         if tensor.is_floating_point() or tensor.is_complex()
     }
-    if compute_dtype != torch.float32:
-        # Exact source identity was admitted above. The recipe's lower-precision
-        # execution mode now applies to teacher and student alike, avoiding a
-        # resident FP32 teacher plus FP16 student duplicate on constrained GPUs.
-        teacher.to(dtype=compute_dtype)
-
-    teacher_was_training = teacher.training
-    teacher.eval()
     try:
+        if compute_dtype != torch.float32:
+            # Original storage must coexist with the execution cast until it is
+            # restored, including if a partially completed cast raises.
+            teacher.to(dtype=compute_dtype)
+        teacher.eval()
         parent_student, _ = _build_scale_model(
             teacher, conversion, compute_dtype=compute_dtype
         )
@@ -1159,13 +1171,18 @@ def refine(
         del initial_planes, best_planes
         gc.collect()
     finally:
-        teacher.train(teacher_was_training)
         if compute_dtype != torch.float32:
-            for tensor, dtype in original_tensors.values():
-                # `teacher.to` mutates tensor storage in place; restore the
-                # caller-owned module's exact floating/complex dtypes.
-                if tensor.dtype != dtype:
-                    tensor.data = tensor.data.to(dtype=dtype)
+            for tensor, data, gradient, gradient_data in original_tensors.values():
+                tensor.data = data
+                if isinstance(tensor, nn.Parameter):
+                    if gradient is not None:
+                        gradient.data = gradient_data
+                    tensor.grad = gradient
+            for module, parameters, buffers in original_bindings:
+                module._parameters.update(parameters)
+                module._buffers.update(buffers)
+        for module, training in training_flags:
+            module.training = training
     if after > before:
         raise TritiumError(
             "held-out predecessor retention failed",
