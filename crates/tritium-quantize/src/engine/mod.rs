@@ -17,6 +17,7 @@ mod model;
 mod model_import;
 mod observed_source;
 mod original_capture;
+mod owner_scores;
 mod salience;
 mod salience_model;
 mod sinks;
@@ -25,6 +26,7 @@ mod source_transform;
 mod sources;
 
 pub use observed_source::ObservedWeightSource;
+pub use owner_scores::{OwnerScoreError, OwnerScoreUse, OwnerScoreWindow};
 pub use salience::{SalienceFoldError, SaliencePair, divide_rows, scale_cols, smooth_scales};
 pub use salience_model::JoinedSalienceModel;
 

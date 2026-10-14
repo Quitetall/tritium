@@ -17,7 +17,7 @@ use std::{
 use tritium_quantize::engine::{
     CalibrationBatch, CalibrationCache, CalibrationCacheBuilder, CalibrationCollector,
     CalibrationInput, CalibrationOutputBatch, FileWeightSource, ObservedWeightSource,
-    read_original_file_bounded,
+    OwnerScoreUse, OwnerScoreWindow, read_original_file_bounded,
 };
 use tritium_schema::{
     BlobId, CalibratedFitPlan, CalibratedQuantAction, CalibratedQuantPlan,
@@ -35,6 +35,60 @@ fn json<T: serde::de::DeserializeOwned>(value: &str) -> PyResult<T> {
         return Err(error("calibration JSON exceeds byte limit"));
     }
     serde_json::from_str(value).map_err(error)
+}
+
+/// Numerical only: caller owns actual use coverage, adjoints and immutable buffers.
+/// Each tuple is ("matmul" | "gather", input | indices, full output adjoint).
+#[pyfunction]
+pub(crate) fn _owner_row_score(
+    py: Python<'_>,
+    rows: usize,
+    columns: usize,
+    row: usize,
+    uses: Vec<(String, Dlpack, Dlpack)>,
+    max_observation_bytes: u64,
+    max_workspace_bytes: u64,
+) -> PyResult<Py<PyAny>> {
+    let mut observations = Vec::new();
+    observations.try_reserve_exact(uses.len()).map_err(error)?;
+    for (role, input, adjoint) in &uses {
+        let input_shape = tensor_shape(input, "owner-use input")?;
+        let adjoint_shape = tensor_shape(adjoint, "owner-use adjoint")?;
+        let adjoints = cpu_f32(adjoint, "owner-use adjoint")?;
+        match role.as_str() {
+            "matmul" => {
+                if input_shape.len() != 2
+                    || input_shape[1] != columns
+                    || adjoint_shape.as_slice() != [input_shape[0], rows]
+                {
+                    return Err(error("owner matmul shape mismatch"));
+                }
+                observations.push(OwnerScoreUse::Matmul {
+                    samples: input_shape[0],
+                    inputs: cpu_f32(input, "owner matmul input")?,
+                    adjoints,
+                });
+            }
+            "gather" => {
+                if input_shape.len() != 1 || adjoint_shape.as_slice() != [input_shape[0], columns] {
+                    return Err(error("owner gather shape mismatch"));
+                }
+                observations.push(OwnerScoreUse::Gather {
+                    indices: input.cpu_data_slice::<i64>().map_err(error)?,
+                    adjoints,
+                });
+            }
+            _ => return Err(error("unsupported owner-use role")),
+        }
+    }
+    let window = OwnerScoreWindow::new(rows, columns, &observations, max_observation_bytes)
+        .map_err(error)?;
+    let values = window.row_score(row, max_workspace_bytes).map_err(error)?;
+    // Transfer the one f64 row without narrowing or a second output-data copy.
+    let capsule: Dlpack = dlpark::Builder::from(Box::new(ndarray::Array1::from_vec(values)))
+        .try_build()
+        .map_err(error)?;
+    Ok(capsule.into_pyobject(py)?.unbind())
 }
 
 /// Actual complete stored-byte observation. It is neither a source lock nor a qualification.
