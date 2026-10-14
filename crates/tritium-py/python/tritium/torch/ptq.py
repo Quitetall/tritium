@@ -2147,6 +2147,34 @@ def load_activation_calibration(
     )
 
 
+def _activation_rows(value: torch.Tensor) -> Iterator[torch.Tensor]:
+    """Preserve legacy moment-reduction chunks without a full strided reshape."""
+    features = value.shape[-1]
+    maximum_rows = max(1, (1024 * 1024) // features)
+    maximum_elements = maximum_rows * features
+    if value.is_contiguous() or value.numel() <= maximum_elements:
+        rows = value.reshape(-1, features)
+        for offset in range(0, rows.shape[0], maximum_rows):
+            yield rows[offset : offset + maximum_rows]
+        return
+    # Slabs need not align to the old row windows. Reblock in the input dtype
+    # before FP64 conversion so summation order and persisted evidence stay exact.
+    pending = torch.empty(maximum_elements, dtype=value.dtype, device=value.device)
+    used = 0
+    for piece in _logical_tensor_pieces(value, maximum_elements):
+        offset = 0
+        while offset < piece.numel():
+            count = min(maximum_elements - used, piece.numel() - offset)
+            pending[used : used + count].copy_(piece[offset : offset + count])
+            used += count
+            offset += count
+            if used == maximum_elements:
+                yield pending.view(maximum_rows, features)
+                used = 0
+    if used:
+        yield pending[:used].view(-1, features)
+
+
 def _collect_activations(
     prepared: PreparedModel,
     data: Iterable[Any],
@@ -2193,12 +2221,10 @@ def _collect_activations(
                     stage="calibrate",
                     module=path,
                 )
-            rows = value.reshape(-1, value.shape[-1])
-            chunk_rows = max(1, (1024 * 1024) // rows.shape[-1])
-            for offset in range(0, rows.shape[0], chunk_rows):
-                chunk = rows[offset : offset + chunk_rows].to(torch.float64)
+            for rows in _activation_rows(value):
+                chunk = rows.to(torch.float64)
                 accumulators[path].add_(chunk.square().sum(dim=0).cpu())
-            samples[path] += rows.shape[0]
+                samples[path] += rows.shape[0]
 
         return capture
 
