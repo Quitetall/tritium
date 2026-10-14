@@ -17,7 +17,7 @@ use std::{
 use tritium_quantize::engine::{
     CalibrationBatch, CalibrationCache, CalibrationCacheBuilder, CalibrationCollector,
     CalibrationInput, CalibrationOutputBatch, FileWeightSource, ObservedWeightSource,
-    OwnerScoreUse, OwnerScoreWindow, read_original_file_bounded,
+    OwnedOwnerScoreWindow, OwnerScoreUse, OwnerScoreWindow, read_original_file_bounded,
 };
 use tritium_schema::{
     BlobId, CalibratedFitPlan, CalibratedQuantAction, CalibratedQuantPlan,
@@ -49,9 +49,23 @@ pub(crate) fn _owner_row_score(
     max_observation_bytes: u64,
     max_workspace_bytes: u64,
 ) -> PyResult<Py<PyAny>> {
+    let observations = owner_uses(rows, columns, &uses)?;
+    let window = OwnerScoreWindow::new(rows, columns, &observations, max_observation_bytes)
+        .map_err(error)?;
+    export_owner_row(
+        py,
+        window.row_score(row, max_workspace_bytes).map_err(error)?,
+    )
+}
+
+fn owner_uses(
+    rows: usize,
+    columns: usize,
+    uses: &[(String, Dlpack, Dlpack)],
+) -> PyResult<Vec<OwnerScoreUse<'_>>> {
     let mut observations = Vec::new();
     observations.try_reserve_exact(uses.len()).map_err(error)?;
-    for (role, input, adjoint) in &uses {
+    for (role, input, adjoint) in uses {
         let input_shape = tensor_shape(input, "owner-use input")?;
         let adjoint_shape = tensor_shape(adjoint, "owner-use adjoint")?;
         let adjoints = cpu_f32(adjoint, "owner-use adjoint")?;
@@ -81,14 +95,56 @@ pub(crate) fn _owner_row_score(
             _ => return Err(error("unsupported owner-use role")),
         }
     }
-    let window = OwnerScoreWindow::new(rows, columns, &observations, max_observation_bytes)
-        .map_err(error)?;
-    let values = window.row_score(row, max_workspace_bytes).map_err(error)?;
+    Ok(observations)
+}
+
+fn export_owner_row(py: Python<'_>, values: Vec<f64>) -> PyResult<Py<PyAny>> {
     // Transfer the one f64 row without narrowing or a second output-data copy.
     let capsule: Dlpack = dlpark::Builder::from(Box::new(ndarray::Array1::from_vec(values)))
         .try_build()
         .map_err(error)?;
     Ok(capsule.into_pyobject(py)?.unbind())
+}
+
+/// Immutable numerical observations, not a persisted estimator or qualification.
+#[pyclass(frozen, module = "tritium._tritium")]
+pub(crate) struct NativeOwnerScoreWindow {
+    source: OriginalSourceId,
+    #[pyo3(get)]
+    tensor_name: String,
+    #[pyo3(get)]
+    rows: usize,
+    #[pyo3(get)]
+    columns: usize,
+    observations: OwnedOwnerScoreWindow,
+}
+#[pymethods]
+impl NativeOwnerScoreWindow {
+    #[getter]
+    fn source_id(&self) -> String {
+        hex(self.source.as_bytes())
+    }
+    #[getter]
+    fn observation_bytes(&self) -> u64 {
+        self.observations.observation_bytes()
+    }
+    #[getter]
+    fn use_count(&self) -> usize {
+        self.observations.use_count()
+    }
+    fn row_score(
+        &self,
+        py: Python<'_>,
+        row: usize,
+        max_workspace_bytes: u64,
+    ) -> PyResult<Py<PyAny>> {
+        export_owner_row(
+            py,
+            self.observations
+                .row_score(row, max_workspace_bytes)
+                .map_err(error)?,
+        )
+    }
 }
 
 /// Actual complete stored-byte observation. It is neither a source lock nor a qualification.
@@ -140,6 +196,35 @@ pub(crate) fn _observe_model_plan_source(
 
 #[pymethods]
 impl NativeSourceObservation {
+    /// Geometry/source come from actual original inventory, never caller hashes.
+    fn _owner_window(
+        &self,
+        name: &str,
+        uses: Vec<(String, Dlpack, Dlpack)>,
+        max_observation_bytes: u64,
+    ) -> PyResult<NativeOwnerScoreWindow> {
+        let tensor = &self
+            .tensors
+            .iter()
+            .find(|t| t.source.name == name)
+            .ok_or_else(|| error("tensor absent from observed source"))?
+            .source;
+        let [rows, columns] = tensor.shape.as_slice() else {
+            return Err(error("owner score requires a matrix"));
+        };
+        let rows = usize::try_from(*rows).map_err(error)?;
+        let columns = usize::try_from(*columns).map_err(error)?;
+        let observations = owner_uses(rows, columns, &uses)?;
+        let window = OwnerScoreWindow::new(rows, columns, &observations, max_observation_bytes)
+            .map_err(error)?;
+        Ok(NativeOwnerScoreWindow {
+            source: self.source,
+            tensor_name: name.to_owned(),
+            rows,
+            columns,
+            observations: window.snapshot().map_err(error)?,
+        })
+    }
     fn validate_cache(&self, cache: &NativeCalibrationCache) -> PyResult<()> {
         let binding = cache.cache.binding();
         if binding.request.model != self.source

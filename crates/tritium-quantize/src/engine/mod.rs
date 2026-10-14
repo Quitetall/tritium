@@ -26,7 +26,7 @@ mod source_transform;
 mod sources;
 
 pub use observed_source::ObservedWeightSource;
-pub use owner_scores::{OwnerScoreError, OwnerScoreUse, OwnerScoreWindow};
+pub use owner_scores::{OwnedOwnerScoreWindow, OwnerScoreError, OwnerScoreUse, OwnerScoreWindow};
 pub use salience::{SalienceFoldError, SaliencePair, divide_rows, scale_cols, smooth_scales};
 pub use salience_model::JoinedSalienceModel;
 

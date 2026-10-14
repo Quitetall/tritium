@@ -62,6 +62,69 @@ pub struct OwnerScoreWindow<'a> {
     rows: usize,
     columns: usize,
     uses: &'a [OwnerScoreUse<'a>],
+    observation_bytes: u64,
+}
+
+#[derive(Debug)]
+enum OwnedUse {
+    Matmul {
+        samples: usize,
+        inputs: Vec<f32>,
+        adjoints: Vec<f32>,
+    },
+    Gather {
+        indices: Vec<i64>,
+        adjoints: Vec<f32>,
+    },
+}
+impl OwnedUse {
+    fn borrowed(&self) -> OwnerScoreUse<'_> {
+        match self {
+            Self::Matmul {
+                samples,
+                inputs,
+                adjoints,
+            } => OwnerScoreUse::Matmul {
+                samples: *samples,
+                inputs,
+                adjoints,
+            },
+            Self::Gather { indices, adjoints } => OwnerScoreUse::Gather { indices, adjoints },
+        }
+    }
+}
+
+/// Immutable numerical snapshots, not a source lock or an estimator/cache receipt.
+#[derive(Debug)]
+pub struct OwnedOwnerScoreWindow {
+    rows: usize,
+    columns: usize,
+    uses: Vec<OwnedUse>,
+    observation_bytes: u64,
+}
+impl OwnedOwnerScoreWindow {
+    /// Logical owned numerical bytes. Excludes metadata, external copies and RSS.
+    pub fn observation_bytes(&self) -> u64 {
+        self.observation_bytes
+    }
+    /// Actual number of supplied invocations, not independently verified coverage.
+    pub fn use_count(&self) -> usize {
+        self.uses.len()
+    }
+    /// Reconstruct one row without revalidating or materializing other rows.
+    pub fn row_score(
+        &self,
+        row: usize,
+        max_workspace_bytes: u64,
+    ) -> Result<Vec<f64>, OwnerScoreError> {
+        reconstruct_row(
+            self.rows,
+            self.columns,
+            self.uses.iter().map(OwnedUse::borrowed),
+            row,
+            max_workspace_bytes,
+        )
+    }
 }
 
 impl<'a> OwnerScoreWindow<'a> {
@@ -131,6 +194,39 @@ impl<'a> OwnerScoreWindow<'a> {
             rows,
             columns,
             uses,
+            observation_bytes: bytes,
+        })
+    }
+
+    /// Copy admitted observations into immutable owned storage. Source buffers
+    /// must remain immutable during this call; transient source/copy overlap is
+    /// not included in the observation limit. No identity or receipt is invented.
+    pub fn snapshot(&self) -> Result<OwnedOwnerScoreWindow, OwnerScoreError> {
+        let mut uses = Vec::new();
+        uses.try_reserve_exact(self.uses.len())
+            .map_err(|_| OwnerScoreError::Allocation)?;
+        for usage in self.uses {
+            uses.push(match *usage {
+                OwnerScoreUse::Matmul {
+                    samples,
+                    inputs,
+                    adjoints,
+                } => OwnedUse::Matmul {
+                    samples,
+                    inputs: copy_slice(inputs)?,
+                    adjoints: copy_slice(adjoints)?,
+                },
+                OwnerScoreUse::Gather { indices, adjoints } => OwnedUse::Gather {
+                    indices: copy_slice(indices)?,
+                    adjoints: copy_slice(adjoints)?,
+                },
+            });
+        }
+        Ok(OwnedOwnerScoreWindow {
+            rows: self.rows,
+            columns: self.columns,
+            uses,
+            observation_bytes: self.observation_bytes,
         })
     }
 
@@ -142,53 +238,78 @@ impl<'a> OwnerScoreWindow<'a> {
         row: usize,
         max_workspace_bytes: u64,
     ) -> Result<Vec<f64>, OwnerScoreError> {
-        if row >= self.rows {
-            return Err(OwnerScoreError::Index);
-        }
-        let mut bytes = 0;
-        add_bytes(&mut bytes, self.columns, 8)?;
-        admit(bytes, max_workspace_bytes)?;
-        let mut score = Vec::new();
-        score
-            .try_reserve_exact(self.columns)
-            .map_err(|_| OwnerScoreError::Allocation)?;
-        score.resize(self.columns, 0.0);
-        for usage in self.uses {
-            match *usage {
-                OwnerScoreUse::Matmul {
-                    samples,
-                    inputs,
-                    adjoints,
-                } => {
-                    for sample in 0..samples {
-                        let delta = f64::from(adjoints[sample * self.rows + row]);
-                        for (value, &input) in score
-                            .iter_mut()
-                            .zip(&inputs[sample * self.columns..(sample + 1) * self.columns])
-                        {
-                            *value += delta * f64::from(input);
-                        }
+        reconstruct_row(
+            self.rows,
+            self.columns,
+            self.uses.iter().copied(),
+            row,
+            max_workspace_bytes,
+        )
+    }
+}
+
+fn copy_slice<T: Copy>(input: &[T]) -> Result<Vec<T>, OwnerScoreError> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(input.len())
+        .map_err(|_| OwnerScoreError::Allocation)?;
+    output.extend_from_slice(input);
+    Ok(output)
+}
+
+fn reconstruct_row<'a>(
+    rows: usize,
+    columns: usize,
+    uses: impl Iterator<Item = OwnerScoreUse<'a>>,
+    row: usize,
+    max_workspace_bytes: u64,
+) -> Result<Vec<f64>, OwnerScoreError> {
+    if row >= rows {
+        return Err(OwnerScoreError::Index);
+    }
+    let mut bytes = 0;
+    add_bytes(&mut bytes, columns, 8)?;
+    admit(bytes, max_workspace_bytes)?;
+    let mut score = Vec::new();
+    score
+        .try_reserve_exact(columns)
+        .map_err(|_| OwnerScoreError::Allocation)?;
+    score.resize(columns, 0.0);
+    for usage in uses {
+        match usage {
+            OwnerScoreUse::Matmul {
+                samples,
+                inputs,
+                adjoints,
+            } => {
+                for sample in 0..samples {
+                    let delta = f64::from(adjoints[sample * rows + row]);
+                    for (value, &input) in score
+                        .iter_mut()
+                        .zip(&inputs[sample * columns..(sample + 1) * columns])
+                    {
+                        *value += delta * f64::from(input);
                     }
                 }
-                OwnerScoreUse::Gather { indices, adjoints } => {
-                    for (sample, &index) in indices.iter().enumerate() {
-                        if usize::try_from(index) == Ok(row) {
-                            for (value, &delta) in score
-                                .iter_mut()
-                                .zip(&adjoints[sample * self.columns..(sample + 1) * self.columns])
-                            {
-                                *value += f64::from(delta);
-                            }
+            }
+            OwnerScoreUse::Gather { indices, adjoints } => {
+                for (sample, &index) in indices.iter().enumerate() {
+                    if usize::try_from(index) == Ok(row) {
+                        for (value, &delta) in score
+                            .iter_mut()
+                            .zip(&adjoints[sample * columns..(sample + 1) * columns])
+                        {
+                            *value += f64::from(delta);
                         }
                     }
                 }
             }
         }
-        if score.iter().any(|value| !value.is_finite()) {
-            return Err(OwnerScoreError::Nonfinite);
-        }
-        Ok(score)
     }
+    if score.iter().any(|value| !value.is_finite()) {
+        return Err(OwnerScoreError::Nonfinite);
+    }
+    Ok(score)
 }
 
 fn add_bytes(bytes: &mut u64, count: usize, width: u64) -> Result<(), OwnerScoreError> {
@@ -215,6 +336,36 @@ fn finite(values: &[f32]) -> Result<(), OwnerScoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_owns_values_and_reuses_validated_geometry() {
+        let mut inputs = [2.0, 3.0];
+        let mut adjoints = [1.0, -2.0];
+        let snapshot = {
+            let uses = [OwnerScoreUse::Matmul {
+                samples: 1,
+                inputs: &inputs,
+                adjoints: &adjoints,
+            }];
+            OwnerScoreWindow::new(2, 2, &uses, 16)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+        };
+        inputs.fill(f32::NAN);
+        adjoints.fill(f32::NAN);
+        assert_eq!(snapshot.observation_bytes(), 16);
+        assert_eq!(snapshot.use_count(), 1);
+        assert_eq!(snapshot.row_score(1, 16).unwrap(), [-4.0, -6.0]);
+        assert_eq!(snapshot.row_score(0, 16).unwrap(), [2.0, 3.0]);
+        assert_eq!(
+            snapshot.row_score(1, 15).unwrap_err(),
+            OwnerScoreError::Budget {
+                required: 16,
+                limit: 15
+            }
+        );
+    }
 
     #[test]
     fn owner_cross_terms_reinforce_and_cancel() {

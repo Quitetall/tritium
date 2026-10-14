@@ -53,6 +53,11 @@ class NativeModulePreparation:
             raise ValueError("native prepared source content changed")
         return observed
 
+    def capture_owner_window(self, window, objective, **limits):
+        """Actual shared-owner window capture; durable calibrated fitting is separate."""
+        from .owner_capture import capture_owner_window
+        return capture_owner_window(self, window, objective, **limits)
+
 
 def prepare_native_module(prepared, *, actions, levels, limits, work_dir, asset_paths,
                           architecture="torch-module"):
