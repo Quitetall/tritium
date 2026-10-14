@@ -248,6 +248,7 @@ def capture_owner_window(source, window, objective, *, objective_bytes,
         if role == "gather":
             frame["input"] = frame["input"].reshape(-1)
         frame["role"], frame["samples"] = role, samples
+        frame["ordinal"] = totals["calls"]
         totals["calls"] += 1; totals["samples"] += samples; totals["bytes"] += size
 
     def post(module, args, value):
@@ -280,6 +281,7 @@ def capture_owner_window(source, window, objective, *, objective_bytes,
         with torch.enable_grad():
             with _OwnerReads(protected, active, admit):
                 loss = objective(model, window)
+            records.sort(key=lambda frame: frame["ordinal"])
             _check_context(window, specs, snapshots)
             if (active or {id(frame["module"]) for frame in records} != set(consumers)):
                 raise ValueError("required owner consumers did not execute")

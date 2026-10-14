@@ -305,3 +305,27 @@ def test_ephemeral_capture_is_not_a_durable_calibrated_fit(tmp_path):
         convert_calibrated_native_module(captured, tmp_path/"output", "not-a-fit",
             partition="Full", damping=0.01, max_numeric_bytes=100_000, max_cache_package_bytes=100_000)
     assert not (tmp_path/"output").exists()
+
+
+def test_nested_ordinary_invocations_keep_operator_order(tmp_path, monkeypatch):
+    source = _source(tmp_path)
+    model = source.prepared.model
+    original = nn.Linear.forward
+    saved = []
+    def forward(module, value):
+        result = original(module, value)
+        if module is model.head and value.shape[0] > 1:
+            saved.append(module(value[:1]))
+        return result
+    monkeypatch.setattr(nn.Linear, "forward", forward)
+    def objective(model, window):
+        saved.clear()
+        result = _objective(model, window)
+        return result + 0.1 * saved[0].square().mean()
+    capture = _capture(source, objective=objective)
+    assert [(role,samples) for _,_,role,samples in capture.invocations] == [
+        ("gather",3), ("gather",3), ("matmul",3), ("matmul",1), ("matmul",1)]
+    dense = torch.autograd.grad(objective(model,_window()),model.head.weight)[0]
+    torch.testing.assert_close(capture.row_score("embed.weight",0,max_workspace_bytes=256),
+                               dense[0].double(),rtol=5e-6,atol=5e-7)
+    assert _hooks_empty(model)
