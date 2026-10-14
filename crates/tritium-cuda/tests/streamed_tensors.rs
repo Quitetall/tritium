@@ -51,7 +51,7 @@ fn physical_bounded_stream_crosses_payload_and_native_suffix_windows() {
         .tensor_stream_plan(source.metadata(), source.encoding())
         .unwrap()
         .unwrap();
-    assert_eq!(stream_plan.upload.host_workspace_bytes, 131072);
+    assert_eq!(stream_plan.upload.host_workspace_bytes, 196608);
     assert_eq!(stream_plan.upload.device_workspace_bytes, 4);
     assert!(stream_plan.upload.caps.payload_bytes > stream_plan.upload.host_workspace_bytes);
     let device = cuda.upload_tensor_stream(&source).unwrap();
@@ -66,6 +66,50 @@ fn physical_bounded_stream_crosses_payload_and_native_suffix_windows() {
             .unwrap();
     }
     assert_eq!(actual, expected);
+    // Failure after multiple full windows exercises queued-copy cleanup, not
+    // merely a tiny source that errors before its first staging flush.
+    for _ in 0..3 {
+        let failing = Source {
+            metadata: source.metadata(),
+            encoding: source.encoding(),
+            bytes: &raw,
+            fail: true,
+        };
+        let payload = TensorPayloadBudget::new(stream_plan.upload.caps.payload_bytes);
+        let host = TensorPayloadBudget::new(stream_plan.upload.host_workspace_bytes);
+        let work = TensorPayloadBudget::new(stream_plan.upload.device_workspace_bytes);
+        let mut recorder =
+            EvidenceRecorder::new("queued-pinned-fault", [TENSOR_UPLOADED_REGISTRATION]).unwrap();
+        assert!(
+            upload_tensor_stream_logged_with_resources(
+                &cuda,
+                &failing,
+                TensorUploadPolicy::default(),
+                "fixture",
+                TensorUploadContext {
+                    recorder: &mut recorder,
+                    span: "upload",
+                    parent: None,
+                    logical_time: 0
+                },
+                TensorUploadResources {
+                    payload: &payload,
+                    host_workspace: &host,
+                    device_workspace: &work
+                }
+            )
+            .is_err()
+        );
+        assert!(recorder.events().is_empty());
+        assert_eq!(
+            (payload.used_bytes(), host.used_bytes(), work.used_bytes()),
+            (0, 0, 0)
+        );
+        let retry = cuda.upload_tensor_stream(&source).unwrap();
+        let mut retry_rows = vec![0.; actual.len()];
+        cuda.embed_rows(&*retry, &ids, &mut retry_rows).unwrap();
+        assert_eq!(retry_rows, expected);
+    }
     for precision in [
         tritium_schema::ScalePrecision::F16,
         tritium_schema::ScalePrecision::Bf16,
@@ -99,7 +143,7 @@ fn physical_bounded_stream_crosses_payload_and_native_suffix_windows() {
             .tensor_stream_plan(source.metadata(), source.encoding())
             .unwrap()
             .unwrap();
-        assert_eq!(plan.upload.host_workspace_bytes, 196608);
+        assert_eq!(plan.upload.host_workspace_bytes, 393216);
         assert!(plan.upload.caps.payload_bytes > plan.upload.host_workspace_bytes);
         let device = cuda.upload_tensor_stream(&source).unwrap();
         let ids = [0, 511, 1023];

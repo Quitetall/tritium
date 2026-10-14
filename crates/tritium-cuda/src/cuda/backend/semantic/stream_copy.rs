@@ -1,5 +1,7 @@
 //! Checked windows into unpublished device payloads.
 use super::*;
+mod pinned;
+use pinned::Window;
 
 pub(super) fn dense(
     backend: &CudaBackend,
@@ -26,22 +28,22 @@ pub(super) fn dense(
         .stream
         .alloc_zeros::<f32>(elements)
         .map_err(|e| alloc_or_backend("allocate private dense stream payload", &e, elements * 4))?;
-    let mut values = Vec::new();
     let capacity = elements.min(TENSOR_STREAM_CHUNK_BYTES / width);
-    values
-        .try_reserve_exact(capacity)
-        .map_err(|_| BackendError::OutOfMemory {
-            requested: capacity * 4,
-        })?;
-    values.resize(capacity, 0.);
+    let mut windows = [
+        Window::<f32>::new(backend, capacity)?,
+        Window::<f32>::new(backend, capacity)?,
+    ];
+    let mut active = 0usize;
     let mut pending = [0u8; TENSOR_STREAM_CHUNK_BYTES];
     let mut used = 0;
     let mut at = 0usize;
     let mut flush = |bytes: &[u8]| -> Result<(), BackendError> {
         let count = bytes.len() / width;
-        let mut decoder =
-            tritium_format::trit_model::DensePayloadDecoder::new(precision, &mut values[..count])
-                .map_err(|e| invalid(&e.to_string()))?;
+        let mut decoder = tritium_format::trit_model::DensePayloadDecoder::new(
+            precision,
+            &mut windows[active].mutable()?[..count],
+        )
+        .map_err(|e| invalid(&e.to_string()))?;
         decoder.push(bytes).map_err(|e| invalid(&e.to_string()))?;
         decoder.finish().map_err(|e| invalid(&e.to_string()))?;
         let end = at
@@ -50,16 +52,8 @@ pub(super) fn dense(
         if end > elements {
             return Err(invalid("dense copy exceeds private allocation"));
         }
-        backend
-            .stream
-            .memcpy_htod(&values[..count], &mut device.slice_mut(at..end))
-            .map_err(|e| driver_err("bounded dense CUDA copy", &e))?;
-        // cudarc 0.19.9 HostSlice for ordinary slices/Vec uses Sync(None),
-        // not a source-lifetime guard. Never overwrite scratch while DMA reads it.
-        backend
-            .stream
-            .synchronize()
-            .map_err(|e| driver_err("complete dense CUDA host window", &e))?;
+        windows[active].copy(&mut device, at, count)?;
+        active ^= 1;
         at = end;
         Ok(())
     };
@@ -82,10 +76,19 @@ pub(super) fn dense(
     if at != elements {
         return Err(invalid("dense stream final extent mismatch"));
     }
+    for window in &mut windows {
+        window.wait()?;
+    }
+    drop(windows);
     backend
         .stream
         .synchronize()
         .map_err(|e| driver_err("finish private dense CUDA upload", &e))?;
+    backend
+        .stream
+        .context()
+        .check_err()
+        .map_err(|e| driver_err("check dense pinned cleanup", &e))?;
     Ok(Some(device))
 }
 
@@ -123,9 +126,10 @@ pub(super) fn visit(
 }
 
 pub(super) struct ByteWriter<'a> {
-    backend: &'a CudaBackend,
     device: &'a mut CudaSlice<u8>,
-    pending: Vec<u8>,
+    windows: [Window<u8>; 2],
+    active: usize,
+    used: usize,
     at: usize,
 }
 impl<'a> ByteWriter<'a> {
@@ -134,57 +138,53 @@ impl<'a> ByteWriter<'a> {
         device: &'a mut CudaSlice<u8>,
         at: usize,
     ) -> Result<Self, BackendError> {
-        let mut pending = Vec::new();
-        pending
-            .try_reserve_exact(TENSOR_STREAM_CHUNK_BYTES)
-            .map_err(|_| BackendError::OutOfMemory {
-                requested: TENSOR_STREAM_CHUNK_BYTES,
-            })?;
+        let windows = [
+            Window::new(backend, TENSOR_STREAM_CHUNK_BYTES)?,
+            Window::new(backend, TENSOR_STREAM_CHUNK_BYTES)?,
+        ];
         Ok(Self {
-            backend,
             device,
-            pending,
+            windows,
+            active: 0,
+            used: 0,
             at,
         })
     }
     pub(super) fn push(&mut self, mut bytes: &[u8]) -> Result<(), BackendError> {
         while !bytes.is_empty() {
-            let n = bytes
-                .len()
-                .min(TENSOR_STREAM_CHUNK_BYTES - self.pending.len());
-            self.pending.extend_from_slice(&bytes[..n]);
+            let n = bytes.len().min(TENSOR_STREAM_CHUNK_BYTES - self.used);
+            self.windows[self.active].mutable()?[self.used..self.used + n]
+                .copy_from_slice(&bytes[..n]);
+            self.used += n;
             bytes = &bytes[n..];
-            if self.pending.len() == TENSOR_STREAM_CHUNK_BYTES {
+            if self.used == TENSOR_STREAM_CHUNK_BYTES {
                 self.flush()?;
             }
         }
         Ok(())
     }
     fn flush(&mut self) -> Result<(), BackendError> {
-        if self.pending.is_empty() {
+        if self.used == 0 {
             return Ok(());
         }
         let end = self
             .at
-            .checked_add(self.pending.len())
+            .checked_add(self.used)
             .ok_or_else(|| invalid("CUDA copy offset overflow"))?;
         if end > self.device.len() {
             return Err(invalid("CUDA copy exceeds private allocation"));
         }
-        self.backend
-            .stream
-            .memcpy_htod(&self.pending, &mut self.device.slice_mut(self.at..end))
-            .map_err(|e| driver_err("bounded CUDA byte copy", &e))?;
-        self.backend
-            .stream
-            .synchronize()
-            .map_err(|e| driver_err("complete CUDA byte host window", &e))?;
+        self.windows[self.active].copy(self.device, self.at, self.used)?;
         self.at = end;
-        self.pending.clear();
+        self.active ^= 1;
+        self.used = 0;
         Ok(())
     }
     pub(super) fn finish(mut self, expected: usize) -> Result<(), BackendError> {
         self.flush()?;
+        for window in &mut self.windows {
+            window.wait()?;
+        }
         if self.at != expected {
             return Err(invalid("CUDA byte writer extent mismatch"));
         }

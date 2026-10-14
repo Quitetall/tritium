@@ -63,7 +63,7 @@ fn encoded_stream_plans_account_for_constant_host_scratch_and_private_validation
     .unwrap();
     assert_eq!(plan.upload.caps.payload_bytes, 70);
     assert_eq!(plan.encoded_bytes, 10);
-    assert_eq!(plan.upload.host_workspace_bytes, 2 * 65536);
+    assert_eq!(plan.upload.host_workspace_bytes, 3 * 65536);
     assert_eq!(plan.upload.device_workspace_bytes, 4);
     let mut large = source.layout();
     large.rows = 248320;
@@ -92,7 +92,7 @@ fn encoded_stream_plans_account_for_constant_host_scratch_and_private_validation
         .unwrap()
         .unwrap();
         assert_eq!(plan.upload.caps.payload_bytes, 7 * 32 * 4);
-        assert_eq!(plan.upload.host_workspace_bytes, 3 * 65536);
+        assert_eq!(plan.upload.host_workspace_bytes, 6 * 65536);
         assert_eq!(
             plan.encoded_bytes,
             7 * 32

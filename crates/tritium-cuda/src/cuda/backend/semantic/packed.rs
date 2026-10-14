@@ -510,7 +510,7 @@ impl PackedAdditive {
             return Err(BackendError::UnsupportedTensor);
         }
         let plan = Plan::from_metadata(metadata)?;
-        let workspace = 2 * TENSOR_STREAM_CHUNK_BYTES;
+        let workspace = 3 * TENSOR_STREAM_CHUNK_BYTES;
         Ok((plan.bytes, workspace, plan.header[10] as usize - HEADER))
     }
     #[cfg(test)]
@@ -621,6 +621,11 @@ impl PackedAdditive {
             .stream
             .synchronize()
             .map_err(|e| driver_err("finish private CUDA stream upload", &e))?;
+        backend
+            .stream
+            .context()
+            .check_err()
+            .map_err(|e| driver_err("check packed pinned cleanup", &e))?;
         Ok(result)
     }
     pub(super) fn plan_metadata(

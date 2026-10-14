@@ -111,7 +111,7 @@ fn encoded_stream_native_envelopes_and_scalar_cursors_match_decoded_oracle_all_p
                         let (payload, workspace, encoded) =
                             PackedAdditive::stream_metadata(metadata).unwrap();
                         assert_eq!((payload, encoded), (bytes.len(), raw.len()));
-                        assert_eq!(workspace, 2 * 65536);
+                        assert_eq!(workspace, 3 * 65536);
                         let mut suffix = Vec::new();
                         plan.visit_suffix(metadata, |part| {
                             suffix.extend_from_slice(part);

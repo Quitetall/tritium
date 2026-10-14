@@ -89,7 +89,7 @@ impl CudaTensor {
                 let encoded =
                     tritium_format::trit_model::DensePayloadDecoder::byte_len(precision, bytes / 4)
                         .map_err(|e| invalid(&e.to_string()))?;
-                let workspace = 3 * TENSOR_STREAM_CHUNK_BYTES;
+                let workspace = 6 * TENSOR_STREAM_CHUNK_BYTES;
                 (bytes, workspace, encoded)
             }
             _ => return Ok(None),
