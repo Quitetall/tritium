@@ -36,6 +36,7 @@
 
 mod hf_assets;
 mod kronecker;
+mod model_calibration;
 mod model_conversion;
 mod model_level;
 mod module_package;
@@ -389,6 +390,13 @@ fn backend_for_device(device: &str) -> Result<Box<dyn TernaryBackend>, String> {
 /// the CPU backend visible to the runtime registry that [`Model::load`] / [`ternary_matmul`] consult.
 #[pymodule]
 fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<model_calibration::NativeSourceObservation>()?;
+    m.add_class::<model_calibration::NativeCalibrationBuilder>()?;
+    m.add_class::<model_calibration::NativeCalibrationCache>()?;
+    m.add_function(wrap_pyfunction!(
+        model_calibration::_observe_model_plan_source,
+        m
+    )?)?;
     m.add_class::<model_conversion::NativeModelConversion>()?;
     m.add_class::<model_level::NativeModelLevel>()?;
     m.add_class::<model_level::NativePackedMatrix>()?;

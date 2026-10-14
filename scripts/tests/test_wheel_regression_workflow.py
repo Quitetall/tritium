@@ -9,6 +9,7 @@ TESTS = (
     "test_model_conversion.py",
     "test_native_module_source.py",
     "test_native_module_load.py",
+    "test_native_module_calibration.py",
     "test_ptq_hashing.py", "test_calibration_memory.py", "test_refinement.py",
     "test_refinement_core.py", "test_refinement_lifecycle.py",
     "test_refinement_teacher_state.py", "test_refinement_containers.py",

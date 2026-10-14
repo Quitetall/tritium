@@ -66,6 +66,37 @@ native allocations, not aggregate RSS: the initial receiver retains one admitted
 whole package byte image. Its sealed upload observations are not a model-quality,
 physical-memory, performance or full-release qualification receipt.
 
+The opt-in calibrated lifecycle is separate from the legacy diagonal `calibrate`:
+`prepare_native_module(prepared, actions=..., levels=..., limits=..., work_dir=...,
+asset_paths=...)` observes the complete original source without fitting.
+`calibrate_native_module(source, windows, objective, objective_bytes=...,
+cache_limits=..., max_total_payload_bytes=...)` runs each actual objective once
+and captures CPU Linear inputs plus loss gradients through `autograd.grad`,
+without accumulating parameter gradients. Each window supplies integer
+`input_ids` matching the flattened projection samples. The objective callable
+returns a finite scalar; declared recipe bytes do not independently prove its
+execution. Use `output="None"` explicitly for input-Gram-only capture.
+
+`convert_calibrated_native_module(calibration, output_dir, run_id, partition="Full",
+damping=0.01, max_numeric_bytes=..., max_cache_package_bytes=...)` uses the shared
+native calibrated plan, reducers, row-specific metrics and sealed lifecycle.
+`partition={"Groups": {"columns": width}}` explicitly selects a block-diagonal
+approximation. Input-only capture requires zero damping. The source is re-observed
+at each phase; source/asset/cache changes fail rather than fall back to Identity.
+The preparation JSON ceiling is 1 MiB. Existing direct plans, stored scale laws
+and native loader semantics are unchanged.
+
+`calibration.save(directory, max_package_bytes=...)` atomically publishes existing
+`.trit` cache packages with their Rust-owned binding metadata. Reopen with
+`NativeModuleCalibration.open(source, directory, max_package_bytes=...,
+max_total_payload_bytes=...)`. Logical cache/numerical budgets do not cover the
+framework tape, source copies or full RSS. The first Torch capture adapter
+requires Linear-only consumers; mixed tied embedding/head roles fail explicitly
+and remain full-release work. Existing expert native consumers still support
+gather/indexed factors. Source observation does not freeze concurrent writers,
+and callback mutations are detected, not rolled back. No empirical gate is
+cleared by this software lifecycle.
+
 See the [repository README](https://github.com/Quitetall/tritium#readme) and the
 [book](https://github.com/Quitetall/tritium/tree/main/docs/book) for usage.
 

@@ -19,7 +19,7 @@ use tritium_schema::{CalibratedQuantPlan, ModelQuantPlan, QuantPlan, TensorStora
 fn error(value: impl std::fmt::Display) -> PyErr {
     PyValueError::new_err(value.to_string())
 }
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 fn paths(input: Option<BTreeMap<String, String>>) -> BTreeMap<String, PathBuf> {

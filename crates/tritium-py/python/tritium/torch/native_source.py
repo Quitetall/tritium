@@ -149,7 +149,7 @@ def _graph_contract(model, entries):
     return json.loads(json.dumps(graph, sort_keys=True, separators=(",", ":"), allow_nan=False))
 
 
-def convert_native_module(
+def _run_native_source(
     prepared: PreparedModel,
     output_dir,
     run_id: str,
@@ -161,6 +161,7 @@ def convert_native_module(
     asset_paths: Mapping,
     architecture: str = "torch-module",
     input_grams: Mapping | None = None,
+    consume=None,
 ):
     """Compile persistent state to native files and fit with explicit Rust actions.
 
@@ -213,8 +214,8 @@ def convert_native_module(
         raise ValueError("Torch state catalog exceeds asset byte limit")
     if not isinstance(run_id, str) or not run_id:
         raise ValueError("run_id must not be empty")
-    output = Path(output_dir).absolute()
-    if output.exists() or output.is_symlink():
+    output = Path(output_dir).absolute() if output_dir is not None else None
+    if output is not None and (output.exists() or output.is_symlink()):
         raise FileExistsError(f"native output already exists: {output}")
     work = Path(work_dir).resolve(strict=True)
     if not work.is_dir():
@@ -244,8 +245,9 @@ def convert_native_module(
             raise ValueError("model graph contract changed during source capture")
         if _source_model_digest(prepared.model) != source_digest:
             raise ValueError("model state changed during source capture")
-        result = _tritium.convert_model_plan(plan_json, [str(source)], str(output), run_id,
-                                             asset_paths=assets, input_grams=grams)
+        receiver = _tritium.convert_model_plan if consume is None else consume
+        result = receiver(plan_json, [str(source)], str(output) if output is not None else None, run_id,
+                          asset_paths=assets, input_grams=grams)
     finally:
         try:
             temporary.cleanup()
@@ -254,6 +256,14 @@ def convert_native_module(
                 raise
             result = result._with_source_cleanup_warning(str(error))
     return result
+
+
+def convert_native_module(prepared, output_dir, run_id, *, actions, levels, limits,
+                          work_dir, asset_paths, architecture="torch-module", input_grams=None):
+    """Compile all persistent state using explicit native direct-fit actions."""
+    return _run_native_source(prepared, output_dir, run_id, actions=actions, levels=levels,
+                              limits=limits, work_dir=work_dir, asset_paths=asset_paths,
+                              architecture=architecture, input_grams=input_grams)
 
 
 __all__ = ["convert_native_module"]
