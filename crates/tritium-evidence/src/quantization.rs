@@ -2,15 +2,15 @@
 
 use super::{
     CalibratedFitReceiptView, CalibratedQuantizationReceiptView, DirectFitReceiptView,
-    EventRegistration, EvidenceEnvelope, EvidenceError, EvidenceEvent, OwnerScoreFitReceiptView,
-    VerifiedLog, decode_hex, verify_log,
+    EventRegistration, EvidenceEnvelope, EvidenceError, EvidenceEvent,
+    OwnerQuantizationReceiptView, OwnerScoreFitReceiptView, VerifiedLog, decode_hex, verify_log,
 };
 use std::collections::BTreeMap;
 use tritium_schema::{
     BlobReference, CalibratedQuantizationCompleted, CalibratedQuantizationStarted,
     EvidenceReference, Level, LevelFit, ManifestAsset, ModelManifest, ModelQuantPlan,
-    OriginalSourceId, PlaneCounts, QuantActionRef, QuantizationCompleted, QuantizationStarted,
-    SchemaId, TensorStorage,
+    OriginalSourceId, OwnerQuantizationCompleted, OwnerQuantizationStarted, PlaneCounts,
+    QuantActionRef, QuantizationCompleted, QuantizationStarted, SchemaId, TensorStorage,
 };
 
 impl EvidenceEvent for QuantizationStarted {
@@ -83,7 +83,7 @@ impl QuantizationReceiptView {
     /// # Errors
     /// Bad chain/root/version/payload or incomplete/mismatched fit-stage bindings.
     pub fn fold(log: &VerifiedLog) -> Result<Vec<Self>, EvidenceError> {
-        fold_stages(log, false)?
+        fold_stages(log, Lifecycle::Plain)?
             .into_iter()
             .map(|stage| {
                 let StageStart::Plain(start) = stage.start else {
@@ -105,12 +105,14 @@ impl QuantizationReceiptView {
 enum StageStart {
     Plain(QuantizationStarted),
     Calibrated(CalibratedQuantizationStarted),
+    Owner(OwnerQuantizationStarted),
 }
 impl StageStart {
     fn plan(&self) -> ModelQuantPlan<'_> {
         match self {
             Self::Plain(s) => ModelQuantPlan::Uncalibrated(&s.plan),
             Self::Calibrated(s) => ModelQuantPlan::Calibrated(&s.plan),
+            Self::Owner(s) => ModelQuantPlan::Owner(&s.plan),
         }
     }
 }
@@ -119,6 +121,7 @@ struct StageView {
     completed: QuantizationCompleted,
     fits: Vec<DirectFitReceiptView>,
     calibrated: Vec<CalibratedFitReceiptView>,
+    owners: Vec<OwnerScoreFitReceiptView>,
     manifest: ModelManifest,
     source_id: OriginalSourceId,
     reference: EvidenceReference,
@@ -126,7 +129,7 @@ struct StageView {
 pub(crate) fn fold_calibrated(
     log: &VerifiedLog,
 ) -> Result<Vec<CalibratedQuantizationReceiptView>, EvidenceError> {
-    fold_stages(log, true)?
+    fold_stages(log, Lifecycle::Calibrated)?
         .into_iter()
         .map(|stage| {
             let StageStart::Calibrated(start) = stage.start else {
@@ -147,17 +150,51 @@ pub(crate) fn fold_calibrated(
         })
         .collect()
 }
-fn fold_stages(log: &VerifiedLog, calibrated: bool) -> Result<Vec<StageView>, EvidenceError> {
-    let (start_schema, completed_schema) = if calibrated {
-        (
+pub(crate) fn fold_owner(
+    log: &VerifiedLog,
+) -> Result<Vec<OwnerQuantizationReceiptView>, EvidenceError> {
+    fold_stages(log, Lifecycle::Owner)?
+        .into_iter()
+        .map(|stage| {
+            let StageStart::Owner(start) = stage.start else {
+                return Err(invalid("wrong lifecycle"));
+            };
+            Ok(OwnerQuantizationReceiptView {
+                start,
+                completed: OwnerQuantizationCompleted {
+                    original_source: stage.source_id,
+                    output: stage.completed,
+                },
+                fits: stage.fits,
+                calibrated: stage.calibrated,
+                owners: stage.owners,
+                manifest: stage.manifest,
+                source_id: stage.source_id,
+                reference: stage.reference,
+            })
+        })
+        .collect()
+}
+#[derive(Clone, Copy)]
+enum Lifecycle {
+    Plain,
+    Calibrated,
+    Owner,
+}
+fn fold_stages(log: &VerifiedLog, lifecycle: Lifecycle) -> Result<Vec<StageView>, EvidenceError> {
+    let (start_schema, completed_schema) = match lifecycle {
+        Lifecycle::Calibrated => (
             CalibratedQuantizationStarted::SCHEMA_ID,
             CalibratedQuantizationCompleted::SCHEMA_ID,
-        )
-    } else {
-        (
+        ),
+        Lifecycle::Plain => (
             QuantizationStarted::SCHEMA_ID,
             QuantizationCompleted::SCHEMA_ID,
-        )
+        ),
+        Lifecycle::Owner => (
+            OwnerQuantizationStarted::SCHEMA_ID,
+            OwnerQuantizationCompleted::SCHEMA_ID,
+        ),
     };
     let invalid = |detail: &str| EvidenceError::InvalidPayload {
         schema: completed_schema.into(),
@@ -178,10 +215,10 @@ fn fold_stages(log: &VerifiedLog, calibrated: bool) -> Result<Vec<StageView>, Ev
     >::new();
     for event in &log.events {
         if event.schema == start_schema {
-            let value = if calibrated {
-                StageStart::Calibrated(decode(event, completed_schema)?)
-            } else {
-                StageStart::Plain(decode(event, completed_schema)?)
+            let value = match lifecycle {
+                Lifecycle::Calibrated => StageStart::Calibrated(decode(event, completed_schema)?),
+                Lifecycle::Plain => StageStart::Plain(decode(event, completed_schema)?),
+                Lifecycle::Owner => StageStart::Owner(decode(event, completed_schema)?),
             };
             value
                 .plan()
@@ -194,11 +231,16 @@ fn fold_stages(log: &VerifiedLog, calibrated: bool) -> Result<Vec<StageView>, Ev
                 return Err(invalid("duplicate or non-root start"));
             }
         } else if event.schema == completed_schema {
-            let (value, claimed_source) = if calibrated {
-                let value: CalibratedQuantizationCompleted = decode(event, completed_schema)?;
-                (value.output, Some(value.original_source))
-            } else {
-                (decode(event, completed_schema)?, None)
+            let (value, claimed_source) = match lifecycle {
+                Lifecycle::Calibrated => {
+                    let value: CalibratedQuantizationCompleted = decode(event, completed_schema)?;
+                    (value.output, Some(value.original_source))
+                }
+                Lifecycle::Plain => (decode(event, completed_schema)?, None),
+                Lifecycle::Owner => {
+                    let value: OwnerQuantizationCompleted = decode(event, completed_schema)?;
+                    (value.output, Some(value.original_source))
+                }
             };
             if event.parent.is_some()
                 || event.seq != 1
@@ -230,9 +272,15 @@ fn fold_stages(log: &VerifiedLog, calibrated: bool) -> Result<Vec<StageView>, Ev
             .cloned()
             .collect::<Vec<_>>();
         let plan = start.plan();
-        if owner_fits
+        let selected_owner = owner_fits
             .iter()
-            .any(|fit| fit.envelope().parent.as_deref() == Some(span))
+            .filter(|fit| fit.envelope().parent.as_deref() == Some(span))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !matches!(lifecycle, Lifecycle::Owner)
+            && owner_fits
+                .iter()
+                .any(|fit| fit.envelope().parent.as_deref() == Some(span))
         {
             return Err(invalid(
                 "owner-score fit requires a separate model lifecycle",
@@ -287,6 +335,26 @@ fn fold_stages(log: &VerifiedLog, calibrated: bool) -> Result<Vec<StageView>, Ev
                 return Err(invalid("duplicate or foreign calibrated fit"));
             }
         }
+        let mut by_owner_tensor = BTreeMap::new();
+        for fit in &selected_owner {
+            let envelope = fit.envelope();
+            if envelope.run != start_event.run
+                || envelope.seq != 0
+                || by_owner_tensor
+                    .insert(
+                        fit.observation().plan.windows[0]
+                            .binding
+                            .content
+                            .tensor
+                            .name
+                            .as_str(),
+                        fit.observation(),
+                    )
+                    .is_some()
+            {
+                return Err(invalid("duplicate or foreign owner fit"));
+            }
+        }
         for level in &completed.levels {
             if level
                 .tensors
@@ -300,13 +368,16 @@ fn fold_stages(log: &VerifiedLog, calibrated: bool) -> Result<Vec<StageView>, Ev
         for (index, (request, source)) in plan.tensors().zip(&completed.sources).enumerate() {
             let fitted = by_tensor.remove(request.source.name.as_str());
             let calibrated_fit = by_calibrated_tensor.remove(request.source.name.as_str());
+            let owner_fit = by_owner_tensor.remove(request.source.name.as_str());
             match request.action {
-                QuantActionRef::KeepDense if fitted.is_some() || calibrated_fit.is_some() => {
+                QuantActionRef::KeepDense
+                    if fitted.is_some() || calibrated_fit.is_some() || owner_fit.is_some() =>
+                {
                     return Err(invalid("dense source has a fit claim"));
                 }
                 QuantActionRef::KeepDense => {}
                 QuantActionRef::Fit { plan, metric } => {
-                    if calibrated_fit.is_some() {
+                    if calibrated_fit.is_some() || owner_fit.is_some() {
                         return Err(invalid("plain request has a calibrated fit"));
                     }
                     let fit = fitted.ok_or_else(|| invalid("requested fit absent"))?;
@@ -315,13 +386,22 @@ fn fold_stages(log: &VerifiedLog, calibrated: bool) -> Result<Vec<StageView>, Ev
                     }
                 }
                 QuantActionRef::CalibratedFit(plan) => {
-                    if fitted.is_some() {
+                    if fitted.is_some() || owner_fit.is_some() {
                         return Err(invalid("calibrated request has a plain fit"));
                     }
                     let fit =
                         calibrated_fit.ok_or_else(|| invalid("requested calibrated fit absent"))?;
                     if &fit.plan != plan {
                         return Err(invalid("calibrated plan or cache changed"));
+                    }
+                }
+                QuantActionRef::OwnerFit(plan) => {
+                    if fitted.is_some() || calibrated_fit.is_some() {
+                        return Err(invalid("owner request has a different fit class"));
+                    }
+                    let fit = owner_fit.ok_or_else(|| invalid("requested owner fit absent"))?;
+                    if &fit.plan != plan {
+                        return Err(invalid("owner plan or cache stream changed"));
                     }
                 }
                 _ => return Err(invalid("unsupported quant action")),
@@ -366,7 +446,8 @@ fn fold_stages(log: &VerifiedLog, calibrated: bool) -> Result<Vec<StageView>, Ev
                 }
             }
         }
-        if !by_tensor.is_empty() || !by_calibrated_tensor.is_empty() {
+        if !by_tensor.is_empty() || !by_calibrated_tensor.is_empty() || !by_owner_tensor.is_empty()
+        {
             return Err(invalid("unrequested fit"));
         }
         let ancestry = EvidenceReference {
@@ -394,7 +475,10 @@ fn fold_stages(log: &VerifiedLog, calibrated: bool) -> Result<Vec<StageView>, Ev
                 .map(|l| Level {
                     name: l.name.clone(),
                     tensors: l.tensors.clone(),
-                    fit: if selected.is_empty() && selected_calibrated.is_empty() {
+                    fit: if selected.is_empty()
+                        && selected_calibrated.is_empty()
+                        && selected_owner.is_empty()
+                    {
                         LevelFit::Imported
                     } else {
                         LevelFit::Direct {
@@ -412,8 +496,8 @@ fn fold_stages(log: &VerifiedLog, calibrated: bool) -> Result<Vec<StageView>, Ev
         let source_id =
             super::original_source_id(plan.architecture(), &completed.sources, &completed.assets)
                 .map_err(|_| invalid("invalid original source identity inventory"))?;
-        if let ModelQuantPlan::Calibrated(request) = plan
-            && (source_id != request.original_source || claimed_source != Some(source_id))
+        if let Some(expected) = plan.expected_source()
+            && (source_id != expected || claimed_source != Some(source_id))
         {
             return Err(invalid(
                 "calibrated original source differs from preparation",
@@ -424,6 +508,7 @@ fn fold_stages(log: &VerifiedLog, calibrated: bool) -> Result<Vec<StageView>, Ev
             completed,
             fits: selected,
             calibrated: selected_calibrated,
+            owners: selected_owner,
             manifest,
             source_id,
             reference: ancestry,

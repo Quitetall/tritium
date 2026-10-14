@@ -62,6 +62,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         "owner-score-metric-limits"
     );
     project!(tritium_schema::OwnerScoreFitPlan, "owner-score-fit-plan");
+    project!(tritium_schema::OwnerQuantAction, "owner-quant-action");
+    project!(
+        tritium_schema::OwnerQuantTensorPlan,
+        "owner-quant-tensor-plan"
+    );
+    project!(tritium_schema::OwnerQuantPlan, "owner-quant-plan");
+    project!(
+        tritium_schema::OwnerQuantizationStarted,
+        "owner-quantization-started"
+    );
+    project!(
+        tritium_schema::OwnerQuantizationCompleted,
+        "owner-quantization-completed"
+    );
     project!(
         tritium_schema::OwnerRowMetricBinding,
         "owner-row-metric-binding"

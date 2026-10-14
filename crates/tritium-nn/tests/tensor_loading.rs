@@ -18,6 +18,10 @@ mod joined;
 #[path = "tensor_loading/calibration.rs"]
 mod calibration;
 
+#[cfg(feature = "tokenizer")]
+#[path = "tensor_loading/owner.rs"]
+mod owner;
+
 #[path = "tensor_loading/compact.rs"]
 mod compact;
 
@@ -1280,7 +1284,7 @@ fn engine_produced_ternary_model_executes_through_actual_text_loader() {
         DirectFitProfile, JointGroupFitOptions, QuantAction, QuantLimits, QuantPlan,
         QuantTensorPlan,
     };
-    for calibrated in [false, true] {
+    for mode in 0..3 {
         let fixture = HfFixture::new("qwen3", true, 6, None);
         let (tokenizer, tokenizer_config) = tokenizer_assets(false);
         let assets = std::collections::BTreeMap::from([
@@ -1356,7 +1360,9 @@ fn engine_produced_ternary_model_executes_through_actual_text_loader() {
                 .collect(),
         };
         let mut sink = MemoryTensorSink::default();
-        let fitted = if calibrated {
+        let fitted = if mode == 2 {
+            owner::convert(&plan, &mut source, &mut sink)
+        } else if mode == 1 {
             let original_source = Engine::observe_source(&plan, &mut source).unwrap();
             let selected = plan
                 .tensors

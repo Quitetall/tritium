@@ -77,6 +77,11 @@ mod owner_score_fit;
 pub use owner_score_fit::*;
 
 #[cfg(feature = "alloc")]
+mod owner_quant_plan;
+#[cfg(feature = "alloc")]
+pub use owner_quant_plan::*;
+
+#[cfg(feature = "alloc")]
 mod calibration_capture;
 #[cfg(feature = "alloc")]
 pub use calibration_capture::*;

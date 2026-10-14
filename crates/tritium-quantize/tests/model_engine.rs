@@ -3,6 +3,8 @@
 mod calibrated;
 #[path = "model_engine/observed.rs"]
 mod observed;
+#[path = "model_engine/owner.rs"]
+mod owner;
 #[path = "model_engine/spool_publish.rs"]
 mod spool_publish;
 use std::{collections::BTreeMap, io::Cursor};

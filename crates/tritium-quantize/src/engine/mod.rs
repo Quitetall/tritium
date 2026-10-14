@@ -18,8 +18,12 @@ mod model;
 mod model_import;
 mod observed_source;
 mod original_capture;
+mod owner_calibration_sources;
 mod owner_score_cache;
 mod owner_score_metric;
+pub use owner_calibration_sources::{
+    InMemoryOwnerCalibrationSource, OwnerCalibrationSource, TritOwnerCalibrationSource,
+};
 pub use owner_score_metric::{
     OwnerRowMetric, OwnerScoreMetricError, OwnerScoreMetricLimits, OwnerScoreMetrics,
     WeightedOwnerWindow, fit_owner_score_levels,

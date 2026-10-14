@@ -3,14 +3,16 @@
 use super::StagedSalienceSource;
 use super::salience_model::SalienceProductionContext;
 use super::{
-    CalibrationCacheError, CalibrationSource, DirectFitError, RecordedCalibratedFitError,
-    RecordedDirectFitError, fit_calibrated_levels_recorded, fit_direct_levels_recorded,
+    CalibrationCacheError, CalibrationSource, DirectFitError, OwnerCalibrationSource,
+    OwnerScoreCacheError, RecordedCalibratedFitError, RecordedDirectFitError,
+    RecordedOwnerScoreFitError, fit_calibrated_levels_recorded, fit_direct_levels_recorded,
+    fit_owner_score_levels_recorded,
 };
 use std::{borrow::Cow, collections::BTreeMap};
 use tritium_core::DType;
 use tritium_evidence::{
-    CalibratedQuantizationReceiptView, EvidenceError, EvidenceRecorder, QuantizationReceiptView,
-    SealedEvidence,
+    CalibratedQuantizationReceiptView, EvidenceError, EvidenceRecorder,
+    OwnerQuantizationReceiptView, QuantizationReceiptView, SealedEvidence,
 };
 use tritium_format::trit_model::{
     TritModelError, decode_dense_f32, encode_model_manifest, read_trit_model,
@@ -20,9 +22,10 @@ use tritium_format::{TritBlob, TritBlobKind, TritPackageError, write_trit_packag
 use tritium_schema::{
     BlobId, BlobReference, CalibratedQuantPlan, CalibratedQuantizationCompleted,
     CalibratedQuantizationStarted, DirectFitMetric, ModelId, ModelQuantPlan, NamedAssetDigest,
-    OriginalSourceId, PackageId, PlaneCounts, QuantActionRef, QuantOutputLevel, QuantPlan,
-    QuantPlanError, QuantSourceBinding, QuantSourceTensor, QuantizationCompleted,
-    QuantizationStarted, SalienceConversionLimits, ScalePrecision, TensorMeta, TensorStorage,
+    OriginalSourceId, OwnerQuantPlan, OwnerQuantizationCompleted, OwnerQuantizationStarted,
+    PackageId, PlaneCounts, QuantActionRef, QuantOutputLevel, QuantPlan, QuantPlanError,
+    QuantSourceBinding, QuantSourceTensor, QuantizationCompleted, QuantizationStarted,
+    SalienceConversionLimits, ScalePrecision, TensorMeta, TensorStorage,
 };
 
 /// Original byte provider; adapters never supply trusted input digests.
@@ -77,6 +80,10 @@ pub enum QuantEngineError {
     Cache(CalibrationCacheError),
     /// Actual recorded calibrated controller failed.
     CalibratedFit(RecordedCalibratedFitError),
+    /// Actual owner cache file/content admission failed.
+    OwnerCache(OwnerScoreCacheError),
+    /// Actual recorded owner-window fitting failed.
+    OwnerFit(RecordedOwnerScoreFitError),
     /// Actual evidence integrity or typed-fold failure.
     Evidence(EvidenceError),
     /// Existing typed model/payload reader failed.
@@ -142,6 +149,19 @@ pub struct QuantizedModel {
 /// Rust-owned complete conversion controller; numerical work is not duplicated.
 #[derive(Debug)]
 pub struct Engine;
+#[derive(Default)]
+struct FitSources<'a, 'b> {
+    calibrated: Option<&'a mut dyn CalibrationSource>,
+    owners: Option<&'b mut dyn OwnerCalibrationSource>,
+}
+impl<'a> FitSources<'a, '_> {
+    fn calibrated(source: &'a mut dyn CalibrationSource) -> Self {
+        Self {
+            calibrated: Some(source),
+            owners: None,
+        }
+    }
+}
 impl Engine {
     /// Observe the complete original model identity before calibration, without fitting.
     ///
@@ -176,7 +196,7 @@ impl Engine {
         Self::run_impl(
             ModelQuantPlan::Uncalibrated(plan),
             source,
-            None,
+            FitSources::default(),
             sink,
             recorder,
             None,
@@ -208,7 +228,7 @@ impl Engine {
         Self::run_impl(
             ModelQuantPlan::Uncalibrated(plan),
             source,
-            None,
+            FitSources::default(),
             sink,
             recorder,
             Some(expected_source),
@@ -232,10 +252,35 @@ impl Engine {
         Self::run_impl(
             ModelQuantPlan::Calibrated(plan),
             source,
-            Some(caches),
+            FitSources::calibrated(caches),
             sink,
             recorder,
             Some(plan.original_source),
+            None,
+        )
+    }
+
+    /// Convert a complete owner-calibrated model using the shared engine.
+    /// Actual consumed original bytes must match every cache's preparation before
+    /// completion/publication. Logical limits do not prove recipe custody or RSS.
+    pub fn run_owner(
+        plan: &OwnerQuantPlan,
+        source: &mut dyn WeightSource,
+        owners: &mut dyn OwnerCalibrationSource,
+        calibrated: Option<&mut dyn CalibrationSource>,
+        sink: &mut dyn TensorSink,
+        recorder: EvidenceRecorder,
+    ) -> Result<QuantizedModel, QuantEngineError> {
+        Self::run_impl(
+            ModelQuantPlan::Owner(plan),
+            source,
+            FitSources {
+                calibrated,
+                owners: Some(owners),
+            },
+            sink,
+            recorder,
+            None,
             None,
         )
     }
@@ -257,7 +302,7 @@ impl Engine {
         Self::run_impl(
             ModelQuantPlan::Uncalibrated(plan),
             stage,
-            None,
+            FitSources::default(),
             sink,
             recorder,
             Some(expected),
@@ -286,7 +331,7 @@ impl Engine {
         Self::run_impl(
             ModelQuantPlan::Calibrated(plan),
             stage,
-            Some(caches),
+            FitSources::calibrated(caches),
             sink,
             recorder,
             Some(plan.original_source),
@@ -319,7 +364,7 @@ impl Engine {
         Self::run_impl(
             ModelQuantPlan::Calibrated(plan),
             stage,
-            Some(caches),
+            FitSources::calibrated(caches),
             sink,
             recorder,
             Some(plan.original_source),
@@ -351,7 +396,7 @@ impl Engine {
         Self::run_impl(
             ModelQuantPlan::Calibrated(plan),
             stage,
-            Some(caches),
+            FitSources::calibrated(caches),
             sink,
             recorder,
             Some(plan.original_source),
@@ -362,12 +407,14 @@ impl Engine {
     fn run_impl(
         plan: ModelQuantPlan<'_>,
         source: &mut dyn WeightSource,
-        mut caches: Option<&mut dyn CalibrationSource>,
+        fit_sources: FitSources<'_, '_>,
         sink: &mut dyn TensorSink,
         mut recorder: EvidenceRecorder,
         expected_source: Option<OriginalSourceId>,
         salience: Option<SalienceProductionContext>,
     ) -> Result<QuantizedModel, QuantEngineError> {
+        let mut caches = fit_sources.calibrated;
+        let mut owners = fit_sources.owners;
         plan.validate().map_err(QuantEngineError::Plan)?;
         if !recorder.events().is_empty() {
             return Err(QuantEngineError::Binding(
@@ -382,23 +429,50 @@ impl Engine {
             ModelQuantPlan::Calibrated(_) => {
                 recorder.check_emit::<CalibratedQuantizationStarted>("quantize", None, 0)?;
                 recorder.check_emit::<CalibratedQuantizationCompleted>("quantize", None, 1)?;
+            }
+            ModelQuantPlan::Owner(_) => {
+                recorder.check_emit::<OwnerQuantizationStarted>("quantize", None, 0)?;
+                recorder.check_emit::<OwnerQuantizationCompleted>("quantize", None, 1)?;
                 let names = plan
                     .tensors()
-                    .filter(|t| matches!(t.action, QuantActionRef::CalibratedFit(_)))
+                    .filter(|t| matches!(t.action, QuantActionRef::OwnerFit(_)))
                     .map(|t| t.source.name.clone())
                     .collect::<Vec<_>>();
-                if caches
+                if owners
                     .as_deref()
-                    .ok_or(QuantEngineError::Binding("calibration source absent"))?
+                    .ok_or(QuantEngineError::Binding("owner calibration source absent"))?
                     .names()
                     != names
                 {
                     return Err(QuantEngineError::Binding(
-                        "complete calibration inventory changed",
+                        "complete owner inventory changed",
                     ));
                 }
             }
             _ => return Err(QuantEngineError::Binding("unsupported model request")),
+        }
+        if plan.cache_limits().is_some() {
+            let names = plan
+                .tensors()
+                .filter(|t| matches!(t.action, QuantActionRef::CalibratedFit(_)))
+                .map(|t| t.source.name.clone())
+                .collect::<Vec<_>>();
+            if names.is_empty()
+                && caches
+                    .as_deref()
+                    .is_none_or(|source| source.names().is_empty())
+            {
+                // No legacy cache is invented for an owner-only request.
+            } else if caches
+                .as_deref()
+                .ok_or(QuantEngineError::Binding("calibration source absent"))?
+                .names()
+                != names
+            {
+                return Err(QuantEngineError::Binding(
+                    "complete calibration inventory changed",
+                ));
+            }
         }
         let limits = plan.limits();
         let mut total = 0u64;
@@ -427,6 +501,16 @@ impl Engine {
                     0,
                 )?;
             }
+            if let QuantActionRef::OwnerFit(plan) = tensor.action {
+                super::direct::admit_plan(&plan.direct, true)
+                    .map_err(QuantEngineError::Admission)?;
+                recorder.check_owner_score_fit_context(
+                    &format!("tensor-{index}"),
+                    Some("quantize"),
+                    0,
+                    plan,
+                )?;
+            }
         }
         bound(total, limits.max_source_bytes, "source bytes")?;
         check_source_inventory(plan, source)?;
@@ -445,6 +529,14 @@ impl Engine {
                     None,
                     0,
                     &CalibratedQuantizationStarted { plan: plan.clone() },
+                )?;
+            }
+            ModelQuantPlan::Owner(plan) => {
+                recorder.emit(
+                    "quantize",
+                    None,
+                    0,
+                    &OwnerQuantizationStarted { plan: plan.clone() },
                 )?;
             }
             _ => return Err(QuantEngineError::Binding("unsupported model request")),
@@ -553,15 +645,13 @@ impl Engine {
                             .levels
                         }
                         QuantActionRef::CalibratedFit(request) => {
-                            let ModelQuantPlan::Calibrated(model) = plan else {
-                                return Err(QuantEngineError::Binding(
-                                    "calibrated model request absent",
-                                ));
-                            };
+                            let (_, max_package) = plan.cache_limits().ok_or(
+                                QuantEngineError::Binding("calibrated model request absent"),
+                            )?;
                             let cache = caches
                                 .as_deref_mut()
                                 .ok_or(QuantEngineError::Binding("calibration source absent"))?
-                                .cache(&request.cache, model.max_cache_package_bytes)?;
+                                .cache(&request.cache, max_package)?;
                             fit_calibrated_levels_recorded(
                                 request,
                                 &weights,
@@ -572,6 +662,26 @@ impl Engine {
                                 0,
                             )
                             .map_err(QuantEngineError::CalibratedFit)?
+                            .levels
+                        }
+                        QuantActionRef::OwnerFit(request) => {
+                            let (_, max_package) = plan
+                                .cache_limits()
+                                .ok_or(QuantEngineError::Binding("owner model request absent"))?;
+                            let stream = owners
+                                .as_deref_mut()
+                                .ok_or(QuantEngineError::Binding("owner source absent"))?
+                                .stream(request, max_package)?;
+                            fit_owner_score_levels_recorded(
+                                request,
+                                &weights,
+                                &stream,
+                                &mut recorder,
+                                &format!("tensor-{index}"),
+                                Some("quantize"),
+                                0,
+                            )
+                            .map_err(QuantEngineError::OwnerFit)?
                             .levels
                         }
                         _ => return Err(QuantEngineError::Binding("unsupported fit request")),
@@ -622,6 +732,22 @@ impl Engine {
                     None,
                     1,
                     &CalibratedQuantizationCompleted {
+                        original_source: actual_source,
+                        output: completed,
+                    },
+                )?;
+            }
+            ModelQuantPlan::Owner(request) => {
+                if actual_source != request.original_source {
+                    return Err(QuantEngineError::Binding(
+                        "actual original source differs from owner preparation",
+                    ));
+                }
+                recorder.emit(
+                    "quantize",
+                    None,
+                    1,
+                    &OwnerQuantizationCompleted {
                         original_source: actual_source,
                         output: completed,
                     },
@@ -762,48 +888,70 @@ pub(super) fn verify_conversion_model(
             }
         }
     }
+    for fit in view.owner_fits() {
+        let observation = fit.observation();
+        let name = &observation.plan.windows[0].binding.content.tensor.name;
+        for output in &observation.outputs {
+            if model.tensor_digest(&output.level, name)? != output.content {
+                return Err(QuantEngineError::Binding("owner semantic output changed"));
+            }
+        }
+    }
     Ok(())
 }
 
 pub(super) enum ConversionView {
     Plain(QuantizationReceiptView),
     Calibrated(CalibratedQuantizationReceiptView),
+    Owner(OwnerQuantizationReceiptView),
 }
 impl ConversionView {
     pub(super) fn reference(&self) -> &tritium_schema::EvidenceReference {
         match self {
             Self::Plain(v) => v.reference(),
             Self::Calibrated(v) => v.reference(),
+            Self::Owner(v) => v.reference(),
         }
     }
     pub(super) fn completed(&self) -> &QuantizationCompleted {
         match self {
             Self::Plain(v) => v.completed(),
             Self::Calibrated(v) => &v.completed().output,
+            Self::Owner(v) => &v.completed().output,
         }
     }
     pub(super) fn manifest(&self) -> &tritium_schema::ModelManifest {
         match self {
             Self::Plain(v) => v.manifest(),
             Self::Calibrated(v) => v.manifest(),
+            Self::Owner(v) => v.manifest(),
         }
     }
     pub(super) fn source_id(&self) -> OriginalSourceId {
         match self {
             Self::Plain(v) => v.source_id(),
             Self::Calibrated(v) => v.source_id(),
+            Self::Owner(v) => v.source_id(),
         }
     }
     pub(super) fn fits(&self) -> &[tritium_evidence::DirectFitReceiptView] {
         match self {
             Self::Plain(v) => v.fits(),
             Self::Calibrated(v) => v.fits(),
+            Self::Owner(v) => v.fits(),
         }
     }
     pub(super) fn calibrated_fits(&self) -> &[tritium_evidence::CalibratedFitReceiptView] {
         match self {
             Self::Plain(_) => &[],
             Self::Calibrated(v) => v.calibrated_fits(),
+            Self::Owner(v) => v.calibrated_fits(),
+        }
+    }
+    pub(super) fn owner_fits(&self) -> &[tritium_evidence::OwnerScoreFitReceiptView] {
+        match self {
+            Self::Owner(v) => v.owner_fits(),
+            _ => &[],
         }
     }
 }
@@ -814,6 +962,11 @@ pub(super) fn conversion_views(
         .into_iter()
         .map(ConversionView::Plain)
         .collect::<Vec<_>>();
+    views.extend(
+        OwnerQuantizationReceiptView::fold(log)?
+            .into_iter()
+            .map(ConversionView::Owner),
+    );
     views.extend(
         CalibratedQuantizationReceiptView::fold(log)?
             .into_iter()

@@ -55,6 +55,7 @@ impl FileWeightSource {
                 }
                 QuantActionRef::KeepDense
                 | QuantActionRef::CalibratedFit(_)
+                | QuantActionRef::OwnerFit(_)
                 | QuantActionRef::Fit {
                     metric: DirectFitMetric::Identity,
                     ..

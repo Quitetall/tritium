@@ -10,8 +10,8 @@ use serde::Serialize;
 use tritium_evidence::{
     CalibratedFitReceiptView, CalibratedQuantizationReceiptView, CalibrationCaptureView,
     DirectFitReceiptView, EventRegistration, EvidenceEvent, EvidenceRecorder, ModelLoadReceiptView,
-    OriginalSalienceCaptureView, OwnerScoreFitReceiptView, QuantizationReceiptView,
-    SalienceTransformView, verify_jsonl,
+    OriginalSalienceCaptureView, OwnerQuantizationReceiptView, OwnerScoreFitReceiptView,
+    QuantizationReceiptView, SalienceTransformView, verify_jsonl,
 };
 
 /// Evidence detail level for a CLI invocation.
@@ -202,6 +202,8 @@ pub(crate) fn run(command: EvidenceCommand) -> anyhow::Result<()> {
     OwnerScoreFitReceiptView::fold(&verified).map_err(|error| {
         anyhow::anyhow!("verify owner-score fit view {}: {error}", path.display())
     })?;
+    OwnerQuantizationReceiptView::fold(&verified)
+        .map_err(|error| anyhow::anyhow!("verify owner model view {}: {error}", path.display()))?;
     QuantizationReceiptView::fold(&verified)
         .map_err(|error| anyhow::anyhow!("verify quantization view {}: {error}", path.display()))?;
     CalibratedQuantizationReceiptView::fold(&verified).map_err(|error| {
@@ -636,6 +638,52 @@ mod tests {
         let cleanup = std::fs::remove_file(path);
         cleanup.expect("remove temporary log");
         result.expect("CLI verification succeeds");
+    }
+
+    #[test]
+    fn verify_and_view_reject_invalid_owner_model_payloads_with_valid_hashes() {
+        #[derive(Serialize)]
+        struct InvalidStart {
+            release_approved: bool,
+        }
+        impl EvidenceEvent for InvalidStart {
+            const SCHEMA_ID: &'static str = "tritium.quantize.owner_model_started";
+            const VERSION: u16 = 1;
+        }
+        #[derive(Serialize)]
+        struct InvalidCompleted {
+            release_approved: bool,
+        }
+        impl EvidenceEvent for InvalidCompleted {
+            const SCHEMA_ID: &'static str = "tritium.quantize.owner_model_completed";
+            const VERSION: u16 = 1;
+        }
+        fn reject<E: EvidenceEvent>(event: &E) {
+            let mut recorder = EvidenceRecorder::new(
+                "invalid-owner-model",
+                [EventRegistration {
+                    schema: E::SCHEMA_ID,
+                    version: E::VERSION,
+                }],
+            )
+            .unwrap();
+            recorder.emit("quantize", None, 0, event).unwrap();
+            let text = recorder.to_jsonl().unwrap();
+            verify_jsonl(&text).unwrap();
+            let path = temp_log();
+            std::fs::write(&path, text).unwrap();
+            let verify = run(EvidenceCommand::Verify { path: path.clone() });
+            let view = run(EvidenceCommand::View { path: path.clone() });
+            std::fs::remove_file(path).unwrap();
+            assert!(verify.unwrap_err().to_string().contains("owner model view"));
+            assert!(view.unwrap_err().to_string().contains("owner model view"));
+        }
+        reject(&InvalidStart {
+            release_approved: true,
+        });
+        reject(&InvalidCompleted {
+            release_approved: true,
+        });
     }
 
     #[test]

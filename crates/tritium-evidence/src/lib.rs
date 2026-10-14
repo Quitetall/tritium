@@ -32,7 +32,12 @@ pub use direct_fit::{DIRECT_LEVELS_FITTED_REGISTRATION, DirectFitReceiptView};
 mod calibrated_fit;
 pub use calibrated_fit::{CALIBRATED_LEVELS_FITTED_REGISTRATION, CalibratedFitReceiptView};
 
+mod owner_quantization;
 mod owner_score_fit;
+pub use owner_quantization::{
+    OWNER_QUANTIZATION_COMPLETED_REGISTRATION, OWNER_QUANTIZATION_STARTED_REGISTRATION,
+    OwnerQuantizationReceiptView,
+};
 pub use owner_score_fit::{
     OWNER_SCORE_LEVELS_FITTED_REGISTRATION, OwnerScoreFitReceiptView, owner_metric_rows_id,
     owner_metric_stream_id,

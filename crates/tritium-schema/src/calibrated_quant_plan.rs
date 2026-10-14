@@ -115,6 +115,8 @@ pub enum ModelQuantPlan<'a> {
     Uncalibrated(&'a QuantPlan),
     /// Separate calibrated model lifecycle, with mandatory original source equality.
     Calibrated(&'a CalibratedQuantPlan),
+    /// Separate owner-window model lifecycle, optionally mixing legacy fits.
+    Owner(&'a crate::OwnerQuantPlan),
 }
 /// Borrowed actual operation; calibrated work is never mapped to Identity.
 #[non_exhaustive]
@@ -131,6 +133,8 @@ pub enum QuantActionRef<'a> {
     },
     /// Actual cache-bound calibrated controller request.
     CalibratedFit(&'a CalibratedFitPlan),
+    /// Actual complete scalar-window owner fit request.
+    OwnerFit(&'a crate::OwnerScoreFitPlan),
 }
 impl<'a> QuantActionRef<'a> {
     /// Original-row controller for either real fit class; absent for preservation.
@@ -140,6 +144,7 @@ impl<'a> QuantActionRef<'a> {
             Self::KeepDense => None,
             Self::Fit { plan, .. } => Some(plan),
             Self::CalibratedFit(plan) => Some(&plan.direct),
+            Self::OwnerFit(plan) => Some(&plan.direct),
         }
     }
 }
@@ -158,6 +163,7 @@ impl<'a> ModelQuantPlan<'a> {
         match self {
             Self::Uncalibrated(p) => &p.architecture,
             Self::Calibrated(p) => &p.architecture,
+            Self::Owner(p) => &p.architecture,
         }
     }
     /// Actual complete original asset inventory.
@@ -166,6 +172,7 @@ impl<'a> ModelQuantPlan<'a> {
         match self {
             Self::Uncalibrated(p) => &p.assets,
             Self::Calibrated(p) => &p.assets,
+            Self::Owner(p) => &p.assets,
         }
     }
     /// Actual complete level inventory.
@@ -174,6 +181,7 @@ impl<'a> ModelQuantPlan<'a> {
         match self {
             Self::Uncalibrated(p) => &p.levels,
             Self::Calibrated(p) => &p.levels,
+            Self::Owner(p) => &p.levels,
         }
     }
     /// Actual existing logical output/source bounds.
@@ -182,13 +190,31 @@ impl<'a> ModelQuantPlan<'a> {
         match self {
             Self::Uncalibrated(p) => p.limits,
             Self::Calibrated(p) => p.limits,
+            Self::Owner(p) => p.limits,
+        }
+    }
+    /// Mandatory expected original identity for actual calibrated lifecycles.
+    pub fn expected_source(self) -> Option<OriginalSourceId> {
+        match self {
+            Self::Uncalibrated(_) => None,
+            Self::Calibrated(p) => Some(p.original_source),
+            Self::Owner(p) => Some(p.original_source),
+        }
+    }
+    /// Aggregate logical payload and per-file physical cache limits, if calibrated.
+    pub fn cache_limits(self) -> Option<(u64, u64)> {
+        match self {
+            Self::Uncalibrated(_) => None,
+            Self::Calibrated(p) => Some((p.max_cache_payload_bytes, p.max_cache_package_bytes)),
+            Self::Owner(p) => Some((p.max_cache_payload_bytes, p.max_cache_package_bytes)),
         }
     }
     /// Complete inventory traversal without allocating or changing a recipe.
     pub fn tensors(self) -> impl Iterator<Item = QuantTensorRef<'a>> {
-        let (plain, calibrated) = match self {
-            Self::Uncalibrated(p) => (Some(p), None),
-            Self::Calibrated(p) => (None, Some(p)),
+        let (plain, calibrated, owner) = match self {
+            Self::Uncalibrated(p) => (Some(p), None, None),
+            Self::Calibrated(p) => (None, Some(p), None),
+            Self::Owner(p) => (None, None, Some(p)),
         };
         plain
             .into_iter()
@@ -215,6 +241,15 @@ impl<'a> ModelQuantPlan<'a> {
                                 QuantActionRef::CalibratedFit(plan)
                             }
                         },
+                    }),
+            )
+            .chain(
+                owner
+                    .into_iter()
+                    .flat_map(|p| &p.tensors)
+                    .map(|t| QuantTensorRef {
+                        source: &t.source,
+                        action: t.action.borrowed(),
                     }),
             )
     }
@@ -255,6 +290,7 @@ impl<'a> ModelQuantPlan<'a> {
             return Err(E::MissingAsset);
         }
         let mut calibrated_count = 0;
+        let mut owner_count = 0;
         let mut cache_bytes = 0u64;
         for tensor in self.tensors() {
             tensor.source.byte_len()?;
@@ -274,12 +310,9 @@ impl<'a> ModelQuantPlan<'a> {
                 }
             }
             if let QuantActionRef::CalibratedFit(fit) = tensor.action {
-                let Self::Calibrated(model) = self else {
-                    return Err(E::CalibrationBinding);
-                };
                 fit.calibration_plan().map_err(|_| E::CalibrationBinding)?;
                 if fit.cache.request.tensor != *tensor.source
-                    || fit.cache.request.model != model.original_source
+                    || Some(fit.cache.request.model) != self.expected_source()
                 {
                     return Err(E::CalibrationBinding);
                 }
@@ -288,13 +321,34 @@ impl<'a> ModelQuantPlan<'a> {
                     .checked_add(fit.cache.payload_bytes)
                     .ok_or(E::CalibrationBinding)?;
             }
+            if let QuantActionRef::OwnerFit(fit) = tensor.action {
+                if !matches!(self, Self::Owner(_)) {
+                    return Err(E::CalibrationBinding);
+                }
+                fit.validate().map_err(|_| E::CalibrationBinding)?;
+                if fit.windows.iter().any(|w| {
+                    w.binding.content.tensor != *tensor.source
+                        || Some(w.binding.content.source) != self.expected_source()
+                }) {
+                    return Err(E::CalibrationBinding);
+                }
+                owner_count += 1;
+                for window in &fit.windows {
+                    cache_bytes = cache_bytes
+                        .checked_add(window.binding.payload_bytes)
+                        .ok_or(E::CalibrationBinding)?;
+                }
+            }
         }
-        if let Self::Calibrated(plan) = self
-            && (calibrated_count == 0
-                || plan.original_source.as_bytes() == &[0; 32]
-                || plan.max_cache_payload_bytes == 0
-                || cache_bytes > plan.max_cache_payload_bytes
-                || plan.max_cache_package_bytes == 0)
+        if let Some((payload, package)) = self.cache_limits()
+            && (self
+                .expected_source()
+                .is_none_or(|id| id.as_bytes() == &[0; 32])
+                || payload == 0
+                || package == 0
+                || cache_bytes > payload
+                || matches!(self, Self::Calibrated(_)) && calibrated_count == 0
+                || matches!(self, Self::Owner(_)) && owner_count == 0)
         {
             return Err(E::CalibrationBinding);
         }

@@ -123,6 +123,12 @@ impl NativeModelConversion {
                     .into_iter()
                     .map(|view| view.source_id()),
             );
+            ids.extend(
+                tritium_evidence::OwnerQuantizationReceiptView::fold(&log)
+                    .map_err(error)?
+                    .into_iter()
+                    .map(|view| view.source_id()),
+            );
             if ids.len() != 1 {
                 return Err(error("exactly one conversion identity required"));
             }
