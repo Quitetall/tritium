@@ -13,6 +13,8 @@ mod hf_shards;
 #[cfg(feature = "tokenizer")]
 mod host;
 mod limits;
+#[cfg(feature = "tokenizer")]
+mod load_config;
 mod qwen35;
 mod qwen35_execution;
 mod qwen35_hf;
@@ -53,6 +55,8 @@ pub(crate) use hf::NameSchema;
 #[cfg(feature = "tokenizer")]
 pub use hf_json_tokenizer::HfJsonTokenizer;
 pub use limits::{CacheAdmission, StreamLimits};
+#[cfg(feature = "tokenizer")]
+pub use load_config::TypedLoadConfig;
 pub use qwen35::{
     Qwen35TextCache, Qwen35TextLayerWeights, Qwen35TextMixerWeights, Qwen35TextOutput,
     Qwen35TextRunner, Qwen35TextWeights,

@@ -314,6 +314,128 @@ impl Runner {
         }
         Ok(())
     }
+    /// Segmented initial prefill shared by generation and serving.
+    /// Pre-cancellation skips validation/work. Requires an empty cache. DeltaNet
+    /// cached continuation uses single tokens; positions scratch is segment-sized.
+    /// # Errors
+    /// Empty/invalid prompt, nonempty cache, capacity, allocation or graph errors.
+    /// Later errors/cancellation can leave a prefix; the caller owns reset policy.
+    pub fn prefill_segmented_cancellable(
+        &mut self,
+        tokens: &[u32],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<f32>>, NnError> {
+        if cancelled() {
+            return Ok(None);
+        }
+        if self.cache_len() != 0 || tokens.is_empty() {
+            return Err(NnError::Backend(
+                "segmented prefill requires an empty stream and nonempty prompt".into(),
+            ));
+        }
+        if tokens.len() > self.max_context() {
+            return Err(NnError::ResourceExhausted(
+                "prompt exceeds admitted context".into(),
+            ));
+        }
+        if tokens
+            .iter()
+            .any(|&id| id as usize >= self.architecture.vocab_size())
+        {
+            return Err(NnError::Backend(
+                "prompt ID outside model vocabulary".into(),
+            ));
+        }
+        let segment = self
+            .cache_admission()
+            .map_or(tokens.len(), |a| a.limits().max_segment_tokens)
+            .min(tokens.len());
+        let single_cached = self
+            .architecture
+            .layer_kinds()
+            .any(|k| k == LayerKind::DeltaNet);
+        let mut positions = Vec::new();
+        positions
+            .try_reserve_exact(segment)
+            .map_err(|e| NnError::Backend(format!("prefill positions: {e}")))?;
+        let mut at = 0;
+        let mut logits = None;
+        while at < tokens.len() {
+            let count = if at != 0 && single_cached { 1 } else { segment };
+            let end = at + count.min(tokens.len() - at);
+            positions.clear();
+            positions.extend(at..end);
+            let Some(next) = self.forward_cancellable(&tokens[at..end], &positions, cancelled)?
+            else {
+                return Ok(None);
+            };
+            logits = Some(next);
+            at = end;
+        }
+        Ok(logits)
+    }
+    /// Bounded greedy generation with segmented prefill and explicit context refusal.
+    /// Validates all IDs/capacity before reset/work; zero requested output skips
+    /// graph work. Does not forward the unused last sampled token. Errors during
+    /// execution reset the private stream; legacy generate remains unchanged.
+    /// # Errors
+    /// Empty/out-of-vocabulary prompt, output/context overflow or graph errors.
+    pub fn generate_bounded(
+        &mut self,
+        prompt: &[u32],
+        max_new: usize,
+        eos: u32,
+    ) -> Result<Vec<u32>, NnError> {
+        if prompt.is_empty()
+            || prompt
+                .iter()
+                .any(|&id| id as usize >= self.architecture.vocab_size())
+        {
+            return Err(NnError::Backend(
+                "bounded generation requires a nonempty in-vocabulary prompt".into(),
+            ));
+        }
+        if prompt
+            .len()
+            .checked_add(max_new)
+            .is_none_or(|n| n > self.max_context())
+        {
+            return Err(NnError::ResourceExhausted(
+                "prompt and --max-new exceed admitted context".into(),
+            ));
+        }
+        self.reset();
+        if max_new == 0 {
+            return Ok(Vec::new());
+        }
+        let result = (|| {
+            let mut logits = self
+                .prefill_segmented_cancellable(prompt, &|| false)?
+                .ok_or_else(|| NnError::Backend("uncancelled prefill returned no output".into()))?;
+            let mut out = Vec::new();
+            out.try_reserve_exact(max_new)
+                .map_err(|e| NnError::Backend(format!("generated IDs: {e}")))?;
+            for i in 0..max_new {
+                let next = crate::ops::sample_greedy(&logits).ok_or(NnError::Shape {
+                    expected: 1,
+                    got: 0,
+                })?;
+                if next == eos {
+                    break;
+                }
+                out.push(next);
+                if i + 1 < max_new {
+                    logits = self.forward(&[next], &[prompt.len() + i])?;
+                }
+            }
+            Ok(out)
+        })();
+        if result.is_err() {
+            self.reset();
+        }
+        result
+    }
+
     /// Greedy generation with the same loop/reset/EOS behavior as the legacy runner.
     /// # Errors
     /// Actual forward errors or allocation/position overflow.

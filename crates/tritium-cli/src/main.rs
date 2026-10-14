@@ -148,11 +148,22 @@ enum Command {
     /// Load a model and greedily generate from exact token IDs or its own tokenizer.
     #[command(group(clap::ArgGroup::new("joined_generation")
         .args(["original_captured_stage"])
-        .requires_all(["conversion_evidence", "level", "max_payload_bytes", "eos"])))]
+        .requires_all(["model", "conversion_evidence", "level", "max_payload_bytes", "eos"])))]
     Generate {
         /// A `.gguf` file, a legacy converted directory, or explicit joined C `.trit`.
-        #[arg(long, alias = "input")]
-        model: PathBuf,
+        #[arg(
+            long,
+            alias = "input",
+            required_unless_present = "typed",
+            conflicts_with = "typed"
+        )]
+        model: Option<PathBuf>,
+        /// Shared typed load JSON; requires encoded resource admission and explicit EOS.
+        #[arg(long, requires = "eos", conflicts_with = "original_captured_stage")]
+        typed: Option<PathBuf>,
+        /// Registry backend for typed generation only (defaults to cpu).
+        #[arg(long, requires = "typed")]
+        backend: Option<String>,
         /// Explicit original-captured joined admission; ordinary readers never unwrap it.
         #[command(flatten)]
         joined: Box<generate::JoinedArgs>,
@@ -635,6 +646,8 @@ fn main() -> anyhow::Result<()> {
             } => pull::run(&repo, file.as_deref(), &revision)?,
             Command::Generate {
                 model,
+                typed,
+                backend,
                 joined,
                 tokens,
                 prompt,
@@ -642,24 +655,44 @@ fn main() -> anyhow::Result<()> {
                 greedy,
                 eos,
             } => {
-                // clap guarantees exactly one of the two is present.
-                let ids = tokens.map(|p| generate::read_token_file(&p)).transpose()?;
-                let source = match (&ids, &prompt) {
-                    (Some(ids), _) => generate::Prompt::Ids(ids),
-                    (None, Some(text)) => generate::Prompt::Text(text),
-                    (None, None) => unreachable!("clap requires --tokens or --prompt"),
-                };
-                if joined.enabled() {
-                    generate::run_joined(
-                        &model,
-                        &joined,
-                        &source,
+                if let Some(path) = typed {
+                    generate::run_typed(
+                        &path,
+                        backend.as_deref().unwrap_or("cpu"),
+                        tokens.as_deref(),
+                        prompt.as_deref(),
                         max_new,
                         greedy,
-                        eos.context("joined generation requires --eos")?,
+                        eos.context("typed generation requires --eos")?,
                     )?;
                 } else {
-                    generate::run(&model, &source, max_new, greedy, eos.unwrap_or(DEFAULT_EOS))?;
+                    // Compatibility token-file behavior is intentionally unchanged.
+                    let ids = tokens.map(|p| generate::read_token_file(&p)).transpose()?;
+                    let source = match (&ids, &prompt) {
+                        (Some(ids), _) => generate::Prompt::Ids(ids),
+                        (None, Some(text)) => generate::Prompt::Text(text),
+                        (None, None) => unreachable!("clap requires --tokens or --prompt"),
+                    };
+                    if joined.enabled() {
+                        generate::run_joined(
+                            model
+                                .as_deref()
+                                .context("joined generation requires --model")?,
+                            &joined,
+                            &source,
+                            max_new,
+                            greedy,
+                            eos.context("joined generation requires --eos")?,
+                        )?;
+                    } else {
+                        generate::run(
+                            model.as_deref().context("generation requires --model")?,
+                            &source,
+                            max_new,
+                            greedy,
+                            eos.unwrap_or(DEFAULT_EOS),
+                        )?;
+                    }
                 }
             }
             Command::Repack { input, output, to } => repack::run(&input, &output, to)?,

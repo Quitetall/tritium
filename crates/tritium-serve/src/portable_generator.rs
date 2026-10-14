@@ -144,7 +144,9 @@ impl Generator for RunnerGenerator {
                 let max_new = request.max_new.min(context - length);
                 runner.reset();
                 let result = (|| {
-                    let Some(logits) = bounded_prefill(runner, &request.prompt_tokens, cancelled)?
+                    let Some(logits) = runner
+                        .prefill_segmented_cancellable(&request.prompt_tokens, cancelled)
+                        .map_err(|e| GenError::Backend(e.to_string()))?
                     else {
                         return Ok(StreamEnd::Cancelled);
                     };
@@ -244,42 +246,4 @@ fn resource_admission(
 #[cfg(not(feature = "serve"))]
 fn resource_admission(_: &tritium_nn::Runner) -> Option<crate::generator::RunnerResourceAdmission> {
     None
-}
-
-// The whole prompt is validated before entry. Every segment crosses the same
-// common Runner interface; a hybrid cached continuation is exactly one token.
-fn bounded_prefill(
-    runner: &mut tritium_nn::Runner,
-    tokens: &[u32],
-    cancelled: &dyn Fn() -> bool,
-) -> Result<Option<Vec<f32>>, GenError> {
-    let segment = runner
-        .cache_admission()
-        .map_or(tokens.len(), |a| a.limits().max_segment_tokens)
-        .min(tokens.len());
-    let single_cached = runner
-        .architecture()
-        .layer_kinds()
-        .any(|k| k == tritium_nn::LayerKind::DeltaNet);
-    let mut positions = Vec::new();
-    positions
-        .try_reserve_exact(segment)
-        .map_err(|e| GenError::Backend(format!("prefill positions: {e}")))?;
-    let mut at = 0;
-    let mut logits = None;
-    while at < tokens.len() {
-        let count = if at != 0 && single_cached { 1 } else { segment };
-        let end = at + count.min(tokens.len() - at);
-        positions.clear();
-        positions.extend(at..end);
-        let Some(next) = runner
-            .forward_cancellable(&tokens[at..end], &positions, cancelled)
-            .map_err(|e| GenError::Backend(e.to_string()))?
-        else {
-            return Ok(None);
-        };
-        logits = Some(next);
-        at = end;
-    }
-    Ok(logits)
 }

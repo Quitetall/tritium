@@ -45,6 +45,7 @@ use tritium_nn::{GgufBpeTokenizer, HfJsonTokenizer, ModelRunner, Runner, Tokeniz
 enum CliRunner {
     Legacy(Box<ModelRunner>),
     Shared(Box<Runner>),
+    Bounded(Box<Runner>),
 }
 impl From<ModelRunner> for CliRunner {
     fn from(runner: ModelRunner) -> Self {
@@ -66,8 +67,96 @@ impl CliRunner {
         match self {
             Self::Legacy(runner) => runner.generate(prompt, max_new, eos),
             Self::Shared(runner) => runner.generate(prompt, max_new, eos),
+            Self::Bounded(runner) => runner.generate_bounded(prompt, max_new, eos),
         }
     }
+}
+
+/// Explicit typed generation; same load JSON and common streaming path as serving.
+pub(crate) fn run_typed(
+    path: &Path,
+    backend_name: &str,
+    token_file: Option<&Path>,
+    text: Option<&str>,
+    max_new: usize,
+    greedy: bool,
+    eos: u32,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        greedy,
+        "--greedy=false: sampling is not implemented in this subcommand"
+    );
+    let config = tritium_nn::TypedLoadConfig::read(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    config
+        .require_encoded_streaming()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let limits = config
+        .stream_limits()
+        .context("typed generation requires stream_limits")?;
+    anyhow::ensure!(
+        max_new <= limits.max_context,
+        "--max-new exceeds admitted context"
+    );
+    let ids = token_file
+        .map(|path| -> anyhow::Result<Vec<u32>> {
+            let bytes = read_bounded(path, DEFAULT_MAX_JSON_BYTES)?;
+            let ids: Vec<u32> = serde_json::from_slice(&bytes).context("typed prompt token IDs")?;
+            anyhow::ensure!(
+                ids.len()
+                    .checked_add(max_new)
+                    .is_some_and(|n| n <= limits.max_context),
+                "prompt and --max-new exceed admitted context"
+            );
+            Ok(ids)
+        })
+        .transpose()?;
+    let prompt = match (&ids, text) {
+        (Some(ids), None) => Prompt::Ids(ids),
+        (None, Some(text)) => Prompt::Text(text),
+        _ => bail!("typed generation requires exactly one of --tokens or --prompt"),
+    };
+    let model_path = config.path().to_path_buf();
+    let init = tritium_runtime::BACKENDS
+        .iter()
+        .find(|b| b.name == backend_name)
+        .map(|b| b.init)
+        .with_context(|| format!("backend `{backend_name}` is not in the registry"))?;
+    let backend =
+        init().map_err(|e| anyhow::anyhow!("backend `{backend_name}` failed to init: {e}"))?;
+    let mut recorder = tritium_evidence::EvidenceRecorder::new(
+        "typed-generation-load",
+        [
+            tritium_evidence::TENSOR_UPLOADED_REGISTRATION,
+            tritium_evidence::MODEL_LOADED_REGISTRATION,
+        ],
+    )?;
+    let context = tritium_runtime::TensorUploadContext {
+        recorder: &mut recorder,
+        span: "load",
+        parent: None,
+        logical_time: 0,
+    };
+    let loaded = config
+        .load(backend, context)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    anyhow::ensure!(
+        loaded.runner.resource_admission().is_some(),
+        "typed generation missing mandatory resource admission"
+    );
+    eprintln!(
+        "typed candidate, not production-qualified: execution={:?}, resource_admission={:?}",
+        loaded.runner.execution(),
+        loaded.runner.resource_admission()
+    );
+    recorder.seal()?;
+    decode_and_print(
+        CliRunner::Bounded(Box::new(loaded.runner)),
+        Some(Box::new(loaded.tokenizer)),
+        &model_path,
+        &prompt,
+        max_new,
+        eos,
+    )
 }
 
 #[derive(Args, Debug)]

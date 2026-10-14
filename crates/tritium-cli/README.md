@@ -212,6 +212,34 @@ streaming/mmap, standalone distribution, serving integration or model quality.
 Keep B and the required logs with C for cold reproduction. CLI lifecycle logs
 remain summaries, not independently qualified model-execution receipts.
 
+### Retained typed streaming generation
+
+Use the same bounded typed load JSON documented in tritium-serve, including
+explicit `streamed_resources` and `stream_limits`:
+
+```bash
+tritium generate --typed /models/example/load.json --backend cpu \
+  --prompt "Hello partner" --max-new 16 --eos EOS_ID
+```
+
+`--tokens ids.json` selects exact IDs instead of text. Typed mode requires an
+explicit EOS policy (an out-of-vocabulary sentinel can disable stopping), and
+conflicts with `--model`/joined-capture mode. The optional registry backend
+defaults to cpu; CUDA requires building the CLI with `--features cuda`.
+Configuration is validated before backend initialization; absent streaming
+resources refuse without decoded fallback. The common runner splits prefill
+into admitted segments, with one-token cached DeltaNet continuation. Prompt plus
+requested output must fit the selected context; overflow refuses rather than
+silently truncating. Zero requested output does no graph work.
+Typed token JSON input is bounded to16MiB and checked against selected context
+before backend initialization; legacy token-file behavior remains unchanged.
+
+The output keeps the existing text/ID report shape. Stderr resource diagnostics
+cover logical admitted domains only, not physical RAM/VRAM, performance, verified
+MTP, official source authentication or release clearance. CUDA still charges its
+full native host staging tensor. Legacy and joined generation are unchanged;
+this ordinary retained route does not unwrap a joined package or infer ancestry.
+
 For storage or transfer, wrap an existing fixed-codec artifact without changing
 runtime accounting:
 

@@ -69,7 +69,7 @@ pub use model::{
 #[cfg(feature = "tokenizer")]
 pub use model::{
     GgufBpeTokenizer, HfJsonTokenizer, LoadedModel, ModelLoadResources, ModelResourceAdmission,
-    load, load_streamed_with_resources, load_with_limits, load_with_resources,
+    TypedLoadConfig, load, load_streamed_with_resources, load_with_limits, load_with_resources,
 };
 #[cfg(feature = "cuda")]
 pub use model::{
