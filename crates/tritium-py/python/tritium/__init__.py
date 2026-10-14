@@ -6,6 +6,8 @@ PyTorch is installed — the :mod:`tritium.torch` research facade, :mod:`tritium
 """
 
 from ._tritium import (
+    NativeModelConversion,
+    convert_model_plan,
     KroneckerConflictError,
     KroneckerContractError,
     KroneckerEvidenceBuilder,
@@ -42,6 +44,8 @@ from ._tritium import (
 from . import onnx, portable, salt
 
 __all__ = [
+    "NativeModelConversion",
+    "convert_model_plan",
     "KroneckerConflictError",
     "KroneckerContractError",
     "KroneckerEvidenceBuilder",

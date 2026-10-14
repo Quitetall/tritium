@@ -382,6 +382,7 @@ jobs:
         run: >-
           python -I -m pytest -q
           crates/tritium-py/tests/test_ptq_artifacts.py
+          crates/tritium-py/tests/test_model_conversion.py
           crates/tritium-py/tests/test_ptq_hashing.py
           crates/tritium-py/tests/test_calibration_memory.py
           crates/tritium-py/tests/test_refinement.py

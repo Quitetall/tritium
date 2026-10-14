@@ -1,12 +1,10 @@
 //! Shared convert/quantize filesystem receiver for the actual engine (ADR0063).
 //! No fitting, identities, package assembly or publication logic lives here.
-use crate::stage_input::{StageArgs, read_bounded, regular_file};
+use crate::stage_input::{StageArgs, read_bounded};
 use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
 use std::{
-    borrow::Cow,
     collections::BTreeMap,
-    fs::File,
     path::{Path, PathBuf},
 };
 use tritium_evidence::{
@@ -15,13 +13,10 @@ use tritium_evidence::{
     EvidenceRecorder, QUANTIZATION_COMPLETED_REGISTRATION, QUANTIZATION_STARTED_REGISTRATION,
 };
 use tritium_quantize::engine::{
-    DirectoryTensorSink, Engine, QuantEngineError, QuantizedModel, SafeTensorsWeightSource,
-    TritCalibrationSource, WeightSource,
+    DirectoryTensorSink, Engine, FileWeightSource, QuantizedModel, TritCalibrationSource,
+    file_calibration_source,
 };
-use tritium_schema::{
-    CalibratedQuantPlan, DirectFitMetric, ModelQuantPlan, QuantActionRef, QuantPlan,
-    QuantSourceTensor,
-};
+use tritium_schema::{CalibratedQuantPlan, ModelQuantPlan, QuantPlan};
 
 const DEFAULT_MAX_PLAN_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -102,87 +97,6 @@ fn paths(bindings: &[NamedPath]) -> Result<BTreeMap<String, PathBuf>> {
     }
     Ok(result)
 }
-fn inventory<'a>(
-    paths: &BTreeMap<String, PathBuf>,
-    expected: impl Iterator<Item = &'a str>,
-    kind: &str,
-) -> Result<()> {
-    ensure!(
-        paths.keys().map(String::as_str).eq(expected),
-        "{kind} input inventory does not match plan"
-    );
-    Ok(())
-}
-
-// Real file-backed raw Grams are loaded only when requested by the common engine;
-// do not retain every model's square Gram in the safetensors adapter's memory map.
-struct FileWeightSource {
-    raw: SafeTensorsWeightSource<File>,
-    grams: BTreeMap<String, PathBuf>,
-    gram_sizes: BTreeMap<String, u64>,
-}
-impl WeightSource for FileWeightSource {
-    fn inventory(&self) -> std::result::Result<Vec<QuantSourceTensor>, QuantEngineError> {
-        self.raw.inventory()
-    }
-    fn asset_names(&self) -> Vec<String> {
-        self.raw.asset_names()
-    }
-    fn tensor(
-        &mut self,
-        name: &str,
-        max: usize,
-    ) -> std::result::Result<Cow<'_, [u8]>, QuantEngineError> {
-        self.raw.tensor(name, max)
-    }
-    fn asset(
-        &mut self,
-        name: &str,
-        max: usize,
-    ) -> std::result::Result<Cow<'_, [u8]>, QuantEngineError> {
-        self.raw.asset(name, max)
-    }
-    fn input_gram(
-        &mut self,
-        name: &str,
-        max: usize,
-    ) -> std::result::Result<Cow<'_, [f64]>, QuantEngineError> {
-        (|| -> Result<Vec<f64>> {
-            let path = self
-                .grams
-                .get(name)
-                .context("missing requested raw Gram file")?;
-            let expected = *self
-                .gram_sizes
-                .get(name)
-                .context("missing requested Gram shape")?;
-            ensure!(
-                expected / 8 <= u64::try_from(max)?,
-                "requested Gram exceeds engine limit"
-            );
-            let bytes = read_bounded(path, expected)?;
-            ensure!(
-                u64::try_from(bytes.len())? == expected,
-                "Gram file has wrong square length: {name}"
-            );
-            let mut values = Vec::new();
-            values
-                .try_reserve_exact(bytes.len() / 8)
-                .context("reserve bounded Gram")?;
-            values.extend(
-                bytes
-                    .as_chunks::<8>()
-                    .0
-                    .iter()
-                    .map(|b| f64::from_le_bytes(*b)),
-            );
-            Ok(values)
-        })()
-        .map(Cow::Owned)
-        .map_err(|e| QuantEngineError::Source(format!("raw Gram {name}: {e:#}")))
-    }
-}
-
 pub(crate) fn run(args: &PlanArgs, output: &Path) -> Result<()> {
     let max = args.max_plan_bytes.unwrap_or(DEFAULT_MAX_PLAN_BYTES);
     ensure!(max > 0, "--max-plan-bytes must be positive");
@@ -199,44 +113,8 @@ pub(crate) fn run(args: &PlanArgs, output: &Path) -> Result<()> {
     let view = request.view();
     view.validate().context("validate conversion plan")?;
     let gram_paths = paths(&args.input_gram)?;
-    let mut gram_sizes = BTreeMap::new();
-    let mut cache_names = Vec::new();
-    for tensor in view.tensors() {
-        match tensor.action {
-            QuantActionRef::Fit {
-                plan,
-                metric: DirectFitMetric::InputGramF64 { .. },
-            } => {
-                let entries = plan
-                    .layout
-                    .cols
-                    .checked_mul(plan.layout.cols)
-                    .context("Gram shape overflow")?;
-                ensure!(
-                    entries <= plan.limits.max_metric_entries,
-                    "Gram shape exceeds requested metric limit"
-                );
-                gram_sizes.insert(
-                    tensor.source.name.clone(),
-                    entries.checked_mul(8).context("Gram byte overflow")?,
-                );
-            }
-            QuantActionRef::CalibratedFit(_) => cache_names.push(tensor.source.name.as_str()),
-            QuantActionRef::KeepDense
-            | QuantActionRef::Fit {
-                metric: DirectFitMetric::Identity,
-                ..
-            } => {}
-            _ => bail!("unsupported typed plan action or metric"),
-        }
-    }
-    inventory(
-        &gram_paths,
-        gram_sizes.keys().map(String::as_str),
-        "raw Gram",
-    )?;
     let caches = paths(&args.calibration_cache)?;
-    inventory(&caches, cache_names.into_iter(), "calibration cache")?;
+    let mut calibration = file_calibration_source(view, caches)?;
     let run = args
         .conversion_run_id
         .as_deref()
@@ -247,44 +125,17 @@ pub(crate) fn run(args: &PlanArgs, output: &Path) -> Result<()> {
         let Request::Calibrated(plan) = request else {
             bail!("original-captured stage requires a calibrated plan");
         };
-        let result = run_stage(args, &plan, caches, output, recorder, max)?;
+        let result = run_stage(args, &plan, &mut calibration, output, recorder, max)?;
         return print_result(output, &result);
     }
     let assets = paths(&args.asset)?;
-    inventory(&assets, view.assets().iter().map(String::as_str), "asset")?;
-    ensure!(
-        !args.source_shard.is_empty(),
-        "at least one --source-shard is required"
-    );
-    let readers = args
-        .source_shard
-        .iter()
-        .map(|p| regular_file(p))
-        .collect::<Result<Vec<_>>>()?;
-    let mut remaining = view.limits().max_asset_bytes;
-    let assets = assets
-        .into_iter()
-        .map(|(name, path)| {
-            let bytes = read_bounded(&path, remaining)?;
-            remaining -= u64::try_from(bytes.len()).context("asset platform size")?;
-            Ok((name, bytes))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    let mut source = FileWeightSource {
-        raw: SafeTensorsWeightSource::new(readers, assets, BTreeMap::new())?,
-        grams: gram_paths,
-        gram_sizes,
-    };
+    let mut source = FileWeightSource::open(view, &args.source_shard, assets, gram_paths)?;
     let mut sink = DirectoryTensorSink::new(output);
     let result = match request {
         Request::Plain(plan) => Engine::run(&plan, &mut source, &mut sink, recorder)?,
-        Request::Calibrated(plan) => Engine::run_calibrated(
-            &plan,
-            &mut source,
-            &mut TritCalibrationSource::new(caches)?,
-            &mut sink,
-            recorder,
-        )?,
+        Request::Calibrated(plan) => {
+            Engine::run_calibrated(&plan, &mut source, &mut calibration, &mut sink, recorder)?
+        }
     };
     print_result(output, &result)
 }
@@ -306,7 +157,7 @@ fn recorder(run: &str) -> Result<EvidenceRecorder> {
 fn run_stage(
     args: &PlanArgs,
     plan: &CalibratedQuantPlan,
-    caches: BTreeMap<String, PathBuf>,
+    calibration: &mut TritCalibrationSource,
     output: &Path,
     recorder: EvidenceRecorder,
     max_json: u64,
@@ -321,7 +172,7 @@ fn run_stage(
         plan,
         &mut stage,
         &inputs.capture,
-        &mut TritCalibrationSource::new(caches)?,
+        calibration,
         &mut DirectoryTensorSink::new(output),
         recorder,
         inputs.conversion_limits,

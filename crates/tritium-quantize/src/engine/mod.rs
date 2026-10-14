@@ -10,6 +10,7 @@ mod calibration;
 mod calibration_cache;
 mod calibration_sources;
 mod direct;
+mod file_source;
 mod joint_feedback;
 mod ladder;
 mod model;
@@ -27,6 +28,9 @@ pub use observed_source::ObservedWeightSource;
 pub use salience::{SalienceFoldError, SaliencePair, divide_rows, scale_cols, smooth_scales};
 pub use salience_model::JoinedSalienceModel;
 
+pub use file_source::{
+    FileWeightSource, file_calibration_source, open_original_file, read_original_file_bounded,
+};
 pub use model::{
     Engine, PublicationWarning, QuantEngineError, QuantizedModel, TensorSink, WeightSource,
     verify_package_with_fit_log,

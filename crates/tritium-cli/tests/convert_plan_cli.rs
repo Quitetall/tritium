@@ -14,6 +14,8 @@ use tritium_schema::*;
 
 #[path = "convert_plan_cli/original_stage.rs"]
 mod original_stage;
+#[path = "convert_plan_cli/python.rs"]
+mod python;
 #[path = "convert_plan_cli/quantize.rs"]
 mod typed_quantize;
 

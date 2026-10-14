@@ -6,6 +6,26 @@ Part of [Tritium](https://github.com/Quitetall/tritium) — Apache-2.0 infrastru
 quantizing, training, and serving additive-ternary ({-1, 0, +1}) neural networks with
 exact byte accounting and receipt-backed benchmarks.
 
+The expert `tritium.convert_model_plan(plan_json, source_shards, output_dir,
+run_id, *, asset_paths=None, input_grams=None, calibration_caches=None,
+calibrated=False, max_plan_bytes=16777216)` runs the same Rust model conversion
+engine as `tritium convert --plan`. Supply the existing Rust `QuantPlan` JSON,
+the complete original safetensors shard inventory and exact named asset paths.
+`calibrated=True` selects `CalibratedQuantPlan` and requires its bound `.trit`
+cache files. `input_grams` binds named raw little-endian f64 square Gram files;
+neither absent nor invalid metrics fall back to Identity. Computation releases
+the GIL. The destination must be new and is never overwritten.
+
+The readonly `NativeModelConversion` reports actual source/package/model/evidence
+identities and publication warnings. `verify()` reopens `model.trit` and
+`evidence.jsonl` and verifies their exact identity and binding.
+`preserved_tensor(level, name, max_bytes=67108864)` returns precision, shape and
+original dense bytes after verification; it does not decode additive tensors.
+Revalidation reads whole files under declared bounds, not a streaming/RSS claim.
+This converts the complete declared floating-point inventory, not arbitrary HF
+architectures, and is not a model-quality or release-qualification receipt.
+The existing torch PTQ lifecycle and its matrix-only packages are unchanged.
+
 See the [repository README](https://github.com/Quitetall/tritium#readme) and the
 [book](https://github.com/Quitetall/tritium/tree/main/docs/book) for usage.
 

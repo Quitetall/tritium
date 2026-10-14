@@ -36,6 +36,7 @@
 
 mod hf_assets;
 mod kronecker;
+mod model_conversion;
 mod module_package;
 #[cfg(feature = "onnx")]
 mod onnx;
@@ -387,6 +388,8 @@ fn backend_for_device(device: &str) -> Result<Box<dyn TernaryBackend>, String> {
 /// the CPU backend visible to the runtime registry that [`Model::load`] / [`ternary_matmul`] consult.
 #[pymodule]
 fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<model_conversion::NativeModelConversion>()?;
+    m.add_function(wrap_pyfunction!(model_conversion::convert_model_plan, m)?)?;
     m.add_class::<Model>()?;
     m.add_class::<qwen::QwenModel>()?;
     m.add_class::<qwen::QwenLoadReceipt>()?;
