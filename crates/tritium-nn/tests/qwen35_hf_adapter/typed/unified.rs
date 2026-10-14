@@ -12,6 +12,9 @@ mod stream_limits;
 #[path = "unified/inspection.rs"]
 mod inspection;
 
+#[path = "unified/resources.rs"]
+mod resources;
+
 #[cfg(feature = "cuda")]
 #[path = "unified/resident.rs"]
 mod resident;

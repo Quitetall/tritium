@@ -67,7 +67,10 @@ pub use model::{
     UnverifiedQwen35Mtp, qwen35_language_mtp_tensor_schema, qwen36_27b_canonical_source_config,
 };
 #[cfg(feature = "tokenizer")]
-pub use model::{GgufBpeTokenizer, HfJsonTokenizer, LoadedModel, load, load_with_limits};
+pub use model::{
+    GgufBpeTokenizer, HfJsonTokenizer, LoadedModel, ModelLoadResources, ModelResourceAdmission,
+    load, load_with_limits, load_with_resources,
+};
 #[cfg(feature = "cuda")]
 pub use model::{
     SaltV2LoadedTensorReceipt, SaltV2ModelAllocationReceipt, SaltV2PreservedTensorReceipt,

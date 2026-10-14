@@ -3,9 +3,13 @@
 use std::sync::Arc;
 
 use tritium_format::AdditiveTensor;
-use tritium_runtime::{TensorPayloadBudget, TensorUploadContext, upload_tensor_logged_admitted};
+use tritium_runtime::{
+    TensorPayloadBudget, TensorUploadContext, TensorUploadResources, upload_tensor_logged_admitted,
+    upload_tensor_logged_with_resources,
+};
 use tritium_spec::{
-    DeviceBuffer, TensorCaps, TensorMatmul, TensorUploadPolicy, TensorView, TernaryBackend,
+    DeviceBuffer, TensorCaps, TensorMatmul, TensorUploadPlan, TensorUploadPolicy, TensorView,
+    TernaryBackend,
 };
 
 use crate::NnError;
@@ -21,6 +25,10 @@ pub struct TensorLoader<'a> {
     policy: TensorUploadPolicy,
     budget: &'a TensorPayloadBudget,
     context: TensorUploadContext<'a>,
+    planned: Option<(
+        TensorUploadResources<'a>,
+        &'a std::collections::BTreeMap<String, TensorUploadPlan>,
+    )>,
 }
 
 impl core::fmt::Debug for TensorLoader<'_> {
@@ -46,6 +54,24 @@ impl<'a> TensorLoader<'a> {
             policy,
             budget,
             context,
+            planned: None,
+        }
+    }
+
+    #[cfg(feature = "tokenizer")]
+    pub(crate) fn planned(
+        backend: &'a dyn TernaryBackend,
+        policy: TensorUploadPolicy,
+        resources: TensorUploadResources<'a>,
+        plans: &'a std::collections::BTreeMap<String, TensorUploadPlan>,
+        context: TensorUploadContext<'a>,
+    ) -> Self {
+        Self {
+            backend,
+            policy,
+            budget: resources.payload,
+            context,
+            planned: Some((resources, plans)),
         }
     }
 
@@ -97,20 +123,58 @@ impl<'a> TensorLoader<'a> {
                 "{name}: empty model weight geometry"
             )));
         }
-        let (dev, caps) = upload_tensor_logged_admitted(
-            self.backend,
-            view,
-            self.policy,
-            name,
-            TensorUploadContext {
-                recorder: self.context.recorder,
-                span: self.context.span,
-                parent: self.context.parent,
-                logical_time: self.context.logical_time,
-            },
-            self.budget,
-        )
-        .map_err(|error| NnError::Backend(format!("{name}: {error}")))?;
+        let context = TensorUploadContext {
+            recorder: self.context.recorder,
+            span: self.context.span,
+            parent: self.context.parent,
+            logical_time: self.context.logical_time,
+        };
+        let result = if let Some((resources, plans)) = &self.planned {
+            let expected = plans
+                .get(name)
+                .ok_or_else(|| NnError::Backend(format!("{name}: absent aggregate upload plan")))?;
+            let actual = self
+                .backend
+                .tensor_upload_plan(
+                    tritium_spec::TensorMetadata::from_view(view)
+                        .map_err(|e| NnError::Backend(e.to_string()))?,
+                )
+                .map_err(|e| NnError::Backend(e.to_string()))?;
+            if actual != Some(*expected) {
+                return Err(NnError::Backend(format!(
+                    "{name}: upload plan changed after aggregate admission"
+                )));
+            }
+            upload_tensor_logged_with_resources(
+                self.backend,
+                view,
+                self.policy,
+                name,
+                context,
+                TensorUploadResources {
+                    payload: resources.payload,
+                    host_workspace: resources.host_workspace,
+                    device_workspace: resources.device_workspace,
+                },
+            )
+        } else {
+            upload_tensor_logged_admitted(
+                self.backend,
+                view,
+                self.policy,
+                name,
+                context,
+                self.budget,
+            )
+        };
+        let (dev, caps) = result.map_err(|error| NnError::Backend(format!("{name}: {error}")))?;
+        if let Some((_, plans)) = &self.planned
+            && plans.get(name).is_none_or(|plan| plan.caps != caps)
+        {
+            return Err(NnError::Backend(format!(
+                "{name}: actual caps differ from aggregate plan"
+            )));
+        }
         Ok(Linear {
             rows,
             cols,

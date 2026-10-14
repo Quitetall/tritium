@@ -368,7 +368,7 @@ pub fn load(
     budget: &tritium_runtime::TensorPayloadBudget,
     context: tritium_runtime::TensorUploadContext<'_>,
 ) -> Result<LoadedModel, NnError> {
-    load_impl(source, backend, policy, budget, None, context)
+    load_impl(source, backend, policy, budget, None, None, context)
 }
 
 /// Load through the same source/runner with explicit bounded stream admission.
@@ -390,16 +390,49 @@ pub fn load_with_limits(
     context: tritium_runtime::TensorUploadContext<'_>,
 ) -> Result<LoadedModel, NnError> {
     limits.validate()?;
-    load_impl(source, backend, policy, budget, Some(limits), context)
+    load_impl(source, backend, policy, budget, Some(limits), None, context)
+}
+
+/// Load retained typed weights after reserving all covered logical domains.
+/// Metadata/inventory/tokenizer preparation precedes aggregate admission; no
+/// complete weight tensor is materialized or uploaded before admission. Unknown
+/// backend plans, resident graphs and non-retained carriers fail without fallback.
+/// The decoded compatibility path remains; bounded streaming is not implied.
+/// Source/tokenizer metadata heaps, allocator/driver costs and execution scratch
+/// are excluded. This does not establish physical fit, quality or release readiness.
+/// # Errors
+/// Source/stream/planning/policy/budget/backend/evidence errors, including rollback
+/// of every private handle and reservation on incomplete assembly.
+#[cfg(feature = "tokenizer")]
+pub fn load_with_resources(
+    source: ModelSource<'_>,
+    backend: Box<dyn tritium_spec::TernaryBackend>,
+    policy: tritium_schema::TensorUploadPolicy,
+    resources: super::ModelLoadResources<'_>,
+    limits: super::StreamLimits,
+    context: tritium_runtime::TensorUploadContext<'_>,
+) -> Result<LoadedModel, NnError> {
+    limits.validate()?;
+    load_impl(
+        source,
+        backend,
+        policy,
+        resources.payload,
+        Some(limits),
+        Some(resources),
+        context,
+    )
 }
 
 #[cfg(feature = "tokenizer")]
+#[allow(clippy::too_many_arguments)]
 fn load_impl(
     source: ModelSource<'_>,
     backend: Box<dyn tritium_spec::TernaryBackend>,
     policy: tritium_schema::TensorUploadPolicy,
     budget: &tritium_runtime::TensorPayloadBudget,
     execution: Option<super::StreamLimits>,
+    resources: Option<super::ModelLoadResources<'_>>,
     context: tritium_runtime::TensorUploadContext<'_>,
 ) -> Result<LoadedModel, NnError> {
     context
@@ -422,15 +455,21 @@ fn load_impl(
             limits,
         } => {
             return super::retained::load_file(
-                path, level, receiving, limits, backend, policy, budget, execution, context,
+                path, level, receiving, limits, backend, policy, budget, execution, resources,
+                context,
             );
         }
         ModelSource::Trit { bytes, level } => {
             return super::retained::load_bytes(
-                bytes, level, backend, policy, budget, execution, context,
+                bytes, level, backend, policy, budget, execution, resources, context,
             );
         }
         _ => {}
+    }
+    if resources.is_some() {
+        return Err(NnError::ResourceExhausted(
+            "resource-planned loading requires a retained typed source".into(),
+        ));
     }
     let source = PreparedSource::new(source)?;
     let admission = source.admission(execution)?;

@@ -11,6 +11,8 @@ use tritium_spec::{BackendError, DeviceBuffer};
 struct Ledger {
     limit: u64,
     used: AtomicU64,
+    // A child keeps its parent reservation until the final child owner drops.
+    _parent: Option<Reservation>,
 }
 
 /// Shared cap on payload bytes owned by admitted tensor handles.
@@ -37,6 +39,7 @@ impl TensorPayloadBudget {
             ledger: Arc::new(Ledger {
                 limit,
                 used: AtomicU64::new(0),
+                _parent: None,
             }),
         }
     }
@@ -52,6 +55,30 @@ impl TensorPayloadBudget {
     #[must_use]
     pub fn used_bytes(&self) -> u64 {
         self.ledger.used.load(Ordering::Acquire)
+    }
+
+    /// Atomically reserve a fixed partition before a model starts allocating.
+    /// Child uploads charge this partition, not the parent twice. The entire
+    /// partition remains charged until its last budget/handle/reservation drops.
+    /// This is logical admission, not a physical-memory measurement.
+    pub fn partition(&self, bytes: u64) -> Result<Self, BackendError> {
+        let parent = self.reserve(bytes)?;
+        Ok(Self {
+            ledger: Arc::new(Ledger {
+                limit: bytes,
+                used: AtomicU64::new(0),
+                _parent: Some(parent),
+            }),
+        })
+    }
+
+    /// Reserve caller-owned logical storage before allocation. The non-cloneable
+    /// guard must outlive the storage; dropping it releases the reservation.
+    pub fn reserve_storage(&self, bytes: u64) -> Result<TensorStorageReservation, BackendError> {
+        self.reserve(bytes)
+            .map(|reservation| TensorStorageReservation {
+                _reservation: reservation,
+            })
     }
 
     pub(super) fn reserve(&self, bytes: u64) -> Result<Reservation, BackendError> {
@@ -84,9 +111,17 @@ impl TensorPayloadBudget {
     }
 }
 
+#[derive(Debug)]
 pub(super) struct Reservation {
     ledger: Arc<Ledger>,
     bytes: u64,
+}
+
+/// Opaque lifetime guard for caller-owned logical storage, not physical memory.
+/// Declare it after the owned storage so storage drops before admission releases.
+#[derive(Debug)]
+pub struct TensorStorageReservation {
+    _reservation: Reservation,
 }
 
 impl Reservation {
@@ -148,5 +183,54 @@ mod tests {
         ));
         drop(empty.reserve(0).unwrap());
         assert_eq!(empty.used_bytes(), 0);
+    }
+
+    #[test]
+    fn partition_is_atomic_and_follows_final_child_owner() {
+        let parent = TensorPayloadBudget::new(100);
+        let child = parent.partition(80).unwrap();
+        assert_eq!(parent.used_bytes(), 80);
+        assert!(parent.partition(21).is_err());
+        let clone = child.clone();
+        let storage = child.reserve_storage(60).unwrap();
+        assert_eq!(child.used_bytes(), 60);
+        assert!(child.reserve_storage(21).is_err());
+        drop(child);
+        drop(clone);
+        assert_eq!(parent.used_bytes(), 80);
+        drop(storage);
+        assert_eq!(parent.used_bytes(), 0);
+    }
+
+    #[test]
+    fn concurrent_partitions_cannot_overcommit_the_parent() {
+        let parent = TensorPayloadBudget::new(100);
+        let start = Arc::new(std::sync::Barrier::new(9));
+        let finish = Arc::new(std::sync::Barrier::new(9));
+        std::thread::scope(|scope| {
+            let jobs = (0..8)
+                .map(|_| {
+                    let parent = parent.clone();
+                    let start = start.clone();
+                    let finish = finish.clone();
+                    scope.spawn(move || {
+                        start.wait();
+                        let child = parent.partition(60);
+                        finish.wait();
+                        child.is_ok()
+                    })
+                })
+                .collect::<Vec<_>>();
+            start.wait();
+            finish.wait();
+            assert_eq!(
+                jobs.into_iter()
+                    .map(|job| job.join().unwrap())
+                    .filter(|ok| *ok)
+                    .count(),
+                1
+            );
+        });
+        assert_eq!(parent.used_bytes(), 0);
     }
 }

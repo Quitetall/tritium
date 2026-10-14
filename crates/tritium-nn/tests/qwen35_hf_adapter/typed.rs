@@ -623,6 +623,12 @@ impl TernaryBackend for Probe {
     ) -> Result<Option<tritium_spec::TensorCaps>, BackendError> {
         tritium_cpu::CpuBackend::new().tensor_caps(t)
     }
+    fn tensor_upload_plan(
+        &self,
+        metadata: tritium_spec::TensorMetadata<'_>,
+    ) -> Result<Option<tritium_spec::TensorUploadPlan>, BackendError> {
+        tritium_cpu::CpuBackend::new().tensor_upload_plan(metadata)
+    }
     fn upload_tensor(&self, t: TensorView<'_>) -> Result<Box<dyn DeviceBuffer>, BackendError> {
         let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some(path) = self.mutate.as_ref().filter(|_| n == 1) {

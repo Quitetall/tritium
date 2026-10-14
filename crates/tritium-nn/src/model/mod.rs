@@ -25,6 +25,8 @@ mod qwen35_trit;
 #[cfg(feature = "tokenizer")]
 pub(crate) mod resident;
 #[cfg(feature = "tokenizer")]
+mod resources;
+#[cfg(feature = "tokenizer")]
 mod retained;
 #[cfg(feature = "tokenizer")]
 mod retained_plan;
@@ -79,6 +81,8 @@ pub use qwen35_salt_v2::{
 };
 pub use qwen35_trit::Qwen35TritReadLimits;
 #[cfg(feature = "tokenizer")]
+pub use resources::{ModelLoadResources, ModelResourceAdmission};
+#[cfg(feature = "tokenizer")]
 pub use retained_plan::{ModelLoadPlan, TensorLoadPlan, inspect_trit_file};
 pub use runner::{ForwardDump, ModelRunner};
 #[cfg(feature = "cuda")]
@@ -87,7 +91,7 @@ pub use salt_v2::{
 };
 pub use source::ModelSource;
 #[cfg(feature = "tokenizer")]
-pub use source::{LoadedModel, load, load_with_limits};
+pub use source::{LoadedModel, load, load_with_limits, load_with_resources};
 pub(crate) use staged_calibration::{dense_source_weights, dense_stage_weights};
 pub use tokenizer::Tokenizer;
 pub use training_salt::{

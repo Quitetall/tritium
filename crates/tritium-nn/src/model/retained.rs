@@ -32,6 +32,7 @@ pub(super) fn load_file(
     policy: TensorUploadPolicy,
     budget: &TensorPayloadBudget,
     execution: Option<super::StreamLimits>,
+    resources: Option<super::ModelLoadResources<'_>>,
     context: TensorUploadContext<'_>,
 ) -> Result<LoadedModel, NnError> {
     positive(limits)?;
@@ -47,9 +48,11 @@ pub(super) fn load_file(
         policy,
         budget,
         execution,
+        resources,
         context,
     )
 }
+#[allow(clippy::too_many_arguments)]
 pub(super) fn load_bytes(
     bytes: &[u8],
     level: &str,
@@ -57,6 +60,7 @@ pub(super) fn load_bytes(
     policy: TensorUploadPolicy,
     budget: &TensorPayloadBudget,
     execution: Option<super::StreamLimits>,
+    resources: Option<super::ModelLoadResources<'_>>,
     context: TensorUploadContext<'_>,
 ) -> Result<LoadedModel, NnError> {
     // Preserve the borrowed source's historical admission envelope. The caller
@@ -83,6 +87,7 @@ pub(super) fn load_bytes(
         policy,
         budget,
         execution,
+        resources,
         context,
     )
 }
@@ -108,6 +113,7 @@ fn load_reader<R: Read + Seek>(
     policy: TensorUploadPolicy,
     budget: &TensorPayloadBudget,
     execution: Option<super::StreamLimits>,
+    resources: Option<super::ModelLoadResources<'_>>,
     context: TensorUploadContext<'_>,
 ) -> Result<LoadedModel, NnError> {
     let Prepared {
@@ -118,21 +124,44 @@ fn load_reader<R: Read + Seek>(
     let vocab = plan.architecture().vocab_size();
     let admission = plan.cache_admission();
     let source = plan.source().clone();
+    let reservations = resources
+        .map(|resources| {
+            super::resources::reserve(
+                &model,
+                level,
+                &graph,
+                &plan,
+                backend.as_ref(),
+                policy,
+                resources,
+            )
+        })
+        .transpose()?;
     drop(plan);
     let backend_name = backend.device_id().to_owned();
     let physical_device = backend.physical_device_id().to_owned();
-    let runner = {
-        let mut loader = TensorLoader::new(
-            backend.as_ref(),
-            policy,
-            budget,
-            TensorUploadContext {
-                recorder: &mut *context.recorder,
-                span: context.span,
-                parent: context.parent,
-                logical_time: context.logical_time,
-            },
-        );
+    let mut runner = {
+        let upload_context = TensorUploadContext {
+            recorder: &mut *context.recorder,
+            span: context.span,
+            parent: context.parent,
+            logical_time: context.logical_time,
+        };
+        let mut loader = if let Some(reservations) = &reservations {
+            TensorLoader::planned(
+                backend.as_ref(),
+                policy,
+                tritium_runtime::TensorUploadResources {
+                    payload: &reservations.payload,
+                    host_workspace: &reservations.host_workspace,
+                    device_workspace: &reservations.device_workspace,
+                },
+                &reservations.plans,
+                upload_context,
+            )
+        } else {
+            TensorLoader::new(backend.as_ref(), policy, budget, upload_context)
+        };
         match graph {
             Graph::Standard(prepared) => {
                 let (config, spec, plan) = *prepared;
@@ -184,6 +213,16 @@ fn load_reader<R: Read + Seek>(
             }
         }
     };
+    if let Some(reservations) = reservations {
+        if reservations.payload.used_bytes() != reservations.admission.payload_bytes {
+            return Err(invalid(
+                "actual aggregate payload differs from pre-decode plan",
+            ));
+        }
+        runner.bind_resources(reservations.admission, reservations.retained_host);
+        // Transient source/upload work is no longer needed. Owned handles keep
+        // the payload partition alive, and the runner owns the retained-host guard.
+    }
     model.verify().map_err(invalid)?;
     let observation = ModelLoaded {
         source,

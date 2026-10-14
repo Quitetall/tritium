@@ -112,6 +112,11 @@ pub struct Runner {
     architecture: ArchitectureSpec,
     executor: Box<dyn Executor>,
     admission: Option<CacheAdmission>,
+    #[cfg(feature = "tokenizer")]
+    resources: Option<(
+        super::ModelResourceAdmission,
+        tritium_runtime::TensorStorageReservation,
+    )>,
 }
 impl Runner {
     /// Actual selected graph implementation, not a quality/performance verdict.
@@ -145,6 +150,7 @@ impl Runner {
             architecture,
             executor,
             admission,
+            resources: None,
         })
     }
     #[cfg(feature = "tokenizer")]
@@ -172,7 +178,23 @@ impl Runner {
             architecture,
             executor,
             admission,
+            resources: None,
         })
+    }
+    #[cfg(feature = "tokenizer")]
+    pub(super) fn bind_resources(
+        &mut self,
+        admission: super::ModelResourceAdmission,
+        reservation: tritium_runtime::TensorStorageReservation,
+    ) {
+        self.resources = Some((admission, reservation));
+    }
+    /// Covered logical domains admitted before weight materialization, if selected.
+    /// Absent for compatibility loading; never a physical-memory qualification.
+    #[cfg(feature = "tokenizer")]
+    #[must_use]
+    pub fn resource_admission(&self) -> Option<super::ModelResourceAdmission> {
+        self.resources.as_ref().map(|(admission, _)| *admission)
     }
     /// Actual immutable graph/configuration used by this stream.
     #[must_use]

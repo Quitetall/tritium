@@ -67,7 +67,7 @@ mod reference;
 mod tensor_budget;
 mod tensor_upload;
 pub use reference::ReferenceBackend;
-pub use tensor_budget::TensorPayloadBudget;
+pub use tensor_budget::{TensorPayloadBudget, TensorStorageReservation};
 pub use tensor_upload::{
     TensorUploadContext, TensorUploadError, TensorUploadResources, upload_tensor_logged,
     upload_tensor_logged_admitted, upload_tensor_logged_with_resources,
