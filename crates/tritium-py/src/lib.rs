@@ -37,6 +37,7 @@
 mod hf_assets;
 mod kronecker;
 mod model_conversion;
+mod model_level;
 mod module_package;
 #[cfg(feature = "onnx")]
 mod onnx;
@@ -389,6 +390,8 @@ fn backend_for_device(device: &str) -> Result<Box<dyn TernaryBackend>, String> {
 #[pymodule]
 fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<model_conversion::NativeModelConversion>()?;
+    m.add_class::<model_level::NativeModelLevel>()?;
+    m.add_class::<model_level::NativePackedMatrix>()?;
     m.add_function(wrap_pyfunction!(model_conversion::convert_model_plan, m)?)?;
     m.add_function(wrap_pyfunction!(model_conversion::_validate_model_plan, m)?)?;
     m.add_class::<Model>()?;

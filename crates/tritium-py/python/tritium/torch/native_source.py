@@ -119,6 +119,36 @@ def _source_tensor(tensor):
     return tensor.detach().resolve_conj().resolve_neg().to(device="cpu").contiguous()
 
 
+def _graph_contract(model, entries):
+    selected = {alias for _, aliases, _, _, targeted, _ in entries if targeted for alias in aliases}
+    groups = {}
+    for path, module in model.named_modules(remove_duplicate=False):
+        alias = f"{path}.weight" if path else "weight"
+        if alias not in selected:
+            continue
+        if type(module) is nn.Linear:
+            options = dict(in_features=module.in_features, out_features=module.out_features,
+                           bias=module.bias is not None)
+        elif type(module) is nn.Embedding:
+            options = dict(num_embeddings=module.num_embeddings, embedding_dim=module.embedding_dim,
+                           padding_idx=module.padding_idx, max_norm=module.max_norm,
+                           norm_type=module.norm_type, scale_grad_by_freq=module.scale_grad_by_freq,
+                           sparse=module.sparse)
+            if module.max_norm is not None:
+                raise ValueError("native embedding cannot preserve mutating max_norm")
+        else:
+            raise ValueError("native consumers must be exact Linear or Embedding modules")
+        group = groups.setdefault(id(module), dict(paths=[], kind=type(module).__name__, options=options))
+        group["paths"].append(path)
+    consumers = sorted((dict(paths=sorted(group["paths"]), kind=group["kind"], options=group["options"])
+                        for group in groups.values()), key=lambda group: group["paths"][0])
+    config = getattr(model, "config", None)
+    # The asset is JSON: normalize integer config keys and tuples once at its
+    # owning compiler, so reopen compares the exact serialized interpretation.
+    graph = dict(consumers=consumers, model_config=config.to_dict() if hasattr(config, "to_dict") else None)
+    return json.loads(json.dumps(graph, sort_keys=True, separators=(",", ":"), allow_nan=False))
+
+
 def convert_native_module(
     prepared: PreparedModel,
     output_dir,
@@ -144,6 +174,7 @@ def convert_native_module(
 
     entries = _inventory(prepared)
     topology = _topology(entries)
+    graph = _graph_contract(prepared.model, entries)
     selected = {owner for owner, _, _, _, targeted, _ in entries if targeted}
     if not selected or not isinstance(actions, Mapping) or set(actions) != selected:
         raise ValueError("native actions must exactly match selected tensor owners")
@@ -170,7 +201,7 @@ def convert_native_module(
     if source_bytes > limits["max_source_bytes"] or opaque_bytes > limits["max_asset_bytes"]:
         raise ValueError("persistent state exceeds native source/asset byte limits")
     source_digest = _source_model_digest(prepared.model)
-    catalog = dict(adapter="tritium.torch.native-source@1", source_preparation_config=prepared.config.to_dict(),
+    catalog = dict(adapter="tritium.torch.native-source@2", graph=graph, source_preparation_config=prepared.config.to_dict(),
                    coverage=prepared.coverage.to_dict(), source_model_digest=source_digest,
                    state=[dict(owner=owner, aliases=aliases, dtype=str(tensor.dtype),
                                shape=list(tensor.shape), kind=kind,
@@ -209,6 +240,8 @@ def convert_native_module(
             raise ValueError("original Torch state assets exceed native byte limit")
         if _topology(_inventory(prepared)) != topology:
             raise ValueError("model state ownership changed during source capture")
+        if _graph_contract(prepared.model, entries) != graph:
+            raise ValueError("model graph contract changed during source capture")
         if _source_model_digest(prepared.model) != source_digest:
             raise ValueError("model state changed during source capture")
         result = _tritium.convert_model_plan(plan_json, [str(source)], str(output), run_id,

@@ -67,6 +67,7 @@ mod reference;
 mod tensor_budget;
 mod tensor_stream_upload;
 mod tensor_upload;
+mod trit_tensor_source;
 pub use reference::ReferenceBackend;
 pub use tensor_budget::{TensorPayloadBudget, TensorStorageReservation};
 pub use tensor_stream_upload::upload_tensor_stream_logged_with_resources;
@@ -74,6 +75,7 @@ pub use tensor_upload::{
     TensorUploadContext, TensorUploadError, TensorUploadResources, upload_tensor_logged,
     upload_tensor_logged_admitted, upload_tensor_logged_with_resources,
 };
+pub use trit_tensor_source::{TritTensorSource, trit_tensor_encoding, trit_tensor_metadata};
 
 // Re-export the core vocabulary types the dispatch surface uses (via
 // `tritium-spec`'s re-exports) so a dispatch caller needs only depend on

@@ -16,12 +16,10 @@ tritium-spec = { workspace = true }
 tritium-evidence = { workspace = true }
 tritium-core = { workspace = true }
 tritium-format = { workspace = true }
+tritium-schema = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 linkme = { workspace = true }
-
-[dev-dependencies]
-tritium-schema = { workspace = true }
 
 [lints]
 workspace = true

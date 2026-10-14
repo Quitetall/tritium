@@ -41,8 +41,30 @@ silently admitted as native executable tensors. The current state dtype profile
 is F16/BF16/F32/F64, signed I8/I16/I32/I64, U8 and bool; other dtypes, custom
 non-tensor state, meta/sparse/quantized tensors and overlapping views reject.
 `result.asset(name, max_bytes=67108864)` reads bounded original asset bytes after
-package/log verification. This is source packaging, not fresh-shell Torch/HF
-application, calibrated phase migration or runtime/quality qualification.
+package/log verification. This is source packaging, not calibrated phase
+migration or runtime/quality qualification.
+
+`tritium.torch.load_native_module(shell, artifact, level="full",
+load_run_id="load-1", inplace=False)` applies the version-2 state catalog to a
+compatible fresh CPU Torch/HF shell. `artifact` is the returned native conversion
+or its output directory, reopened through `NativeModelConversion.open(path)`.
+The shared Rust reader verifies package/fit-log binding; the shared CPU backend
+executes immutable packed Linear/Embedding owners without retaining a selected
+dense weight. Original biases, norms and persistent buffers are restored with
+exact aliases. F32 scale laws and Identity/Hadamard/SignedRht bases are preserved.
+The loader checks state topology, selected consumer options and normalized HF
+configuration before privately staging any changes. The version-1 preservation
+catalog is not executable and is never silently upgraded.
+
+This initial adapter is eager CPU inference only. Autograd, accelerator placement,
+`torch.compile`, ordinary `state_dict`/`save_pretrained` export and arbitrary model
+architectures are not supported or inferred. Save/reopen the native package, not
+an incomplete framework checkpoint. Root dtype moves keep packed scale precision
+unchanged and restore preserved aliases; descendant-only moves do not carry that
+whole-model topology guarantee. Payload/workspace/output limits bound declared
+native allocations, not aggregate RSS: the initial receiver retains one admitted
+whole package byte image. Its sealed upload observations are not a model-quality,
+physical-memory, performance or full-release qualification receipt.
 
 See the [repository README](https://github.com/Quitetall/tritium#readme) and the
 [book](https://github.com/Quitetall/tritium/tree/main/docs/book) for usage.
