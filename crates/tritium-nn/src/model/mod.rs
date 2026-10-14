@@ -89,7 +89,10 @@ pub use qwen35_trit::Qwen35TritReadLimits;
 #[cfg(feature = "tokenizer")]
 pub use resources::{ModelLoadResources, ModelResourceAdmission};
 #[cfg(feature = "tokenizer")]
-pub use retained_plan::{ModelLoadPlan, TensorLoadPlan, inspect_trit_file};
+pub use retained_plan::{
+    ModelLoadPlan, StreamedModelLoadPlan, TensorLoadPlan, inspect_trit_file,
+    inspect_trit_file_streamed,
+};
 pub use runner::{ForwardDump, ModelRunner};
 #[cfg(feature = "cuda")]
 pub use salt_v2::{

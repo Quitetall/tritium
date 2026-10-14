@@ -1,5 +1,183 @@
 use super::*;
-use tritium_nn::{StreamLimits, inspect_trit_file};
+use tritium_nn::{ModelLoadResources, StreamLimits, inspect_trit_file, inspect_trit_file_streamed};
+
+#[test]
+fn streamed_inspection_matches_actual_hybrid_language_mtp_resource_admission_without_upload() {
+    for uniform in [false, true] {
+        let root = Scratch::new(&format!("streamed-inspection-{uniform}"));
+        let path = root.0.join("model.trit");
+        let bytes = text_package(uniform, false).bytes();
+        std::fs::write(&path, &bytes).unwrap();
+        let stream = StreamLimits {
+            max_context: 16,
+            max_segment_tokens: 4,
+            max_host_cache_payload_bytes: 1_000_000,
+        };
+        let ledgers: [TensorPayloadBudget; 5] =
+            std::array::from_fn(|_| TensorPayloadBudget::new(1_000_000));
+        let mut evidence = recorder();
+        let mut planned_names = 0;
+        let plan = inspect_trit_file_streamed(
+            &path,
+            "typed",
+            receiving(),
+            limits(),
+            stream,
+            TensorUploadPolicy::default(),
+            |metadata, encoding| {
+                planned_names += 1;
+                tritium_cpu::CpuBackend.tensor_stream_plan(metadata, encoding)
+            },
+        )
+        .unwrap();
+        assert!(evidence.events().is_empty());
+        assert!(ledgers.iter().all(|b| b.used_bytes() == 0));
+        let config = Qwen35CheckpointConfig::from_hf_config(&config_json()).unwrap();
+        let schema = qwen35_language_mtp_tensor_schema(&config.text).unwrap();
+        assert_eq!(
+            planned_names,
+            schema
+                .iter()
+                .filter(|s| s.role == Qwen35TensorSchemaRole::Matrix)
+                .count()
+        );
+        let reader = tritium_format::trit_model::read_trit_model(&bytes).unwrap();
+        let preserved = schema
+            .iter()
+            .filter(|s| s.role != Qwen35TensorSchemaRole::Matrix)
+            .map(|s| {
+                let (meta, _) = reader.tensor("typed", &s.name).unwrap();
+                let TensorStorage::Dense { shape, .. } = &meta.storage else {
+                    panic!("preserved storage")
+                };
+                shape.iter().product::<u64>() * 4
+            })
+            .sum::<u64>();
+        assert_eq!(
+            plan.retained_host_bytes(),
+            preserved
+                + plan
+                    .source_plan()
+                    .cache_admission()
+                    .unwrap()
+                    .logical_host_cache_payload_bytes()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let loaded = tritium_nn::load_streamed_with_resources(
+            file_source(&path),
+            Box::new(tritium_cpu::CpuBackend),
+            TensorUploadPolicy::default(),
+            ModelLoadResources {
+                payload: &ledgers[0],
+                source_workspace: &ledgers[1],
+                host_workspace: &ledgers[2],
+                device_workspace: &ledgers[3],
+                retained_host: &ledgers[4],
+            },
+            stream,
+            TensorUploadContext {
+                recorder: &mut evidence,
+                span: "load",
+                parent: None,
+                logical_time: 0,
+            },
+        )
+        .unwrap();
+        let admitted = loaded.runner.resource_admission().unwrap();
+        assert_eq!(
+            (
+                plan.payload_bytes(),
+                plan.source_workspace_bytes(),
+                plan.host_workspace_bytes(),
+                plan.device_workspace_bytes(),
+                plan.retained_host_bytes()
+            ),
+            (
+                admitted.payload_bytes,
+                admitted.source_workspace_bytes,
+                admitted.host_workspace_bytes,
+                admitted.device_workspace_bytes,
+                admitted.retained_host_bytes
+            )
+        );
+        assert_eq!(
+            plan.source_plan().source(),
+            &loaded.receipt.observation().source
+        );
+        drop(loaded);
+        assert!(ledgers.iter().all(|b| b.used_bytes() == 0));
+    }
+}
+
+#[test]
+fn streamed_inspection_refuses_unknown_geometry_caps_and_terminal_source_mutation() {
+    let root = Scratch::new("streamed-inspection-refusals");
+    let path = root.0.join("model.trit");
+    let bytes = text_package(true, false).bytes();
+    let stream = StreamLimits {
+        max_context: 16,
+        max_segment_tokens: 4,
+        max_host_cache_payload_bytes: 1_000_000,
+    };
+    for case in 0..6 {
+        std::fs::write(&path, &bytes).unwrap();
+        let mut caps = limits();
+        if case == 2 {
+            caps.max_tensor_bytes = 1;
+        }
+        let mut mutated = false;
+        let policy = TensorUploadPolicy {
+            native_only: false,
+            max_payload_bytes: (case == 5).then_some(1),
+        };
+        let error = inspect_trit_file_streamed(
+            &path,
+            "typed",
+            receiving(),
+            caps,
+            stream,
+            policy,
+            |metadata, encoding| {
+                if case == 0 {
+                    return Ok(None);
+                }
+                let mut plan = tritium_cpu::CpuBackend
+                    .tensor_stream_plan(metadata, encoding)?
+                    .unwrap();
+                if case == 1 {
+                    plan.encoded_bytes += 1;
+                }
+                if case == 3 && !mutated {
+                    let mut file = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&path)
+                        .unwrap();
+                    file.seek(SeekFrom::End(-1)).unwrap();
+                    file.write_all(&[bytes[bytes.len() - 1] ^ 1]).unwrap();
+                    file.flush().unwrap();
+                    mutated = true;
+                }
+                if case == 4 {
+                    plan.upload.caps.payload_bytes = u64::MAX;
+                }
+                Ok(Some(plan))
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!error.is_empty());
+        if case == 0 {
+            assert!(error.contains("plan is unknown"), "{error}");
+        }
+        if case == 1 {
+            assert!(error.contains("encoded geometry mismatch"), "{error}");
+        }
+        if case == 4 {
+            assert!(error.contains("overflow"), "{error}");
+        }
+    }
+}
 
 #[test]
 fn shared_inspection_matches_actual_metadata_and_public_load_without_upload() {

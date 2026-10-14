@@ -106,7 +106,21 @@ terminal source verification and complete bounded JSON serialization;
 `--max-output-bytes` defaults to 1MiB including the newline, with no partial stdout
 on overflow. No per-tile count arrays or full-manifest JSON copy is included.
 
-Status is `source-prepared-not-runtime-admitted`. The per-name encoded/decode
+For pure aggregate streaming costs, add `--backend cpu` (or `cuda` in a CUDA
+build) and all three stream limits. This uses the same graph/resource calculation
+as streamed loading without initializing a GPU, reserving a ledger or uploading
+weights. `--native-only` and `--max-tensor-payload-bytes N` enforce the selected
+backend's per-matrix structural policy; they require `--backend`.
+The report then has status `resource-planned-not-runtime-admitted`, five covered
+logical costs under `resource_plan`, `backend_initialized:false` and
+`weights_uploaded:false`. Tied matrices are charged once; preserved vectors/
+convolutions and maximum host cache remain host-owned. Unknown plans, geometry,
+policy, overflow and source mutation refuse without a decoded fallback.
+These costs exclude metadata/tokenizer heaps, allocator/driver/activation
+overhead and physical peaks. They do not authorize load, fit, readiness or quality.
+
+Without `--backend`, status is `source-prepared-not-runtime-admitted` and
+`resource_plan`/`backend_payload_bytes` remain null. The per-name encoded/decode
 sums and maximum encoded+decoded payload pair describe the current compatibility
 path, not deduplicated storage, retained native payload or physical peak memory.
 Backend costs remain null/unknown. Metadata, allocator/driver, tokenizer heap,

@@ -1,6 +1,6 @@
 //! Bounded read-only preparation through the ordinary retained text loader.
 use anyhow::{Context as _, ensure};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use serde::Serialize;
 use std::{
     io::{self, Write},
@@ -14,6 +14,15 @@ pub(crate) struct InspectTritArgs {
     /// Actual target level, not the original bundle profile name.
     #[arg(long)]
     level: String,
+    /// Pure aggregate streaming costs; no GPU/context initialization or runtime admission.
+    #[arg(long, value_enum, requires = "max_context")]
+    backend: Option<InspectionBackend>,
+    /// Refuse backend-declared dense emulation in the structural plan.
+    #[arg(long, requires = "backend")]
+    native_only: bool,
+    /// Per-matrix backend payload ceiling, not aggregate or physical memory.
+    #[arg(long, requires = "backend")]
+    max_tensor_payload_bytes: Option<u64>,
     #[arg(long, default_value_t = 2 * 1024 * 1024 * 1024u64)]
     max_package_bytes: u64,
     #[arg(long, default_value_t = 16 * 1024 * 1024u64)]
@@ -37,6 +46,59 @@ pub(crate) struct InspectTritArgs {
     max_host_cache_payload_bytes: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum InspectionBackend {
+    Cpu,
+    Cuda,
+}
+impl InspectionBackend {
+    fn plan(
+        self,
+        metadata: tritium_spec::TensorMetadata<'_>,
+        encoding: tritium_spec::TensorStreamEncoding,
+    ) -> Result<Option<tritium_spec::TensorStreamPlan>, tritium_spec::BackendError> {
+        match self {
+            Self::Cpu => tritium_spec::TernaryBackend::tensor_stream_plan(
+                &tritium_cpu::CpuBackend,
+                metadata,
+                encoding,
+            ),
+            #[cfg(feature = "cuda")]
+            Self::Cuda => tritium_cuda::CudaBackend::plan_tensor_stream(metadata, encoding),
+            #[cfg(not(feature = "cuda"))]
+            Self::Cuda => Err(tritium_spec::BackendError::Backend(
+                "CUDA inspection requires a build with --features cuda".into(),
+            )),
+        }
+    }
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Cuda => "cuda",
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ResourcePlan {
+    payload_bytes: u64,
+    source_workspace_bytes: u64,
+    host_workspace_bytes: u64,
+    device_workspace_bytes: u64,
+    retained_host_bytes: u64,
+}
+impl From<&tritium_nn::StreamedModelLoadPlan> for ResourcePlan {
+    fn from(plan: &tritium_nn::StreamedModelLoadPlan) -> Self {
+        Self {
+            payload_bytes: plan.payload_bytes(),
+            source_workspace_bytes: plan.source_workspace_bytes(),
+            host_workspace_bytes: plan.host_workspace_bytes(),
+            device_workspace_bytes: plan.device_workspace_bytes(),
+            retained_host_bytes: plan.retained_host_bytes(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct Report<'a> {
     status: &'static str,
@@ -52,6 +114,9 @@ struct Report<'a> {
     tokenizer_encoded_bytes: u64,
     logical_host_cache_payload_bytes: Option<u64>,
     backend_payload_bytes: Option<u64>,
+    backend: Option<&'static str>,
+    resource_plan: Option<ResourcePlan>,
+    backend_initialized: bool,
     physical_memory: &'static str,
     weights_uploaded: bool,
 }
@@ -86,6 +151,10 @@ pub(crate) fn run(args: InspectTritArgs) -> anyhow::Result<()> {
         args.max_output_bytes > 0,
         "--max-output-bytes must be positive"
     );
+    ensure!(
+        args.backend != Some(InspectionBackend::Cuda) || cfg!(feature = "cuda"),
+        "CUDA inspection requires a build with --features cuda"
+    );
     let execution = match (
         args.max_context,
         args.max_segment_tokens,
@@ -101,23 +170,57 @@ pub(crate) fn run(args: InspectTritArgs) -> anyhow::Result<()> {
         }
         _ => anyhow::bail!("inspection stream limits must be supplied together"),
     };
-    let plan = tritium_nn::inspect_trit_file(
-        &args.model,
-        &args.level,
-        tritium_format::TritPackageReadLimits {
-            max_source_bytes: args.max_package_bytes,
-            max_manifest_bytes: usize::try_from(args.max_manifest_bytes)?,
-            max_directory_bytes: usize::try_from(args.max_directory_bytes)?,
-        },
-        tritium_nn::Qwen35TritReadLimits {
-            max_config_bytes: args.max_config_bytes,
-            max_tensor_bytes: args.max_tensor_bytes,
-            max_decoded_tensor_bytes: args.max_decoded_tensor_bytes,
-        },
-        execution,
-    )?;
+    let receiving = tritium_format::TritPackageReadLimits {
+        max_source_bytes: args.max_package_bytes,
+        max_manifest_bytes: usize::try_from(args.max_manifest_bytes)?,
+        max_directory_bytes: usize::try_from(args.max_directory_bytes)?,
+    };
+    let limits = tritium_nn::Qwen35TritReadLimits {
+        max_config_bytes: args.max_config_bytes,
+        max_tensor_bytes: args.max_tensor_bytes,
+        max_decoded_tensor_bytes: args.max_decoded_tensor_bytes,
+    };
+    let streamed = args
+        .backend
+        .map(|backend| {
+            tritium_nn::inspect_trit_file_streamed(
+                &args.model,
+                &args.level,
+                receiving,
+                limits,
+                execution
+                    .ok_or_else(|| anyhow::anyhow!("backend inspection requires stream limits"))?,
+                tritium_schema::TensorUploadPolicy {
+                    native_only: args.native_only,
+                    max_payload_bytes: args.max_tensor_payload_bytes,
+                },
+                |metadata, encoding| backend.plan(metadata, encoding),
+            )
+            .map_err(anyhow::Error::from)
+        })
+        .transpose()?;
+    let source_only = if streamed.is_none() {
+        Some(tritium_nn::inspect_trit_file(
+            &args.model,
+            &args.level,
+            receiving,
+            limits,
+            execution,
+        )?)
+    } else {
+        None
+    };
+    let plan = streamed
+        .as_ref()
+        .map(|p| p.source_plan())
+        .or(source_only.as_ref())
+        .expect("exactly one inspection mode");
     let report = Report {
-        status: "source-prepared-not-runtime-admitted",
+        status: if streamed.is_some() {
+            "resource-planned-not-runtime-admitted"
+        } else {
+            "source-prepared-not-runtime-admitted"
+        },
         source: plan.source(),
         architecture: plan.architecture().name(),
         layer_count: plan.architecture().layer_count(),
@@ -131,8 +234,15 @@ pub(crate) fn run(args: InspectTritArgs) -> anyhow::Result<()> {
         logical_host_cache_payload_bytes: plan
             .cache_admission()
             .map(|c| c.logical_host_cache_payload_bytes()),
-        backend_payload_bytes: plan.backend_payload_bytes(),
-        physical_memory: "unknown-not-covered-by-source-plan",
+        backend_payload_bytes: streamed.as_ref().map(|p| p.payload_bytes()),
+        backend: args.backend.map(InspectionBackend::name),
+        resource_plan: streamed.as_ref().map(ResourcePlan::from),
+        backend_initialized: false,
+        physical_memory: if streamed.is_some() {
+            "unknown-not-covered-by-logical-plan"
+        } else {
+            "unknown-not-covered-by-source-plan"
+        },
         weights_uploaded: false,
     };
     let mut output = BoundedOutput {

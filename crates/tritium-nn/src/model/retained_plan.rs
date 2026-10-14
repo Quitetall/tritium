@@ -98,6 +98,42 @@ impl ModelLoadPlan {
     }
 }
 
+/// Descriptive aggregate encoded-streaming costs, not runtime admission.
+/// No backend is initialized, payload uploaded or ledger reserved by inspection.
+/// The supplied planner declares logical costs; physical/support/quality/source
+/// authentication and independently qualified release claims remain unknown.
+#[derive(Debug, Clone)]
+pub struct StreamedModelLoadPlan {
+    source: ModelLoadPlan,
+    covered: super::ModelResourceAdmission,
+}
+impl StreamedModelLoadPlan {
+    /// Source identity, inventory and cache preparation shared with ordinary loading.
+    pub fn source_plan(&self) -> &ModelLoadPlan {
+        &self.source
+    }
+    /// Aggregate backend-declared matrix bytes, with tied graph handles counted once.
+    pub const fn payload_bytes(&self) -> u64 {
+        self.covered.payload_bytes
+    }
+    /// Maximum bounded matrix source window or preserved encoded/decoded pair.
+    pub const fn source_workspace_bytes(&self) -> u64 {
+        self.covered.source_workspace_bytes
+    }
+    /// Maximum additional declared backend host-upload working bytes.
+    pub const fn host_workspace_bytes(&self) -> u64 {
+        self.covered.host_workspace_bytes
+    }
+    /// Maximum additional declared backend device-upload working bytes.
+    pub const fn device_workspace_bytes(&self) -> u64 {
+        self.covered.device_workspace_bytes
+    }
+    /// Widened preserved host tensors and maximum logical language cache.
+    pub const fn retained_host_bytes(&self) -> u64 {
+        self.covered.retained_host_bytes
+    }
+}
+
 pub(super) enum Graph {
     Standard(Box<(ModelConfig, ArchSpec, StandardModelPlan)>),
     Hybrid(Box<Qwen35CheckpointConfig>),
@@ -267,4 +303,50 @@ pub fn inspect_trit_file(
     let prepared = prepare(&mut model, level, metadata.len(), limits, execution)?;
     model.verify().map_err(invalid)?;
     Ok(prepared.plan)
+}
+
+/// Describe aggregate streamed-loader costs without initializing a backend.
+/// Uses the ordinary loader's exact inventory and resource calculation, but does
+/// not reserve resources, materialize/upload weights, or emit ModelLoaded.
+/// Callers supply a pure structural planner, not a registry/device initializer.
+/// No descriptive result may be substituted for actual load admission/custody.
+/// # Errors
+/// The errors of inspect_trit_file, unknown/invalid backend streaming plans,
+/// encoded geometry/policy faults, aggregate overflow, or terminal source mutation.
+#[allow(clippy::too_many_arguments)]
+pub fn inspect_trit_file_streamed(
+    path: &Path,
+    level: &str,
+    receiving: TritPackageReadLimits,
+    limits: Qwen35TritReadLimits,
+    execution: StreamLimits,
+    policy: tritium_schema::TensorUploadPolicy,
+    planner: impl FnMut(
+        tritium_spec::TensorMetadata<'_>,
+        tritium_spec::TensorStreamEncoding,
+    )
+        -> Result<Option<tritium_spec::TensorStreamPlan>, tritium_spec::BackendError>,
+) -> Result<StreamedModelLoadPlan, NnError> {
+    positive(limits)?;
+    execution.validate()?;
+    let file = File::open(path).map_err(invalid)?;
+    let metadata = file.metadata().map_err(invalid)?;
+    if !metadata.is_file() {
+        return Err(invalid("source must be a regular file"));
+    }
+    let mut model = TritModelReader::open(file, receiving).map_err(invalid)?;
+    let prepared = prepare(&mut model, level, metadata.len(), limits, Some(execution))?;
+    let covered = super::resources::describe_streamed(
+        &model,
+        level,
+        &prepared.graph,
+        &prepared.plan,
+        policy,
+        planner,
+    )?;
+    model.verify().map_err(invalid)?;
+    Ok(StreamedModelLoadPlan {
+        source: prepared.plan,
+        covered,
+    })
 }

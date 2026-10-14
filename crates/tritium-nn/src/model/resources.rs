@@ -8,8 +8,9 @@ use std::{
 use tritium_format::trit_model::TritModelReader;
 use tritium_runtime::{TensorPayloadBudget, TensorStorageReservation};
 use tritium_spec::{
-    TENSOR_STREAM_CHUNK_BYTES, TensorStreamPlan, TensorUploadPlan, TensorUploadPolicy,
-    TernaryBackend, validate_tensor_upload_policy,
+    BackendError, TENSOR_STREAM_CHUNK_BYTES, TensorMetadata, TensorStreamEncoding,
+    TensorStreamPlan, TensorUploadPlan, TensorUploadPolicy, TernaryBackend,
+    validate_tensor_upload_policy,
 };
 
 /// Explicit logical storage domains for resource-planned retained loading.
@@ -59,6 +60,16 @@ pub(super) struct LoadReservations {
     _source_workspace: TensorStorageReservation,
 }
 
+struct AggregatePlan {
+    plans: BTreeMap<String, TensorUploadPlan>,
+    stream_plans: Option<BTreeMap<String, TensorStreamPlan>>,
+    admission: ModelResourceAdmission,
+}
+struct PlannedTensor {
+    upload: TensorUploadPlan,
+    stream: Option<TensorStreamPlan>,
+}
+
 fn invalid(e: impl std::fmt::Display) -> NnError {
     NnError::ResourceExhausted(format!("model resource admission: {e}"))
 }
@@ -83,6 +94,82 @@ pub(super) fn reserve<R: Read + Seek>(
     if backend.resident_decoder_requested() {
         return Err(invalid("resident graph resource planning is unavailable"));
     }
+    let AggregatePlan {
+        plans,
+        stream_plans,
+        admission,
+    } = calculate(
+        model,
+        level,
+        graph,
+        source,
+        policy,
+        streamed,
+        |meta, encoding| {
+            if let Some(encoding) = encoding {
+                backend.tensor_stream_plan(meta, encoding).map(|plan| {
+                    plan.map(|stream| PlannedTensor {
+                        upload: stream.upload,
+                        stream: Some(stream),
+                    })
+                })
+            } else {
+                backend.tensor_upload_plan(meta).map(|plan| {
+                    plan.map(|upload| PlannedTensor {
+                        upload,
+                        stream: None,
+                    })
+                })
+            }
+        },
+    )?;
+    // All domains are reserved before any complete tensor is read/decompressed.
+    // A later refusal drops earlier guards/partitions, including on shared ledgers.
+    let payload = resources
+        .payload
+        .partition(admission.payload_bytes)
+        .map_err(invalid)?;
+    let retained_host = resources
+        .retained_host
+        .reserve_storage(admission.retained_host_bytes)
+        .map_err(invalid)?;
+    let source_workspace = resources
+        .source_workspace
+        .reserve_storage(admission.source_workspace_bytes)
+        .map_err(invalid)?;
+    let host_workspace = resources
+        .host_workspace
+        .partition(admission.host_workspace_bytes)
+        .map_err(invalid)?;
+    let device_workspace = resources
+        .device_workspace
+        .partition(admission.device_workspace_bytes)
+        .map_err(invalid)?;
+    Ok(LoadReservations {
+        payload,
+        host_workspace,
+        device_workspace,
+        plans,
+        stream_plans,
+        admission,
+        retained_host,
+        _source_workspace: source_workspace,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn calculate<R: Read + Seek>(
+    model: &TritModelReader<R>,
+    level: &str,
+    graph: &Graph,
+    source: &ModelLoadPlan,
+    policy: TensorUploadPolicy,
+    streamed: bool,
+    mut planner: impl FnMut(
+        TensorMetadata<'_>,
+        Option<TensorStreamEncoding>,
+    ) -> Result<Option<PlannedTensor>, BackendError>,
+) -> Result<AggregatePlan, NnError> {
     let mut admission = ModelResourceAdmission {
         payload_bytes: 0,
         source_workspace_bytes: if streamed {
@@ -121,25 +208,27 @@ pub(super) fn reserve<R: Read + Seek>(
             return Ok(());
         }
         let metadata = super::tensor_stream::metadata(meta).map_err(invalid)?;
-        let plan = if let Some(plans) = &mut stream_plans {
-            let plan = backend
-                .tensor_stream_plan(
-                    metadata,
-                    super::tensor_stream::encoding(meta).map_err(invalid)?,
-                )
-                .map_err(invalid)?
-                .ok_or_else(|| invalid(format!("{name}: backend streaming plan is unknown")))?;
-            if plan.encoded_bytes != model.tensor_byte_len(level, name).map_err(invalid)? {
+        let encoding = streamed
+            .then(|| super::tensor_stream::encoding(meta).map_err(invalid))
+            .transpose()?;
+        let planned = planner(metadata, encoding)
+            .map_err(invalid)?
+            .ok_or_else(|| {
+                invalid(format!(
+                    "{name}: backend {} plan is unknown",
+                    if streamed { "streaming" } else { "upload" }
+                ))
+            })?;
+        let plan = planned.upload;
+        if let Some(plans) = &mut stream_plans {
+            let stream = planned
+                .stream
+                .ok_or_else(|| invalid("missing required streaming plan"))?;
+            if stream.encoded_bytes != model.tensor_byte_len(level, name).map_err(invalid)? {
                 return Err(invalid(format!("{name}: stream encoded geometry mismatch")));
             }
-            plans.insert(name.to_owned(), plan);
-            plan.upload
-        } else {
-            backend
-                .tensor_upload_plan(metadata)
-                .map_err(invalid)?
-                .ok_or_else(|| invalid(format!("{name}: backend upload plan is unknown")))?
-        };
+            plans.insert(name.to_owned(), stream);
+        }
         validate_tensor_upload_policy(plan.caps, policy).map_err(invalid)?;
         add(&mut admission.payload_bytes, plan.caps.payload_bytes)?;
         admission.host_workspace_bytes = admission
@@ -167,36 +256,43 @@ pub(super) fn reserve<R: Read + Seek>(
             }
         }
     }
-    // All domains are reserved before any complete tensor is read/decompressed.
-    // A later refusal drops earlier guards/partitions, including on shared ledgers.
-    let payload = resources
-        .payload
-        .partition(admission.payload_bytes)
-        .map_err(invalid)?;
-    let retained_host = resources
-        .retained_host
-        .reserve_storage(admission.retained_host_bytes)
-        .map_err(invalid)?;
-    let source_workspace = resources
-        .source_workspace
-        .reserve_storage(admission.source_workspace_bytes)
-        .map_err(invalid)?;
-    let host_workspace = resources
-        .host_workspace
-        .partition(admission.host_workspace_bytes)
-        .map_err(invalid)?;
-    let device_workspace = resources
-        .device_workspace
-        .partition(admission.device_workspace_bytes)
-        .map_err(invalid)?;
-    Ok(LoadReservations {
-        payload,
-        host_workspace,
-        device_workspace,
+    Ok(AggregatePlan {
         plans,
         stream_plans,
         admission,
-        retained_host,
-        _source_workspace: source_workspace,
     })
+}
+
+pub(super) fn describe_streamed<R: Read + Seek>(
+    model: &TritModelReader<R>,
+    level: &str,
+    graph: &Graph,
+    source: &ModelLoadPlan,
+    policy: TensorUploadPolicy,
+    mut planner: impl FnMut(
+        TensorMetadata<'_>,
+        TensorStreamEncoding,
+    ) -> Result<Option<TensorStreamPlan>, BackendError>,
+) -> Result<ModelResourceAdmission, NnError> {
+    calculate(
+        model,
+        level,
+        graph,
+        source,
+        policy,
+        true,
+        |meta, encoding| {
+            planner(
+                meta,
+                encoding.expect("streamed calculation supplies encoding"),
+            )
+            .map(|plan| {
+                plan.map(|stream| PlannedTensor {
+                    upload: stream.upload,
+                    stream: Some(stream),
+                })
+            })
+        },
+    )
+    .map(|plan| plan.admission)
 }
