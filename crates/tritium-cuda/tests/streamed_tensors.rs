@@ -13,6 +13,196 @@ struct Source<'a> {
     bytes: &'a [u8],
     fail: bool,
 }
+
+#[test]
+fn physical_bounded_stream_crosses_payload_and_native_suffix_windows() {
+    use tritium_core::{PerTilePlan, Trit};
+    use tritium_format::AdditiveTensor;
+    use tritium_schema::{ADMITTED_LAWS, AdditiveLayout, PlaneAllocation, PlaneCodec, Transport};
+    let cuda = CudaBackend::new(0).expect("bounded stream test requires physical CUDA");
+    let layout = AdditiveLayout {
+        rows: 10_000,
+        cols: 32,
+        tile: 256,
+        group: 32,
+        max_planes: 2,
+        allocation: PlaneAllocation::PerTile,
+        codec: PlaneCodec::B3,
+        law: ADMITTED_LAWS[0].law,
+        basis: Basis::Identity,
+        transport: Transport::Raw,
+    };
+    let counts = vec![2; layout.rows as usize];
+    let plan = PerTilePlan::new(layout, &counts).unwrap();
+    let trits = (0..plan.trit_count())
+        .map(|i| [Trit::ZERO, Trit::NEG, Trit::POS, Trit::NEG][i % 4])
+        .collect();
+    let scales = vec![0.5; plan.scale_count()];
+    let tensor = AdditiveTensor::new_per_tile(layout, counts, trits, scales).unwrap();
+    let raw = tensor.encode_payload().unwrap();
+    assert!(raw.len() > 65536);
+    let source = Source {
+        metadata: TensorMetadata::Additive(AdditiveMetadata::from_view(tensor.view())),
+        encoding: TensorStreamEncoding::CanonicalRawAdditive,
+        bytes: &raw,
+        fail: false,
+    };
+    let stream_plan = cuda
+        .tensor_stream_plan(source.metadata(), source.encoding())
+        .unwrap()
+        .unwrap();
+    assert_eq!(stream_plan.upload.host_workspace_bytes, 131072);
+    assert_eq!(stream_plan.upload.device_workspace_bytes, 4);
+    assert!(stream_plan.upload.caps.payload_bytes > stream_plan.upload.host_workspace_bytes);
+    let device = cuda.upload_tensor_stream(&source).unwrap();
+    let ids = [0, 4999, 9999];
+    let mut actual = vec![0.; ids.len() * 32];
+    cuda.embed_rows(&*device, &ids, &mut actual).unwrap();
+    let mut expected = vec![0.; actual.len()];
+    for (i, &row) in ids.iter().enumerate() {
+        tensor
+            .view()
+            .dequant_row_into(row, &mut expected[i * 32..(i + 1) * 32])
+            .unwrap();
+    }
+    assert_eq!(actual, expected);
+    for precision in [
+        tritium_schema::ScalePrecision::F16,
+        tritium_schema::ScalePrecision::Bf16,
+        tritium_schema::ScalePrecision::F32,
+    ] {
+        let values = (0..1024 * 128)
+            .map(|i| ((i % 9) as f32 - 4.) / 8.)
+            .collect::<Vec<_>>();
+        let raw = values
+            .iter()
+            .flat_map(|&v| match precision {
+                tritium_schema::ScalePrecision::F16 => {
+                    half::f16::from_f32(v).to_bits().to_le_bytes().to_vec()
+                }
+                tritium_schema::ScalePrecision::Bf16 => {
+                    half::bf16::from_f32(v).to_bits().to_le_bytes().to_vec()
+                }
+                _ => v.to_le_bytes().to_vec(),
+            })
+            .collect::<Vec<_>>();
+        let source = Source {
+            metadata: TensorMetadata::Dense {
+                rows: 1024,
+                cols: 128,
+            },
+            encoding: TensorStreamEncoding::DenseLittleEndian(precision),
+            bytes: &raw,
+            fail: false,
+        };
+        let plan = cuda
+            .tensor_stream_plan(source.metadata(), source.encoding())
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.upload.host_workspace_bytes, 196608);
+        assert!(plan.upload.caps.payload_bytes > plan.upload.host_workspace_bytes);
+        let device = cuda.upload_tensor_stream(&source).unwrap();
+        let ids = [0, 511, 1023];
+        let mut actual = vec![0.; 384];
+        cuda.embed_rows(&*device, &ids, &mut actual).unwrap();
+        let expected = ids
+            .into_iter()
+            .flat_map(|r| values[r * 128..(r + 1) * 128].iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn physical_private_device_check_accepts_finite_cancellation_and_refuses_overflow() {
+    use tritium_core::Trit;
+    use tritium_format::AdditiveTensor;
+    use tritium_schema::{
+        AdditiveLayout, PlaneAllocation, PlaneCodec, PlaneRelation, ScaleAnchor, ScaleLaw,
+        ScalePrecision, Transport,
+    };
+    let cuda = CudaBackend::new(0).expect("finite stream test requires physical CUDA");
+    for compact in [false, true] {
+        for cancellation in [false, true] {
+            let layout = AdditiveLayout {
+                rows: 2,
+                cols: 4,
+                tile: 256,
+                group: 32,
+                max_planes: 3,
+                allocation: if compact {
+                    PlaneAllocation::PerTile
+                } else {
+                    PlaneAllocation::Uniform
+                },
+                codec: PlaneCodec::D2,
+                law: ScaleLaw {
+                    anchor: ScaleAnchor::Group,
+                    relation: PlaneRelation::Free,
+                    precision: ScalePrecision::F32,
+                },
+                basis: Basis::Identity,
+                transport: Transport::Raw,
+            };
+            let trits = if cancellation {
+                [Trit::POS; 8]
+                    .into_iter()
+                    .chain([Trit::NEG; 8])
+                    .chain([Trit::ZERO; 8])
+                    .collect()
+            } else {
+                vec![Trit::POS; 24]
+            };
+            let tensor = if compact {
+                AdditiveTensor::new_per_tile(layout, vec![3, 3], trits, vec![f32::MAX; 6]).unwrap()
+            } else {
+                AdditiveTensor::new(layout, 3, trits, vec![f32::MAX; 6]).unwrap()
+            };
+            let raw = tensor.encode_payload().unwrap();
+            let source = Source {
+                metadata: TensorMetadata::Additive(AdditiveMetadata::from_view(tensor.view())),
+                encoding: TensorStreamEncoding::CanonicalRawAdditive,
+                bytes: &raw,
+                fail: false,
+            };
+            let result = cuda.upload_tensor_stream(&source);
+            if cancellation {
+                let device = result.unwrap();
+                let mut actual = [1.; 8];
+                cuda.embed_rows(&*device, &[0, 1], &mut actual).unwrap();
+                assert_eq!(actual, [0.; 8]);
+            } else {
+                assert!(result.is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn physical_direct_stream_refuses_swallowed_visitor_failure() {
+    struct Swallow;
+    impl TensorStreamSource for Swallow {
+        fn metadata(&self) -> TensorMetadata<'_> {
+            TensorMetadata::Dense { rows: 1, cols: 1 }
+        }
+        fn encoding(&self) -> TensorStreamEncoding {
+            TensorStreamEncoding::DenseLittleEndian(tritium_schema::ScalePrecision::F32)
+        }
+        fn encoded_bytes(&self) -> u64 {
+            4
+        }
+        fn visit(
+            &self,
+            visitor: &mut dyn FnMut(&[u8]) -> Result<(), BackendError>,
+        ) -> Result<(), BackendError> {
+            let _ = visitor(&vec![0; 65537]);
+            let _ = visitor(&1.0f32.to_le_bytes());
+            Ok(())
+        }
+    }
+    let cuda = CudaBackend::new(0).expect("poisoned stream test requires physical CUDA");
+    assert!(cuda.upload_tensor_stream(&Swallow).is_err());
+}
 impl TensorStreamSource for Source<'_> {
     fn metadata(&self) -> TensorMetadata<'_> {
         self.metadata
@@ -125,12 +315,13 @@ fn physical_encoded_resources_and_source_faults_release_without_observation() {
         .tensor_stream_plan(metadata, encoding)
         .unwrap()
         .unwrap();
-    for case in 0..4 {
+    for case in 0..5 {
         let payload =
             TensorPayloadBudget::new(plan.upload.caps.payload_bytes - u64::from(case == 0));
         let host =
             TensorPayloadBudget::new(plan.upload.host_workspace_bytes - u64::from(case == 1));
-        let device = TensorPayloadBudget::new(plan.upload.device_workspace_bytes);
+        let device =
+            TensorPayloadBudget::new(plan.upload.device_workspace_bytes - u64::from(case == 4));
         let source = Source {
             metadata,
             encoding,

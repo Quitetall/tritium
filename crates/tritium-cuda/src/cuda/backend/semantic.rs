@@ -17,6 +17,7 @@ use tritium_spec::{
 };
 mod basis;
 mod packed;
+mod stream_copy;
 pub(super) mod swiglu;
 use packed::PackedAdditive;
 pub(super) use swiglu::Workspace as SwigluWorkspace;
@@ -88,9 +89,7 @@ impl CudaTensor {
                 let encoded =
                     tritium_format::trit_model::DensePayloadDecoder::byte_len(precision, bytes / 4)
                         .map_err(|e| invalid(&e.to_string()))?;
-                let workspace = bytes
-                    .checked_add(TENSOR_STREAM_CHUNK_BYTES)
-                    .ok_or_else(|| invalid("CUDA dense stream workspace overflows"))?;
+                let workspace = 3 * TENSOR_STREAM_CHUNK_BYTES;
                 (bytes, workspace, encoded)
             }
             _ => return Ok(None),
@@ -102,34 +101,14 @@ impl CudaTensor {
                     payload_bytes: bytes as u64,
                 },
                 host_workspace_bytes: workspace as u64,
-                device_workspace_bytes: 0,
+                device_workspace_bytes: if matches!(metadata, TensorMetadata::Additive(_)) {
+                    4
+                } else {
+                    0
+                },
             },
             encoded_bytes: encoded as u64,
         }))
-    }
-    fn stage_dense(
-        source: &dyn TensorStreamSource,
-        rows: usize,
-        cols: usize,
-        precision: tritium_schema::ScalePrecision,
-    ) -> Result<Vec<f32>, BackendError> {
-        let requested = TensorMetadata::dense_bytes(rows, cols)?;
-        let mut values = Vec::new();
-        values
-            .try_reserve_exact(requested / 4)
-            .map_err(|_| BackendError::OutOfMemory { requested })?;
-        values.resize(requested / 4, 0.);
-        let mut decoder =
-            tritium_format::trit_model::DensePayloadDecoder::new(precision, &mut values)
-                .map_err(|e| invalid(&e.to_string()))?;
-        source.visit(&mut |chunk| {
-            if chunk.len() > TENSOR_STREAM_CHUNK_BYTES {
-                return Err(invalid("CUDA source window exceeds stream bound"));
-            }
-            decoder.push(chunk).map_err(|e| invalid(&e.to_string()))
-        })?;
-        decoder.finish().map_err(|e| invalid(&e.to_string()))?;
-        Ok(values)
     }
     pub(super) fn upload_stream(
         backend: &CudaBackend,
@@ -157,18 +136,7 @@ impl CudaTensor {
                 TensorMetadata::Dense { rows, cols },
                 TensorStreamEncoding::DenseLittleEndian(precision),
             ) => {
-                let values = Self::stage_dense(source, rows, cols, precision)?;
-                let device = if values.is_empty() {
-                    None
-                } else {
-                    Some(backend.stream.clone_htod(&values).map_err(|e| {
-                        alloc_or_backend(
-                            "upload CUDA dense stream",
-                            &e,
-                            plan.upload.caps.payload_bytes as usize,
-                        )
-                    })?)
-                };
+                let device = stream_copy::dense(backend, source, rows, cols, precision)?;
                 Ok(Box::new(Self {
                     rows,
                     cols,

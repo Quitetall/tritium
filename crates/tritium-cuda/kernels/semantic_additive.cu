@@ -341,13 +341,8 @@ extern "C" __global__ void semantic_additive_matmul(
     }
     out[at] = sum;
 }
-extern "C" __global__ void semantic_additive_gather(
-    const uint8_t *p, const uint32_t *ids, float *out, uint32_t selected
-) {
-    uint64_t at = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    uint32_t rows = h(p, 0), cols = h(p, 1), planes = h(p, 2);
-    if (at >= uint64_t(selected) * cols) return;
-    uint32_t row = ids[at / cols], col = at % cols, group = h(p, 3), codec = h(p, 4);
+__device__ __forceinline__ float semantic_stored_weight(const uint8_t *p, uint32_t row, uint32_t col) {
+    uint32_t cols = h(p, 1), planes = h(p, 2), group = h(p, 3), codec = h(p, 4);
     bool compact = h(p, 13), tensor = h(p, 7);
     float sum = 0.0f;
     for (uint32_t plane = 0; plane < planes; ++plane) {
@@ -372,5 +367,23 @@ extern "C" __global__ void semantic_additive_gather(
         }
         sum += float(digit(p + plane_start(p, plane), codec, coefficient)) * scale(p, plane, index);
     }
-    out[at] = sum;
+    return sum;
+}
+extern "C" __global__ void semantic_additive_gather(
+    const uint8_t *p, const uint32_t *ids, float *out, uint32_t selected
+) {
+    uint64_t at = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    uint32_t cols = h(p, 1);
+    if (at >= uint64_t(selected) * cols) return;
+    out[at] = semantic_stored_weight(p, ids[at / cols], at % cols);
+}
+// Private-upload check only, after canonical bytes and native metadata validation.
+// Grid-stride indexing covers large/pruned logical geometry without a full row.
+extern "C" __global__ void semantic_additive_validate_finite(const uint8_t *p, uint32_t *invalid) {
+    uint32_t cols = h(p, 1);
+    uint64_t total = uint64_t(h(p, 0)) * cols;
+    uint64_t stride = uint64_t(gridDim.x) * blockDim.x;
+    for (uint64_t at = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; at < total; at += stride) {
+        if (!isfinite(semantic_stored_weight(p, at / cols, at % cols))) atomicExch(invalid, 1u);
+    }
 }

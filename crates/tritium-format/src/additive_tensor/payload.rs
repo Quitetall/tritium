@@ -5,6 +5,8 @@ use tritium_core::UniformPlan;
 use tritium_schema::PlaneCounts;
 
 mod prefix;
+mod stream;
+pub use stream::AdditiveStreamValidator;
 
 const SCRATCH_TRITS: usize = D2_TRITS_PER_BYTE * B3_TRITS_PER_BYTE * (8 * S34_TRITS_PER_GROUP);
 pub(crate) const RANGE_BYTES: usize = 64 * 1024;
@@ -237,18 +239,7 @@ fn validate_scale_chunk(
 ) -> Result<(), AdditiveTensorError> {
     let width = scale_width(layout.law.precision)?;
     for bytes in bytes.chunks_exact(width) {
-        let scale = match layout.law.precision {
-            ScalePrecision::F16 => {
-                f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32()
-            }
-            ScalePrecision::Bf16 => {
-                bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32()
-            }
-            ScalePrecision::F32 => {
-                f32::from_bits(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-            }
-            _ => return Err(AdditiveTensorError::LengthOverflow),
-        };
+        let scale = stored_scale(layout.law.precision, bytes)?;
         if !scale.is_finite() || scale.is_sign_negative() {
             return Err(AdditiveTensorError::InvalidView(
                 AdditiveError::InvalidScale,
@@ -268,6 +259,15 @@ fn validate_scale_chunk(
         }
     }
     Ok(())
+}
+
+fn stored_scale(precision: ScalePrecision, bytes: &[u8]) -> Result<f32, AdditiveTensorError> {
+    Ok(match precision {
+        ScalePrecision::F16 => f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32(),
+        ScalePrecision::Bf16 => bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32(),
+        ScalePrecision::F32 => f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        _ => return Err(AdditiveTensorError::LengthOverflow),
+    })
 }
 
 fn decode_window(

@@ -809,6 +809,7 @@ pub struct CudaBackend {
     pub(super) func_deltanet_step: CudaFunction,
     pub(super) func_semantic_additive_matmul: CudaFunction,
     pub(super) func_semantic_additive_gather: CudaFunction,
+    pub(super) func_semantic_additive_validate_finite: CudaFunction,
     pub(super) func_semantic_basis_sign: CudaFunction,
     pub(super) func_semantic_basis_butterfly: CudaFunction,
     pub(super) func_semantic_basis_finish: CudaFunction,
@@ -1488,6 +1489,9 @@ impl CudaBackend {
         let func_semantic_additive_gather = semantic_module
             .load_function("semantic_additive_gather")
             .map_err(|e| driver_err("resolve semantic additive gather", &e))?;
+        let func_semantic_additive_validate_finite = semantic_module
+            .load_function("semantic_additive_validate_finite")
+            .map_err(|e| driver_err("resolve semantic additive finite validation", &e))?;
         let func_semantic_basis_sign = semantic_module
             .load_function("semantic_basis_sign")
             .map_err(|e| driver_err("resolve semantic basis signs", &e))?;
@@ -1549,6 +1553,7 @@ impl CudaBackend {
             func_deltanet_step,
             func_semantic_additive_matmul,
             func_semantic_additive_gather,
+            func_semantic_additive_validate_finite,
             func_semantic_basis_sign,
             func_semantic_basis_butterfly,
             func_semantic_basis_finish,

@@ -236,8 +236,10 @@ before backend initialization; legacy token-file behavior remains unchanged.
 
 The output keeps the existing text/ID report shape. Stderr resource diagnostics
 cover logical admitted domains only, not physical RAM/VRAM, performance, verified
-MTP, official source authentication or release clearance. CUDA still charges its
-full native host staging tensor. Legacy and joined generation are unchanged;
+MTP, official source authentication or release clearance. CUDA uses bounded host
+upload windows; its additive plan requires a4-byte device validation workspace,
+so set `max_device_workspace_bytes` to at least4 for additive CUDA. Driver/pinned/
+compiler/allocator and physical costs remain unknown. Legacy and joined generation are unchanged;
 this ordinary retained route does not unwrap a joined package or infer ancestry.
 
 For storage or transfer, wrap an existing fixed-codec artifact without changing

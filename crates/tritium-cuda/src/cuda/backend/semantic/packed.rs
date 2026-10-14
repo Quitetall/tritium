@@ -223,6 +223,72 @@ impl Plan {
         Ok(bytes)
     }
 
+    // Suffix in physical order; only scalar prefix state, no full row-index Vec.
+    // The legacy allocated oracle remains independent for exact byte checks.
+    fn visit_suffix(
+        &self,
+        metadata: AdditiveMetadata<'_>,
+        mut emit: impl FnMut(&[u8]) -> Result<(), BackendError>,
+    ) -> Result<(), BackendError> {
+        let Some(counts) = metadata.tile_counts() else {
+            return Ok(());
+        };
+        let rows = self.header[0] as usize;
+        let cols = self.header[1] as usize;
+        let planes = self.header[2] as usize;
+        let group = self.header[3] as usize;
+        let free = self.header[6] != 0;
+        let tensor = self.header[7] != 0;
+        let tile_width = self.header[12] as usize;
+        let tiles = cols.div_ceil(tile_width);
+        let mut at = HEADER;
+        for plane in 0..planes {
+            emit(&narrow(at)?.to_le_bytes())?;
+            at += self
+                .codec
+                .ledger(metadata.plane_trit_count(plane)?)
+                .map_err(|_| invalid("CUDA codec ledger failed"))?
+                .physical_bytes;
+        }
+        for scale_indices in [false, true] {
+            let mut scale = 0usize;
+            for plane in 0..planes {
+                if !free {
+                    scale = 0;
+                }
+                let mut coefficient = 0usize;
+                for row in 0..=rows {
+                    let value = if scale_indices {
+                        if tensor { plane } else { scale }
+                    } else {
+                        coefficient
+                    };
+                    emit(&narrow(value)?.to_le_bytes())?;
+                    if row == rows {
+                        break;
+                    }
+                    for tile in 0..tiles {
+                        let len = (cols - tile * tile_width).min(tile_width);
+                        let count = usize::from(counts[row * tiles + tile]);
+                        if count > plane {
+                            coefficient += len;
+                        }
+                        if !tensor && if free { count > plane } else { count > 0 } {
+                            scale += len.div_ceil(group);
+                        }
+                    }
+                }
+                if coefficient != metadata.plane_trit_count(plane)? {
+                    return Err(invalid("CUDA compact coefficient index mismatch"));
+                }
+            }
+            if !tensor && scale != metadata.scale_count() {
+                return Err(invalid("CUDA compact scale index mismatch"));
+            }
+        }
+        emit(counts)
+    }
+
     fn validate_finite(view: AdditiveView<'_>) -> Result<(), BackendError> {
         let layout = view.layout();
         let (free, ratio) = match layout.law.relation {
@@ -257,6 +323,7 @@ impl Plan {
         Ok(())
     }
 
+    #[cfg(test)]
     fn scale(&self, bytes: &[u8], plane: usize, index: usize) -> f32 {
         let at = self.header[9] as usize + index * self.header[5] as usize;
         let mut value = if self.header[5] == 2 {
@@ -272,6 +339,7 @@ impl Plan {
         }
         value
     }
+    #[cfg(test)]
     fn digit(&self, bytes: &[u8], start: usize, coefficient: usize) -> f32 {
         let data = &bytes[start..self.header[9] as usize];
         match self.codec {
@@ -307,6 +375,7 @@ impl Plan {
             _ => unreachable!("private planner admits only canonical codecs"),
         }
     }
+    #[cfg(test)]
     fn validate_encoded_finite(&self, bytes: &[u8]) -> Result<(), BackendError> {
         let width = self.header[5] as usize;
         let scales = (self.header[10] - self.header[9]) as usize / width;
@@ -334,6 +403,7 @@ impl Plan {
             }
         })
     }
+    #[cfg(test)]
     fn visit_weights(
         &self,
         bytes: &[u8],
@@ -418,6 +488,7 @@ impl Plan {
     }
 }
 
+#[cfg(test)]
 fn read_u32(bytes: &[u8], at: usize) -> usize {
     u32::from_le_bytes(
         bytes[at..at + 4]
@@ -439,12 +510,10 @@ impl PackedAdditive {
             return Err(BackendError::UnsupportedTensor);
         }
         let plan = Plan::from_metadata(metadata)?;
-        let workspace = plan
-            .bytes
-            .checked_add(TENSOR_STREAM_CHUNK_BYTES)
-            .ok_or_else(|| invalid("CUDA stream workspace overflows"))?;
+        let workspace = 2 * TENSOR_STREAM_CHUNK_BYTES;
         Ok((plan.bytes, workspace, plan.header[10] as usize - HEADER))
     }
+    #[cfg(test)]
     fn stage_stream(
         metadata: AdditiveMetadata<'_>,
         source: &dyn TensorStreamSource,
@@ -454,6 +523,20 @@ impl PackedAdditive {
             return Err(invalid("CUDA stream encoded length mismatch"));
         }
         let plan = Plan::from_metadata(metadata)?;
+        let mut validator = if let Some(counts) = metadata.tile_counts() {
+            tritium_format::AdditiveStreamValidator::new_per_tile(
+                metadata.layout(),
+                counts,
+                expected,
+            )
+        } else {
+            tritium_format::AdditiveStreamValidator::new_uniform(
+                metadata.layout(),
+                metadata.plane_count() as u8,
+                expected,
+            )
+        }
+        .map_err(|e| invalid(&format!("CUDA canonical source: {e:?}")))?;
         let mut bytes = plan.allocate(metadata)?;
         let mut at = HEADER;
         let end = plan.header[10] as usize;
@@ -467,6 +550,9 @@ impl PackedAdditive {
             if next > end {
                 return Err(invalid("CUDA source exceeds stream plan"));
             }
+            validator
+                .push(chunk)
+                .map_err(|e| invalid(&format!("CUDA canonical source: {e:?}")))?;
             bytes[at..next].copy_from_slice(chunk);
             at = next;
             Ok(())
@@ -474,21 +560,9 @@ impl PackedAdditive {
         if at != end {
             return Err(invalid("CUDA source shorter than stream plan"));
         }
-        if let Some(counts) = metadata.tile_counts() {
-            tritium_format::AdditivePayload::new_per_tile(
-                metadata.layout(),
-                counts,
-                &bytes[HEADER..end],
-            )
+        validator
+            .finish()
             .map_err(|e| invalid(&format!("CUDA canonical source: {e:?}")))?;
-        } else {
-            tritium_format::AdditivePayload::new_uniform(
-                metadata.layout(),
-                metadata.plane_count() as u8,
-                &bytes[HEADER..end],
-            )
-            .map_err(|e| invalid(&format!("CUDA canonical source: {e:?}")))?;
-        }
         plan.validate_encoded_finite(&bytes)?;
         Ok(bytes)
     }
@@ -497,8 +571,57 @@ impl PackedAdditive {
         metadata: AdditiveMetadata<'_>,
         source: &dyn TensorStreamSource,
     ) -> Result<Self, BackendError> {
-        let bytes = Self::stage_stream(metadata, source)?;
-        Self::transfer(backend, &bytes)
+        let (_, _, expected) = Self::stream_metadata(metadata)?;
+        if source.encoded_bytes() != expected as u64 {
+            return Err(invalid("CUDA stream encoded length mismatch"));
+        }
+        let plan = Plan::from_metadata(metadata)?;
+        let mut validator = if let Some(counts) = metadata.tile_counts() {
+            tritium_format::AdditiveStreamValidator::new_per_tile(
+                metadata.layout(),
+                counts,
+                expected,
+            )
+        } else {
+            tritium_format::AdditiveStreamValidator::new_uniform(
+                metadata.layout(),
+                metadata.plane_count() as u8,
+                expected,
+            )
+        }
+        .map_err(|e| invalid(&format!("CUDA canonical source: {e:?}")))?;
+        let mut bytes = backend.stream.alloc_zeros::<u8>(plan.bytes).map_err(|e| {
+            alloc_or_backend("allocate private CUDA stream payload", &e, plan.bytes)
+        })?;
+        {
+            let mut writer = super::stream_copy::ByteWriter::new(backend, &mut bytes, 0)?;
+            for word in plan.header {
+                writer.push(&word.to_le_bytes())?;
+            }
+            super::stream_copy::visit(source, expected, |chunk| {
+                validator
+                    .push(chunk)
+                    .map_err(|e| invalid(&format!("CUDA canonical source: {e:?}")))?;
+                writer.push(chunk)
+            })?;
+            writer.finish(plan.header[10] as usize)?;
+        }
+        let maximum = validator
+            .finish()
+            .map_err(|e| invalid(&format!("CUDA canonical source: {e:?}")))?;
+        {
+            let mut writer =
+                super::stream_copy::ByteWriter::new(backend, &mut bytes, plan.header[10] as usize)?;
+            plan.visit_suffix(metadata, |part| writer.push(part))?;
+            writer.finish(plan.bytes)?;
+        }
+        let result = Self { bytes };
+        result.validate_device_finite(backend, &plan, maximum)?;
+        backend
+            .stream
+            .synchronize()
+            .map_err(|e| driver_err("finish private CUDA stream upload", &e))?;
+        Ok(result)
     }
     pub(super) fn plan_metadata(
         metadata: AdditiveMetadata<'_>,
@@ -560,6 +683,52 @@ impl PackedAdditive {
 
     pub(super) fn len_bytes(&self) -> usize {
         self.bytes.len()
+    }
+
+    fn validate_device_finite(
+        &self,
+        backend: &CudaBackend,
+        plan: &Plan,
+        maximum: f32,
+    ) -> Result<(), BackendError> {
+        let mut bound = 0.;
+        let mut value = maximum;
+        for _ in 0..plan.header[2] {
+            bound += value;
+            if plan.header[6] == 0 {
+                value *= f32::from_bits(plan.header[8]);
+            }
+        }
+        if bound.is_finite() {
+            return Ok(());
+        }
+        let total = product(plan.header[0] as usize, plan.header[1] as usize)?;
+        if total == 0 {
+            return Ok(());
+        }
+        let mut flag = backend
+            .stream
+            .alloc_zeros::<u32>(1)
+            .map_err(|e| alloc_or_backend("allocate CUDA finite-check flag", &e, 4))?;
+        let mut launch = backend
+            .stream
+            .launch_builder(&backend.func_semantic_additive_validate_finite);
+        launch.arg(&self.bytes).arg(&mut flag);
+        #[allow(unsafe_code)]
+        // SAFETY: generated metadata and all canonical bytes are checked;
+        // grid-stride reads use exact logical geometry and one private flag.
+        unsafe { launch.launch(LaunchConfig::for_num_elems(narrow(total.min(65536))?)) }
+            .map_err(|e| driver_err("validate CUDA stored finite weights", &e))?;
+        drop(launch);
+        let mut result = [0u32];
+        backend
+            .stream
+            .memcpy_dtoh(&flag, &mut result)
+            .map_err(|e| driver_err("read CUDA finite-check flag", &e))?;
+        if result[0] != 0 {
+            return Err(invalid("CUDA packed semantic decoded weight is nonfinite"));
+        }
+        Ok(())
     }
 
     pub(super) fn matmul(

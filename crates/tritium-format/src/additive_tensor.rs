@@ -9,7 +9,7 @@ use crate::salt_v2::{
 };
 
 mod payload;
-pub use payload::AdditivePayload;
+pub use payload::{AdditivePayload, AdditiveStreamValidator};
 pub(crate) use payload::{PayloadPlan, PayloadSource, RANGE_BYTES};
 
 /// Failure constructing an owned [`AdditiveTensor`].
@@ -41,6 +41,8 @@ pub enum AdditiveTensorError {
     },
     /// This tensor-level codec does not itself apply the outer entropy transport.
     UnsupportedTransport,
+    /// Incremental validation previously failed; ignoring it cannot yield success.
+    StreamPoisoned,
 }
 
 /// Owned semantic additive tensor used between fitters, package codecs, and backends.

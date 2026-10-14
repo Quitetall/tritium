@@ -339,6 +339,9 @@ fn check_actual_typed_binary(resident: bool, bounded: bool, streamed: bool, cuda
             }
             if streamed {
                 config["streamed_resources"] = streamed_resources();
+                if cuda {
+                    config["streamed_resources"]["max_device_workspace_bytes"] = 4.into();
+                }
             }
             std::fs::write(&load_path, config.to_string()).unwrap();
             let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -398,7 +401,10 @@ fn check_actual_typed_binary(resident: bool, bounded: bool, streamed: bool, cuda
                 assert!(admission["payload_bytes"].as_u64().unwrap() > 0);
                 assert_eq!(admission["source_workspace_bytes"], 65_536);
                 assert!(admission["host_workspace_bytes"].as_u64().unwrap() > 0);
-                assert_eq!(admission["device_workspace_bytes"], 0);
+                assert_eq!(
+                    admission["device_workspace_bytes"],
+                    if cuda && additive { 4 } else { 0 }
+                );
                 assert!(admission["retained_host_bytes"].as_u64().unwrap() > 0);
                 assert_eq!(admission.as_object().unwrap().len(), 5);
             } else {

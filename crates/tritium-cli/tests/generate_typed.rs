@@ -88,7 +88,10 @@ fn check_binary(backend: &str) {
             let ids = root.0.join("ids.json");
             std::fs::write(&model, fixture::package(hybrid, additive)).unwrap();
             std::fs::write(&ids, "[1,2,1,2,1,2]").unwrap();
-            let request = config(&model);
+            let mut request = config(&model);
+            if backend == "cuda" {
+                request["streamed_resources"]["max_device_workspace_bytes"] = 4.into();
+            }
             std::fs::write(&path, request.to_string()).unwrap();
             let mut compatibility = request.clone();
             compatibility

@@ -80,8 +80,12 @@ Reservations follow the loaded runner into the serving worker; failure drops
 private partial handles. Preserved host vectors retain their bounded decode path.
 Metadata/tokenizer heaps, allocator/driver/pinned costs and activation scratch
 remain excluded: this is logical admission, not complete physical fit.
-CUDA still stages one whole native tensor in host memory; its plan charges that
-workspace. `streamed_resources` currently requires host graph execution (CUDA
+CUDA streams into unpublished device storage using bounded host windows. Its
+logical plan charges128KiB additive/192KiB dense host upload workspace plus a
+4-byte additive device validation flag. Additive CUDA requests must therefore set
+`max_device_workspace_bytes` to at least4; zero deliberately refuses that cost.
+Driver/pinned/compiler/allocator costs and physical peaks remain unknown.
+`streamed_resources` currently requires host graph execution (CUDA
 matrix operations are allowed), not `resident_device_f32`. Omitting it preserves
 the explicit compatibility loader and does not invent resource admission.
 

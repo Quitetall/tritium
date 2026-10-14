@@ -52,7 +52,7 @@ fn large_geometry_is_planned_without_coefficients_or_runtime_indices() {
 }
 
 #[test]
-fn encoded_stream_plans_account_for_native_staging_and_bounded_scratch_without_init() {
+fn encoded_stream_plans_account_for_constant_host_scratch_and_private_validation_without_init() {
     let source = tritium_testkit::additive_upload_fixture();
     let metadata = TensorMetadata::Additive(AdditiveMetadata::uniform(source.layout(), 1).unwrap());
     let plan = CudaBackend::plan_tensor_stream(
@@ -63,8 +63,23 @@ fn encoded_stream_plans_account_for_native_staging_and_bounded_scratch_without_i
     .unwrap();
     assert_eq!(plan.upload.caps.payload_bytes, 70);
     assert_eq!(plan.encoded_bytes, 10);
-    assert_eq!(plan.upload.host_workspace_bytes, 70 + 65536);
-    assert_eq!(plan.upload.device_workspace_bytes, 0);
+    assert_eq!(plan.upload.host_workspace_bytes, 2 * 65536);
+    assert_eq!(plan.upload.device_workspace_bytes, 4);
+    let mut large = source.layout();
+    large.rows = 248320;
+    large.cols = 5120;
+    let large_plan = CudaBackend::plan_tensor_stream(
+        TensorMetadata::Additive(AdditiveMetadata::uniform(large, 1).unwrap()),
+        tritium_spec::TensorStreamEncoding::CanonicalRawAdditive,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(large_plan.upload.caps.payload_bytes > 250_000_000);
+    assert_eq!(
+        large_plan.upload.host_workspace_bytes,
+        plan.upload.host_workspace_bytes
+    );
+    assert_eq!(large_plan.upload.device_workspace_bytes, 4);
     for precision in [
         tritium_schema::ScalePrecision::F16,
         tritium_schema::ScalePrecision::Bf16,
@@ -77,7 +92,7 @@ fn encoded_stream_plans_account_for_native_staging_and_bounded_scratch_without_i
         .unwrap()
         .unwrap();
         assert_eq!(plan.upload.caps.payload_bytes, 7 * 32 * 4);
-        assert_eq!(plan.upload.host_workspace_bytes, 7 * 32 * 4 + 65536);
+        assert_eq!(plan.upload.host_workspace_bytes, 3 * 65536);
         assert_eq!(
             plan.encoded_bytes,
             7 * 32
