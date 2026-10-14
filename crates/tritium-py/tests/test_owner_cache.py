@@ -27,6 +27,70 @@ def _open(source, directory, **overrides):
     return NativeOwnerWindowCapture.open(source,directory,**options)
 
 
+def _metric(caches, weights, row=0, damping=0.1, bounds=(8,65536,256,32768), bindings=None):
+    values, identity = _tritium.NativeOwnerScoreCache.row_metric(
+        caches, [c.binding_json for c in caches] if bindings is None else bindings,
+        weights, row, damping, bounds)
+    return torch.from_dlpack(values).reshape(caches[0].columns,caches[0].columns), identity
+
+
+def test_actual_tied_windows_native_metric_matches_full_owner_autograd(tmp_path):
+    source = _source(tmp_path)
+    first = _window()
+    second = _window(); second["input_ids"] = torch.tensor([2,0,1])
+    captures = [_durable(source,w) for w in (first,second)]
+    caches = [c.caches[0] for c in captures]
+    for row in range(3):
+        actual, identity = _metric(caches,[0.5,2.],row)
+        assert actual.dtype == torch.float64 and len(identity)==64
+        gradients = [torch.autograd.grad(_objective(source.prepared.model,w),
+                     source.prepared.model.embed.weight)[0][row].double() for w in (first,second)]
+        expected = (0.5*torch.outer(gradients[0],gradients[0])+2*torch.outer(gradients[1],gradients[1]))/2.5
+        expected += 0.1*torch.eye(32,dtype=torch.float64)
+        torch.testing.assert_close(actual,expected,rtol=1e-5,atol=1e-6)
+        # Exact common-core row replay rather than framework f32 reduction order.
+        rows = [torch.from_dlpack(c.row_score(row,256)) for c in caches]
+        numerical = (0.5*torch.outer(rows[0],rows[0])+2*torch.outer(rows[1],rows[1]))/2.5
+        numerical += 0.1*torch.eye(32,dtype=torch.float64)
+        torch.testing.assert_close(actual,numerical,rtol=0,atol=0)
+    assert source.prepared.model.embed.weight.grad is None
+
+
+def test_native_metric_package_reopen_and_changed_semantics(tmp_path):
+    source=_source(tmp_path)
+    captured=_durable(source)
+    directory=captured.save(tmp_path/"metric-caches",max_package_bytes=65536)
+    reopened=_open(source,directory)
+    original=captured.caches[0]; replay=reopened.caches[0]
+    actual,identity=_metric([original],[1.],damping=0.)
+    after,after_id=_metric([replay],[1.],damping=-0.,bounds=(16,131072,512,65536))
+    torch.testing.assert_close(actual,after,rtol=0,atol=0)
+    assert identity==after_id
+    assert _metric([original],[2.],damping=0.)[1]!=identity
+    assert _metric([original],[1.],row=1,damping=0.)[1]!=identity
+    assert _metric([original],[1.],damping=0.2)[1]!=identity
+    assert _metric([original,original],[1.,1.],damping=0.)[1]!=identity
+
+
+@pytest.mark.parametrize("variant",["wrong_binding","recipe","weight","damping","rows","budget","inventory"])
+def test_native_metric_rejects_wrong_context_and_admission(tmp_path,variant):
+    source=_source(tmp_path); capture=_durable(source); cache=capture.caches[0]
+    options={}
+    caches=[cache]; weights=[1.]
+    if variant=="wrong_binding":
+        binding=json.loads(cache.binding_json); binding["samples"]+=1
+        options["bindings"]=[json.dumps(binding)]
+    elif variant=="recipe":
+        another=_capture(source,objective_bytes=b"different recipe",cache_limits=_limits(),max_total_cache_bytes=8192)
+        caches.append(another.caches[0]); weights.append(1.)
+    elif variant=="weight": weights=[float("nan")]
+    elif variant=="damping": options["damping"]=-1.
+    elif variant=="rows": options["row"]=3
+    elif variant=="budget": options["bounds"]=(8,65536,256,1)
+    else: weights=[]
+    with pytest.raises(ValueError): _metric(caches,weights,**options)
+
+
 def test_real_owner_cache_saves_reopens_and_replays_exact_rows(tmp_path):
     source=_source(tmp_path)
     captured=_durable(source)
@@ -177,3 +241,28 @@ def test_complete_tiny_hf_owner_inventory_reopens_with_shared_context(tmp_path):
     total=sum(c.payload_bytes for c in capture.caches)
     with pytest.raises(ValueError):
         _open(source,directory,limits=limits,max_package_bytes=200_000,max_total_cache_bytes=total-1)
+
+
+def test_complete_tiny_hf_two_window_metrics_match_actual_language_autograd(tmp_path):
+    from test_owner_capture import _hf_source
+    from tritium.torch.native_source import _inventory
+    source=_hf_source(tmp_path)
+    windows=[dict(input_ids=torch.tensor([tokens]),labels=torch.tensor([tokens]))
+             for tokens in ([1,2,3,4],[4,3,2,1])]
+    objective=lambda m,w:m(**w,use_cache=False).loss
+    captures=[_capture(source,w,objective=objective,objective_bytes=b"tiny HF next-token CE mean",
+        max_observation_bytes=1_000_000,max_context_bytes=8192,max_invocations=32,
+        max_samples=256,max_graph_nodes=4096,
+        cache_limits=dict(_limits(),max_payload_bytes=65536,max_context_bytes=8192,max_samples=256),
+        max_total_cache_bytes=1_000_000) for w in windows]
+    tensors=[tensor for _,_,tensor,_,selected,_ in _inventory(source.prepared) if selected]
+    gradients=[torch.autograd.grad(objective(source.prepared.model,w),tensors) for w in windows]
+    assert len(tensors)==len(captures[0].caches)==len(captures[1].caches)
+    for index,(a,b) in enumerate(zip(captures[0].caches,captures[1].caches)):
+        assert a.tensor_name==b.tensor_name
+        for row in (0,a.rows-1):
+            actual,_=_metric([a,b],[1.,2.],row,bounds=(8,200_000,1024,200_000))
+            ga,gb=gradients[0][index][row].double(),gradients[1][index][row].double()
+            expected=(torch.outer(ga,ga)+2*torch.outer(gb,gb))/3
+            expected+=0.1*torch.eye(a.columns,dtype=torch.float64)
+            torch.testing.assert_close(actual,expected,rtol=2e-5,atol=2e-7)

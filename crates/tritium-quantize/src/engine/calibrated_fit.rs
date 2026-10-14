@@ -71,6 +71,23 @@ pub fn fit_calibrated_levels(
     {
         return Err(CalibratedFitError::Binding);
     }
+    fit_row_metrics(plan, weights, |row, cols, metric| {
+        if row == 0 || calibration.output().is_some() {
+            metric.fill(0.0);
+            assemble_metric(calibration, row, cols, metric)?;
+        }
+        Ok(())
+    })
+}
+
+// Common row controller: admit the full tensor before any row work and install
+// each unchanged direct fitter output. Consumers provide source-basis metrics,
+// not another solver or basis transform. Errors never publish partial levels.
+pub(super) fn fit_row_metrics<E: From<DirectFitError>>(
+    plan: &DirectFitPlan,
+    weights: &[f32],
+    mut assemble: impl FnMut(usize, usize, &mut [f64]) -> Result<(), E>,
+) -> Result<Vec<DirectTensorFit>, E> {
     let (rows, cols, count) = admit_plan(plan, true)?;
     let metric_count = cols
         .checked_mul(cols)
@@ -91,10 +108,7 @@ pub fn fit_calibrated_levels(
     let mut row_plan = plan.clone();
     row_plan.layout.rows = 1;
     for row in 0..rows {
-        if row == 0 || calibration.output().is_some() {
-            metric.fill(0.0);
-            assemble_metric(calibration, row, cols, &mut metric)?;
-        }
+        assemble(row, cols, &mut metric)?;
         let fitted = fit_direct_levels(
             &row_plan,
             &weights[row * cols..(row + 1) * cols],

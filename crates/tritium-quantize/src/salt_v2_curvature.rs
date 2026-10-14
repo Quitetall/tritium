@@ -674,6 +674,35 @@ fn canonicalize_indexed_fisher_segments(
     Ok(canonical)
 }
 
+// Scalar adaptation only; finite outer products, normalization and deterministic
+// segment folding have one implementation for activations and owner scores.
+trait GramScalar: Copy {
+    fn widen(self) -> f64;
+    fn sample_digest(dimension: usize, values: &[Self], selection: [u8; 32]) -> [u8; 32];
+}
+impl GramScalar for f32 {
+    fn widen(self) -> f64 {
+        f64::from(self)
+    }
+    fn sample_digest(dimension: usize, values: &[Self], selection: [u8; 32]) -> [u8; 32] {
+        input_sample_digest(dimension, values, selection)
+    }
+}
+impl GramScalar for f64 {
+    fn widen(self) -> f64 {
+        self
+    }
+    fn sample_digest(dimension: usize, values: &[Self], selection: [u8; 32]) -> [u8; 32] {
+        let mut hash = blake3::Hasher::new_derive_key("tritium.owner-window.score-sample.v1");
+        hash.update(&u64::try_from(dimension).unwrap_or(u64::MAX).to_le_bytes());
+        hash.update(&selection);
+        for &value in values {
+            hash.update(&canonical_f64_bits(value).to_le_bytes());
+        }
+        *hash.finalize().as_bytes()
+    }
+}
+
 /// Streaming accumulator for `E[x x^T]` over row-major activation samples.
 ///
 /// Batch updates are atomic: malformed input does not change sums or content traces. Each sample
@@ -770,6 +799,27 @@ impl InputGramAccumulator {
         token_weights: Option<&[f64]>,
         token_mask: Option<&[bool]>,
     ) -> Result<(), CurvatureError> {
+        self.accumulate_scalar_batch(activations, samples, token_weights, token_mask)
+    }
+
+    // Owner gradients have already accumulated products in f64. Keep that
+    // precision and a distinct data domain; this unbound intermediate is not
+    // published as old K-FAC evidence by the owner metric consumer.
+    pub(crate) fn accumulate_owner_row(
+        &mut self,
+        values: &[f64],
+        weight: f64,
+    ) -> Result<(), CurvatureError> {
+        self.accumulate_scalar_batch(values, 1, Some(&[weight]), None)
+    }
+
+    fn accumulate_scalar_batch<T: GramScalar>(
+        &mut self,
+        activations: &[T],
+        samples: usize,
+        token_weights: Option<&[f64]>,
+        token_mask: Option<&[bool]>,
+    ) -> Result<(), CurvatureError> {
         validate_batch_shape(
             "activations",
             activations.len(),
@@ -778,7 +828,12 @@ impl InputGramAccumulator {
             token_weights,
             token_mask,
         )?;
-        validate_activations(activations, samples, self.dimension)?;
+        if let Some(index) = activations.iter().position(|v| !v.widen().is_finite()) {
+            return Err(CurvatureError::NonFiniteActivation {
+                sample: index / self.dimension,
+                feature: index % self.dimension,
+            });
+        }
 
         let added_samples =
             u64::try_from(samples).map_err(|_| CurvatureError::SampleOrdinalOverflow)?;
@@ -815,7 +870,7 @@ impl InputGramAccumulator {
             let is_selected = selected(token_mask, sample);
             let selection_leaf =
                 selection_sample_digest(self.source_id, ordinal, weight, is_selected);
-            let data_trace = input_sample_digest(
+            let data_trace = T::sample_digest(
                 self.dimension,
                 &activations[base..base + self.dimension],
                 selection_leaf,
@@ -823,9 +878,9 @@ impl InputGramAccumulator {
             let mut sums = zeroed_f64_values(entries)?;
             if is_selected {
                 for row in 0..self.dimension {
-                    let left = f64::from(activations[base + row]);
+                    let left = activations[base + row].widen();
                     for col in row..self.dimension {
-                        let right = f64::from(activations[base + col]);
+                        let right = activations[base + col].widen();
                         let contribution = finite_product3(weight, left, right)?;
                         let index = row * self.dimension + col;
                         sums[index] = contribution;
@@ -1906,21 +1961,6 @@ fn validate_batch_shape(
             got: mask.len(),
         });
     }
-    Ok(())
-}
-
-fn validate_activations(
-    activations: &[f32],
-    samples: usize,
-    dimension: usize,
-) -> Result<(), CurvatureError> {
-    if let Some(index) = activations.iter().position(|value| !value.is_finite()) {
-        return Err(CurvatureError::NonFiniteActivation {
-            sample: index / dimension,
-            feature: index % dimension,
-        });
-    }
-    debug_assert_eq!(activations.len(), samples * dimension);
     Ok(())
 }
 

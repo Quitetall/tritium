@@ -17,7 +17,8 @@ use std::{
 use tritium_quantize::engine::{
     CalibrationBatch, CalibrationCache, CalibrationCacheBuilder, CalibrationCollector,
     CalibrationInput, CalibrationOutputBatch, FileWeightSource, ObservedWeightSource,
-    OwnedOwnerScoreWindow, OwnerScoreCache, OwnerScoreCacheInput, OwnerScoreUse, OwnerScoreWindow,
+    OwnedOwnerScoreWindow, OwnerScoreCache, OwnerScoreCacheInput, OwnerScoreMetricLimits,
+    OwnerScoreMetrics, OwnerScoreUse, OwnerScoreWindow, WeightedOwnerWindow,
     read_original_file_bounded,
 };
 use tritium_schema::{
@@ -127,6 +128,51 @@ pub(crate) struct NativeOwnerScoreCache {
 }
 #[pymethods]
 impl NativeOwnerScoreCache {
+    /// Common full row-block metric; bounds are windows/payload/row/reducer entries.
+    /// Returns a flat f64 DLPack matrix and finalized metric identity. This is
+    /// scalar-window score evidence, not K-FAC, GGN or a model fit receipt.
+    #[staticmethod]
+    fn row_metric(
+        py: Python<'_>,
+        caches: Vec<PyRef<'_, Self>>,
+        expected_bindings: Vec<String>,
+        weights: Vec<f64>,
+        row: usize,
+        damping: f64,
+        bounds: (u64, u64, u64, u64),
+    ) -> PyResult<(Py<PyAny>, String)> {
+        if caches.len() != expected_bindings.len() || caches.len() != weights.len() {
+            return Err(error("owner metric window inventory differs"));
+        }
+        let mut expected = Vec::new();
+        expected.try_reserve_exact(caches.len()).map_err(error)?;
+        for ((cache, binding), weight) in caches.iter().zip(expected_bindings).zip(weights) {
+            let binding: OwnerScoreCacheBinding = json(&binding)?;
+            if cache.cache.binding() != &binding {
+                return Err(error("owner metric expected cache binding differs"));
+            }
+            expected.push(WeightedOwnerWindow {
+                cache: binding.cache,
+                weight,
+            });
+        }
+        let refs: Vec<_> = caches.iter().map(|cache| &cache.cache).collect();
+        let metrics = OwnerScoreMetrics::new(
+            &refs,
+            &expected,
+            damping,
+            OwnerScoreMetricLimits {
+                max_windows: bounds.0,
+                max_payload_bytes: bounds.1,
+                max_row_bytes: bounds.2,
+                max_reduction_entries: bounds.3,
+            },
+        )
+        .map_err(error)?;
+        let metric = metrics.row_metric(row).map_err(error)?;
+        let digest = hex(&metric.digest());
+        export_owner_row(py, metric.into_values()).map(|values| (values, digest))
+    }
     fn verify_file(&self, path: &str, max_package_bytes: usize) -> PyResult<()> {
         let bytes =
             read_original_file_bounded(Path::new(path), max_package_bytes as u64).map_err(error)?;

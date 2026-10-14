@@ -19,6 +19,11 @@ mod model_import;
 mod observed_source;
 mod original_capture;
 mod owner_score_cache;
+mod owner_score_metric;
+pub use owner_score_metric::{
+    OwnerRowMetric, OwnerScoreMetricError, OwnerScoreMetricLimits, OwnerScoreMetrics,
+    WeightedOwnerWindow, fit_owner_score_levels,
+};
 mod owner_scores;
 pub use owner_score_cache::{OwnerScoreCache, OwnerScoreCacheError, OwnerScoreCacheInput};
 mod salience;
