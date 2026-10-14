@@ -232,7 +232,6 @@ class KroneckerCalibrationWriter:
             raise ValueError(
                 f"activations last dimension must be {self._columns}, got {activations.shape[-1]}"
             )
-        _require_finite_tensor(activations, "calibration activations")
         sample_shape = tuple(activations.shape[:-1])
         samples = activations.numel() // self._columns
         required_bytes = activations.numel() * 4
@@ -246,7 +245,6 @@ class KroneckerCalibrationWriter:
                 raise ValueError(
                     f"output_factors must have shape {sample_shape + (self._rows,)}"
                 )
-            _require_finite_tensor(output_factors, "calibration output factors")
             required_bytes += output_factors.numel() * 4
         if token_weights is not None:
             if (
@@ -254,7 +252,6 @@ class KroneckerCalibrationWriter:
                 or tuple(token_weights.shape) != sample_shape
             ):
                 raise ValueError(f"token_weights must have shape {sample_shape}")
-            _require_finite_tensor(token_weights, "calibration token weights")
             required_bytes += token_weights.numel() * 8
         if token_mask is not None:
             if (
@@ -267,6 +264,12 @@ class KroneckerCalibrationWriter:
             raise ValueError(
                 f"batch requires {required_bytes} bytes, limit is {self._max_batch_bytes}"
             )
+        # Admit the complete encoded batch before value scans or materialization.
+        _require_finite_tensor(activations, "calibration activations")
+        if output_factors is not None:
+            _require_finite_tensor(output_factors, "calibration output factors")
+        if token_weights is not None:
+            _require_finite_tensor(token_weights, "calibration token weights")
         factors_bytes = (
             self._float_bytes(output_factors, torch.float32, "<f4")
             if output_factors is not None
@@ -326,24 +329,16 @@ class KroneckerCalibrationWriter:
         }
         if output_indices.dtype not in integer_dtypes:
             raise TypeError("output_indices must use an integer dtype")
-        if bool((output_indices < 0).any()) or bool(
-            (output_indices >= self._rows).any()
-        ):
-            raise ValueError(f"output_indices values must be in [0, {self._rows})")
         if output_factors is not None and (
             not isinstance(output_factors, torch.Tensor)
             or tuple(output_factors.shape) != sample_shape
         ):
             raise ValueError(f"output_factors must have shape {sample_shape}")
-        if output_factors is not None:
-            _require_finite_tensor(output_factors, "calibration output factors")
         if token_weights is not None and (
             not isinstance(token_weights, torch.Tensor)
             or tuple(token_weights.shape) != sample_shape
         ):
             raise ValueError(f"token_weights must have shape {sample_shape}")
-        if token_weights is not None:
-            _require_finite_tensor(token_weights, "calibration token weights")
         if token_mask is not None and (
             not isinstance(token_mask, torch.Tensor)
             or tuple(token_mask.shape) != sample_shape
@@ -358,6 +353,14 @@ class KroneckerCalibrationWriter:
             raise ValueError(
                 f"batch requires {required_bytes} bytes, limit is {self._max_batch_bytes}"
             )
+        if bool((output_indices < 0).any()) or bool(
+            (output_indices >= self._rows).any()
+        ):
+            raise ValueError(f"output_indices values must be in [0, {self._rows})")
+        if output_factors is not None:
+            _require_finite_tensor(output_factors, "calibration output factors")
+        if token_weights is not None:
+            _require_finite_tensor(token_weights, "calibration token weights")
         indices_bytes = (
             output_indices.detach()
             .to(device="cpu", dtype=torch.int64)
@@ -417,17 +420,11 @@ class KroneckerCalibrationWriter:
             raise TypeError("output_indices must use an integer dtype")
         sample_shape = tuple(output_indices.shape)
         samples = output_indices.numel()
-        if bool((output_indices < 0).any()) or bool(
-            (output_indices >= self._rows).any()
-        ):
-            raise ValueError(f"output_indices values must be in [0, {self._rows})")
         if token_weights is not None and (
             not isinstance(token_weights, torch.Tensor)
             or tuple(token_weights.shape) != sample_shape
         ):
             raise ValueError(f"token_weights must have shape {sample_shape}")
-        if token_weights is not None:
-            _require_finite_tensor(token_weights, "calibration token weights")
         if token_mask is not None and (
             not isinstance(token_mask, torch.Tensor)
             or tuple(token_mask.shape) != sample_shape
@@ -442,6 +439,12 @@ class KroneckerCalibrationWriter:
             raise ValueError(
                 f"batch requires {required_bytes} bytes, limit is {self._max_batch_bytes}"
             )
+        if bool((output_indices < 0).any()) or bool(
+            (output_indices >= self._rows).any()
+        ):
+            raise ValueError(f"output_indices values must be in [0, {self._rows})")
+        if token_weights is not None:
+            _require_finite_tensor(token_weights, "calibration token weights")
         indices_bytes = (
             output_indices.detach()
             .to(device="cpu", dtype=torch.int64)

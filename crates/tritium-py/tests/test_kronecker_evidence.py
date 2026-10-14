@@ -338,6 +338,109 @@ def test_pytorch_writer_streams_indexed_embedding_factors(tmp_path):
     assert writer.finish().tensor_index == 7
 
 
+@pytest.mark.parametrize(
+    "kind,optional,limit,required,samples",
+    [
+        ("dense", False, 16, 520, 1),
+        ("dense", True, 520, 529, 1),
+        ("indexed", False, 16, 524, 1),
+        ("indexed", True, 524, 533, 1),
+        ("identity", False, 4, 8, 1),
+        ("identity", True, 8, 17, 1),
+        ("dense", False, 16, 520 * (1 << 30), 1 << 30),
+        ("indexed", False, 16, 524 * (1 << 30), 1 << 30),
+        ("identity", False, 16, 8 * (1 << 30), 1 << 30),
+    ],
+)
+def test_writer_admits_batch_before_tensor_value_operations(
+    tmp_path, kind, optional, limit, required, samples
+):
+    torch = pytest.importorskip("torch")
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class RefuseTensorOperations(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            raise AssertionError(f"tensor operation before batch admission: {func}")
+
+    writer = KroneckerCalibrationWriter(
+        tmp_path / "evidence",
+        tensor_index=0,
+        tensor_name="a.weight",
+        rows=4 if kind != "dense" else 2,
+        columns=128,
+        curvature="input-hessian" if kind == "identity" else "guided-fisher",
+        source_model_digest="01" * 32,
+        activation_cache_digest="02" * 32,
+        token_stream_digest="03" * 32,
+        damping=0.25,
+        indexed_output=kind != "dense",
+        max_batch_bytes=limit,
+    )
+    # Expanded views exercise huge logical batches without allocating their lanes.
+    activations = torch.ones(1, 128).expand(samples, 128)
+    indices = torch.tensor([1]).expand(samples)
+    factors = (
+        torch.ones(1, 2).expand(samples, 2)
+        if kind == "dense"
+        else torch.ones(1).expand(samples)
+    )
+    options = (
+        {"token_weights": torch.ones(1), "token_mask": torch.ones(1, dtype=torch.bool)}
+        if optional
+        else {}
+    )
+    before = sorted((tmp_path / "evidence").rglob("*"))
+    try:
+        with RefuseTensorOperations(), pytest.raises(
+            ValueError, match=f"batch requires {required} bytes, limit is {limit}"
+        ):
+            if kind == "dense":
+                writer.append(activations, factors, **options)
+            elif kind == "indexed":
+                writer.append_indexed(activations, indices, factors, **options)
+            else:
+                writer.append_indexed_identity(indices, **options)
+        assert writer.active
+        assert sorted((tmp_path / "evidence").rglob("*")) == before
+    finally:
+        writer.abort()
+
+
+@pytest.mark.parametrize("kind,limit", [("dense", 529), ("indexed", 533), ("identity", 17)])
+def test_writer_exact_batch_limit_preserves_canonical_record(tmp_path, kind, limit):
+    torch = pytest.importorskip("torch")
+    receipts = []
+    for name, budget in [("exact", limit), ("reference", 4096)]:
+        writer = KroneckerCalibrationWriter(
+            tmp_path / name,
+            tensor_index=0,
+            tensor_name="a.weight",
+            rows=4 if kind != "dense" else 2,
+            columns=128,
+            curvature="input-hessian" if kind == "identity" else "guided-fisher",
+            source_model_digest="01" * 32,
+            activation_cache_digest="02" * 32,
+            token_stream_digest="03" * 32,
+            damping=0.25,
+            indexed_output=kind != "dense",
+            max_batch_bytes=budget,
+        )
+        options = {"token_weights": torch.tensor([2.0]), "token_mask": torch.tensor([True])}
+        if kind == "dense":
+            writer.append(torch.ones(1, 128), torch.tensor([[2.0, -3.0]]), **options)
+        elif kind == "indexed":
+            writer.append_indexed(
+                torch.ones(1, 128), torch.tensor([1]), torch.tensor([2.0]), **options
+            )
+        else:
+            writer.append_indexed_identity(torch.tensor([1]), **options)
+        receipts.append(writer.finish())
+    assert receipts[0].record_digest == receipts[1].record_digest
+    assert (tmp_path / "exact/000000.s2kf").read_bytes() == (
+        tmp_path / "reference/000000.s2kf"
+    ).read_bytes()
+
+
 def test_pytorch_writer_streams_indexed_embedding_identity_input_hessian(tmp_path):
     torch = pytest.importorskip("torch")
     writer = KroneckerCalibrationWriter(
