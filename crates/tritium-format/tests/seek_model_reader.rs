@@ -19,6 +19,48 @@ struct Source {
     fault: Rc<Cell<u8>>,
     mutate_on_terminal: bool,
 }
+
+#[test]
+fn named_tensor_stream_borrows_exact_metadata_repeats_and_preserves_faults() {
+    let bytes = fixture::fixture(65537, 131076);
+    let source = Source::new(bytes.clone());
+    let mutable = source.bytes.clone();
+    let limits = parity::limits(&bytes);
+    let mut reader = TritModelReader::open(source, limits).unwrap();
+    let pointer = reader.tensor_meta("child", "weight").unwrap() as *const _;
+    let expected = {
+        let borrowed = tritium_format::trit_model::read_trit_model(&bytes).unwrap();
+        borrowed.tensor("child", "weight").unwrap().1.to_vec()
+    };
+    {
+        let mut stream = reader.tensor_stream("child", "weight").unwrap();
+        assert_eq!(stream.metadata() as *const _, pointer);
+        assert_eq!(stream.encoded_bytes(), expected.len() as u64);
+        for _ in 0..2 {
+            let mut actual = Vec::new();
+            stream
+                .visit(|chunk| -> Result<(), u8> {
+                    assert!(chunk.len() <= 65536);
+                    actual.extend_from_slice(chunk);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(actual, expected);
+        }
+        assert!(matches!(
+            stream.visit(|_| Err(37u8)),
+            Err(TritModelVisitError::Visitor(37))
+        ));
+        let raw = mutable
+            .borrow()
+            .windows(expected.len())
+            .position(|s| s == expected)
+            .unwrap();
+        mutable.borrow_mut()[raw] ^= 1;
+        assert!(stream.visit(|_| Ok::<_, u8>(())).is_err());
+    }
+    assert!(reader.verify().is_err());
+}
 impl Source {
     fn new(bytes: Vec<u8>) -> Self {
         Self {

@@ -6,7 +6,9 @@ use rayon::prelude::*;
 use tritium_core::{AdditiveView, OwnedPerTileIndex, apply_basis, apply_inverse_basis};
 use tritium_format::salt_v2::SaltV2Codec;
 use tritium_schema::{AdditiveLayout, PlaneCodec, PlaneRelation, ScaleAnchor, ScalePrecision};
-use tritium_spec::{AdditiveMetadata, BackendError, TensorMatmul};
+use tritium_spec::{
+    AdditiveMetadata, BackendError, TENSOR_STREAM_CHUNK_BYTES, TensorMatmul, TensorStreamSource,
+};
 
 #[derive(Debug)]
 pub(crate) struct PackedAdditive {
@@ -57,11 +59,6 @@ impl PackedAdditive {
         }
     }
 
-    pub(super) fn payload_bytes(view: AdditiveView<'_>) -> Result<usize, BackendError> {
-        Self::validate_symbols(view)?;
-        Self::payload_metadata(AdditiveMetadata::from_view(view))
-    }
-
     pub(super) fn validate_symbols(view: AdditiveView<'_>) -> Result<(), BackendError> {
         for plane in 0..view.plane_count() {
             let trits = view.plane_trits(plane).map_err(invalid)?;
@@ -110,65 +107,13 @@ impl PackedAdditive {
     }
 
     pub(super) fn upload(view: AdditiveView<'_>) -> Result<Self, BackendError> {
-        let total = Self::payload_bytes(view)?;
-        let layout = view.layout();
-        let planes = view.plane_count();
+        Self::validate_symbols(view)?;
+        let mut tensor = Self::allocate(AdditiveMetadata::from_view(view))?;
+        let layout = tensor.layout;
         let codec = codec(layout)?;
-        let mut scale_offset = 0usize;
-        for plane in 0..planes {
-            scale_offset += codec
-                .ledger(view.plane_trits(plane).map_err(invalid)?.len())
-                .map_err(invalid)?
-                .physical_bytes;
-        }
-        let data_bytes = scale_offset + view.scales().len() * Self::scale_width(layout)?;
-        let allocation = if let Some(counts) = view.tile_counts() {
-            let mut owned_counts = Vec::new();
-            owned_counts
-                .try_reserve_exact(counts.len())
-                .map_err(|_| BackendError::OutOfMemory { requested: total })?;
-            owned_counts.extend_from_slice(counts);
-            let index =
-                OwnedPerTileIndex::new(layout, owned_counts).map_err(|error| match error {
-                    tritium_core::AdditiveError::AllocationFailed { requested } => {
-                        BackendError::OutOfMemory { requested }
-                    }
-                    other => invalid(other),
-                })?;
-            let mut starts = Vec::new();
-            starts
-                .try_reserve_exact(planes)
-                .map_err(|_| BackendError::OutOfMemory { requested: total })?;
-            let mut byte = 0;
-            let mut trit = 0;
-            for plane in 0..planes {
-                starts.push(PlaneStart { byte, trit });
-                let len = view.plane_trits(plane).map_err(invalid)?.len();
-                byte += codec.ledger(len).map_err(invalid)?.physical_bytes;
-                trit += len;
-            }
-            Allocation::PerTile { index, starts }
-        } else {
-            // Only Uniform divides by its validated nonzero plane count.
-            let plane_bytes = scale_offset / planes;
-            let scale_units = if matches!(layout.law.relation, PlaneRelation::Free) {
-                view.scales().len() / planes
-            } else {
-                view.scales().len()
-            };
-            Allocation::Uniform {
-                plane_bytes,
-                scale_units,
-            }
-        };
-        let mut packed = Vec::new();
-        packed
-            .try_reserve_exact(data_bytes)
-            .map_err(|_| BackendError::OutOfMemory { requested: total })?;
-        packed.resize(data_bytes, 0);
-        let (plane_data, scale_data) = packed.split_at_mut(scale_offset);
+        let (plane_data, scale_data) = tensor.packed.split_at_mut(tensor.scale_offset);
         let mut byte = 0;
-        for plane in 0..planes {
+        for plane in 0..tensor.planes {
             let source = view.plane_trits(plane).map_err(invalid)?;
             let len = codec.ledger(source.len()).map_err(invalid)?.physical_bytes;
             codec
@@ -189,6 +134,132 @@ impl PackedAdditive {
                 _ => return Err(BackendError::UnsupportedTensor),
             }
         }
+        Ok(tensor)
+    }
+
+    pub(super) fn stream_encoded_bytes(
+        metadata: AdditiveMetadata<'_>,
+    ) -> Result<usize, BackendError> {
+        let mut bytes = metadata
+            .scale_count()
+            .checked_mul(Self::scale_width(metadata.layout())?)
+            .ok_or_else(|| invalid("scale size overflow"))?;
+        let codec = codec(metadata.layout())?;
+        for p in 0..metadata.plane_count() {
+            bytes = bytes
+                .checked_add(
+                    codec
+                        .ledger(metadata.plane_trit_count(p)?)
+                        .map_err(invalid)?
+                        .physical_bytes,
+                )
+                .ok_or_else(|| invalid("encoded size overflow"))?;
+        }
+        Ok(bytes)
+    }
+
+    pub(super) fn upload_stream(
+        metadata: AdditiveMetadata<'_>,
+        source: &dyn TensorStreamSource,
+    ) -> Result<Self, BackendError> {
+        let mut tensor = Self::allocate(metadata)?;
+        let mut at = 0usize;
+        source.visit(&mut |chunk| {
+            if chunk.len() > TENSOR_STREAM_CHUNK_BYTES {
+                return Err(invalid("source window exceeds stream bound"));
+            }
+            let end = at
+                .checked_add(chunk.len())
+                .ok_or_else(|| invalid("stream length overflow"))?;
+            let output = tensor
+                .packed
+                .get_mut(at..end)
+                .ok_or_else(|| invalid("source exceeds encoded plan"))?;
+            output.copy_from_slice(chunk);
+            at = end;
+            Ok(())
+        })?;
+        if at != tensor.packed.len() {
+            return Err(invalid("source shorter than encoded plan"));
+        }
+        // CPU canonical plane/scale ordering is identical, including plane-reset
+        // padding. Validate this final private native buffer with bounded codec
+        // scratch; never decode a complete trit master or retain a second copy.
+        if let Some(counts) = metadata.tile_counts() {
+            tritium_format::AdditivePayload::new_per_tile(
+                metadata.layout(),
+                counts,
+                &tensor.packed,
+            )
+            .map_err(invalid)?;
+        } else {
+            tritium_format::AdditivePayload::new_uniform(
+                metadata.layout(),
+                metadata.plane_count() as u8,
+                &tensor.packed,
+            )
+            .map_err(invalid)?;
+        }
+        Ok(tensor)
+    }
+
+    fn allocate(metadata: AdditiveMetadata<'_>) -> Result<Self, BackendError> {
+        let total = Self::payload_metadata(metadata)?;
+        let layout = metadata.layout();
+        let planes = metadata.plane_count();
+        let codec = codec(layout)?;
+        let mut scale_offset = 0usize;
+        for plane in 0..planes {
+            scale_offset += codec
+                .ledger(metadata.plane_trit_count(plane)?)
+                .map_err(invalid)?
+                .physical_bytes;
+        }
+        let data_bytes = Self::stream_encoded_bytes(metadata)?;
+        let allocation = if let Some(counts) = metadata.tile_counts() {
+            let mut owned_counts = Vec::new();
+            owned_counts
+                .try_reserve_exact(counts.len())
+                .map_err(|_| BackendError::OutOfMemory { requested: total })?;
+            owned_counts.extend_from_slice(counts);
+            let index =
+                OwnedPerTileIndex::new(layout, owned_counts).map_err(|error| match error {
+                    tritium_core::AdditiveError::AllocationFailed { requested } => {
+                        BackendError::OutOfMemory { requested }
+                    }
+                    other => invalid(other),
+                })?;
+            let mut starts = Vec::new();
+            starts
+                .try_reserve_exact(planes)
+                .map_err(|_| BackendError::OutOfMemory { requested: total })?;
+            let mut byte = 0;
+            let mut trit = 0;
+            for plane in 0..planes {
+                starts.push(PlaneStart { byte, trit });
+                let len = metadata.plane_trit_count(plane)?;
+                byte += codec.ledger(len).map_err(invalid)?.physical_bytes;
+                trit += len;
+            }
+            Allocation::PerTile { index, starts }
+        } else {
+            // Only Uniform divides by its validated nonzero plane count.
+            let plane_bytes = scale_offset / planes;
+            let scale_units = if matches!(layout.law.relation, PlaneRelation::Free) {
+                metadata.scale_count() / planes
+            } else {
+                metadata.scale_count()
+            };
+            Allocation::Uniform {
+                plane_bytes,
+                scale_units,
+            }
+        };
+        let mut packed = Vec::new();
+        packed
+            .try_reserve_exact(data_bytes)
+            .map_err(|_| BackendError::OutOfMemory { requested: total })?;
+        packed.resize(data_bytes, 0);
         Ok(Self {
             layout,
             planes,

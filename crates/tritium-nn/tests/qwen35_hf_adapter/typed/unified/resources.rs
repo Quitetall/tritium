@@ -15,7 +15,21 @@ fn guarded(
     ledgers: &[TensorPayloadBudget; 5],
     evidence: &mut EvidenceRecorder,
 ) -> Result<tritium_nn::LoadedModel, tritium_nn::NnError> {
-    tritium_nn::load_with_resources(
+    guarded_mode(source, backend, ledgers, evidence, false)
+}
+fn guarded_mode(
+    source: ModelSource<'_>,
+    backend: Box<dyn TernaryBackend>,
+    ledgers: &[TensorPayloadBudget; 5],
+    evidence: &mut EvidenceRecorder,
+    streamed: bool,
+) -> Result<tritium_nn::LoadedModel, tritium_nn::NnError> {
+    let load = if streamed {
+        tritium_nn::load_streamed_with_resources
+    } else {
+        tritium_nn::load_with_resources
+    };
+    load(
         source,
         backend,
         TensorUploadPolicy::default(),
@@ -260,53 +274,60 @@ fn retained_admission_matches_uploads_roles_and_oracle_and_follows_runner_owners
             },
             file_source(&path),
         ] {
-            let budgets = ledgers();
-            let mut evidence = recorder();
-            let mut loaded = guarded(
-                source,
-                Box::new(tritium_cpu::CpuBackend::new()),
-                &budgets,
-                &mut evidence,
-            )
-            .unwrap();
-            let admission = loaded.runner.resource_admission().unwrap();
-            assert_eq!(
-                admission.source_workspace_bytes,
-                plan.maximum_tensor_working_payload_bytes()
-            );
-            assert_eq!(admission.retained_host_bytes, preserved + 448);
-            let actual = evidence
-                .events()
-                .iter()
-                .filter(|e| e.schema == tritium_evidence::TensorUploaded::SCHEMA_ID)
-                .map(|e| e.payload["caps"]["payload_bytes"].as_u64().unwrap())
-                .sum::<u64>();
-            assert_eq!(admission.payload_bytes, actual);
-            assert_eq!(budgets[0].used_bytes(), actual);
-            assert_eq!(budgets[4].used_bytes(), preserved + 448);
-            assert!(budgets[1..4].iter().all(|b| b.used_bytes() == 0));
-            let oracle_budget = TensorPayloadBudget::new(1_000_000);
-            let mut oracle = load(
-                source,
-                Box::new(tritium_cpu::CpuBackend::new()),
-                &oracle_budget,
-                &mut recorder(),
-            )
-            .unwrap();
-            assert!(oracle.runner.resource_admission().is_none());
-            assert_eq!(
-                loaded.runner.prefill(&[1, 2]).unwrap(),
-                oracle.runner.prefill(&[1, 2]).unwrap()
-            );
-            assert_eq!(
-                loaded.runner.step(3).unwrap(),
-                oracle.runner.step(3).unwrap()
-            );
-            // Moving the runner out of LoadedModel must not release host custody.
-            let runner = loaded.runner;
-            assert_eq!(budgets[4].used_bytes(), preserved + 448);
-            drop(runner);
-            empty(&budgets);
+            for streamed in [false, true] {
+                let budgets = ledgers();
+                let mut evidence = recorder();
+                let mut loaded = guarded_mode(
+                    source,
+                    Box::new(tritium_cpu::CpuBackend::new()),
+                    &budgets,
+                    &mut evidence,
+                    streamed,
+                )
+                .unwrap();
+                let admission = loaded.runner.resource_admission().unwrap();
+                assert_eq!(
+                    admission.source_workspace_bytes,
+                    if streamed {
+                        65536
+                    } else {
+                        plan.maximum_tensor_working_payload_bytes()
+                    }
+                );
+                assert_eq!(admission.retained_host_bytes, preserved + 448);
+                let actual = evidence
+                    .events()
+                    .iter()
+                    .filter(|e| e.schema == tritium_evidence::TensorUploaded::SCHEMA_ID)
+                    .map(|e| e.payload["caps"]["payload_bytes"].as_u64().unwrap())
+                    .sum::<u64>();
+                assert_eq!(admission.payload_bytes, actual);
+                assert_eq!(budgets[0].used_bytes(), actual);
+                assert_eq!(budgets[4].used_bytes(), preserved + 448);
+                assert!(budgets[1..4].iter().all(|b| b.used_bytes() == 0));
+                let oracle_budget = TensorPayloadBudget::new(1_000_000);
+                let mut oracle = load(
+                    source,
+                    Box::new(tritium_cpu::CpuBackend::new()),
+                    &oracle_budget,
+                    &mut recorder(),
+                )
+                .unwrap();
+                assert!(oracle.runner.resource_admission().is_none());
+                assert_eq!(
+                    loaded.runner.prefill(&[1, 2]).unwrap(),
+                    oracle.runner.prefill(&[1, 2]).unwrap()
+                );
+                assert_eq!(
+                    loaded.runner.step(3).unwrap(),
+                    oracle.runner.step(3).unwrap()
+                );
+                // Moving the runner out of LoadedModel must not release host custody.
+                let runner = loaded.runner;
+                assert_eq!(budgets[4].used_bytes(), preserved + 448);
+                drop(runner);
+                empty(&budgets);
+            }
         }
     }
 }
@@ -472,11 +493,12 @@ fn per_tile_pruning_coding_and_signed_basis_share_the_same_aggregate_loader() {
             level: "typed",
         };
         let budgets = ledgers();
-        let mut loaded = guarded(
+        let mut loaded = guarded_mode(
             source,
             Box::new(tritium_cpu::CpuBackend::new()),
             &budgets,
             &mut recorder(),
+            true,
         )
         .unwrap();
         let oracle_budget = TensorPayloadBudget::new(1_000_000);
@@ -496,6 +518,244 @@ fn per_tile_pruning_coding_and_signed_basis_share_the_same_aggregate_loader() {
             oracle.runner.step(3).unwrap()
         );
         drop(loaded);
+        empty(&budgets);
+    }
+}
+
+#[test]
+fn streamed_large_embeddings_load_below_the_full_decoding_workspace_cap() {
+    let root = Scratch::new("stream-working-cap");
+    let small = text_package(true, false).bytes();
+    let assets = tritium_format::trit_model::read_trit_model(&small).unwrap();
+    let original_vocab = Qwen35CheckpointConfig::from_hf_config(&config_json())
+        .unwrap()
+        .text
+        .vocab_size as usize;
+    let expanded = tensors()
+        .into_iter()
+        .map(|t| {
+            if t.shape == [original_vocab, H] {
+                let mut large = tensor(t.name, &[32768, H], 1);
+                for v in &mut large.values {
+                    *v = v.clamp(-13. / 32., 13. / 32.);
+                }
+                large
+            } else {
+                t
+            }
+        })
+        .collect();
+    let mut package = Package::new(expanded, true);
+    let mut config: serde_json::Value = serde_json::from_str(&config_json()).unwrap();
+    config["text_config"]["vocab_size"] = 32768.into();
+    asset(
+        &mut package,
+        "config.json",
+        serde_json::to_vec(&config).unwrap(),
+    );
+    asset(
+        &mut package,
+        "tokenizer.json",
+        assets.asset("tokenizer.json").unwrap().to_vec(),
+    );
+    asset(
+        &mut package,
+        "tokenizer_config.json",
+        assets.asset("tokenizer_config.json").unwrap().to_vec(),
+    );
+    let path = root.0.join("model.trit");
+    std::fs::write(&path, package.bytes()).unwrap();
+    let source = ModelSource::TritFile {
+        path: &path,
+        level: "typed",
+        receiving: TritPackageReadLimits {
+            max_source_bytes: 4_000_000,
+            ..receiving()
+        },
+        limits: Qwen35TritReadLimits {
+            max_tensor_bytes: 2_000_000,
+            max_decoded_tensor_bytes: 2_000_000,
+            ..limits()
+        },
+    };
+    let plan = tritium_nn::inspect_trit_file(
+        &path,
+        "typed",
+        TritPackageReadLimits {
+            max_source_bytes: 4_000_000,
+            ..receiving()
+        },
+        Qwen35TritReadLimits {
+            max_tensor_bytes: 2_000_000,
+            max_decoded_tensor_bytes: 2_000_000,
+            ..limits()
+        },
+        Some(stream()),
+    )
+    .unwrap();
+    assert!(plan.maximum_tensor_working_payload_bytes() > 10 * 65536);
+    let mut budgets = ledgers();
+    budgets[1] = TensorPayloadBudget::new(65536);
+    let mut refused = recorder();
+    assert!(
+        guarded(
+            source,
+            Box::new(tritium_cpu::CpuBackend::new()),
+            &budgets,
+            &mut refused
+        )
+        .is_err()
+    );
+    assert!(refused.events().is_empty());
+    empty(&budgets);
+    let mut actual = guarded_mode(
+        source,
+        Box::new(tritium_cpu::CpuBackend::new()),
+        &budgets,
+        &mut recorder(),
+        true,
+    )
+    .unwrap();
+    let admission = actual.runner.resource_admission().unwrap();
+    assert_eq!(admission.source_workspace_bytes, 65536);
+    assert_eq!(admission.host_workspace_bytes, 65536);
+    assert_eq!(budgets[1].used_bytes(), 0);
+    let oracle_budget = TensorPayloadBudget::new(2_000_000);
+    let mut oracle = load(
+        source,
+        Box::new(tritium_cpu::CpuBackend::new()),
+        &oracle_budget,
+        &mut recorder(),
+    )
+    .unwrap();
+    assert_eq!(
+        actual.runner.prefill(&[1, 2]).unwrap(),
+        oracle.runner.prefill(&[1, 2]).unwrap()
+    );
+    assert_eq!(
+        actual.runner.step(3).unwrap(),
+        oracle.runner.step(3).unwrap()
+    );
+    drop(actual);
+    empty(&budgets);
+}
+
+#[test]
+fn mandatory_streaming_support_and_all_positive_storage_domains_refuse_without_fallback() {
+    let bytes = text_package(true, false).bytes();
+    let source = ModelSource::Trit {
+        bytes: &bytes,
+        level: "typed",
+    };
+    for index in [0, 1, 2, 4] {
+        let mut budgets = ledgers();
+        budgets[index] = TensorPayloadBudget::new(0);
+        let mut evidence = recorder();
+        assert!(
+            guarded_mode(
+                source,
+                Box::new(tritium_cpu::CpuBackend::new()),
+                &budgets,
+                &mut evidence,
+                true
+            )
+            .is_err()
+        );
+        assert!(evidence.events().is_empty());
+        empty(&budgets);
+    }
+    let budgets = ledgers();
+    let count = Arc::new(AtomicUsize::new(0));
+    let mut evidence = recorder();
+    let error = guarded_mode(
+        source,
+        Box::new(Probe {
+            count: count.clone(),
+            fail_at: None,
+            mutate: None,
+        }),
+        &budgets,
+        &mut evidence,
+        true,
+    )
+    .err()
+    .unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("backend streaming plan is unknown")
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    assert!(evidence.events().is_empty());
+    empty(&budgets);
+}
+
+#[derive(Debug)]
+struct StreamFaultProbe(Probe);
+impl TernaryBackend for StreamFaultProbe {
+    fn device_id(&self) -> &str {
+        "stream-model-fault-probe"
+    }
+    fn capabilities(&self) -> tritium_spec::DeviceCaps {
+        self.0.capabilities()
+    }
+    fn tensor_stream_plan(
+        &self,
+        m: tritium_spec::TensorMetadata<'_>,
+        e: tritium_spec::TensorStreamEncoding,
+    ) -> Result<Option<tritium_spec::TensorStreamPlan>, BackendError> {
+        tritium_cpu::CpuBackend::new().tensor_stream_plan(m, e)
+    }
+    fn upload_tensor_stream(
+        &self,
+        source: &dyn tritium_spec::TensorStreamSource,
+    ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        self.0.before_upload()?;
+        tritium_cpu::CpuBackend::new().upload_tensor_stream(source)
+    }
+    fn upload_tensor(&self, _: TensorView<'_>) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        panic!("decoded fallback forbidden")
+    }
+    fn upload_weights(
+        &self,
+        p: &[u8],
+        s: tritium_core::GemmShape,
+        f: tritium_core::TernaryFormat,
+    ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        self.0.upload_weights(p, s, f)
+    }
+    fn mpgemm(&self, p: tritium_spec::MpGemm<'_>) -> Result<(), BackendError> {
+        self.0.mpgemm(p)
+    }
+}
+#[test]
+fn streamed_partial_models_and_terminal_source_mutations_release_without_model_loaded() {
+    for mutate in [false, true] {
+        let root = Scratch::new("stream-model-rollback");
+        let path = root.0.join("model.trit");
+        std::fs::write(&path, text_package(true, false).bytes()).unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let budgets = ledgers();
+        let mut evidence = recorder();
+        let result = guarded_mode(
+            file_source(&path),
+            Box::new(StreamFaultProbe(Probe {
+                count: count.clone(),
+                fail_at: (!mutate).then_some(3),
+                mutate: mutate.then_some(path.clone()),
+            })),
+            &budgets,
+            &mut evidence,
+            true,
+        );
+        assert!(result.is_err());
+        assert!(count.load(Ordering::SeqCst) > 0);
+        assert!(
+            !evidence
+                .events()
+                .iter()
+                .any(|e| e.schema == ModelLoaded::SCHEMA_ID)
+        );
         empty(&budgets);
     }
 }

@@ -368,7 +368,7 @@ pub fn load(
     budget: &tritium_runtime::TensorPayloadBudget,
     context: tritium_runtime::TensorUploadContext<'_>,
 ) -> Result<LoadedModel, NnError> {
-    load_impl(source, backend, policy, budget, None, None, context)
+    load_impl(source, backend, policy, budget, None, None, false, context)
 }
 
 /// Load through the same source/runner with explicit bounded stream admission.
@@ -390,7 +390,16 @@ pub fn load_with_limits(
     context: tritium_runtime::TensorUploadContext<'_>,
 ) -> Result<LoadedModel, NnError> {
     limits.validate()?;
-    load_impl(source, backend, policy, budget, Some(limits), None, context)
+    load_impl(
+        source,
+        backend,
+        policy,
+        budget,
+        Some(limits),
+        None,
+        false,
+        context,
+    )
 }
 
 /// Load retained typed weights after reserving all covered logical domains.
@@ -420,6 +429,38 @@ pub fn load_with_resources(
         resources.payload,
         Some(limits),
         Some(resources),
+        false,
+        context,
+    )
+}
+
+/// Load every retained matrix through mandatory bounded encoded streaming.
+/// Unknown streaming support fails before materialization, without decoded
+/// fallback. Preserved host vectors retain their existing bounded decode path.
+/// Shares inventory, aggregate admission, graph assembly and source/ModelLoaded
+/// checks with ordinary loading. Physical/driver/activation scratch and release
+/// qualification remain excluded. Backend-specific transcode must be explicit.
+/// # Errors
+/// The errors of load_with_resources plus unavailable/changed streaming plans,
+/// encoded geometry, codec/scale/value/source faults and backend transfer errors.
+#[cfg(feature = "tokenizer")]
+pub fn load_streamed_with_resources(
+    source: ModelSource<'_>,
+    backend: Box<dyn tritium_spec::TernaryBackend>,
+    policy: tritium_schema::TensorUploadPolicy,
+    resources: super::ModelLoadResources<'_>,
+    limits: super::StreamLimits,
+    context: tritium_runtime::TensorUploadContext<'_>,
+) -> Result<LoadedModel, NnError> {
+    limits.validate()?;
+    load_impl(
+        source,
+        backend,
+        policy,
+        resources.payload,
+        Some(limits),
+        Some(resources),
+        true,
         context,
     )
 }
@@ -433,6 +474,7 @@ fn load_impl(
     budget: &tritium_runtime::TensorPayloadBudget,
     execution: Option<super::StreamLimits>,
     resources: Option<super::ModelLoadResources<'_>>,
+    streamed: bool,
     context: tritium_runtime::TensorUploadContext<'_>,
 ) -> Result<LoadedModel, NnError> {
     context
@@ -456,12 +498,12 @@ fn load_impl(
         } => {
             return super::retained::load_file(
                 path, level, receiving, limits, backend, policy, budget, execution, resources,
-                context,
+                streamed, context,
             );
         }
         ModelSource::Trit { bytes, level } => {
             return super::retained::load_bytes(
-                bytes, level, backend, policy, budget, execution, resources, context,
+                bytes, level, backend, policy, budget, execution, resources, streamed, context,
             );
         }
         _ => {}

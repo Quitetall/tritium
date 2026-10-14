@@ -610,6 +610,27 @@ struct Probe {
     fail_at: Option<usize>,
     mutate: Option<PathBuf>,
 }
+impl Probe {
+    fn before_upload(&self) -> Result<(), BackendError> {
+        let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(path) = self.mutate.as_ref().filter(|_| n == 1) {
+            let bytes = std::fs::read(path).unwrap();
+            let config = config_json();
+            let offset = bytes
+                .windows(config.len())
+                .position(|w| w == config.as_bytes())
+                .unwrap();
+            let mut f = OpenOptions::new().write(true).open(path).unwrap();
+            f.seek(SeekFrom::Start(offset as u64)).unwrap();
+            f.write_all(b"[").unwrap();
+            f.sync_all().unwrap();
+        }
+        if self.fail_at == Some(n) {
+            return Err(BackendError::Backend("injected upload fault".into()));
+        }
+        Ok(())
+    }
+}
 impl TernaryBackend for Probe {
     fn device_id(&self) -> &str {
         "cpu-qwen-assembly-probe"
@@ -630,22 +651,7 @@ impl TernaryBackend for Probe {
         tritium_cpu::CpuBackend::new().tensor_upload_plan(metadata)
     }
     fn upload_tensor(&self, t: TensorView<'_>) -> Result<Box<dyn DeviceBuffer>, BackendError> {
-        let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
-        if let Some(path) = self.mutate.as_ref().filter(|_| n == 1) {
-            let bytes = std::fs::read(path).unwrap();
-            let config = config_json();
-            let offset = bytes
-                .windows(config.len())
-                .position(|w| w == config.as_bytes())
-                .unwrap();
-            let mut f = OpenOptions::new().write(true).open(path).unwrap();
-            f.seek(SeekFrom::Start(offset as u64)).unwrap();
-            f.write_all(b"[").unwrap();
-            f.sync_all().unwrap();
-        }
-        if self.fail_at == Some(n) {
-            return Err(BackendError::Backend("injected upload fault".into()));
-        }
+        self.before_upload()?;
         tritium_cpu::CpuBackend::new().upload_tensor(t)
     }
     fn upload_weights(

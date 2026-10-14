@@ -183,6 +183,21 @@ fn upload_logged(
             "tensor capabilities changed during admitted upload".into(),
         )));
     }
+    record_uploaded(backend, name, caps, decoded_source_bytes, context)?;
+    let buffer = match reserved {
+        Some((_, reservation)) => reservation.attach(buffer),
+        None => buffer,
+    };
+    Ok((buffer, caps))
+}
+
+pub(super) fn record_uploaded(
+    backend: &dyn TernaryBackend,
+    name: &str,
+    caps: TensorCaps,
+    decoded_source_bytes: u64,
+    context: TensorUploadContext<'_>,
+) -> Result<(), TensorUploadError> {
     context
         .recorder
         .emit(
@@ -198,11 +213,7 @@ fn upload_logged(
             },
         )
         .map_err(TensorUploadError::Evidence)?;
-    let buffer = match reserved {
-        Some((_, reservation)) => reservation.attach(buffer),
-        None => buffer,
-    };
-    Ok((buffer, caps))
+    Ok(())
 }
 
 #[cfg(test)]

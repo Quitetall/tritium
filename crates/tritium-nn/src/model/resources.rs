@@ -7,10 +7,9 @@ use std::{
 };
 use tritium_format::trit_model::TritModelReader;
 use tritium_runtime::{TensorPayloadBudget, TensorStorageReservation};
-use tritium_schema::{PlaneCounts, TensorStorage};
 use tritium_spec::{
-    AdditiveMetadata, TensorMetadata, TensorUploadPlan, TensorUploadPolicy, TernaryBackend,
-    validate_tensor_upload_policy,
+    TENSOR_STREAM_CHUNK_BYTES, TensorStreamPlan, TensorUploadPlan, TensorUploadPolicy,
+    TernaryBackend, validate_tensor_upload_policy,
 };
 
 /// Explicit logical storage domains for resource-planned retained loading.
@@ -21,7 +20,9 @@ use tritium_spec::{
 pub struct ModelLoadResources<'a> {
     /// Whole-model matrix payload, including MTP and counting tied handles once.
     pub payload: &'a TensorPayloadBudget,
-    /// Maximum current encoded+decoded tensor pair, held during serial assembly.
+    /// Maximum source working storage during assembly: current encoded+decoded
+    /// pair in compatibility mode, bounded matrix windows/preserved pairs in
+    /// mandatory streaming mode. Excludes metadata and allocator overhead.
     pub source_workspace: &'a TensorPayloadBudget,
     /// Maximum additional explicit backend host upload workspace.
     pub host_workspace: &'a TensorPayloadBudget,
@@ -52,6 +53,7 @@ pub(super) struct LoadReservations {
     pub(super) host_workspace: TensorPayloadBudget,
     pub(super) device_workspace: TensorPayloadBudget,
     pub(super) plans: BTreeMap<String, TensorUploadPlan>,
+    pub(super) stream_plans: Option<BTreeMap<String, TensorStreamPlan>>,
     pub(super) admission: ModelResourceAdmission,
     pub(super) retained_host: TensorStorageReservation,
     _source_workspace: TensorStorageReservation,
@@ -67,6 +69,7 @@ fn add(sum: &mut u64, bytes: u64) -> Result<(), NnError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn reserve<R: Read + Seek>(
     model: &TritModelReader<R>,
     level: &str,
@@ -75,13 +78,18 @@ pub(super) fn reserve<R: Read + Seek>(
     backend: &dyn TernaryBackend,
     policy: TensorUploadPolicy,
     resources: ModelLoadResources<'_>,
+    streamed: bool,
 ) -> Result<LoadReservations, NnError> {
     if backend.resident_decoder_requested() {
         return Err(invalid("resident graph resource planning is unavailable"));
     }
     let mut admission = ModelResourceAdmission {
         payload_bytes: 0,
-        source_workspace_bytes: source.maximum_tensor_working_payload_bytes(),
+        source_workspace_bytes: if streamed {
+            TENSOR_STREAM_CHUNK_BYTES as u64
+        } else {
+            source.maximum_tensor_working_payload_bytes()
+        },
         host_workspace_bytes: 0,
         device_workspace_bytes: 0,
         retained_host_bytes: source
@@ -90,6 +98,7 @@ pub(super) fn reserve<R: Read + Seek>(
             .logical_host_cache_payload_bytes(),
     };
     let mut plans = BTreeMap::new();
+    let mut stream_plans = streamed.then(BTreeMap::new);
     let mut visit = |name: &str, matrix: bool| -> Result<(), NnError> {
         let meta = model.tensor_meta(level, name).map_err(invalid)?;
         if !matrix {
@@ -97,27 +106,40 @@ pub(super) fn reserve<R: Read + Seek>(
                 &mut admission.retained_host_bytes,
                 super::qwen35_trit::decoded_bytes(meta)?,
             )?;
+            if streamed {
+                let pair = source
+                    .tensors()
+                    .iter()
+                    .find(|t| t.name() == name)
+                    .ok_or_else(|| invalid("absent preserved source plan"))?;
+                admission.source_workspace_bytes = admission.source_workspace_bytes.max(
+                    pair.encoded_bytes()
+                        .checked_add(pair.logical_decoded_bytes())
+                        .ok_or_else(|| invalid("preserved working pair overflow"))?,
+                );
+            }
             return Ok(());
         }
-        let metadata = match &meta.storage {
-            TensorStorage::Dense { shape, .. } if shape.len() == 2 => TensorMetadata::Dense {
-                rows: usize::try_from(shape[0]).map_err(invalid)?,
-                cols: usize::try_from(shape[1]).map_err(invalid)?,
-            },
-            TensorStorage::Additive { layout, planes } => TensorMetadata::Additive(
-                match planes {
-                    PlaneCounts::Uniform(n) => AdditiveMetadata::uniform(*layout, *n),
-                    PlaneCounts::PerTile(counts) => AdditiveMetadata::per_tile(*layout, counts),
-                    _ => return Err(invalid("unsupported plane allocation")),
-                }
-                .map_err(invalid)?,
-            ),
-            _ => return Err(invalid(format!("{name}: unsupported matrix metadata"))),
+        let metadata = super::tensor_stream::metadata(meta).map_err(invalid)?;
+        let plan = if let Some(plans) = &mut stream_plans {
+            let plan = backend
+                .tensor_stream_plan(
+                    metadata,
+                    super::tensor_stream::encoding(meta).map_err(invalid)?,
+                )
+                .map_err(invalid)?
+                .ok_or_else(|| invalid(format!("{name}: backend streaming plan is unknown")))?;
+            if plan.encoded_bytes != model.tensor_byte_len(level, name).map_err(invalid)? {
+                return Err(invalid(format!("{name}: stream encoded geometry mismatch")));
+            }
+            plans.insert(name.to_owned(), plan);
+            plan.upload
+        } else {
+            backend
+                .tensor_upload_plan(metadata)
+                .map_err(invalid)?
+                .ok_or_else(|| invalid(format!("{name}: backend upload plan is unknown")))?
         };
-        let plan = backend
-            .tensor_upload_plan(metadata)
-            .map_err(invalid)?
-            .ok_or_else(|| invalid(format!("{name}: backend upload plan is unknown")))?;
         validate_tensor_upload_policy(plan.caps, policy).map_err(invalid)?;
         add(&mut admission.payload_bytes, plan.caps.payload_bytes)?;
         admission.host_workspace_bytes = admission
@@ -172,6 +194,7 @@ pub(super) fn reserve<R: Read + Seek>(
         host_workspace,
         device_workspace,
         plans,
+        stream_plans,
         admission,
         retained_host,
         _source_workspace: source_workspace,

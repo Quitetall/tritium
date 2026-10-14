@@ -6,6 +6,8 @@ use tritium_schema::{
     TensorUploadPolicy, Transport,
 };
 use tritium_spec::{AdditiveMetadata, TensorMetadata, TensorView, TernaryBackend};
+#[path = "common/stream_source.rs"]
+mod stream_source;
 
 #[test]
 fn metadata_plans_match_actual_compact_upload_for_all_laws_codecs_and_pruning() {
@@ -49,6 +51,21 @@ fn metadata_plans_match_actual_compact_upload_for_all_laws_codecs_and_pruning() 
                 assert_eq!(buffer.len_bytes() as u64, plan.caps.payload_bytes);
                 assert_eq!(plan.host_workspace_bytes, 0);
                 assert_eq!(plan.device_workspace_bytes, 0);
+                let bytes = owned.encode_payload().unwrap();
+                let source = stream_source::Source::new(
+                    metadata,
+                    tritium_spec::TensorStreamEncoding::CanonicalRawAdditive,
+                    &bytes,
+                );
+                let streamed = cpu.upload_tensor_stream(&source).unwrap();
+                assert_eq!(streamed.len_bytes(), buffer.len_bytes());
+                let mut streamed_rows = vec![0.; 1024];
+                let mut decoded_rows = vec![0.; 1024];
+                cpu.embed_rows(&*buffer, &[1, 0], &mut decoded_rows)
+                    .unwrap();
+                cpu.embed_rows(&*streamed, &[1, 0], &mut streamed_rows)
+                    .unwrap();
+                assert_eq!(streamed_rows, decoded_rows);
             }
         }
     }

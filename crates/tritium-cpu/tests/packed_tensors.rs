@@ -8,6 +8,8 @@ use tritium_schema::{
     TensorUploadPolicy, Transport,
 };
 use tritium_spec::{BackendError, TensorExecution, TensorMatmul, TensorView, TernaryBackend};
+#[path = "common/stream_source.rs"]
+mod stream_source;
 
 fn check(codec: PlaneCodec, rows: usize, cols: usize, plane: &[Trit]) -> usize {
     let cpu = CpuBackend::new();
@@ -137,11 +139,35 @@ fn check(codec: PlaneCodec, rows: usize, cols: usize, plane: &[Trit]) -> usize {
                         expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
                     );
                     assert_eq!(scratch, expected_scratch);
+                    let source = stream_source::Source::new(
+                        metadata,
+                        tritium_spec::TensorStreamEncoding::CanonicalRawAdditive,
+                        &packed,
+                    );
+                    let stream_plan = cpu
+                        .tensor_stream_plan(metadata, source.encoding)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(stream_plan.upload.caps, caps);
+                    assert_eq!(stream_plan.encoded_bytes, packed.len() as u64);
+                    let streamed = cpu.upload_tensor_stream(&source).unwrap();
+                    assert_eq!(streamed.len_bytes(), expected_bytes);
+                    cpu.matmul(TensorMatmul {
+                        act: &act,
+                        tensor: &*streamed,
+                        batch: 3,
+                        transformed_act: &mut scratch,
+                        out: &mut out,
+                    })
+                    .unwrap();
+                    assert_eq!(out, expected);
+                    assert_eq!(scratch, expected_scratch);
                     let ids = [rows - 1, 0, rows - 1];
                     let mut gathered = vec![0.; ids.len() * cols];
                     let mut expected_rows = gathered.clone();
                     reference_embed(&view.bind_gather(), &ids, &mut expected_rows).unwrap();
                     cpu.embed_rows(&*uploaded, &ids, &mut gathered).unwrap();
+                    cpu.embed_rows(&*streamed, &ids, &mut gathered).unwrap();
                     assert_eq!(
                         gathered.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
                         expected_rows

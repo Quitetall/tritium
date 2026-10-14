@@ -4,7 +4,8 @@ use core::any::Any;
 use tritium_core::DenseView;
 use tritium_format::AdditiveTensor;
 use tritium_spec::{
-    BackendError, DeviceBuffer, TensorCaps, TensorExecution, TensorMatmul, TensorMetadata,
+    BackendError, DeviceBuffer, TENSOR_STREAM_CHUNK_BYTES, TensorCaps, TensorExecution,
+    TensorMatmul, TensorMetadata, TensorStreamEncoding, TensorStreamPlan, TensorStreamSource,
     TensorUploadPlan, TensorView, admitted_execution_group,
 };
 
@@ -38,6 +39,125 @@ impl DeviceBuffer for CpuTensor {
 }
 
 impl CpuTensor {
+    pub(crate) fn stream_plan(
+        metadata: TensorMetadata<'_>,
+        encoding: TensorStreamEncoding,
+    ) -> Result<Option<TensorStreamPlan>, BackendError> {
+        let encoded = match (metadata, encoding) {
+            (TensorMetadata::Additive(a), TensorStreamEncoding::CanonicalRawAdditive)
+                if matches!(a.layout().transport, tritium_schema::Transport::Raw) =>
+            {
+                PackedAdditive::stream_encoded_bytes(a)?
+            }
+            (
+                TensorMetadata::Dense { rows, cols },
+                TensorStreamEncoding::DenseLittleEndian(precision),
+            ) => {
+                let width = match precision {
+                    tritium_schema::ScalePrecision::F16 | tritium_schema::ScalePrecision::Bf16 => 2,
+                    tritium_schema::ScalePrecision::F32 => 4,
+                    _ => return Ok(None),
+                };
+                TensorMetadata::dense_bytes(rows, cols)? / 4 * width
+            }
+            _ => return Ok(None),
+        };
+        let Some(mut upload) = Self::plan(metadata)? else {
+            return Ok(None);
+        };
+        // Canonical validation uses sequential fixed codec/scale scratch. Dense
+        // widening uses only a scalar carry. Metadata/allocator overhead excluded.
+        upload.host_workspace_bytes = TENSOR_STREAM_CHUNK_BYTES as u64;
+        Ok(Some(TensorStreamPlan {
+            upload,
+            encoded_bytes: encoded as u64,
+        }))
+    }
+
+    pub(crate) fn upload_stream(
+        source: &dyn TensorStreamSource,
+    ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        let metadata = source.metadata();
+        let plan = Self::stream_plan(metadata, source.encoding())?
+            .ok_or(BackendError::UnsupportedTensor)?;
+        if source.encoded_bytes() != plan.encoded_bytes {
+            return Err(BackendError::InvalidInput(
+                "CPU stream encoded length differs from geometry".into(),
+            ));
+        }
+        let tensor = match (metadata, source.encoding()) {
+            (TensorMetadata::Additive(a), TensorStreamEncoding::CanonicalRawAdditive) => {
+                Self::Additive(PackedAdditive::upload_stream(a, source)?)
+            }
+            (
+                TensorMetadata::Dense { rows, cols },
+                TensorStreamEncoding::DenseLittleEndian(precision),
+            ) => {
+                let requested = TensorMetadata::dense_bytes(rows, cols)?;
+                let mut values = Vec::new();
+                values
+                    .try_reserve_exact(requested / 4)
+                    .map_err(|_| BackendError::OutOfMemory { requested })?;
+                let width = if precision == tritium_schema::ScalePrecision::F32 {
+                    4
+                } else {
+                    2
+                };
+                let mut carry = [0u8; 4];
+                let mut filled = 0;
+                let mut bytes = 0u64;
+                source.visit(&mut |chunk| {
+                    if chunk.len() > TENSOR_STREAM_CHUNK_BYTES {
+                        return Err(BackendError::InvalidInput(
+                            "source window exceeds stream bound".into(),
+                        ));
+                    }
+                    bytes = bytes
+                        .checked_add(chunk.len() as u64)
+                        .ok_or_else(|| BackendError::InvalidInput("stream size overflow".into()))?;
+                    if bytes > plan.encoded_bytes {
+                        return Err(BackendError::InvalidInput(
+                            "dense source exceeds stream plan".into(),
+                        ));
+                    }
+                    for &byte in chunk {
+                        carry[filled] = byte;
+                        filled += 1;
+                        if filled == width {
+                            let value = match precision {
+                                tritium_schema::ScalePrecision::F16 => {
+                                    half::f16::from_bits(u16::from_le_bytes([carry[0], carry[1]]))
+                                        .to_f32()
+                                }
+                                tritium_schema::ScalePrecision::Bf16 => {
+                                    half::bf16::from_bits(u16::from_le_bytes([carry[0], carry[1]]))
+                                        .to_f32()
+                                }
+                                tritium_schema::ScalePrecision::F32 => f32::from_le_bytes(carry),
+                                _ => return Err(BackendError::UnsupportedTensor),
+                            };
+                            if !value.is_finite() {
+                                return Err(BackendError::InvalidInput(
+                                    "non-finite streamed model weight".into(),
+                                ));
+                            }
+                            values.push(value);
+                            filled = 0;
+                        }
+                    }
+                    Ok(())
+                })?;
+                if bytes != plan.encoded_bytes || filled != 0 || values.len() != requested / 4 {
+                    return Err(BackendError::InvalidInput(
+                        "dense source shorter than stream plan".into(),
+                    ));
+                }
+                Self::Dense { rows, cols, values }
+            }
+            _ => return Err(BackendError::UnsupportedTensor),
+        };
+        Ok(Box::new(tensor))
+    }
     pub(crate) fn plan(
         metadata: TensorMetadata<'_>,
     ) -> Result<Option<TensorUploadPlan>, BackendError> {

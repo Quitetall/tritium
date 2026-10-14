@@ -1,9 +1,9 @@
 //! Private retained-source adapter behind the one public text loader.
 use super::{
     LoadedModel, Qwen35TritReadLimits, Runner,
-    qwen35_trit::{assemble_prepared, check, collect},
+    qwen35_trit::{assemble_prepared, check, collect, upload_retained_matrix},
     retained_plan::{Graph, Prepared, positive, prepare},
-    source::{dense_values, upload_matrix},
+    source::dense_values,
 };
 use crate::{
     NnError, Projection, Qwen35TextRunner, TensorLoader, TokenEmbedding, UnverifiedQwen35Mtp,
@@ -33,6 +33,7 @@ pub(super) fn load_file(
     budget: &TensorPayloadBudget,
     execution: Option<super::StreamLimits>,
     resources: Option<super::ModelLoadResources<'_>>,
+    streamed: bool,
     context: TensorUploadContext<'_>,
 ) -> Result<LoadedModel, NnError> {
     positive(limits)?;
@@ -49,6 +50,7 @@ pub(super) fn load_file(
         budget,
         execution,
         resources,
+        streamed,
         context,
     )
 }
@@ -61,6 +63,7 @@ pub(super) fn load_bytes(
     budget: &TensorPayloadBudget,
     execution: Option<super::StreamLimits>,
     resources: Option<super::ModelLoadResources<'_>>,
+    streamed: bool,
     context: TensorUploadContext<'_>,
 ) -> Result<LoadedModel, NnError> {
     // Preserve the borrowed source's historical admission envelope. The caller
@@ -88,6 +91,7 @@ pub(super) fn load_bytes(
         budget,
         execution,
         resources,
+        streamed,
         context,
     )
 }
@@ -114,6 +118,7 @@ fn load_reader<R: Read + Seek>(
     budget: &TensorPayloadBudget,
     execution: Option<super::StreamLimits>,
     resources: Option<super::ModelLoadResources<'_>>,
+    streamed: bool,
     context: TensorUploadContext<'_>,
 ) -> Result<LoadedModel, NnError> {
     let Prepared {
@@ -134,6 +139,7 @@ fn load_reader<R: Read + Seek>(
                 backend.as_ref(),
                 policy,
                 resources,
+                streamed,
             )
         })
         .transpose()?;
@@ -157,6 +163,7 @@ fn load_reader<R: Read + Seek>(
                     device_workspace: &reservations.device_workspace,
                 },
                 &reservations.plans,
+                reservations.stream_plans.as_ref(),
                 upload_context,
             )
         } else {
@@ -166,18 +173,15 @@ fn load_reader<R: Read + Seek>(
             Graph::Standard(prepared) => {
                 let (config, spec, plan) = *prepared;
                 model.verify().map_err(invalid)?;
-                let payload = tensor(&mut model, level, &plan.embedding.name, limits)?;
-                let meta = model
-                    .tensor_meta(level, &plan.embedding.name)
-                    .map_err(invalid)?;
-                let embedding = TokenEmbedding::from_linear(upload_matrix(
+                let embedding = TokenEmbedding::from_linear(upload_retained_matrix(
+                    &mut model,
+                    level,
+                    &plan.embedding.name,
                     &mut loader,
-                    meta,
-                    &payload,
+                    limits,
                     vocab,
                     config.n_embd as usize,
                 )?);
-                drop(payload);
                 let model = RefCell::new(&mut model);
                 let loader = RefCell::new(&mut loader);
                 let vectors = |name: &str, request: super::hf::DenseTensorRequest| {
@@ -195,10 +199,16 @@ fn load_reader<R: Read + Seek>(
                 };
                 let projections = |name: &str, rows, cols| {
                     let mut model = model.borrow_mut();
-                    let payload = tensor(&mut model, level, name, limits)?;
-                    let meta = model.tensor_meta(level, name).map_err(invalid)?;
-                    upload_matrix(&mut loader.borrow_mut(), meta, &payload, rows, cols)
-                        .map(Projection::Tensor)
+                    upload_retained_matrix(
+                        &mut model,
+                        level,
+                        name,
+                        &mut loader.borrow_mut(),
+                        limits,
+                        rows,
+                        cols,
+                    )
+                    .map(Projection::Tensor)
                 };
                 let weights = plan.assemble(&config, &spec, embedding, vectors, projections)?;
                 Runner::standard(config, weights, backend, spec, admission)?

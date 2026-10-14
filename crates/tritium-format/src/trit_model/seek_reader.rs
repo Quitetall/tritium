@@ -100,7 +100,53 @@ pub struct TritModelReader<R> {
     package: TritPackageReader<R>,
     binding: ModelBindings,
 }
+
+/// Borrowed named tensor stream over one retained package handle. Metadata/counts
+/// stay borrowed; every visit rechecks actual blob bytes and source length. This
+/// is not terminal package verification or a physical-memory/load receipt.
+#[derive(Debug)]
+pub struct TritTensorStream<'a, R> {
+    meta: &'a TensorMeta,
+    package: &'a mut TritPackageReader<R>,
+    index: usize,
+}
+impl<'a, R: Read + Seek> TritTensorStream<'a, R> {
+    /// Immutable original binding metadata; no manifest or counts cloned.
+    pub const fn metadata(&self) -> &'a TensorMeta {
+        self.meta
+    }
+    /// Actual admitted blob length, not decoded/retained native bytes.
+    pub fn encoded_bytes(&self) -> u64 {
+        self.package.blobs()[self.index].length
+    }
+    /// Sequential <=64KiB raw windows and digest/length checks. Visitor effects
+    /// remain private until this and enclosing terminal source verification pass.
+    pub fn visit<E>(
+        &mut self,
+        visitor: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), TritModelVisitError<E>> {
+        self.package
+            .visit_blob(self.index, visitor)
+            .map_err(Into::into)
+    }
+}
 impl<R: Read + Seek> TritModelReader<R> {
+    /// Borrow a named tensor's immutable metadata and retained source together.
+    /// # Errors
+    /// Absent or invalid binding. Actual byte/source faults are checked by visit.
+    pub fn tensor_stream(
+        &mut self,
+        level: &str,
+        name: &str,
+    ) -> Result<TritTensorStream<'_, R>, TritModelError> {
+        let meta = self.binding.tensor_meta(level, name)?;
+        let index = self.binding.tensor_index(meta, self.package.blobs())?;
+        Ok(TritTensorStream {
+            meta,
+            package: &mut self.package,
+            index,
+        })
+    }
     /// Admit an ordinary typed model and verify complete source identity again.
     ///
     /// Owns the supplied handle, not its pathname. External concurrent writers

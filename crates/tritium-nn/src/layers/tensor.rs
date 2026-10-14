@@ -29,6 +29,7 @@ pub struct TensorLoader<'a> {
         TensorUploadResources<'a>,
         &'a std::collections::BTreeMap<String, TensorUploadPlan>,
     )>,
+    stream_plans: Option<&'a std::collections::BTreeMap<String, tritium_spec::TensorStreamPlan>>,
 }
 
 impl core::fmt::Debug for TensorLoader<'_> {
@@ -55,6 +56,7 @@ impl<'a> TensorLoader<'a> {
             budget,
             context,
             planned: None,
+            stream_plans: None,
         }
     }
 
@@ -64,6 +66,7 @@ impl<'a> TensorLoader<'a> {
         policy: TensorUploadPolicy,
         resources: TensorUploadResources<'a>,
         plans: &'a std::collections::BTreeMap<String, TensorUploadPlan>,
+        streams: Option<&'a std::collections::BTreeMap<String, tritium_spec::TensorStreamPlan>>,
         context: TensorUploadContext<'a>,
     ) -> Self {
         Self {
@@ -72,7 +75,76 @@ impl<'a> TensorLoader<'a> {
             budget: resources.payload,
             context,
             planned: Some((resources, plans)),
+            stream_plans: streams,
         }
+    }
+
+    pub(crate) fn is_streaming(&self) -> bool {
+        self.stream_plans.is_some()
+    }
+
+    #[cfg(feature = "tokenizer")]
+    pub(crate) fn upload_stream(
+        &mut self,
+        name: &str,
+        source: &dyn tritium_spec::TensorStreamSource,
+    ) -> Result<Linear, NnError> {
+        let expected = self
+            .stream_plans
+            .and_then(|p| p.get(name))
+            .ok_or_else(|| NnError::Backend(format!("{name}: absent aggregate stream plan")))?;
+        let actual = self
+            .backend
+            .tensor_stream_plan(source.metadata(), source.encoding())
+            .map_err(|e| NnError::Backend(e.to_string()))?;
+        if actual != Some(*expected) || source.encoded_bytes() != expected.encoded_bytes {
+            return Err(NnError::Backend(format!(
+                "{name}: stream plan changed after aggregate admission"
+            )));
+        }
+        let (rows, cols) = match source.metadata() {
+            tritium_spec::TensorMetadata::Dense { rows, cols } => (rows, cols),
+            tritium_spec::TensorMetadata::Additive(a) => (
+                usize::try_from(a.layout().rows)
+                    .map_err(|_| NnError::Backend("rows exceed usize".into()))?,
+                usize::try_from(a.layout().cols)
+                    .map_err(|_| NnError::Backend("columns exceed usize".into()))?,
+            ),
+        };
+        if rows == 0 || cols == 0 {
+            return Err(NnError::Backend("empty streamed model geometry".into()));
+        }
+        let (resources, _) = self
+            .planned
+            .as_ref()
+            .ok_or_else(|| NnError::Backend("stream resources absent".into()))?;
+        let (dev, caps) = tritium_runtime::upload_tensor_stream_logged_with_resources(
+            self.backend,
+            source,
+            self.policy,
+            name,
+            TensorUploadContext {
+                recorder: self.context.recorder,
+                span: self.context.span,
+                parent: self.context.parent,
+                logical_time: self.context.logical_time,
+            },
+            TensorUploadResources {
+                payload: resources.payload,
+                host_workspace: resources.host_workspace,
+                device_workspace: resources.device_workspace,
+            },
+        )
+        .map_err(|e| NnError::Backend(format!("{name}: {e}")))?;
+        if caps != expected.upload.caps {
+            return Err(NnError::Backend(format!("{name}: streamed caps changed")));
+        }
+        Ok(Linear {
+            rows,
+            cols,
+            dev: Arc::from(dev),
+            caps,
+        })
     }
 
     pub(crate) fn check_evidence(&self) -> Result<(), NnError> {
@@ -95,6 +167,11 @@ impl<'a> TensorLoader<'a> {
     /// Rejects empty geometry, invalid scales/weights, unavailable capability,
     /// policy/budget/backend failure or unregistered/failed upload evidence.
     pub fn upload(&mut self, name: &str, view: TensorView<'_>) -> Result<Linear, NnError> {
+        if self.is_streaming() {
+            return Err(NnError::Backend(
+                "mandatory streaming cannot use decoded upload fallback".into(),
+            ));
+        }
         let (rows, cols) = match view {
             TensorView::Dense { rows, cols, values } => {
                 tritium_core::DenseView::new(rows, cols, values)

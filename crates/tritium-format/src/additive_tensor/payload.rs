@@ -296,6 +296,22 @@ pub struct AdditivePayload<'a> {
     bytes: &'a [u8],
 }
 impl<'a> AdditivePayload<'a> {
+    /// Validate canonical Uniform bytes while borrowing geometry and storage.
+    pub fn new_uniform(
+        layout: AdditiveLayout,
+        planes: u8,
+        bytes: &'a [u8],
+    ) -> Result<Self, AdditiveTensorError> {
+        Self::with_allocation(layout, Allocation::Uniform(planes), bytes)
+    }
+    /// Validate canonical PerTile bytes without copying the count array or index.
+    pub fn new_per_tile(
+        layout: AdditiveLayout,
+        counts: &'a [u8],
+        bytes: &'a [u8],
+    ) -> Result<Self, AdditiveTensorError> {
+        Self::with_allocation(layout, Allocation::PerTile(counts), bytes)
+    }
     /// Validate bytes under externally authenticated layout and count metadata.
     pub fn new(
         layout: AdditiveLayout,

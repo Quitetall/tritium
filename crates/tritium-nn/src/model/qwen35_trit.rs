@@ -196,6 +196,28 @@ pub(super) fn decoded_bytes(meta: &TensorMeta) -> Result<u64, NnError> {
     }
 }
 type Visitor<'a> = &'a mut dyn FnMut(&[u8]) -> Result<(), NnError>;
+#[allow(clippy::too_many_arguments)]
+pub(super) fn upload_retained_matrix<R: Read + Seek>(
+    model: &mut TritModelReader<R>,
+    level: &str,
+    name: &str,
+    loader: &mut TensorLoader<'_>,
+    limits: Qwen35TritReadLimits,
+    rows: usize,
+    cols: usize,
+) -> Result<crate::Linear, NnError> {
+    let len = model.tensor_byte_len(level, name).map_err(invalid)?;
+    check(len, limits.max_tensor_bytes, "encoded tensor bytes")?;
+    #[cfg(feature = "tokenizer")]
+    if loader.is_streaming() {
+        return super::tensor_stream::upload(loader, model, level, name, rows, cols);
+    }
+    let payload = collect(len, |visit| {
+        model.visit_tensor(level, name, visit).map_err(invalid)
+    })?;
+    let meta = model.tensor_meta(level, name).map_err(invalid)?;
+    upload_matrix(loader, meta, &payload, rows, cols)
+}
 pub(super) fn collect(
     length: u64,
     mut read: impl FnMut(Visitor<'_>) -> Result<(), NnError>,
@@ -254,12 +276,12 @@ impl<R: Read + Seek> Qwen35HfTensorSource for Source<'_, '_, R> {
         cols: usize,
     ) -> Result<Projection, NnError> {
         let mut model = self.model.borrow_mut();
-        let payload = self.payload(&mut model, name)?;
-        let meta = model.tensor_meta(self.level, name).map_err(invalid)?;
-        Ok(Projection::Tensor(upload_matrix(
+        Ok(Projection::Tensor(upload_retained_matrix(
+            &mut model,
+            self.level,
+            name,
             &mut self.loader.borrow_mut(),
-            meta,
-            &payload,
+            self.limits,
             rows,
             cols,
         )?))
@@ -271,12 +293,12 @@ impl<R: Read + Seek> Qwen35HfTensorSource for Source<'_, '_, R> {
         cols: usize,
     ) -> Result<TokenEmbedding, NnError> {
         let mut model = self.model.borrow_mut();
-        let payload = self.payload(&mut model, name)?;
-        let meta = model.tensor_meta(self.level, name).map_err(invalid)?;
-        Ok(TokenEmbedding::from_linear(upload_matrix(
+        Ok(TokenEmbedding::from_linear(upload_retained_matrix(
+            &mut model,
+            self.level,
+            name,
             &mut self.loader.borrow_mut(),
-            meta,
-            &payload,
+            self.limits,
             rows,
             cols,
         )?))

@@ -36,6 +36,8 @@ mod salt_v2;
 mod source;
 mod staged_calibration;
 mod standard;
+#[cfg(feature = "tokenizer")]
+mod tensor_stream;
 mod tokenizer;
 mod training_salt;
 mod unified;
@@ -91,7 +93,9 @@ pub use salt_v2::{
 };
 pub use source::ModelSource;
 #[cfg(feature = "tokenizer")]
-pub use source::{LoadedModel, load, load_with_limits, load_with_resources};
+pub use source::{
+    LoadedModel, load, load_streamed_with_resources, load_with_limits, load_with_resources,
+};
 pub(crate) use staged_calibration::{dense_source_weights, dense_stage_weights};
 pub use tokenizer::Tokenizer;
 pub use training_salt::{

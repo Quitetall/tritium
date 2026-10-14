@@ -16,7 +16,7 @@ enum Allocation<'a> {
 pub struct AdditiveMetadata<'a> {
     layout: AdditiveLayout,
     allocation: Allocation<'a>,
-    count_bytes: Option<usize>,
+    counts: Option<&'a [u8]>,
 }
 fn invalid(e: impl core::fmt::Debug) -> BackendError {
     BackendError::InvalidInput(format!("tensor metadata: {e:?}"))
@@ -27,7 +27,7 @@ impl<'a> AdditiveMetadata<'a> {
         Ok(Self {
             layout,
             allocation: Allocation::Uniform(UniformPlan::new(layout, planes).map_err(invalid)?),
-            count_bytes: None,
+            counts: None,
         })
     }
     /// Validate borrowed exact PerTile counts without copying them or building an index.
@@ -35,7 +35,7 @@ impl<'a> AdditiveMetadata<'a> {
         Ok(Self {
             layout,
             allocation: Allocation::PerTile(PerTilePlan::new(layout, counts).map_err(invalid)?),
-            count_bytes: Some(counts.len()),
+            counts: Some(counts),
         })
     }
     /// Borrow an already sealed decoded view without rescanning/rebuilding its index.
@@ -43,7 +43,7 @@ impl<'a> AdditiveMetadata<'a> {
         Self {
             layout: view.layout(),
             allocation: Allocation::View(view),
-            count_bytes: view.tile_counts().map(<[u8]>::len),
+            counts: view.tile_counts(),
         }
     }
     /// Exact declared law, basis, dimensions and coding.
@@ -87,7 +87,11 @@ impl<'a> AdditiveMetadata<'a> {
     }
     /// Exact number of borrowed per-tile count bytes, or None for Uniform.
     pub fn count_bytes(self) -> Option<usize> {
-        self.count_bytes
+        self.counts.map(<[u8]>::len)
+    }
+    /// Borrow exact immutable counts without constructing/copying a runtime index.
+    pub const fn tile_counts(self) -> Option<&'a [u8]> {
+        self.counts
     }
 }
 
@@ -108,6 +112,26 @@ pub enum TensorMetadata<'a> {
     },
 }
 impl<'a> TensorMetadata<'a> {
+    /// Logical decoded scalar bytes used by upload observations, not allocated
+    /// storage or full indexed payload bytes. Streaming need not allocate these.
+    pub fn decoded_payload_bytes(self) -> Result<u64, BackendError> {
+        let bytes = match self {
+            Self::Dense { rows, cols } => Self::dense_bytes(rows, cols)?,
+            Self::Additive(a) => {
+                let mut bytes = a
+                    .scale_count()
+                    .checked_mul(4)
+                    .ok_or_else(|| invalid("scale size overflow"))?;
+                for p in 0..a.plane_count() {
+                    bytes = bytes
+                        .checked_add(a.plane_trit_count(p)?)
+                        .ok_or_else(|| invalid("scalar size overflow"))?;
+                }
+                bytes
+            }
+        };
+        u64::try_from(bytes).map_err(invalid)
+    }
     /// Borrow structural metadata from an existing decoded view.
     pub fn from_view(view: TensorView<'a>) -> Result<Self, BackendError> {
         Ok(match view {

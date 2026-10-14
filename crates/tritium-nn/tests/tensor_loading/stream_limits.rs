@@ -233,79 +233,86 @@ fn standard_retained_resources_count_tied_embedding_once_and_refuse_other_carrie
         let path = hf.dir.join("resource-standard.trit");
         std::fs::write(&path, &bytes).unwrap();
         for source in sources(&hf, &bytes, &path) {
-            let total = TensorPayloadBudget::new(1_000_000);
-            let resources = tritium_nn::ModelLoadResources {
-                payload: &total,
-                source_workspace: &total,
-                host_workspace: &total,
-                device_workspace: &total,
-                retained_host: &total,
-            };
-            let mut evidence = record();
-            let result = tritium_nn::load_with_resources(
-                source,
-                Box::new(tritium_cpu::CpuBackend::new()),
-                TensorUploadPolicy::default(),
-                resources,
-                limits(),
-                TensorUploadContext {
-                    recorder: &mut evidence,
-                    span: "load",
-                    parent: None,
-                    logical_time: 0,
-                },
-            );
-            if matches!(source, ModelSource::HuggingFace(_)) {
-                assert!(
-                    result
-                        .err()
-                        .unwrap()
-                        .to_string()
-                        .contains("requires a retained typed source")
-                );
-                assert!(evidence.events().is_empty());
-            } else {
-                let mut loaded = result.unwrap();
-                let admission = loaded.runner.resource_admission().unwrap();
-                let uploads = evidence
-                    .events()
-                    .iter()
-                    .filter(|e| e.schema == tritium_evidence::TensorUploaded::SCHEMA_ID)
-                    .collect::<Vec<_>>();
-                assert_eq!(
-                    uploads
-                        .iter()
-                        .filter(|e| e.payload["tensor"] == "lm_head.weight")
-                        .count(),
-                    usize::from(!tied)
-                );
-                assert_eq!(
-                    admission.payload_bytes,
-                    uploads
-                        .iter()
-                        .map(|e| e.payload["caps"]["payload_bytes"].as_u64().unwrap())
-                        .sum::<u64>()
-                );
-                assert_eq!(
-                    total.used_bytes(),
-                    admission.payload_bytes + admission.retained_host_bytes
-                );
-                let oracle_budget = TensorPayloadBudget::new(1_000_000);
-                let mut oracle = bounded(
+            for streamed in [false, true] {
+                let total = TensorPayloadBudget::new(1_000_000);
+                let resources = tritium_nn::ModelLoadResources {
+                    payload: &total,
+                    source_workspace: &total,
+                    host_workspace: &total,
+                    device_workspace: &total,
+                    retained_host: &total,
+                };
+                let mut evidence = record();
+                let load = if streamed {
+                    tritium_nn::load_streamed_with_resources
+                } else {
+                    tritium_nn::load_with_resources
+                };
+                let result = load(
                     source,
                     Box::new(tritium_cpu::CpuBackend::new()),
-                    &oracle_budget,
+                    TensorUploadPolicy::default(),
+                    resources,
                     limits(),
-                    &mut record(),
-                )
-                .unwrap();
-                assert_eq!(
-                    loaded.runner.prefill(&[1, 2]).unwrap(),
-                    oracle.runner.prefill(&[1, 2]).unwrap()
+                    TensorUploadContext {
+                        recorder: &mut evidence,
+                        span: "load",
+                        parent: None,
+                        logical_time: 0,
+                    },
                 );
-                drop(loaded);
+                if matches!(source, ModelSource::HuggingFace(_)) {
+                    assert!(
+                        result
+                            .err()
+                            .unwrap()
+                            .to_string()
+                            .contains("requires a retained typed source")
+                    );
+                    assert!(evidence.events().is_empty());
+                } else {
+                    let mut loaded = result.unwrap();
+                    let admission = loaded.runner.resource_admission().unwrap();
+                    let uploads = evidence
+                        .events()
+                        .iter()
+                        .filter(|e| e.schema == tritium_evidence::TensorUploaded::SCHEMA_ID)
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        uploads
+                            .iter()
+                            .filter(|e| e.payload["tensor"] == "lm_head.weight")
+                            .count(),
+                        usize::from(!tied)
+                    );
+                    assert_eq!(
+                        admission.payload_bytes,
+                        uploads
+                            .iter()
+                            .map(|e| e.payload["caps"]["payload_bytes"].as_u64().unwrap())
+                            .sum::<u64>()
+                    );
+                    assert_eq!(
+                        total.used_bytes(),
+                        admission.payload_bytes + admission.retained_host_bytes
+                    );
+                    let oracle_budget = TensorPayloadBudget::new(1_000_000);
+                    let mut oracle = bounded(
+                        source,
+                        Box::new(tritium_cpu::CpuBackend::new()),
+                        &oracle_budget,
+                        limits(),
+                        &mut record(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        loaded.runner.prefill(&[1, 2]).unwrap(),
+                        oracle.runner.prefill(&[1, 2]).unwrap()
+                    );
+                    drop(loaded);
+                }
+                assert_eq!(total.used_bytes(), 0);
             }
-            assert_eq!(total.used_bytes(), 0);
         }
     }
 }

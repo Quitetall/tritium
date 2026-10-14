@@ -7,7 +7,7 @@ mod seek_reader;
 mod sizing;
 mod stage;
 
-pub use seek_reader::{TritModelReadError, TritModelReader, TritModelVisitError};
+pub use seek_reader::{TritModelReadError, TritModelReader, TritModelVisitError, TritTensorStream};
 pub use sizing::{imported_manifest_cbor_size_bounds, tensor_meta_cbor_size_bounds};
 pub use stage::{TritModelStageError, stage_trit_model_from_spool};
 

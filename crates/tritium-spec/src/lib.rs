@@ -34,8 +34,12 @@ pub use tritium_schema::{
 
 mod caps;
 mod tensor_plan;
+mod tensor_stream;
 pub use caps::DeviceCaps;
 pub use tensor_plan::{AdditiveMetadata, TensorMetadata, TensorUploadPlan};
+pub use tensor_stream::{
+    TENSOR_STREAM_CHUNK_BYTES, TensorStreamEncoding, TensorStreamPlan, TensorStreamSource,
+};
 mod deltanet;
 pub use deltanet::{DeltaNetGeometry, DeltaNetStep, ResidentDeltaNet};
 mod delta_mixer;
@@ -417,6 +421,26 @@ pub trait TernaryBackend: Send + Sync {
         _metadata: TensorMetadata<'_>,
     ) -> Result<Option<TensorUploadPlan>, BackendError> {
         Ok(None)
+    }
+
+    /// Plan explicit encoded streaming without reading/decoding source values.
+    /// None is unknown/unsupported, never a full-decoding compatibility fallback.
+    fn tensor_stream_plan(
+        &self,
+        _metadata: TensorMetadata<'_>,
+        _encoding: TensorStreamEncoding,
+    ) -> Result<Option<TensorStreamPlan>, BackendError> {
+        Ok(None)
+    }
+
+    /// Stage privately from a bounded encoded source, validating lengths, values,
+    /// canonical coding/padding and exact semantic metadata. Default refuses.
+    /// Caller must enforce policy/resources and enclosing terminal source custody.
+    fn upload_tensor_stream(
+        &self,
+        _source: &dyn TensorStreamSource,
+    ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        Err(BackendError::UnsupportedTensor)
     }
 
     /// Enforce capability, native-only and payload-budget policy before upload.

@@ -232,6 +232,19 @@ impl CpuBackend {
 }
 
 impl TernaryBackend for CpuBackend {
+    fn tensor_stream_plan(
+        &self,
+        metadata: tritium_spec::TensorMetadata<'_>,
+        encoding: tritium_spec::TensorStreamEncoding,
+    ) -> Result<Option<tritium_spec::TensorStreamPlan>, BackendError> {
+        semantic::CpuTensor::stream_plan(metadata, encoding)
+    }
+    fn upload_tensor_stream(
+        &self,
+        source: &dyn tritium_spec::TensorStreamSource,
+    ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        semantic::CpuTensor::upload_stream(source)
+    }
     fn tensor_upload_plan(
         &self,
         metadata: tritium_spec::TensorMetadata<'_>,
