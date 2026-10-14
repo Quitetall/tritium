@@ -385,8 +385,11 @@ def _loss(
         return (
             F.kl_div(
                 F.log_softmax(student.float() / temperature, dim=-1),
-                F.softmax(teacher.float() / temperature, dim=-1),
+                # Avoid softmax -> log roundoff in the target branch: identical
+                # logits must have exact zero KL, not an invalid negative loss.
+                F.log_softmax(teacher.float() / temperature, dim=-1),
                 reduction="batchmean",
+                log_target=True,
             )
             * temperature**2
         )
@@ -496,7 +499,7 @@ def _build_scale_model(
             )
         store = _ScaleOnlyWeight(planes).to(source.weight.device)
         stores[reference.path] = store
-        for alias in reference.aliases:
+        for alias_index, alias in enumerate(reference.aliases):
             path = "" if alias == "weight" else alias.removesuffix(".weight")
             module = modules.get(path)
             replacement = replacement_by_module.get(id(module))
@@ -524,6 +527,10 @@ def _build_scale_model(
                         module=path,
                     )
                 replacement_by_module[id(module)] = replacement
+            if alias_index == 0:
+                # Own shared parameters once under a converted leaf. Registering
+                # bookkeeping on the root adds executable slots to Sequential.
+                replacement.add_module("_tritium_scale_store", store)
             replacements[path] = replacement
     root = model
     for path, replacement in replacements.items():
@@ -535,9 +542,6 @@ def _build_scale_model(
         for part in parts[:-1]:
             owner = owner._modules[part]
         owner._modules[parts[-1]] = replacement
-    # Register each shared scale store exactly once after graph replacement.
-    for index, store in enumerate(stores.values()):
-        root.add_module(f"_tritium_scale_store_{index}", store)
     if compute_dtype != torch.float32 and hasattr(
         root, "gradient_checkpointing_enable"
     ):
