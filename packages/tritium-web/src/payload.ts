@@ -25,7 +25,8 @@ type EncodedEntry = {
   readonly name: string;
   readonly nameBytes: Uint8Array;
   readonly dtype: DType;
-  readonly data: Uint8Array;
+  readonly tensor: PortableScheduleTensorV1;
+  readonly byteLength: number;
 };
 
 export class WebTrainingPayloadError extends Error {
@@ -63,30 +64,35 @@ function exactNameBytes(name: string): Uint8Array {
   return encoded;
 }
 
-function encodeTensor(
-  tensor: PortableScheduleTensorV1,
-): Readonly<{ dtype: DType; data: Uint8Array }> {
-  if (tensor instanceof Float32Array) {
-    const data = new Uint8Array(tensor.byteLength);
-    const output = new DataView(data.buffer);
-    const lanes = new Uint32Array(tensor.buffer, tensor.byteOffset, tensor.length);
-    lanes.forEach((value, index) => {
-      output.setUint32(index * 4, value, true);
-    });
-    return { dtype: "f32", data };
-  }
-  if (tensor instanceof Uint32Array) {
-    const data = new Uint8Array(tensor.byteLength);
-    const output = new DataView(data.buffer);
-    tensor.forEach((value, index) => {
-      output.setUint32(index * 4, value, true);
-    });
-    return { dtype: "u32", data };
-  }
-  if (tensor instanceof Uint8Array) {
-    return { dtype: "bytes", data: Uint8Array.from(tensor) };
-  }
+function tensorDtype(tensor: PortableScheduleTensorV1): DType {
+  if (tensor instanceof Float32Array) return "f32";
+  if (tensor instanceof Uint32Array) return "u32";
+  if (tensor instanceof Uint8Array) return "bytes";
   fail("invalid_schema", "initial tensor must be Float32Array, Uint32Array, or Uint8Array");
+}
+
+function writeTensor(
+  entry: EncodedEntry,
+  output: Uint8Array,
+  view: DataView,
+  offset: number,
+): void {
+  const tensor = entry.tensor;
+  if (tensorDtype(tensor) !== entry.dtype || tensor.byteLength !== entry.byteLength) {
+    fail("invalid_schema", "initial tensor changed during payload admission");
+  }
+  if (tensor instanceof Float32Array) {
+    const lanes = new Uint32Array(tensor.buffer, tensor.byteOffset, entry.byteLength / 4);
+    for (let index = 0; index < lanes.length; index += 1) {
+      view.setUint32(offset + index * 4, lanes[index]!, true);
+    }
+  } else if (tensor instanceof Uint32Array) {
+    for (let index = 0; index < entry.byteLength / 4; index += 1) {
+      view.setUint32(offset + index * 4, tensor[index]!, true);
+    }
+  } else {
+    output.set(tensor, offset);
+  }
 }
 
 function dtypeCode(dtype: DType): number {
@@ -116,44 +122,46 @@ export function encodeWebTrainingPayload(tensors: WebTrainingInitialTensorsV1): 
   if (Reflect.ownKeys(tensors).some((key) => typeof key !== "string")) {
     fail("invalid_schema", "initial tensors cannot contain symbol keys");
   }
-  const entries: EncodedEntry[] = Object.keys(tensors).map((name) => {
-    const encoded = encodeTensor(tensors[name]!);
-    return { name, nameBytes: exactNameBytes(name), ...encoded };
-  });
+  let outputBytes = HEADER_BYTES;
+  const entries: EncodedEntry[] = [];
+  for (const name of Object.keys(tensors)) {
+    const nameBytes = exactNameBytes(name);
+    const tensor = tensors[name]!;
+    const dtype = tensorDtype(tensor);
+    const byteLength = tensor.byteLength;
+    outputBytes = checkedSize(outputBytes, ENTRY_HEADER_BYTES);
+    outputBytes = checkedSize(outputBytes, nameBytes.length);
+    outputBytes = checkedSize(outputBytes, byteLength);
+    entries.push({ name, nameBytes, dtype, tensor, byteLength });
+  }
   if (entries.length === 0) fail("invalid_schema", "initial tensors cannot be empty");
   entries.sort((left, right) => byteOrder(left.nameBytes, right.nameBytes));
 
-  let bodyBytes = 0;
-  for (const entry of entries) {
-    bodyBytes = checkedSize(bodyBytes, ENTRY_HEADER_BYTES);
-    bodyBytes = checkedSize(bodyBytes, entry.nameBytes.length);
-    bodyBytes = checkedSize(bodyBytes, entry.data.length);
-  }
-  const body = new Uint8Array(bodyBytes);
-  const view = new DataView(body.buffer);
-  let offset = 0;
+  // Admit the complete frame before materializing any tensor bytes. Write into
+  // its final owner instead of retaining per-tensor and body-sized snapshots.
+  const output = new Uint8Array(outputBytes);
+  const view = new DataView(output.buffer);
+  let offset = HEADER_BYTES;
   for (const entry of entries) {
     view.setUint16(offset, entry.nameBytes.length, true);
     view.setUint8(offset + 2, dtypeCode(entry.dtype));
     view.setUint8(offset + 3, 0);
-    view.setUint32(offset + 4, entry.data.length, true);
+    view.setUint32(offset + 4, entry.byteLength, true);
     offset += ENTRY_HEADER_BYTES;
-    body.set(entry.nameBytes, offset);
+    output.set(entry.nameBytes, offset);
     offset += entry.nameBytes.length;
-    body.set(entry.data, offset);
-    offset += entry.data.length;
+    writeTensor(entry, output, view, offset);
+    offset += entry.byteLength;
   }
 
-  const outputBytes = checkedSize(HEADER_BYTES, body.length);
-  const output = new Uint8Array(outputBytes);
-  const header = new DataView(output.buffer);
+  const body = output.subarray(HEADER_BYTES);
+  const header = view;
   output.set(MAGIC, 0);
   header.setUint32(8, 1, true);
   header.setUint32(12, entries.length, true);
   header.setUint32(16, body.length, true);
   header.setUint32(20, 0, true);
   output.set(blake3(body), 24);
-  output.set(body, HEADER_BYTES);
   return output;
 }
 

@@ -92,6 +92,122 @@ function throwsPayloadCode(run, code) {
   });
 }
 
+function observePayloadAllocations(run, minimumBytes, prohibit = false) {
+  const original = globalThis.Uint8Array;
+  const allocations = [];
+  globalThis.Uint8Array = new Proxy(original, {
+    construct(target, args, newTarget) {
+      if (typeof args[0] === "number" && args[0] >= minimumBytes) {
+        allocations.push(args[0]);
+        if (prohibit) throw new Error("tensor copy attempted before capacity admission");
+      }
+      return Reflect.construct(target, args, newTarget);
+    },
+  });
+  try {
+    return { result: run(), allocations };
+  } finally {
+    globalThis.Uint8Array = original;
+  }
+}
+
+test("payload capacity admission precedes all oversized tensor copies", () => {
+  const maximum = 64 * 1024 * 1024;
+  const bytes = new Uint8Array(maximum + 4);
+  for (const tensor of [bytes, new Float32Array(bytes.buffer), new Uint32Array(bytes.buffer)]) {
+    const { allocations } = observePayloadAllocations(
+      () => throwsPayloadCode(() => encodeWebTrainingPayload({ weight: tensor }), "capacity"),
+      1024,
+      true,
+    );
+    assert.deepEqual(allocations, []);
+  }
+});
+
+test("payload capacity admission includes aggregate roots and the complete header", () => {
+  const maximum = 64 * 1024 * 1024;
+  const bytes = new Uint8Array(maximum);
+  const half = bytes.subarray(0, maximum / 2);
+  for (const tensors of [
+    { a: half, b: half },
+    // 56 header bytes, 8 entry bytes, and one UTF-8 name byte.
+    { w: bytes.subarray(0, maximum - 56 - 8 - 1 + 1) },
+  ]) {
+    const { allocations } = observePayloadAllocations(
+      () => throwsPayloadCode(() => encodeWebTrainingPayload(tensors), "capacity"),
+      1024,
+      true,
+    );
+    assert.deepEqual(allocations, []);
+  }
+});
+
+test("payload invalid-name admission precedes tensor copies", () => {
+  const weight = new Float32Array(256);
+  const { allocations } = observePayloadAllocations(
+    () => throwsPayloadCode(() => encodeWebTrainingPayload({ "": weight }), "invalid_schema"),
+    weight.byteLength,
+    true,
+  );
+  assert.deepEqual(allocations, []);
+});
+
+test("payload materialization owns one payload-sized allocation", () => {
+  const weight = new Float32Array(256);
+  const { result, allocations } = observePayloadAllocations(
+    () => encodeWebTrainingPayload({ weight }),
+    weight.byteLength,
+  );
+  assert.deepEqual(allocations, [result.byteLength]);
+});
+
+test("payload wire retains mixed-lane bytes from the prior admitted codec", () => {
+  const weight = new Float32Array(3);
+  new Uint32Array(weight.buffer).set([0x7fa12345, 0x80000000, 0x3f800000]);
+  const payload = encodeWebTrainingPayload({
+    z: Uint8Array.of(0, 255),
+    w: weight,
+    u: Uint32Array.of(0, 0xffffffff),
+  });
+  assert.equal(
+    Buffer.from(payload).toString("hex"),
+    "54525745425031000100000003000000310000000000000091210922068977921c316f8a052fc998f93c4bffbe7b92303a19e44b5ded494c01000100080000007500000000ffffffff010000000c000000774523a17f000000800000803f01000200020000007a00ff",
+  );
+});
+
+test("payload materialization respects offset windows for every lane type", () => {
+  const storage = new Float32Array(5);
+  new Uint32Array(storage.buffer).set([0, 0x7fa12345, 0x80000000, 0x3f800000, 0]);
+  const values = {
+    z: Uint8Array.of(3, 0, 255, 4).subarray(1, 3),
+    w: storage.subarray(1, 4),
+    u: Uint32Array.of(3, 0, 0xffffffff, 4).subarray(1, 3),
+  };
+  const plain = new Float32Array(3);
+  new Uint32Array(plain.buffer).set([0x7fa12345, 0x80000000, 0x3f800000]);
+  assert.deepEqual(
+    encodeWebTrainingPayload(values),
+    encodeWebTrainingPayload({
+      z: Uint8Array.of(0, 255),
+      w: plain,
+      u: Uint32Array.of(0, 0xffffffff),
+    }),
+  );
+});
+
+test("payload rejects root window growth during metadata admission", () => {
+  const buffer = new ArrayBuffer(16, { maxByteLength: 32 });
+  const first = new Float32Array(buffer);
+  const tensors = {
+    first,
+    get second() {
+      buffer.resize(32);
+      return Uint8Array.of(1);
+    },
+  };
+  throwsPayloadCode(() => encodeWebTrainingPayload(tensors), "invalid_schema");
+});
+
 test("payload wire is deterministic and fails closed on corruption or drift", () => {
   const plan = compileTrainingPlan(model, config);
   const weight = new Float32Array([1, -0]);
