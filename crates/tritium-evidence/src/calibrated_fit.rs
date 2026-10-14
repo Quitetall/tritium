@@ -59,7 +59,7 @@ impl CalibratedFitReceiptView {
             )));
         }
         let envelope = canonical_envelope(event).map_err(invalid_payload)?;
-        let observation = serde_json::from_value(envelope.payload.clone())
+        let observation = serde::Deserialize::deserialize(&envelope.payload)
             .map_err(|error| invalid_payload(&format!("{:?}", error.classify())))?;
         validate_bindings(&observation)?;
         Ok(Self {

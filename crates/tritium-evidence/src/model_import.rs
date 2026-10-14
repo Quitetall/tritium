@@ -41,7 +41,7 @@ impl LegacyModelImportView {
                     return Err(invalid("import event version"));
                 }
                 let observation: LegacyModelImportPrepared =
-                    serde_json::from_value(event.payload.clone())
+                    serde::Deserialize::deserialize(&event.payload)
                         .map_err(|_| invalid("import payload"))?;
                 validate(&observation)?;
                 Ok(Self { observation })

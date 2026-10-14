@@ -271,15 +271,20 @@ impl EvidenceRecorder {
     /// Serialization, chain/root or registry consistency failure.
     pub fn seal(self) -> Result<SealedEvidence, EvidenceError> {
         let jsonl = self.to_jsonl()?;
+        let run = self.run;
+        let registered = self.registered;
+        // Parsing cold JSONL still verifies the actual wire representation.
+        // Release the old tree first; two large Value arrays need not coexist.
+        drop(self.events);
         let log = verify_jsonl(&jsonl)?;
         for event in &log.events {
-            if self.registered.get(&event.schema) != Some(&event.v) {
+            if registered.get(&event.schema) != Some(&event.v) {
                 return Err(EvidenceError::UnregisteredSchema(event.schema.clone()));
             }
         }
         let root = decode_hex(&log.root_digest)?;
         Ok(SealedEvidence {
-            run: self.run,
+            run,
             jsonl,
             log,
             root,

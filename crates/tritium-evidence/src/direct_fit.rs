@@ -62,7 +62,7 @@ impl DirectFitReceiptView {
         // view must expose the same wire representation, not serde's transient
         // integer-vs-float Number distinction. Never change the hashed meaning.
         let envelope = canonical_envelope(event).map_err(invalid_payload)?;
-        let observation = serde_json::from_value(envelope.payload.clone())
+        let observation = serde::Deserialize::deserialize(&envelope.payload)
             .map_err(|error| invalid_payload(&format!("{:?}", error.classify())))?;
         validate_bindings(&observation)?;
         Ok(Self {

@@ -64,12 +64,12 @@ impl ModelLoadReceiptView {
                 event.schema, event.v
             )));
         }
-        let observation = serde_json::from_value(event.payload.clone()).map_err(|error| {
-            EvidenceError::InvalidPayload {
+        let observation = serde::Deserialize::deserialize(&event.payload).map_err(
+            |error: serde_json::Error| EvidenceError::InvalidPayload {
                 schema: event.schema.clone(),
                 detail: format!("{:?}", error.classify()),
-            }
-        })?;
+            },
+        )?;
         Ok(Self {
             envelope: event.clone(),
             observation,

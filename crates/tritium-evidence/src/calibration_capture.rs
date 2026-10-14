@@ -134,6 +134,6 @@ fn decode<E: EvidenceEvent + serde::de::DeserializeOwned>(
             event.schema, event.v
         )));
     }
-    serde_json::from_value(event.payload.clone())
+    serde::Deserialize::deserialize(&event.payload)
         .map_err(|_| invalid("strict capture payload decoding failed"))
 }

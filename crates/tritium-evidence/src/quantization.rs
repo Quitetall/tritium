@@ -439,7 +439,7 @@ fn decode<E: EvidenceEvent + serde::de::DeserializeOwned>(
             event.schema, event.v
         )));
     }
-    serde_json::from_value(event.payload.clone()).map_err(|_| EvidenceError::InvalidPayload {
+    serde::Deserialize::deserialize(&event.payload).map_err(|_| EvidenceError::InvalidPayload {
         schema: error_schema.into(),
         detail: "strict payload decoding failed".into(),
     })
