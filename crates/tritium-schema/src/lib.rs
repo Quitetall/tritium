@@ -67,6 +67,11 @@ mod calibration;
 pub use calibration::*;
 
 #[cfg(feature = "alloc")]
+mod owner_score_cache;
+#[cfg(feature = "alloc")]
+pub use owner_score_cache::*;
+
+#[cfg(feature = "alloc")]
 mod calibration_capture;
 #[cfg(feature = "alloc")]
 pub use calibration_capture::*;
@@ -487,6 +492,10 @@ digest_id!(
 digest_id!(
     CalibrationCacheId,
     "Candidate identity of finalized calibration payloads and context, not independent model provenance."
+);
+digest_id!(
+    OwnerScoreCacheId,
+    "Candidate identity of one scalar-window owner snapshot, not a fit or qualification."
 );
 digest_id!(
     SemanticTensorDigest,

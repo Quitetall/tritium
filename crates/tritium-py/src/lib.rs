@@ -394,6 +394,7 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<model_calibration::NativeCalibrationBuilder>()?;
     m.add_class::<model_calibration::NativeCalibrationCache>()?;
     m.add_class::<model_calibration::NativeOwnerScoreWindow>()?;
+    m.add_class::<model_calibration::NativeOwnerScoreCache>()?;
     m.add_function(wrap_pyfunction!(model_calibration::_owner_row_score, m)?)?;
     m.add_function(wrap_pyfunction!(
         model_calibration::_observe_model_plan_source,

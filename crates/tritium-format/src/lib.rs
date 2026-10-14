@@ -75,7 +75,9 @@ mod tqidx;
 mod training_salt;
 pub mod trit_calibration;
 pub mod trit_model;
+pub mod trit_owner_score;
 mod trit_package;
+mod trit_profile;
 pub mod trit_salience;
 pub mod trit_salience_conversion;
 

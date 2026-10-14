@@ -231,7 +231,7 @@ def test_batched_linear_views_and_bias_preserve_actual_row_adjoint(tmp_path, bia
                                dense[0].double(), rtol=5e-6, atol=5e-7)
 
 
-def test_actual_tiny_hf_language_owner_capture(tmp_path):
+def _hf_source(tmp_path):
     from transformers import LlamaConfig, LlamaForCausalLM
     from tritium.torch.native_source import _inventory
     model = LlamaForCausalLM(LlamaConfig(vocab_size=32, hidden_size=32, intermediate_size=64,
@@ -254,9 +254,18 @@ def test_actual_tiny_hf_language_owner_capture(tmp_path):
         limits=dict(max_source_bytes=1_000_000,max_asset_bytes=100_000,max_retained_blob_bytes=1_000_000,
                     max_package_bytes=2_000_000),work_dir=work,
         asset_paths={name:tmp_path/name for name in ("config.json","tokenizer.json")})
+    return source
+
+
+def test_actual_tiny_hf_language_owner_capture(tmp_path):
+    from tritium.torch.native_source import _inventory
+    source=_hf_source(tmp_path)
+    prepared=source.prepared; model=prepared.model
+    actions={owner for owner,_,_,_,selected,_ in _inventory(prepared) if selected}
     window=dict(input_ids=torch.tensor([[1,2,3,4]]), labels=torch.tensor([[1,2,3,4]]))
     objective=lambda m,w: m(**w, use_cache=False).loss
     capture = _capture(source, window, objective=objective, max_observation_bytes=1_000_000,
+                       objective_bytes=b"tiny HF next-token CE mean",
                        max_invocations=32,max_samples=256,max_graph_nodes=4096)
     owners = [tensor for _,_,tensor,_,selected,_ in _inventory(prepared) if selected]
     expected = torch.autograd.grad(objective(model, window), owners)
@@ -265,7 +274,7 @@ def test_actual_tiny_hf_language_owner_capture(tmp_path):
         for row in (0, owner.rows-1):
             torch.testing.assert_close(capture.row_score(owner.tensor_name,row,max_workspace_bytes=1024),
                                        dense[row].double(),rtol=1e-5,atol=1e-7)
-    assert _hooks_empty(model) and list(work.iterdir()) == []
+    assert _hooks_empty(model) and list((tmp_path/"work").iterdir()) == []
 
 
 def test_nonfinite_context_and_actual_nonfinite_adjoints_reject(tmp_path):

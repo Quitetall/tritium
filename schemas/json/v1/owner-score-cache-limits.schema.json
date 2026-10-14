@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OwnerScoreCacheLimits",
+  "description": "Positive logical snapshot admission; excludes copies/metadata/tape/full RSS.",
+  "type": "object",
+  "properties": {
+    "max_context_bytes": {
+      "description": "Total context bytes, excluding recipe/tokenizer.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_context_tensors": {
+      "description": "Number of distinct context tensors.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_invocations": {
+      "description": "Number of actual invocations.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_payload_bytes": {
+      "description": "Total tokenizer/objective/context/numerical payload bytes.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_samples": {
+      "description": "Sum of invocation samples, not token/window count.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "max_payload_bytes",
+    "max_context_bytes",
+    "max_context_tensors",
+    "max_invocations",
+    "max_samples"
+  ]
+}

@@ -103,6 +103,18 @@ pub struct OwnedOwnerScoreWindow {
     observation_bytes: u64,
 }
 impl OwnedOwnerScoreWindow {
+    /// Immutable borrowed invocations in their declared order, without copying.
+    pub fn uses(&self) -> impl Iterator<Item = OwnerScoreUse<'_>> {
+        self.uses.iter().map(OwnedUse::borrowed)
+    }
+    /// Original owner row count.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+    /// Original owner column count.
+    pub fn columns(&self) -> usize {
+        self.columns
+    }
     /// Logical owned numerical bytes. Excludes metadata, external copies and RSS.
     pub fn observation_bytes(&self) -> u64 {
         self.observation_bytes

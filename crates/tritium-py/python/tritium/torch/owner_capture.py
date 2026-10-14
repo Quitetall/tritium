@@ -6,12 +6,28 @@ rejects unsupported owner reads instead of assuming module hooks are exhaustive.
 from __future__ import annotations
 from dataclasses import dataclass
 from collections.abc import Mapping
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+import tempfile
 import torch
 from torch import nn
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_flatten
 from .native_source import _inventory, _graph_contract
 from .native_load import _compact
+from .module_artifacts import _pairs_without_duplicates, _sync_directory
+from .. import _tritium
+
+_CONTEXT_DTYPES = {torch.float16:"F16",torch.bfloat16:"Bf16",torch.float32:"F32",torch.float64:"F64",
+    torch.int8:"I8",torch.int16:"I16",torch.int32:"I32",torch.int64:"I64",torch.uint8:"U8",torch.bool:"Bool",
+    torch.complex64:"C64",torch.complex128:"C128"}
+_CACHE_PROFILE="tritium.torch.owner-score-window.v1"
+
+def _json(value):
+    return json.dumps(value,sort_keys=True,separators=(",",":"),allow_nan=False)
 
 
 @dataclass(frozen=True)
@@ -20,6 +36,8 @@ class NativeOwnerWindowCapture:
     owners: tuple
     invocations: tuple
     objective_bytes: bytes
+    caches: tuple = ()
+    max_total_cache_bytes: int = 0
 
     @property
     def source_id(self):
@@ -30,6 +48,89 @@ class NativeOwnerWindowCapture:
             if owner.tensor_name == name:
                 return torch.from_dlpack(owner.row_score(row, max_workspace_bytes))
         raise ValueError("tensor absent from captured owner inventory")
+
+    def save(self, output_dir, *, max_package_bytes):
+        """No-clobber durable native caches; not an old calibrated-fit directory."""
+        if not self.caches or type(max_package_bytes) is not int or max_package_bytes<=0:
+            raise ValueError("durable capture and positive package limit required")
+        if sum(cache.payload_bytes for cache in self.caches)>self.max_total_cache_bytes:
+            raise ValueError("owner cache aggregate payload exceeds limit")
+        target=Path(output_dir).absolute()
+        if target.exists() or target.is_symlink(): raise FileExistsError(target)
+        staging=Path(tempfile.mkdtemp(prefix=".tritium-owner-cache-",dir=target.parent))
+        published=False
+        try:
+            bindings={}
+            for index,cache in enumerate(self.caches):
+                path=staging/f"owner-{index}.trit"
+                with path.open("xb") as stream:
+                    stream.write(cache.package(max_package_bytes)); stream.flush(); os.fsync(stream.fileno())
+                cache.verify_file(str(path),max_package_bytes)
+                bindings[cache.tensor_name]=json.loads(cache.binding_json)
+            metadata=_json(dict(profile=_CACHE_PROFILE,bindings=bindings)).encode()
+            if len(metadata)>1024*1024: raise ValueError("owner cache binding metadata exceeds limit")
+            with (staging/"bindings.json").open("xb") as stream:
+                stream.write(metadata); stream.flush(); os.fsync(stream.fileno())
+            _sync_directory(staging)
+            _tritium.publish_directory_noreplace(str(staging),str(target))
+            published=True; _sync_directory(target.parent)
+        finally:
+            if not published: shutil.rmtree(staging)
+        return target
+
+    @classmethod
+    def open(cls, source, directory, *, limits, max_package_bytes, max_total_cache_bytes):
+        """Strict shared-native reopen against actual complete source observation."""
+        from .native_calibration import NativeModulePreparation
+        if not isinstance(source,NativeModulePreparation): raise TypeError("actual native preparation required")
+        _cache_limits(limits,max_total_cache_bytes)
+        if type(max_package_bytes) is not int or max_package_bytes<=0: raise ValueError("positive package limit required")
+        source.verify()
+        root=Path(directory).absolute()
+        path=root/"bindings.json"
+        if root.is_symlink() or not root.is_dir() or path.is_symlink() or not path.is_file():
+            raise ValueError("owner cache directory/metadata must be ordinary")
+        with path.open("rb") as stream: encoded=stream.read(1024*1024+1)
+        if len(encoded)>1024*1024: raise ValueError("owner cache binding metadata exceeds limit")
+        metadata=json.loads(encoded,object_pairs_hook=_pairs_without_duplicates)
+        if not isinstance(metadata,dict) or set(metadata)!={"profile","bindings"} or metadata["profile"]!=_CACHE_PROFILE:
+            raise ValueError("owner cache directory profile differs")
+        bindings=metadata["bindings"]
+        names=sorted(owner for owner,_,_,_,selected,_ in _inventory(source.prepared) if selected)
+        if not isinstance(bindings,dict) or sorted(bindings)!=names:
+            raise ValueError("owner cache source inventory differs")
+        if {p.name for p in root.iterdir()}!={"bindings.json",*(f"owner-{i}.trit" for i in range(len(names)))}:
+            raise ValueError("owner cache directory inventory differs")
+        caches=[]; total=0; calls=[]
+        shared=None
+        for index,name in enumerate(names):
+            path=root/f"owner-{index}.trit"
+            if path.is_symlink() or not path.is_file(): raise ValueError("owner cache package must be ordinary")
+            remaining=max_total_cache_bytes-total
+            receiving=dict(limits,max_payload_bytes=min(limits["max_payload_bytes"],remaining))
+            if receiving["max_payload_bytes"]<=0: raise ValueError("owner cache aggregate payload exceeds limit")
+            cache=_tritium.NativeOwnerScoreCache.open(str(path),_json(bindings[name]),_json(receiving),max_package_bytes)
+            source.observation.validate_owner_cache(cache)
+            b=json.loads(cache.binding_json); content=b["content"]
+            identity=(content["source"],content["tokenizer"],content["objective"],content["context"])
+            if shared is not None and shared!=identity: raise ValueError("owner caches have different window context")
+            shared=identity
+            total+=cache.payload_bytes; caches.append(cache)
+            for invocation in content["invocations"]:
+                m=invocation["meta"]
+                calls.append((m["ordinal"],(name,tuple(m["paths"]),m["role"].lower(),m["samples"])))
+        calls.sort(key=lambda call:call[0])
+        if [ordinal for ordinal,_ in calls]!=list(range(len(calls))):
+            raise ValueError("owner global invocation inventory differs")
+        return cls(tuple(caches),tuple(call for _,call in calls),bytes(caches[0].objective_bytes),tuple(caches),max_total_cache_bytes)
+
+
+def _cache_limits(limits,total):
+    fields={"max_payload_bytes","max_context_bytes","max_context_tensors","max_invocations","max_samples"}
+    if (not isinstance(limits,dict) or set(limits)!=fields
+            or any(type(v) is not int or v<=0 for v in limits.values())
+            or type(total) is not int or total<=0):
+        raise ValueError("owner cache limits must be explicit positive integers")
 
 
 def _storage(tensor):
@@ -169,7 +270,7 @@ def _graph_is_supported(loss, maximum):
 
 def capture_owner_window(source, window, objective, *, objective_bytes,
                          max_observation_bytes, max_context_bytes, max_invocations,
-                         max_samples, max_graph_nodes):
+                         max_samples, max_graph_nodes, cache_limits=None, max_total_cache_bytes=None):
     """Capture one actual scalar objective. Durable cache/fit integration is separate."""
     from .native_calibration import NativeModulePreparation
     if not isinstance(source, NativeModulePreparation) or not callable(objective):
@@ -211,6 +312,17 @@ def capture_owner_window(source, window, objective, *, objective_bytes,
             consumers.setdefault(id(module), dict(module=module, owner=owner, paths=[]))["paths"].append(path)
     if not consumers or any(tensor.device.type != "cpu" for _, _, tensor, _, _, _ in entries):
         raise ValueError("owner capture requires a complete compatible CPU source")
+    tokenizer=None
+    if cache_limits is not None or max_total_cache_bytes is not None:
+        _cache_limits(cache_limits,max_total_cache_bytes)
+        if len(protected)*cache_limits["max_payload_bytes"]>max_total_cache_bytes:
+            raise ValueError("owner declared cache capacity exceeds aggregate limit")
+        if sys.byteorder!="little" or any(value.dtype not in _CONTEXT_DTYPES for value in snapshots.values()):
+            raise ValueError("owner durable context scalar platform/dtype unsupported")
+        options=json.loads(source.options_json)
+        maximum=options["limits"]["max_asset_bytes"]
+        with Path(options["asset_paths"]["tokenizer.json"]).open("rb") as stream: tokenizer=stream.read(maximum+1)
+        if len(tokenizer)>maximum: raise ValueError("owner tokenizer exceeds original asset limit")
     training = tuple((module, module.training) for module in modules.values())
     gradients = tuple((tensor, tensor.requires_grad, tensor.grad,
                        None if tensor.grad is None else tensor.grad._version)
@@ -315,7 +427,19 @@ def capture_owner_window(source, window, objective, *, objective_bytes,
             raise ValueError("owner observation byte accounting differs")
         invocations = tuple((frame["owner"], tuple(sorted(frame["paths"])), frame["role"], frame["samples"])
                             for frame in records)
-        return NativeOwnerWindowCapture(owners, invocations, objective_bytes)
+        caches=()
+        if tokenizer is not None:
+            names=sorted(snapshots)
+            context_meta=[dict(name=name,dtype=_CONTEXT_DTYPES[snapshots[name].dtype],shape=list(specs[name][1]),
+                              conjugated=specs[name][3],negated=specs[name][4]) for name in names]
+            context=[_compact(snapshots[name].view(torch.uint8).reshape(-1)) for name in names]
+            caches=tuple(source.observation.owner_cache(owner,tokenizer,objective_bytes,_json(dict(
+                context=context_meta,invocations=[dict(ordinal=frame["ordinal"],paths=sorted(frame["paths"]),
+                    role=frame["role"].capitalize(),samples=frame["samples"]) for frame in records if frame["owner"]==owner.tensor_name])),
+                context,_json(cache_limits)) for owner in owners)
+            if sum(cache.payload_bytes for cache in caches)>max_total_cache_bytes:
+                raise ValueError("owner cache aggregate payload exceeds limit")
+        return NativeOwnerWindowCapture(owners, invocations, objective_bytes,caches,max_total_cache_bytes or 0)
     finally:
         for handle in hooks:
             handle.remove()

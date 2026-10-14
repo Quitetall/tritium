@@ -12,19 +12,20 @@ use pyo3::{
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 use tritium_quantize::engine::{
     CalibrationBatch, CalibrationCache, CalibrationCacheBuilder, CalibrationCollector,
     CalibrationInput, CalibrationOutputBatch, FileWeightSource, ObservedWeightSource,
-    OwnedOwnerScoreWindow, OwnerScoreUse, OwnerScoreWindow, read_original_file_bounded,
+    OwnedOwnerScoreWindow, OwnerScoreCache, OwnerScoreCacheInput, OwnerScoreUse, OwnerScoreWindow,
+    read_original_file_bounded,
 };
 use tritium_schema::{
     BlobId, CalibratedFitPlan, CalibratedQuantAction, CalibratedQuantPlan,
     CalibratedQuantTensorPlan, CalibrationCacheBinding, CalibrationCacheId,
     CalibrationCacheRequest, CalibrationConsumer, CalibrationOutput, CalibrationPartition,
-    DirectFitMetric, ModelQuantPlan, NamedAssetDigest, OriginalSourceId, QuantAction, QuantPlan,
-    QuantSourceBinding,
+    DirectFitMetric, ModelQuantPlan, NamedAssetDigest, OriginalSourceId, OwnerScoreCacheBinding,
+    OwnerScoreCacheLimits, OwnerScoreWindowMeta, QuantAction, QuantPlan, QuantSourceBinding,
 };
 
 fn error(value: impl std::fmt::Display) -> PyErr {
@@ -116,7 +117,108 @@ pub(crate) struct NativeOwnerScoreWindow {
     rows: usize,
     #[pyo3(get)]
     columns: usize,
-    observations: OwnedOwnerScoreWindow,
+    observations: Arc<OwnedOwnerScoreWindow>,
+}
+
+/// Strict actual owner cache transport/replay, not a calibrated fit or qualification.
+#[pyclass(frozen, module = "tritium._tritium")]
+pub(crate) struct NativeOwnerScoreCache {
+    cache: OwnerScoreCache,
+}
+#[pymethods]
+impl NativeOwnerScoreCache {
+    fn verify_file(&self, path: &str, max_package_bytes: usize) -> PyResult<()> {
+        let bytes =
+            read_original_file_bounded(Path::new(path), max_package_bytes as u64).map_err(error)?;
+        OwnerScoreCache::decode_package(
+            &bytes,
+            self.cache.binding(),
+            self.cache.limits(),
+            max_package_bytes,
+        )
+        .map_err(error)?;
+        Ok(())
+    }
+    #[getter]
+    fn binding_json(&self) -> PyResult<String> {
+        serde_json::to_string(self.cache.binding()).map_err(error)
+    }
+    #[getter]
+    fn cache_id(&self) -> String {
+        hex(self.cache.id().as_bytes())
+    }
+    #[getter]
+    fn source_id(&self) -> String {
+        hex(self.cache.binding().content.source.as_bytes())
+    }
+    #[getter]
+    fn tensor_name(&self) -> &str {
+        &self.cache.binding().content.tensor.name
+    }
+    #[getter]
+    fn rows(&self) -> u64 {
+        self.cache.binding().content.tensor.shape[0]
+    }
+    #[getter]
+    fn columns(&self) -> u64 {
+        self.cache.binding().content.tensor.shape[1]
+    }
+    #[getter]
+    fn observation_bytes(&self) -> u64 {
+        self.cache.observation_bytes()
+    }
+    #[getter]
+    fn payload_bytes(&self) -> u64 {
+        self.cache.binding().payload_bytes
+    }
+    #[getter]
+    fn use_count(&self) -> usize {
+        self.cache.binding().content.invocations.len()
+    }
+    #[getter]
+    fn objective_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, self.cache.objective())
+    }
+    fn row_score(
+        &self,
+        py: Python<'_>,
+        row: usize,
+        max_workspace_bytes: u64,
+    ) -> PyResult<Py<PyAny>> {
+        export_owner_row(
+            py,
+            self.cache
+                .row_score(row, max_workspace_bytes)
+                .map_err(error)?,
+        )
+    }
+    fn package<'py>(
+        &self,
+        py: Python<'py>,
+        max_package_bytes: usize,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = self
+            .cache
+            .encode_package(max_package_bytes)
+            .map_err(error)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+    #[staticmethod]
+    fn open(
+        path: &str,
+        expected_json: &str,
+        limits_json: &str,
+        max_package_bytes: usize,
+    ) -> PyResult<Self> {
+        let expected: OwnerScoreCacheBinding = json(expected_json)?;
+        let limits: OwnerScoreCacheLimits = json(limits_json)?;
+        let bytes =
+            read_original_file_bounded(Path::new(path), max_package_bytes as u64).map_err(error)?;
+        Ok(Self {
+            cache: OwnerScoreCache::decode_package(&bytes, &expected, limits, max_package_bytes)
+                .map_err(error)?,
+        })
+    }
 }
 #[pymethods]
 impl NativeOwnerScoreWindow {
@@ -222,8 +324,75 @@ impl NativeSourceObservation {
             tensor_name: name.to_owned(),
             rows,
             columns,
-            observations: window.snapshot().map_err(error)?,
+            observations: Arc::new(window.snapshot().map_err(error)?),
         })
+    }
+    fn owner_cache(
+        &self,
+        window: &NativeOwnerScoreWindow,
+        tokenizer: &[u8],
+        objective: &[u8],
+        meta_json: &str,
+        context: Vec<Dlpack>,
+        limits_json: &str,
+    ) -> PyResult<NativeOwnerScoreCache> {
+        let tensor = self
+            .tensors
+            .iter()
+            .find(|t| t.source.name == window.tensor_name)
+            .ok_or_else(|| error("owner absent from observed source"))?
+            .source
+            .clone();
+        if window.source != self.source
+            || tensor.shape.as_slice() != [window.rows as u64, window.columns as u64]
+            || !self.assets.iter().any(|a| {
+                a.name == "tokenizer.json"
+                    && a.content.as_bytes() == blake3::hash(tokenizer).as_bytes()
+            })
+        {
+            return Err(error("owner cache source/tokenizer mismatch"));
+        }
+        let meta: OwnerScoreWindowMeta = json(meta_json)?;
+        let limits: OwnerScoreCacheLimits = json(limits_json)?;
+        if context.len() != meta.context.len() || context.len() as u64 > limits.max_context_tensors
+        {
+            return Err(error("owner context inventory exceeds limit"));
+        }
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(context.len()).map_err(error)?;
+        for value in &context {
+            if tensor_shape(value, "owner context")?.len() != 1 {
+                return Err(error("owner context bytes must be flat"));
+            }
+            bytes.push(value.cpu_data_slice::<u8>().map_err(error)?);
+        }
+        let cache = OwnerScoreCache::new(
+            OwnerScoreCacheInput {
+                source: self.source,
+                tensor,
+                tokenizer,
+                objective,
+                meta,
+                context: &bytes,
+                observations: Arc::clone(&window.observations),
+            },
+            limits,
+        )
+        .map_err(error)?;
+        Ok(NativeOwnerScoreCache { cache })
+    }
+    fn validate_owner_cache(&self, cache: &NativeOwnerScoreCache) -> PyResult<()> {
+        let content = &cache.cache.binding().content;
+        if content.source != self.source
+            || !self.tensors.iter().any(|t| t.source == content.tensor)
+            || !self
+                .assets
+                .iter()
+                .any(|a| a.name == "tokenizer.json" && a.content == content.tokenizer)
+        {
+            return Err(error("owner cache differs from observed source/tokenizer"));
+        }
+        Ok(())
     }
     fn validate_cache(&self, cache: &NativeCalibrationCache) -> PyResult<()> {
         let binding = cache.cache.binding();

@@ -48,6 +48,30 @@ fn main() -> Result<(), Box<dyn Error>> {
     project!(ModelId, "model-id");
     project!(tritium_schema::OriginalSourceId, "original-source-id");
     project!(tritium_schema::CalibrationCacheId, "calibration-cache-id");
+    project!(tritium_schema::OwnerScoreCacheId, "owner-score-cache-id");
+    project!(tritium_schema::OwnerScoreEstimator, "owner-score-estimator");
+    project!(tritium_schema::OwnerScoreRole, "owner-score-role");
+    project!(tritium_schema::OwnerContextDtype, "owner-context-dtype");
+    project!(
+        tritium_schema::OwnerScoreWindowMeta,
+        "owner-score-window-meta"
+    );
+    project!(
+        tritium_schema::OwnerScoreCacheContent,
+        "owner-score-cache-content"
+    );
+    project!(
+        tritium_schema::OwnerScoreCacheLimits,
+        "owner-score-cache-limits"
+    );
+    project!(
+        tritium_schema::OwnerScoreCacheBinding,
+        "owner-score-cache-binding"
+    );
+    project!(
+        tritium_schema::OwnerScoreCacheManifest,
+        "owner-score-cache-manifest"
+    );
     project!(
         tritium_schema::OriginalSalienceCaptureProfile,
         "original-salience-capture-profile"

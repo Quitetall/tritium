@@ -5,6 +5,7 @@
 //! The f64 feedback oracle remains an explicitly separate reference profile.
 
 mod activation_aware;
+mod cache_scalar;
 mod calibrated_fit;
 mod calibration;
 mod calibration_cache;
@@ -17,7 +18,9 @@ mod model;
 mod model_import;
 mod observed_source;
 mod original_capture;
+mod owner_score_cache;
 mod owner_scores;
+pub use owner_score_cache::{OwnerScoreCache, OwnerScoreCacheError, OwnerScoreCacheInput};
 mod salience;
 mod salience_model;
 mod sinks;

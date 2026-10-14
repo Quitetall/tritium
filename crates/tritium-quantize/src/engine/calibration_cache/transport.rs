@@ -288,41 +288,27 @@ fn take<'a>(
     assets.remove(name).ok_or(CalibrationCacheError::Binding)
 }
 fn reserved(n: usize) -> Result<Vec<u8>, CalibrationCacheError> {
-    let mut v = Vec::new();
-    v.try_reserve_exact(n)
-        .map_err(|_| CalibrationCacheError::Allocation)?;
-    Ok(v)
+    super::super::cache_scalar::reserved(n).map_err(scalar_error)
 }
 fn encode<T, const N: usize>(
     values: &[T],
     convert: impl Fn(&T) -> [u8; N],
 ) -> Result<Vec<u8>, CalibrationCacheError> {
-    let mut bytes = reserved(
-        values
-            .len()
-            .checked_mul(N)
-            .ok_or(CalibrationCacheError::Allocation)?,
-    )?;
-    for value in values {
-        bytes.extend_from_slice(&convert(value));
-    }
-    Ok(bytes)
+    super::super::cache_scalar::encode(values, convert).map_err(scalar_error)
 }
 fn check_len(bytes: &[u8], count: usize, width: usize) -> Result<(), CalibrationCacheError> {
-    if count.checked_mul(width) != Some(bytes.len()) {
-        return Err(CalibrationCacheError::Batch);
-    }
-    Ok(())
+    super::super::cache_scalar::check_len(bytes, count, width).map_err(scalar_error)
 }
 fn decode<T, const N: usize>(
     bytes: &[u8],
     count: usize,
     convert: impl Fn([u8; N]) -> T,
 ) -> Result<Vec<T>, CalibrationCacheError> {
-    check_len(bytes, count, N)?;
-    let mut v = Vec::new();
-    v.try_reserve_exact(count)
-        .map_err(|_| CalibrationCacheError::Allocation)?;
-    v.extend(bytes.as_chunks::<N>().0.iter().map(|chunk| convert(*chunk)));
-    Ok(v)
+    super::super::cache_scalar::decode(bytes, count, convert).map_err(scalar_error)
+}
+fn scalar_error(error: super::super::cache_scalar::ScalarError) -> CalibrationCacheError {
+    match error {
+        super::super::cache_scalar::ScalarError::Allocation => CalibrationCacheError::Allocation,
+        super::super::cache_scalar::ScalarError::Length => CalibrationCacheError::Batch,
+    }
 }
