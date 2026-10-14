@@ -43,9 +43,33 @@ impl Plan {
     }
 }
 
+fn parse_plan(json: &str, calibrated: bool, maximum: usize) -> PyResult<Plan> {
+    if maximum == 0 || json.len() > maximum {
+        return Err(error("plan JSON exceeds positive byte limit"));
+    }
+    let plan = if calibrated {
+        Plan::Calibrated(serde_json::from_str(json).map_err(error)?)
+    } else {
+        Plan::Plain(serde_json::from_str(json).map_err(error)?)
+    };
+    plan.view().validate().map_err(error)?;
+    Ok(plan)
+}
+
+/// Internal frontend preflight; the same parser runs before native conversion.
+#[pyfunction]
+#[pyo3(signature=(plan_json, *, calibrated=false, max_plan_bytes=16_777_216))]
+pub(crate) fn _validate_model_plan(
+    plan_json: &str,
+    calibrated: bool,
+    max_plan_bytes: usize,
+) -> PyResult<()> {
+    parse_plan(plan_json, calibrated, max_plan_bytes).map(|_| ())
+}
+
 /// Actual conversion identities, not a qualification or complete architecture claim.
 #[pyclass(frozen, module = "tritium._tritium", skip_from_py_object)]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct NativeModelConversion {
     #[pyo3(get)]
     output_dir: String,
@@ -87,6 +111,38 @@ impl NativeModelConversion {
     /// Reopen exact files and verify package/log binding against this result.
     fn verify(&self, py: Python<'_>) -> PyResult<()> {
         py.detach(|| self.verified_bytes().map(|_| ()))
+    }
+    // The source adapter can report cleanup after a successful commit without
+    // turning a published artifact into a misleading conversion failure.
+    fn _with_source_cleanup_warning(&self, message: &str) -> Self {
+        let mut result = self.clone();
+        result.publication_warnings.push(format!(
+            "SourceCleanup: {}",
+            message.chars().take(1024).collect::<String>()
+        ));
+        result
+    }
+    /// Read exact original asset bytes after package/log identity verification.
+    #[pyo3(signature=(name, *, max_bytes=67_108_864))]
+    fn asset<'py>(
+        &self,
+        py: Python<'py>,
+        name: &str,
+        max_bytes: usize,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        if max_bytes == 0 {
+            return Err(error("max_bytes must be positive"));
+        }
+        let payload = py.detach(|| {
+            let bytes = self.verified_bytes()?;
+            let model = tritium_format::trit_model::read_trit_model(&bytes).map_err(error)?;
+            let payload = model.asset(name).map_err(error)?;
+            if payload.len() > max_bytes {
+                return Err(error("asset exceeds byte limit"));
+            }
+            Ok::<_, PyErr>(payload.to_vec())
+        })?;
+        Ok(PyBytes::new(py, &payload))
     }
     /// Return a declared dense-preserved tensor's original bytes, never additive decode.
     #[pyo3(signature=(level, name, *, max_bytes=67_108_864))]
@@ -135,9 +191,7 @@ pub(crate) fn convert_model_plan(
     calibrated: bool,
     max_plan_bytes: usize,
 ) -> PyResult<NativeModelConversion> {
-    if max_plan_bytes == 0 || plan_json.len() > max_plan_bytes {
-        return Err(error("plan JSON exceeds positive byte limit"));
-    }
+    let request = parse_plan(plan_json, calibrated, max_plan_bytes)?;
     if run_id.is_empty() {
         return Err(error("run_id must not be empty"));
     }
@@ -151,12 +205,6 @@ pub(crate) fn convert_model_plan(
         .into_os_string()
         .into_string()
         .map_err(|_| error("output directory is not representable as a Python string"))?;
-    let request = if calibrated {
-        Plan::Calibrated(serde_json::from_str(plan_json).map_err(error)?)
-    } else {
-        Plan::Plain(serde_json::from_str(plan_json).map_err(error)?)
-    };
-    request.view().validate().map_err(error)?;
     let shards = source_shards
         .into_iter()
         .map(PathBuf::from)

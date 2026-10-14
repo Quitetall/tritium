@@ -26,6 +26,24 @@ This converts the complete declared floating-point inventory, not arbitrary HF
 architectures, and is not a model-quality or release-qualification receipt.
 The existing torch PTQ lifecycle and its matrix-only packages are unchanged.
 
+`tritium.torch.convert_native_module(prepared, output_dir, run_id, *, actions,
+levels, limits, work_dir, asset_paths, architecture="torch-module",
+input_grams=None)` is an opt-in persistent-state adapter to that engine. Supply
+the existing Rust Fit actions for every selected coverage owner and the original
+config/tokenizer assets required by QuantPlan. Its temporary source files live
+under an existing caller work directory and are cleaned up after conversion.
+Post-publication cleanup faults remain explicit warnings on the successful result.
+
+The state catalog preserves exact aliases, biases, norms and buffers. Admitted
+positive-shaped F16/BF16/F32 owners use native Fit/KeepDense. Scalar, empty,
+float64, integer and boolean state is preserved as a safetensors asset, not
+silently admitted as native executable tensors. The current state dtype profile
+is F16/BF16/F32/F64, signed I8/I16/I32/I64, U8 and bool; other dtypes, custom
+non-tensor state, meta/sparse/quantized tensors and overlapping views reject.
+`result.asset(name, max_bytes=67108864)` reads bounded original asset bytes after
+package/log verification. This is source packaging, not fresh-shell Torch/HF
+application, calibrated phase migration or runtime/quality qualification.
+
 See the [repository README](https://github.com/Quitetall/tritium#readme) and the
 [book](https://github.com/Quitetall/tritium/tree/main/docs/book) for usage.
 

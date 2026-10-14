@@ -127,6 +127,13 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         continue
     fi
 
+    # Mirror the existing CI drift gate against the exact pushed tree, not WIP.
+    if ! (cd "$WT" && python scripts/generate-api-diff.py --check); then
+        echo "pre-push: public API projection check FAILED for $local_sha ($local_ref)." >&2
+        fail=1
+        break
+    fi
+
     if ! (cd "$WT" && cargo clippy --locked --workspace --all-targets -- -D warnings); then
         echo "pre-push: workspace clippy FAILED for $local_sha ($local_ref)." >&2
         fail=1

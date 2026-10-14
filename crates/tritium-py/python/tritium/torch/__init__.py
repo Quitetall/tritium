@@ -90,6 +90,7 @@ from .ptq import (
     load_quantized_module,
     quantize,
 )
+from .native_source import convert_native_module
 from .qwen36 import (
     Qwen36ComponentError,
     Qwen36Components,
@@ -155,6 +156,7 @@ __all__ = [
     "KroneckerCalibrationWriter",
     "KroneckerModuleCaptureReceipt",
     "ModuleQuantizationResult",
+    "convert_native_module",
     "ModuleOnnxArtifact",
     "ModuleOnnxLineage",
     "OnnxBundleManifest",

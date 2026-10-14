@@ -390,6 +390,7 @@ fn backend_for_device(device: &str) -> Result<Box<dyn TernaryBackend>, String> {
 fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<model_conversion::NativeModelConversion>()?;
     m.add_function(wrap_pyfunction!(model_conversion::convert_model_plan, m)?)?;
+    m.add_function(wrap_pyfunction!(model_conversion::_validate_model_plan, m)?)?;
     m.add_class::<Model>()?;
     m.add_class::<qwen::QwenModel>()?;
     m.add_class::<qwen::QwenLoadReceipt>()?;

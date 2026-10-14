@@ -1,4 +1,4 @@
-"""Exercise the real pre-push script with controlled Git/Cargo adapters."""
+"""Cache/routing only, with controlled Git/Cargo/Python command adapters."""
 
 import os
 from pathlib import Path
@@ -40,12 +40,16 @@ esac
             cargo.write_text(
                 '#!/bin/sh\nprintf "%s|%s\\n" "$CARGO_TARGET_DIR" "$*" >> "$CALL_LOG"\n'
             )
+            python = bins / "python"
+            python.write_text('#!/bin/sh\nprintf "%s|%s\\n" "$PWD" "$*" > "$API_CALL_LOG"\n')
             git.chmod(0o700)
             cargo.chmod(0o700)
+            python.chmod(0o700)
             env = dict(os.environ)
             env.update(PATH=f"{bins}:{env['PATH']}", XDG_CACHE_HOME=str(cache), CALL_LOG=str(log))
             env.update(FIXTURE_REPO_ROOT=str(root),
-                       FIXTURE_WORKTREE=str(cache / "tritium-prepush" / "worktree"))
+                       FIXTURE_WORKTREE=str(cache / "tritium-prepush" / "worktree"),
+                       API_CALL_LOG=str(root / "api-call"))
             env.pop("TRITIUM_PREPUSH_FMT_ONLY", None)
             env.pop("CARGO_TARGET_DIR", None)
             if target is not None:
@@ -63,6 +67,8 @@ esac
             ])
             expected = target or str(cache / "tritium-prepush" / "target")
             self.assertEqual([call[0] for call in calls], [expected, expected])
+            self.assertEqual((root / "api-call").read_text().strip(),
+                             f"{cache / 'tritium-prepush' / 'worktree'}|scripts/generate-api-diff.py --check")
             self.assertFalse((cache / "tritium-prepush" / "lock").exists())
 
     def test_explicit_project_cache_is_used_without_skipping_checks(self):

@@ -224,6 +224,7 @@ case "$tier" in
         ;;
     prepush)
         run cargo fmt --all --check
+        run python scripts/generate-api-diff.py --check
         run cargo run --locked -p tritium-schema --features schema-gen --bin tritium-schema-projections -- --check
         verify_no_std_foundations
         run cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -245,6 +246,7 @@ case "$tier" in
         ;;
     ci)
         run cargo fmt --all --check
+        run python scripts/generate-api-diff.py --check
         run cargo run --locked -p tritium-schema --features schema-gen --bin tritium-schema-projections -- --check
         verify_no_std_foundations
         run cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -260,6 +262,7 @@ case "$tier" in
         ;;
     release)
         run cargo fmt --all --check
+        run python scripts/generate-api-diff.py --check
         run cargo run --locked -p tritium-schema --features schema-gen --bin tritium-schema-projections -- --check
         verify_no_std_foundations
         # Type-check every feature-gated surface without requiring GPU toolkits.
