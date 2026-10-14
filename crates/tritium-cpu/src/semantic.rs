@@ -53,12 +53,19 @@ impl CpuTensor {
                 TensorMetadata::Dense { rows, cols },
                 TensorStreamEncoding::DenseLittleEndian(precision),
             ) => {
-                let width = match precision {
-                    tritium_schema::ScalePrecision::F16 | tritium_schema::ScalePrecision::Bf16 => 2,
-                    tritium_schema::ScalePrecision::F32 => 4,
-                    _ => return Ok(None),
-                };
-                TensorMetadata::dense_bytes(rows, cols)? / 4 * width
+                if !matches!(
+                    precision,
+                    tritium_schema::ScalePrecision::F16
+                        | tritium_schema::ScalePrecision::Bf16
+                        | tritium_schema::ScalePrecision::F32
+                ) {
+                    return Ok(None);
+                }
+                tritium_format::trit_model::DensePayloadDecoder::byte_len(
+                    precision,
+                    TensorMetadata::dense_bytes(rows, cols)? / 4,
+                )
+                .map_err(|e| BackendError::InvalidInput(e.to_string()))?
             }
             _ => return Ok(None),
         };
@@ -98,60 +105,23 @@ impl CpuTensor {
                 values
                     .try_reserve_exact(requested / 4)
                     .map_err(|_| BackendError::OutOfMemory { requested })?;
-                let width = if precision == tritium_schema::ScalePrecision::F32 {
-                    4
-                } else {
-                    2
-                };
-                let mut carry = [0u8; 4];
-                let mut filled = 0;
-                let mut bytes = 0u64;
+                values.resize(requested / 4, 0.);
+                let mut decoder =
+                    tritium_format::trit_model::DensePayloadDecoder::new(precision, &mut values)
+                        .map_err(|e| BackendError::InvalidInput(e.to_string()))?;
                 source.visit(&mut |chunk| {
                     if chunk.len() > TENSOR_STREAM_CHUNK_BYTES {
                         return Err(BackendError::InvalidInput(
                             "source window exceeds stream bound".into(),
                         ));
                     }
-                    bytes = bytes
-                        .checked_add(chunk.len() as u64)
-                        .ok_or_else(|| BackendError::InvalidInput("stream size overflow".into()))?;
-                    if bytes > plan.encoded_bytes {
-                        return Err(BackendError::InvalidInput(
-                            "dense source exceeds stream plan".into(),
-                        ));
-                    }
-                    for &byte in chunk {
-                        carry[filled] = byte;
-                        filled += 1;
-                        if filled == width {
-                            let value = match precision {
-                                tritium_schema::ScalePrecision::F16 => {
-                                    half::f16::from_bits(u16::from_le_bytes([carry[0], carry[1]]))
-                                        .to_f32()
-                                }
-                                tritium_schema::ScalePrecision::Bf16 => {
-                                    half::bf16::from_bits(u16::from_le_bytes([carry[0], carry[1]]))
-                                        .to_f32()
-                                }
-                                tritium_schema::ScalePrecision::F32 => f32::from_le_bytes(carry),
-                                _ => return Err(BackendError::UnsupportedTensor),
-                            };
-                            if !value.is_finite() {
-                                return Err(BackendError::InvalidInput(
-                                    "non-finite streamed model weight".into(),
-                                ));
-                            }
-                            values.push(value);
-                            filled = 0;
-                        }
-                    }
-                    Ok(())
+                    decoder
+                        .push(chunk)
+                        .map_err(|e| BackendError::InvalidInput(e.to_string()))
                 })?;
-                if bytes != plan.encoded_bytes || filled != 0 || values.len() != requested / 4 {
-                    return Err(BackendError::InvalidInput(
-                        "dense source shorter than stream plan".into(),
-                    ));
-                }
+                decoder
+                    .finish()
+                    .map_err(|e| BackendError::InvalidInput(e.to_string()))?;
                 Self::Dense { rows, cols, values }
             }
             _ => return Err(BackendError::UnsupportedTensor),

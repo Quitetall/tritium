@@ -759,3 +759,59 @@ fn streamed_partial_models_and_terminal_source_mutations_release_without_model_l
         empty(&budgets);
     }
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+fn physical_streamed_cuda_hybrid_public_loader_matches_cpu_without_resident_or_decode_fallback() {
+    let root = Scratch::new("cuda-stream-model");
+    for uniform in [false, true] {
+        let path = root.0.join("model.trit");
+        std::fs::write(&path, text_package(uniform, false).bytes()).unwrap();
+        let cpu_budgets = ledgers();
+        let gpu_budgets = ledgers();
+        let source = file_source(&path);
+        let mut cpu = guarded_mode(
+            source,
+            Box::new(tritium_cpu::CpuBackend::new()),
+            &cpu_budgets,
+            &mut recorder(),
+            true,
+        )
+        .unwrap();
+        let backend = tritium_cuda::CudaBackend::new(0)
+            .expect("public streamed model test requires physical CUDA");
+        let mut gpu = guarded_mode(
+            source,
+            Box::new(backend),
+            &gpu_budgets,
+            &mut recorder(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(gpu.runner.execution(), tritium_spec::DecoderExecution::Host);
+        assert_eq!(gpu.runner.mtp_status(), Some(Qwen35MtpStatus::Unverified));
+        for token in [None, Some(3)] {
+            let (a, b) = if let Some(token) = token {
+                (
+                    gpu.runner.step(token).unwrap(),
+                    cpu.runner.step(token).unwrap(),
+                )
+            } else {
+                (
+                    gpu.runner.prefill(&[1, 2]).unwrap(),
+                    cpu.runner.prefill(&[1, 2]).unwrap(),
+                )
+            };
+            for (a, b) in a.into_iter().zip(b) {
+                assert!(
+                    a.is_finite() && b.is_finite() && (a - b).abs() <= 2e-4 + 2e-4 * b.abs(),
+                    "GPU={a} CPU={b}"
+                );
+            }
+        }
+        drop(cpu);
+        drop(gpu);
+        empty(&cpu_budgets);
+        empty(&gpu_budgets);
+    }
+}

@@ -6,9 +6,11 @@ use half::f16;
 use tritium_core::AdditiveView;
 use tritium_format::salt_v2::SaltV2Codec;
 use tritium_schema::{PlaneCodec, PlaneRelation, ScaleAnchor, ScalePrecision};
-use tritium_spec::AdditiveMetadata;
+use tritium_spec::{AdditiveMetadata, TENSOR_STREAM_CHUNK_BYTES, TensorStreamSource};
 
 const HEADER: usize = 60;
+#[cfg(test)]
+mod stream_tests;
 
 struct Plan {
     header: [u32; 15],
@@ -147,6 +149,80 @@ impl Plan {
         })
     }
 
+    fn allocate(&self, metadata: AdditiveMetadata<'_>) -> Result<Vec<u8>, BackendError> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(self.bytes)
+            .map_err(|_| BackendError::OutOfMemory {
+                requested: self.bytes,
+            })?;
+        bytes.resize(self.bytes, 0);
+        for (i, value) in self.header.iter().enumerate() {
+            bytes[4 * i..4 * i + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        if let Some(counts) = metadata.tile_counts() {
+            let rows = self.header[0] as usize;
+            let cols = self.header[1] as usize;
+            let planes = self.header[2] as usize;
+            let group = self.header[3] as usize;
+            let free = self.header[6] != 0;
+            let tensor = self.header[7] != 0;
+            let index = self.header[10] as usize;
+            let slots = planes * (rows + 1);
+            let tile_width = self.header[12] as usize;
+            let tiles = cols.div_ceil(tile_width);
+            let mut at = HEADER;
+            let mut scale = 0;
+            for plane in 0..planes {
+                if !free {
+                    scale = 0;
+                }
+                put_u32(&mut bytes, index + 4 * plane, at)?;
+                let mut coefficient = 0;
+                for row in 0..rows {
+                    let slot = plane * (rows + 1) + row;
+                    put_u32(&mut bytes, index + 4 * (planes + slot), coefficient)?;
+                    put_u32(
+                        &mut bytes,
+                        index + 4 * (planes + slots + slot),
+                        if tensor { plane } else { scale },
+                    )?;
+                    for tile in 0..tiles {
+                        let len = (cols - tile * tile_width).min(tile_width);
+                        let count = usize::from(counts[row * tiles + tile]);
+                        if count > plane {
+                            coefficient += len;
+                        }
+                        if !tensor && if free { count > plane } else { count > 0 } {
+                            scale += len.div_ceil(group);
+                        }
+                    }
+                }
+                let trits = metadata.plane_trit_count(plane)?;
+                if coefficient != trits {
+                    return Err(invalid("CUDA compact coefficient index mismatch"));
+                }
+                let end = plane * (rows + 1) + rows;
+                put_u32(&mut bytes, index + 4 * (planes + end), coefficient)?;
+                put_u32(
+                    &mut bytes,
+                    index + 4 * (planes + slots + end),
+                    if tensor { plane } else { scale },
+                )?;
+                at += self
+                    .codec
+                    .ledger(trits)
+                    .map_err(|_| invalid("CUDA codec ledger failed"))?
+                    .physical_bytes;
+            }
+            if !tensor && scale != metadata.scale_count() {
+                return Err(invalid("CUDA compact scale index mismatch"));
+            }
+            bytes[self.header[11] as usize..].copy_from_slice(counts);
+        }
+        Ok(bytes)
+    }
+
     fn validate_finite(view: AdditiveView<'_>) -> Result<(), BackendError> {
         let layout = view.layout();
         let (free, ratio) = match layout.law.relation {
@@ -180,6 +256,174 @@ impl Plan {
         }
         Ok(())
     }
+
+    fn scale(&self, bytes: &[u8], plane: usize, index: usize) -> f32 {
+        let at = self.header[9] as usize + index * self.header[5] as usize;
+        let mut value = if self.header[5] == 2 {
+            f16::from_bits(u16::from_le_bytes([bytes[at], bytes[at + 1]])).to_f32()
+        } else {
+            f32::from_le_bytes(bytes[at..at + 4].try_into().expect("private planned scale"))
+        };
+        if self.header[6] == 0 {
+            let ratio = f32::from_bits(self.header[8]);
+            for _ in 0..plane {
+                value *= ratio;
+            }
+        }
+        value
+    }
+    fn digit(&self, bytes: &[u8], start: usize, coefficient: usize) -> f32 {
+        let data = &bytes[start..self.header[9] as usize];
+        match self.codec {
+            SaltV2Codec::D2 => {
+                f32::from(((data[coefficient / 4] >> (2 * (coefficient % 4))) & 3) as i8 - 1)
+            }
+            SaltV2Codec::B3 => {
+                let divisor = [1, 3, 9, 27, 81][coefficient % 5];
+                f32::from(((data[coefficient / 5] / divisor) % 3) as i8 - 1)
+            }
+            SaltV2Codec::S34 => {
+                let bit = coefficient / 4 * 5;
+                let at = bit / 8;
+                let shift = bit % 8;
+                let mut word = u16::from(data[at]);
+                if shift > 3 {
+                    word |= u16::from(data[at + 1]) << 8;
+                }
+                let code = ((word >> shift) & 31) as usize;
+                let lane = coefficient % 4;
+                let zero = code & 3;
+                if lane == zero {
+                    0.
+                } else {
+                    let sign = lane - usize::from(lane > zero);
+                    if code & (1 << (2 + sign)) == 0 {
+                        -1.
+                    } else {
+                        1.
+                    }
+                }
+            }
+            _ => unreachable!("private planner admits only canonical codecs"),
+        }
+    }
+    fn validate_encoded_finite(&self, bytes: &[u8]) -> Result<(), BackendError> {
+        let width = self.header[5] as usize;
+        let scales = (self.header[10] - self.header[9]) as usize / width;
+        let maximum = (0..scales)
+            .map(|i| self.scale(bytes, 0, i))
+            .fold(0., f32::max);
+        let planes = self.header[2] as usize;
+        let ratio = f32::from_bits(self.header[8]);
+        let mut bound = 0.;
+        let mut component = maximum;
+        for _ in 0..planes {
+            bound += component;
+            if self.header[6] == 0 {
+                component *= ratio;
+            }
+        }
+        if bound.is_finite() {
+            return Ok(());
+        }
+        self.visit_weights(bytes, |_, _, value| {
+            if value.is_finite() {
+                Ok(())
+            } else {
+                Err(invalid("CUDA packed semantic decoded weight is nonfinite"))
+            }
+        })
+    }
+    fn visit_weights(
+        &self,
+        bytes: &[u8],
+        mut visit: impl FnMut(usize, usize, f32) -> Result<(), BackendError>,
+    ) -> Result<(), BackendError> {
+        let planes = self.header[2] as usize;
+        let rows = self.header[0] as usize;
+        let cols = self.header[1] as usize;
+        let group = self.header[3] as usize;
+        let compact = self.header[13] != 0;
+        let tensor = self.header[7] != 0;
+        let free = self.header[6] != 0;
+        let index = self.header[10] as usize;
+        let slots = planes * (rows + 1);
+        // Plane counts are u8. Fixed cursors avoid a complete decoded row/master.
+        let mut cursors = [[0usize; 3]; u8::MAX as usize];
+        for row in 0..rows {
+            for (plane, cursor) in cursors[..planes].iter_mut().enumerate() {
+                *cursor = if compact {
+                    let slot = plane * (rows + 1) + row;
+                    [
+                        read_u32(bytes, index + 4 * plane),
+                        read_u32(bytes, index + 4 * (planes + slot)),
+                        read_u32(bytes, index + 4 * (planes + slots + slot)),
+                    ]
+                } else {
+                    [
+                        HEADER + plane * self.header[12] as usize,
+                        row * cols,
+                        if free {
+                            plane * self.header[14] as usize
+                        } else {
+                            0
+                        },
+                    ]
+                };
+            }
+            for col in 0..cols {
+                let mut sum = 0.;
+                let tile_width = if compact {
+                    self.header[12] as usize
+                } else {
+                    cols
+                };
+                let tiles = cols.div_ceil(tile_width);
+                let tile = col / tile_width;
+                let offset = col % tile_width;
+                let len = (cols - tile * tile_width).min(tile_width);
+                let count = if compact {
+                    usize::from(bytes[self.header[11] as usize + row * tiles + tile])
+                } else {
+                    planes
+                };
+                for (plane, cursor) in cursors[..planes].iter_mut().enumerate() {
+                    if count > plane {
+                        let stored = if compact {
+                            cursor[2] + if tensor { 0 } else { offset / group }
+                        } else {
+                            cursor[2]
+                                + if tensor {
+                                    0
+                                } else {
+                                    row * cols.div_ceil(group) + col / group
+                                }
+                        };
+                        sum += self.digit(bytes, cursor[0], cursor[1] + offset)
+                            * self.scale(bytes, plane, stored);
+                    }
+                    if compact && offset + 1 == len {
+                        if count > plane {
+                            cursor[1] += len;
+                        }
+                        if !tensor && if free { count > plane } else { count > 0 } {
+                            cursor[2] += len.div_ceil(group);
+                        }
+                    }
+                }
+                visit(row, col, sum)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn read_u32(bytes: &[u8], at: usize) -> usize {
+    u32::from_le_bytes(
+        bytes[at..at + 4]
+            .try_into()
+            .expect("private planned native index"),
+    ) as usize
 }
 
 fn put_u32(bytes: &mut [u8], at: usize, value: usize) -> Result<(), BackendError> {
@@ -188,6 +432,74 @@ fn put_u32(bytes: &mut [u8], at: usize, value: usize) -> Result<(), BackendError
 }
 
 impl PackedAdditive {
+    pub(super) fn stream_metadata(
+        metadata: AdditiveMetadata<'_>,
+    ) -> Result<(usize, usize, usize), BackendError> {
+        if !matches!(metadata.layout().transport, tritium_schema::Transport::Raw) {
+            return Err(BackendError::UnsupportedTensor);
+        }
+        let plan = Plan::from_metadata(metadata)?;
+        let workspace = plan
+            .bytes
+            .checked_add(TENSOR_STREAM_CHUNK_BYTES)
+            .ok_or_else(|| invalid("CUDA stream workspace overflows"))?;
+        Ok((plan.bytes, workspace, plan.header[10] as usize - HEADER))
+    }
+    fn stage_stream(
+        metadata: AdditiveMetadata<'_>,
+        source: &dyn TensorStreamSource,
+    ) -> Result<Vec<u8>, BackendError> {
+        let (_, _, expected) = Self::stream_metadata(metadata)?;
+        if source.encoded_bytes() != expected as u64 {
+            return Err(invalid("CUDA stream encoded length mismatch"));
+        }
+        let plan = Plan::from_metadata(metadata)?;
+        let mut bytes = plan.allocate(metadata)?;
+        let mut at = HEADER;
+        let end = plan.header[10] as usize;
+        source.visit(&mut |chunk| {
+            if chunk.len() > TENSOR_STREAM_CHUNK_BYTES {
+                return Err(invalid("CUDA source window exceeds stream bound"));
+            }
+            let next = at
+                .checked_add(chunk.len())
+                .ok_or_else(|| invalid("CUDA source size overflows"))?;
+            if next > end {
+                return Err(invalid("CUDA source exceeds stream plan"));
+            }
+            bytes[at..next].copy_from_slice(chunk);
+            at = next;
+            Ok(())
+        })?;
+        if at != end {
+            return Err(invalid("CUDA source shorter than stream plan"));
+        }
+        if let Some(counts) = metadata.tile_counts() {
+            tritium_format::AdditivePayload::new_per_tile(
+                metadata.layout(),
+                counts,
+                &bytes[HEADER..end],
+            )
+            .map_err(|e| invalid(&format!("CUDA canonical source: {e:?}")))?;
+        } else {
+            tritium_format::AdditivePayload::new_uniform(
+                metadata.layout(),
+                metadata.plane_count() as u8,
+                &bytes[HEADER..end],
+            )
+            .map_err(|e| invalid(&format!("CUDA canonical source: {e:?}")))?;
+        }
+        plan.validate_encoded_finite(&bytes)?;
+        Ok(bytes)
+    }
+    pub(super) fn upload_stream(
+        backend: &CudaBackend,
+        metadata: AdditiveMetadata<'_>,
+        source: &dyn TensorStreamSource,
+    ) -> Result<Self, BackendError> {
+        let bytes = Self::stage_stream(metadata, source)?;
+        Self::transfer(backend, &bytes)
+    }
     pub(super) fn plan_metadata(
         metadata: AdditiveMetadata<'_>,
     ) -> Result<(usize, usize), BackendError> {
@@ -203,27 +515,15 @@ impl PackedAdditive {
         backend: &CudaBackend,
         view: AdditiveView<'_>,
     ) -> Result<Self, BackendError> {
+        let bytes = Self::stage_view(view)?;
+        Self::transfer(backend, &bytes)
+    }
+
+    fn stage_view(view: AdditiveView<'_>) -> Result<Vec<u8>, BackendError> {
         let plan = Plan::new(view)?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(plan.bytes)
-            .map_err(|_| BackendError::OutOfMemory {
-                requested: plan.bytes,
-            })?;
-        bytes.resize(plan.bytes, 0);
-        for (i, value) in plan.header.iter().enumerate() {
-            bytes[4 * i..4 * i + 4].copy_from_slice(&value.to_le_bytes());
-        }
+        let mut bytes = plan.allocate(AdditiveMetadata::from_view(view))?;
         let mut at = HEADER;
-        let rows = plan.header[0] as usize;
-        let cols = plan.header[1] as usize;
         let planes = plan.header[2] as usize;
-        let group = plan.header[3] as usize;
-        let free = plan.header[6] != 0;
-        let tensor = plan.header[7] != 0;
-        let index = plan.header[10] as usize;
-        let slots = planes * (rows + 1);
-        let mut scale = 0usize;
         for plane in 0..planes {
             let trits = view
                 .plane_trits(plane)
@@ -236,49 +536,6 @@ impl PackedAdditive {
             plan.codec
                 .pack_into(trits, &mut bytes[at..at + len])
                 .map_err(|_| invalid("CUDA canonical plane encoding failed"))?;
-            if let Some(counts) = view.tile_counts() {
-                if !free {
-                    scale = 0;
-                }
-                put_u32(&mut bytes, index + 4 * plane, at)?;
-                let mut coefficient = 0usize;
-                let tile_width = plan.header[12] as usize;
-                let tiles = cols.div_ceil(tile_width);
-                for row in 0..rows {
-                    let slot = plane * (rows + 1) + row;
-                    put_u32(&mut bytes, index + 4 * (planes + slot), coefficient)?;
-                    put_u32(
-                        &mut bytes,
-                        index + 4 * (planes + slots + slot),
-                        if tensor { plane } else { scale },
-                    )?;
-                    for tile in 0..tiles {
-                        let len = (cols - tile * tile_width).min(tile_width);
-                        if usize::from(counts[row * tiles + tile]) > plane {
-                            coefficient += len;
-                        }
-                        if !tensor
-                            && if free {
-                                usize::from(counts[row * tiles + tile]) > plane
-                            } else {
-                                counts[row * tiles + tile] > 0
-                            }
-                        {
-                            scale += len.div_ceil(group);
-                        }
-                    }
-                }
-                if coefficient != trits.len() {
-                    return Err(invalid("CUDA compact coefficient index mismatch"));
-                }
-                let end = plane * (rows + 1) + rows;
-                put_u32(&mut bytes, index + 4 * (planes + end), coefficient)?;
-                put_u32(
-                    &mut bytes,
-                    index + 4 * (planes + slots + end),
-                    if tensor { plane } else { scale },
-                )?;
-            }
             at += len;
         }
         let width = plan.header[5] as usize;
@@ -290,16 +547,14 @@ impl PackedAdditive {
             }
             at += width;
         }
-        if let Some(counts) = view.tile_counts() {
-            if !tensor && scale != view.scales().len() {
-                return Err(invalid("CUDA compact scale index mismatch"));
-            }
-            bytes[plan.header[11] as usize..].copy_from_slice(counts);
-        }
+        Ok(bytes)
+    }
+
+    fn transfer(backend: &CudaBackend, bytes: &[u8]) -> Result<Self, BackendError> {
         let bytes = backend
             .stream
-            .clone_htod(&bytes)
-            .map_err(|e| alloc_or_backend("upload CUDA packed semantic tensor", &e, plan.bytes))?;
+            .clone_htod(bytes)
+            .map_err(|e| alloc_or_backend("upload CUDA packed semantic tensor", &e, bytes.len()))?;
         Ok(Self { bytes })
     }
 

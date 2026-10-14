@@ -50,3 +50,52 @@ fn large_geometry_is_planned_without_coefficients_or_runtime_indices() {
     assert!(plan.host_workspace_bytes >= plan.caps.payload_bytes);
     // This is a structural software test, not observed allocation/VRAM or support.
 }
+
+#[test]
+fn encoded_stream_plans_account_for_native_staging_and_bounded_scratch_without_init() {
+    let source = tritium_testkit::additive_upload_fixture();
+    let metadata = TensorMetadata::Additive(AdditiveMetadata::uniform(source.layout(), 1).unwrap());
+    let plan = CudaBackend::plan_tensor_stream(
+        metadata,
+        tritium_spec::TensorStreamEncoding::CanonicalRawAdditive,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(plan.upload.caps.payload_bytes, 70);
+    assert_eq!(plan.encoded_bytes, 10);
+    assert_eq!(plan.upload.host_workspace_bytes, 70 + 65536);
+    assert_eq!(plan.upload.device_workspace_bytes, 0);
+    for precision in [
+        tritium_schema::ScalePrecision::F16,
+        tritium_schema::ScalePrecision::Bf16,
+        tritium_schema::ScalePrecision::F32,
+    ] {
+        let plan = CudaBackend::plan_tensor_stream(
+            TensorMetadata::Dense { rows: 7, cols: 32 },
+            tritium_spec::TensorStreamEncoding::DenseLittleEndian(precision),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(plan.upload.caps.payload_bytes, 7 * 32 * 4);
+        assert_eq!(plan.upload.host_workspace_bytes, 7 * 32 * 4 + 65536);
+        assert_eq!(
+            plan.encoded_bytes,
+            7 * 32
+                * if precision == tritium_schema::ScalePrecision::F32 {
+                    4
+                } else {
+                    2
+                }
+        );
+    }
+    assert!(
+        CudaBackend::plan_tensor_stream(
+            metadata,
+            tritium_spec::TensorStreamEncoding::DenseLittleEndian(
+                tritium_schema::ScalePrecision::F32
+            )
+        )
+        .unwrap()
+        .is_none()
+    );
+}

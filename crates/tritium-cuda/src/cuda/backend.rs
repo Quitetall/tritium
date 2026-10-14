@@ -9200,6 +9200,15 @@ impl CudaBackend {
     ) -> Result<Option<tritium_spec::TensorUploadPlan>, BackendError> {
         semantic::CudaTensor::plan(metadata)
     }
+    /// Pure encoded-source/native-envelope planning; no device initialization.
+    /// Host staging and bounded explicit scratch are declared; allocator/driver/
+    /// pinned transfer overhead and execution resources remain excluded/unknown.
+    pub fn plan_tensor_stream(
+        metadata: tritium_spec::TensorMetadata<'_>,
+        encoding: tritium_spec::TensorStreamEncoding,
+    ) -> Result<Option<tritium_spec::TensorStreamPlan>, BackendError> {
+        semantic::CudaTensor::stream_plan(metadata, encoding)
+    }
 }
 
 impl TernaryBackend for CudaBackend {
@@ -9310,6 +9319,19 @@ impl TernaryBackend for CudaBackend {
         tensor: tritium_spec::TensorView<'_>,
     ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
         semantic::CudaTensor::upload(self, tensor)
+    }
+    fn tensor_stream_plan(
+        &self,
+        metadata: tritium_spec::TensorMetadata<'_>,
+        encoding: tritium_spec::TensorStreamEncoding,
+    ) -> Result<Option<tritium_spec::TensorStreamPlan>, BackendError> {
+        Self::plan_tensor_stream(metadata, encoding)
+    }
+    fn upload_tensor_stream(
+        &self,
+        source: &dyn tritium_spec::TensorStreamSource,
+    ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        semantic::CudaTensor::upload_stream(self, source)
     }
 
     fn matmul(&self, p: tritium_spec::TensorMatmul<'_>) -> Result<(), BackendError> {

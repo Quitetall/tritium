@@ -3,7 +3,9 @@
 //! external evidence, owner acceptance of candidate identities, quality or release admission.
 
 mod binding;
+mod dense_stream;
 mod seek_reader;
+pub use dense_stream::DensePayloadDecoder;
 mod sizing;
 mod stage;
 

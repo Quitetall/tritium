@@ -11,7 +11,8 @@ use std::sync::Arc;
 use tritium_core::{GemmShape, apply_basis, apply_inverse_basis};
 use tritium_format::AdditiveTensor;
 use tritium_spec::{
-    BackendError, Basis, DeviceBuffer, TensorCaps, TensorExecution, TensorMatmul, TensorMetadata,
+    BackendError, Basis, DeviceBuffer, TENSOR_STREAM_CHUNK_BYTES, TensorCaps, TensorExecution,
+    TensorMatmul, TensorMetadata, TensorStreamEncoding, TensorStreamPlan, TensorStreamSource,
     TensorUploadPlan, TensorView, admitted_execution_group,
 };
 mod basis;
@@ -56,6 +57,130 @@ fn product(a: usize, b: usize) -> Result<usize, BackendError> {
 }
 
 impl CudaTensor {
+    pub(super) fn stream_plan(
+        metadata: TensorMetadata<'_>,
+        encoding: TensorStreamEncoding,
+    ) -> Result<Option<TensorStreamPlan>, BackendError> {
+        let (bytes, workspace, encoded) = match (metadata, encoding) {
+            (TensorMetadata::Additive(a), TensorStreamEncoding::CanonicalRawAdditive) => {
+                match PackedAdditive::stream_metadata(a) {
+                    Ok(p) => p,
+                    Err(BackendError::UnsupportedTensor) => return Ok(None),
+                    Err(e) => return Err(e),
+                }
+            }
+            (
+                TensorMetadata::Dense { rows, cols },
+                TensorStreamEncoding::DenseLittleEndian(precision),
+            ) => {
+                if !matches!(
+                    precision,
+                    tritium_schema::ScalePrecision::F16
+                        | tritium_schema::ScalePrecision::Bf16
+                        | tritium_schema::ScalePrecision::F32
+                ) {
+                    return Ok(None);
+                }
+                let bytes = TensorMetadata::dense_bytes(rows, cols)?;
+                if rows != 0 && cols != 0 {
+                    CudaBackend::check_grad_launch_bounds(1, rows, cols)?;
+                }
+                let encoded =
+                    tritium_format::trit_model::DensePayloadDecoder::byte_len(precision, bytes / 4)
+                        .map_err(|e| invalid(&e.to_string()))?;
+                let workspace = bytes
+                    .checked_add(TENSOR_STREAM_CHUNK_BYTES)
+                    .ok_or_else(|| invalid("CUDA dense stream workspace overflows"))?;
+                (bytes, workspace, encoded)
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(TensorStreamPlan {
+            upload: TensorUploadPlan {
+                caps: TensorCaps {
+                    execution: TensorExecution::Native,
+                    payload_bytes: bytes as u64,
+                },
+                host_workspace_bytes: workspace as u64,
+                device_workspace_bytes: 0,
+            },
+            encoded_bytes: encoded as u64,
+        }))
+    }
+    fn stage_dense(
+        source: &dyn TensorStreamSource,
+        rows: usize,
+        cols: usize,
+        precision: tritium_schema::ScalePrecision,
+    ) -> Result<Vec<f32>, BackendError> {
+        let requested = TensorMetadata::dense_bytes(rows, cols)?;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(requested / 4)
+            .map_err(|_| BackendError::OutOfMemory { requested })?;
+        values.resize(requested / 4, 0.);
+        let mut decoder =
+            tritium_format::trit_model::DensePayloadDecoder::new(precision, &mut values)
+                .map_err(|e| invalid(&e.to_string()))?;
+        source.visit(&mut |chunk| {
+            if chunk.len() > TENSOR_STREAM_CHUNK_BYTES {
+                return Err(invalid("CUDA source window exceeds stream bound"));
+            }
+            decoder.push(chunk).map_err(|e| invalid(&e.to_string()))
+        })?;
+        decoder.finish().map_err(|e| invalid(&e.to_string()))?;
+        Ok(values)
+    }
+    pub(super) fn upload_stream(
+        backend: &CudaBackend,
+        source: &dyn TensorStreamSource,
+    ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        let metadata = source.metadata();
+        let plan = Self::stream_plan(metadata, source.encoding())?
+            .ok_or(BackendError::UnsupportedTensor)?;
+        if source.encoded_bytes() != plan.encoded_bytes {
+            return Err(invalid("CUDA stream encoded length differs from geometry"));
+        }
+        match (metadata, source.encoding()) {
+            (TensorMetadata::Additive(a), TensorStreamEncoding::CanonicalRawAdditive) => {
+                let layout = a.layout();
+                Ok(Box::new(Self {
+                    rows: layout.rows as usize,
+                    cols: layout.cols as usize,
+                    basis: layout.basis,
+                    values: None,
+                    packed: Some(PackedAdditive::upload_stream(backend, a, source)?),
+                    owner: Arc::clone(&backend.stream),
+                }))
+            }
+            (
+                TensorMetadata::Dense { rows, cols },
+                TensorStreamEncoding::DenseLittleEndian(precision),
+            ) => {
+                let values = Self::stage_dense(source, rows, cols, precision)?;
+                let device = if values.is_empty() {
+                    None
+                } else {
+                    Some(backend.stream.clone_htod(&values).map_err(|e| {
+                        alloc_or_backend(
+                            "upload CUDA dense stream",
+                            &e,
+                            plan.upload.caps.payload_bytes as usize,
+                        )
+                    })?)
+                };
+                Ok(Box::new(Self {
+                    rows,
+                    cols,
+                    basis: Basis::Identity,
+                    values: device,
+                    packed: None,
+                    owner: Arc::clone(&backend.stream),
+                }))
+            }
+            _ => Err(BackendError::UnsupportedTensor),
+        }
+    }
     pub(super) fn plan(
         metadata: TensorMetadata<'_>,
     ) -> Result<Option<TensorUploadPlan>, BackendError> {
