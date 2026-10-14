@@ -57,6 +57,7 @@ mod generate;
 mod hestia_gate;
 mod hex;
 mod inspect;
+mod inspect_trit;
 mod migrate;
 #[cfg(feature = "cuda")]
 mod nvml_probe;
@@ -109,6 +110,11 @@ enum Command {
     Inspect {
         /// Path to the `.gguf` file to inspect.
         path: PathBuf,
+    },
+    /// Prepare an actual typed text source without loading backend weights.
+    InspectTrit {
+        #[command(flatten)]
+        args: Box<inspect_trit::InspectTritArgs>,
     },
     /// List every backend the runtime discovered, with its capabilities.
     ListBackends,
@@ -412,6 +418,7 @@ impl Command {
     fn evidence_name(&self) -> &'static str {
         match self {
             Self::Inspect { .. } => "inspect",
+            Self::InspectTrit { .. } => "inspect-trit",
             Self::Migrate { .. } => "migrate",
             Self::ListBackends => "list-backends",
             Self::Campaign { .. } => "campaign",
@@ -616,6 +623,7 @@ fn main() -> anyhow::Result<()> {
     let command_result = (|| -> anyhow::Result<()> {
         match cli.command {
             Command::Inspect { path } => inspect::run(&path)?,
+            Command::InspectTrit { args } => inspect_trit::run(*args)?,
             Command::Migrate { migrate: command } => migrate::run(command)?,
             Command::ListBackends => backends::run(),
             Command::Campaign { campaign: command } => campaign::run(command)?,

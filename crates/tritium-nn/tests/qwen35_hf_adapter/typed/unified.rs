@@ -9,6 +9,9 @@ use tritium_nn::{LayerKind, ModelSource, Tokenizer};
 #[path = "unified/stream_limits.rs"]
 mod stream_limits;
 
+#[path = "unified/inspection.rs"]
+mod inspection;
+
 #[cfg(feature = "cuda")]
 #[path = "unified/resident.rs"]
 mod resident;

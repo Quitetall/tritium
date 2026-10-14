@@ -26,6 +26,8 @@ mod qwen35_trit;
 pub(crate) mod resident;
 #[cfg(feature = "tokenizer")]
 mod retained;
+#[cfg(feature = "tokenizer")]
+mod retained_plan;
 mod runner;
 #[cfg(feature = "cuda")]
 mod salt_v2;
@@ -76,6 +78,8 @@ pub use qwen35_salt_v2::{
     Qwen35SaltV2BundleAdmission, Qwen35SaltV2LanguageMtpModel, Qwen35SaltV2LoadReceipt,
 };
 pub use qwen35_trit::Qwen35TritReadLimits;
+#[cfg(feature = "tokenizer")]
+pub use retained_plan::{ModelLoadPlan, TensorLoadPlan, inspect_trit_file};
 pub use runner::{ForwardDump, ModelRunner};
 #[cfg(feature = "cuda")]
 pub use salt_v2::{

@@ -2,6 +2,98 @@
 use super::*;
 use tritium_nn::Tokenizer;
 
+#[test]
+fn actual_cli_inspects_source_without_executing_or_replacing_joined_authority() {
+    let f = Fixture::with_tokenizer();
+    let path = f.dir.0.join("inspect.trit");
+    std::fs::write(&path, &f.expected).unwrap();
+    let args: Vec<OsString> = vec![
+        "--evidence".into(),
+        "off".into(),
+        "inspect-trit".into(),
+        "--model".into(),
+        path.clone().into(),
+        "--level".into(),
+        "standard".into(),
+        "--max-context".into(),
+        "16".into(),
+        "--max-segment-tokens".into(),
+        "4".into(),
+        "--max-host-cache-payload-bytes".into(),
+        "1000000".into(),
+    ];
+    let result = run(&args);
+    assert!(
+        !result.status.success(),
+        "joined C cannot become an ordinary source plan"
+    );
+    assert!(result.stdout.is_empty());
+    let mut source = Fixture::text_source();
+    let request = QuantPlan {
+        architecture: "qwen3".into(),
+        tensors: source
+            .inventory()
+            .unwrap()
+            .into_iter()
+            .map(|source| QuantTensorPlan {
+                source,
+                action: QuantAction::KeepDense,
+            })
+            .collect(),
+        assets: source.asset_names(),
+        levels: vec!["standard".into()],
+        limits: QuantLimits {
+            max_source_bytes: 64000,
+            max_asset_bytes: 16000,
+            max_retained_blob_bytes: 64000,
+            max_package_bytes: 1000000,
+        },
+    };
+    let mut sink = MemoryTensorSink::default();
+    Engine::run(&request, &mut source, &mut sink, recorder()).unwrap();
+    let ordinary = sink.artifact().unwrap().0;
+    std::fs::write(&path, ordinary).unwrap();
+    let result = run(&args);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report["status"], "source-prepared-not-runtime-admitted");
+    assert_eq!(report["source_bytes"], ordinary.len() as u64);
+    assert_eq!(report["source"]["Trit"]["level"], "standard");
+    assert_eq!(report["architecture"], "qwen3");
+    assert_eq!(report["backend_payload_bytes"], serde_json::Value::Null);
+    assert_eq!(
+        report["physical_memory"],
+        "unknown-not-covered-by-source-plan"
+    );
+    assert_eq!(report["weights_uploaded"], false);
+    assert!(report["tensors"].as_array().unwrap().len() > 1);
+    assert!(report["logical_host_cache_payload_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(std::fs::read(&path).unwrap(), ordinary);
+    let mut too_small = args.clone();
+    too_small.extend(["--max-output-bytes".into(), "16".into()]);
+    let refused = run(&too_small);
+    assert!(!refused.status.success());
+    assert!(refused.stdout.is_empty(), "no partial report on overflow");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--max-output-bytes"));
+    let mut partial_policy = vec![
+        "--evidence".into(),
+        "off".into(),
+        "inspect-trit".into(),
+        "--model".into(),
+        path.into(),
+        "--level".into(),
+        "standard".into(),
+    ];
+    partial_policy.extend(["--max-context".into(), "16".into()]);
+    let refused = run(&partial_policy);
+    assert!(!refused.status.success());
+    assert!(refused.stdout.is_empty());
+}
+
 fn arguments(f: &Fixture, text: Option<&str>, max_new: usize, eos: u32) -> Vec<OsString> {
     std::fs::write(f.dir.0.join("model.trit"), &f.expected).unwrap();
     std::fs::write(f.dir.0.join("fit.jsonl"), &f.fit).unwrap();

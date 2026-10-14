@@ -84,6 +84,37 @@ either protocol and rejects mixed/duplicate preparations, changed metadata,
 invalid payload inventory and changed exact package bytes. Compact evidence is
 not a source-authentication, memory/RSS, quality or public-release receipt.
 
+Migration reports expose actual target `levels`; inspection/import also expose
+the selected original `source_profile`. These are different names: migrating
+an original `compact-v1` profile currently produces target level `imported`.
+
+Read-only typed text-source preparation uses the same module as ordinary loading:
+
+```text
+tritium --evidence off inspect-trit --model /absolute/model.trit --level imported \
+  --max-package-bytes 8589934592 --max-manifest-bytes 134217728 \
+  --max-tensor-bytes 2147483648 --max-decoded-tensor-bytes 8589934592 \
+  --max-context 32 --max-segment-tokens 4 --max-host-cache-payload-bytes 536870912
+```
+
+Source/config/inventory/tokenizer and optional stream caps still apply. The three
+stream limits are supplied together or omitted together. `inspect-trit` does
+not initialize a backend, fully materialize a tensor, upload weights, serve,
+emit ModelLoaded or replace joined-lineage admission. Canonical codec windows
+are still validated by the format reader. Reports are published only after
+terminal source verification and complete bounded JSON serialization;
+`--max-output-bytes` defaults to 1MiB including the newline, with no partial stdout
+on overflow. No per-tile count arrays or full-manifest JSON copy is included.
+
+Status is `source-prepared-not-runtime-admitted`. The per-name encoded/decode
+sums and maximum encoded+decoded payload pair describe the current compatibility
+path, not deduplicated storage, retained native payload or physical peak memory.
+Backend costs remain null/unknown. Metadata, allocator/driver, tokenizer heap,
+backend copies, widened preserved values and device state/scratch still need
+separate aggregate admission and physical qualification. Cache payload is only
+reported for an explicit admitted stream policy. Raising inspection caps does
+not allocate those full decoded buffers or establish that inference fits.
+
 Typed `quantize` rejects legacy `--input`/`--model`, `--bpw`, `--scale-group`,
 `--sensitivity`, `--fisher`, `--format`, `--ladder`, `--planes`, `--group`,
 `--grid` and `--rotate`, even when explicitly set to their legacy defaults.

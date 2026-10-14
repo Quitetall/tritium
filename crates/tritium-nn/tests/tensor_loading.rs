@@ -1157,6 +1157,20 @@ fn check_text_load(
         _ => panic!("unexpected test source"),
     };
     let expected_backend = backend.device_id().to_owned();
+    if let tritium_nn::ModelSource::TritFile {
+        path,
+        level,
+        receiving,
+        limits,
+    } = source
+    {
+        let plan = tritium_nn::inspect_trit_file(path, level, receiving, limits, None).unwrap();
+        assert_eq!(plan.source(), &expected_source);
+        assert_eq!(plan.architecture().name(), "qwen3");
+        assert_eq!(plan.architecture().vocab_size(), 10);
+        assert!(plan.backend_payload_bytes().is_none());
+        assert!(plan.cache_admission().is_none());
+    }
     let expected_device = backend.physical_device_id().to_owned();
     let budget = TensorPayloadBudget::new(100_000);
     let mut recorder = EvidenceRecorder::new(

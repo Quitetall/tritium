@@ -32,6 +32,9 @@ mod teacher_cache;
 mod tensor;
 mod training;
 
+#[cfg(feature = "tokenizer")]
+pub use model::{ModelLoadPlan, TensorLoadPlan, inspect_trit_file};
+
 pub use config::{ArchSpec, MlpKind, ModelConfig};
 pub use error::NnError;
 #[cfg(feature = "cuda")]

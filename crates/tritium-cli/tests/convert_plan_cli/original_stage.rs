@@ -124,6 +124,9 @@ impl Fixture {
         Self::from_raw(raw(precision))
     }
     fn with_tokenizer() -> Self {
+        Self::from_raw(Self::text_source())
+    }
+    fn text_source() -> InMemoryWeightSource {
         let mut source = raw(ScalePrecision::Bf16);
         let vocab = [
             "[UNK]", "hello", "partner", "[EOS]", "[BOS]", "t5", "t6", "t7", "t8", "t9",
@@ -147,7 +150,7 @@ impl Fixture {
             "tokenizer_config.json".into(),
             br#"{"bos_token":"[BOS]","eos_token":{"content":"[EOS]"}}"#.to_vec(),
         );
-        Self::from_raw(source)
+        source
     }
     fn from_raw(mut raw: InMemoryWeightSource) -> Self {
         let dir = Scratch::new();

@@ -74,59 +74,82 @@ impl Qwen35TextWeights {
         let config_bytes = collect(length, |visit| {
             model.visit_asset("config.json", visit).map_err(invalid)
         })?;
-        let config = Qwen35CheckpointConfig::from_hf_config(
-            std::str::from_utf8(&config_bytes).map_err(invalid)?,
-        )?;
-        if model.manifest().architecture != config.model_type {
-            return Err(invalid("manifest/config architecture mismatch"));
-        }
-        let schema = qwen35_language_mtp_tensor_schema(&config.text)?;
-        let selected = model
-            .manifest()
-            .levels
-            .iter()
-            .find(|l| l.name == level)
-            .ok_or_else(|| invalid("absent Qwen level"))?;
-        if selected.tensors.len() != schema.len() {
-            return Err(invalid("Qwen language/MTP inventory count mismatch"));
-        }
-        for entry in &schema {
-            let meta = model.tensor_meta(level, &entry.name).map_err(invalid)?;
-            let expected = entry.shape.iter().map(|&d| d as u64).collect::<Vec<_>>();
-            match (&meta.storage, entry.role) {
-                (TensorStorage::Dense { shape, .. }, _) if shape == &expected => {}
-                (TensorStorage::Additive { .. }, Qwen35TensorSchemaRole::Matrix)
-                    if expected.len() == 2
-                        && matrix_shape(meta)? == (entry.shape[0], entry.shape[1]) => {}
-                _ => {
-                    return Err(invalid(format!(
-                        "{}: Qwen shape/storage mismatch",
-                        entry.name
-                    )));
-                }
-            }
-            check(
-                model.tensor_byte_len(level, &entry.name).map_err(invalid)?,
-                limits.max_tensor_bytes,
-                "encoded tensor bytes",
-            )?;
-            check(
-                decoded_bytes(meta)?,
-                limits.max_decoded_tensor_bytes,
-                "logical decoded tensor bytes",
-            )?;
-        }
-        let source = Source {
-            model: RefCell::new(model),
-            level,
-            loader: RefCell::new(loader),
-            limits,
-        };
-        let language = load_language_weights(&source, &config.text)?;
-        let mtp = load_mtp_weights(&source, &config.text)?;
-        source.model.borrow_mut().verify().map_err(invalid)?;
+        let config = prepare_metadata(model, level, limits, &config_bytes)?;
+        let (language, mtp) = assemble_prepared(model, level, loader, limits, &config)?;
         Ok((config, language, mtp))
     }
+}
+
+pub(super) fn prepare_metadata<R: Read + Seek>(
+    model: &TritModelReader<R>,
+    level: &str,
+    limits: Qwen35TritReadLimits,
+    config_bytes: &[u8],
+) -> Result<Qwen35CheckpointConfig, NnError> {
+    let config = Qwen35CheckpointConfig::from_hf_config(
+        std::str::from_utf8(config_bytes).map_err(invalid)?,
+    )?;
+    if model.manifest().architecture != config.model_type {
+        return Err(invalid("manifest/config architecture mismatch"));
+    }
+    let schema = qwen35_language_mtp_tensor_schema(&config.text)?;
+    let selected = model
+        .manifest()
+        .levels
+        .iter()
+        .find(|l| l.name == level)
+        .ok_or_else(|| invalid("absent Qwen level"))?;
+    if selected.tensors.len() != schema.len() {
+        return Err(invalid("Qwen language/MTP inventory count mismatch"));
+    }
+    for entry in &schema {
+        let meta = model.tensor_meta(level, &entry.name).map_err(invalid)?;
+        let expected = entry.shape.iter().map(|&d| d as u64).collect::<Vec<_>>();
+        match (&meta.storage, entry.role) {
+            (TensorStorage::Dense { shape, .. }, _) if shape == &expected => {}
+            (TensorStorage::Additive { .. }, Qwen35TensorSchemaRole::Matrix)
+                if expected.len() == 2
+                    && matrix_shape(meta)? == (entry.shape[0], entry.shape[1]) => {}
+            _ => {
+                return Err(invalid(format!(
+                    "{}: Qwen shape/storage mismatch",
+                    entry.name
+                )));
+            }
+        }
+        check(
+            model.tensor_byte_len(level, &entry.name).map_err(invalid)?,
+            limits.max_tensor_bytes,
+            "encoded tensor bytes",
+        )?;
+        check(
+            decoded_bytes(meta)?,
+            limits.max_decoded_tensor_bytes,
+            "logical decoded tensor bytes",
+        )?;
+    }
+    Ok(config)
+}
+
+pub(super) fn assemble_prepared<R: Read + Seek>(
+    model: &mut TritModelReader<R>,
+    level: &str,
+    loader: &mut TensorLoader<'_>,
+    limits: Qwen35TritReadLimits,
+    config: &Qwen35CheckpointConfig,
+) -> Result<(Qwen35TextWeights, Qwen35MtpWeights), NnError> {
+    loader.check_evidence()?;
+    model.verify().map_err(invalid)?;
+    let source = Source {
+        model: RefCell::new(model),
+        level,
+        loader: RefCell::new(loader),
+        limits,
+    };
+    let language = load_language_weights(&source, &config.text)?;
+    let mtp = load_mtp_weights(&source, &config.text)?;
+    source.model.borrow_mut().verify().map_err(invalid)?;
+    Ok((language, mtp))
 }
 
 fn invalid(error: impl std::fmt::Display) -> NnError {

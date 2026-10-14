@@ -1,12 +1,12 @@
 //! Private retained-source adapter behind the one public text loader.
 use super::{
-    HfJsonTokenizer, LoadedModel, Qwen35TritReadLimits, Runner,
-    qwen35_trit::{check, collect, decoded_bytes},
-    source::{dense_values, matrix_shape, prepare_trit_metadata, upload_matrix},
+    LoadedModel, Qwen35TritReadLimits, Runner,
+    qwen35_trit::{assemble_prepared, check, collect},
+    retained_plan::{Graph, Prepared, positive, prepare},
+    source::{dense_values, upload_matrix},
 };
 use crate::{
-    NnError, Projection, Qwen35CheckpointConfig, Qwen35TextRunner, Qwen35TextWeights, TensorLoader,
-    TokenEmbedding, UnverifiedQwen35Mtp,
+    NnError, Projection, Qwen35TextRunner, TensorLoader, TokenEmbedding, UnverifiedQwen35Mtp,
 };
 use std::{
     cell::RefCell,
@@ -16,7 +16,7 @@ use std::{
 };
 use tritium_format::{TritPackageReadLimits, trit_model::TritModelReader};
 use tritium_runtime::{TensorPayloadBudget, TensorUploadContext};
-use tritium_schema::{LoadedSourceIdentity, ModelLoaded, TensorStorage, TensorUploadPolicy};
+use tritium_schema::{ModelLoaded, TensorStorage, TensorUploadPolicy};
 use tritium_spec::TernaryBackend;
 
 fn invalid(e: impl std::fmt::Display) -> NnError {
@@ -35,10 +35,19 @@ pub(super) fn load_file(
     context: TensorUploadContext<'_>,
 ) -> Result<LoadedModel, NnError> {
     positive(limits)?;
-    let model =
-        TritModelReader::open(File::open(path).map_err(invalid)?, receiving).map_err(invalid)?;
+    let file = File::open(path).map_err(invalid)?;
+    let source_bytes = file.metadata().map_err(invalid)?.len();
+    let model = TritModelReader::open(file, receiving).map_err(invalid)?;
     load_reader(
-        model, level, limits, backend, policy, budget, execution, context,
+        model,
+        source_bytes,
+        level,
+        limits,
+        backend,
+        policy,
+        budget,
+        execution,
+        context,
     )
 }
 pub(super) fn load_bytes(
@@ -63,6 +72,7 @@ pub(super) fn load_bytes(
     .map_err(invalid)?;
     load_reader(
         model,
+        bytes.len() as u64,
         level,
         Qwen35TritReadLimits {
             max_config_bytes: 16 * 1024 * 1024,
@@ -75,27 +85,6 @@ pub(super) fn load_bytes(
         execution,
         context,
     )
-}
-fn positive(l: Qwen35TritReadLimits) -> Result<(), NnError> {
-    if [
-        l.max_config_bytes,
-        l.max_tensor_bytes,
-        l.max_decoded_tensor_bytes,
-    ]
-    .contains(&0)
-    {
-        return Err(invalid("read/decode caps must be positive"));
-    }
-    Ok(())
-}
-fn asset<R: Read + Seek>(
-    model: &mut TritModelReader<R>,
-    name: &str,
-    max: u64,
-) -> Result<Vec<u8>, NnError> {
-    let n = model.asset_byte_len(name).map_err(invalid)?;
-    check(n, max, "asset bytes")?;
-    collect(n, |visit| model.visit_asset(name, visit).map_err(invalid))
 }
 fn tensor<R: Read + Seek>(
     model: &mut TritModelReader<R>,
@@ -112,6 +101,7 @@ fn tensor<R: Read + Seek>(
 #[allow(clippy::too_many_arguments)]
 fn load_reader<R: Read + Seek>(
     mut model: TritModelReader<R>,
+    source_bytes: u64,
     level: &str,
     limits: Qwen35TritReadLimits,
     backend: Box<dyn TernaryBackend>,
@@ -120,78 +110,15 @@ fn load_reader<R: Read + Seek>(
     execution: Option<super::StreamLimits>,
     context: TensorUploadContext<'_>,
 ) -> Result<LoadedModel, NnError> {
-    positive(limits)?;
-    model
-        .validate_complete_payload_inventory()
-        .map_err(invalid)?;
-    let config_bytes = asset(&mut model, "config.json", limits.max_config_bytes)?;
-    let text = std::str::from_utf8(&config_bytes).map_err(invalid)?;
-    let json: serde_json::Value = serde_json::from_str(text).map_err(invalid)?;
-    let hybrid = json["model_type"] == "qwen3_5";
-    let standard = if hybrid {
-        None
-    } else {
-        Some(prepare_trit_metadata(
-            model.manifest(),
-            level,
-            &config_bytes,
-        )?)
-    };
-    let qwen = if hybrid {
-        Some(Qwen35CheckpointConfig::from_hf_config(text)?)
-    } else {
-        None
-    };
-    let admission = execution
-        .map(|limits| {
-            if let Some((config, _, _)) = &standard {
-                super::CacheAdmission::standard(config, limits)
-            } else {
-                super::CacheAdmission::hybrid(
-                    qwen.as_ref()
-                        .ok_or_else(|| invalid("missing hybrid config"))?,
-                    limits,
-                )
-            }
-        })
-        .transpose()?;
-    let vocab = if let Some(qwen) = &qwen {
-        qwen.text.vocab_size as usize
-    } else {
-        let meta = model
-            .tensor_meta(level, "model.embed_tokens.weight")
-            .map_err(invalid)?;
-        matrix_shape(meta)?.0
-    };
-    // Exact hybrid inventory is admitted by the shared assembly before upload;
-    // standard inventory is already admitted by the common model plan above.
-    let selected = model
-        .manifest()
-        .levels
-        .iter()
-        .find(|l| l.name == level)
-        .ok_or_else(|| invalid("absent selected level"))?;
-    for meta in &selected.tensors {
-        check(
-            model.tensor_byte_len(level, &meta.name).map_err(invalid)?,
-            limits.max_tensor_bytes,
-            "encoded tensor bytes",
-        )?;
-        check(
-            decoded_bytes(meta)?,
-            limits.max_decoded_tensor_bytes,
-            "logical decoded tensor bytes",
-        )?;
-    }
-    let tokenizer_bytes = asset(&mut model, "tokenizer.json", 256 * 1024 * 1024)?;
-    let tokenizer_config = asset(&mut model, "tokenizer_config.json", 16 * 1024 * 1024)?;
-    let tokenizer = HfJsonTokenizer::from_bytes(&tokenizer_bytes, &tokenizer_config)?;
-    tokenizer.validate_model_vocab(vocab)?;
-    let source = LoadedSourceIdentity::Trit {
-        package_id: tritium_schema::PackageId::from_bytes(*model.package_id().as_bytes()),
-        model_id: model.model_id(level).map_err(invalid)?,
-        level: level.to_owned(),
-    };
+    let Prepared {
+        graph,
+        tokenizer,
+        plan,
+    } = prepare(&mut model, level, source_bytes, limits, execution)?;
+    let vocab = plan.architecture().vocab_size();
+    let admission = plan.cache_admission();
+    let source = plan.source().clone();
+    drop(plan);
     let backend_name = backend.device_id().to_owned();
     let physical_device = backend.physical_device_id().to_owned();
     let runner = {
@@ -206,53 +133,55 @@ fn load_reader<R: Read + Seek>(
                 logical_time: context.logical_time,
             },
         );
-        if standard.is_some() {
-            // Source binding is rechecked before any private matrix handle exists.
-            model.verify().map_err(invalid)?;
-        }
-        if let Some((config, spec, plan)) = standard {
-            let payload = tensor(&mut model, level, &plan.embedding.name, limits)?;
-            let meta = model
-                .tensor_meta(level, &plan.embedding.name)
-                .map_err(invalid)?;
-            let embedding = TokenEmbedding::from_linear(upload_matrix(
-                &mut loader,
-                meta,
-                &payload,
-                vocab,
-                config.n_embd as usize,
-            )?);
-            drop(payload);
-            let model = RefCell::new(&mut model);
-            let loader = RefCell::new(&mut loader);
-            let vectors = |name: &str, request: super::hf::DenseTensorRequest| {
-                let super::hf::DenseTensorRequest::Vector { len } = request else {
-                    return Err(invalid("embedding must use shared handle"));
+        match graph {
+            Graph::Standard(prepared) => {
+                let (config, spec, plan) = *prepared;
+                model.verify().map_err(invalid)?;
+                let payload = tensor(&mut model, level, &plan.embedding.name, limits)?;
+                let meta = model
+                    .tensor_meta(level, &plan.embedding.name)
+                    .map_err(invalid)?;
+                let embedding = TokenEmbedding::from_linear(upload_matrix(
+                    &mut loader,
+                    meta,
+                    &payload,
+                    vocab,
+                    config.n_embd as usize,
+                )?);
+                drop(payload);
+                let model = RefCell::new(&mut model);
+                let loader = RefCell::new(&mut loader);
+                let vectors = |name: &str, request: super::hf::DenseTensorRequest| {
+                    let super::hf::DenseTensorRequest::Vector { len } = request else {
+                        return Err(invalid("embedding must use shared handle"));
+                    };
+                    let mut model = model.borrow_mut();
+                    let payload = tensor(&mut model, level, name, limits)?;
+                    let meta = model.tensor_meta(level, name).map_err(invalid)?;
+                    if !matches!(&meta.storage, TensorStorage::Dense { shape, .. } if shape.as_slice() == [len as u64])
+                    {
+                        return Err(invalid("preserved vector shape"));
+                    }
+                    dense_values(meta, &payload)
                 };
-                let mut model = model.borrow_mut();
-                let payload = tensor(&mut model, level, name, limits)?;
-                let meta = model.tensor_meta(level, name).map_err(invalid)?;
-                if !matches!(&meta.storage, TensorStorage::Dense { shape, .. } if shape.as_slice() == [len as u64])
-                {
-                    return Err(invalid("preserved vector shape"));
-                }
-                dense_values(meta, &payload)
-            };
-            let projections = |name: &str, rows, cols| {
-                let mut model = model.borrow_mut();
-                let payload = tensor(&mut model, level, name, limits)?;
-                let meta = model.tensor_meta(level, name).map_err(invalid)?;
-                upload_matrix(&mut loader.borrow_mut(), meta, &payload, rows, cols)
-                    .map(Projection::Tensor)
-            };
-            let weights = plan.assemble(&config, &spec, embedding, vectors, projections)?;
-            Runner::standard(config, weights, backend, spec, admission)?
-        } else {
-            let (config, weights, mtp_weights) =
-                Qwen35TextWeights::load_trit_admitted(&mut model, level, &mut loader, limits)?;
-            let language = Qwen35TextRunner::new(&config.text, weights, backend)?;
-            let mtp = UnverifiedQwen35Mtp::new(&language, mtp_weights)?;
-            Runner::hybrid(config, language, mtp, admission)?
+                let projections = |name: &str, rows, cols| {
+                    let mut model = model.borrow_mut();
+                    let payload = tensor(&mut model, level, name, limits)?;
+                    let meta = model.tensor_meta(level, name).map_err(invalid)?;
+                    upload_matrix(&mut loader.borrow_mut(), meta, &payload, rows, cols)
+                        .map(Projection::Tensor)
+                };
+                let weights = plan.assemble(&config, &spec, embedding, vectors, projections)?;
+                Runner::standard(config, weights, backend, spec, admission)?
+            }
+            Graph::Hybrid(prepared) => {
+                let config = *prepared;
+                let (weights, mtp_weights) =
+                    assemble_prepared(&mut model, level, &mut loader, limits, &config)?;
+                let language = Qwen35TextRunner::new(&config.text, weights, backend)?;
+                let mtp = UnverifiedQwen35Mtp::new(&language, mtp_weights)?;
+                Runner::hybrid(config, language, mtp, admission)?
+            }
         }
     };
     model.verify().map_err(invalid)?;
