@@ -13,6 +13,10 @@ mod cbor;
 #[cfg(test)]
 mod directory_tests;
 mod seek_reader;
+mod sizing;
+pub use sizing::{
+    EncodedSizeBounds, TritBlobSize, TritPackageSizeBounds, trit_package_size_bounds,
+};
 
 pub use seek_reader::{
     TritBlobVisitError, TritPackageReadError, TritPackageReadLimits, TritPackageReader,
@@ -890,20 +894,28 @@ fn encode_directory(blobs: &[TritBlobInfo]) -> Result<Vec<u8>, TritPackageError>
     let entries = blobs
         .iter()
         .map(|blob| {
-            let (kind, aux) = encode_kind(&blob.kind);
-            Value::Array(vec![
-                Value::Bytes(blob.id.as_bytes().to_vec()),
-                Value::Integer(kind.into()),
-                aux,
-                Value::Integer(blob.offset.into()),
-                Value::Integer(blob.length.into()),
-            ])
+            let mut fields = directory_fields(&blob.kind, blob.offset, blob.length);
+            fields.insert(0, Value::Bytes(blob.id.as_bytes().to_vec()));
+            Value::Array(fields)
         })
         .collect();
-    encode_cbor_value(&Value::Array(vec![
+    encode_cbor_value(&directory_value(entries))
+}
+
+fn directory_fields(kind: &TritBlobKind, offset: u64, length: u64) -> Vec<Value> {
+    let (kind, aux) = encode_kind(kind);
+    vec![
+        Value::Integer(kind.into()),
+        aux,
+        Value::Integer(offset.into()),
+        Value::Integer(length.into()),
+    ]
+}
+fn directory_value(entries: Vec<Value>) -> Value {
+    Value::Array(vec![
         Value::Integer(DIRECTORY_VERSION.into()),
         Value::Array(entries),
-    ]))
+    ])
 }
 
 fn decode_directory(bytes: &[u8]) -> Result<Vec<TritBlobInfo>, TritPackageError> {

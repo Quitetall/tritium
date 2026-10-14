@@ -4,9 +4,11 @@
 
 mod binding;
 mod seek_reader;
+mod sizing;
 mod stage;
 
 pub use seek_reader::{TritModelReadError, TritModelReader, TritModelVisitError};
+pub use sizing::{imported_manifest_cbor_size_bounds, tensor_meta_cbor_size_bounds};
 pub use stage::{TritModelStageError, stage_trit_model_from_spool};
 
 use ciborium::value::Value;
@@ -85,8 +87,14 @@ impl From<ModelManifestError> for TritModelError {
 /// # Errors
 /// Serializer failure or checked byte-counter overflow.
 pub fn tensor_storage_cbor_bytes(storage: &TensorStorage) -> Result<u64, TritModelError> {
+    metadata_cbor_bytes(storage)
+}
+
+pub(crate) fn metadata_cbor_bytes<T: serde::Serialize>(
+    metadata: &T,
+) -> Result<u64, TritModelError> {
     let mut output = CountOutput(0);
-    ciborium::ser::into_writer(storage, &mut output)
+    ciborium::ser::into_writer(metadata, &mut output)
         .map_err(|e| TritModelError::Schema(e.to_string()))?;
     Ok(output.0)
 }

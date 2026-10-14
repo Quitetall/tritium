@@ -124,6 +124,10 @@ fn readonly_inspection_matches_actual_import_payloads_without_output_or_spool() 
                 assert_eq!(report["scale_representability"], "not-checked");
                 assert_eq!(report["physical_memory"], "not-covered");
                 assert_eq!(report["manifest_size"], "storage-fragment-lower-bound-only");
+                assert_eq!(
+                    report["container_overhead"],
+                    "complete-encoded-byte-bounds-not-exact-output"
+                );
                 assert_eq!(report["complete_model"], false);
                 assert_eq!(report["official_payload_authenticated"], false);
                 assert!(!root.0.join("output").exists() && !root.0.join("spool").exists());
@@ -149,6 +153,24 @@ fn readonly_inspection_matches_actual_import_payloads_without_output_or_spool() 
                     .sum::<u64>();
                 assert_eq!(report["manifest_lower_bound_bytes"], bound);
                 assert!(bound < encode_model_manifest(model.manifest()).unwrap().len() as u64);
+                let manifest_bytes = encode_model_manifest(model.manifest()).unwrap().len() as u64;
+                let package_bytes = fs::metadata(root.0.join("output/model.trit"))
+                    .unwrap()
+                    .len();
+                for (what, actual) in [("manifest", manifest_bytes), ("package", package_bytes)] {
+                    assert!(
+                        report[format!("{what}_bytes_lower_bound")]
+                            .as_u64()
+                            .unwrap()
+                            <= actual
+                    );
+                    assert!(
+                        actual
+                            <= report[format!("{what}_bytes_upper_bound")]
+                                .as_u64()
+                                .unwrap()
+                    );
+                }
                 let mut matrix_bytes = 0u64;
                 model
                     .visit_tensor("imported", "proj", |c| -> Result<(), ()> {
@@ -251,11 +273,11 @@ fn manifest_lower_bound_refuses_before_create_and_is_not_full_manifest_admission
         assert!(!root.0.join("output").exists());
     }
     fs::remove_file(root.0.join("spool")).unwrap();
-    // Equality fits the known fragments, but references and envelope also cost
-    // bytes. The actual publisher must still refuse its larger full manifest.
+    // Equality fits the known storage fragments, but the complete manifest
+    // upper-bound check now refuses before staging the larger container.
     let equal = bound.to_string();
     assert!(
-        inspect(
+        !inspect(
             &root.0,
             "compact-v1",
             "b3",
@@ -275,6 +297,46 @@ fn manifest_lower_bound_refuses_before_create_and_is_not_full_manifest_admission
         .success()
     );
     assert!(!root.0.join("output").exists());
+}
+
+#[test]
+fn complete_container_caps_refuse_before_spool_creation() {
+    let root = Scratch::new();
+    fixture(&root.0, SaltV2Codec::B3);
+    let observed = inspect(&root.0, "compact-v1", "b3", &[]);
+    assert!(observed.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&observed.stdout).unwrap();
+    fs::write(root.0.join("spool"), b"owner sentinel").unwrap();
+    for (flag, key, error_scope) in [
+        (
+            "--max-manifest-bytes",
+            "manifest_bytes_upper_bound",
+            "full manifest upper bound",
+        ),
+        (
+            "--max-directory-bytes",
+            "directory_bytes_upper_bound",
+            "directory upper bound",
+        ),
+        (
+            "--max-package-bytes",
+            "package_bytes_upper_bound",
+            "full package upper bound",
+        ),
+    ] {
+        let cap = (report[key].as_u64().unwrap() - 1).to_string();
+        for result in [
+            inspect(&root.0, "compact-v1", "b3", &[flag, &cap]),
+            invoke(&root.0, "compact-v1", "b3", &[flag, &cap]),
+        ] {
+            assert!(!result.status.success());
+            let error = String::from_utf8_lossy(&result.stderr);
+            assert!(error.contains(error_scope), "{flag}: {error}");
+            assert!(!error.contains("create new import spool"));
+            assert_eq!(fs::read(root.0.join("spool")).unwrap(), b"owner sentinel");
+            assert!(!root.0.join("output").exists());
+        }
+    }
 }
 
 #[test]

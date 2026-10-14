@@ -169,10 +169,11 @@ pub use tqbin::{TQBIN_HEADER_BYTES, TQBIN_MAGIC, TQBIN_VERSION, read_tqbin, writ
 pub use tqidx::{ShardEntry, TQIDX_MAGIC, TQIDX_VERSION, TqIndex, read_tqidx, write_tqidx};
 pub use training_salt::{PackedTrainingSaltSnapshot, TernaryStructure, TrainingSaltPlane};
 pub use trit_package::{
-    TRIT_BLOB_ALIGNMENT, TRIT_HEADER_BYTES, TRIT_MAGIC, TRIT_PACKAGE_MAJOR, TritBlob, TritBlobInfo,
-    TritBlobKind, TritBlobVisitError, TritPackage, TritPackageError, TritPackageReadError,
-    TritPackageReadLimits, TritPackageReader, TritPackageWriteError, TritSpoolBlob,
-    read_trit_package, read_trit_package_with_manifest_limit, write_trit_package,
+    EncodedSizeBounds, TRIT_BLOB_ALIGNMENT, TRIT_HEADER_BYTES, TRIT_MAGIC, TRIT_PACKAGE_MAJOR,
+    TritBlob, TritBlobInfo, TritBlobKind, TritBlobSize, TritBlobVisitError, TritPackage,
+    TritPackageError, TritPackageReadError, TritPackageReadLimits, TritPackageReader,
+    TritPackageSizeBounds, TritPackageWriteError, TritSpoolBlob, read_trit_package,
+    read_trit_package_with_manifest_limit, trit_package_size_bounds, write_trit_package,
     write_trit_package_bounded, write_trit_package_from_spool, write_trit_package_to,
 };
 

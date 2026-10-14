@@ -54,13 +54,20 @@ coverage, not official source authentication or model quality.
 
 Inspection forbids `--output`, `--spool` and `--import-run-id`, creates neither
 spool nor output, and does not encode bytes or perform target scale-bit proof.
-Its output explicitly excludes container overhead and full physical RSS/VRAM.
+Its output excludes full physical RSS/VRAM. Complete encoded-byte bounds include
+manifest fields, directory, header/footer, payloads and alignment. Bounds are
+not observed output sizes: manifest digest-byte widths and blob deduplication
+are unknown before actual encoding. Conservative receiving admission requires
+all manifest/directory/package caps to cover their upper bounds, even when an
+eventual smaller deduplicated package might fit. Exact staging and final
+receiving validation still apply; caps never increase automatically.
 `manifest_lower_bound_bytes` sums exact schema-serialized tensor-storage
 fragments without retaining every count vector or inventing future blob IDs.
 A receiving manifest cap below that bound is rejected before any spool write,
 including for library callers. Names, references, assets, ancestry and other
 manifest fields are omitted: passing this check does **not** admit the full
-manifest, directory or package. Blob deduplication is also not planned.
+manifest, directory or package; the additional complete upper-bound checks do
+encoded-byte admission, not source/payload/runtime/physical-memory qualification.
 Logical caps apply; it never expands them automatically. The selected profile
 is fully read/validated, so inspection is not a cheap header-only probe.
 

@@ -424,6 +424,47 @@ fn library_manifest_lower_bound_refuses_before_any_spool_write() {
     assert!(!out.exists());
 }
 
+#[test]
+fn library_complete_container_caps_refuse_before_any_spool_write() {
+    let root = Scratch::new("container-bound");
+    for refusal in 0..4 {
+        let mut reader = SaltV2PackageReader::new_strict(Cursor::new(legacy(
+            SaltV2Codec::B3,
+            vec![tensor("weight", vec![2, 256], SaltV2Transform::None)],
+        )))
+        .unwrap();
+        let mut companions = originals(ScalePrecision::F32);
+        let mut plan = request(&companions, PlaneCodec::B3, 128);
+        let inspected = inspect_salt_v2_model_import(&plan, &reader, &mut companions).unwrap();
+        let bounds = inspected.container_bounds;
+        match refusal {
+            0 => plan.receiving.max_manifest_bytes = bounds.manifest.upper_bytes as usize - 1,
+            1 => plan.receiving.max_directory_bytes = bounds.directory.upper_bytes as usize - 1,
+            2 => plan.receiving.max_source_bytes = bounds.package.upper_bytes - 1,
+            _ => plan.companions.limits.max_package_bytes = bounds.package.upper_bytes - 1,
+        }
+        let mut spool = Cursor::new(Vec::new());
+        let out = root.0.join(format!("{refusal}.out"));
+        let error = import_salt_v2_model(
+            &plan,
+            &mut reader,
+            &mut companions,
+            &mut spool,
+            &mut DirectoryTensorSink::new(&out),
+            recorder(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("upper bound exceeds receiving cap"),
+            "{error}"
+        );
+        assert!(spool.get_ref().is_empty());
+        assert!(!out.exists());
+    }
+}
+
 struct ChangingCompanion {
     inner: InMemoryWeightSource,
     reads: usize,

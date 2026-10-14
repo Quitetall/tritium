@@ -7,15 +7,16 @@ use alloc::{string::String, vec::Vec};
 
 /// Stored-byte blob reference, local unless a declared shard is selected.
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema-gen", schemars(rename = "BlobReference"))]
 #[cfg_attr(
     feature = "serde",
     derive(serde_nostd::Serialize, serde_nostd::Deserialize)
 )]
 #[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BlobReference {
+pub struct BlobReference<Id = BlobId> {
     /// BLAKE3 of the exact stored blob bytes, not a semantic tensor digest.
-    pub id: BlobId,
+    pub id: Id,
     /// Basename of a declared shard; `None` selects the root package.
     pub shard: Option<String>,
 }
@@ -64,17 +65,18 @@ pub enum TensorStorage {
 
 /// Named tensor binding in one complete quality/size level.
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema-gen", schemars(rename = "TensorMeta"))]
 #[cfg_attr(
     feature = "serde",
     derive(serde_nostd::Serialize, serde_nostd::Deserialize)
 )]
 #[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TensorMeta {
+pub struct TensorMeta<Id = BlobId> {
     /// Logical tensor name, independent of any filesystem path.
     pub name: String,
     /// Exact stored bytes and their package location.
-    pub blob: BlobReference,
+    pub blob: BlobReference<Id>,
     /// Metadata required to interpret those bytes.
     pub storage: TensorStorage,
 }
@@ -122,34 +124,36 @@ pub enum LevelFit {
 
 /// One complete model level; identical blob references may be shared across levels.
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema-gen", schemars(rename = "Level"))]
 #[cfg_attr(
     feature = "serde",
     derive(serde_nostd::Serialize, serde_nostd::Deserialize)
 )]
 #[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Level {
+pub struct Level<Id = BlobId> {
     /// Logical level name.
     pub name: String,
     /// Declared production/import ancestry.
     pub fit: LevelFit,
     /// Complete sorted tensor inventory; all levels have the same names/shapes.
-    pub tensors: Vec<TensorMeta>,
+    pub tensors: Vec<TensorMeta<Id>>,
 }
 
 /// Named model asset such as config, tokenizer or chat template.
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema-gen", schemars(rename = "ManifestAsset"))]
 #[cfg_attr(
     feature = "serde",
     derive(serde_nostd::Serialize, serde_nostd::Deserialize)
 )]
 #[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ManifestAsset {
+pub struct ManifestAsset<Id = BlobId> {
     /// Safe basename, not an extraction path.
     pub name: String,
     /// Stored asset bytes; the directory must also declare the same asset name.
-    pub blob: BlobReference,
+    pub blob: BlobReference<Id>,
 }
 
 /// Content-pinned shard declaration. Shard loading is a separate capability.
@@ -186,26 +190,64 @@ pub struct LegacyModelIdentity {
 ///
 /// Validation establishes structural consistency only: no architecture coverage,
 /// tokenizer validity, evidence availability, model quality or backend capability.
+// Nondefault identity parameters are planning views, not resolved manifests.
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema-gen", schemars(rename = "ModelManifest"))]
 #[cfg_attr(
     feature = "serde",
     derive(serde_nostd::Serialize, serde_nostd::Deserialize)
 )]
 #[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ModelManifest {
+pub struct ModelManifest<Id = BlobId> {
     /// Model metadata version, independent of the outer package version.
     pub schema: SchemaId,
     /// Architecture identifier; execution admission belongs to the loader.
     pub architecture: String,
     /// Sorted assets, including `config.json` and `tokenizer.json`.
-    pub assets: Vec<ManifestAsset>,
+    pub assets: Vec<ManifestAsset<Id>>,
     /// Sorted complete levels, not incremental patches or inferred prefixes.
-    pub levels: Vec<Level>,
+    pub levels: Vec<Level<Id>>,
     /// Sorted shard declarations.
     pub shards: Vec<ModelShard>,
     /// Sorted legacy-id map; verified migration must establish their authenticity.
     pub legacy_ids: Vec<LegacyModelIdentity>,
+}
+
+impl<Id> ModelManifest<Id> {
+    /// Shared single Imported-level construction for actual imports and sizing.
+    /// This does not validate references, source custody or any model claim.
+    /// Nondefault identity parameters cannot use resolved validation/publication.
+    ///
+    /// ```compile_fail
+    /// fn unresolved(manifest: &tritium_schema::ModelManifest<()>) {
+    ///     manifest.validate().unwrap();
+    /// }
+    /// ```
+    #[must_use]
+    pub fn imported(
+        architecture: String,
+        level: String,
+        legacy_id: String,
+        assets: Vec<ManifestAsset<Id>>,
+        tensors: Vec<TensorMeta<Id>>,
+    ) -> Self {
+        Self {
+            schema: SchemaId { major: 1, minor: 0 },
+            architecture,
+            assets,
+            levels: alloc::vec![Level {
+                name: level.clone(),
+                fit: LevelFit::Imported,
+                tensors,
+            }],
+            shards: Vec::new(),
+            legacy_ids: alloc::vec![LegacyModelIdentity {
+                id: legacy_id,
+                level
+            }],
+        }
+    }
 }
 
 /// Structural typed-manifest rejection; missing capabilities are not green results.

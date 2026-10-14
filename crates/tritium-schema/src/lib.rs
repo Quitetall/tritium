@@ -443,6 +443,9 @@ pub struct SchemaId {
     pub minor: u16,
 }
 
+/// Primitive digest encoding shared by identity types and nonidentity size views.
+pub type DigestBytes = [u8; 32];
+
 macro_rules! digest_id {
     ($name:ident, $doc:literal) => {
         #[doc = $doc]
@@ -453,18 +456,18 @@ macro_rules! digest_id {
             derive(serde_nostd::Serialize, serde_nostd::Deserialize)
         )]
         #[cfg_attr(feature = "serde", serde(crate = "serde_nostd"))]
-        pub struct $name([u8; 32]);
+        pub struct $name(DigestBytes);
 
         impl $name {
             /// Construct from a BLAKE3-sized digest byte array.
             #[must_use]
-            pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+            pub const fn from_bytes(bytes: DigestBytes) -> Self {
                 Self(bytes)
             }
 
             /// Borrow the digest bytes.
             #[must_use]
-            pub const fn as_bytes(&self) -> &[u8; 32] {
+            pub const fn as_bytes(&self) -> &DigestBytes {
                 &self.0
             }
         }

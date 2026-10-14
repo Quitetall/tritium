@@ -102,6 +102,8 @@ pub struct SaltTensorSpoolPlan {
     pub working_bytes: u64,
     /// Exact target TensorStorage CBOR fragment size; not a whole manifest size.
     pub storage_metadata_bytes: u64,
+    /// Complete target named tensor record bounds, including unresolved blob ID.
+    pub tensor_metadata_bounds: crate::EncodedSizeBounds,
 }
 
 struct PayloadPlan {
@@ -187,23 +189,32 @@ pub fn inspect_salt_v2_tensor_spool<R: Read + Seek>(
     let plan = PerTilePlan::new(layout, &p.counts).map_err(view_error)?;
     let payload = payload_plan(&plan, layout, limits)?;
     let info = reader.tensor_info(name).ok_or(E::Geometry)?;
+    let (trits, scales, planes) = (
+        plan.trit_count() as u64,
+        plan.scale_count() as u64,
+        plan.plane_count(),
+    );
+    let storage = TensorStorage::Additive {
+        layout,
+        planes: PlaneCounts::PerTile(p.counts),
+    };
+    let storage_metadata_bytes =
+        crate::trit_model::tensor_storage_cbor_bytes(&storage).map_err(|_| E::Overflow)?;
+    let tensor_metadata_bounds =
+        crate::trit_model::tensor_meta_cbor_size_bounds(name.to_owned(), storage)
+            .map_err(|_| E::Overflow)?;
     Ok(SaltTensorSpoolPlan {
         source_bytes: info
             .encoded_payload_bytes()
             .checked_add(info.encoded_scale_bytes())
             .ok_or(E::Overflow)?,
-        trits: plan.trit_count() as u64,
-        scales: plan.scale_count() as u64,
-        planes: plan.plane_count(),
+        trits,
+        scales,
+        planes,
         payload_bytes: payload.total as u64,
         working_bytes: payload.working as u64,
-        storage_metadata_bytes: crate::trit_model::tensor_storage_cbor_bytes(
-            &TensorStorage::Additive {
-                layout,
-                planes: PlaneCounts::PerTile(p.counts),
-            },
-        )
-        .map_err(|_| E::Overflow)?,
+        storage_metadata_bytes,
+        tensor_metadata_bounds,
     })
 }
 

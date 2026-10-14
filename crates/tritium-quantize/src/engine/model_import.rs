@@ -15,11 +15,14 @@ use tritium_evidence::{
 use tritium_format::salt_v2_package::{
     SaltV2PackageReadError, SaltV2PackageReader, SaltV2Transform,
 };
-use tritium_format::trit_model::{TritModelReadError, TritModelReader, tensor_storage_cbor_bytes};
+use tritium_format::trit_model::{
+    TritModelReadError, TritModelReader, imported_manifest_cbor_size_bounds,
+    tensor_meta_cbor_size_bounds, tensor_storage_cbor_bytes,
+};
 use tritium_format::{
-    SaltTensorSpoolError, SaltTensorSpoolLimits, SaltTensorSpoolPlan, TritBlobKind,
-    TritPackageReadLimits, TritSpoolBlob, import_salt_v2_tensor_to_spool,
-    inspect_salt_v2_tensor_spool,
+    SaltTensorSpoolError, SaltTensorSpoolLimits, SaltTensorSpoolPlan, TritBlobKind, TritBlobSize,
+    TritPackageReadLimits, TritPackageSizeBounds, TritSpoolBlob, import_salt_v2_tensor_to_spool,
+    inspect_salt_v2_tensor_spool, trit_package_size_bounds,
 };
 use tritium_schema::*;
 
@@ -67,6 +70,8 @@ pub struct SaltV2ModelImportPlan {
     /// Sum of exact storage fragments, excluding all other manifest fields.
     /// A lower bound only: passing it does not admit the full manifest/package.
     pub manifest_lower_bound_bytes: u64,
+    /// Complete encoded-container bounds; not exact output, disk or RSS admission.
+    pub container_bounds: TritPackageSizeBounds,
 }
 
 fn matrix_inventory<R: Read + Seek>(
@@ -172,11 +177,18 @@ pub fn inspect_salt_v2_model_import<R: Read + Seek>(
         .map_err(|_| refusal("inspection allocation"))?;
     let mut additive_payload_bytes = 0;
     let mut manifest_lower_bound_bytes = 0;
+    let mut metadata_bounds = Vec::new();
+    let mut blob_sizes = Vec::new();
     for (name, layout) in inventory {
         let spool = inspect_salt_v2_tensor_spool(legacy, &name, layout, request.tensor_limits)
             .map_err(SaltV2ModelImportError::Tensor)?;
         additive_payload_bytes = sum(additive_payload_bytes, spool.payload_bytes)?;
         manifest_lower_bound_bytes = sum(manifest_lower_bound_bytes, spool.storage_metadata_bytes)?;
+        metadata_bounds.push(spool.tensor_metadata_bounds);
+        blob_sizes.push(TritBlobSize {
+            kind: TritBlobKind::AdditiveTensor,
+            length: spool.payload_bytes,
+        });
         matrices.push(SaltV2MatrixImportPlan {
             name,
             layout,
@@ -199,6 +211,14 @@ pub fn inspect_salt_v2_model_import<R: Read + Seek>(
             tensor_storage_cbor_bytes(&storage)
                 .map_err(|_| refusal("inspection storage metadata serialization"))?,
         )?;
+        metadata_bounds.push(
+            tensor_meta_cbor_size_bounds(t.source.name.clone(), storage)
+                .map_err(|_| refusal("inspection tensor metadata serialization"))?,
+        );
+        blob_sizes.push(TritBlobSize {
+            kind: TritBlobKind::DenseTensor(dense_dtype(t.source.precision)?),
+            length: bytes,
+        });
     }
     if manifest_lower_bound_bytes > request.receiving.max_manifest_bytes as u64 {
         return Err(refusal(
@@ -215,6 +235,10 @@ pub fn inspect_salt_v2_model_import<R: Read + Seek>(
             return Err(refusal("inspection asset exceeds cap"));
         }
         asset_payload_bytes = sum(asset_payload_bytes, bytes.len() as u64)?;
+        blob_sizes.push(TritBlobSize {
+            kind: TritBlobKind::Asset(name.clone()),
+            length: bytes.len() as u64,
+        });
     }
     let spool_payload_bytes = sum(
         sum(additive_payload_bytes, dense_payload_bytes)?,
@@ -228,6 +252,35 @@ pub fn inspect_salt_v2_model_import<R: Read + Seek>(
             "inspection aggregate raw spool payload exceeds cap (container overhead not covered)",
         ));
     }
+    let manifest_bounds = imported_manifest_cbor_size_bounds(
+        &plan.architecture,
+        &plan.levels[0],
+        &legacy.package_id().to_string(),
+        &plan.assets,
+        &metadata_bounds,
+    )
+    .map_err(|_| refusal("inspection full manifest sizing failed"))?;
+    let container_bounds =
+        trit_package_size_bounds(manifest_bounds, &blob_sizes).map_err(|_| {
+            refusal("inspection full container sizing failed or exceeds global metadata caps")
+        })?;
+    if container_bounds.manifest.upper_bytes > request.receiving.max_manifest_bytes as u64 {
+        return Err(refusal(
+            "inspection full manifest upper bound exceeds receiving cap (actual digest byte widths unknown)",
+        ));
+    }
+    if container_bounds.directory.upper_bytes > request.receiving.max_directory_bytes as u64 {
+        return Err(refusal(
+            "inspection directory upper bound exceeds receiving cap (deduplication unknown)",
+        ));
+    }
+    if container_bounds.package.upper_bytes > request.receiving.max_source_bytes
+        || container_bounds.package.upper_bytes > plan.limits.max_package_bytes
+    {
+        return Err(refusal(
+            "inspection full package upper bound exceeds receiving cap (deduplication and alignment unknown)",
+        ));
+    }
     Ok(SaltV2ModelImportPlan {
         matrices,
         additive_payload_bytes,
@@ -235,6 +288,7 @@ pub fn inspect_salt_v2_model_import<R: Read + Seek>(
         asset_payload_bytes,
         spool_payload_bytes,
         manifest_lower_bound_bytes,
+        container_bounds,
     })
 }
 
@@ -388,12 +442,7 @@ pub fn import_salt_v2_model<R: Read + Seek, S: Read + Write + Seek>(
         let source = &tensor.source;
         let length = source.byte_len().map_err(QuantEngineError::Plan)?;
         let bytes = observed.tensor(&source.name, platform(length, "import companion bytes")?)?;
-        let dtype = match source.precision {
-            ScalePrecision::F16 => DType::F16,
-            ScalePrecision::Bf16 => DType::BF16,
-            ScalePrecision::F32 => DType::F32,
-            _ => return Err(refusal("import dense precision")),
-        };
+        let dtype = dense_dtype(source.precision)?;
         let blob = append(
             spool,
             TritBlobKind::DenseTensor(dtype),
@@ -431,21 +480,13 @@ pub fn import_salt_v2_model<R: Read + Seek, S: Read + Write + Seek>(
     tensors.sort_by(|a, b| a.name.cmp(&b.name));
     let level = plan.levels[0].clone();
     let legacy_id = legacy.package_id().to_string();
-    let manifest = ModelManifest {
-        schema: SchemaId { major: 1, minor: 0 },
-        architecture: plan.architecture.clone(),
+    let manifest = ModelManifest::imported(
+        plan.architecture.clone(),
+        level,
+        legacy_id.clone(),
         assets,
-        levels: vec![Level {
-            name: level.clone(),
-            fit: LevelFit::Imported,
-            tensors,
-        }],
-        shards: vec![],
-        legacy_ids: vec![LegacyModelIdentity {
-            id: legacy_id.clone(),
-            level,
-        }],
-    };
+        tensors,
+    );
     let preparation = LegacyModelImportPrepared {
         legacy_id,
         companion_source: observed.source_id(),
@@ -482,6 +523,15 @@ pub fn import_salt_v2_model<R: Read + Seek, S: Read + Write + Seek>(
         evidence,
         warnings,
     })
+}
+
+fn dense_dtype(precision: ScalePrecision) -> Result<DType, SaltV2ModelImportError> {
+    match precision {
+        ScalePrecision::F16 => Ok(DType::F16),
+        ScalePrecision::Bf16 => Ok(DType::BF16),
+        ScalePrecision::F32 => Ok(DType::F32),
+        _ => Err(refusal("import dense precision")),
+    }
 }
 
 /// Reverify an actual retained package against recorded import preparation.
