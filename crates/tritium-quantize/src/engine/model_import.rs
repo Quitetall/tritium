@@ -10,7 +10,8 @@ use std::{
 };
 use tritium_core::DType;
 use tritium_evidence::{
-    EvidenceError, EvidenceRecorder, LegacyModelImportView, SealedEvidence, VerifiedLog,
+    EvidenceError, EvidenceEvent, EvidenceRecorder, LegacyModelImportBoundView,
+    LegacyModelImportView, SealedEvidence, VerifiedLog,
 };
 use tritium_format::salt_v2_package::{
     SaltV2PackageReadError, SaltV2PackageReader, SaltV2Transform,
@@ -394,7 +395,113 @@ pub fn import_salt_v2_model<R: Read + Seek, S: Read + Write + Seek>(
     companions: &mut dyn WeightSource,
     spool: &mut S,
     destination: &mut DirectoryTensorSink,
-    mut recorder: EvidenceRecorder,
+    recorder: EvidenceRecorder,
+) -> Result<ImportedSaltV2Model, SaltV2ModelImportError> {
+    import_model(
+        request,
+        legacy,
+        companions,
+        spool,
+        destination,
+        ImportRecording {
+            recorder,
+            bound: false,
+        },
+    )
+}
+
+/// Same exact importer/publication with compact canonical-manifest-bound evidence.
+/// Caller must register LegacyModelImportBoundPrepared; no fitted/source-quality
+/// or whole-RSS claim is inferred. Embedded v1 remains the separate default API.
+/// # Errors
+/// The same source, geometry, caps, scale/trit, staging/guard/no-clobber errors,
+/// plus strict compact evidence/actual canonical-manifest binding refusal.
+pub fn import_salt_v2_model_bound<R: Read + Seek, S: Read + Write + Seek>(
+    request: &SaltV2ModelImportRequest,
+    legacy: &mut SaltV2PackageReader<R>,
+    companions: &mut dyn WeightSource,
+    spool: &mut S,
+    destination: &mut DirectoryTensorSink,
+    recorder: EvidenceRecorder,
+) -> Result<ImportedSaltV2Model, SaltV2ModelImportError> {
+    import_model(
+        request,
+        legacy,
+        companions,
+        spool,
+        destination,
+        ImportRecording {
+            recorder,
+            bound: true,
+        },
+    )
+}
+
+struct ImportRecording {
+    recorder: EvidenceRecorder,
+    bound: bool,
+}
+impl ImportRecording {
+    fn check(&self) -> Result<(), SaltV2ModelImportError> {
+        if !self.recorder.events().is_empty() {
+            return Err(refusal("import needs a fresh recorder"));
+        }
+        if self.bound {
+            self.recorder
+                .check_emit::<LegacyModelImportBoundPrepared>("migration", None, 0)?;
+        } else {
+            self.recorder
+                .check_emit::<LegacyModelImportPrepared>("migration", None, 0)?;
+        }
+        Ok(())
+    }
+    fn seal(
+        mut self,
+        manifest: ModelManifest,
+        legacy_id: String,
+        observed: &ObservedWeightSource<'_>,
+    ) -> Result<(ModelManifest, SealedEvidence), SaltV2ModelImportError> {
+        if self.bound {
+            let preparation = LegacyModelImportBoundView::prepare(
+                &manifest,
+                legacy_id,
+                observed.source_id(),
+                observed.tensor_bindings().to_vec(),
+                observed.asset_bindings().to_vec(),
+            )?;
+            self.recorder.emit("migration", None, 0, &preparation)?;
+            let evidence = self.recorder.seal()?;
+            let views = LegacyModelImportBoundView::fold(evidence.log(), &manifest)?;
+            if views.len() != 1 || views[0].observation() != &preparation {
+                return Err(refusal("bound prepared import log binding"));
+            }
+            Ok((manifest, evidence))
+        } else {
+            let preparation = LegacyModelImportPrepared {
+                legacy_id,
+                companion_source: observed.source_id(),
+                companion_tensors: observed.tensor_bindings().to_vec(),
+                companion_assets: observed.asset_bindings().to_vec(),
+                manifest,
+            };
+            self.recorder.emit("migration", None, 0, &preparation)?;
+            let evidence = self.recorder.seal()?;
+            let views = LegacyModelImportView::fold(evidence.log())?;
+            if views.len() != 1 || views[0].observation() != &preparation {
+                return Err(refusal("prepared import log binding"));
+            }
+            Ok((preparation.manifest, evidence))
+        }
+    }
+}
+
+fn import_model<R: Read + Seek, S: Read + Write + Seek>(
+    request: &SaltV2ModelImportRequest,
+    legacy: &mut SaltV2PackageReader<R>,
+    companions: &mut dyn WeightSource,
+    spool: &mut S,
+    destination: &mut DirectoryTensorSink,
+    recording: ImportRecording,
 ) -> Result<ImportedSaltV2Model, SaltV2ModelImportError> {
     use SaltV2ModelImportError as E;
     let plan = &request.companions;
@@ -407,10 +514,7 @@ pub fn import_salt_v2_model<R: Read + Seek, S: Read + Write + Seek>(
     {
         return Err(refusal("import companions must be one KeepDense level"));
     }
-    if !recorder.events().is_empty() {
-        return Err(refusal("import needs a fresh recorder"));
-    }
-    recorder.check_emit::<LegacyModelImportPrepared>("migration", None, 0)?;
+    recording.check()?;
     if spool.seek(SeekFrom::End(0))? != 0 || spool.seek(SeekFrom::Start(0))? != 0 {
         return Err(refusal("model import spool must be empty"));
     }
@@ -487,22 +591,10 @@ pub fn import_salt_v2_model<R: Read + Seek, S: Read + Write + Seek>(
         assets,
         tensors,
     );
-    let preparation = LegacyModelImportPrepared {
-        legacy_id,
-        companion_source: observed.source_id(),
-        companion_tensors: observed.tensor_bindings().to_vec(),
-        companion_assets: observed.asset_bindings().to_vec(),
-        manifest,
-    };
-    recorder.emit("migration", None, 0, &preparation)?;
-    let evidence = recorder.seal()?;
-    let views = LegacyModelImportView::fold(evidence.log())?;
-    if views.len() != 1 || views[0].observation() != &preparation {
-        return Err(refusal("prepared import log binding"));
-    }
+    let (manifest, evidence) = recording.seal(manifest, legacy_id, &observed)?;
     let (model, warnings) = destination
         .publish_spooled_model(
-            &preparation.manifest,
+            &manifest,
             &blobs,
             spool,
             request.receiving,
@@ -542,14 +634,66 @@ pub fn verify_imported_model_with_log<R: Read + Seek>(
     model: &mut TritModelReader<R>,
     log: &VerifiedLog,
 ) -> Result<LegacyModelImportView, SaltV2ModelImportError> {
-    let mut views = LegacyModelImportView::fold(log)?;
-    if views.len() != 1 {
+    match verify_imported_model_evidence(model, log)? {
+        ImportedModelEvidenceView::Embedded(view) => Ok(view),
+        ImportedModelEvidenceView::ManifestBound(_) => {
+            Err(refusal("embedded v1 import preparation required"))
+        }
+    }
+}
+
+/// Verified supported preparation view, not a public-release/source-truth verdict.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ImportedModelEvidenceView {
+    /// Original embedded-manifest v1 observation.
+    Embedded(LegacyModelImportView),
+    /// Compact actual-canonical-manifest-bound observation.
+    ManifestBound(LegacyModelImportBoundView),
+}
+impl ImportedModelEvidenceView {
+    /// Actual recorded original legacy identity (its source truth remains external).
+    #[must_use]
+    pub fn legacy_id(&self) -> &str {
+        match self {
+            Self::Embedded(v) => &v.observation().legacy_id,
+            Self::ManifestBound(v) => &v.observation().legacy_id,
+        }
+    }
+}
+
+/// Cold verify either supported preparation with complete payload and exact bytes.
+/// Requires exactly one preparation across both protocols; mixed/duplicate logs
+/// are rejected, not selected. This does not authenticate original source/quality.
+/// # Errors
+/// Corrupt/ambiguous/version-mismatched evidence, full manifest/binding mismatch,
+/// missing or invalid payload inventory or terminal exact package identity failure.
+pub fn verify_imported_model_evidence<R: Read + Seek>(
+    model: &mut TritModelReader<R>,
+    log: &VerifiedLog,
+) -> Result<ImportedModelEvidenceView, SaltV2ModelImportError> {
+    let preparations: Vec<_> = log
+        .events
+        .iter()
+        .filter(|e| {
+            e.schema == LegacyModelImportPrepared::SCHEMA_ID
+                || e.schema == LegacyModelImportBoundPrepared::SCHEMA_ID
+        })
+        .collect();
+    if preparations.len() != 1 {
         return Err(refusal("exactly one imported preparation required"));
     }
-    let view = views.remove(0);
-    if &view.observation().manifest != model.manifest() {
-        return Err(refusal("import log/model manifest mismatch"));
-    }
+    let view = if preparations[0].schema == LegacyModelImportPrepared::SCHEMA_ID {
+        let mut views = LegacyModelImportView::fold(log)?;
+        let view = views.remove(0);
+        if &view.observation().manifest != model.manifest() {
+            return Err(refusal("import log/model manifest mismatch"));
+        }
+        ImportedModelEvidenceView::Embedded(view)
+    } else {
+        let mut views = LegacyModelImportBoundView::fold(log, model.manifest())?;
+        ImportedModelEvidenceView::ManifestBound(views.remove(0))
+    };
     model
         .validate_complete_payload_inventory()
         .map_err(QuantEngineError::Model)?;

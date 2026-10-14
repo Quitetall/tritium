@@ -21,7 +21,10 @@ mod model_load;
 pub use model_load::{MODEL_LOADED_REGISTRATION, ModelLoadReceiptView};
 
 mod model_import;
-pub use model_import::{LEGACY_MODEL_IMPORT_PREPARED_REGISTRATION, LegacyModelImportView};
+pub use model_import::{
+    LEGACY_MODEL_IMPORT_BOUND_PREPARED_REGISTRATION, LEGACY_MODEL_IMPORT_PREPARED_REGISTRATION,
+    LegacyModelImportBoundView, LegacyModelImportView,
+};
 
 mod direct_fit;
 pub use direct_fit::{DIRECT_LEVELS_FITTED_REGISTRATION, DirectFitReceiptView};

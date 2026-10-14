@@ -76,6 +76,14 @@ The same logical preflight runs before spool creation; actual import still
 requires exact scale/trit encoding checks, terminal custody and cold log replay.
 This imports existing coefficients without fitting and does not qualify release.
 
+`--compact-evidence` explicitly selects canonical-manifest-bound preparation:
+the actual manifest remains in `model.trit`; JSONL holds its exact canonical
+CBOR length/BLAKE3 and all original companion bindings, not millions of counts.
+The embedded-manifest v1 route remains the default. `migrate verify` cold-replays
+either protocol and rejects mixed/duplicate preparations, changed metadata,
+invalid payload inventory and changed exact package bytes. Compact evidence is
+not a source-authentication, memory/RSS, quality or public-release receipt.
+
 Typed `quantize` rejects legacy `--input`/`--model`, `--bpw`, `--scale-group`,
 `--sensitivity`, `--fisher`, `--format`, `--ladder`, `--planes`, `--group`,
 `--grid` and `--rotate`, even when explicitly set to their legacy defaults.

@@ -17,6 +17,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_json_canonicalizer = { workspace = true }
 tritium-schema = { workspace = true, features = ["serde", "std"] }
+tritium-format = { workspace = true }
 
 [lints]
 workspace = true

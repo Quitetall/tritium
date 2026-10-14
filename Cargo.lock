@@ -4837,6 +4837,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
+ "tritium-format",
  "tritium-schema",
 ]
 

@@ -8,15 +8,18 @@ use std::{
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
-use tritium_evidence::{EvidenceRecorder, LEGACY_MODEL_IMPORT_PREPARED_REGISTRATION, verify_jsonl};
+use tritium_evidence::{
+    EvidenceRecorder, LEGACY_MODEL_IMPORT_BOUND_PREPARED_REGISTRATION,
+    LEGACY_MODEL_IMPORT_PREPARED_REGISTRATION, verify_jsonl,
+};
 use tritium_format::{
     PackageHasher, SafeTensorsReader, SaltTensorSpoolLimits, TritPackageReadLimits,
     salt_v2_package::SaltV2PackageReader, trit_model::TritModelReader,
 };
 use tritium_quantize::engine::{
     DirectoryTensorSink, QuantEngineError, SafeTensorsWeightSource, SaltV2ModelImportRequest,
-    WeightSource, import_salt_v2_model, inspect_salt_v2_model_import,
-    verify_imported_model_with_log,
+    WeightSource, import_salt_v2_model, import_salt_v2_model_bound, inspect_salt_v2_model_import,
+    verify_imported_model_evidence,
 };
 use tritium_schema::{
     LEGACY_SALT_V2_HF_ASSETS, LegacySaltV2BundleDescriptor, PlaneCodec, QuantAction, QuantLimits,
@@ -46,6 +49,9 @@ pub(crate) struct BundleArgs {
     /// Strict read-only source/inventory/logical sizing; no scale proof or output.
     #[arg(long)]
     inspect_only: bool,
+    /// Opt in to actual canonical-manifest-bound evidence (no embedded count JSON).
+    #[arg(long)]
+    compact_evidence: bool,
     /// Original schema-v3 bundle directory; not a downloaded/official source claim.
     #[arg(long)]
     bundle: PathBuf,
@@ -163,13 +169,13 @@ pub(crate) fn run(command: MigrateCommand) -> Result<()> {
             let bytes = read_small(&mut log_file, args.max_evidence_bytes)?;
             let log = verify_jsonl(std::str::from_utf8(&bytes).context("import evidence UTF-8")?)?;
             let mut model = TritModelReader::open(model, limits)?;
-            let view = verify_imported_model_with_log(&mut model, &log)?;
+            let view = verify_imported_model_evidence(&mut model, &log)?;
             println!(
                 "{}",
                 serde_json::json!({
                     "status": "import-consistent-not-qualified",
                     "package_id": model.package_id().to_string(),
-                    "legacy_id": view.observation().legacy_id,
+                    "legacy_id": view.legacy_id(),
                 })
             );
             Ok(())
@@ -206,7 +212,11 @@ fn import(args: &BundleArgs) -> Result<()> {
             args.import_run_id
                 .as_deref()
                 .context("import requires --import-run-id")?,
-            [LEGACY_MODEL_IMPORT_PREPARED_REGISTRATION],
+            [if args.compact_evidence {
+                LEGACY_MODEL_IMPORT_BOUND_PREPARED_REGISTRATION
+            } else {
+                LEGACY_MODEL_IMPORT_PREPARED_REGISTRATION
+            }],
         )?)
     };
     ensure!(
@@ -408,7 +418,12 @@ fn import(args: &BundleArgs) -> Result<()> {
     let spool_path = args.spool.as_ref().context("import requires --spool")?;
     let recorder = recorder.context("import requires prepared recorder")?;
     let mut spool = OwnedSpool::new(spool_path)?;
-    let imported = import_salt_v2_model(
+    let import_model = if args.compact_evidence {
+        import_salt_v2_model_bound
+    } else {
+        import_salt_v2_model
+    };
+    let imported = import_model(
         &request,
         &mut legacy,
         &mut source,
@@ -428,6 +443,7 @@ fn import(args: &BundleArgs) -> Result<()> {
         "{}",
         serde_json::json!({
             "status": "imported-not-qualified",
+            "evidence_profile": if args.compact_evidence { "canonical-manifest-bound-v1" } else { "embedded-manifest-v1" },
             "package_id": imported.model.package_id().to_string(),
             "complete_model": descriptor.complete_model,
             "official_payload_authenticated": descriptor.official_payload_authenticated,

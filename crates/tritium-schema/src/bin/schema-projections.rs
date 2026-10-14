@@ -147,6 +147,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         tritium_schema::LegacyModelImportPrepared,
         "legacy-model-import-prepared"
     );
+    project!(
+        tritium_schema::LegacyModelImportBoundPrepared,
+        "legacy-model-import-bound-prepared"
+    );
     project!(ModelShard, "model-shard");
     project!(
         tritium_schema::LegacySaltV2BundleDescriptor,

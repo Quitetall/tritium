@@ -1,5 +1,5 @@
 //! Prepared legacy migration observations; no fit/publication verdict is implied.
-use crate::{ModelManifest, NamedAssetDigest, OriginalSourceId, QuantSourceBinding};
+use crate::{DigestBytes, ModelManifest, NamedAssetDigest, OriginalSourceId, QuantSourceBinding};
 use alloc::{string::String, vec::Vec};
 
 /// Actual prepared Imported manifest and observed original companion bindings.
@@ -22,6 +22,30 @@ pub struct LegacyModelImportPrepared {
     pub companion_assets: Vec<NamedAssetDigest>,
     /// Exact prepared manifest, without fabricated Direct fit/evidence lineage.
     pub manifest: ModelManifest,
+}
+
+/// Compact preparation bound to actual full canonical manifest bytes.
+/// No embedded count vectors or fit/publication/source-truth verdict is implied.
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LegacyModelImportBoundPrepared {
+    /// Actual original namespaced legacy container identity.
+    pub legacy_id: String,
+    /// Actual observed raw dense/asset source identity.
+    pub companion_source: OriginalSourceId,
+    /// Complete companion interpretations and raw-byte content identities.
+    pub companion_tensors: Vec<QuantSourceBinding>,
+    /// Complete companion asset content identities.
+    pub companion_assets: Vec<NamedAssetDigest>,
+    /// Actual encoded canonical manifest byte length, not a sizing bound.
+    pub manifest_bytes: u64,
+    /// Plain BLAKE3 of the exact canonical manifest CBOR, not a package/model ID.
+    pub manifest_digest: DigestBytes,
 }
 
 /// Canonical legacy schema-v3 HF asset names and encoded byte ceilings.

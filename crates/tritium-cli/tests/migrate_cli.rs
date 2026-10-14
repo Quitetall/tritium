@@ -8,7 +8,7 @@ use std::{
     process::{Command, Output},
     sync::atomic::{AtomicU64, Ordering},
 };
-use tritium_evidence::{LegacyModelImportView, verify_jsonl};
+use tritium_evidence::{LegacyModelImportBoundView, LegacyModelImportView, verify_jsonl};
 use tritium_format::{
     AdditiveTensor, PackageHasher, TritPackageReadLimits,
     salt_v2::SaltV2Codec,
@@ -95,6 +95,69 @@ fn inspect(root: &Path, profile: &str, codec: &str, extra: &[&str]) -> Output {
     ];
     args.extend(extra.iter().map(std::ffi::OsStr::new));
     run(&args)
+}
+
+#[test]
+fn compact_cli_preserves_exact_package_and_cold_replay_without_embedded_manifest() {
+    for source in [SaltV2Codec::D2, SaltV2Codec::B3, SaltV2Codec::S34] {
+        for profile in ["compact-v1", "near-lossless-v1"] {
+            for target in ["d2", "b3"] {
+                let root = Scratch::new();
+                fixture(&root.0, source);
+                let embedded = invoke(&root.0, profile, target, &[]);
+                assert!(
+                    embedded.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&embedded.stderr)
+                );
+                let bytes = fs::read(root.0.join("output/model.trit")).unwrap();
+                fs::rename(root.0.join("output"), root.0.join("embedded")).unwrap();
+                let compact = invoke(&root.0, profile, target, &["--compact-evidence"]);
+                assert!(
+                    compact.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&compact.stderr)
+                );
+                assert_eq!(fs::read(root.0.join("output/model.trit")).unwrap(), bytes);
+                let report: serde_json::Value = serde_json::from_slice(&compact.stdout).unwrap();
+                assert_eq!(report["evidence_profile"], "canonical-manifest-bound-v1");
+                assert_eq!(report["complete_model"], false);
+                assert_eq!(report["official_payload_authenticated"], false);
+                let log = verify_jsonl(
+                    &fs::read_to_string(root.0.join("output/evidence.jsonl")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(log.events.len(), 1);
+                assert!(log.events[0].payload.get("manifest").is_none());
+                let model = TritModelReader::open(
+                    fs::File::open(root.0.join("output/model.trit")).unwrap(),
+                    TritPackageReadLimits {
+                        max_source_bytes: 1_000_000,
+                        max_manifest_bytes: 65536,
+                        max_directory_bytes: 65536,
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    LegacyModelImportBoundView::fold(&log, model.manifest())
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert!(verify(&root.0).status.success());
+                assert!(!root.0.join("spool").exists());
+                let refused = invoke(&root.0, profile, target, &["--compact-evidence"]);
+                assert!(!refused.status.success());
+                assert_eq!(fs::read(root.0.join("output/model.trit")).unwrap(), bytes);
+                let path = root.0.join("output/model.trit");
+                let mut corrupt = bytes;
+                let at = corrupt.len() - 1;
+                corrupt[at] ^= 1;
+                fs::write(&path, corrupt).unwrap();
+                assert!(!verify(&root.0).status.success());
+            }
+        }
+    }
 }
 
 #[test]

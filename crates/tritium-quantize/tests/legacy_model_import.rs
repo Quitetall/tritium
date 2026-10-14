@@ -7,8 +7,9 @@ use std::{
     io::{Cursor, Read, Seek, SeekFrom, Write},
 };
 use tritium_evidence::{
-    EventRegistration, EvidenceEvent, EvidenceRecorder, LEGACY_MODEL_IMPORT_PREPARED_REGISTRATION,
-    LegacyModelImportView, verify_jsonl,
+    EventRegistration, EvidenceEvent, EvidenceRecorder,
+    LEGACY_MODEL_IMPORT_BOUND_PREPARED_REGISTRATION, LEGACY_MODEL_IMPORT_PREPARED_REGISTRATION,
+    LegacyModelImportBoundView, LegacyModelImportView, verify_jsonl,
 };
 use tritium_format::salt_v2::SaltV2Codec;
 use tritium_format::salt_v2_package::{
@@ -150,6 +151,178 @@ fn recorder() -> EvidenceRecorder {
         [LEGACY_MODEL_IMPORT_PREPARED_REGISTRATION],
     )
     .unwrap()
+}
+
+#[derive(serde::Serialize)]
+struct UnsupportedBoundVersion(LegacyModelImportBoundPrepared);
+impl EvidenceEvent for UnsupportedBoundVersion {
+    const SCHEMA_ID: &'static str = LegacyModelImportBoundPrepared::SCHEMA_ID;
+    const VERSION: u16 = 2;
+}
+#[derive(serde::Serialize)]
+struct ExtraBoundField {
+    #[serde(flatten)]
+    preparation: LegacyModelImportBoundPrepared,
+    unexpected: bool,
+}
+impl EvidenceEvent for ExtraBoundField {
+    const SCHEMA_ID: &'static str = LegacyModelImportBoundPrepared::SCHEMA_ID;
+    const VERSION: u16 = 1;
+}
+
+#[test]
+fn compact_library_binds_full_metadata_and_rejects_resealed_lies_and_mixed_logs() {
+    let root = Scratch::new("compact-binding");
+    let mut reader = SaltV2PackageReader::new_strict(Cursor::new(legacy(
+        SaltV2Codec::B3,
+        vec![tensor("weight", vec![2, 256], SaltV2Transform::None)],
+    )))
+    .unwrap();
+    let mut companions = originals(ScalePrecision::F32);
+    let plan = request(&companions, PlaneCodec::B3, 128);
+    let mut spool = Cursor::new(Vec::new());
+    let out = root.0.join("output");
+    let mut result = import_salt_v2_model_bound(
+        &plan,
+        &mut reader,
+        &mut companions,
+        &mut spool,
+        &mut DirectoryTensorSink::new(&out),
+        EvidenceRecorder::new(
+            "compact-binding",
+            [LEGACY_MODEL_IMPORT_BOUND_PREPARED_REGISTRATION],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let log = result.evidence.log();
+    let view = verify_imported_model_evidence(&mut result.model, log).unwrap();
+    let ImportedModelEvidenceView::ManifestBound(view) = view else {
+        panic!("compact view")
+    };
+    let observation = view.observation().clone();
+    assert!(verify_imported_model_with_log(&mut result.model, log).is_err());
+    assert!(log.events[0].payload.get("manifest").is_none());
+    let mut newer = EvidenceRecorder::new(
+        "unsupported-bound-version",
+        [EventRegistration {
+            schema: UnsupportedBoundVersion::SCHEMA_ID,
+            version: UnsupportedBoundVersion::VERSION,
+        }],
+    )
+    .unwrap();
+    newer
+        .emit(
+            "migration",
+            None,
+            0,
+            &UnsupportedBoundVersion(observation.clone()),
+        )
+        .unwrap();
+    assert!(
+        verify_imported_model_evidence(&mut result.model, newer.seal().unwrap().log()).is_err()
+    );
+    let mut extra = EvidenceRecorder::new(
+        "extra-bound-field",
+        [LEGACY_MODEL_IMPORT_BOUND_PREPARED_REGISTRATION],
+    )
+    .unwrap();
+    extra
+        .emit(
+            "migration",
+            None,
+            0,
+            &ExtraBoundField {
+                preparation: observation.clone(),
+                unexpected: true,
+            },
+        )
+        .unwrap();
+    assert!(
+        verify_imported_model_evidence(&mut result.model, extra.seal().unwrap().log()).is_err()
+    );
+    for case in 0..6 {
+        let mut bad = observation.clone();
+        match case {
+            0 => bad.manifest_digest[0] ^= 1,
+            1 => bad.manifest_bytes += 1,
+            2 => bad.legacy_id.push('x'),
+            3 => bad.companion_tensors[0].source.shape[0] += 1,
+            4 => bad.companion_assets.pop().map(|_| ()).unwrap(),
+            _ => {
+                bad.companion_source =
+                    OriginalSourceId::from_bytes(*blake3::hash(b"wrong-fixture-source").as_bytes())
+            }
+        }
+        let mut recorder = EvidenceRecorder::new(
+            "resealed-compact",
+            [LEGACY_MODEL_IMPORT_BOUND_PREPARED_REGISTRATION],
+        )
+        .unwrap();
+        recorder.emit("migration", None, 0, &bad).unwrap();
+        let bad = recorder.seal().unwrap();
+        assert!(verify_imported_model_evidence(&mut result.model, bad.log()).is_err());
+    }
+    let mut changed = result.model.manifest().clone();
+    let matrix = changed.levels[0]
+        .tensors
+        .iter_mut()
+        .find(|t| t.name == "weight")
+        .unwrap();
+    let TensorStorage::Additive {
+        planes: PlaneCounts::PerTile(counts),
+        ..
+    } = &mut matrix.storage
+    else {
+        panic!("matrix")
+    };
+    counts[0] = 0; // structurally valid pruning, but not the bound metadata
+    changed.validate().unwrap();
+    assert!(LegacyModelImportBoundView::fold(log, &changed).is_err());
+    let embedded = LegacyModelImportPrepared {
+        legacy_id: observation.legacy_id.clone(),
+        companion_source: observation.companion_source,
+        companion_tensors: observation.companion_tensors.clone(),
+        companion_assets: observation.companion_assets.clone(),
+        manifest: result.model.manifest().clone(),
+    };
+    for duplicate in [false, true] {
+        let mut mixed = EvidenceRecorder::new(
+            "mixed-preparations",
+            [
+                LEGACY_MODEL_IMPORT_PREPARED_REGISTRATION,
+                LEGACY_MODEL_IMPORT_BOUND_PREPARED_REGISTRATION,
+            ],
+        )
+        .unwrap();
+        mixed.emit("migration", None, 0, &observation).unwrap();
+        if duplicate {
+            mixed.emit("migration", None, 0, &observation).unwrap();
+        } else {
+            mixed.emit("migration", None, 0, &embedded).unwrap();
+        }
+        let mixed = mixed.seal().unwrap();
+        assert!(verify_imported_model_evidence(&mut result.model, mixed.log()).is_err());
+    }
+    let mut wrong_registration = SaltV2PackageReader::new_strict(Cursor::new(legacy(
+        SaltV2Codec::B3,
+        vec![tensor("weight", vec![2, 256], SaltV2Transform::None)],
+    )))
+    .unwrap();
+    let mut empty = Cursor::new(Vec::new());
+    assert!(
+        import_salt_v2_model_bound(
+            &plan,
+            &mut wrong_registration,
+            &mut companions,
+            &mut empty,
+            &mut DirectoryTensorSink::new(root.0.join("wrong-registration")),
+            recorder()
+        )
+        .is_err()
+    );
+    assert!(empty.get_ref().is_empty());
+    assert!(!root.0.join("wrong-registration").exists());
 }
 fn check_tensor(model: &mut TritModelReader<File>, source: &SaltV2Tensor) {
     let meta = model.manifest().levels[0]
@@ -563,6 +736,47 @@ fn actual_companion_and_original_file_mutations_preserve_typed_refusals_and_clea
                 ))
             )),
         }
+        assert!(!out.exists());
+    }
+}
+
+#[test]
+fn compact_source_guards_and_preflight_keep_owned_output_clean_on_refusal() {
+    let root = Scratch::new("compact-guards");
+    for change_on in [2, 3] {
+        let mut reader = SaltV2PackageReader::new_strict(Cursor::new(legacy(
+            SaltV2Codec::B3,
+            vec![tensor("weight", vec![2, 256], SaltV2Transform::None)],
+        )))
+        .unwrap();
+        let mut companions = ChangingCompanion {
+            inner: originals(ScalePrecision::F32),
+            reads: 0,
+            change_on,
+            legacy_path: None,
+        };
+        let plan = request(&companions, PlaneCodec::B3, 128);
+        let mut spool = Cursor::new(Vec::new());
+        let out = root.0.join(format!("{change_on}.out"));
+        let error = import_salt_v2_model_bound(
+            &plan,
+            &mut reader,
+            &mut companions,
+            &mut spool,
+            &mut DirectoryTensorSink::new(&out),
+            EvidenceRecorder::new(
+                "compact-source-guard",
+                [LEGACY_MODEL_IMPORT_BOUND_PREPARED_REGISTRATION],
+            )
+            .unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("observed tensor content changed"),
+            "{error}"
+        );
         assert!(!out.exists());
     }
 }
