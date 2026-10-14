@@ -728,6 +728,22 @@ fn validate_scales(
 /// existing training transform. SignedRht uses SplitMix64-derived signs with
 /// the signed diagonal applied before the normalized Hadamard transform.
 pub fn apply_basis(values: &mut [f32], basis: Basis) -> Result<(), AdditiveError> {
+    apply_forward_basis(values, basis)
+}
+
+/// Apply the declared forward basis in f64 without narrowing metric values.
+///
+/// Shares f32's butterfly order, sign domain and input-axis coordinate indexing.
+/// Geometry is checked before mutation; finite-value/overflow admission remains
+/// the numerical caller's responsibility, as for [`apply_basis`].
+pub fn apply_basis_f64(values: &mut [f64], basis: Basis) -> Result<(), AdditiveError> {
+    apply_forward_basis(values, basis)
+}
+
+fn apply_forward_basis<T: BasisScalar>(
+    values: &mut [T],
+    basis: Basis,
+) -> Result<(), AdditiveError> {
     match basis {
         Basis::Identity => Ok(()),
         Basis::Hadamard { block } => apply_hadamard_blocks(values, block),
@@ -767,7 +783,7 @@ pub fn apply_inverse_basis(values: &mut [f32], basis: Basis) -> Result<(), Addit
     }
 }
 
-fn apply_signs(values: &mut [f32], seed: u64, domain: u64) {
+fn apply_signs<T: BasisScalar>(values: &mut [T], seed: u64, domain: u64) {
     for (index, value) in values.iter_mut().enumerate() {
         if signed_rht_negative(seed, domain, index as u64) {
             *value = -*value;
@@ -857,7 +873,10 @@ fn validate_basis_blocks(len: usize, block: u32) -> Result<usize, AdditiveError>
     Ok(block)
 }
 
-fn apply_hadamard_blocks(values: &mut [f32], block: u32) -> Result<(), AdditiveError> {
+fn apply_hadamard_blocks<T: BasisScalar>(
+    values: &mut [T],
+    block: u32,
+) -> Result<(), AdditiveError> {
     let block = validate_basis_blocks(values.len(), block)?;
     for vector in values.chunks_exact_mut(block) {
         hadamard_vector(vector);
@@ -882,6 +901,19 @@ pub const fn group_is_rotatable(len: usize) -> bool {
 /// # Panics
 /// Panics if the slice length is not a power of two (including an empty slice).
 pub fn fast_hadamard(values: &mut [f32]) {
+    fast_hadamard_impl(values);
+}
+
+/// In-place normalized Walsh–Hadamard transform preserving f64 metric precision.
+///
+/// Uses the common butterfly order and the legacy f64 sqrt-reciprocal bits.
+/// # Panics
+/// Panics if the slice length is not a power of two (including an empty slice).
+pub fn fast_hadamard_f64(values: &mut [f64]) {
+    fast_hadamard_impl(values);
+}
+
+fn fast_hadamard_impl<T: BasisScalar>(values: &mut [T]) {
     let n = values.len();
     assert!(
         n.is_power_of_two(),
@@ -890,7 +922,35 @@ pub fn fast_hadamard(values: &mut [f32]) {
     hadamard_vector(values);
 }
 
-fn hadamard_vector(vector: &mut [f32]) {
+trait BasisScalar:
+    Copy
+    + core::ops::Add<Output = Self>
+    + core::ops::Sub<Output = Self>
+    + core::ops::Neg<Output = Self>
+    + core::ops::MulAssign
+{
+    fn normalization(log2_block: u32) -> Self;
+}
+
+impl BasisScalar for f32 {
+    fn normalization(log2_block: u32) -> Self {
+        hadamard_normalization(log2_block)
+    }
+}
+
+impl BasisScalar for f64 {
+    fn normalization(log2_block: u32) -> Self {
+        if log2_block.is_multiple_of(2) {
+            let exponent = 1023 - u64::from(log2_block / 2);
+            f64::from_bits(exponent << 52)
+        } else {
+            let exponent = 1022 - u64::from(log2_block / 2);
+            f64::from_bits((exponent << 52) | 0x0006_a09e_667f_3bcc)
+        }
+    }
+}
+
+fn hadamard_vector<T: BasisScalar>(vector: &mut [T]) {
     let block = vector.len();
     let mut width = 1usize;
     while width < block {
@@ -903,7 +963,7 @@ fn hadamard_vector(vector: &mut [f32]) {
         }
         width *= 2;
     }
-    let normalization = hadamard_normalization(block.trailing_zeros());
+    let normalization = T::normalization(block.trailing_zeros());
     for value in vector {
         *value *= normalization;
     }
@@ -945,6 +1005,59 @@ mod tests {
                 super::hadamard_normalization(log2).to_bits(),
                 original.to_bits()
             );
+        }
+    }
+
+    #[test]
+    fn f64_normalization_retains_legacy_sqrt_reciprocal_bits() {
+        for log2 in 0..usize::BITS {
+            let len = 1usize << log2;
+            let original = 1.0 / (len as f64).sqrt();
+            assert_eq!(
+                <f64 as super::BasisScalar>::normalization(log2).to_bits(),
+                original.to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn f64_basis_preserves_perturbations_and_rejects_geometry_before_mutation() {
+        let delta = 1.0 / ((1u64 << 45) as f64);
+        let mut precise = [1.0 + delta, 1.0 - delta];
+        let expected = (precise[0] - precise[1]) / 2.0f64.sqrt();
+        super::apply_basis_f64(&mut precise, Basis::Hadamard { block: 2 }).unwrap();
+        assert!(precise[1] > 0.0);
+        assert!((precise[1] - expected).abs() < 1e-28);
+        let mut narrowed = [1.0f32 + delta as f32, 1.0f32 - delta as f32];
+        apply_basis(&mut narrowed, Basis::Hadamard { block: 2 }).unwrap();
+        assert_eq!(narrowed[1], 0.0);
+
+        let original = [1.0f64, 2.0, 3.0, 4.0];
+        let mut signed = original;
+        super::apply_basis_f64(
+            &mut signed,
+            Basis::SignedRht {
+                block: 4,
+                seed: 7,
+                domain: 9,
+            },
+        )
+        .unwrap();
+        assert_eq!(signed, [-4.0, 2.0, 3.0, 1.0]);
+        for block in [0, 3, 8] {
+            let mut invalid = original;
+            assert!(
+                super::apply_basis_f64(
+                    &mut invalid,
+                    Basis::SignedRht {
+                        block,
+                        seed: 7,
+                        domain: 9
+                    }
+                )
+                .is_err()
+            );
+            assert_eq!(invalid, original);
         }
     }
 

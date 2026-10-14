@@ -743,7 +743,26 @@ fn requested_real_gram_is_used_and_input_changes_rebind_provenance() {
 
 #[test]
 fn joint_feedback_profile_is_source_bound_replayed_and_published_deterministically() {
-    for precision in [WorkPrecision::F32Accum64, WorkPrecision::F64] {
+    for (precision, basis) in [
+        (WorkPrecision::F32Accum64, Basis::Hadamard { block: 64 }),
+        (WorkPrecision::F64, Basis::Hadamard { block: 64 }),
+        (
+            WorkPrecision::F32Accum64,
+            Basis::SignedRht {
+                block: 16,
+                seed: 42,
+                domain: 9,
+            },
+        ),
+        (
+            WorkPrecision::F64,
+            Basis::SignedRht {
+                block: 16,
+                seed: 42,
+                domain: 9,
+            },
+        ),
+    ] {
         let mut source = source(ScalePrecision::F32);
         let values = (0..64)
             .map(|i| ((i * 29 % 101) as f32 - 50.0) / 37.0)
@@ -768,7 +787,7 @@ fn joint_feedback_profile_is_source_bound_replayed_and_published_deterministical
             decay_ramp: true,
         });
         fit_plan.layout.cols = 64;
-        fit_plan.layout.basis = Basis::Hadamard { block: 64 };
+        fit_plan.layout.basis = basis;
         fit_plan.limits.max_weights = 64;
         fit_plan.limits.max_metric_entries = 4096;
         fit_plan.limits.max_output_trits = 384;

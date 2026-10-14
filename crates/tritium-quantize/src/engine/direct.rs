@@ -4,7 +4,7 @@ use super::{ActivationAwareConfig, ScaleRefitMode, fit_tensor_with_scale_refit_m
 use crate::{DensePsdMetric, JointFitConfig, JointFitError, JointFitMetric, RelayBasins};
 use half::f16;
 use std::collections::BTreeSet;
-use tritium_core::{AdditiveError, Trit, apply_basis};
+use tritium_core::{AdditiveError, Trit, apply_basis, apply_basis_f64};
 use tritium_format::{AdditiveTensor, AdditiveTensorError};
 use tritium_schema::{
     AdditiveLayout, Basis, DirectFitPlan, DirectFitProfile, JointFeedbackFitOptions,
@@ -220,8 +220,14 @@ pub fn fit_direct_levels(
         _ => None,
     };
     let mut metric = metric;
-    if let (Some(values), Basis::Hadamard { block }) = (&mut metric, plan.layout.basis) {
-        super::activation_aware::rotate_gram(values, cols, block as usize);
+    if let Some(values) = &mut metric {
+        match plan.layout.basis {
+            Basis::Hadamard { block } => {
+                super::activation_aware::rotate_gram(values, cols, block as usize);
+            }
+            Basis::SignedRht { .. } => rotate_metric(values, cols, plan.layout.basis)?,
+            _ => {}
+        }
     }
     if let Some(values) = &metric
         && let Some(index) = values.iter().position(|value| !value.is_finite())
@@ -298,7 +304,10 @@ pub(super) fn admit_plan(
     if layout.transport != Transport::Raw {
         return Err(DirectFitError::Unsupported("entropy transport"));
     }
-    if !matches!(layout.basis, Basis::Identity | Basis::Hadamard { .. }) {
+    if !matches!(
+        layout.basis,
+        Basis::Identity | Basis::Hadamard { .. } | Basis::SignedRht { .. }
+    ) {
         return Err(DirectFitError::Unsupported("basis metric transform"));
     }
     if layout.law.anchor != ScaleAnchor::Group {
@@ -404,6 +413,26 @@ pub(super) fn admit_plan(
     usize::try_from(metric_count).map_err(|_| DirectFitError::ShapeOverflow)?;
     usize::try_from(output_count).map_err(|_| DirectFitError::ShapeOverflow)?;
     Ok((rows, cols, count))
+}
+
+// B G B^T: row-wise forward transforms right-multiply B^T; then columns
+// left-multiply B. Core owns signs, global input-axis indices and precision.
+fn rotate_metric(values: &mut [f64], cols: usize, basis: Basis) -> Result<(), DirectFitError> {
+    for row in values.chunks_exact_mut(cols) {
+        apply_basis_f64(row, basis).map_err(DirectFitError::Basis)?;
+    }
+    let mut column = reserved_vec(cols)?;
+    column.resize(cols, 0.0);
+    for col in 0..cols {
+        for (row, value) in column.iter_mut().enumerate() {
+            *value = values[row * cols + col];
+        }
+        apply_basis_f64(&mut column, basis).map_err(DirectFitError::Basis)?;
+        for (row, value) in column.iter().enumerate() {
+            values[row * cols + col] = *value;
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn admit_payload(

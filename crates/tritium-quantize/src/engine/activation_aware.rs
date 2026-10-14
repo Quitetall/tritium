@@ -4,7 +4,7 @@
 use super::ladder::{ladder_quantize_at, ladder_step};
 use half::f16;
 use rayon::prelude::*;
-use tritium_core::{fast_hadamard, group_is_rotatable};
+use tritium_core::{fast_hadamard, fast_hadamard_f64, group_is_rotatable};
 
 /// How to fit one tensor in the activation metric.
 #[derive(Clone, Copy, Debug)]
@@ -90,32 +90,10 @@ fn rotate_row(row: &mut [f32], group: usize) {
     }
 }
 
-/// `fast_hadamard` in f64. The Gram is a metric and its inverse is Cholesky-factored, so rounding it
-/// to f32 to reuse the f32 transform would throw away half the digits of the very matrix being
-/// factorized.
-fn hadamard_f64(v: &mut [f64]) {
-    let n = v.len();
-    let mut len = 1;
-    while len < n {
-        for start in (0..n).step_by(len * 2) {
-            for i in start..start + len {
-                let (a, b) = (v[i], v[i + len]);
-                v[i] = a + b;
-                v[i + len] = a - b;
-            }
-        }
-        len *= 2;
-    }
-    let scale = 1.0 / (n as f64).sqrt();
-    for x in v.iter_mut() {
-        *x *= scale;
-    }
-}
-
 fn rotate_row_f64(row: &mut [f64], group: usize) {
     for slice in row.chunks_mut(group) {
         if group_is_rotatable(slice.len()) {
-            hadamard_f64(slice);
+            fast_hadamard_f64(slice);
         }
     }
 }

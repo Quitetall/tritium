@@ -243,7 +243,18 @@ fn matmul(tensor: &AdditiveTensor, input: &[f32]) -> Vec<f32> {
 
 #[test]
 fn every_profile_uses_actual_row_kfac_and_fresh_original_level_fits() {
-    for (cols, basis) in [(35, Basis::Identity), (64, Basis::Hadamard { block: 64 })] {
+    for (cols, basis) in [
+        (35, Basis::Identity),
+        (64, Basis::Hadamard { block: 64 }),
+        (
+            64,
+            Basis::SignedRht {
+                block: 16,
+                seed: 42,
+                domain: 9,
+            },
+        ),
+    ] {
         let (original, weights, model) = source(cols);
         let calibration = factors(
             &original,

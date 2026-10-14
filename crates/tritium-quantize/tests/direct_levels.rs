@@ -98,10 +98,75 @@ fn feedback(precision: WorkPrecision, decay: f64, damp: f64) -> DirectFitProfile
 }
 
 #[test]
+fn signed_rht_direct_fits_match_signed_diagonal_hadamard_conjugation() {
+    let cols = 64;
+    let source = weights(2, cols);
+    let metric = gram(cols);
+    let source_before = source.clone();
+    let metric_before = metric.clone();
+    for (block, seed, domain) in [(4, 7, 9), (16, 42, 9), (32, 42, 10)] {
+        let signed = Basis::SignedRht {
+            block,
+            seed,
+            domain,
+        };
+        let hadamard = Basis::Hadamard { block };
+        // H (H D 1) reveals the existing core's diagonal signs; no copied PRNG.
+        let mut signs = vec![1.0f32; cols];
+        apply_basis(&mut signs, signed).unwrap();
+        apply_basis(&mut signs, hadamard).unwrap();
+        signs.iter_mut().for_each(|value| *value = value.signum());
+        let signed_source = source
+            .iter()
+            .enumerate()
+            .map(|(i, value)| value * signs[i % cols])
+            .collect::<Vec<_>>();
+        let signed_metric = metric
+            .iter()
+            .enumerate()
+            .map(|(i, value)| value * f64::from(signs[i / cols]) * f64::from(signs[i % cols]))
+            .collect::<Vec<_>>();
+        for profile in [
+            ladder(),
+            joint(),
+            feedback(WorkPrecision::F32Accum64, 0.6, 0.01),
+            feedback(WorkPrecision::F64, 0.6, 0.01),
+        ] {
+            let mut expected_plan = plan(profile, cols as u64);
+            expected_plan.layout.basis = hadamard;
+            let expected =
+                fit_direct_levels(&expected_plan, &signed_source, Some(&signed_metric)).unwrap();
+            let mut actual_plan = expected_plan;
+            actual_plan.layout.basis = signed;
+            let actual = fit_direct_levels(&actual_plan, &source, Some(&metric)).unwrap();
+            for (got, reference) in actual.iter().zip(&expected) {
+                assert_eq!(got.level, reference.level);
+                assert_eq!(got.tensor.trits(), reference.tensor.trits());
+                assert_eq!(got.tensor.scales(), reference.tensor.scales());
+                assert_eq!(got.tensor.layout().basis, signed);
+            }
+        }
+    }
+    assert_eq!(source, source_before);
+    assert_eq!(metric, metric_before);
+}
+
+#[test]
 fn zero_joint_feedback_equals_independent_fits_in_both_precisions() {
     for precision in [WorkPrecision::F32Accum64, WorkPrecision::F64] {
         for stored in [ScalePrecision::F16, ScalePrecision::F32] {
-            for (cols, basis) in [(35, Basis::Identity), (64, Basis::Hadamard { block: 64 })] {
+            for (cols, basis) in [
+                (35, Basis::Identity),
+                (64, Basis::Hadamard { block: 64 }),
+                (
+                    64,
+                    Basis::SignedRht {
+                        block: 16,
+                        seed: 42,
+                        domain: 9,
+                    },
+                ),
+            ] {
                 let source = weights(2, cols);
                 let metric = gram(cols);
                 let mut independent = plan(joint(), cols as u64);
@@ -318,10 +383,20 @@ fn independent_joint_levels_are_actual_fresh_fits_not_prefixes() {
 
 #[test]
 fn basis_block_is_independent_of_scale_group_and_payload_executes() {
-    for profile in [ladder(), joint()] {
+    for (profile, basis) in [ladder(), joint()].into_iter().flat_map(|profile| {
+        [
+            Basis::Hadamard { block: 16 },
+            Basis::SignedRht {
+                block: 16,
+                seed: 42,
+                domain: 9,
+            },
+        ]
+        .map(|basis| (profile, basis))
+    }) {
         for codec in [PlaneCodec::D2, PlaneCodec::B3] {
             let mut request = plan(profile, 64);
-            request.layout.basis = Basis::Hadamard { block: 16 };
+            request.layout.basis = basis;
             request.layout.codec = codec;
             let source = weights(2, 64);
             let output = fit_direct_levels(&request, &source, Some(&gram(64))).unwrap();
@@ -488,13 +563,6 @@ fn unsupported_combinations_and_logical_limits_are_not_silently_admitted() {
         |p: &mut DirectFitPlan| p.layout.codec = PlaneCodec::S34,
         |p: &mut DirectFitPlan| p.layout.allocation = PlaneAllocation::PerTile,
         |p: &mut DirectFitPlan| p.layout.transport = Transport::JointHuffman { block: 32 },
-        |p: &mut DirectFitPlan| {
-            p.layout.basis = Basis::SignedRht {
-                block: 32,
-                seed: 42,
-                domain: 9,
-            }
-        },
         |p: &mut DirectFitPlan| p.layout.law.relation = PlaneRelation::Free,
     ] {
         let mut bad = request.clone();
@@ -528,17 +596,26 @@ fn unsupported_combinations_and_logical_limits_are_not_silently_admitted() {
 #[test]
 fn basis_and_stored_scale_overflow_are_errors_not_clamping() {
     let mut request = plan(ladder(), 64);
-    request.layout.basis = Basis::Hadamard { block: 32 };
-    assert!(matches!(
-        fit_direct_levels(&request, &[f32::MAX; 128], None),
-        Err(DirectFitError::NonFiniteBasisWeight { .. })
-    ));
-    let mut metric = vec![f64::MAX; 4096];
-    assert!(matches!(
-        fit_direct_levels(&request, &[1.0; 128], Some(&metric)),
-        Err(DirectFitError::NonFiniteBasisMetric { .. })
-    ));
-    metric.fill(0.0);
+    for basis in [
+        Basis::Hadamard { block: 32 },
+        Basis::SignedRht {
+            block: 32,
+            seed: 42,
+            domain: 9,
+        },
+    ] {
+        request.layout.basis = basis;
+        assert!(matches!(
+            fit_direct_levels(&request, &[f32::MAX; 128], None),
+            Err(DirectFitError::NonFiniteBasisWeight { .. })
+        ));
+        let metric = vec![f64::MAX; 4096];
+        assert!(matches!(
+            fit_direct_levels(&request, &[1.0; 128], Some(&metric)),
+            Err(DirectFitError::NonFiniteBasisMetric { .. })
+        ));
+    }
+    let mut metric = vec![0.0; 4096];
     for i in 0..64 {
         metric[i * 64 + i] = 1.0;
     }
@@ -547,6 +624,22 @@ fn basis_and_stored_scale_overflow_are_errors_not_clamping() {
         fit_direct_levels(&request, &[100_000.0; 128], Some(&metric)),
         Err(DirectFitError::Output(_))
     ));
+}
+
+#[test]
+fn signed_rht_invalid_geometry_is_refused_before_source_validation() {
+    for block in [0, 3, 128] {
+        let mut request = plan(ladder(), 64);
+        request.layout.basis = Basis::SignedRht {
+            block,
+            seed: 42,
+            domain: 9,
+        };
+        assert!(matches!(
+            fit_direct_levels(&request, &[], None),
+            Err(DirectFitError::Layout(_))
+        ));
+    }
 }
 
 #[test]
