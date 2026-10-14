@@ -46,7 +46,8 @@ mod worker;
 
 pub use generator::{
     CancellationCapabilitiesV1, CancellationCheckpoint, FinishReason, GenError, GenRequest,
-    Generator, MockGenerator, RunnerRuntimeInfo, Sampling, Step, TreeOpError,
+    Generator, MockGenerator, RunnerResourceAdmission, RunnerRuntimeInfo, Sampling, Step,
+    TreeOpError,
 };
 pub use portable_generator::RunnerGenerator;
 pub use qwen_generator::QwenGenerator;

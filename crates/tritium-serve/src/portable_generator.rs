@@ -83,6 +83,7 @@ impl Generator for RunnerGenerator {
                     .cache_admission()
                     .map_or(runner.max_context(), |a| a.limits().max_segment_tokens),
                 resident_payload_bytes: runner.resident_payload_bytes(),
+                resource_admission: resource_admission(runner),
             }),
         }
     }
@@ -223,6 +224,26 @@ impl Generator for RunnerGenerator {
             )),
         }
     }
+}
+
+#[cfg(feature = "serve")]
+fn resource_admission(
+    runner: &tritium_nn::Runner,
+) -> Option<crate::generator::RunnerResourceAdmission> {
+    runner
+        .resource_admission()
+        .map(|a| crate::generator::RunnerResourceAdmission {
+            payload_bytes: a.payload_bytes,
+            source_workspace_bytes: a.source_workspace_bytes,
+            host_workspace_bytes: a.host_workspace_bytes,
+            device_workspace_bytes: a.device_workspace_bytes,
+            retained_host_bytes: a.retained_host_bytes,
+        })
+}
+
+#[cfg(not(feature = "serve"))]
+fn resource_admission(_: &tritium_nn::Runner) -> Option<crate::generator::RunnerResourceAdmission> {
+    None
 }
 
 // The whole prompt is validated before entry. Every segment crosses the same

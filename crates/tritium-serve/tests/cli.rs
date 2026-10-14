@@ -149,6 +149,102 @@ fn typed_source_rejects_bad_launch_and_limits_before_backend_init() {
 fn stream_config() -> serde_json::Value {
     serde_json::json!({"max_context":32,"max_segment_tokens":2,"max_host_cache_payload_bytes":1_000_000})
 }
+fn streamed_resources() -> serde_json::Value {
+    serde_json::json!({
+        "max_source_workspace_bytes":65_536,
+        "max_host_workspace_bytes":1_000_000,
+        "max_device_workspace_bytes":0,
+        "max_retained_host_bytes":1_000_000
+    })
+}
+
+#[test]
+fn streamed_resources_reject_bad_contract_before_backend_initialization() {
+    let root = Scratch::new("streamed-contract");
+    let path = root.0.join("load.json");
+    for case in 0..10 {
+        let mut config = typed_config(&root.0.join("missing.trit"));
+        config["stream_limits"] = stream_config();
+        config["streamed_resources"] = streamed_resources();
+        match case {
+            0 => {
+                config.as_object_mut().unwrap().remove("stream_limits");
+            }
+            1 => {
+                config["execution"] = serde_json::json!({"kind":"resident_device_f32","max_device_payload_bytes":1_000_000})
+            }
+            2 => config["streamed_resources"]["max_source_workspace_bytes"] = 0.into(),
+            3 => config["streamed_resources"]["max_host_workspace_bytes"] = 0.into(),
+            4 => config["streamed_resources"]["max_retained_host_bytes"] = 0.into(),
+            5 => {
+                config["streamed_resources"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("max_device_workspace_bytes");
+            }
+            6 => config["streamed_resources"]["unknown"] = true.into(),
+            7 => config["streamed_resources"]["max_device_workspace_bytes"] = (-1).into(),
+            8 => config["streamed_resources"]["max_host_workspace_bytes"] = "unlimited".into(),
+            9 => config["streamed_resources"] = true.into(),
+            _ => unreachable!(),
+        }
+        std::fs::write(&path, config.to_string()).unwrap();
+        let output = clean_command()
+            .arg("--typed")
+            .arg(&path)
+            .args(["--backend", "not-linked"])
+            .output()
+            .unwrap();
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "case {case}");
+        assert!(
+            !error.contains("is not in the registry"),
+            "case {case}: {error}"
+        );
+        assert!(!error.contains("No such file"), "case {case}: {error}");
+    }
+}
+
+#[test]
+fn actual_streamed_binary_refuses_each_covered_budget_without_starting_listener() {
+    let root = Scratch::new("streamed-budget");
+    let model = root.0.join("model.trit");
+    let path = root.0.join("load.json");
+    std::fs::write(&model, fixture::package(true, true)).unwrap();
+    for field in [
+        "max_payload_bytes",
+        "max_source_workspace_bytes",
+        "max_host_workspace_bytes",
+        "max_retained_host_bytes",
+    ] {
+        let mut config = typed_config(&model);
+        config["stream_limits"] = stream_config();
+        config["streamed_resources"] = streamed_resources();
+        if field == "max_payload_bytes" {
+            config[field] = 1.into();
+        } else {
+            config["streamed_resources"][field] = 1.into();
+        }
+        std::fs::write(&path, config.to_string()).unwrap();
+        let output = clean_command()
+            .arg("--typed")
+            .arg(&path)
+            .args(["--backend", "cpu"])
+            .output()
+            .unwrap();
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{field}");
+        assert!(
+            error.contains("model resource admission"),
+            "{field}: {error}"
+        );
+        assert!(
+            !error.contains("typed runtime diagnostics"),
+            "{field}: {error}"
+        );
+        assert!(!error.contains("listening"), "{field}: {error}");
+    }
+}
 #[test]
 fn unsupported_resident_selection_rejects_before_model_access_without_host_fallback() {
     let root = Scratch::new("resident-unsupported");
@@ -199,24 +295,34 @@ fn http(port: u16, method: &str, path: &str, body: &str) -> std::io::Result<Stri
 }
 #[test]
 fn actual_typed_binary_loads_real_graph_and_serves_chat_on_loopback() {
-    check_actual_typed_binary(false, false);
+    check_actual_typed_binary(false, false, false, false);
 }
 #[test]
 fn actual_bounded_typed_binary_prefills_multiple_segments_and_reports_admission() {
-    check_actual_typed_binary(false, true);
+    check_actual_typed_binary(false, true, false, false);
+}
+#[test]
+fn actual_encoded_streamed_typed_binary_serves_chat_and_reports_logical_resources() {
+    check_actual_typed_binary(false, true, true, false);
+}
+#[cfg(feature = "cuda")]
+#[test]
+fn physical_encoded_streamed_typed_binary_serves_cuda_chat_without_resident_fallback() {
+    tritium_cuda::CudaBackend::new(0).expect("physical encoded serving test requires CUDA");
+    check_actual_typed_binary(false, true, true, true);
 }
 #[cfg(feature = "cuda")]
 #[test]
 fn actual_resident_typed_binary_serves_gpu_chat_and_sse_with_effective_diagnostics() {
     match tritium_cuda::CudaBackend::new(0) {
-        Ok(_) => check_actual_typed_binary(true, true),
+        Ok(_) => check_actual_typed_binary(true, true, false, true),
         Err(e) if std::env::var("TRITIUM_REQUIRE_CUDA").as_deref() == Ok("1") => {
             panic!("required CUDA: {e}")
         }
         Err(e) => eprintln!("SKIP resident typed binary: {e}"),
     }
 }
-fn check_actual_typed_binary(resident: bool, bounded: bool) {
+fn check_actual_typed_binary(resident: bool, bounded: bool, streamed: bool, cuda: bool) {
     for hybrid in [false, true] {
         for additive in [false, true] {
             let root = Scratch::new("binary");
@@ -231,6 +337,9 @@ fn check_actual_typed_binary(resident: bool, bounded: bool) {
             if resident {
                 config["execution"] = serde_json::json!({"kind":"resident_device_f32","max_device_payload_bytes":1_000_000});
             }
+            if streamed {
+                config["streamed_resources"] = streamed_resources();
+            }
             std::fs::write(&load_path, config.to_string()).unwrap();
             let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -241,7 +350,7 @@ fn check_actual_typed_binary(resident: bool, bounded: bool) {
                     .arg(&load_path)
                     .args([
                         "--backend",
-                        if resident { "cuda" } else { "cpu" },
+                        if cuda { "cuda" } else { "cpu" },
                         "--port",
                         &port.to_string(),
                         "--rate-limit-rpm",
@@ -284,6 +393,20 @@ fn check_actual_typed_binary(resident: bool, bounded: bool) {
             assert_eq!(info["max_context"], if bounded { 16 } else { 32 });
             assert_eq!(info["max_segment_tokens"], if bounded { 2 } else { 32 });
             assert_eq!(info["resident_payload_bytes"].as_u64().is_some(), resident);
+            let admission = &info["resource_admission"];
+            if streamed {
+                assert!(admission["payload_bytes"].as_u64().unwrap() > 0);
+                assert_eq!(admission["source_workspace_bytes"], 65_536);
+                assert!(admission["host_workspace_bytes"].as_u64().unwrap() > 0);
+                assert_eq!(admission["device_workspace_bytes"], 0);
+                assert!(admission["retained_host_bytes"].as_u64().unwrap() > 0);
+                assert_eq!(admission.as_object().unwrap().len(), 5);
+            } else {
+                assert!(
+                    admission.is_null(),
+                    "compatibility must not invent admission: {info}"
+                );
+            }
             let body=serde_json::json!({"model":"tritium","messages":[{"role":"user","content":"hello partner"}],
             "max_tokens":3,"temperature":0,"stream":false}).to_string();
             let response = http(port, "POST", "/v1/chat/completions", &body).unwrap();
@@ -321,7 +444,7 @@ fn check_actual_typed_binary(resident: bool, bounded: bool) {
                 );
             }
             eprintln!(
-                "actual typed binary resident={resident} bounded={bounded} hybrid={hybrid} additive={additive}: loopback chat/SSE returned HTTP 200; toy unqualified"
+                "actual typed binary resident={resident} bounded={bounded} streamed={streamed} cuda={cuda} hybrid={hybrid} additive={additive}: loopback chat/SSE returned HTTP 200; toy unqualified"
             );
             drop(server);
         }

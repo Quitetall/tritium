@@ -504,6 +504,21 @@ impl CancellationCapabilitiesV1 {
 }
 
 /// Descriptive common-runner configuration, never release or physical-memory evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct RunnerResourceAdmission {
+    /// Logical matrix payload, including admitted draft weights and tied sharing.
+    pub payload_bytes: u64,
+    /// Maximum concurrent source window or preserved encoded/decoded pair.
+    pub source_workspace_bytes: u64,
+    /// Backend-declared additional host upload workspace.
+    pub host_workspace_bytes: u64,
+    /// Backend-declared additional device upload workspace.
+    pub device_workspace_bytes: u64,
+    /// Preserved widened values plus admitted host language cache.
+    pub retained_host_bytes: u64,
+}
+
+/// Descriptive common-runner configuration, never release or physical-memory evidence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RunnerRuntimeInfo {
     /// Actual selected language executor.
@@ -514,6 +529,9 @@ pub struct RunnerRuntimeInfo {
     pub max_segment_tokens: usize,
     /// Logical resident payload, excluding allocator/driver/host overhead.
     pub resident_payload_bytes: Option<usize>,
+    /// Covered logical domains only; absent for compatibility/undeclared loads.
+    /// Excludes metadata/tokenizer heaps, allocator/driver and execution scratch.
+    pub resource_admission: Option<RunnerResourceAdmission>,
 }
 
 /// The inference seam: prefill a prompt and stream decode steps.

@@ -3,6 +3,9 @@ use serde::Deserialize;
 use std::{fs::File, io::Read, path::Path};
 
 const MAX_LOAD_JSON: u64 = 16 * 1024;
+#[cfg(test)]
+#[path = "typed_source_tests.rs"]
+mod tests;
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Execution {
@@ -30,6 +33,15 @@ impl StreamConfig {
         }
     }
 }
+/// Explicit logical ceilings; selecting these requires encoded matrix upload.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StreamedResources {
+    max_source_workspace_bytes: u64,
+    max_host_workspace_bytes: u64,
+    max_device_workspace_bytes: u64,
+    max_retained_host_bytes: u64,
+}
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TypedConfig {
@@ -46,6 +58,7 @@ pub(crate) struct TypedConfig {
     #[serde(default)]
     execution: Execution,
     stream_limits: Option<StreamConfig>,
+    streamed_resources: Option<StreamedResources>,
 }
 impl TypedConfig {
     pub(crate) fn read(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
@@ -99,6 +112,22 @@ impl TypedConfig {
             && (max_device_payload_bytes == 0 || self.stream_limits.is_none())
         {
             return Err("--typed resident execution requires positive device payload and explicit stream_limits".into());
+        }
+        if let Some(resources) = self.streamed_resources {
+            if self.stream_limits.is_none() || !matches!(self.execution, Execution::Host {}) {
+                return Err("--typed streamed_resources requires explicit stream_limits and host graph execution".into());
+            }
+            if [
+                resources.max_source_workspace_bytes,
+                resources.max_host_workspace_bytes,
+                resources.max_retained_host_bytes,
+            ]
+            .contains(&0)
+            {
+                return Err("--typed streamed source/host workspace and retained-host limits must be positive".into());
+            }
+            // A zero device-workspace ceiling is a real refusal ceiling, not an
+            // unknown-cost substitution. The backend must explicitly plan zero.
         }
         Ok(())
     }
@@ -162,8 +191,35 @@ impl TypedConfig {
             parent: None,
             logical_time: 0,
         };
-        let loaded = match self.stream_limits {
-            Some(stream) => tritium_nn::load_with_limits(
+        let loaded = match (self.streamed_resources, self.stream_limits) {
+            (Some(resources), Some(stream)) => {
+                let source_workspace =
+                    tritium_runtime::TensorPayloadBudget::new(resources.max_source_workspace_bytes);
+                let host_workspace =
+                    tritium_runtime::TensorPayloadBudget::new(resources.max_host_workspace_bytes);
+                let device_workspace =
+                    tritium_runtime::TensorPayloadBudget::new(resources.max_device_workspace_bytes);
+                let retained_host =
+                    tritium_runtime::TensorPayloadBudget::new(resources.max_retained_host_bytes);
+                tritium_nn::load_streamed_with_resources(
+                    source,
+                    backend,
+                    policy,
+                    tritium_nn::ModelLoadResources {
+                        payload: &budget,
+                        source_workspace: &source_workspace,
+                        host_workspace: &host_workspace,
+                        device_workspace: &device_workspace,
+                        retained_host: &retained_host,
+                    },
+                    stream.limits(),
+                    context,
+                )?
+            }
+            (Some(_), None) => {
+                return Err("--typed streamed_resources requires explicit stream_limits".into());
+            }
+            (None, Some(stream)) => tritium_nn::load_with_limits(
                 source,
                 backend,
                 policy,
@@ -171,7 +227,7 @@ impl TypedConfig {
                 stream.limits(),
                 context,
             )?,
-            None => tritium_nn::load(source, backend, policy, &budget, context)?,
+            (None, None) => tritium_nn::load(source, backend, policy, &budget, context)?,
         };
         let expected = match self.execution {
             Execution::Host {} => tritium_spec::DecoderExecution::Host,
@@ -181,6 +237,9 @@ impl TypedConfig {
         };
         if loaded.runner.execution() != expected {
             return Err("--typed loaded execution disagrees with explicit selection".into());
+        }
+        if self.streamed_resources.is_some() && loaded.runner.resource_admission().is_none() {
+            return Err("--typed streamed load did not retain logical resource admission".into());
         }
         eprintln!(
             "WARNING: typed candidate, not production-qualified: {}",
@@ -198,6 +257,11 @@ impl TypedConfig {
                     .max_segment_tokens),
             loaded.runner.resident_payload_bytes()
         );
+        if let Some(admission) = loaded.runner.resource_admission() {
+            eprintln!(
+                "typed encoded-stream logical resource admission (not physical fit/qualification): {admission:?}"
+            );
+        }
         Ok(loaded)
     }
 }

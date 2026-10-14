@@ -50,6 +50,41 @@ and the existing logical host-cache plan. Serving splits longer prompts into
 segments; hybrid DeltaNet continuation stays one token. The selected capacity,
 not the source model's maximum, bounds requests/completions.
 
+To require resource-admitted encoded matrix streaming, add `streamed_resources`
+and explicit `stream_limits` to the complete load JSON. This selects the common
+`load_streamed_with_resources` path, without decoded-upload fallback:
+
+```json
+{
+  "stream_limits": {
+    "max_context": 4096,
+    "max_segment_tokens": 128,
+    "max_host_cache_payload_bytes": 1073741824
+  },
+  "streamed_resources": {
+    "max_source_workspace_bytes": 67108864,
+    "max_host_workspace_bytes": 536870912,
+    "max_device_workspace_bytes": 0,
+    "max_retained_host_bytes": 2147483648
+  }
+}
+```
+
+These are illustrative ceilings, not model-fit recommendations. Existing
+`max_payload_bytes` bounds aggregate native matrix payload; the four additional
+ceilings cover concurrent source work, backend-declared host/device upload work,
+and preserved widened values plus host cache. A zero device-workspace ceiling
+is allowed only when the backend explicitly plans zero. Other ceilings must be
+positive. Unknown streaming/resource support refuses before matrix upload.
+Reservations follow the loaded runner into the serving worker; failure drops
+private partial handles. Preserved host vectors retain their bounded decode path.
+Metadata/tokenizer heaps, allocator/driver/pinned costs and activation scratch
+remain excluded: this is logical admission, not complete physical fit.
+CUDA still stages one whole native tensor in host memory; its plan charges that
+workspace. `streamed_resources` currently requires host graph execution (CUDA
+matrix operations are allowed), not `resident_device_f32`. Omitting it preserves
+the explicit compatibility loader and does not invent resource admission.
+
 Optional `execution` defaults to `{"kind":"host"}`. To request the common CUDA
 device-f32 graph, build with `--features cuda`, use `--backend cuda`, and add both:
 
@@ -78,6 +113,9 @@ payload caps cover different domains; neither is a complete physical-memory ledg
 `resident_device_f32`), admitted `max_context`, `max_segment_tokens` and logical
 `resident_payload_bytes` (null for host). Unknown/legacy generators return null.
 This snapshot is descriptive, not a receipt or inference/self-test probe.
+Its nullable `resource_admission` reports the five covered logical byte domains
+when resource admission was selected; compatibility loading returns null.
+Neither this field nor successful streaming changes production readiness.
 
 This route is loopback-only and unqualified. It rejects raw-token mode, spec,
 draft, batching and KV-pool options. Hybrid MTP remains privately Unverified,

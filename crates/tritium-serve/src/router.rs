@@ -2283,6 +2283,7 @@ async fn readiness(State(st): State<AppState>) -> Response {
                 "max_context": info.max_context,
                 "max_segment_tokens": info.max_segment_tokens,
                 "resident_payload_bytes": info.resident_payload_bytes,
+                "resource_admission": info.resource_admission,
             })),
         })),
     )
