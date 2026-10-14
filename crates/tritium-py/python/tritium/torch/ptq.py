@@ -17,6 +17,7 @@ from typing import (
     Callable,
     Dict,
     Iterable,
+    Iterator,
     Optional,
     Sequence,
     Tuple,
@@ -1797,12 +1798,44 @@ def capture_kronecker_module_group(
     )
 
 
-def _hash_field(digest: "hashlib._Hash", tag: str, payload: bytes) -> None:
+def _hash_field(digest: "hashlib._Hash", tag: str, payload: Union[bytes, bytearray]) -> None:
     encoded = tag.encode("utf-8")
     digest.update(struct.pack("<Q", len(encoded)))
     digest.update(encoded)
     digest.update(struct.pack("<Q", len(payload)))
     digest.update(payload)
+
+
+def _logical_tensor_pieces(
+    tensor: torch.Tensor, maximum_elements: int
+) -> Iterator[torch.Tensor]:
+    """Visit logical C-order values with bounded contiguous copies, not a master."""
+    if tensor.numel() == 0:
+        return
+    if tensor.is_contiguous():
+        flat = tensor.view(-1)
+        for offset in range(0, flat.numel(), maximum_elements):
+            piece = flat[offset : offset + maximum_elements]
+            # A contiguous child view can still retain a conjugate/negative bit
+            # from a strided parent. The old full copy resolved these bits.
+            if piece.is_conj() or piece.is_neg():
+                piece = piece.clone(memory_format=torch.contiguous_format)
+            yield piece
+        return
+    # Group complete leading-axis slabs when possible. Otherwise recurse into
+    # views until a slab fits: no flatten/reshape of the whole strided tensor.
+    if tensor.numel() <= maximum_elements:
+        yield tensor.clone(memory_format=torch.contiguous_format).view(-1)
+        return
+    elements_per_row = tensor.numel() // tensor.shape[0]
+    if elements_per_row > maximum_elements:
+        for index in range(tensor.shape[0]):
+            yield from _logical_tensor_pieces(tensor.select(0, index), maximum_elements)
+    else:
+        rows = max(1, maximum_elements // elements_per_row)
+        for offset in range(0, tensor.shape[0], rows):
+            slab = tensor.narrow(0, offset, min(rows, tensor.shape[0] - offset))
+            yield slab.clone(memory_format=torch.contiguous_format).view(-1)
 
 
 def _hash_tensor(digest: "hashlib._Hash", tag: str, value: torch.Tensor) -> None:
@@ -1813,18 +1846,23 @@ def _hash_tensor(digest: "hashlib._Hash", tag: str, value: torch.Tensor) -> None
         f"{tag}:shape",
         json.dumps(list(tensor.shape), separators=(",", ":")).encode("ascii"),
     )
-    flat = tensor.contiguous().view(-1)
-    chunk_elements = max(1, (1024 * 1024) // max(1, flat.element_size()))
-    for offset in range(0, flat.numel(), chunk_elements):
-        chunk = (
-            flat[offset : offset + chunk_elements]
-            .contiguous()
-            .view(torch.uint8)
-            .cpu()
-            .numpy()
-            .tobytes()
-        )
-        _hash_field(digest, f"{tag}:chunk", chunk)
+    chunk_elements = max(1, (1024 * 1024) // max(1, tensor.element_size()))
+    chunk_bytes = chunk_elements * tensor.element_size()
+    pending = bytearray()
+    for piece in _logical_tensor_pieces(tensor, chunk_elements):
+        payload = memoryview(piece.view(torch.uint8).cpu().numpy()).cast("B")
+        offset = 0
+        # Slab sizes may differ from the historical fixed chunk boundaries.
+        # Reblock bytes exactly so old source/data identities remain unchanged.
+        while offset < len(payload):
+            count = min(chunk_bytes - len(pending), len(payload) - offset)
+            pending.extend(payload[offset : offset + count])
+            offset += count
+            if len(pending) == chunk_bytes:
+                _hash_field(digest, f"{tag}:chunk", pending)
+                pending.clear()
+    if pending:
+        _hash_field(digest, f"{tag}:chunk", pending)
 
 
 def _hash_value(digest: "hashlib._Hash", tag: str, value: Any) -> None:
