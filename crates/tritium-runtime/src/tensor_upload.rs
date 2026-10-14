@@ -3,8 +3,8 @@
 use crate::TensorPayloadBudget;
 use tritium_evidence::{EvidenceError, EvidenceRecorder, TensorUploaded};
 use tritium_spec::{
-    BackendError, DeviceBuffer, TensorCaps, TensorUploadPolicy, TensorView, TernaryBackend,
-    validate_tensor_upload_policy,
+    BackendError, DeviceBuffer, TensorCaps, TensorMetadata, TensorUploadPolicy, TensorView,
+    TernaryBackend, validate_tensor_upload_policy,
 };
 
 /// Run/span context for one typed successful-upload observation.
@@ -18,6 +18,19 @@ pub struct TensorUploadContext<'a> {
     pub parent: Option<&'a str>,
     /// Deterministic logical time, not wall-clock time.
     pub logical_time: u64,
+}
+
+/// Separate logical lifetime budgets for a planned upload. These do not cover
+/// source decoding, driver/allocator overhead or whole-runtime memory. Reusing
+/// one ledger intentionally charges overlapping domains to the same cap.
+#[derive(Debug)]
+pub struct TensorUploadResources<'a> {
+    /// Retained payload reservation, transferred to the returned handle.
+    pub payload: &'a TensorPayloadBudget,
+    /// Explicit host workspace reserved through validation/upload/evidence.
+    pub host_workspace: &'a TensorPayloadBudget,
+    /// Explicit device workspace reserved through validation/upload/evidence.
+    pub device_workspace: &'a TensorPayloadBudget,
 }
 
 /// Upload/admission or evidence failure; neither becomes a successful load.
@@ -65,7 +78,7 @@ pub fn upload_tensor_logged(
     name: &str,
     context: TensorUploadContext<'_>,
 ) -> Result<(Box<dyn DeviceBuffer>, TensorCaps), TensorUploadError> {
-    upload_logged(backend, view, policy, name, context, None)
+    upload_logged(backend, view, policy, name, context, None, None)
 }
 
 /// Logged upload with shared lifetime-bound owned-payload admission.
@@ -88,7 +101,31 @@ pub fn upload_tensor_logged_admitted(
     context: TensorUploadContext<'_>,
     budget: &TensorPayloadBudget,
 ) -> Result<(Box<dyn DeviceBuffer>, TensorCaps), TensorUploadError> {
-    upload_logged(backend, view, policy, name, context, Some(budget))
+    upload_logged(backend, view, policy, name, context, Some(budget), None)
+}
+
+/// Planned upload with retained payload and transient workspace reservations.
+/// Unknown metadata planning is refused without fallback. Reservations precede
+/// numeric capability checks and upload, and all faults release them. Actual
+/// capabilities/payload must equal the plan before a successful event is emitted.
+/// Source/decode and physical/driver costs remain separate admission obligations.
+pub fn upload_tensor_logged_with_resources(
+    backend: &dyn TernaryBackend,
+    view: TensorView<'_>,
+    policy: TensorUploadPolicy,
+    name: &str,
+    context: TensorUploadContext<'_>,
+    resources: TensorUploadResources<'_>,
+) -> Result<(Box<dyn DeviceBuffer>, TensorCaps), TensorUploadError> {
+    upload_logged(
+        backend,
+        view,
+        policy,
+        name,
+        context,
+        Some(resources.payload),
+        Some(resources),
+    )
 }
 
 fn upload_logged(
@@ -98,6 +135,7 @@ fn upload_logged(
     name: &str,
     context: TensorUploadContext<'_>,
     budget: Option<&TensorPayloadBudget>,
+    resources: Option<TensorUploadResources<'_>>,
 ) -> Result<(Box<dyn DeviceBuffer>, TensorCaps), TensorUploadError> {
     if name.is_empty() {
         return Err(TensorUploadError::EmptyTensorName);
@@ -105,11 +143,31 @@ fn upload_logged(
     let decoded_source_bytes = view
         .decoded_payload_bytes()
         .map_err(TensorUploadError::Backend)?;
+    let work = resources
+        .map(|resources| {
+            let plan = backend
+                .tensor_upload_plan(TensorMetadata::from_view(view)?)?
+                .ok_or(BackendError::UnsupportedTensor)?;
+            validate_tensor_upload_policy(plan.caps, policy)?;
+            let host = resources
+                .host_workspace
+                .reserve(plan.host_workspace_bytes)?;
+            let device = resources
+                .device_workspace
+                .reserve(plan.device_workspace_bytes)?;
+            Ok::<_, BackendError>((plan, host, device))
+        })
+        .transpose()
+        .map_err(TensorUploadError::Backend)?;
     let reserved = budget
         .map(|budget| {
-            let caps = backend
-                .tensor_caps(view)?
-                .ok_or(BackendError::UnsupportedTensor)?;
+            let caps = if let Some((plan, _, _)) = &work {
+                plan.caps
+            } else {
+                backend
+                    .tensor_caps(view)?
+                    .ok_or(BackendError::UnsupportedTensor)?
+            };
             validate_tensor_upload_policy(caps, policy)?;
             Ok::<_, BackendError>((caps, budget.reserve(caps.payload_bytes)?))
         })

@@ -9191,6 +9191,17 @@ pub(super) enum AddKernel {
     Tiled,
 }
 
+impl CudaBackend {
+    /// Pure structural payload/workspace planning without creating a GPU context.
+    /// Numerical validation, actual driver/device support and physical-memory
+    /// qualification remain required at initialization/upload/execution.
+    pub fn plan_tensor_metadata(
+        metadata: tritium_spec::TensorMetadata<'_>,
+    ) -> Result<Option<tritium_spec::TensorUploadPlan>, BackendError> {
+        semantic::CudaTensor::plan(metadata)
+    }
+}
+
 impl TernaryBackend for CudaBackend {
     fn resident_delta_mixer(
         &self,
@@ -9285,6 +9296,13 @@ impl TernaryBackend for CudaBackend {
         tensor: tritium_spec::TensorView<'_>,
     ) -> Result<Option<tritium_spec::TensorCaps>, BackendError> {
         semantic::CudaTensor::caps(tensor)
+    }
+
+    fn tensor_upload_plan(
+        &self,
+        metadata: tritium_spec::TensorMetadata<'_>,
+    ) -> Result<Option<tritium_spec::TensorUploadPlan>, BackendError> {
+        Self::plan_tensor_metadata(metadata)
     }
 
     fn upload_tensor(

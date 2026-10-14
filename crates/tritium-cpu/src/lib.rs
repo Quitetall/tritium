@@ -232,6 +232,12 @@ impl CpuBackend {
 }
 
 impl TernaryBackend for CpuBackend {
+    fn tensor_upload_plan(
+        &self,
+        metadata: tritium_spec::TensorMetadata<'_>,
+    ) -> Result<Option<tritium_spec::TensorUploadPlan>, BackendError> {
+        semantic::CpuTensor::plan(metadata)
+    }
     fn tensor_caps(
         &self,
         tensor: TensorView<'_>,

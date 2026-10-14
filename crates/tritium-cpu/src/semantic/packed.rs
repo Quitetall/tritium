@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use tritium_core::{AdditiveView, OwnedPerTileIndex, apply_basis, apply_inverse_basis};
 use tritium_format::salt_v2::SaltV2Codec;
 use tritium_schema::{AdditiveLayout, PlaneCodec, PlaneRelation, ScaleAnchor, ScalePrecision};
-use tritium_spec::{BackendError, TensorMatmul};
+use tritium_spec::{AdditiveMetadata, BackendError, TensorMatmul};
 
 #[derive(Debug)]
 pub(crate) struct PackedAdditive {
@@ -58,11 +58,13 @@ impl PackedAdditive {
     }
 
     pub(super) fn payload_bytes(view: AdditiveView<'_>) -> Result<usize, BackendError> {
-        let mut total = 0usize;
-        let codec = codec(view.layout())?;
+        Self::validate_symbols(view)?;
+        Self::payload_metadata(AdditiveMetadata::from_view(view))
+    }
+
+    pub(super) fn validate_symbols(view: AdditiveView<'_>) -> Result<(), BackendError> {
         for plane in 0..view.plane_count() {
             let trits = view.plane_trits(plane).map_err(invalid)?;
-            let bytes = codec.ledger(trits.len()).map_err(invalid)?.physical_bytes;
             if view.layout().codec == PlaneCodec::S34 {
                 // Check each plane separately: canonical padding resets there.
                 for group in trits.as_chunks::<4>().0 {
@@ -71,18 +73,29 @@ impl PackedAdditive {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    pub(super) fn payload_metadata(metadata: AdditiveMetadata<'_>) -> Result<usize, BackendError> {
+        let mut total = 0usize;
+        let codec = codec(metadata.layout())?;
+        for plane in 0..metadata.plane_count() {
+            let bytes = codec
+                .ledger(metadata.plane_trit_count(plane)?)
+                .map_err(invalid)?
+                .physical_bytes;
             total = total
                 .checked_add(bytes)
                 .ok_or_else(|| invalid("plane size overflow"))?;
         }
-        let scales = view
-            .scales()
-            .len()
-            .checked_mul(Self::scale_width(view.layout())?)
+        let scales = metadata
+            .scale_count()
+            .checked_mul(Self::scale_width(metadata.layout())?)
             .ok_or_else(|| invalid("scale size overflow"))?;
-        if view.tile_counts().is_some() {
-            let index_bytes = view.auxiliary_buffer_len_bytes().map_err(invalid)?;
-            let starts = view
+        if metadata.count_bytes().is_some() {
+            let index_bytes = metadata.auxiliary_bytes()?;
+            let starts = metadata
                 .plane_count()
                 .checked_mul(core::mem::size_of::<PlaneStart>())
                 .ok_or_else(|| invalid("plane index size overflow"))?;

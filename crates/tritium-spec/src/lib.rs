@@ -33,7 +33,9 @@ pub use tritium_schema::{
 };
 
 mod caps;
+mod tensor_plan;
 pub use caps::DeviceCaps;
+pub use tensor_plan::{AdditiveMetadata, TensorMetadata, TensorUploadPlan};
 mod deltanet;
 pub use deltanet::{DeltaNetGeometry, DeltaNetStep, ResidentDeltaNet};
 mod delta_mixer;
@@ -404,6 +406,16 @@ pub trait TernaryBackend: Send + Sync {
     /// Defaults fail closed independently of legacy packed kernels or ISA
     /// flags. A declaration must be backed by frozen conformance vectors.
     fn tensor_caps(&self, _tensor: TensorView<'_>) -> Result<Option<TensorCaps>, BackendError> {
+        Ok(None)
+    }
+
+    /// Plan structural payload/workspace without decoding coefficients or allocating.
+    /// None is unknown/unsupported, never a zero-byte fit. Actual upload still
+    /// validates values/coding and checks declared versus returned payload bytes.
+    fn tensor_upload_plan(
+        &self,
+        _metadata: TensorMetadata<'_>,
+    ) -> Result<Option<TensorUploadPlan>, BackendError> {
         Ok(None)
     }
 

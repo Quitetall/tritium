@@ -11,8 +11,8 @@ use std::sync::Arc;
 use tritium_core::{GemmShape, apply_basis, apply_inverse_basis};
 use tritium_format::AdditiveTensor;
 use tritium_spec::{
-    BackendError, Basis, DeviceBuffer, TensorCaps, TensorExecution, TensorMatmul, TensorView,
-    admitted_execution_group,
+    BackendError, Basis, DeviceBuffer, TensorCaps, TensorExecution, TensorMatmul, TensorMetadata,
+    TensorUploadPlan, TensorView, admitted_execution_group,
 };
 mod basis;
 mod packed;
@@ -56,6 +56,32 @@ fn product(a: usize, b: usize) -> Result<usize, BackendError> {
 }
 
 impl CudaTensor {
+    pub(super) fn plan(
+        metadata: TensorMetadata<'_>,
+    ) -> Result<Option<TensorUploadPlan>, BackendError> {
+        let (bytes, workspace) = match metadata {
+            TensorMetadata::Dense { rows, cols } => {
+                let bytes = TensorMetadata::dense_bytes(rows, cols)?;
+                if rows != 0 && cols != 0 {
+                    CudaBackend::check_grad_launch_bounds(1, rows, cols)?;
+                }
+                (bytes, 0)
+            }
+            TensorMetadata::Additive(metadata) => match PackedAdditive::plan_metadata(metadata) {
+                Ok(plan) => plan,
+                Err(BackendError::UnsupportedTensor) => return Ok(None),
+                Err(error) => return Err(error),
+            },
+        };
+        Ok(Some(TensorUploadPlan {
+            caps: TensorCaps {
+                execution: TensorExecution::Native,
+                payload_bytes: bytes as u64,
+            },
+            host_workspace_bytes: workspace as u64,
+            device_workspace_bytes: 0,
+        }))
+    }
     pub(super) fn dimensions(&self) -> (usize, usize) {
         (self.rows, self.cols)
     }

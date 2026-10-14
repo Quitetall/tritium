@@ -76,6 +76,13 @@ fn check(codec: PlaneCodec, rows: usize, cols: usize, plane: &[Trit]) -> usize {
                     let view = AdditiveView::new(layout, planes, &trits, &scales).unwrap();
                     let tensor = TensorView::Additive(view);
                     let caps = cpu.tensor_caps(tensor).unwrap().unwrap();
+                    let metadata = tritium_spec::TensorMetadata::Additive(
+                        tritium_spec::AdditiveMetadata::uniform(layout, planes).unwrap(),
+                    );
+                    let planned = cpu.tensor_upload_plan(metadata).unwrap().unwrap();
+                    assert_eq!(planned.caps, caps);
+                    assert_eq!(planned.host_workspace_bytes, 0);
+                    assert_eq!(planned.device_workspace_bytes, 0);
                     assert_eq!(caps.execution, TensorExecution::Native);
                     let packed = AdditiveTensor::from_view(view)
                         .unwrap()

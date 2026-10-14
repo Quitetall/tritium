@@ -4,8 +4,8 @@ use core::any::Any;
 use tritium_core::DenseView;
 use tritium_format::AdditiveTensor;
 use tritium_spec::{
-    BackendError, DeviceBuffer, TensorCaps, TensorExecution, TensorMatmul, TensorView,
-    admitted_execution_group,
+    BackendError, DeviceBuffer, TensorCaps, TensorExecution, TensorMatmul, TensorMetadata,
+    TensorUploadPlan, TensorView, admitted_execution_group,
 };
 
 mod packed;
@@ -38,8 +38,35 @@ impl DeviceBuffer for CpuTensor {
 }
 
 impl CpuTensor {
+    pub(crate) fn plan(
+        metadata: TensorMetadata<'_>,
+    ) -> Result<Option<TensorUploadPlan>, BackendError> {
+        let bytes = match metadata {
+            TensorMetadata::Dense { rows, cols } => TensorMetadata::dense_bytes(rows, cols)?,
+            TensorMetadata::Additive(additive) => {
+                let layout = additive.layout();
+                if !matches!(
+                    layout.allocation,
+                    tritium_schema::PlaneAllocation::Uniform
+                        | tritium_schema::PlaneAllocation::PerTile
+                ) || !admitted_execution_group(layout.law, layout.group)
+                {
+                    return Ok(None);
+                }
+                PackedAdditive::payload_metadata(additive)?
+            }
+        };
+        Ok(Some(TensorUploadPlan {
+            caps: TensorCaps {
+                execution: TensorExecution::Native,
+                payload_bytes: bytes as u64,
+            },
+            host_workspace_bytes: 0,
+            device_workspace_bytes: 0,
+        }))
+    }
     pub(crate) fn caps(view: TensorView<'_>) -> Result<Option<TensorCaps>, BackendError> {
-        let payload_bytes = if let TensorView::Additive(additive) = view {
+        if let TensorView::Additive(additive) = view {
             let layout = additive.layout();
             if !matches!(
                 layout.allocation,
@@ -51,14 +78,10 @@ impl CpuTensor {
             AdditiveTensor::validate_view(additive).map_err(|e| {
                 BackendError::InvalidInput(format!("CPU additive capability input failed: {e:?}"))
             })?;
-            PackedAdditive::payload_bytes(additive)? as u64
-        } else {
-            view.decoded_payload_bytes()?
-        };
-        Ok(Some(TensorCaps {
-            execution: TensorExecution::Native,
-            payload_bytes,
-        }))
+            PackedAdditive::validate_symbols(additive)?;
+        }
+        let plan = Self::plan(TensorMetadata::from_view(view)?)?;
+        Ok(plan.map(|p| p.caps))
     }
 
     pub(crate) fn upload(view: TensorView<'_>) -> Result<Box<dyn DeviceBuffer>, BackendError> {

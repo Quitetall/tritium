@@ -6,6 +6,7 @@ use half::f16;
 use tritium_core::AdditiveView;
 use tritium_format::salt_v2::SaltV2Codec;
 use tritium_schema::{PlaneCodec, PlaneRelation, ScaleAnchor, ScalePrecision};
+use tritium_spec::AdditiveMetadata;
 
 const HEADER: usize = 60;
 
@@ -27,7 +28,13 @@ impl Plan {
     fn new(view: AdditiveView<'_>) -> Result<Self, BackendError> {
         AdditiveTensor::validate_view(view)
             .map_err(|e| invalid(&format!("CUDA packed semantic input: {e:?}")))?;
-        let layout = view.layout();
+        let plan = Self::from_metadata(AdditiveMetadata::from_view(view))?;
+        Self::validate_finite(view)?;
+        Ok(plan)
+    }
+
+    fn from_metadata(metadata: AdditiveMetadata<'_>) -> Result<Self, BackendError> {
+        let layout = metadata.layout();
         if !admitted_execution_group(layout.law, layout.group) {
             return Err(BackendError::UnsupportedTensor);
         }
@@ -58,42 +65,14 @@ impl Plan {
         if rows != 0 && cols != 0 {
             CudaBackend::check_grad_launch_bounds(1, rows, cols)?;
         }
-        let planes = view.plane_count();
-        // Retain the previous adapter's rejection of nonfinite decoded weights
-        // without materializing a matrix. Most inputs prove this from a scale
-        // upper bound; only overflow-risk inputs need one reusable row.
-        let max_scale = view.scales().iter().copied().fold(0.0f32, f32::max);
-        let mut bound = 0.0f32;
-        let mut plane_bound = max_scale;
-        for _ in 0..planes {
-            bound += plane_bound;
-            if !free {
-                plane_bound *= ratio;
-            }
-        }
-        if !bound.is_finite() {
-            let requested = product(cols, 4)?;
-            let mut row = Vec::new();
-            row.try_reserve_exact(cols)
-                .map_err(|_| BackendError::OutOfMemory { requested })?;
-            row.resize(cols, 0.0);
-            for index in 0..rows {
-                view.dequant_row_into(index, &mut row)
-                    .map_err(|_| invalid("CUDA packed semantic row validation failed"))?;
-                if row.iter().any(|value| !value.is_finite()) {
-                    return Err(invalid("CUDA packed semantic decoded weight is nonfinite"));
-                }
-            }
-        }
-        let compact = view.tile_counts().is_some();
+        let planes = metadata.plane_count();
+        let compact = metadata.count_bytes().is_some();
         let mut encoded = 0usize;
         for plane in 0..planes {
-            let trits = view
-                .plane_trits(plane)
-                .map_err(|_| invalid("CUDA plane geometry mismatch"))?;
-            narrow(trits.len())?;
+            let trits = metadata.plane_trit_count(plane)?;
+            narrow(trits)?;
             let size = codec
-                .ledger(trits.len())
+                .ledger(trits)
                 .map_err(|_| invalid("CUDA plane physical size overflow"))?
                 .physical_bytes;
             encoded = encoded
@@ -103,7 +82,7 @@ impl Plan {
         let scale_offset = HEADER
             .checked_add(encoded)
             .ok_or_else(|| invalid("CUDA scale offset overflow"))?;
-        let scale_bytes = product(view.scales().len(), width)?;
+        let scale_bytes = product(metadata.scale_count(), width)?;
         let index_offset = scale_offset
             .checked_add(scale_bytes)
             .ok_or_else(|| invalid("CUDA index offset overflow"))?;
@@ -126,15 +105,15 @@ impl Plan {
             .checked_add(index_bytes)
             .ok_or_else(|| invalid("CUDA counts offset overflow"))?;
         let bytes = counts_offset
-            .checked_add(view.tile_counts().map_or(0, |c| c.len()))
+            .checked_add(metadata.count_bytes().unwrap_or(0))
             .ok_or_else(|| invalid("CUDA payload byte count overflow"))?;
         narrow(bytes)?;
         let units = if compact {
             0
         } else if free {
-            view.scales().len().checked_div(planes).unwrap_or(0)
+            metadata.scale_count().checked_div(planes).unwrap_or(0)
         } else {
-            view.scales().len()
+            metadata.scale_count()
         };
         Ok(Self {
             codec,
@@ -167,6 +146,40 @@ impl Plan {
             ],
         })
     }
+
+    fn validate_finite(view: AdditiveView<'_>) -> Result<(), BackendError> {
+        let layout = view.layout();
+        let (free, ratio) = match layout.law.relation {
+            PlaneRelation::Free => (true, 1.0f32),
+            PlaneRelation::Tied { num, den } => (false, num as f32 / den as f32),
+            _ => return Err(BackendError::UnsupportedTensor),
+        };
+        let max_scale = view.scales().iter().copied().fold(0.0f32, f32::max);
+        let mut bound = 0.0f32;
+        let mut plane_bound = max_scale;
+        for _ in 0..view.plane_count() {
+            bound += plane_bound;
+            if !free {
+                plane_bound *= ratio;
+            }
+        }
+        if !bound.is_finite() {
+            let (rows, cols) = (layout.rows as usize, layout.cols as usize);
+            let requested = product(cols, 4)?;
+            let mut row = Vec::new();
+            row.try_reserve_exact(cols)
+                .map_err(|_| BackendError::OutOfMemory { requested })?;
+            row.resize(cols, 0.0);
+            for index in 0..rows {
+                view.dequant_row_into(index, &mut row)
+                    .map_err(|_| invalid("CUDA packed semantic row validation failed"))?;
+                if row.iter().any(|value| !value.is_finite()) {
+                    return Err(invalid("CUDA packed semantic decoded weight is nonfinite"));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn put_u32(bytes: &mut [u8], at: usize, value: usize) -> Result<(), BackendError> {
@@ -175,6 +188,13 @@ fn put_u32(bytes: &mut [u8], at: usize, value: usize) -> Result<(), BackendError
 }
 
 impl PackedAdditive {
+    pub(super) fn plan_metadata(
+        metadata: AdditiveMetadata<'_>,
+    ) -> Result<(usize, usize), BackendError> {
+        let plan = Plan::from_metadata(metadata)?;
+        let row = product(metadata.layout().cols as usize, 4)?;
+        Ok((plan.bytes, plan.bytes.max(row)))
+    }
     pub(super) fn payload_bytes(view: AdditiveView<'_>) -> Result<usize, BackendError> {
         Ok(Plan::new(view)?.bytes)
     }
