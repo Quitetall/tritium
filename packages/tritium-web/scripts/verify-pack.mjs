@@ -6,9 +6,12 @@ import { arch, hostname, platform, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
+import { admitArchiveNativeReference } from "./archive-native-reference.mjs";
 import { generateNpmSbom } from "./generate-npm-sbom.mjs";
 
-const run = promisify(execFile);
+const execute = promisify(execFile);
+const run = (command, args, options = {}) =>
+  execute(command, args, { timeout: 60_000, ...options });
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const packageJson = JSON.parse(await readFile(resolve(root, "package.json"), "utf8"));
 const packageLock = JSON.parse(await readFile(resolve(root, "package-lock.json"), "utf8"));
@@ -192,8 +195,9 @@ async function verifyArchive(temporary, startedAtUtc, started) {
     resolve(consumer, "smoke.mjs"),
     `
 import assert from "node:assert/strict";
-import { runPortableWasmConformance } from "@tritium-ai/web";
-import { webGpuVectorConformanceInventoryV1 } from "@tritium-ai/web/qualification";
+import { writeFile } from "node:fs/promises";
+import { prepareTraining, runPortableWasmConformance } from "@tritium-ai/web";
+import { physicalBrowserTrainingScenarioV1, webGpuVectorConformanceInventoryV1 } from "@tritium-ai/web/qualification";
 const resolved = import.meta.resolve("@tritium-ai/web");
 const qualificationResolved = import.meta.resolve("@tritium-ai/web/qualification");
 assert.ok(resolved.startsWith(${JSON.stringify(installedRootUrl)}));
@@ -204,6 +208,30 @@ assert.equal(receipt.caseCount, 117);
 assert.deepEqual(webGpuVectorConformanceInventoryV1().caseCounts, {
   valid: 72, invalid: 45, compute: 68, lifecycle: 4, total: 117,
 });
+const scenario = physicalBrowserTrainingScenarioV1();
+const config = { ...scenario.config, backend: "wasm", allowWasmFallback: false };
+const sessions = [];
+try {
+  const session = await prepareTraining(scenario.model, config);
+  sessions.push(session);
+  const forward = await session.forward(scenario.batch);
+  await session.backward(forward);
+  await session.step();
+  const checkpoint = await session.checkpoint();
+  const exported = await session.export();
+  const resumed = await prepareTraining(scenario.model, config);
+  sessions.push(resumed);
+  await resumed.resume(checkpoint.bytes);
+  assert.deepEqual((await resumed.checkpoint()).bytes, checkpoint.bytes);
+  assert.deepEqual((await resumed.export()).bytes, exported.bytes);
+  await writeFile(new URL("./wasm-trained.salt", import.meta.url), exported.bytes, { flag: "wx" });
+  await writeFile(new URL("./wasm-checkpoint.bin", import.meta.url), checkpoint.bytes, { flag: "wx" });
+} finally {
+  for (const session of sessions) {
+    await session.dispose();
+    await session.dispose();
+  }
+}
 process.stdout.write(JSON.stringify(receipt));
 `,
   );
@@ -224,6 +252,33 @@ process.stdout.write(JSON.stringify(receipt));
   ) {
     fail("installed WASM returned an invalid identity receipt");
   }
+  const trainedBytes = await readFile(resolve(consumer, "wasm-trained.salt"));
+  const checkpointBytes = await readFile(resolve(consumer, "wasm-checkpoint.bin"));
+  const nativeDirectory = process.env.TRITIUM_WEB_NATIVE_REFERENCE_DIR;
+  let native = null;
+  if (nativeDirectory !== undefined) {
+    if (sourceIdentity[2] !== undefined) fail("native parity requires a clean candidate build");
+    native = await admitArchiveNativeReference(nativeDirectory, sourceIdentity[1]);
+    if (!trainedBytes.equals(native.bytes))
+      fail("installed WASM training export differs from native CPU");
+  }
+  const lifecycleReplay = {
+    scope: "installed npm WASM training replay; not physical WebGPU qualification",
+    source_revision: sourceIdentity[1],
+    source_dirty: sourceIdentity[2] !== undefined,
+    implementation: "wasm-fallback",
+    node: process.version,
+    archive_sha256: digest("sha256", archiveBytes),
+    wasm_guest_digest: wasmReceipt.guestDigest,
+    scenario_id: "salt-ste-sgd-256-v1",
+    completed_steps: 1,
+    checkpoint_resume: true,
+    export_bytes: trainedBytes.byteLength,
+    export_sha256: digest("sha256", trainedBytes),
+    checkpoint_sha256: digest("sha256", checkpointBytes),
+    native_artifact_parity: native === null ? null : true,
+    native_receipt_id: native?.admitted.receiptId ?? null,
+  };
 
   await writeFile(
     resolve(consumer, "index.ts"),
@@ -335,6 +390,21 @@ void qualification;
     await writeFile(
       resolve(output, "tritium-web-node22.cdx.json"),
       `${JSON.stringify(sbom, null, 2)}\n`,
+      { flag: "wx" },
+    );
+    await copyFile(
+      resolve(consumer, "wasm-trained.salt"),
+      resolve(output, "wasm-trained.salt"),
+      constants.COPYFILE_EXCL,
+    );
+    await copyFile(
+      resolve(consumer, "wasm-checkpoint.bin"),
+      resolve(output, "wasm-checkpoint.bin"),
+      constants.COPYFILE_EXCL,
+    );
+    await writeFile(
+      resolve(output, "installed-wasm-replay.json"),
+      `${JSON.stringify(lifecycleReplay, null, 2)}\n`,
       { flag: "wx" },
     );
   }

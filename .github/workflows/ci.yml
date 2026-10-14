@@ -166,11 +166,19 @@ jobs:
       - name: install exact web build dependencies
         working-directory: packages/tritium-web
         run: npm ci
+      - name: stage locked native reference dependencies
+        run: cargo fetch --locked
+      - name: produce exact-source native CPU training reference
+        run: >-
+          python scripts/produce-browser-native-reference.py
+          --source-revision "$TRITIUM_SOURCE_REVISION"
+          --output-dir "$RUNNER_TEMP/tritium-npm-evidence/native"
       - name: qualify exact npm archive
         working-directory: packages/tritium-web
         env:
           TRITIUM_NPM_EVIDENCE_DIR: ${{ runner.temp }}/tritium-npm-evidence
           TRITIUM_NPM_RUN_ID: github-${{ github.run_id }}-${{ github.run_attempt }}-npm-archive
+          TRITIUM_WEB_NATIVE_REFERENCE_DIR: ${{ runner.temp }}/tritium-npm-evidence/native
         run: npm run check
       - name: retain local-RC archive and receipt
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
