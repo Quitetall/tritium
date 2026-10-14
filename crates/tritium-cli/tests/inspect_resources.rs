@@ -2,7 +2,7 @@
 use serde_json::Value;
 use std::{path::PathBuf, process::Command};
 use tritium_spec::TernaryBackend;
-#[path = "../../tritium-serve/tests/portable_fixture/mod.rs"]
+#[path = "portable_fixture/mod.rs"]
 mod fixture;
 
 struct Scratch(PathBuf);

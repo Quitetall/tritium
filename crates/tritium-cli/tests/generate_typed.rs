@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
-#[path = "../../tritium-serve/tests/portable_fixture/mod.rs"]
+#[path = "portable_fixture/mod.rs"]
 mod fixture;
 
 struct Scratch(PathBuf);

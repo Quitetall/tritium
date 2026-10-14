@@ -21,6 +21,8 @@ use tritium_format::{
 use tritium_schema::{LEGACY_SALT_V2_HF_ASSETS, LevelFit, PlaneCounts, TensorStorage};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
+#[path = "support/process.rs"]
+mod process;
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
@@ -44,14 +46,14 @@ fn hash(bytes: &[u8]) -> String {
     h.finalize().to_string()
 }
 fn run(args: &[&std::ffi::OsStr]) -> Output {
-    // A hung child is terminated by the external deadline even if the parent test fails.
-    Command::new("timeout")
-        .args(["45s", env!("CARGO_BIN_EXE_tritium")])
-        .arg("--evidence")
-        .arg("off")
-        .args(args)
-        .output()
-        .unwrap()
+    process::output(
+        Command::new(env!("CARGO_BIN_EXE_tritium"))
+            .arg("--evidence")
+            .arg("off")
+            .args(args),
+        std::time::Duration::from_secs(45),
+    )
+    .unwrap()
 }
 fn invoke(root: &Path, profile: &str, codec: &str, extra: &[&str]) -> Output {
     let bundle = root.join("bundle");
