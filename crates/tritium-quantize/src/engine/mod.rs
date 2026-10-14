@@ -75,8 +75,12 @@ mod recorded;
 pub use recorded::{RecordedDirectFit, RecordedDirectFitError, fit_direct_levels_recorded};
 
 mod recorded_calibrated;
+mod recorded_owner_score;
 pub use recorded_calibrated::{
     RecordedCalibratedFit, RecordedCalibratedFitError, fit_calibrated_levels_recorded,
+};
+pub use recorded_owner_score::{
+    RecordedOwnerScoreFit, RecordedOwnerScoreFitError, fit_owner_score_levels_recorded,
 };
 
 pub use activation_aware::{

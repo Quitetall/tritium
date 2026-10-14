@@ -10,7 +10,8 @@ use serde::Serialize;
 use tritium_evidence::{
     CalibratedFitReceiptView, CalibratedQuantizationReceiptView, CalibrationCaptureView,
     DirectFitReceiptView, EventRegistration, EvidenceEvent, EvidenceRecorder, ModelLoadReceiptView,
-    OriginalSalienceCaptureView, QuantizationReceiptView, SalienceTransformView, verify_jsonl,
+    OriginalSalienceCaptureView, OwnerScoreFitReceiptView, QuantizationReceiptView,
+    SalienceTransformView, verify_jsonl,
 };
 
 /// Evidence detail level for a CLI invocation.
@@ -197,6 +198,9 @@ pub(crate) fn run(command: EvidenceCommand) -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!("verify direct-fit view {}: {error}", path.display()))?;
     CalibratedFitReceiptView::fold(&verified).map_err(|error| {
         anyhow::anyhow!("verify calibrated-fit view {}: {error}", path.display())
+    })?;
+    OwnerScoreFitReceiptView::fold(&verified).map_err(|error| {
+        anyhow::anyhow!("verify owner-score fit view {}: {error}", path.display())
     })?;
     QuantizationReceiptView::fold(&verified)
         .map_err(|error| anyhow::anyhow!("verify quantization view {}: {error}", path.display()))?;
@@ -727,6 +731,49 @@ mod tests {
             view.unwrap_err()
                 .to_string()
                 .contains("calibrated-fit view")
+        );
+    }
+
+    #[test]
+    fn verify_and_view_reject_invalid_owner_score_payload_with_valid_hashes() {
+        #[derive(Serialize)]
+        struct InvalidOwnerFit {
+            release_approved: bool,
+        }
+        impl EvidenceEvent for InvalidOwnerFit {
+            const SCHEMA_ID: &'static str = "tritium.quantize.owner_score_levels_fitted";
+            const VERSION: u16 = 1;
+        }
+        let mut recorder = EvidenceRecorder::new(
+            "invalid-owner-fit",
+            [tritium_evidence::OWNER_SCORE_LEVELS_FITTED_REGISTRATION],
+        )
+        .unwrap();
+        recorder
+            .emit(
+                "fit",
+                None,
+                0,
+                &InvalidOwnerFit {
+                    release_approved: true,
+                },
+            )
+            .unwrap();
+        let path = temp_log();
+        std::fs::write(&path, recorder.to_jsonl().unwrap()).unwrap();
+        let verify = run(EvidenceCommand::Verify { path: path.clone() });
+        let view = run(EvidenceCommand::View { path: path.clone() });
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            verify
+                .unwrap_err()
+                .to_string()
+                .contains("owner-score fit view")
+        );
+        assert!(
+            view.unwrap_err()
+                .to_string()
+                .contains("owner-score fit view")
         );
     }
 

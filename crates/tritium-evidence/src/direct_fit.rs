@@ -93,11 +93,16 @@ pub(crate) fn canonical_envelope(
     event: &EvidenceEnvelope,
 ) -> Result<EvidenceEnvelope, &'static str> {
     let mut envelope = event.clone();
-    let canonical = serde_json_canonicalizer::to_string(&envelope.payload)
-        .map_err(|_| "payload canonicalization failed")?;
-    envelope.payload =
-        serde_json::from_str(&canonical).map_err(|_| "canonical payload decoding failed")?;
+    envelope.payload = canonical_payload(&envelope.payload)?;
     Ok(envelope)
+}
+
+pub(crate) fn canonical_payload(
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, &'static str> {
+    let canonical = serde_json_canonicalizer::to_string(payload)
+        .map_err(|_| "payload canonicalization failed")?;
+    serde_json::from_str(&canonical).map_err(|_| "canonical payload decoding failed")
 }
 
 pub(crate) fn validate_fit_outputs(

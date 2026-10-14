@@ -283,53 +283,59 @@ impl OwnerScoreCacheManifest {
     /// Content identity/numerical/source truth must be checked separately.
     #[must_use]
     pub fn valid(&self, receiving: OwnerScoreCacheLimits) -> bool {
-        let b = &self.binding;
-        let c = &b.content;
-        let l = self.limits;
-        if !l.valid()
-            || !receiving.valid()
-            || c.source.as_bytes() == &[0; 32]
-            || c.tensor.shape.len() != 2
-            || c.tensor.byte_len().is_err()
-            || c.tokenizer.as_bytes() == &[0; 32]
-            || c.objective.as_bytes() == &[0; 32]
-            || b.cache.as_bytes() == &[0; 32]
-            || c.context.is_empty()
-            || c.invocations.is_empty()
-            || c.context.len() as u64 > l.max_context_tensors.min(receiving.max_context_tensors)
-            || c.invocations.len() as u64 > l.max_invocations.min(receiving.max_invocations)
-            || !c
-                .context
-                .windows(2)
-                .all(|p| p[0].meta.name < p[1].meta.name)
-            || !c
-                .invocations
-                .windows(2)
-                .all(|p| p[0].meta.ordinal < p[1].meta.ordinal)
-            || c.invocations.iter().any(|i| !i.meta.valid())
-        {
-            return false;
-        }
-        let context = c
-            .context
-            .iter()
-            .try_fold(0u64, |n, t| n.checked_add(t.meta.byte_len()?));
-        let samples = c
-            .invocations
-            .iter()
-            .try_fold(0u64, |n, i| n.checked_add(i.meta.samples));
-        let tokens = c.context.iter().find(|t| t.meta.name == "input_ids");
-        context == Some(b.context_bytes)
-            && samples == Some(b.samples)
-            && b.context_bytes <= l.max_context_bytes.min(receiving.max_context_bytes)
-            && b.payload_bytes <= l.max_payload_bytes.min(receiving.max_payload_bytes)
-            && b.payload_bytes > b.context_bytes
-            && b.samples <= l.max_samples.min(receiving.max_samples)
-            && tokens.is_some_and(|t| {
-                matches!(
-                    t.meta.dtype,
-                    OwnerContextDtype::I32 | OwnerContextDtype::I64
-                ) && t.meta.byte_len().is_some_and(|n| n > 0)
-            })
+        valid_owner_score_binding(&self.binding, self.limits, receiving)
     }
+}
+
+pub(crate) fn valid_owner_score_binding(
+    b: &OwnerScoreCacheBinding,
+    l: OwnerScoreCacheLimits,
+    receiving: OwnerScoreCacheLimits,
+) -> bool {
+    let c = &b.content;
+    if !l.valid()
+        || !receiving.valid()
+        || c.source.as_bytes() == &[0; 32]
+        || c.tensor.shape.len() != 2
+        || c.tensor.byte_len().is_err()
+        || c.tokenizer.as_bytes() == &[0; 32]
+        || c.objective.as_bytes() == &[0; 32]
+        || b.cache.as_bytes() == &[0; 32]
+        || c.context.is_empty()
+        || c.invocations.is_empty()
+        || c.context.len() as u64 > l.max_context_tensors.min(receiving.max_context_tensors)
+        || c.invocations.len() as u64 > l.max_invocations.min(receiving.max_invocations)
+        || !c
+            .context
+            .windows(2)
+            .all(|p| p[0].meta.name < p[1].meta.name)
+        || !c
+            .invocations
+            .windows(2)
+            .all(|p| p[0].meta.ordinal < p[1].meta.ordinal)
+        || c.invocations.iter().any(|i| !i.meta.valid())
+    {
+        return false;
+    }
+    let context = c
+        .context
+        .iter()
+        .try_fold(0u64, |n, t| n.checked_add(t.meta.byte_len()?));
+    let samples = c
+        .invocations
+        .iter()
+        .try_fold(0u64, |n, i| n.checked_add(i.meta.samples));
+    let tokens = c.context.iter().find(|t| t.meta.name == "input_ids");
+    context == Some(b.context_bytes)
+        && samples == Some(b.samples)
+        && b.context_bytes <= l.max_context_bytes.min(receiving.max_context_bytes)
+        && b.payload_bytes <= l.max_payload_bytes.min(receiving.max_payload_bytes)
+        && b.payload_bytes > b.context_bytes
+        && b.samples <= l.max_samples.min(receiving.max_samples)
+        && tokens.is_some_and(|t| {
+            matches!(
+                t.meta.dtype,
+                OwnerContextDtype::I32 | OwnerContextDtype::I64
+            ) && t.meta.byte_len().is_some_and(|n| n > 0)
+        })
 }

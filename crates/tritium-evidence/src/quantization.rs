@@ -2,8 +2,8 @@
 
 use super::{
     CalibratedFitReceiptView, CalibratedQuantizationReceiptView, DirectFitReceiptView,
-    EventRegistration, EvidenceEnvelope, EvidenceError, EvidenceEvent, VerifiedLog, decode_hex,
-    verify_log,
+    EventRegistration, EvidenceEnvelope, EvidenceError, EvidenceEvent, OwnerScoreFitReceiptView,
+    VerifiedLog, decode_hex, verify_log,
 };
 use std::collections::BTreeMap;
 use tritium_schema::{
@@ -166,6 +166,7 @@ fn fold_stages(log: &VerifiedLog, calibrated: bool) -> Result<Vec<StageView>, Ev
     verify_log(log)?;
     let fits = DirectFitReceiptView::fold(log)?;
     let calibrated_fits = CalibratedFitReceiptView::fold(log)?;
+    let owner_fits = OwnerScoreFitReceiptView::fold(log)?;
     let mut starts = BTreeMap::<&str, (&EvidenceEnvelope, StageStart)>::new();
     let mut completions = BTreeMap::<
         &str,
@@ -229,6 +230,14 @@ fn fold_stages(log: &VerifiedLog, calibrated: bool) -> Result<Vec<StageView>, Ev
             .cloned()
             .collect::<Vec<_>>();
         let plan = start.plan();
+        if owner_fits
+            .iter()
+            .any(|fit| fit.envelope().parent.as_deref() == Some(span))
+        {
+            return Err(invalid(
+                "owner-score fit requires a separate model lifecycle",
+            ));
+        }
         if completed.sources.len() != plan.tensors().count()
             || completed
                 .assets

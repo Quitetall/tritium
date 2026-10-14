@@ -2,29 +2,8 @@
 use super::calibrated_fit::fit_row_metrics;
 use super::{DirectFitError, DirectTensorFit, OwnerScoreCache, OwnerScoreCacheError};
 use crate::{CurvatureError, InputGramAccumulator};
-use tritium_schema::{DirectFitPlan, OriginalSourceId, OwnerScoreCacheId, QuantSourceTensor};
-
-/// One explicitly ordered expected scalar-loss window. Repetition is intentional.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct WeightedOwnerWindow {
-    /// Actual finalized cache content ID, never a bootstrap/declared placeholder.
-    pub cache: OwnerScoreCacheId,
-    /// Nonnegative finite window weight; normalization uses the sum of weights.
-    pub weight: f64,
-}
-
-/// Logical admission only, excluding source/tapes/metadata/solver/allocator/RSS.
-#[derive(Clone, Copy, Debug)]
-pub struct OwnerScoreMetricLimits {
-    /// Maximum ordered window count, including repeats and zero weights.
-    pub max_windows: u64,
-    /// Sum of logical cache payload bytes, counting each list position.
-    pub max_payload_bytes: u64,
-    /// Maximum one reconstructed row's f64 output bytes.
-    pub max_row_bytes: u64,
-    /// Conservative bound on live reducer numerical f64 entries and row output.
-    pub max_reduction_entries: u64,
-}
+use tritium_schema::{DirectFitPlan, OriginalSourceId, OwnerMetricStreamId, QuantSourceTensor};
+pub use tritium_schema::{OwnerScoreMetricLimits, WeightedOwnerWindow};
 
 /// No identity/fitted success is returned on invalid context, limits or numerics.
 #[derive(Debug)]
@@ -114,23 +93,14 @@ impl<'a> OwnerScoreMetrics<'a> {
         }
         let content = &caches[0].binding().content;
         let columns = usize::try_from(content.tensor.shape[1]).map_err(|_| E::Limit)?;
-        let row_bytes = (columns as u64).checked_mul(8).ok_or(E::Limit)?;
         // Transactional updates and finalization clone canonical segment stacks.
         // Four stacks plus eight temporary matrices conservatively cover the
         // common reducer, returned Gram and row score, not the downstream fitter.
-        let depth = u64::from(usize::BITS - caches.len().leading_zeros()) + 1;
-        let entries = (columns as u64)
-            .checked_mul(columns as u64)
-            .and_then(|n| n.checked_mul(4 * depth + 8))
-            .and_then(|n| n.checked_add(columns as u64))
-            .ok_or(E::Limit)?;
-        if row_bytes > limits.max_row_bytes || entries > limits.max_reduction_entries {
+        if !limits.admits(columns as u64, caches.len() as u64, 0) {
             return Err(E::Limit);
         }
         let mut payload = 0_u64;
         let mut total_weight = 0.0_f64;
-        let mut hash = blake3::Hasher::new_derive_key("tritium.owner-window.metric-stream.v1");
-        hash.update(&(caches.len() as u64).to_le_bytes());
         for (cache, window) in caches.iter().zip(expected) {
             let actual = &cache.binding().content;
             if cache.id() != window.cache
@@ -149,8 +119,6 @@ impl<'a> OwnerScoreMetrics<'a> {
             payload = payload
                 .checked_add(cache.binding().payload_bytes)
                 .ok_or(E::Limit)?;
-            hash.update(cache.id().as_bytes());
-            hash.update(&bits(window.weight).to_le_bytes());
         }
         if !total_weight.is_finite() || total_weight <= 0.0 {
             return Err(E::Configuration);
@@ -158,7 +126,8 @@ impl<'a> OwnerScoreMetrics<'a> {
         if payload > limits.max_payload_bytes {
             return Err(E::Limit);
         }
-        hash.update(&bits(damping).to_le_bytes());
+        let stream = tritium_evidence::owner_metric_stream_id(expected, damping)
+            .map_err(|_| E::Configuration)?;
         let mut windows = Vec::new();
         windows
             .try_reserve_exact(expected.len())
@@ -169,7 +138,7 @@ impl<'a> OwnerScoreMetrics<'a> {
             windows,
             damping,
             limits,
-            stream: *hash.finalize().as_bytes(),
+            stream: *stream.as_bytes(),
             columns,
         })
     }
@@ -177,6 +146,10 @@ impl<'a> OwnerScoreMetrics<'a> {
     /// Source observed when constructing the actual caches, not audited custody.
     pub fn source(&self) -> OriginalSourceId {
         self.caches[0].binding().content.source
+    }
+    /// Actual admitted ordered window/weight/damping identity.
+    pub fn stream_id(&self) -> OwnerMetricStreamId {
+        OwnerMetricStreamId::from_bytes(self.stream)
     }
     /// Common canonical tensor interpretation.
     pub fn tensor(&self) -> &QuantSourceTensor {
@@ -236,6 +209,17 @@ pub fn fit_owner_score_levels(
     weights: &[f32],
     metrics: &OwnerScoreMetrics<'_>,
 ) -> Result<Vec<DirectTensorFit>, OwnerScoreMetricError> {
+    fit_owner_score_levels_observed(plan, original, model, weights, metrics, |_, _| Ok(()))
+}
+
+pub(super) fn fit_owner_score_levels_observed(
+    plan: &DirectFitPlan,
+    original: &QuantSourceTensor,
+    model: OriginalSourceId,
+    weights: &[f32],
+    metrics: &OwnerScoreMetrics<'_>,
+    mut observe: impl FnMut(usize, &OwnerRowMetric) -> Result<(), OwnerScoreMetricError>,
+) -> Result<Vec<DirectTensorFit>, OwnerScoreMetricError> {
     if metrics.source() != model
         || metrics.tensor() != original
         || original.shape.as_slice() != [plan.layout.rows, plan.layout.cols]
@@ -244,6 +228,7 @@ pub fn fit_owner_score_levels(
     }
     fit_row_metrics(plan, weights, |row, _, destination| {
         let metric = metrics.row_metric(row)?;
+        observe(row, &metric)?;
         destination.copy_from_slice(metric.as_slice());
         Ok(())
     })

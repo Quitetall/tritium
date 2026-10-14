@@ -49,6 +49,27 @@ fn main() -> Result<(), Box<dyn Error>> {
     project!(tritium_schema::OriginalSourceId, "original-source-id");
     project!(tritium_schema::CalibrationCacheId, "calibration-cache-id");
     project!(tritium_schema::OwnerScoreCacheId, "owner-score-cache-id");
+    project!(
+        tritium_schema::OwnerMetricStreamId,
+        "owner-metric-stream-id"
+    );
+    project!(tritium_schema::OwnerRowMetricId, "owner-row-metric-id");
+    project!(tritium_schema::OwnerMetricRowsId, "owner-metric-rows-id");
+    project!(tritium_schema::WeightedOwnerWindow, "weighted-owner-window");
+    project!(tritium_schema::WeightedOwnerCache, "weighted-owner-cache");
+    project!(
+        tritium_schema::OwnerScoreMetricLimits,
+        "owner-score-metric-limits"
+    );
+    project!(tritium_schema::OwnerScoreFitPlan, "owner-score-fit-plan");
+    project!(
+        tritium_schema::OwnerRowMetricBinding,
+        "owner-row-metric-binding"
+    );
+    project!(
+        tritium_schema::OwnerScoreLevelsFitted,
+        "owner-score-levels-fitted"
+    );
     project!(tritium_schema::OwnerScoreEstimator, "owner-score-estimator");
     project!(tritium_schema::OwnerScoreRole, "owner-score-role");
     project!(tritium_schema::OwnerContextDtype, "owner-context-dtype");

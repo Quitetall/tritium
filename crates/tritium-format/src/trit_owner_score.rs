@@ -1,11 +1,21 @@
 //! Typed owner/window cache metadata in the unchanged common .trit envelope.
 use crate::trit_model::TritModelError;
-use tritium_schema::{OwnerScoreCacheContent, OwnerScoreCacheManifest};
+use tritium_schema::{OwnerScoreCacheContent, OwnerScoreCacheId, OwnerScoreCacheManifest};
 
 /// Separate metadata cap, not a numerical or process-memory qualification.
 pub const MAX_OWNER_SCORE_MANIFEST_BYTES: usize = 1024 * 1024;
 const PROFILE: &str = "tritium.owner-score-cache.v1";
 const CONTENT: &str = "tritium.owner-score-content.v1";
+
+/// Shared ADR0093 identity from canonical content; bytes/custody need verification.
+pub fn owner_score_cache_id(
+    content: &OwnerScoreCacheContent,
+) -> Result<OwnerScoreCacheId, TritModelError> {
+    let bytes = encode_owner_score_content(content)?;
+    let mut hash = blake3::Hasher::new_derive_key("tritium.owner-score.cache.v1");
+    hash.update(&bytes);
+    Ok(OwnerScoreCacheId::from_bytes(*hash.finalize().as_bytes()))
+}
 
 /// Canonical logical identity preimage; excludes producer/receiver ceilings.
 pub fn encode_owner_score_content(

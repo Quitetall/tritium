@@ -247,11 +247,7 @@ impl OwnerScoreCache {
 }
 
 fn content_id(content: &OwnerScoreCacheContent) -> Result<OwnerScoreCacheId, OwnerScoreCacheError> {
-    let bytes = tritium_format::trit_owner_score::encode_owner_score_content(content)
-        .map_err(transport_error)?;
-    let mut hash = blake3::Hasher::new_derive_key("tritium.owner-score.cache.v1");
-    hash.update(&bytes);
-    Ok(OwnerScoreCacheId::from_bytes(*hash.finalize().as_bytes()))
+    tritium_format::trit_owner_score::owner_score_cache_id(content).map_err(transport_error)
 }
 fn blob(bytes: &[u8]) -> BlobId {
     BlobId::from_bytes(*blake3::hash(bytes).as_bytes())
