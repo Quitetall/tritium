@@ -76,6 +76,17 @@ without accumulating parameter gradients. Each window supplies integer
 `input_ids` matching the flattened projection samples. The objective callable
 returns a finite scalar; declared recipe bytes do not independently prove its
 execution. Use `output="None"` explicitly for input-Gram-only capture.
+Optional `calibration_weights` (finite nonnegative CPU floating values) and
+`calibration_mask` (CPU bool values) must have exactly the input_ids shape.
+These affect statistical reduction, not the objective loss. No broadcasting or
+implicit use of attention_mask occurs. Weights are widened to native f64;
+masked activations/gradients/weights must still be finite. Missing selection
+preserves the unit-weight/true-mask cache bytes. Preparation binds relative
+work/asset paths immediately, so later phases do not depend on the current
+working directory; this is not immutable source custody.
+Token and selection context is snapshotted before the objective; visible
+changes during it reject rather than publish stale context. This does not prove
+that arbitrary callback code used those tokens or freeze concurrent writers.
 
 `convert_calibrated_native_module(calibration, output_dir, run_id, partition="Full",
 damping=0.01, max_numeric_bytes=..., max_cache_package_bytes=...)` uses the shared
@@ -90,7 +101,9 @@ and native loader semantics are unchanged.
 `.trit` cache packages with their Rust-owned binding metadata. Reopen with
 `NativeModuleCalibration.open(source, directory, max_package_bytes=...,
 max_total_payload_bytes=...)`. Logical cache/numerical budgets do not cover the
-framework tape, source copies or full RSS. The first Torch capture adapter
+framework tape, source copies or full RSS. Remaining aggregate cache payload
+allowance is enforced by the shared decoder before decoded-payload copies.
+The first Torch capture adapter
 requires Linear-only consumers; mixed tied embedding/head roles fail explicitly
 and remain full-release work. Existing expert native consumers still support
 gather/indexed factors. Source observation does not freeze concurrent writers,

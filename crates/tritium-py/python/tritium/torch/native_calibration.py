@@ -23,6 +23,22 @@ def _observe(plan, shards, output, run, *, asset_paths, input_grams):
     return _tritium._observe_model_plan_source(plan, shards, asset_paths)
 
 
+def _check_window_context(window, specs):
+    """Check declared context after caller execution; this is not writer custody."""
+    for name, original, snapshot in specs:
+        observed = window.get(name)
+        if original is None:
+            if observed is not None:
+                raise ValueError("native window context changed during objective")
+            continue
+        if (not isinstance(observed, torch.Tensor) or observed.device.type != "cpu"
+                or observed.dtype != original[0] or observed.shape != original[1]):
+            raise ValueError("native window context changed during objective")
+        current = _compact(observed.detach().reshape(-1).to(dtype=snapshot.dtype))
+        if not torch.equal(current.view(torch.uint8), snapshot.view(torch.uint8)):
+            raise ValueError("native window context changed during objective")
+
+
 @dataclass(frozen=True)
 class NativeModulePreparation:
     """Live source with native byte observation; not an immutable writer snapshot."""
@@ -41,8 +57,8 @@ class NativeModulePreparation:
 def prepare_native_module(prepared, *, actions, levels, limits, work_dir, asset_paths,
                           architecture="torch-module"):
     """Observe complete actual stored source before calibration, without fitting."""
-    options = dict(actions=actions, levels=list(levels), limits=limits, work_dir=os.fspath(work_dir),
-                   asset_paths={name:os.fspath(path) for name,path in asset_paths.items()}, architecture=architecture)
+    options = dict(actions=actions, levels=list(levels), limits=limits, work_dir=os.fspath(Path(work_dir).resolve(strict=True)),
+                   asset_paths={name:os.fspath(Path(path).absolute()) for name,path in asset_paths.items()}, architecture=architecture)
     options = json.loads(_encoded(options))
     observed = _run_native_source(prepared, None, "native-source-prepare", consume=_observe, **options)
     return NativeModulePreparation(prepared, observed, _encoded(options))
@@ -60,6 +76,8 @@ class NativeModuleCalibration:
         if target.exists() or target.is_symlink(): raise FileExistsError(target)
         if type(max_package_bytes) is not int or max_package_bytes <= 0:
             raise ValueError("cache package byte limit must be positive")
+        if sum(cache.payload_bytes for _,cache in self.caches)>self.max_total_payload_bytes:
+            raise ValueError("aggregate calibration payload exceeds byte limit")
         staging = Path(tempfile.mkdtemp(prefix=".tritium-native-cache-", dir=target.parent))
         published = False
         try:
@@ -105,7 +123,10 @@ class NativeModuleCalibration:
         for index,name in enumerate(names):
             path = root / f"cache-{index}.trit"
             if path.is_symlink() or not path.is_file(): raise ValueError("cache package must be ordinary")
-            cache = _tritium.NativeCalibrationCache.open(str(path), _encoded(bindings[name]), max_package_bytes)
+            remaining=max_total_payload_bytes-total
+            if remaining<=0: raise ValueError("aggregate calibration payload exceeds byte limit")
+            cache = _tritium.NativeCalibrationCache.open(str(path), _encoded(bindings[name]), max_package_bytes,
+                                                         max_payload_bytes=remaining)
             source.observation.validate_cache(cache)
             total += cache.payload_bytes
             if total > max_total_payload_bytes: raise ValueError("aggregate calibration payload exceeds byte limit")
@@ -184,10 +205,28 @@ def calibrate_native_module(source, windows, objective, *, objective_bytes, cach
                 raise ValueError("native token window must be bounded CPU integer values")
             if torch.any(tokens<0).item() or torch.any(tokens>2**32-1).item():
                 raise ValueError("native token values must be u32")
+            selection = {}
+            weights = window.get("calibration_weights")
+            if weights is not None:
+                if (not isinstance(weights,torch.Tensor) or weights.device.type!="cpu"
+                        or not weights.dtype.is_floating_point or weights.shape!=tokens.shape
+                        or not torch.isfinite(weights).all().item() or torch.any(weights<0).item()):
+                    raise ValueError("calibration weights must be finite nonnegative CPU floating values matching input_ids")
+                selection["weights"] = _compact(weights.detach().reshape(-1).to(dtype=torch.float64).clone())
+            mask = window.get("calibration_mask")
+            if mask is not None:
+                if (not isinstance(mask,torch.Tensor) or mask.device.type!="cpu"
+                        or mask.dtype!=torch.bool or mask.shape!=tokens.shape):
+                    raise ValueError("calibration mask must be CPU bool values matching input_ids")
+                selection["mask"] = _compact(mask.detach().reshape(-1).to(dtype=torch.uint8).clone())
             current["tokens"]=_compact(tokens.detach().reshape(-1).to(dtype=torch.int64).clone())
+            specs = [("input_ids", (tokens.dtype, tokens.shape), current["tokens"]),
+                     ("calibration_weights", None if weights is None else (weights.dtype,weights.shape), selection.get("weights")),
+                     ("calibration_mask", None if mask is None else (mask.dtype,mask.shape), selection.get("mask"))]
             records.clear()
             with (torch.enable_grad() if output=="DenseFisher" else torch.no_grad()):
                 loss=objective(model,window)
+                _check_window_context(window, specs)
                 if {module_id for _,module_id,_,_ in records} != set(consumers): raise ValueError("required native consumers did not execute")
                 if not isinstance(loss,torch.Tensor) or loss.ndim!=0 or not torch.isfinite(loss).item():
                     raise ValueError("native objective must return a finite scalar")
@@ -196,7 +235,7 @@ def calibrate_native_module(source, windows, objective, *, objective_bytes, cach
                 else: gradients=[None]*len(records)
             for (owner,_,inputs,_),gradient in zip(records,gradients):
                 kwargs={} if gradient is None else {"gradients":_compact(gradient.detach().to(dtype=torch.float32).reshape(inputs.shape[0],-1))}
-                builders[owner].capture(current["tokens"],inputs,**kwargs)
+                builders[owner].capture(current["tokens"],inputs,**selection,**kwargs)
             records.clear()
         source.verify()
         caches=tuple((name,builders[name].finish()) for name in sorted(builders))

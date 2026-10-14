@@ -269,17 +269,21 @@ pub(crate) struct NativeCalibrationBuilder {
 }
 #[pymethods]
 impl NativeCalibrationBuilder {
-    #[pyo3(signature=(tokens, inputs, *, gradients=None))]
+    #[pyo3(signature=(tokens, inputs, *, gradients=None, weights=None, mask=None))]
     fn capture(
         &self,
         py: Python<'_>,
         tokens: &Bound<'_, PyAny>,
         inputs: &Bound<'_, PyAny>,
         gradients: Option<&Bound<'_, PyAny>>,
+        weights: Option<&Bound<'_, PyAny>>,
+        mask: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let tokens: Dlpack = tokens.extract()?;
         let input: Dlpack = inputs.extract()?;
         let gradients: Option<Dlpack> = gradients.map(|v| v.extract()).transpose()?;
+        let weights: Option<Dlpack> = weights.map(|v| v.extract()).transpose()?;
+        let mask: Option<Dlpack> = mask.map(|v| v.extract()).transpose()?;
         let token_shape = tensor_shape(&tokens, "tokens")?;
         let shape = tensor_shape(&input, "inputs")?;
         if token_shape.len() != 1
@@ -310,6 +314,28 @@ impl NativeCalibrationBuilder {
             }
             _ => return Err(error("calibration output encoding differs")),
         };
+        let weights = weights
+            .as_ref()
+            .map(|v| {
+                if tensor_shape(v, "weights")? != [n] {
+                    return Err(error("calibration weight geometry differs"));
+                }
+                v.cpu_data_slice::<f64>().map_err(error)
+            })
+            .transpose()?;
+        let mask = mask
+            .as_ref()
+            .map(|v| {
+                if tensor_shape(v, "mask")? != [n] {
+                    return Err(error("calibration mask geometry differs"));
+                }
+                let values = v.cpu_data_slice::<u8>().map_err(error)?;
+                if values.iter().any(|&value| value > 1) {
+                    return Err(error("calibration mask must contain only 0/1"));
+                }
+                Ok(values)
+            })
+            .transpose()?;
         py.detach(|| {
             let mut tokens = Vec::new();
             tokens
@@ -318,6 +344,14 @@ impl NativeCalibrationBuilder {
             for &value in token_values {
                 tokens.push(u32::try_from(value).map_err(|_| error("token is outside u32"))?);
             }
+            let mask = mask
+                .map(|values| {
+                    let mut output = Vec::new();
+                    output.try_reserve_exact(values.len()).map_err(error)?;
+                    output.extend(values.iter().map(|&value| value != 0));
+                    Ok::<_, PyErr>(output)
+                })
+                .transpose()?;
             let mut state = self.state.lock().map_err(error)?;
             let builder = state
                 .as_mut()
@@ -330,8 +364,8 @@ impl NativeCalibrationBuilder {
                         input: CalibrationInput::Activations(values),
                         output: gradients
                             .map_or(CalibrationOutputBatch::None, CalibrationOutputBatch::Dense),
-                        weights: None,
-                        mask: None,
+                        weights,
+                        mask: mask.as_deref(),
                     },
                 )
                 .map_err(error)
@@ -390,13 +424,22 @@ impl NativeCalibrationCache {
         Ok(PyBytes::new(py, &bytes))
     }
     #[staticmethod]
+    #[pyo3(signature=(path, binding_json, max_package_bytes, *, max_payload_bytes=None))]
     fn open(
         py: Python<'_>,
         path: &str,
         binding_json: &str,
         max_package_bytes: u64,
+        max_payload_bytes: Option<u64>,
     ) -> PyResult<Self> {
         let binding: CalibrationCacheBinding = json(binding_json)?;
+        let mut limits = binding.request.limits;
+        limits.max_payload_bytes = limits
+            .max_payload_bytes
+            .min(max_payload_bytes.unwrap_or(u64::MAX));
+        if limits.max_payload_bytes == 0 {
+            return Err(error("cache payload limit must be positive"));
+        }
         py.detach(|| {
             let bytes =
                 read_original_file_bounded(Path::new(path), max_package_bytes).map_err(error)?;
@@ -404,7 +447,7 @@ impl NativeCalibrationCache {
             let cache = CalibrationCache::decode_package(
                 &bytes,
                 id,
-                binding.request.limits,
+                limits,
                 usize::try_from(max_package_bytes).map_err(error)?,
             )
             .map_err(error)?;
