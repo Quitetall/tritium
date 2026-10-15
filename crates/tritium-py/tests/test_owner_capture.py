@@ -9,11 +9,11 @@ from test_native_module_source import _fit
 
 
 class TiedModel(nn.Module):
-    def __init__(self):
+    def __init__(self, columns=32):
         super().__init__()
-        self.embed = nn.Embedding(3, 32)
+        self.embed = nn.Embedding(3, columns)
         self.embed_alias = self.embed
-        self.head = nn.Linear(32, 3, bias=False)
+        self.head = nn.Linear(columns, 3, bias=False)
         self.head.weight = self.embed.weight
 
     def forward(self, ids):
@@ -23,9 +23,9 @@ class TiedModel(nn.Module):
         return self.head(hidden), self.head(hidden[:1])
 
 
-def _source(root, *, frozen=False, dtype=torch.float32):
+def _source(root, *, frozen=False, dtype=torch.float32, columns=32):
     torch.manual_seed(512)
-    model = TiedModel().to(dtype=dtype)
+    model = TiedModel(columns).to(dtype=dtype)
     if frozen:
         model.requires_grad_(False)
     prepared = prepare(model, TernaryConfig.ptq(profile="compact-v1", planes=2,
@@ -36,8 +36,10 @@ def _source(root, *, frozen=False, dtype=torch.float32):
     fit = _fit()
     plan = fit["Fit"]["plan"]
     plan["layout"]["rows"] = 3
-    plan["limits"]["max_weights"] = 96
-    plan["limits"]["max_output_trits"] = 288
+    plan["layout"]["cols"] = columns
+    plan["limits"]["max_weights"] = 3 * columns
+    plan["limits"]["max_metric_entries"] = columns * columns
+    plan["limits"]["max_output_trits"] = 9 * columns
     return prepare_native_module(prepared, actions={"embed.weight": fit}, levels=["compact", "full"],
         limits=dict(max_source_bytes=4096, max_asset_bytes=32768, max_retained_blob_bytes=65536,
                     max_package_bytes=100_000), work_dir=work,

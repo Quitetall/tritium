@@ -53,7 +53,7 @@ unsafe impl GlobalAlloc for Allocator {
 static ALLOCATOR: Allocator = Allocator;
 
 #[test]
-fn actual_owner_fit_transfers_one_completed_metric_without_full_matrix_copies() {
+fn actual_owner_fit_streams_metric_without_full_matrix_buffers() {
     let input = vec![0.25; COLS];
     let adjoints = [0.5, 1.];
     let uses = [OwnerScoreUse::Matmul {
@@ -182,7 +182,7 @@ fn actual_owner_fit_transfers_one_completed_metric_without_full_matrix_copies() 
     let peak = PEAK.load(Ordering::Relaxed);
     eprintln!("matrix_bytes={MATRIX_BYTES} peak_live_matrix_buffers={peak}");
     assert_eq!(
-        peak, 1,
-        "owned metric should not be cloned between reduction and fitting"
+        peak, 0,
+        "independent owner fitting should stream without a full-matrix buffer"
     );
 }

@@ -328,6 +328,7 @@ fn admit(
         .ok_or(DirectFitError::ShapeOverflow)?;
     admit_payload(weights, None, cols, count, metric_count)?;
     if let Some(metric) = gram {
+        metric.admit_profile(plan)?;
         metric.validate(cols)?;
     }
     Ok((rows, cols, count))

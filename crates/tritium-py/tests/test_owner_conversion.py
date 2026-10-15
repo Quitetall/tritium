@@ -30,8 +30,9 @@ def _convert(source, captures, path, **changes):
 
 
 @pytest.mark.parametrize("dtype,precision", [(torch.float16,"F16"), (torch.bfloat16,"Bf16"), (torch.float32,"F32")])
-def test_actual_owner_conversion_preserves_source_and_loads_packed_tied_handles(tmp_path, dtype, precision):
-    source = _source(tmp_path, dtype=dtype)
+@pytest.mark.parametrize("columns", [32, 64])
+def test_actual_owner_conversion_preserves_source_and_loads_packed_tied_handles(tmp_path, dtype, precision, columns):
+    source = _source(tmp_path, dtype=dtype, columns=columns)
     captured = _durable(source)
     before = source.prepared.model.embed.weight.detach().clone()
     result = _convert(source, [captured], tmp_path/"output")
@@ -42,13 +43,13 @@ def test_actual_owner_conversion_preserves_source_and_loads_packed_tied_handles(
     assert start["tensors"][0]["source"]["precision"] == precision
     assert any(e.get("schema")=="tritium.quantize.owner_score_levels_fitted" for e in events)
     assert not any(e.get("schema")=="tritium.quantize.calibrated_levels_fitted" for e in events)
-    loaded = load_native_module(TiedModel().to(dtype=dtype), result, level="full", load_run_id="owner-load", inplace=False)
+    loaded = load_native_module(TiedModel(columns).to(dtype=dtype), result, level="full", load_run_id="owner-load", inplace=False)
     assert loaded.embed is loaded.embed_alias
     assert loaded.embed.packed_weight is loaded.head.packed_weight
     assert not list(loaded.parameters())
     handle = loaded.head.packed_weight.handle
     dense = torch.from_dlpack(handle.gather(torch.arange(3)))
-    values = torch.arange(64,dtype=torch.float32).reshape(2,32)/32
+    values = torch.arange(2 * columns,dtype=torch.float32).reshape(2,columns)/32
     actual = torch.from_dlpack(handle.matmul(values))
     torch.testing.assert_close(actual, torch.nn.functional.linear(values,dense), rtol=3e-6,atol=3e-6)
     assert torch.equal(before, source.prepared.model.embed.weight)
@@ -56,8 +57,9 @@ def test_actual_owner_conversion_preserves_source_and_loads_packed_tied_handles(
     assert list((tmp_path/"work").iterdir()) == []
 
 
-def test_weighted_ordered_windows_reopen_replay_and_no_clobber(tmp_path):
-    source = _source(tmp_path)
+@pytest.mark.parametrize("columns", [32, 64])
+def test_weighted_ordered_windows_reopen_replay_and_no_clobber(tmp_path, columns):
+    source = _source(tmp_path, columns=columns)
     first = _durable(source)
     window = _window(); window["input_ids"] = torch.tensor([2,0,1])
     second = _durable(source,window)

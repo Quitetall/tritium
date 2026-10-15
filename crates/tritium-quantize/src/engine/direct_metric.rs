@@ -3,6 +3,7 @@
 use super::DirectFitError;
 use super::direct::reserved_vec;
 use std::borrow::Cow;
+use tritium_schema::{Basis, DirectFitPlan, DirectFitProfile};
 
 pub(super) struct MetricBlock<'a> {
     pub width: usize,
@@ -12,13 +13,40 @@ pub(super) struct MetricBlock<'a> {
 pub(super) enum DirectMetric<'a> {
     Dense(Cow<'a, [f64]>),
     BlockDiagonal(Vec<MetricBlock<'a>>),
+    // Local solver views of a fully reduced/hashed source metric. Omitted
+    // cross-group entries are unknown here, not implicit covariance zeros.
+    IndependentGroups {
+        group: usize,
+        blocks: Vec<MetricBlock<'a>>,
+    },
 }
 
 impl<'a> DirectMetric<'a> {
+    pub(super) fn admit_profile(&self, plan: &DirectFitPlan) -> Result<(), DirectFitError> {
+        if let Self::IndependentGroups { group, .. } = self
+            && (*group != usize::from(plan.layout.group)
+                || plan.layout.basis != Basis::Identity
+                || !matches!(plan.profile, DirectFitProfile::JointIndependentGroups(_)))
+        {
+            return Err(DirectFitError::Unsupported("solver-local metric scope"));
+        }
+        Ok(())
+    }
+
     pub(super) fn validate(&self, cols: usize) -> Result<(), DirectFitError> {
+        if let Self::IndependentGroups { group, blocks } = self
+            && (*group == 0
+                || blocks.len() != cols.div_ceil(*group)
+                || blocks
+                    .iter()
+                    .enumerate()
+                    .any(|(i, block)| block.width != (cols - i * group).min(*group)))
+        {
+            return Err(DirectFitError::Unsupported("solver-local metric coverage"));
+        }
         match self {
             Self::Dense(values) => check_length(values.len(), cols)?,
-            Self::BlockDiagonal(blocks) => {
+            Self::BlockDiagonal(blocks) | Self::IndependentGroups { blocks, .. } => {
                 let mut total = 0_usize;
                 for block in blocks {
                     if block.width == 0 {
@@ -46,7 +74,7 @@ impl<'a> DirectMetric<'a> {
         let scale = scale.max(f64::MIN_POSITIVE);
         match self {
             Self::Dense(values) => check_symmetry(values, cols, scale),
-            Self::BlockDiagonal(blocks) => {
+            Self::BlockDiagonal(blocks) | Self::IndependentGroups { blocks, .. } => {
                 for block in blocks {
                     check_symmetry(&block.values, block.width, scale)?;
                 }
@@ -66,7 +94,7 @@ impl<'a> DirectMetric<'a> {
                     visit(index, value)?;
                 }
             }
-            Self::BlockDiagonal(blocks) => {
+            Self::BlockDiagonal(blocks) | Self::IndependentGroups { blocks, .. } => {
                 let mut start = 0;
                 for block in blocks {
                     for (index, &value) in block.values.iter().enumerate() {
@@ -85,7 +113,7 @@ impl<'a> DirectMetric<'a> {
     pub(super) fn as_dense(&self) -> Option<&[f64]> {
         match self {
             Self::Dense(values) => Some(values),
-            Self::BlockDiagonal(_) => None,
+            Self::BlockDiagonal(_) | Self::IndependentGroups { .. } => None,
         }
     }
 
@@ -94,6 +122,9 @@ impl<'a> DirectMetric<'a> {
     pub(super) fn into_dense(self, cols: usize) -> Result<Cow<'a, [f64]>, DirectFitError> {
         match self {
             Self::Dense(values) => Ok(values),
+            Self::IndependentGroups { .. } => Err(DirectFitError::Unsupported(
+                "solver-local metric has no dense covariance",
+            )),
             Self::BlockDiagonal(blocks) => {
                 let mut dense = reserved_vec(cols * cols)?;
                 dense.resize(cols * cols, 0.);
@@ -121,7 +152,18 @@ impl<'a> DirectMetric<'a> {
         start: usize,
         end: usize,
     ) -> Result<Cow<'_, [f64]>, DirectFitError> {
+        if start >= end || end > cols {
+            return Err(DirectFitError::Unsupported("metric block range"));
+        }
         let width = end - start;
+        if let Self::IndependentGroups { group, blocks } = self {
+            if *group == 0 || !start.is_multiple_of(*group) || end != (start + group).min(cols) {
+                return Err(DirectFitError::Unsupported(
+                    "solver-local metric group read",
+                ));
+            }
+            return Ok(Cow::Borrowed(&blocks[start / group].values));
+        }
         if let Self::BlockDiagonal(blocks) = self {
             let mut offset = 0;
             for block in blocks {
@@ -138,6 +180,7 @@ impl<'a> DirectMetric<'a> {
                     local.extend_from_slice(&values[row * cols + start..row * cols + end]);
                 }
             }
+            Self::IndependentGroups { .. } => unreachable!("solver-local group handled above"),
             Self::BlockDiagonal(blocks) => {
                 local.resize(width * width, 0.);
                 let mut offset = 0;
@@ -183,6 +226,107 @@ fn check_symmetry(values: &[f64], cols: usize, scale: f64) -> Result<(), DirectF
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn solver_local_views_cannot_be_reinterpreted_as_complete_covariance() {
+        use tritium_schema::*;
+        let make = || DirectMetric::IndependentGroups {
+            group: 32,
+            blocks: (0..2)
+                .map(|_| {
+                    let mut values = vec![0.; 32 * 32];
+                    for i in 0..32 {
+                        values[i * 32 + i] = 1.;
+                    }
+                    MetricBlock {
+                        width: 32,
+                        values: Cow::Owned(values),
+                    }
+                })
+                .collect(),
+        };
+        let fitter = JointGroupFitOptions {
+            max_iterations: 2,
+            ridge: 1e-8,
+            em_restarts: 1,
+            ridge_condition_limit: 1e6,
+            softened_relay: false,
+            modulated_relay: false,
+        };
+        let plan = DirectFitPlan {
+            layout: AdditiveLayout {
+                rows: 1,
+                cols: 64,
+                tile: 256,
+                group: 32,
+                max_planes: 1,
+                allocation: PlaneAllocation::Uniform,
+                codec: PlaneCodec::B3,
+                basis: Basis::Identity,
+                transport: Transport::Raw,
+                law: ScaleLaw {
+                    anchor: ScaleAnchor::Group,
+                    precision: ScalePrecision::F32,
+                    relation: PlaneRelation::Free,
+                },
+            },
+            profile: DirectFitProfile::JointIndependentGroups(fitter),
+            levels: vec![DirectFitLevel {
+                name: "one".into(),
+                planes: 1,
+            }],
+            limits: DirectFitLimits {
+                max_weights: 64,
+                max_metric_entries: 4096,
+                max_output_trits: 64,
+            },
+        };
+        make().validate(64).unwrap();
+        make().admit_profile(&plan).unwrap();
+        assert!(make().into_dense(64).is_err());
+        for (start, end) in [(0, 64), (1, 33), (33, 32), (64, 64)] {
+            assert!(make().block(64, start, end).is_err());
+        }
+        let weights: Vec<_> = (0..64).map(|i| (i % 17) as f32 / 19. - 0.5).collect();
+        let mut identity = vec![0.; 4096];
+        for i in 0..64 {
+            identity[i * 64 + i] = 1.;
+        }
+        assert_eq!(
+            super::super::direct::fit_direct_levels_metric(&plan, &weights, Some(make())).unwrap(),
+            super::super::fit_direct_levels(&plan, &weights, Some(&identity)).unwrap(),
+        );
+        for variant in 0..3 {
+            let mut changed = plan.clone();
+            match variant {
+                0 => changed.layout.group = 64,
+                1 => changed.layout.basis = Basis::Hadamard { block: 32 },
+                _ => {
+                    changed.profile =
+                        DirectFitProfile::JointFeedbackGroups(JointFeedbackFitOptions {
+                            fitter,
+                            damp: 0.01,
+                            precision: WorkPrecision::F64,
+                            decay: 1.,
+                            decay_ramp: false,
+                        })
+                }
+            }
+            assert_eq!(
+                make().admit_profile(&changed),
+                Err(DirectFitError::Unsupported("solver-local metric scope"))
+            );
+            let expected = if variant == 0 {
+                "unadmitted execution group"
+            } else {
+                "solver-local metric scope"
+            };
+            assert_eq!(
+                super::super::direct::fit_direct_levels_metric(&changed, &weights, Some(make())),
+                Err(DirectFitError::Unsupported(expected))
+            );
+        }
+    }
 
     #[test]
     fn ragged_cross_block_views_and_dense_materialization_preserve_bits() {

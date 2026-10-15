@@ -95,10 +95,10 @@ pub fn fit_owner_score_levels_recorded(
         metrics.source(),
         weights,
         &metrics,
-        |row, metric| {
+        |row, digest| {
             bindings.push(OwnerRowMetricBinding {
                 row: row as u64,
-                content: OwnerRowMetricId::from_bytes(metric.digest()),
+                content: OwnerRowMetricId::from_bytes(digest),
             });
             Ok(())
         },

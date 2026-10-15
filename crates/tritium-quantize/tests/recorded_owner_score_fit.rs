@@ -235,6 +235,42 @@ fn actual_recorded_fit_rows_outputs_and_sealed_replay_match_common_consumer() {
 }
 
 #[test]
+fn streamed_repeated_zero_weight_windows_preserve_complete_dense_row_identities() {
+    let a = fixture(0, b"scalar mean");
+    let b = fixture(1, b"scalar mean");
+    let refs = [&a, &b, &a, &b, &a];
+    let mut request = plan(&refs);
+    for (window, weight) in request.windows.iter_mut().zip([0.5, 0., 2., 0.25, 1.]) {
+        window.weight = weight;
+    }
+    let windows: Vec<_> = request.windows.iter().map(|w| w.window()).collect();
+    let metrics = OwnerScoreMetrics::new(&refs, &windows, request.damping, request.limits).unwrap();
+    let (actual, log) = record(&request, &refs);
+    for row in &actual.observation.observation().rows {
+        assert_eq!(
+            row.content.as_bytes(),
+            &metrics.row_metric(row.row as usize).unwrap().digest()
+        );
+    }
+    let replay: Vec<_> = refs
+        .iter()
+        .map(|cache| {
+            OwnerScoreCache::decode_package(
+                &cache.encode_package(65536).unwrap(),
+                cache.binding(),
+                cache.limits(),
+                65536,
+            )
+            .unwrap()
+        })
+        .collect();
+    let replay_refs: Vec<_> = replay.iter().collect();
+    let (again, replay_log) = record(&request, &replay_refs);
+    assert_eq!(actual.levels, again.levels);
+    assert_eq!(log.to_jsonl().unwrap(), replay_log.to_jsonl().unwrap());
+}
+
+#[test]
 fn actual_cache_package_replay_records_identical_fit_observations() {
     let a = fixture(0, b"scalar mean");
     let b = fixture(1, b"scalar mean");
