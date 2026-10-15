@@ -12,6 +12,9 @@ mod stream_limits;
 #[path = "unified/inspection.rs"]
 mod inspection;
 
+#[path = "unified/read_io.rs"]
+mod read_io;
+
 #[path = "unified/resources.rs"]
 mod resources;
 
