@@ -61,7 +61,7 @@ fn median(mut values: Vec<Duration>) -> Duration {
     values[values.len() / 2]
 }
 
-fn launch_kernel(
+fn launch_kernel<const TIMED: bool>(
     backend: &CudaBackend,
     packed: &PackedAdditive,
     input: &CudaSlice<f32>,
@@ -69,7 +69,7 @@ fn launch_kernel(
     batch: u32,
     outputs: usize,
     cooperative: bool,
-) {
+) -> f64 {
     let (function, config) = if cooperative {
         (
             &backend.func_semantic_additive_matmul_ordered_warp,
@@ -87,22 +87,43 @@ fn launch_kernel(
     };
     let mut launch = backend.stream.launch_builder(function);
     launch.arg(&packed.bytes).arg(input).arg(output).arg(&batch);
+    if TIMED {
+        launch.record_kernel_launch(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    }
     #[allow(unsafe_code)]
     // SAFETY: admitted payloads, bounded outputs; cooperative blocks use whole warps.
-    unsafe { launch.launch(config) }.unwrap();
+    let events = unsafe { launch.launch(config) }.unwrap();
+    if let Some((start, end)) = events {
+        f64::from(start.elapsed_ms(&end).unwrap()) * 1000.
+    } else {
+        0.
+    }
 }
 
 #[test]
 #[ignore = "explicit physical packed-kernel timing diagnostic; not a release gate"]
 fn physical_ordered_packed_kernel_timing() {
+    timing(
+        &[
+            (512, 512),
+            (2048, 2048),
+            (5120, 5120),
+            (5120, 17408),
+            (32768, 512),
+        ],
+        5,
+    );
+}
+
+#[test]
+#[ignore = "explicit small-shape physical timing diagnostic; not a release gate"]
+fn physical_ordered_small_shape_timing() {
+    timing(&[(512, 512)], 31);
+}
+
+fn timing(shapes: &[(usize, usize)], sample_count: usize) {
     let backend = CudaBackend::new(0).expect("requires physical CUDA");
-    for (rows, cols) in [
-        (512, 512),
-        (2048, 2048),
-        (5120, 5120),
-        (5120, 17408),
-        (32768, 512),
-    ] {
+    for &(rows, cols) in shapes {
         for codec in [PlaneCodec::D2, PlaneCodec::B3] {
             for planes in [1, 3] {
                 for compact in [false, true] {
@@ -115,12 +136,13 @@ fn physical_ordered_packed_kernel_timing() {
                         let input = backend.stream.clone_htod(&host).unwrap();
                         let mut output = backend.stream.alloc_zeros::<f32>(rows * batch).unwrap();
                         let mut samples = [Vec::new(), Vec::new()];
+                        let mut device_samples = [Vec::new(), Vec::new()];
                         let mut oracle = None;
-                        for iteration in 0..14 {
+                        for iteration in 0..2 * (sample_count + 2) {
                             let mode = iteration % 2;
                             backend.stream.synchronize().unwrap();
                             let start = Instant::now();
-                            launch_kernel(
+                            let device_us = launch_kernel::<true>(
                                 &backend,
                                 &packed,
                                 &input,
@@ -132,6 +154,8 @@ fn physical_ordered_packed_kernel_timing() {
                             backend.stream.synchronize().unwrap();
                             if iteration >= 4 {
                                 samples[mode].push(start.elapsed());
+                                device_samples[mode]
+                                    .push(Duration::from_secs_f64(device_us * 1e-6));
                             }
                             let actual = backend.stream.clone_dtoh(&output).unwrap();
                             let bits = actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
@@ -144,9 +168,11 @@ fn physical_ordered_packed_kernel_timing() {
                         let actual = backend.stream.clone_dtoh(&output).unwrap();
                         assert!(actual.iter().all(|v| v.is_finite()));
                         eprintln!(
-                            "PACKED_KERNEL rows={rows} cols={cols} codec={codec:?} planes={planes} compact={compact} batch={batch} scalar_us={:.3} warp_us={:.3}",
+                            "PACKED_KERNEL rows={rows} cols={cols} codec={codec:?} planes={planes} compact={compact} batch={batch} scalar_us={:.3} warp_us={:.3} scalar_gpu_us={:.3} warp_gpu_us={:.3}",
                             median(samples[0].clone()).as_secs_f64() * 1e6,
                             median(samples[1].clone()).as_secs_f64() * 1e6,
+                            median(device_samples[0].clone()).as_secs_f64() * 1e6,
+                            median(device_samples[1].clone()).as_secs_f64() * 1e6,
                         );
                     }
                 }
@@ -242,7 +268,7 @@ fn physical_ordered_warp_matches_scalar_and_core_bits() {
                                     .stream
                                     .clone_htod(&vec![77.; rows * batch + rows])
                                     .unwrap();
-                                launch_kernel(
+                                launch_kernel::<false>(
                                     &backend,
                                     &packed,
                                     &input,
@@ -252,7 +278,7 @@ fn physical_ordered_warp_matches_scalar_and_core_bits() {
                                     false,
                                 );
                                 let scalar = backend.stream.clone_dtoh(&output).unwrap();
-                                launch_kernel(
+                                launch_kernel::<false>(
                                     &backend,
                                     &packed,
                                     &input,
