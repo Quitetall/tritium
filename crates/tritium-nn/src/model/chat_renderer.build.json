@@ -156,11 +156,11 @@
     "crates/tritium-nn/chat-renderer/Cargo.toml": "19f78c44630ac15b38508be2e00f52b65fd4083d3569d9234632bba171610ff7",
     "crates/tritium-nn/chat-renderer/src/lib.rs": "4a3ff6feb1982b52909807db0949f2055574375c5166bde3fc5d5fac84055772",
     "rust-toolchain.toml": "0e00698d6f43fdca3f9b2a25e8bad88418a9d61a403a94d2279958737db68d07",
-    "scripts/build-chat-renderer.sh": "d032ceb9d7cfc89d13eee2eafc4469124a9bf4fed7dfb4ddb6c96e590c3ec818",
-    "scripts/generate-chat-renderer-record.py": "4740759e081698a17ca2951699b89618f89cd06896ff41ffd9e36c2bfe6a22d6"
+    "scripts/build-chat-renderer.sh": "fbec9ac27438e1d0806393f0b219c0d98f0bd2d0003f28fdc4974234e02ce76f",
+    "scripts/generate-chat-renderer-record.py": "518aad96dff741a3dcd8bd31129691c1578a6443c0d12ff1befe9076f1f7d3d7"
   },
   "qualified": false,
   "schema": "tritium.fixed-chat-renderer-build.v1",
   "target": "wasm32-unknown-unknown",
-  "wasm_sha256": "eedb1a9978515abc9868047bc41cebf912ba7904966861978c376c02bddf13b5"
+  "wasm_sha256": "8a1f462b375cd712854987d8a519257514503e9bbc34a6def80a4e9966ac843a"
 }

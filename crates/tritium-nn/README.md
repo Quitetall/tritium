@@ -36,6 +36,9 @@ Reproduce the checked-in payload with `bash scripts/build-chat-renderer.sh --che
 from the repository root (pinned Rust toolchain and installed Wasm target).
 `--write` deliberately regenerates it after source changes. Normal crate/wheel
 builds consume the packaged bytes and do not invoke a guest build or Python.
+Regeneration normalizes installed and virtual standard-library source paths to
+the compiler's commit-bound `/rustc` paths, so installing `rust-src` cannot change
+the payload. The build-record check rejects embedded host home/toolchain paths.
 The `source_chat_prompt` example and `scripts/verify-chat-template.py` compare
 exact text and token IDs offline using tokenizer assets only, not model weights.
 

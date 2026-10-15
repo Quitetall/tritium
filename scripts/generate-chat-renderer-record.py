@@ -12,6 +12,13 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def validate_host_paths(payload, roots):
+    """Inlined standard-library panic paths must be remapped too."""
+    for root in roots:
+        if str(root).encode() in payload:
+            raise RuntimeError("fixed renderer contains an unmapped host path")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--write", action="store_true")
@@ -19,6 +26,10 @@ def main():
     root = Path(__file__).resolve().parents[1]
     guest = root / "crates/tritium-nn/chat-renderer"
     destination = root / "crates/tritium-nn/src/model"
+    sysroot = subprocess.check_output(["rustc", "--print", "sysroot"], cwd=root,
+                                     timeout=15, text=True).strip()
+    validate_host_paths((destination / "chat_renderer.wasm").read_bytes(),
+                        [root, Path.home(), Path(sysroot)])
     metadata = json.loads(subprocess.check_output(
         ["cargo", "metadata", "--locked", "--manifest-path", str(guest / "Cargo.toml"),
          "--format-version", "1"], cwd=root, timeout=60, text=True,
