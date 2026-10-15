@@ -215,6 +215,92 @@ fn changed_predecode_plan_and_unknown_resident_resources_refuse_without_upload()
 }
 
 #[cfg(feature = "cuda")]
+fn hybrid_structural_payload(runner: &tritium_nn::Runner, matrix_payload_bytes: usize) -> usize {
+    use tritium_spec::*;
+    let tritium_nn::ArchitectureSpec::Hybrid(config) = runner.architecture() else {
+        panic!("hybrid fixture")
+    };
+    let c = &config.text;
+    let hidden = c.hidden_size as usize;
+    let recurrence = DeltaNetGeometry {
+        value_heads: c.delta_net.num_value_heads as usize,
+        key_head_dim: c.delta_net.key_head_dim as usize,
+        value_head_dim: c.delta_net.value_head_dim as usize,
+        group_size: (c.delta_net.num_value_heads / c.delta_net.num_key_heads) as usize,
+    };
+    let delta = DeltaMixerGeometry {
+        recurrence,
+        conv_kernel: c.delta_net.conv_kernel_dim as usize,
+        rms_eps: c.rms_norm_eps as f32,
+    };
+    let convolution = delta.widths().unwrap().0 * delta.conv_kernel;
+    let layers = c
+        .layer_types
+        .iter()
+        .map(|kind| DecoderAllocationLayer {
+            input_norm: hidden,
+            post_norm: hidden,
+            activation: DecoderActivation::SwiGlu,
+            ffn_sub_norm: 0,
+            ffn_sub_eps: c.rms_norm_eps as f32,
+            mixer: match kind {
+                tritium_nn::Qwen35LayerType::FullAttention => DecoderAllocationMixer::Attention {
+                    gated: true,
+                    vectors: [
+                        0,
+                        0,
+                        0,
+                        0,
+                        c.full_attention.head_dim as usize,
+                        c.full_attention.head_dim as usize,
+                    ],
+                },
+                tritium_nn::Qwen35LayerType::DeltaNet => DecoderAllocationMixer::DeltaNet {
+                    geometry: delta,
+                    weights: DeltaMixerWeightLengths {
+                        convolution,
+                        norm: recurrence.value_head_dim,
+                        dt_bias: recurrence.value_heads,
+                        a_log: recurrence.value_heads,
+                    },
+                },
+            },
+        })
+        .collect::<Vec<_>>();
+    let bounds = stream();
+    tritium_cuda::CudaBackend::plan_decoder_metadata(
+        DecoderAllocationMetadata {
+            geometry: DecoderGeometry {
+                hidden,
+                intermediate: c.intermediate_size as usize,
+                query_heads: c.full_attention.num_heads as usize,
+                kv_heads: c.full_attention.num_key_value_heads as usize,
+                head_dim: c.full_attention.head_dim as usize,
+                vocabulary: c.vocab_size as usize,
+                rms_eps: c.rms_norm_eps as f32,
+                rope_theta: c.rope.theta as f32,
+            },
+            kind: DecoderAllocationKind::Hybrid,
+            semantics: DecoderSemantics {
+                zero_centered_norm: true,
+                rotary_dim: c.rope.rotary_dim as usize,
+                qwen_rope_f32: true,
+            },
+            final_norm: hidden,
+            layers: &layers,
+            matrix_payload_bytes,
+            rotation_workspace_width: 0,
+        },
+        DecoderLimits {
+            max_context: bounds.max_context,
+            max_segment_tokens: bounds.max_segment_tokens,
+        },
+    )
+    .unwrap()
+    .payload_bytes()
+}
+
+#[cfg(feature = "cuda")]
 #[test]
 fn physical_streamed_resident_envelopes_cover_the_complete_runner_lifetime() {
     use tritium_spec::DecoderExecution;
@@ -250,6 +336,13 @@ fn physical_streamed_resident_envelopes_cover_the_complete_runner_lifetime() {
             DecoderExecution::ResidentDeviceF32
         );
         let actual = loaded.runner.resident_payload_bytes().unwrap();
+        assert_eq!(
+            actual,
+            hybrid_structural_payload(
+                &loaded.runner,
+                usize::try_from(admission.payload_bytes).unwrap()
+            )
+        );
         assert!(actual > admission.payload_bytes as usize && actual <= LIMIT);
         let uploaded = evidence
             .events()

@@ -23,6 +23,29 @@ pub struct DeltaMixerWeights<'a> {
     /// Per-value-head log decay coefficient.
     pub a_log: &'a [f32],
 }
+/// Structural coefficient counts; not finite-value validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeltaMixerWeightLengths {
+    /// Channel-major convolution coefficient count.
+    pub convolution: usize,
+    /// Shared value-lane normalization coefficient count.
+    pub norm: usize,
+    /// Per-value-head time-step bias count.
+    pub dt_bias: usize,
+    /// Per-value-head log decay count.
+    pub a_log: usize,
+}
+impl DeltaMixerWeights<'_> {
+    /// Borrowed structural lengths without reading coefficient values.
+    pub const fn lengths(self) -> DeltaMixerWeightLengths {
+        DeltaMixerWeightLengths {
+            convolution: self.convolution.len(),
+            norm: self.norm.len(),
+            dt_bias: self.dt_bias.len(),
+            a_log: self.a_log.len(),
+        }
+    }
+}
 impl DeltaMixerGeometry {
     /// Validate layout and return raw-QKV/value row widths.
     /// # Errors
@@ -46,6 +69,40 @@ impl DeltaMixerGeometry {
         limits: DecoderLimits,
         budget: usize,
     ) -> Result<usize, BackendError> {
+        let bytes = self.structural_payload_bytes(weights.lengths(), limits, usize::MAX)?;
+        if budget == 0 {
+            return Err(invalid("invalid DeltaNet mixer limits"));
+        }
+        if [
+            weights.convolution,
+            weights.norm,
+            weights.dt_bias,
+            weights.a_log,
+        ]
+        .into_iter()
+        .any(|values| values.iter().any(|v| !v.is_finite()))
+        {
+            return Err(invalid("DeltaNet mixer coefficients must be finite"));
+        }
+        if bytes > budget {
+            return Err(BackendError::TensorPayloadBudgetExceeded {
+                requested: bytes as u64,
+                limit: budget as u64,
+            });
+        }
+        Ok(bytes)
+    }
+
+    /// Logical payload from coefficient lengths without allocating or reading values.
+    /// The value-aware planner uses this exact arithmetic and additionally checks finiteness.
+    /// # Errors
+    /// Invalid lengths/geometry/limits, checked overflow or a payload ceiling rejection.
+    pub fn structural_payload_bytes(
+        self,
+        weights: DeltaMixerWeightLengths,
+        limits: DecoderLimits,
+        budget: usize,
+    ) -> Result<usize, BackendError> {
         let (conv, value) = self.widths()?;
         let state = self.recurrence.elements()?;
         let conv_state = mul(conv, self.conv_kernel)?;
@@ -57,20 +114,17 @@ impl DeltaMixerGeometry {
         {
             return Err(invalid("invalid DeltaNet mixer limits"));
         }
-        for (values, expected) in [
+        for (length, expected) in [
             (weights.convolution, conv_state),
             (weights.norm, self.recurrence.value_head_dim),
             (weights.dt_bias, heads),
             (weights.a_log, heads),
         ] {
-            if values.len() != expected {
+            if length != expected {
                 return Err(BackendError::ShapeMismatch {
                     expected,
-                    got: values.len(),
+                    got: length,
                 });
-            }
-            if values.iter().any(|v| !v.is_finite()) {
-                return Err(invalid("DeltaNet mixer coefficients must be finite"));
             }
         }
         let constants = add(
@@ -160,6 +214,33 @@ fn add(a: usize, b: usize) -> Result<usize, BackendError> {
 mod tests {
     use super::*;
     #[test]
+    fn value_validation_precedes_payload_ceiling_rejection() {
+        let geometry = DeltaMixerGeometry {
+            recurrence: DeltaNetGeometry {
+                value_heads: 1,
+                key_head_dim: 1,
+                value_head_dim: 1,
+                group_size: 1,
+            },
+            conv_kernel: 1,
+            rms_eps: 1e-6,
+        };
+        let weights = DeltaMixerWeights {
+            convolution: &[0.; 3],
+            norm: &[f32::NAN],
+            dt_bias: &[0.],
+            a_log: &[0.],
+        };
+        let limits = DecoderLimits {
+            max_context: 1,
+            max_segment_tokens: 1,
+        };
+        assert!(matches!(
+            geometry.payload_bytes(weights, limits, 1),
+            Err(BackendError::InvalidInput(_))
+        ));
+    }
+    #[test]
     fn full_mixer_plan_checks_vectors_limits_and_overflow() {
         let geometry = DeltaMixerGeometry {
             recurrence: DeltaNetGeometry {
@@ -185,6 +266,24 @@ mod tests {
             max_segment_tokens: 5,
         };
         assert_eq!(geometry.widths().unwrap(), (80, 48));
+        assert_eq!(
+            geometry
+                .structural_payload_bytes(weights.lengths(), limits, usize::MAX)
+                .unwrap(),
+            12352
+        );
+        assert!(
+            geometry
+                .structural_payload_bytes(
+                    DeltaMixerWeightLengths {
+                        norm: 7,
+                        ..weights.lengths()
+                    },
+                    limits,
+                    usize::MAX
+                )
+                .is_err()
+        );
         // state pairs=1408, constants=340, workspace=1340 f32.
         assert_eq!(
             geometry.payload_bytes(weights, limits, usize::MAX).unwrap(),

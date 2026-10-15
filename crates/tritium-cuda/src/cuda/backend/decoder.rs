@@ -283,30 +283,15 @@ pub(super) fn create(
         let (rows, cols) = CudaTensor::checked(&backend, handle.as_ref())?.dimensions();
         check(handle, rows, cols, 1, false)?;
     }
-    let mut preserved = vector(graph.final_norm, g.hidden, false)?;
-    let mut state_bytes = 0;
-    let mut has_attention = false;
-    let mut has_delta = false;
-    let mut aux_a = 0;
-    let mut aux_b = 0;
-    let mut aux_c = 0;
-    let mut aux_d = 0;
-    let mut gate_width = 0;
-    let mut conv_width = 0;
-    let mut mixed_width = 0;
-    let mut widest = g.vocabulary.max(g.hidden).max(g.intermediate);
+    vector(graph.final_norm, g.hidden, false)?;
+    let mut allocation_layers = Vec::new();
+    allocation_layers
+        .try_reserve_exact(views.len())
+        .map_err(|_| invalid("decoder allocation metadata"))?;
     for l in &views {
-        preserved = add(preserved, vector(l.input, g.hidden, false)?)?;
-        preserved = add(preserved, vector(l.post, g.hidden, false)?)?;
-        preserved = add(preserved, vector(l.sub, g.intermediate, true)?)?;
-        if !matches!(
-            l.activation,
-            DecoderActivation::SwiGlu | DecoderActivation::Relu2
-        ) || (l.activation == DecoderActivation::SwiGlu && !l.sub.is_empty())
-            || (!l.sub.is_empty() && (!l.sub_eps.is_finite() || l.sub_eps <= 0.))
-        {
-            return Err(invalid("unsupported MLP semantics"));
-        }
+        vector(l.input, g.hidden, false)?;
+        vector(l.post, g.hidden, false)?;
+        vector(l.sub, g.intermediate, true)?;
         for (handle, (rows, cols)) in l.mlp.iter().zip([
             (g.intermediate, g.hidden),
             (g.intermediate, g.hidden),
@@ -314,17 +299,13 @@ pub(super) fn create(
         ]) {
             check(handle, rows, cols, m, true)?;
         }
-        match &l.mixer {
+        let mixer = match &l.mixer {
             ViewMixer::Attention {
                 matrices,
                 vectors,
                 gated,
             } => {
-                has_attention = true;
-                mixed_width = mixed_width.max(q);
-                widest = widest.max(q).max(kv);
                 let query_width = if *gated { mul(2, q)? } else { q };
-                widest = widest.max(query_width);
                 for (handle, (rows, cols)) in matrices.iter().zip([
                     (query_width, g.hidden),
                     (kv, g.hidden),
@@ -338,25 +319,18 @@ pub(super) fn create(
                     .zip([q, q, kv, kv, g.head_dim, g.head_dim])
                     .enumerate()
                 {
-                    preserved = add(preserved, vector(values, width, !*gated || i < 4)?)?;
+                    vector(values, width, !*gated || i < 4)?;
                 }
-                state_bytes = add(state_bytes, mul(mul(mul(2, limits.max_context)?, kv)?, 4)?)?;
-                if *gated {
-                    aux_a = aux_a.max(query_width);
-                    gate_width = gate_width.max(q);
+                DecoderAllocationMixer::Attention {
+                    gated: *gated,
+                    vectors: vectors.map(<[f32]>::len),
                 }
             }
             ViewMixer::Delta(d) => {
-                has_delta = true;
                 let (cv, value) = d.geometry.widths()?;
                 let heads = d.geometry.recurrence.value_heads;
-                if d.geometry.rms_eps.to_bits() != g.rms_eps.to_bits() {
-                    return Err(invalid("DeltaNet epsilon differs from graph"));
-                }
-                state_bytes = add(
-                    state_bytes,
-                    delta_mixer::State::payload_bytes(d.geometry, d.weights, limits)?,
-                )?;
+                // Actual values remain finite-checked; metadata never certifies them.
+                delta_mixer::State::payload_bytes(d.geometry, d.weights, limits)?;
                 for (handle, (rows, cols)) in
                     [d.qkv, d.z, d.beta, d.decay, d.output].into_iter().zip([
                         (cv, g.hidden),
@@ -368,29 +342,47 @@ pub(super) fn create(
                 {
                     check(handle, rows, cols, m, true)?;
                 }
-                aux_a = aux_a.max(cv);
-                aux_b = aux_b.max(value);
-                aux_c = aux_c.max(heads);
-                aux_d = aux_d.max(heads);
-                conv_width = conv_width.max(cv);
-                mixed_width = mixed_width.max(value);
-                widest = widest.max(cv).max(value).max(heads);
+                DecoderAllocationMixer::DeltaNet {
+                    geometry: d.geometry,
+                    weights: d.weights.lengths(),
+                }
             }
-        }
+        };
+        allocation_layers.push(DecoderAllocationLayer {
+            input_norm: l.input.len(),
+            post_norm: l.post.len(),
+            activation: l.activation,
+            ffn_sub_norm: l.sub.len(),
+            ffn_sub_eps: l.sub_eps,
+            mixer,
+        });
     }
-    let q_width = if has_attention { q } else { 0 };
-    let kv_width = if has_attention { kv } else { 0 };
-    let rope_width = if has_attention { s.rotary_dim } else { 0 };
-    let widths = [
-        g.hidden,
-        g.hidden,
-        g.hidden,
+    let plan = super::decoder_plan::plan(
+        DecoderAllocationMetadata {
+            geometry: g,
+            semantics: s,
+            kind: if matches!(&graph.layers, DecoderLayers::Standard(_)) {
+                DecoderAllocationKind::Standard
+            } else {
+                DecoderAllocationKind::Hybrid
+            },
+            final_norm: graph.final_norm.len(),
+            layers: &allocation_layers,
+            matrix_payload_bytes: matrix_bytes,
+            rotation_workspace_width: rotate_width,
+        },
+        limits,
+    )?;
+    let [
+        _,
+        _,
+        _,
         q_width,
         kv_width,
-        kv_width,
+        _,
         mixed_width,
-        g.intermediate,
-        g.intermediate,
+        _,
+        _,
         aux_a,
         aux_b,
         aux_c,
@@ -399,21 +391,10 @@ pub(super) fn create(
         conv_width,
         rotate_width,
         rope_width,
-    ];
-    let mut workspace = 0;
-    for width in widths {
-        let n = mul(m, width)?;
-        u32::try_from(n).map_err(|_| invalid("decoder workspace exceeds u32"))?;
-        workspace = add(workspace, n)?;
-    }
-    if has_attention {
-        u32::try_from(mul(m, g.query_heads)?).map_err(|_| invalid("attention grid exceeds u32"))?;
-    }
-    workspace = add(workspace, add(add(g.hidden, g.vocabulary)?, widest)?)?;
-    let payload = add(
-        add(matrix_bytes, state_bytes)?,
-        add(mul(add(preserved, workspace)?, 4)?, mul(m, 4)?)?,
-    )?;
+    ] = plan.widths;
+    let widest = plan.widest;
+    let has_delta = plan.has_delta;
+    let payload = plan.payload.payload_bytes();
     if payload > budget {
         return Err(BackendError::TensorPayloadBudgetExceeded {
             requested: payload as u64,

@@ -88,6 +88,10 @@ jobs:
         env:
           CUDA_VISIBLE_DEVICES: ""
         run: cargo test --locked -p tritium-cli --features cuda --bin tritium campaign_artifact::tests -- --test-threads=1
+      - name: Structural decoder planning contracts (no GPU)
+        env:
+          CUDA_VISIBLE_DEVICES: ""
+        run: cargo test --locked -p tritium-cuda --features cuda --test decoder_payload_plan
       # Downstream NON-NVIDIA consumers (issue #4). These link the wgpu/rocm backend
       # crates so their registrations reach the shipped `tritium` binary and the bench
       # harness. Checked as a separate invocation from the cuda line above precisely

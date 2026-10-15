@@ -13,6 +13,7 @@ use tritium_format::salt_v2_package::{
 
 mod attention;
 mod decoder;
+mod decoder_plan;
 mod delta_mixer;
 pub(super) mod deltanet;
 mod salt_v2_reader_upload;
@@ -1097,6 +1098,18 @@ impl CudaBackend {
         }
         self.resident_decoder_budget = Some(max_device_payload_bytes);
         self
+    }
+
+    /// Plan structural resident device payload without initializing a CUDA context.
+    /// This excludes host/allocator/driver costs and does not certify weight values,
+    /// ownership, physical fit, source authentication or model quality.
+    /// # Errors
+    /// Unsupported geometry/semantics, coefficient lengths or checked extent overflow.
+    pub fn plan_decoder_metadata(
+        metadata: tritium_spec::DecoderAllocationMetadata<'_>,
+        limits: tritium_spec::DecoderLimits,
+    ) -> Result<tritium_spec::DecoderPayloadPlan, BackendError> {
+        decoder_plan::plan(metadata, limits).map(|plan| plan.payload)
     }
     /// Explicitly opt into device-f32 SwiGLU regions before loading a model.
     /// Device expf may differ from host exp. Default arithmetic is unchanged;
@@ -9248,6 +9261,14 @@ impl TernaryBackend for CudaBackend {
     }
     fn resident_decoder_payload_limit(&self) -> Option<usize> {
         self.resident_decoder_budget
+    }
+
+    fn decoder_payload_plan(
+        &self,
+        metadata: tritium_spec::DecoderAllocationMetadata<'_>,
+        limits: tritium_spec::DecoderLimits,
+    ) -> Result<Option<tritium_spec::DecoderPayloadPlan>, BackendError> {
+        Self::plan_decoder_metadata(metadata, limits).map(Some)
     }
     fn resident_decoder(
         self: Arc<Self>,

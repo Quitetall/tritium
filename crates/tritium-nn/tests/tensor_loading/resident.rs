@@ -108,6 +108,84 @@ fn compare(got: &[f32], expected: &[f32]) {
     }
 }
 
+fn structural_payload(runner: &tritium_nn::Runner, matrices: usize, rotated: bool) -> usize {
+    use tritium_spec::{
+        DecoderAllocationKind, DecoderAllocationLayer, DecoderAllocationMetadata,
+        DecoderAllocationMixer,
+    };
+    let tritium_nn::ArchitectureSpec::Standard {
+        config: c,
+        variation: v,
+        vocab_size,
+    } = runner.architecture()
+    else {
+        panic!("standard fixture")
+    };
+    let hidden = c.n_embd as usize;
+    let intermediate = c.n_ff as usize;
+    let dim = c.head_dim() as usize;
+    let q = c.n_head as usize * dim;
+    let kv = c.n_head_kv as usize * dim;
+    let relu = v.mlp == tritium_nn::MlpKind::Relu2;
+    let layer = DecoderAllocationLayer {
+        input_norm: hidden,
+        post_norm: hidden,
+        activation: if relu {
+            DecoderActivation::Relu2
+        } else {
+            DecoderActivation::SwiGlu
+        },
+        ffn_sub_norm: if relu && v.ffn_sub_norm {
+            intermediate
+        } else {
+            0
+        },
+        ffn_sub_eps: c.rms_eps,
+        mixer: DecoderAllocationMixer::Attention {
+            gated: false,
+            vectors: [
+                if v.attn_sub_norm { q } else { 0 },
+                if v.qkv_bias { q } else { 0 },
+                if v.qkv_bias { kv } else { 0 },
+                if v.qkv_bias { kv } else { 0 },
+                if v.qk_norm { dim } else { 0 },
+                if v.qk_norm { dim } else { 0 },
+            ],
+        },
+    };
+    let layers = vec![layer; c.n_layers as usize];
+    tritium_cuda::CudaBackend::plan_decoder_metadata(
+        DecoderAllocationMetadata {
+            geometry: DecoderGeometry {
+                hidden,
+                intermediate,
+                query_heads: c.n_head as usize,
+                kv_heads: c.n_head_kv as usize,
+                head_dim: dim,
+                vocabulary: *vocab_size,
+                rms_eps: c.rms_eps,
+                rope_theta: c.rope_theta,
+            },
+            kind: DecoderAllocationKind::Standard,
+            semantics: DecoderSemantics::standard(dim),
+            final_norm: hidden,
+            layers: &layers,
+            matrix_payload_bytes: matrices,
+            rotation_workspace_width: if rotated {
+                hidden.max(intermediate).max(q)
+            } else {
+                0
+            },
+        },
+        DecoderLimits {
+            max_context: 7,
+            max_segment_tokens: 3,
+        },
+    )
+    .unwrap()
+    .payload_bytes()
+}
+
 #[test]
 fn whole_standard_dense_additive_rotated_tied_and_variations_match_host() {
     let Some(probe) = cuda(None) else {
@@ -150,6 +228,14 @@ fn whole_standard_dense_additive_rotated_tied_and_variations_match_host() {
                 assert_eq!(cpu.runner.resident_payload_bytes(), None);
                 assert_eq!(gpu.runner.execution(), DecoderExecution::ResidentDeviceF32);
                 assert!(gpu.runner.resident_payload_bytes().unwrap() < 1_000_000);
+                assert_eq!(
+                    gpu.runner.resident_payload_bytes().unwrap(),
+                    structural_payload(
+                        &gpu.runner,
+                        usize::try_from(gpu_budget.used_bytes()).unwrap(),
+                        additive.is_some_and(|(_, b)| b != Basis::Identity)
+                    )
+                );
                 for (tokens, positions) in [
                     (&[1, 3][..], &[0, 1][..]),
                     (&[4, 2, 5][..], &[2, 3, 4][..]),

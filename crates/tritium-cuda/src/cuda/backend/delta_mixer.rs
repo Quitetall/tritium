@@ -1,7 +1,8 @@
 //! Complete device-f32 DeltaNet mixer, separate from exact legacy recurrence.
 use super::*;
 use tritium_spec::{
-    DecoderLimits, DeltaMixerGeometry, DeltaMixerSegment, DeltaMixerWeights, ResidentDeltaMixer,
+    DecoderLimits, DeltaMixerGeometry, DeltaMixerSegment, DeltaMixerWeightLengths,
+    DeltaMixerWeights, ResidentDeltaMixer,
 };
 
 #[derive(Debug)]
@@ -56,7 +57,16 @@ impl State {
         weights: DeltaMixerWeights<'_>,
         limits: DecoderLimits,
     ) -> Result<usize, BackendError> {
-        let full = geometry.payload_bytes(weights, limits, usize::MAX)?;
+        let bytes = Self::structural_payload_bytes(geometry, weights.lengths(), limits)?;
+        geometry.payload_bytes(weights, limits, usize::MAX)?;
+        Ok(bytes)
+    }
+    pub(super) fn structural_payload_bytes(
+        geometry: DeltaMixerGeometry,
+        weights: DeltaMixerWeightLengths,
+        limits: DecoderLimits,
+    ) -> Result<usize, BackendError> {
+        let full = geometry.structural_payload_bytes(weights, limits, usize::MAX)?;
         let g = geometry.recurrence;
         let (conv, value) = geometry.widths()?;
         if g.key_head_dim > 1024

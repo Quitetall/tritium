@@ -50,3 +50,8 @@ _Avoid_: capability declaration, approval
 A reserved logical ceiling covering a resident model's matrices and execution
 state. It is distinct from actual payload consumption and measured physical memory.
 _Avoid_: peak VRAM, exact allocation plan, physical fit
+
+**Resident payload plan**:
+The checked logical matrix, coefficient, state and workspace sizes for one
+resident graph and stream policy. It is not a reserved ceiling or physical memory.
+_Avoid_: resident envelope, measured VRAM, qualification receipt

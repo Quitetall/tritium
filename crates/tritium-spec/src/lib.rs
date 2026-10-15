@@ -44,7 +44,13 @@ mod deltanet;
 pub use deltanet::{DeltaNetGeometry, DeltaNetStep, ResidentDeltaNet};
 mod delta_mixer;
 pub use delta_mixer::{
-    DeltaMixerGeometry, DeltaMixerSegment, DeltaMixerWeights, ResidentDeltaMixer,
+    DeltaMixerGeometry, DeltaMixerSegment, DeltaMixerWeightLengths, DeltaMixerWeights,
+    ResidentDeltaMixer,
+};
+mod decoder_plan;
+pub use decoder_plan::{
+    DecoderAllocationKind, DecoderAllocationLayer, DecoderAllocationMetadata,
+    DecoderAllocationMixer, DecoderPayloadPlan,
 };
 mod decoder;
 pub use decoder::{
@@ -365,6 +371,18 @@ pub trait TernaryBackend: Send + Sync {
     /// memory consumption. Defaults preserve fail-closed resource loading.
     fn resident_decoder_payload_limit(&self) -> Option<usize> {
         None
+    }
+
+    /// Declare structural graph payload without allocations or numerical checks.
+    /// Defaults remain unknown; this is not a reservation or physical-fit receipt.
+    /// # Errors
+    /// Unsupported geometry/semantics, coefficient lengths or checked overflow.
+    fn decoder_payload_plan(
+        &self,
+        _metadata: DecoderAllocationMetadata<'_>,
+        _limits: DecoderLimits,
+    ) -> Result<Option<DecoderPayloadPlan>, BackendError> {
+        Ok(None)
     }
 
     /// Compile existing shared graph weights into an owned resident executor.
