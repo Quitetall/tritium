@@ -2,6 +2,11 @@
 import copy
 from dataclasses import FrozenInstanceError, replace
 import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -216,6 +221,9 @@ def test_owner_arguments_do_not_fall_through_to_legacy_or_qat(tmp_path):
         prepare(TiedModel(), TernaryConfig.qat(), inplace=True, native_options=json.loads(source.options_json))
     with pytest.raises(ValueError, match="native_options"):
         prepare(TiedModel(), source.prepared.config, inplace=True, native_options={})
+    config = replace(source.prepared.config, target_bpw=2.)
+    with pytest.raises(ValueError, match="target_bpw"):
+        prepare(TiedModel(), config, inplace=False, native_options=json.loads(source.options_json))
 
 
 def test_real_hf_loss_through_public_phases_and_generation(tmp_path):
@@ -250,7 +258,39 @@ def test_real_hf_loss_through_public_phases_and_generation(tmp_path):
     tokens = torch.tensor([[1, 2, 3]])
     with torch.no_grad():
         torch.testing.assert_close(loaded(tokens).logits, reference(tokens).logits, rtol=5e-6, atol=5e-6)
-        assert torch.equal(loaded.generate(tokens, max_new_tokens=3, do_sample=False),
-                           reference.generate(tokens, max_new_tokens=3, do_sample=False))
+        generated = loaded.generate(tokens, max_new_tokens=3, do_sample=False)
+        assert torch.equal(generated, reference.generate(tokens, max_new_tokens=3, do_sample=False))
+        expected_logits = loaded(tokens).logits.tolist()
+    model.config.to_json_file(tmp_path/"hf-config.json")
+    replay = dict(tokens=tokens.tolist(), generated=generated.tolist(), logits=expected_logits)
+    (tmp_path/"replay.json").write_text(json.dumps(replay))
+    subprocess.run([sys.executable, "-I", "-c", """
+import json,sys,torch
+from pathlib import Path
+from transformers import LlamaConfig,LlamaForCausalLM
+from tritium.torch import load
+p=Path(sys.argv[1]); expected=json.loads((p/'replay.json').read_text())
+model=load(p/'hf',model=LlamaForCausalLM(LlamaConfig.from_json_file(p/'hf-config.json')),
+           level='full',load_run_id='public-fresh-process',inplace=False).eval()
+tokens=torch.tensor(expected['tokens'])
+with torch.no_grad():
+    torch.testing.assert_close(model(tokens).logits,torch.tensor(expected['logits']),rtol=5e-6,atol=5e-6)
+    assert model.generate(tokens,max_new_tokens=3,do_sample=False).tolist()==expected['generated']
+assert model.model.embed_tokens.packed_weight is model.lm_head.packed_weight
+""", str(tmp_path)], check=True, capture_output=True, text=True, timeout=30)
+    if location := os.environ.get("TRITIUM_OWNER_PHASE_ORACLE_DIR"):
+        from safetensors.torch import save_file
+        root = Path(location)
+        root.mkdir()
+        shutil.copytree(result.output_dir, root/"hf")
+        for name in ("hf-config.json", "replay.json", "config.json", "tokenizer.json"):
+            shutil.copyfile(tmp_path/name, root/name)
+        save_file({name: value.detach().contiguous().clone() for name, value in model.state_dict().items()},
+                  root/"original.safetensors")
+        (root/"source-options.json").write_text(source.options_json)
+        (root/"recipe.json").write_text(json.dumps(dict(
+            objective_bytes_hex=recipe.objective_bytes.hex(), window_weights=recipe.window_weights,
+            capture_options=recipe.capture_options, fit_options=recipe.fit_options)))
+        calibration.captures[0].save(root/"cache", max_package_bytes=fit["max_cache_package_bytes"])
     assert all(parameter.grad is None for parameter in model.parameters())
     assert list((tmp_path/"work").iterdir()) == []
