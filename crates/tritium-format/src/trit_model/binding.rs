@@ -244,14 +244,29 @@ where
     };
     let mut hash = metadata_hasher("tritium.trit.additive.v1", &metadata)?;
     hash.update(&frame_length(plan.trit_count())?);
-    let mut staging = [0u8; 640];
-    plan.visit_trits(source, blob, |chunk| {
-        for (byte, trit) in staging.iter_mut().zip(chunk) {
-            *byte = (trit.get() + 1) as u8;
+    // Codec visitors yield small windows. Coalesce their canonical bytes so
+    // BLAKE3 can process bulk chunks without retaining a tensor-sized master.
+    // Buffering changes only update boundaries, never the framed byte stream.
+    let mut staging = [0u8; 16 * 1024];
+    let mut used = 0;
+    plan.visit_trits(source, blob, |mut chunk| {
+        while !chunk.is_empty() {
+            let count = (staging.len() - used).min(chunk.len());
+            for (byte, trit) in staging[used..used + count].iter_mut().zip(&chunk[..count]) {
+                *byte = (trit.get() + 1) as u8;
+            }
+            used += count;
+            chunk = &chunk[count..];
+            if used == staging.len() {
+                hash.update(&staging);
+                used = 0;
+            }
         }
-        hash.update(&staging[..chunk.len()]);
         Ok(())
     })?;
+    // The partial trit window belongs before the scale frame, including when
+    // it is empty (all-pruned tensors or an exact buffer boundary).
+    hash.update(&staging[..used]);
     hash.update(&frame_length(plan.scale_len())?);
     plan.visit_scale_bytes(source, blob, |chunk| {
         hash.update(chunk);
