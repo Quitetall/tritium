@@ -158,7 +158,8 @@ def _guarded_apply(model, fn, recurse=True):
 
 def load_native_module(model, artifact, *, level, load_run_id, inplace,
                        max_package_bytes=8*1024**3, max_payload_bytes=2*1024**3,
-                       max_workspace_bytes=64*1024**2, max_output_bytes=64*1024**2):
+                       max_workspace_bytes=64*1024**2, max_output_bytes=64*1024**2,
+                       max_evidence_bytes=None):
     """Validate topology and privately stage native CPU weights plus original state.
 
     Artifact may be an actual NativeModelConversion or an engine output directory.
@@ -170,11 +171,14 @@ def load_native_module(model, artifact, *, level, load_run_id, inplace,
     if any(type(limit) is not int or limit <= 0 for limit in
            (max_package_bytes, max_payload_bytes, max_workspace_bytes, max_output_bytes)):
         raise ValueError("native load byte limits must be positive integers")
+    if max_evidence_bytes is not None and (type(max_evidence_bytes) is not int or max_evidence_bytes <= 0):
+        raise ValueError("native evidence byte limit must be a positive integer")
+    evidence_options = {} if max_evidence_bytes is None else dict(max_evidence_bytes=max_evidence_bytes)
     result = artifact if isinstance(artifact, _tritium.NativeModelConversion) else _tritium.NativeModelConversion.open(
-        str(artifact), max_package_bytes=max_package_bytes)
+        str(artifact), max_package_bytes=max_package_bytes, **evidence_options)
     snapshot = result.open_level(level, load_run_id, max_payload_bytes=max_payload_bytes,
                                  max_workspace_bytes=max_workspace_bytes, max_output_bytes=max_output_bytes,
-                                 max_package_bytes=max_package_bytes)
+                                 max_package_bytes=max_package_bytes, **evidence_options)
     data = _catalog(snapshot)
     config = TernaryConfig.from_dict(data["source_preparation_config"])
     coverage = CoverageReport.from_dict(data["coverage"])

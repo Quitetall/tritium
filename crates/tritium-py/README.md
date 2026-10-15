@@ -166,8 +166,41 @@ iterators. The returned NativeOwnerCalibration is distinct from old calibration
 receipts; its individual captures use the existing native save/open interface.
 `inspect(source)` verifies source bytes before returning coverage. Legacy arguments
 cannot silently enter owner conversion, and owner options cannot enter legacy
-conversion. Native export, one-call quantize and qualified profile migration
-remain open; this explicit research route does not certify a deployment profile.
+conversion. Qualified profile migration remains open; this explicit research
+route does not certify a deployment profile.
+
+`quantize` composes the same owner phases for a live module:
+
+```python
+from tritium.torch import quantize, export, load
+
+result = quantize(
+    model, selection_config, inplace=False, native_options=native_options,
+    data=[first_window, second_window], objective=objective, owner_recipe=recipe,
+    output_dir=output_dir, run_id="my-owner-fit",
+)
+portable = export(result, export_dir,
+                  max_package_bytes=package_ceiling, max_evidence_bytes=log_ceiling)
+reopened = load(portable.output_dir, format="trit",
+                max_package_bytes=package_ceiling, max_evidence_bytes=log_ceiling)
+loaded = load(reopened, model=fresh_model_shell, level="full",
+              load_run_id="portable-load", inplace=False)
+```
+
+Export copies the original `model.trit` and canonical `evidence.jsonl` bytes
+through the shared native verifier and no-clobber publisher. Source, package,
+level/model, evidence and run identities stay unchanged. Unrelated source-folder
+files are not exported. Existing destinations are never replaced; successful
+publication with cleanup/sync trouble returns explicit warnings. The native
+result also exposes `.export(...)` without importing the Torch frontend.
+
+Optional export ceilings can tighten, not widen, the original result's bounds.
+`load(path, format="trit")` explicitly admits a native conversion directory;
+unknown formats and native limits on a legacy route fail closed. Converted
+artifact verification does not promote imported/provisional models to completed
+conversions. Export currently retains bounded whole-package/log buffers in Rust;
+it does not claim streaming or complete-process RSS admission, immutable writer
+custody, distribution authorization, model quality or release qualification.
 
 Expert filesystem callers can use `convert_owner_model_plan` on the native
 extension, or `tritium convert/quantize --owner-plan PLAN --source-shard SOURCE

@@ -3148,24 +3148,60 @@ def convert(
 
 
 def quantize(
-    model_or_id: Pathish,
+    model_or_id: Union[Pathish, nn.Module],
     config: TernaryConfig,
     *,
-    revision: str,
-    work_dir: Pathish,
-    source_admission_receipt: Pathish,
-    official_identity_receipt: Pathish,
-    evidence_dir: Pathish,
-    output_dir: Pathish,
-    compact_max_bytes: int,
-    compact_max_resident_bytes: int,
-    near_lossless_max_bytes: int,
-    near_lossless_max_resident_bytes: int,
+    revision: Optional[str] = None,
+    work_dir: Optional[Pathish] = None,
+    source_admission_receipt: Optional[Pathish] = None,
+    official_identity_receipt: Optional[Pathish] = None,
+    evidence_dir: Optional[Pathish] = None,
+    output_dir: Optional[Pathish] = None,
+    compact_max_bytes: Optional[int] = None,
+    compact_max_resident_bytes: Optional[int] = None,
+    near_lossless_max_bytes: Optional[int] = None,
+    near_lossless_max_resident_bytes: Optional[int] = None,
     packing: str = "b3",
     max_evidence_bytes: int = 64 * 1024 * 1024,
-) -> QuantizationResult:
+    inplace: Optional[bool] = None,
+    native_options: Optional[dict] = None,
+    data: Any = None,
+    objective: Optional[Callable] = None,
+    owner_recipe: Optional["OwnerCalibrationRecipe"] = None,
+    run_id: Optional[str] = None,
+) -> Union[QuantizationResult, "_tritium.NativeModelConversion"]:
     """Compose exact PTQ ``prepare`` → ``calibrate`` → ``convert`` phases."""
 
+    legacy = dict(
+        revision=revision, work_dir=work_dir, source_admission_receipt=source_admission_receipt,
+        official_identity_receipt=official_identity_receipt, evidence_dir=evidence_dir,
+        compact_max_bytes=compact_max_bytes, compact_max_resident_bytes=compact_max_resident_bytes,
+        near_lossless_max_bytes=near_lossless_max_bytes,
+        near_lossless_max_resident_bytes=near_lossless_max_resident_bytes,
+    )
+    if native_options is not None:
+        supplied = dict(legacy, packing=packing if packing != "b3" else None,
+            max_evidence_bytes=max_evidence_bytes if max_evidence_bytes != 64 * 1024 * 1024 else None)
+        names = sorted(name for name, value in supplied.items() if value is not None)
+        if names:
+            raise TypeError("native quantize does not accept legacy arguments: " + ", ".join(names))
+        if type(inplace) is not bool:
+            raise TypeError("native quantize requires explicit inplace")
+        if output_dir is None or not isinstance(run_id, str) or not run_id:
+            raise ValueError("native quantize requires output_dir and a nonempty run_id")
+        target = Path(output_dir)
+        if target.exists() or target.is_symlink():
+            raise FileExistsError(target)
+        prepared = prepare(model_or_id, config, inplace=inplace, native_options=native_options)
+        calibration = calibrate(prepared, data, objective=objective, owner_recipe=owner_recipe)
+        return convert(prepared, calibration, output_dir=output_dir, run_id=run_id)
+    if (inplace is not None or data is not None or objective is not None
+            or owner_recipe is not None or run_id is not None):
+        raise TypeError("owner quantize arguments require explicit native_options")
+    required = dict(legacy, output_dir=output_dir)
+    missing = sorted(name for name, value in required.items() if value is None)
+    if missing:
+        raise TypeError("Qwen quantize missing required arguments: " + ", ".join(missing))
     prepared = prepare(model_or_id, config, inplace=False)
     calibration = calibrate(
         prepared,

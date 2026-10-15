@@ -1,5 +1,9 @@
 //! Thin abi3 receiver over the shared file source, engine and publication modules.
-use pyo3::{exceptions::PyValueError, prelude::*, types::PyBytes};
+use pyo3::{
+    exceptions::{PyFileExistsError, PyValueError},
+    prelude::*,
+    types::PyBytes,
+};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -12,7 +16,7 @@ use tritium_evidence::{
     QUANTIZATION_COMPLETED_REGISTRATION, QUANTIZATION_STARTED_REGISTRATION, verify_jsonl,
 };
 use tritium_quantize::engine::{
-    DirectoryTensorSink, Engine, FileWeightSource, TritOwnerCalibrationSource,
+    DirectoryTensorSink, Engine, FileWeightSource, QuantEngineError, TritOwnerCalibrationSource,
     file_calibration_source, read_original_file_bounded, verify_package_with_fit_log,
 };
 use tritium_schema::{
@@ -172,8 +176,16 @@ impl NativeModelConversion {
         self.verified_bytes_bounded(self.max_package_bytes)
     }
     fn verified_bytes_bounded(&self, maximum: u64) -> PyResult<Vec<u8>> {
-        if maximum == 0 {
-            return Err(error("max_package_bytes must be positive"));
+        self.verified_contents_bounded(maximum, self.evidence_bytes)
+            .map(|(bytes, _)| bytes)
+    }
+    fn verified_contents_bounded(
+        &self,
+        maximum: u64,
+        evidence_maximum: u64,
+    ) -> PyResult<(Vec<u8>, Vec<u8>)> {
+        if maximum == 0 || evidence_maximum == 0 {
+            return Err(error("package and evidence byte limits must be positive"));
         }
         let root = Path::new(&self.output_dir);
         let bytes = read_original_file_bounded(
@@ -181,8 +193,11 @@ impl NativeModelConversion {
             self.max_package_bytes.min(maximum),
         )
         .map_err(error)?;
-        let text = read_original_file_bounded(&root.join("evidence.jsonl"), self.evidence_bytes)
-            .map_err(error)?;
+        let text = read_original_file_bounded(
+            &root.join("evidence.jsonl"),
+            self.evidence_bytes.min(evidence_maximum),
+        )
+        .map_err(error)?;
         let log = verify_jsonl(std::str::from_utf8(&text).map_err(error)?).map_err(error)?;
         verify_package_with_fit_log(&bytes, &log).map_err(error)?;
         let model = tritium_format::trit_model::read_trit_model(&bytes).map_err(error)?;
@@ -191,7 +206,7 @@ impl NativeModelConversion {
         {
             return Err(error("conversion package or evidence identity changed"));
         }
-        Ok(bytes)
+        Ok((bytes, text))
     }
 }
 #[pymethods]
@@ -207,11 +222,70 @@ impl NativeModelConversion {
         Self::open_inner(py, output_dir, max_package_bytes, max_evidence_bytes)
     }
     /// Reopen exact files and verify package/log binding against this result.
-    fn verify(&self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| self.verified_bytes().map(|_| ()))
+    #[pyo3(signature=(*, max_package_bytes=None, max_evidence_bytes=None))]
+    fn verify(
+        &self,
+        py: Python<'_>,
+        max_package_bytes: Option<u64>,
+        max_evidence_bytes: Option<u64>,
+    ) -> PyResult<()> {
+        py.detach(|| {
+            self.verified_contents_bounded(
+                max_package_bytes.unwrap_or(self.max_package_bytes),
+                max_evidence_bytes.unwrap_or(self.evidence_bytes),
+            )
+            .map(|_| ())
+        })
+    }
+    /// Export the verified original files without refitting or changing identities.
+    /// Whole-package buffering is bounded, not a full-process RSS guarantee.
+    #[pyo3(signature=(output_dir, *, max_package_bytes=None, max_evidence_bytes=None))]
+    fn export(
+        &self,
+        py: Python<'_>,
+        output_dir: String,
+        max_package_bytes: Option<u64>,
+        max_evidence_bytes: Option<u64>,
+    ) -> PyResult<Self> {
+        if output_dir.is_empty() {
+            return Err(error("output_dir must not be empty"));
+        }
+        let output_dir = std::env::current_dir()
+            .map_err(error)?
+            .join(output_dir)
+            .into_os_string()
+            .into_string()
+            .map_err(|_| error("output path is not UTF-8"))?;
+        let maximum = max_package_bytes
+            .unwrap_or(self.max_package_bytes)
+            .min(self.max_package_bytes);
+        py.detach(|| {
+            let (bytes, text) = self.verified_contents_bounded(
+                maximum,
+                max_evidence_bytes.unwrap_or(self.evidence_bytes),
+            )?;
+            let warnings = DirectoryTensorSink::new(&output_dir)
+                .publish_verified_model(&bytes, std::str::from_utf8(&text).map_err(error)?)
+                .map_err(|failure| match failure {
+                    QuantEngineError::DestinationExists => {
+                        PyFileExistsError::new_err("output directory already exists")
+                    }
+                    other => error(other),
+                })?;
+            let mut result = self.clone();
+            result.output_dir = output_dir;
+            result.max_package_bytes = maximum;
+            result.publication_warnings.extend(
+                warnings
+                    .into_iter()
+                    .map(|warning| format!("Export: {warning:?}")),
+            );
+            Ok(result)
+        })
     }
     #[pyo3(signature=(level, load_run_id, *, max_payload_bytes=2_147_483_648,
-        max_workspace_bytes=67_108_864, max_output_bytes=67_108_864, max_package_bytes=None))]
+        max_workspace_bytes=67_108_864, max_output_bytes=67_108_864, max_package_bytes=None,
+        max_evidence_bytes=None))]
     #[expect(
         clippy::too_many_arguments,
         reason = "PyO3 exposes independent caller byte ceilings as explicit keyword arguments"
@@ -225,10 +299,15 @@ impl NativeModelConversion {
         max_workspace_bytes: u64,
         max_output_bytes: usize,
         max_package_bytes: Option<u64>,
+        max_evidence_bytes: Option<u64>,
     ) -> PyResult<crate::model_level::NativeModelLevel> {
         py.detach(|| {
             crate::model_level::open(
-                self.verified_bytes_bounded(max_package_bytes.unwrap_or(self.max_package_bytes))?,
+                self.verified_contents_bounded(
+                    max_package_bytes.unwrap_or(self.max_package_bytes),
+                    max_evidence_bytes.unwrap_or(self.evidence_bytes),
+                )?
+                .0,
                 level,
                 load_run_id,
                 max_payload_bytes,

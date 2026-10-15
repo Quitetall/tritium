@@ -106,10 +106,33 @@ impl DirectoryTensorSink {
         evidence: &SealedEvidence,
         emit: impl FnOnce(&mut File) -> Result<R, QuantEngineError>,
     ) -> Result<(R, Vec<PublicationWarning>), QuantEngineError> {
-        self.publish_with_emitter(evidence, false, emit)
+        self.publish_with_emitter(evidence.jsonl(), false, emit)
             .map_err(|error| match error {
                 WriteFailure::Emitter(error) | WriteFailure::Publication(error) => error,
             })
+    }
+
+    /// Republish exact existing package/log bytes after their complete shared check.
+    /// This preserves the original run and identities; it does not create a new
+    /// recorder seal, refit, qualification verdict or distribution authorization.
+    /// Caller owns immutable input buffers and their physical byte admission.
+    /// Existing sync, no-clobber commit, cleanup and warning semantics apply.
+    /// # Errors
+    /// Invalid or mismatched package/log, existing destination or pre-commit I/O.
+    pub fn publish_verified_model(
+        &mut self,
+        package: &[u8],
+        original_jsonl: &str,
+    ) -> Result<Vec<PublicationWarning>, QuantEngineError> {
+        let log = tritium_evidence::verify_jsonl(original_jsonl)?;
+        super::verify_package_with_fit_log(package, &log)?;
+        self.publish_with_emitter(original_jsonl, false, |file| {
+            file.write_all(package).map_err(QuantEngineError::Io)
+        })
+        .map(|(_, warnings)| warnings)
+        .map_err(|error| match error {
+            WriteFailure::Emitter(error) | WriteFailure::Publication(error) => error,
+        })
     }
 
     /// Validate bounded spool output before the existing sync/no-clobber commit.
@@ -137,7 +160,7 @@ impl DirectoryTensorSink {
         source_guard: impl FnOnce() -> Result<(), E>,
     ) -> Result<(TritModelReader<File>, Vec<PublicationWarning>), TritModelPublicationError<E>>
     {
-        self.publish_with_emitter(evidence, true, |file| {
+        self.publish_with_emitter(evidence.jsonl(), true, |file| {
             let destination = file.try_clone().map_err(TritModelStageError::Destination)?;
             stage_trit_model_from_spool(manifest, blobs, spool, limits, destination, source_guard)
         })
@@ -149,7 +172,7 @@ impl DirectoryTensorSink {
 
     fn publish_with_emitter<R, E>(
         &mut self,
-        evidence: &SealedEvidence,
+        original_jsonl: &str,
         readable: bool,
         emit: impl FnOnce(&mut File) -> Result<R, E>,
     ) -> Result<(R, Vec<PublicationWarning>), WriteFailure<E>> {
@@ -168,7 +191,7 @@ impl DirectoryTensorSink {
         let result = (|| {
             let mut file = OpenOptions::new().write(true).create_new(true).open(&log)?;
             owned_log = true;
-            file.write_all(evidence.jsonl().as_bytes())?;
+            file.write_all(original_jsonl.as_bytes())?;
             file.sync_all()?;
             let mut file = OpenOptions::new()
                 .read(readable)
