@@ -1,5 +1,6 @@
 //! Typed direct levels over the real numerical fitters, without prefix slicing.
 
+use super::direct_metric::DirectMetric;
 use super::{ActivationAwareConfig, ScaleRefitMode, fit_tensor_with_scale_refit_mode};
 use crate::{DensePsdMetric, JointFitConfig, JointFitError, JointFitMetric, RelayBasins};
 use half::f16;
@@ -117,7 +118,7 @@ trait LevelFitter {
         &self,
         layout: AdditiveLayout,
         source: &[f32],
-        gram: Option<&[f64]>,
+        gram: Option<&DirectMetric<'_>>,
     ) -> Result<AdditiveTensor, DirectFitError>;
 }
 struct ClosedFormFitter(LadderFitOptions);
@@ -126,14 +127,15 @@ impl LevelFitter for ClosedFormFitter {
         &self,
         layout: AdditiveLayout,
         source: &[f32],
-        gram: Option<&[f64]>,
+        gram: Option<&DirectMetric<'_>>,
     ) -> Result<AdditiveTensor, DirectFitError> {
         fit_ladder(
             layout,
             source,
             layout.rows as usize,
             layout.cols as usize,
-            gram.expect("ladder metric built"),
+            gram.and_then(DirectMetric::as_dense)
+                .expect("ladder metric built"),
             self.0,
         )
     }
@@ -147,13 +149,14 @@ impl LevelFitter for JointFitter {
         &self,
         layout: AdditiveLayout,
         source: &[f32],
-        gram: Option<&[f64]>,
+        gram: Option<&DirectMetric<'_>>,
     ) -> Result<AdditiveTensor, DirectFitError> {
         if let Some(options) = self.feedback {
             super::joint_feedback::fit(
                 layout,
                 source,
-                gram.expect("feedback metric built"),
+                gram.and_then(DirectMetric::as_dense)
+                    .expect("feedback metric built"),
                 options,
             )
         } else {
@@ -190,7 +193,11 @@ pub fn fit_direct_levels(
     weights: &[f32],
     gram: Option<&[f64]>,
 ) -> Result<Vec<DirectTensorFit>, DirectFitError> {
-    fit_direct_levels_metric(plan, weights, gram.map(Cow::Borrowed))
+    fit_direct_levels_metric(
+        plan,
+        weights,
+        gram.map(|values| DirectMetric::Dense(Cow::Borrowed(values))),
+    )
 }
 
 // The same numerical controller accepts borrowed reusable or owned one-shot
@@ -198,9 +205,9 @@ pub fn fit_direct_levels(
 pub(super) fn fit_direct_levels_metric(
     plan: &DirectFitPlan,
     weights: &[f32],
-    gram: Option<Cow<'_, [f64]>>,
+    gram: Option<DirectMetric<'_>>,
 ) -> Result<Vec<DirectTensorFit>, DirectFitError> {
-    let (_, cols, count) = admit(plan, weights, gram.as_deref())?;
+    let (_, cols, count) = admit(plan, weights, gram.as_ref())?;
     let mut source = Cow::Borrowed(weights);
     if plan.layout.basis != Basis::Identity {
         let mut owned = reserved_vec(count)?;
@@ -225,11 +232,21 @@ pub(super) fn fit_direct_levels_metric(
             for col in 0..cols {
                 identity[col * cols + col] = 1.0;
             }
-            Some(Cow::Owned(identity))
+            Some(DirectMetric::Dense(Cow::Owned(identity)))
         }
         _ => None,
     };
-    let mut metric = metric;
+    // Only the independent profile in Identity basis can consume structured
+    // entries directly. Other profiles keep their existing exact dense path.
+    let needs_dense = plan.layout.basis != Basis::Identity
+        || !matches!(plan.profile, DirectFitProfile::JointIndependentGroups(_));
+    let mut metric = if needs_dense {
+        metric
+            .map(|values| values.into_dense(cols).map(DirectMetric::Dense))
+            .transpose()?
+    } else {
+        metric
+    };
     if let Some(values) = &mut metric {
         match plan.layout.basis {
             Basis::Hadamard { block } => {
@@ -242,7 +259,7 @@ pub(super) fn fit_direct_levels_metric(
             _ => {}
         }
     }
-    if let Some(values) = &metric
+    if let Some(values) = metric.as_ref().and_then(DirectMetric::as_dense)
         && let Some(index) = values.iter().position(|value| !value.is_finite())
     {
         return Err(DirectFitError::NonFiniteBasisMetric { index });
@@ -277,7 +294,7 @@ pub(super) fn fit_direct_levels_metric(
             max_planes: level.planes,
             ..plan.layout
         };
-        let tensor = fitter.fit(layout, &source, metric.as_deref())?;
+        let tensor = fitter.fit(layout, &source, metric.as_ref())?;
         output.push(DirectTensorFit {
             level: level.name.clone(),
             tensor,
@@ -286,7 +303,12 @@ pub(super) fn fit_direct_levels_metric(
     Ok(output)
 }
 
-fn metric_storage<'a>(metric: &'a mut Cow<'_, [f64]>) -> Result<&'a mut [f64], DirectFitError> {
+fn metric_storage<'a>(metric: &'a mut DirectMetric<'_>) -> Result<&'a mut [f64], DirectFitError> {
+    let DirectMetric::Dense(metric) = metric else {
+        return Err(DirectFitError::Unsupported(
+            "basis requires materialized metric",
+        ));
+    };
     if let Cow::Borrowed(values) = metric {
         let mut owned = reserved_vec(values.len())?;
         owned.extend_from_slice(values);
@@ -298,13 +320,16 @@ fn metric_storage<'a>(metric: &'a mut Cow<'_, [f64]>) -> Result<&'a mut [f64], D
 fn admit(
     plan: &DirectFitPlan,
     weights: &[f32],
-    gram: Option<&[f64]>,
+    gram: Option<&DirectMetric<'_>>,
 ) -> Result<(usize, usize, usize), DirectFitError> {
     let (rows, cols, count) = admit_plan(plan, gram.is_some())?;
     let metric_count = cols
         .checked_mul(cols)
         .ok_or(DirectFitError::ShapeOverflow)?;
-    admit_payload(weights, gram, cols, count, metric_count)?;
+    admit_payload(weights, None, cols, count, metric_count)?;
+    if let Some(metric) = gram {
+        metric.validate(cols)?;
+    }
     Ok((rows, cols, count))
 }
 
@@ -474,30 +499,8 @@ pub(super) fn admit_payload(
         return Err(DirectFitError::NonFiniteWeight { index });
     }
     if let Some(values) = gram {
-        if values.len() != metric_count {
-            return Err(DirectFitError::GramLength {
-                expected: metric_count,
-                actual: values.len(),
-            });
-        }
-        if let Some(index) = values.iter().enumerate().position(|(index, value)| {
-            !value.is_finite() || (index / cols == index % cols && *value < 0.0)
-        }) {
-            return Err(DirectFitError::InvalidGram { index });
-        }
-        let scale = values
-            .iter()
-            .fold(0.0f64, |m, value| m.max(value.abs()))
-            .max(f64::MIN_POSITIVE);
-        for row in 0..cols {
-            for col in row + 1..cols {
-                if (values[row * cols + col] / scale - values[col * cols + row] / scale).abs()
-                    > 1e-10
-                {
-                    return Err(DirectFitError::AsymmetricGram);
-                }
-            }
-        }
+        debug_assert_eq!(metric_count, cols * cols);
+        DirectMetric::Dense(Cow::Borrowed(values)).validate(cols)?;
     }
     Ok(())
 }
@@ -571,7 +574,7 @@ fn fit_joint(
     source: &[f32],
     rows: usize,
     cols: usize,
-    gram: Option<&[f64]>,
+    gram: Option<&DirectMetric<'_>>,
     options: JointGroupFitOptions,
 ) -> Result<AdditiveTensor, DirectFitError> {
     let group = usize::from(layout.group);
@@ -582,10 +585,7 @@ fn fit_joint(
         let end = (start + group).min(cols);
         let width = end - start;
         let metric = if let Some(values) = gram {
-            let mut local = reserved_vec(width * width)?;
-            for row in start..end {
-                local.extend_from_slice(&values[row * cols + start..row * cols + end]);
-            }
+            let local = values.block(cols, start, end)?;
             Some(DensePsdMetric::new(width, &local).map_err(DirectFitError::Joint)?)
         } else {
             None

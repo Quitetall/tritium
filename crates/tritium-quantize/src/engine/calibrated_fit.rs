@@ -2,6 +2,7 @@
 //! Runtime context checks are not audited raw-source or model/package provenance.
 
 use super::direct::{admit_payload, admit_plan, reserved_vec};
+use super::direct_metric::{DirectMetric, MetricBlock};
 use super::{CalibratedTensor, CalibrationError, DirectFitError, DirectTensorFit};
 use std::borrow::Cow;
 use tritium_core::Trit;
@@ -47,8 +48,9 @@ impl From<CalibrationError> for CalibratedFitError {
 /// Input-only factors are never described as Fisher. Basis rotation, numerical
 /// fitting and stored scale rounding stay in the unchanged direct controller.
 ///
-/// Only one assembled row metric is live; scalar source, calibration factors,
-/// outputs, row controller copies and solver state still consume memory. Existing
+/// Independent Identity-basis fitting retains explicit groups as blocks instead
+/// of assembling a full row matrix. Coupled profiles/basis transforms retain
+/// dense arithmetic; factors, sources, outputs and solver state still use memory. Existing
 /// logical element limits are not aggregate RSS or GPU/out-of-core admission.
 /// Expected context equality does not independently prove that caller f32 values
 /// are the raw model identified by `model`. The complete engine must enforce this
@@ -70,45 +72,51 @@ pub fn fit_calibrated_levels(
     {
         return Err(CalibratedFitError::Binding);
     }
-    fit_row_metrics(
-        plan,
-        weights,
-        CalibrationRows {
-            calibration,
-            metric: Vec::new(),
-        },
-    )
+    fit_row_metrics(plan, weights, CalibrationRows { calibration })
 }
 
 pub(super) trait RowMetricSource {
     type Error: From<DirectFitError>;
-    fn metric(&mut self, row: usize, cols: usize) -> Result<Cow<'_, [f64]>, Self::Error>;
+    fn metric(&mut self, row: usize, cols: usize) -> Result<DirectMetric<'_>, Self::Error>;
 }
 
 struct CalibrationRows<'a> {
     calibration: &'a CalibratedTensor,
-    metric: Vec<f64>,
 }
 impl RowMetricSource for CalibrationRows<'_> {
     type Error = CalibratedFitError;
-    fn metric(&mut self, row: usize, cols: usize) -> Result<Cow<'_, [f64]>, Self::Error> {
+    fn metric(&mut self, row: usize, cols: usize) -> Result<DirectMetric<'_>, Self::Error> {
         let calibration = self.calibration;
         if calibration.inputs().len() == 1 && calibration.inputs()[0].dimension() == cols {
             return if calibration.output().is_some() {
-                Ok(Cow::Owned(calibration.kfac_metric(0, row)?.into_values()))
+                Ok(DirectMetric::Dense(Cow::Owned(
+                    calibration.kfac_metric(0, row)?.into_values(),
+                )))
             } else {
-                Ok(Cow::Borrowed(calibration.inputs()[0].as_slice()))
+                Ok(DirectMetric::Dense(Cow::Borrowed(
+                    calibration.inputs()[0].as_slice(),
+                )))
             };
         }
-        if self.metric.is_empty() {
-            self.metric = reserved_vec(cols * cols)?;
-            self.metric.resize(cols * cols, 0.0);
+        let mut blocks = reserved_vec(calibration.inputs().len())?;
+        let mut total = 0_usize;
+        for (group, input) in calibration.inputs().iter().enumerate() {
+            total = total
+                .checked_add(input.dimension())
+                .ok_or(DirectFitError::ShapeOverflow)?;
+            blocks.push(MetricBlock {
+                width: input.dimension(),
+                values: if calibration.output().is_some() {
+                    Cow::Owned(calibration.kfac_metric(group, row)?.into_values())
+                } else {
+                    Cow::Borrowed(input.as_slice())
+                },
+            });
         }
-        if row == 0 || calibration.output().is_some() {
-            self.metric.fill(0.0);
-            assemble_metric(calibration, row, cols, &mut self.metric)?;
+        if total != cols {
+            return Err(CalibratedFitError::Binding);
         }
-        Ok(Cow::Borrowed(&self.metric))
+        Ok(DirectMetric::BlockDiagonal(blocks))
     }
 }
 
@@ -162,38 +170,6 @@ pub(super) fn fit_row_metrics<S: RowMetricSource>(
         });
     }
     Ok(output)
-}
-
-fn assemble_metric(
-    calibration: &CalibratedTensor,
-    row: usize,
-    cols: usize,
-    destination: &mut [f64],
-) -> Result<(), CalibratedFitError> {
-    let mut start = 0;
-    for (group, input) in calibration.inputs().iter().enumerate() {
-        let width = input.dimension();
-        let kfac;
-        let values = if calibration.output().is_some() {
-            kfac = calibration.kfac_metric(group, row)?;
-            kfac.metric().as_slice()
-        } else {
-            input.as_slice()
-        };
-        let end = start + width;
-        if end > cols {
-            return Err(CalibratedFitError::Binding);
-        }
-        for local in 0..width {
-            destination[(start + local) * cols + start..(start + local) * cols + end]
-                .copy_from_slice(&values[local * width..(local + 1) * width]);
-        }
-        start = end;
-    }
-    if start != cols {
-        return Err(CalibratedFitError::Binding);
-    }
-    Ok(())
 }
 
 struct PendingLevel {

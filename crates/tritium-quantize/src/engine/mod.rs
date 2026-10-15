@@ -11,6 +11,7 @@ mod calibration;
 mod calibration_cache;
 mod calibration_sources;
 mod direct;
+mod direct_metric;
 mod file_source;
 mod joint_feedback;
 mod ladder;

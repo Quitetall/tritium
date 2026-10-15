@@ -1,5 +1,6 @@
 //! Actual durable windows -> f64 row Gram -> unchanged common direct fitter.
 use super::calibrated_fit::{RowMetricSource, fit_row_metrics};
+use super::direct_metric::DirectMetric;
 use super::{DirectFitError, DirectTensorFit, OwnerScoreCache, OwnerScoreCacheError};
 use crate::{CurvatureError, InputGramAccumulator};
 use std::borrow::Cow;
@@ -234,10 +235,10 @@ impl<F: FnMut(usize, &OwnerRowMetric) -> Result<(), OwnerScoreMetricError>> RowM
     for OwnerRows<'_, '_, F>
 {
     type Error = OwnerScoreMetricError;
-    fn metric(&mut self, row: usize, _: usize) -> Result<Cow<'_, [f64]>, Self::Error> {
+    fn metric(&mut self, row: usize, _: usize) -> Result<DirectMetric<'_>, Self::Error> {
         let metric = self.metrics.row_metric(row)?;
         (self.observe)(row, &metric)?;
-        Ok(Cow::Owned(metric.into_values()))
+        Ok(DirectMetric::Dense(Cow::Owned(metric.into_values())))
     }
 }
 

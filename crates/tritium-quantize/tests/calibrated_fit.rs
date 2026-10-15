@@ -1,4 +1,6 @@
 //! Numerical consumers use actual cache/reducer/fitter interfaces, not copied solver math.
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tritium_core::reference_ternary_matmul;
 use tritium_evidence::original_source_id;
 use tritium_format::AdditiveTensor;
@@ -9,6 +11,42 @@ use tritium_quantize::engine::{
     fit_calibrated_levels, fit_direct_levels,
 };
 use tritium_schema::*;
+
+const LARGE_COLS: usize = 512;
+const FULL_MATRIX_BYTES: usize = LARGE_COLS * LARGE_COLS * 8;
+static COUNT_MATRICES: AtomicBool = AtomicBool::new(false);
+static MATRIX_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+struct CountingAllocator;
+fn record_allocation(bytes: usize) {
+    if bytes == FULL_MATRIX_BYTES && COUNT_MATRICES.load(Ordering::Relaxed) {
+        MATRIX_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+// SAFETY: all allocation requests are forwarded unchanged to System.
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: caller supplies a valid allocation layout.
+        let output = unsafe { System.alloc(layout) };
+        if !output.is_null() {
+            record_allocation(layout.size());
+        }
+        output
+    }
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        // SAFETY: caller supplies the original pointer and layout.
+        unsafe { System.dealloc(pointer, layout) }
+    }
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        // SAFETY: caller supplies the original allocation and valid requested size.
+        let output = unsafe { System.realloc(pointer, layout, size) };
+        if !output.is_null() {
+            record_allocation(size);
+        }
+        output
+    }
+}
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 fn source(cols: usize) -> (QuantSourceTensor, Vec<f32>, OriginalSourceId) {
     let tensor = QuantSourceTensor {
@@ -39,6 +77,7 @@ fn source(cols: usize) -> (QuantSourceTensor, Vec<f32>, OriginalSourceId) {
 #[derive(Clone, Copy)]
 enum InputFixture {
     Correlated,
+    PositiveCorrelated,
     Diagonal,
     ZeroFisher,
 }
@@ -52,13 +91,24 @@ fn factors(
     fixture: InputFixture,
 ) -> CalibratedTensor {
     let diagonal = matches!(fixture, InputFixture::Diagonal);
+    let positive_correlated = matches!(fixture, InputFixture::PositiveCorrelated);
     let zero_fisher = matches!(fixture, InputFixture::ZeroFisher);
     let cols = tensor.shape[1] as usize;
-    let samples = if diagonal { cols } else { 8 };
+    let samples = if diagonal || positive_correlated {
+        cols
+    } else {
+        8
+    };
     let input: Vec<f32> = (0..samples * cols)
         .map(|i| {
             if diagonal {
                 f32::from(i / cols == i % cols)
+            } else if positive_correlated {
+                if i / cols == i % cols {
+                    2.
+                } else {
+                    (((i / cols + 1) * (i % cols + 3) % 17) as f32 - 8.) / 1000.
+                }
             } else {
                 (((i / cols + 1) * (i % cols + 3) % 17) as f32 - 8.) / 7.
             }
@@ -89,8 +139,8 @@ fn factors(
             output,
             sample_start: 5,
             limits: CalibrationCacheLimits {
-                max_payload_bytes: 1_000_000,
-                max_samples: 128,
+                max_payload_bytes: 1_000_000.max((samples * cols * 8) as u64),
+                max_samples: 128.max(samples as u64),
                 max_windows: 4,
             },
         },
@@ -124,7 +174,11 @@ fn factors(
     builder
         .finish()
         .unwrap()
-        .collect(partition, damping, 16_000_000)
+        .collect(
+            partition,
+            damping,
+            16_000_000.max((cols * cols * 128) as u64),
+        )
         .unwrap()
 }
 
@@ -385,6 +439,170 @@ fn full_and_explicit_grouped_ragged_inputs_agree_for_actual_diagonal_statistics(
             fit_calibrated_levels(&request, &original, model, &weights, &full).unwrap(),
             fit_calibrated_levels(&request, &original, model, &weights, &groups).unwrap()
         );
+    }
+}
+
+#[test]
+fn grouped_metrics_match_explicit_dense_fits_across_profiles_bases_and_ragged_groups() {
+    for (cols, basis) in [
+        (35, Basis::Identity),
+        (64, Basis::Hadamard { block: 64 }),
+        (
+            64,
+            Basis::SignedRht {
+                block: 16,
+                seed: 42,
+                domain: 9,
+            },
+        ),
+    ] {
+        let (original, weights, model) = source(cols);
+        for columns in [13, 32] {
+            for output in [
+                CalibrationOutput::None,
+                CalibrationOutput::DenseFisher,
+                CalibrationOutput::IndexedFisher,
+            ] {
+                let calibration = factors(
+                    &original,
+                    model,
+                    CalibrationPartition::Groups { columns },
+                    CalibrationConsumer::Matmul,
+                    output,
+                    if output == CalibrationOutput::None {
+                        0.
+                    } else {
+                        0.125
+                    },
+                    InputFixture::PositiveCorrelated,
+                );
+                let factors_before = calibration.factors().clone();
+                // Assemble the original dense representation from actual public
+                // factor values. No reduction, basis or fitting math is copied.
+                let mut dense_rows = Vec::new();
+                for row in 0..2 {
+                    let mut dense = vec![0.; cols * cols];
+                    let mut offset = 0;
+                    for (group, input) in calibration.inputs().iter().enumerate() {
+                        let kfac;
+                        let values = if output == CalibrationOutput::None {
+                            input.as_slice()
+                        } else {
+                            kfac = calibration.kfac_metric(group, row).unwrap();
+                            kfac.metric().as_slice()
+                        };
+                        let width = input.dimension();
+                        for local in 0..width {
+                            dense[(offset + local) * cols + offset
+                                ..(offset + local) * cols + offset + width]
+                                .copy_from_slice(&values[local * width..(local + 1) * width]);
+                        }
+                        offset += width;
+                    }
+                    dense_rows.push(dense);
+                }
+                for (profile, precision) in profiles() {
+                    for codec in [PlaneCodec::B3, PlaneCodec::D2] {
+                        let mut request = plan(cols, basis, profile, precision);
+                        request.layout.codec = codec;
+                        let actual = fit_calibrated_levels(
+                            &request,
+                            &original,
+                            model,
+                            &weights,
+                            &calibration,
+                        )
+                        .unwrap();
+                        let mut row_plan = request.clone();
+                        row_plan.layout.rows = 1;
+                        for (row, dense) in dense_rows.iter().enumerate() {
+                            let expected = fit_direct_levels(
+                                &row_plan,
+                                &weights[row * cols..(row + 1) * cols],
+                                Some(dense),
+                            )
+                            .unwrap();
+                            for (whole, single) in actual.iter().zip(expected) {
+                                assert_eq!(whole.level, single.level);
+                                for plane in 0..single.tensor.plane_count() as usize {
+                                    assert_eq!(
+                                        &whole.tensor.trits()[plane * 2 * cols + row * cols
+                                            ..plane * 2 * cols + (row + 1) * cols],
+                                        &single.tensor.trits()[plane * cols..(plane + 1) * cols],
+                                    );
+                                }
+                                let units = cols.div_ceil(32);
+                                for plane in 0..single.tensor.scales().len() / units {
+                                    assert_eq!(
+                                        whole.tensor.scales()[plane * 2 * units + row * units
+                                            ..plane * 2 * units + (row + 1) * units]
+                                            .iter()
+                                            .map(|v| v.to_bits())
+                                            .collect::<Vec<_>>(),
+                                        single.tensor.scales()[plane * units..(plane + 1) * units]
+                                            .iter()
+                                            .map(|v| v.to_bits())
+                                            .collect::<Vec<_>>(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                assert_eq!(calibration.factors(), &factors_before);
+            }
+        }
+    }
+}
+
+#[test]
+fn grouped_independent_fit_does_not_allocate_a_full_input_matrix() {
+    let (original, weights, model) = source(LARGE_COLS);
+    let mut request = plan(
+        LARGE_COLS,
+        Basis::Identity,
+        DirectFitProfile::JointIndependentGroups(JointGroupFitOptions {
+            max_iterations: 2,
+            em_restarts: 1,
+            ..joint()
+        }),
+        ScalePrecision::F32,
+    );
+    request.layout.max_planes = 1;
+    request.levels = vec![DirectFitLevel {
+        name: "one".into(),
+        planes: 1,
+    }];
+    // This is the only 512-column fixture in this integration-test binary.
+    // Count exact full-matrix requests, not total allocator bytes or RSS.
+    for columns in [13, 32] {
+        for output in [CalibrationOutput::None, CalibrationOutput::DenseFisher] {
+            let calibration = factors(
+                &original,
+                model,
+                CalibrationPartition::Groups { columns },
+                CalibrationConsumer::Matmul,
+                output,
+                if output == CalibrationOutput::None {
+                    0.
+                } else {
+                    0.125
+                },
+                InputFixture::Diagonal,
+            );
+            let expected =
+                fit_calibrated_levels(&request, &original, model, &weights, &calibration).unwrap();
+            MATRIX_REQUESTS.store(0, Ordering::Relaxed);
+            COUNT_MATRICES.store(true, Ordering::SeqCst);
+            let actual = fit_calibrated_levels(&request, &original, model, &weights, &calibration);
+            COUNT_MATRICES.store(false, Ordering::SeqCst);
+            assert_eq!(actual.unwrap(), expected);
+            let requests = MATRIX_REQUESTS.load(Ordering::Relaxed);
+            eprintln!(
+                "matrix_bytes={FULL_MATRIX_BYTES} calibration_group={columns} output={output:?} full_matrix_requests={requests}"
+            );
+            assert_eq!(requests, 0, "grouped metrics must remain structured");
+        }
     }
 }
 
