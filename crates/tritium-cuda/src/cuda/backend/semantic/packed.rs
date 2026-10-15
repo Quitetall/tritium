@@ -33,12 +33,15 @@ fn narrow(n: usize) -> Result<u32, BackendError> {
 
 impl Plan {
     fn b3_groups_eligible(&self) -> bool {
-        // Two paired physical diagnostics support only these M=1 families.
-        // The one-plane 17408x5120 improvement was small/noisy, so keep its
-        // existing rows32 path. Do not extrapolate to other shapes or laws.
+        // Repeated paired physical diagnostics support only these M=1 families.
+        // The one-plane 17408x5120 and 1024x5120 cases keep their existing
+        // rows32/ordered-warp paths: observed ranges did not support selection.
+        // No extrapolation to other geometry, laws or prefill batches.
         matches!(
             (self.header[0], self.header[1], self.header[2]),
-            (5120, 5120 | 17408, 1 | 3) | (17408, 5120, 3)
+            (5120, 5120 | 6144 | 17408, 1 | 3)
+                | (48 | 6144 | 10240 | 12288, 5120, 1 | 3)
+                | (1024 | 17408, 5120, 3)
         ) && self.header[3] == 128
             && self.header[4] == 1
             && self.header[5] == 2

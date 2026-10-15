@@ -61,6 +61,17 @@ fn b3_groups_metadata_selection_keeps_unmeasured_families_unchanged() {
         (5120, 17408, 1),
         (5120, 17408, 3),
         (17408, 5120, 3),
+        (48, 5120, 1),
+        (48, 5120, 3),
+        (1024, 5120, 3),
+        (5120, 6144, 1),
+        (5120, 6144, 3),
+        (6144, 5120, 1),
+        (6144, 5120, 3),
+        (10240, 5120, 1),
+        (10240, 5120, 3),
+        (12288, 5120, 1),
+        (12288, 5120, 3),
     ] {
         let layout = AdditiveLayout {
             rows,
@@ -111,6 +122,13 @@ fn b3_groups_metadata_selection_keeps_unmeasured_families_unchanged() {
     let plan = Plan::from_metadata(AdditiveMetadata::uniform(layout, 1).unwrap()).unwrap();
     assert!(!plan.b3_groups_eligible());
     assert!(plan.b3_rows_eligible());
+    let layout = AdditiveLayout {
+        rows: 1024,
+        ..layout
+    };
+    let plan = Plan::from_metadata(AdditiveMetadata::uniform(layout, 1).unwrap()).unwrap();
+    assert!(!plan.b3_groups_eligible());
+    assert!(plan.ordered_warp_eligible());
 }
 
 #[test]
@@ -118,7 +136,17 @@ fn b3_groups_metadata_selection_keeps_unmeasured_families_unchanged() {
 fn physical_b3_groups_public_upload_and_stream_seams() {
     let backend = CudaBackend::new(0).expect("requires physical CUDA");
     let mut cases = 0;
-    for (rows, cols) in [(5120, 5120), (17408, 5120), (5120, 17408)] {
+    for (rows, cols) in [
+        (5120, 5120),
+        (17408, 5120),
+        (5120, 17408),
+        (48, 5120),
+        (1024, 5120),
+        (5120, 6144),
+        (6144, 5120),
+        (10240, 5120),
+        (12288, 5120),
+    ] {
         for planes in [1, 3] {
             let original = source(rows, cols, planes);
             for basis in [
@@ -139,7 +167,7 @@ fn physical_b3_groups_public_upload_and_stream_seams() {
                 )
                 .unwrap();
                 let plan = Plan::new(source.view()).unwrap();
-                let selected = !(rows == 17408 && planes == 1);
+                let selected = !(matches!(rows, 1024 | 17408) && cols == 5120 && planes == 1);
                 assert_eq!(plan.b3_groups_eligible(), selected);
                 let raw = source.encode_payload().unwrap();
                 let stream = Source {
@@ -213,7 +241,7 @@ fn physical_b3_groups_public_upload_and_stream_seams() {
             }
         }
     }
-    assert_eq!(cases, 48);
+    assert_eq!(cases, 144);
     eprintln!("B3_GROUP_PUBLIC_CASES={cases}");
 }
 
