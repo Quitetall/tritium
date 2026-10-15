@@ -27,6 +27,97 @@ use tritium_serve::{
 struct ErrGen;
 
 #[tokio::test]
+async fn source_chat_prompt_precedes_legacy_and_errors_never_dispatch() {
+    struct ObservedGenerator {
+        calls: Arc<AtomicUsize>,
+        inner: MockGenerator,
+    }
+    impl Generator for ObservedGenerator {
+        fn generate(
+            &mut self,
+            req: &GenRequest,
+            on_step: &mut dyn FnMut(Step) -> bool,
+        ) -> Result<(), GenError> {
+            assert_eq!(req.prompt_tokens, vec![42]);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.generate(req, on_step)
+        }
+        fn n_ctx(&self) -> usize {
+            self.inner.n_ctx()
+        }
+        fn vocab(&self) -> usize {
+            self.inner.vocab()
+        }
+    }
+    struct SourceTokenizer {
+        refuse: bool,
+        encoded: Arc<AtomicUsize>,
+    }
+    impl Tokenizer for SourceTokenizer {
+        fn render_chat_prompt(
+            &self,
+            messages: &[(&str, &str)],
+            max_output_bytes: usize,
+        ) -> Result<Option<String>, tritium_nn::NnError> {
+            assert_eq!(messages, &[("user", "Hi")]);
+            assert!(max_output_bytes > 0);
+            if self.refuse {
+                return Err(tritium_nn::NnError::Tokenizer("source refused".into()));
+            }
+            Ok(Some("42".into()))
+        }
+        fn encode(&self, text: &str) -> Result<Vec<u32>, tritium_nn::NnError> {
+            assert_eq!(
+                text, "42",
+                "legacy formatting must not replace a source prompt"
+            );
+            self.encoded.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![42])
+        }
+        fn decode(&self, _: &[u32]) -> Result<String, tritium_nn::NnError> {
+            Ok("ok".into())
+        }
+        fn bos(&self) -> u32 {
+            0
+        }
+        fn eos(&self) -> u32 {
+            0
+        }
+    }
+    for refuse in [false, true] {
+        let encoded = Arc::new(AtomicUsize::new(0));
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let mut cfg = ServeConfig::default();
+        cfg.chat_template = tritium_serve::ChatTemplate::QwenIm;
+        let (router, _) = build_router(
+            Box::new(ObservedGenerator {
+                calls: dispatched.clone(),
+                inner: MockGenerator::new(vec![10]),
+            }),
+            Arc::new(SourceTokenizer {
+                refuse,
+                encoded: encoded.clone(),
+            }),
+            cfg,
+        );
+        let (status, body) = send(&router, chat(json!({"model":"default","messages":[{"role":"user","content":"Hi"}],"max_tokens":1}))).await;
+        assert_eq!(
+            status,
+            if refuse {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::OK
+            }
+        );
+        assert_eq!(encoded.load(Ordering::SeqCst), usize::from(!refuse));
+        assert_eq!(dispatched.load(Ordering::SeqCst), usize::from(!refuse));
+        if refuse {
+            assert!(String::from_utf8(body).unwrap().contains("source refused"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn cancellation_capabilities_health_discloses_legacy_limits() {
     let (router, draining) = build_router(
         Box::new(ErrGen),

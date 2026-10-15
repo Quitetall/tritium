@@ -1,0 +1,166 @@
+{
+  "dependencies_including_build_time": [
+    {
+      "license": "Apache-2.0 OR MIT",
+      "license_text_sha256": [
+        "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+        "7365cc8878a1d7ce155a58c4ca09c3d7a6be413efa5334a80ea842912b669349"
+      ],
+      "name": "equivalent",
+      "version": "1.0.3"
+    },
+    {
+      "license": "Zlib",
+      "license_text_sha256": [
+        "b1181a40b2a7b25cf66fd01481713bc1005df082c53ef73e851e55071b102744"
+      ],
+      "name": "foldhash",
+      "version": "0.2.0"
+    },
+    {
+      "license": "MIT OR Apache-2.0",
+      "license_text_sha256": [
+        "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+        "ff8f68cb076caf8cefe7a6430d4ac086ce6af2ca8ce2c4e5a2004d4552ef52a2"
+      ],
+      "name": "hashbrown",
+      "version": "0.17.1"
+    },
+    {
+      "license": "Apache-2.0 OR MIT",
+      "license_text_sha256": [
+        "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+        "ecc269ef87fd38a1d98e30bfac9ba964a9dbd9315c3770fed98d4d7cb5882055"
+      ],
+      "name": "indexmap",
+      "version": "2.14.2"
+    },
+    {
+      "license": "MIT OR Apache-2.0",
+      "license_text_sha256": [
+        "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+        "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+      ],
+      "name": "itoa",
+      "version": "1.0.18"
+    },
+    {
+      "license": "Unlicense OR MIT",
+      "license_text_sha256": [
+        "01c266bced4a434da0051174d6bee16a4c82cf634e2679b6155d40d75012390f",
+        "0f96a83840e146e43c0ec96a22ec1f392e0680e6c1226e6f3ba87e0740af850f"
+      ],
+      "name": "memchr",
+      "version": "2.8.3"
+    },
+    {
+      "license": "Apache-2.0",
+      "license_text_sha256": [
+        "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+      ],
+      "name": "minijinja",
+      "version": "3.0.0"
+    },
+    {
+      "license": "Apache-2.0",
+      "license_text_sha256": [
+        "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+      ],
+      "name": "minijinja-contrib",
+      "version": "3.0.0"
+    },
+    {
+      "license": "MIT OR Apache-2.0",
+      "license_text_sha256": [
+        "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+        "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+      ],
+      "name": "proc-macro2",
+      "version": "1.0.107"
+    },
+    {
+      "license": "MIT OR Apache-2.0",
+      "license_text_sha256": [
+        "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+        "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+      ],
+      "name": "quote",
+      "version": "1.0.47"
+    },
+    {
+      "license": "MIT OR Apache-2.0",
+      "license_text_sha256": [
+        "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+        "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+      ],
+      "name": "serde",
+      "version": "1.0.229"
+    },
+    {
+      "license": "MIT OR Apache-2.0",
+      "license_text_sha256": [
+        "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+        "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+      ],
+      "name": "serde_core",
+      "version": "1.0.229"
+    },
+    {
+      "license": "MIT OR Apache-2.0",
+      "license_text_sha256": [
+        "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+        "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+      ],
+      "name": "serde_derive",
+      "version": "1.0.229"
+    },
+    {
+      "license": "MIT OR Apache-2.0",
+      "license_text_sha256": [
+        "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+        "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+      ],
+      "name": "serde_json",
+      "version": "1.0.154"
+    },
+    {
+      "license": "MIT OR Apache-2.0",
+      "license_text_sha256": [
+        "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+        "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+      ],
+      "name": "syn",
+      "version": "3.0.9"
+    },
+    {
+      "license": "(MIT OR Apache-2.0) AND Unicode-3.0",
+      "license_text_sha256": [
+        "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+        "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+        "f7db81051789b729fea528a63ec4c938fdcb93d9d61d97dc8cc2e9df6d47f2a1"
+      ],
+      "name": "unicode-ident",
+      "version": "1.0.27"
+    },
+    {
+      "license": "MIT",
+      "license_text_sha256": [
+        "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+      ],
+      "name": "zmij",
+      "version": "1.0.23"
+    }
+  ],
+  "inputs": {
+    "crates/tritium-nn/chat-renderer/Cargo.lock": "0a90512460999d2047a3c9632bd074bcea5b0043fb306129d7ca16da85bf552e",
+    "crates/tritium-nn/chat-renderer/Cargo.toml": "19f78c44630ac15b38508be2e00f52b65fd4083d3569d9234632bba171610ff7",
+    "crates/tritium-nn/chat-renderer/src/lib.rs": "4a3ff6feb1982b52909807db0949f2055574375c5166bde3fc5d5fac84055772",
+    "rust-toolchain.toml": "0e00698d6f43fdca3f9b2a25e8bad88418a9d61a403a94d2279958737db68d07",
+    "scripts/build-chat-renderer.sh": "d032ceb9d7cfc89d13eee2eafc4469124a9bf4fed7dfb4ddb6c96e590c3ec818",
+    "scripts/generate-chat-renderer-record.py": "4740759e081698a17ca2951699b89618f89cd06896ff41ffd9e36c2bfe6a22d6"
+  },
+  "qualified": false,
+  "schema": "tritium.fixed-chat-renderer-build.v1",
+  "target": "wasm32-unknown-unknown",
+  "wasm_sha256": "eedb1a9978515abc9868047bc41cebf912ba7904966861978c376c02bddf13b5"
+}

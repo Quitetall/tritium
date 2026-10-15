@@ -466,6 +466,11 @@ jobs:
         with:
           components: clippy
       - run: cargo clippy --locked -p tritium-serve --features serve --all-targets -- -D warnings
+      - name: Reproduce fixed source-chat renderer
+        run: |
+          cargo fmt --manifest-path crates/tritium-nn/chat-renderer/Cargo.toml --check
+          bash scripts/build-chat-renderer.sh --check
+          cargo test --locked -p tritium-nn --features tokenizer --lib chat_renderer
       - run: cargo test --locked -p tritium-serve --features serve
 
   # serve real-model e2e (v0.80). Manual — needs a GGUF + the e2e feature.

@@ -1679,11 +1679,23 @@ async fn chat_completions(
         );
     }
 
-    let prompt_text = st.chat_template.render(
-        req.messages
-            .iter()
-            .map(|m| (m.role.as_str(), m.content.as_str())),
-    );
+    let messages: Vec<_> = req
+        .messages
+        .iter()
+        .map(|m| (m.role.as_str(), m.content.as_str()))
+        .collect();
+    let prompt_text = match st.tok.render_chat_prompt(&messages, st.max_prompt_bytes) {
+        Ok(Some(prompt)) => prompt,
+        Ok(None) => st.chat_template.render(messages.iter().copied()),
+        Err(error) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                error.to_string(),
+                Some("messages"),
+            );
+        }
+    };
     let tokenization_span = tracing::info_span!("model.tokenize");
     let tokenized = {
         let _entered = tokenization_span.enter();

@@ -6,6 +6,8 @@
 
 #[cfg(feature = "tokenizer")]
 mod bpe_tokenizer;
+#[cfg(feature = "tokenizer")]
+mod chat_renderer;
 mod hf;
 #[cfg(feature = "tokenizer")]
 mod hf_json_tokenizer;

@@ -40,6 +40,8 @@ serde_json = { workspace = true }
 # HuggingFace `tokenizers` pipeline from the vocab/merges a GGUF embeds (single-file
 # UX — no sidecar tokenizer.json). Optional so the default build stays lean.
 tokenizers = { workspace = true, optional = true }
+# Fixed no-import chat renderer: model-provided templates never execute natively.
+wasmi = { version = "=2.0.0", default-features = false, features = ["std", "validate", "portable-dispatch"], optional = true }
 
 [dev-dependencies]
 # Golden vectors pinning the DeltaNet activation kernels, which are duplicated in tritium-onnx
@@ -61,7 +63,7 @@ tritium-cpu = { workspace = true }
 default = []
 cuda = ["dep:tritium-cuda", "tritium-cuda/cuda"]
 # Real text tokenization (GGUF-embedded byte-level BPE via the `tokenizers` crate).
-tokenizer = ["dep:tokenizers"]
+tokenizer = ["dep:tokenizers", "dep:wasmi"]
 # Small non-pinned Qwen bundle fixtures used only by cross-crate integration tests.
 test-fixtures = []
 
