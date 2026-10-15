@@ -101,7 +101,7 @@ pub use stage7_evidence::{
 pub use tensor_work_store::{
     TensorPayloadValidator, TensorPayloadWriter, TensorPutError, TensorRecordInfo,
     TensorRecordReader, TensorRecordReceipt, TensorRecordSpec, TensorValidatedPutError,
-    TensorVisitError, TensorWorkError, TensorWorkStore,
+    TensorVisitError, TensorWorkError, TensorWorkReader, TensorWorkStore,
 };
 
 const CONTENT_ID_CONTEXT: &str = "tritium salt content id v1";

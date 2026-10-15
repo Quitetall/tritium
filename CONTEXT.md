@@ -46,6 +46,11 @@ A discrete additive-ternary representation intended for loading or inference.
 It does not contain the latent training state needed to resume optimization.
 _Avoid_: QAT checkpoint, dense master
 
+**Tensor work record**:
+An immutable, content-bound piece of intermediate conversion work for one tensor.
+It is distinct from a deployable model, a training snapshot and a qualification receipt.
+_Avoid_: model checkpoint, completion proof
+
 **Qualification receipt**:
 Evidence bound to a declared artifact, source, workload, and execution scope.
 It is distinct from a structural plan or a claim of human authorization.

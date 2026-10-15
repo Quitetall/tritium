@@ -331,6 +331,95 @@ pub struct TensorWorkStore {
     temporary: PathBuf,
 }
 
+/// Read-only access to existing immutable tensor work records.
+///
+/// Opening this view never creates a root, object directory or temporary
+/// directory. It exposes the same exact-byte verification as [`TensorWorkStore`]
+/// without publication or scavenging methods. It is not an immutable namespace
+/// snapshot or campaign/quality admission; external source custody is required.
+#[derive(Clone, Debug)]
+pub struct TensorWorkReader {
+    objects: PathBuf,
+}
+
+impl TensorWorkReader {
+    /// Open an existing ordinary root and object directory without writing.
+    ///
+    /// No temporary directory is required. Symlinked directory ancestors, root
+    /// traversal, missing paths and non-directory paths are rejected. The OS may
+    /// still update access times according to filesystem policy.
+    ///
+    /// # Errors
+    /// Returns [`TensorWorkError`] for an invalid or unavailable existing root.
+    pub fn open(root: &Path) -> Result<Self, TensorWorkError> {
+        if root.as_os_str().is_empty() {
+            return Err(TensorWorkError::InvalidPath("store root"));
+        }
+        let root = absolute_path(root)?;
+        ensure_directory(&root, "store root", DirectoryAccess::ExistingOnly)?;
+        let objects = root.join(OBJECT_DIRECTORY);
+        ensure_directory(&objects, "object directory", DirectoryAccess::ExistingOnly)?;
+        Ok(Self { objects })
+    }
+
+    fn checked_record_path(&self, record_id: ContentId) -> Result<PathBuf, TensorWorkError> {
+        let path = record_path(&self.objects, record_id);
+        let parent = path
+            .parent()
+            .ok_or(TensorWorkError::InvalidPath("record prefix directory"))?;
+        ensure_directory(
+            parent,
+            "record prefix directory",
+            DirectoryAccess::ExistingOnly,
+        )?;
+        Ok(path)
+    }
+
+    /// Verify every record byte before returning its retained read-only handle.
+    ///
+    /// Directory ancestors and the record prefix are rechecked on each open.
+    /// Later pathname replacement cannot redirect the returned payload reader.
+    ///
+    /// # Errors
+    /// Missing, symlinked, malformed, changed or receipt-mismatched records fail
+    /// through the same verifier used by [`TensorWorkStore::open_verified`].
+    pub fn open_verified(
+        &self,
+        receipt: &TensorRecordReceipt,
+    ) -> Result<TensorRecordReader, TensorWorkError> {
+        open_and_verify(&self.checked_record_path(receipt.record_id)?, receipt)
+    }
+
+    /// Visit a verified record payload with an explicit maximum chunk size.
+    ///
+    /// No source file or directory is created, modified or synchronized.
+    /// Callback effects remain nontransactional until the complete visit passes.
+    ///
+    /// # Errors
+    /// Store, framing, receipt, digest and mutation faults remain typed store
+    /// errors; callback failures retain their original sink error type.
+    pub fn try_visit_verified<E>(
+        &self,
+        receipt: &TensorRecordReceipt,
+        max_chunk_bytes: usize,
+        visit: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), TensorVisitError<E>> {
+        let path = self
+            .checked_record_path(receipt.record_id)
+            .map_err(TensorVisitError::Store)?;
+        let mut file =
+            open_record_handle(&path, receipt.record_bytes).map_err(TensorVisitError::Store)?;
+        visit_verified_file(&mut file, receipt, None, max_chunk_bytes, visit).map(|_| ())
+    }
+}
+
+fn record_path(objects: &Path, record_id: ContentId) -> PathBuf {
+    let prefix = format!("{:02x}", record_id.as_bytes()[0]);
+    objects
+        .join(prefix)
+        .join(format!("{record_id}.{RECORD_EXTENSION}"))
+}
+
 impl TensorWorkStore {
     /// Open or create one work store rooted at `root`.
     ///
@@ -371,10 +460,7 @@ impl TensorWorkStore {
     /// Deterministic content-addressed path for a record ID.
     #[must_use]
     pub fn record_path(&self, record_id: ContentId) -> PathBuf {
-        let prefix = format!("{:02x}", record_id.as_bytes()[0]);
-        self.objects
-            .join(prefix)
-            .join(format!("{record_id}.{RECORD_EXTENSION}"))
+        record_path(&self.objects, record_id)
     }
 
     /// Remove crash-left temporary records while the caller holds exclusive store ownership.
@@ -701,7 +787,10 @@ impl TensorWorkStore {
         &self,
         receipt: &TensorRecordReceipt,
     ) -> Result<TensorRecordReader, TensorWorkError> {
-        open_and_verify(&self.record_path(receipt.record_id), receipt)
+        TensorWorkReader {
+            objects: self.objects.clone(),
+        }
+        .open_verified(receipt)
     }
 
     /// Open and validate one exact record while visiting its payload once.
@@ -722,10 +811,10 @@ impl TensorWorkStore {
         max_chunk_bytes: usize,
         visit: impl FnMut(&[u8]) -> Result<(), E>,
     ) -> Result<(), TensorVisitError<E>> {
-        let mut file =
-            open_record_handle(&self.record_path(receipt.record_id), receipt.record_bytes)
-                .map_err(TensorVisitError::Store)?;
-        visit_verified_file(&mut file, receipt, None, max_chunk_bytes, visit).map(|_| ())
+        TensorWorkReader {
+            objects: self.objects.clone(),
+        }
+        .try_visit_verified(receipt, max_chunk_bytes, visit)
     }
 }
 
@@ -1681,6 +1770,20 @@ pub(crate) fn ensure_durable_directory(
     path: &Path,
     field: &'static str,
 ) -> Result<(), TensorWorkError> {
+    ensure_directory(path, field, DirectoryAccess::CreateDurable)
+}
+
+#[derive(Clone, Copy)]
+enum DirectoryAccess {
+    ExistingOnly,
+    CreateDurable,
+}
+
+fn ensure_directory(
+    path: &Path,
+    field: &'static str,
+    access: DirectoryAccess,
+) -> Result<(), TensorWorkError> {
     if path.as_os_str().is_empty() {
         return Err(TensorWorkError::InvalidPath(field));
     }
@@ -1688,7 +1791,7 @@ pub(crate) fn ensure_durable_directory(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
-        ensure_durable_directory(parent, "directory ancestor")?;
+        ensure_directory(parent, "directory ancestor", access)?;
     }
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -1697,7 +1800,11 @@ pub(crate) fn ensure_durable_directory(
             }
             return Ok(());
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if matches!(access, DirectoryAccess::ExistingOnly) {
+                return Err(work_io("inspect existing tensor work directory", error));
+            }
+        }
         Err(error) => return Err(work_io("inspect tensor work directory", error)),
     }
     let parent = path
