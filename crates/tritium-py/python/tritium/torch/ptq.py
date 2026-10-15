@@ -51,6 +51,8 @@ from .projection import (
 
 if TYPE_CHECKING:
     from .qat import QatHardResult
+    from .native_calibration import NativeModulePreparation
+    from .owner_phases import NativeOwnerCalibration, OwnerCalibrationRecipe
 
 Pathish = Union[str, os.PathLike[str]]
 # Conservative auxiliary-tensor ledger for the row-tiled float64 fitter.
@@ -2910,19 +2912,32 @@ def load_quantized_module(
 
 
 def calibrate(
-    prepared: PreparedModel,
+    prepared: Union[PreparedModel, "NativeModulePreparation"],
     data: Any = None,
     *,
-    evidence_dir: Pathish,
+    evidence_dir: Optional[Pathish] = None,
     max_evidence_bytes: int = 64 * 1024 * 1024,
-) -> Union[CalibrationReceipt, ActivationCalibrationReceipt]:
-    """Admit precomputed Qwen3.6 S2KF evidence for PTQ conversion.
+    objective: Optional[Callable] = None,
+    owner_recipe: Optional["OwnerCalibrationRecipe"] = None,
+) -> Union[CalibrationReceipt, ActivationCalibrationReceipt, "NativeOwnerCalibration"]:
+    """Admit legacy PTQ evidence or capture explicitly prepared native owners.
 
     Local Qwen sources admit the canonical 506-record S2KF namespace. Live
     PyTorch modules instead stream bounded diagonal second moments from
-    ``data`` into a separately typed evidence namespace.
+    ``data`` into a separately typed evidence namespace. A NativeModulePreparation
+    requires an explicit owner recipe/objective and bounded window list/tuple;
+    its result is never interpreted as either legacy calibration receipt.
     """
 
+    from .native_calibration import NativeModulePreparation
+    from .owner_phases import calibrate_owner_module
+
+    if isinstance(prepared, NativeModulePreparation):
+        if evidence_dir is not None or max_evidence_bytes != 64 * 1024 * 1024:
+            raise TypeError("owner calibration does not accept legacy evidence arguments")
+        return calibrate_owner_module(prepared, data, objective, owner_recipe)
+    if objective is not None or owner_recipe is not None:
+        raise TypeError("owner calibration requires explicit native preparation")
     if not isinstance(prepared, PreparedModel):
         raise TypeError("calibrate requires a PreparedModel")
     if prepared.config.mode != "ptq":
@@ -2931,6 +2946,8 @@ def calibrate(
             code="invalid_phase",
             stage="calibrate",
         )
+    if evidence_dir is None:
+        raise TypeError("legacy calibration requires evidence_dir")
     if isinstance(prepared.model, nn.Module):
         if data is None:
             raise TritiumError(
@@ -2971,9 +2988,9 @@ def calibrate(
 
 
 def convert(
-    prepared: PreparedModel,
+    prepared: Union[PreparedModel, "NativeModulePreparation"],
     calibration: Optional[
-        Union[CalibrationReceipt, ActivationCalibrationReceipt]
+        Union[CalibrationReceipt, ActivationCalibrationReceipt, "NativeOwnerCalibration"]
     ] = None,
     *,
     revision: Optional[str] = None,
@@ -2987,9 +3004,31 @@ def convert(
     near_lossless_max_resident_bytes: Optional[int] = None,
     max_working_bytes: int = 64 * 1024 * 1024,
     packing: str = "b3",
-) -> Union[QuantizationResult, ModuleQuantizationResult, "QatHardResult"]:
+    run_id: Optional[str] = None,
+) -> Union[QuantizationResult, ModuleQuantizationResult, "QatHardResult", "_tritium.NativeModelConversion"]:
     """Freeze QAT or run resumable PTQ with explicit result discriminants."""
 
+    from .native_calibration import NativeModulePreparation
+    from .owner_phases import NativeOwnerCalibration, convert_owner_calibration
+
+    if isinstance(prepared, NativeModulePreparation):
+        supplied = {
+            "revision": revision, "work_dir": work_dir,
+            "source_admission_receipt": source_admission_receipt,
+            "official_identity_receipt": official_identity_receipt,
+            "compact_max_bytes": compact_max_bytes,
+            "compact_max_resident_bytes": compact_max_resident_bytes,
+            "near_lossless_max_bytes": near_lossless_max_bytes,
+            "near_lossless_max_resident_bytes": near_lossless_max_resident_bytes,
+            "max_working_bytes": max_working_bytes if max_working_bytes != 64 * 1024 * 1024 else None,
+            "packing": packing if packing != "b3" else None,
+        }
+        names = sorted(name for name, value in supplied.items() if value is not None)
+        if names:
+            raise TypeError("owner convert does not accept legacy arguments: " + ", ".join(names))
+        return convert_owner_calibration(prepared, calibration, output_dir, run_id)
+    if isinstance(calibration, NativeOwnerCalibration) or run_id is not None:
+        raise TypeError("owner conversion arguments require explicit native preparation")
     if not isinstance(prepared, PreparedModel):
         raise TypeError("convert requires a PreparedModel")
     if prepared.config.mode == "qat":

@@ -16,39 +16,35 @@ from .native_source import _inventory, _run_native_source
 from .owner_capture import NativeOwnerWindowCapture
 
 
-def convert_owner_native_module(
-    source, captures, output_dir, run_id, *, window_weights, damping,
+def _validate_owner_options(
+    window_weights, *, damping,
     metric_limits, max_row_bindings, max_total_cache_bytes, max_cache_package_bytes,
     max_plan_bytes=16_777_216,
 ):
-    """Fit every selected owner using ordered actual captured scalar windows.
-
-    ``captures`` and ``window_weights`` are bounded lists/tuples in window order.
-    Repeating a capture intentionally repeats the observation; numerical payloads
-    are not cloned. Each capture must cover exactly the selected source owners.
-    The native engine verifies the actual original bytes again before publishing.
-    Return a NativeModelConversion accepted by load_native_module, including tied
-    Embedding/Linear consumers. No dense master is retained by the loaded artifact.
-    """
-    if not isinstance(source, NativeModulePreparation):
-        raise TypeError("actual native preparation required")
+    """Shared frontend admission, not a replacement for Rust plan validation."""
     fields = {"max_windows", "max_payload_bytes", "max_row_bytes", "max_reduction_entries"}
     if (not isinstance(metric_limits, dict) or set(metric_limits) != fields
             or any(type(v) is not int or v <= 0 for v in metric_limits.values())
             or any(type(v) is not int or v <= 0 for v in
                    (max_row_bindings, max_total_cache_bytes, max_cache_package_bytes, max_plan_bytes))):
         raise ValueError("owner fit limits must be explicit positive integers")
-    if (not isinstance(captures, (list, tuple)) or not captures
-            or len(captures) > metric_limits["max_windows"]
-            or not isinstance(window_weights, (list, tuple))
-            or len(window_weights) != len(captures)):
+    if (not isinstance(window_weights, (list, tuple)) or not window_weights
+            or len(window_weights) > metric_limits["max_windows"]):
         raise ValueError("owner window inventory exceeds limit or differs from weights")
-    captures, window_weights = tuple(captures), tuple(window_weights)
     if (any(isinstance(w, bool) or not isinstance(w, (int, float))
             or not math.isfinite(w) or w <= 0 for w in window_weights)
             or isinstance(damping, bool) or not isinstance(damping, (int, float))
             or not math.isfinite(damping) or damping < 0):
         raise ValueError("owner weights and damping must be finite and admitted")
+    return tuple(float(weight) for weight in window_weights)
+
+
+def _owner_caches(source, captures, window_weights, max_total_cache_bytes):
+    if not isinstance(source, NativeModulePreparation):
+        raise TypeError("actual native preparation required")
+    if (not isinstance(captures, (list, tuple)) or not captures
+            or len(captures) != len(window_weights)):
+        raise ValueError("owner window inventory exceeds limit or differs from weights")
     names = sorted(owner for owner, _, _, _, selected, _ in _inventory(source.prepared) if selected)
     caches, weights = [], []
     total = 0
@@ -64,6 +60,25 @@ def convert_owner_native_module(
                 raise ValueError("aggregate owner cache payload exceeds byte limit")
             caches.append(cache)
             weights.append(float(weight))
+    return caches, weights
+
+
+def convert_owner_native_module(
+    source, captures, output_dir, run_id, *, window_weights, damping,
+    metric_limits, max_row_bindings, max_total_cache_bytes, max_cache_package_bytes,
+    max_plan_bytes=16_777_216,
+):
+    """Fit selected owners with ordered scalar windows through the Rust engine.
+
+    Bounded captures and weights have matching order. Repeating a capture repeats
+    its observation, not its numerical storage. This is not a qualified recipe.
+    """
+    window_weights = _validate_owner_options(
+        window_weights, damping=damping, metric_limits=metric_limits,
+        max_row_bindings=max_row_bindings, max_total_cache_bytes=max_total_cache_bytes,
+        max_cache_package_bytes=max_cache_package_bytes, max_plan_bytes=max_plan_bytes,
+    )
+    caches, weights = _owner_caches(source, captures, window_weights, max_total_cache_bytes)
     source.verify()
     options = json.loads(source.options_json)
 

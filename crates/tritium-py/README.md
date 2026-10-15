@@ -133,8 +133,41 @@ Tied embedding/head handles remain tied; selected dense masters are not retained
 by the loaded artifact. Temporary sources/caches are cleaned after success or
 failure, with explicit warnings for post-publication cleanup errors. Capture,
 source snapshots and cache encoding/decoding still overlap in memory. Full RSS,
-GPU/out-of-core fitting, immutable recipe custody and public phased-API/profile
-migration remain separate work.
+GPU/out-of-core fitting, immutable recipe custody and qualified profile migration
+remain separate work.
+
+The public phase functions also admit this route explicitly:
+
+```python
+from tritium.torch import OwnerCalibrationRecipe, prepare, calibrate, convert, load
+
+source = prepare(model, selection_config, inplace=False, native_options=native_options)
+recipe = OwnerCalibrationRecipe(
+    objective_bytes=b"my declared scalar objective",
+    window_weights=[1.0, 1.0],
+    capture_options=capture_options,
+    fit_options=fit_options,
+)
+calibration = calibrate(source, [first_window, second_window],
+                        objective=objective, owner_recipe=recipe)
+result = convert(source, calibration, output_dir=output_dir, run_id="my-owner-fit")
+loaded = load(result, model=fresh_model_shell, level="full",
+              load_run_id="my-load", inplace=False)
+```
+
+`native_options` are the explicit `prepare_native_module` arguments above.
+TernaryConfig selects coverage; the native actions and named levels select the
+actual fit. `target_bpw` is not admitted on this explicit-limit route.
+`capture_options` contain the five positive capture limits, `cache_limits` and
+`max_total_cache_bytes` listed above, but not objective bytes. `fit_options` contain
+the owner conversion options except `window_weights`. Recipe dictionaries are
+frozen by value. Windows must be bounded lists/tuples in weight order, not arbitrary
+iterators. The returned NativeOwnerCalibration is distinct from old calibration
+receipts; its individual captures use the existing native save/open interface.
+`inspect(source)` verifies source bytes before returning coverage. Legacy arguments
+cannot silently enter owner conversion, and owner options cannot enter legacy
+conversion. Native export, one-call quantize and qualified profile migration
+remain open; this explicit research route does not certify a deployment profile.
 
 Expert filesystem callers can use `convert_owner_model_plan` on the native
 extension, or `tritium convert/quantize --owner-plan PLAN --source-shard SOURCE

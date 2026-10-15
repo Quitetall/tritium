@@ -378,17 +378,37 @@ def _load_profile(
 
 
 def load(
-    artifact: Union[os.PathLike[str], str],
+    artifact: Union[os.PathLike[str], str, "_tritium.NativeModelConversion"],
     *,
     device: Optional[str] = None,
     profile: str = "compact-v1",
+    model: Optional[Any] = None,
+    level: Optional[str] = None,
+    load_run_id: Optional[str] = None,
+    inplace: Optional[bool] = None,
 ) -> Union[QuantizationResult, "RefinementResult", Any]:
     """Strictly reopen a two-profile Tritium PTQ bundle.
 
     Loading re-parses and hashes every package through the native seek-backed
     reader. Without ``device`` it returns artifact evidence. With ``device`` it
     additionally materializes the selected packed Qwen language runtime.
+    A typed NativeModelConversion is verified directly. Explicit model, level,
+    load_run_id and inplace select the native packed CPU shell loader instead.
     """
+    native = isinstance(artifact, _tritium.NativeModelConversion)
+    if native or model is not None or level is not None or load_run_id is not None or inplace is not None:
+        if device is not None or profile != "compact-v1":
+            raise TypeError("native load does not accept legacy device/profile selection")
+        if model is None:
+            if not native or level is not None or load_run_id is not None or inplace is not None:
+                raise TypeError("native execution requires a model shell, level, load_run_id and explicit inplace")
+            artifact.verify()
+            return artifact
+        if not isinstance(level, str) or not level or not isinstance(load_run_id, str) or not load_run_id:
+            raise TypeError("native execution requires level and load_run_id")
+        from .native_load import load_native_module
+
+        return load_native_module(model, artifact, level=level, load_run_id=load_run_id, inplace=inplace)
     requested = Path(artifact)
     if requested.is_symlink():
         raise ValueError("artifact must be an ordinary Tritium bundle directory")

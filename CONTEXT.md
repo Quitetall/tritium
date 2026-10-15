@@ -16,6 +16,16 @@ A declared computation and update rule over named tensor owners. It is distinct
 from the state used to execute that computation.
 _Avoid_: checkpoint, model weights
 
+**Owner calibration recipe**:
+An ordered, weighted set of declared scalar objectives and observation limits
+for tensor owners. It is distinct from captured observations and qualification.
+_Avoid_: Fisher estimate, qualified profile
+
+**Owner window capture**:
+The observed contribution of every supported use of a tensor owner to one
+scalar objective over a declared input window.
+_Avoid_: independent alias gradient, qualification receipt
+
 **Training payload**:
 The initial tensor state supplied to a training recipe. It is not a trained
 artifact or evidence that the recipe has executed.
