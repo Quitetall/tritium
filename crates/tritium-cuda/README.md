@@ -28,3 +28,9 @@ These check cancellation/ragged-tail bit parity and actual public view/stream
 ingress, including basis transforms and the batch-two fallback. Timing remains
 diagnostic: no exclusive-device, clock/cache control, full-graph speed, model
 quality, cross-hardware or release qualification is implied.
+
+Packed-kernel diagnostics retain raw per-call nanoseconds alongside summaries,
+with host launch/synchronization and CUDA-event samples kept separate. Medians
+use the midpoint of the sorted middle pair for even counts, rounded down to a
+nanosecond without overflowing. Older upper-middle-only logs remain historical
+observations; their missing raw samples cannot be reconstructed or reclassified.

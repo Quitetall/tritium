@@ -57,8 +57,71 @@ fn fixture(
 }
 
 fn median(mut values: Vec<Duration>) -> Duration {
+    assert!(!values.is_empty(), "timing median requires samples");
     values.sort_unstable();
-    values[values.len() / 2]
+    let middle = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        // Exact discrete midpoint, rounded down to a nanosecond. Adding the
+        // two middle durations directly can overflow even when the result fits.
+        values[middle - 1] + (values[middle] - values[middle - 1]) / 2
+    } else {
+        values[middle]
+    }
+}
+
+fn timing_series(values: &[Duration]) -> serde_json::Value {
+    let nanos =
+        |v: Duration| u64::try_from(v.as_nanos()).expect("timing sample exceeds u64 nanoseconds");
+    serde_json::json!({
+        "sample_count": values.len(),
+        "sample_nanoseconds": values.iter().map(|&v| nanos(v)).collect::<Vec<_>>(),
+        "median_nanoseconds": nanos(median(values.to_vec())),
+        "median_rule": "sorted midpoint, floor to nanoseconds for even sample counts"
+    })
+}
+
+#[test]
+fn timing_statistics_median_uses_even_midpoint_without_overflow() {
+    let ns = Duration::from_nanos;
+    assert_eq!(median(vec![ns(20), ns(10)]), ns(15));
+    assert_eq!(median(vec![ns(7), ns(1), ns(2)]), ns(2));
+    assert_eq!(median(vec![ns(9)]), ns(9));
+    // Discrete nanosecond midpoint rounds down; sorted subtraction must not
+    // overflow even when adding the two middle durations directly would.
+    assert_eq!(median(vec![ns(1), ns(0)]), ns(0));
+    assert_eq!(median(vec![Duration::MAX, Duration::MAX]), Duration::MAX);
+}
+
+#[test]
+fn timing_statistics_series_preserves_order_and_replays_summary() {
+    let samples = [20, 10, 100, 0].map(Duration::from_nanos);
+    let report = timing_series(&samples);
+    assert_eq!(report["sample_count"], 4);
+    assert_eq!(
+        report["sample_nanoseconds"],
+        serde_json::json!([20, 10, 100, 0])
+    );
+    assert_eq!(report["median_nanoseconds"], 15);
+    let restored = report["sample_nanoseconds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| Duration::from_nanos(v.as_u64().unwrap()))
+        .collect();
+    assert_eq!(median(restored), Duration::from_nanos(15));
+    assert_eq!(samples, [20, 10, 100, 0].map(Duration::from_nanos));
+}
+
+#[test]
+#[should_panic(expected = "timing median requires samples")]
+fn timing_statistics_empty_samples_refuse() {
+    timing_series(&[]);
+}
+
+#[test]
+#[should_panic(expected = "timing sample exceeds u64 nanoseconds")]
+fn timing_statistics_unrepresentable_samples_refuse() {
+    timing_series(&[Duration::MAX]);
 }
 
 // Direct candidate comparisons bypass production's deliberately narrow dispatch.
@@ -265,6 +328,15 @@ fn physical_b3_rows_kernel_timing() {
                     );
                 }
             }
+            eprintln!(
+                "B3_ROWS_SAMPLES {}",
+                serde_json::json!({
+                    "qualified": false, "rows": rows, "cols": cols, "planes": planes, "batch": 1,
+                    "scope": "Private warm-cache host launch+synchronize samples; shared hardware, no qualified throughput or full-model speed claim",
+                    "scalar": timing_series(&samples[0]), "ordered_warp": timing_series(&samples[1]),
+                    "rows8": timing_series(&samples[2]), "rows32": timing_series(&samples[3])
+                })
+            );
             let us = samples.map(|v| median(v).as_secs_f64() * 1e6);
             eprintln!(
                 "B3_ROWS_TIMING rows={rows} cols={cols} planes={planes} batch=1 scalar_us={:.3} warp_us={:.3} tile8_us={:.3} tile32_us={:.3}",
@@ -523,6 +595,16 @@ fn timing(shapes: &[(usize, usize)], sample_count: usize) {
                         }
                         let actual = backend.stream.clone_dtoh(&output).unwrap();
                         assert!(actual.iter().all(|v| v.is_finite()));
+                        eprintln!(
+                            "PACKED_KERNEL_SAMPLES {}",
+                            serde_json::json!({
+                                "qualified": false, "rows": rows, "cols": cols, "codec": format!("{codec:?}"),
+                                "planes": planes, "compact": compact, "batch": batch,
+                                "scope": "Private packed-kernel diagnostic; host and device-event series are distinct, no release/performance qualification",
+                                "scalar_host": timing_series(&samples[0]), "warp_host": timing_series(&samples[1]),
+                                "scalar_device": timing_series(&device_samples[0]), "warp_device": timing_series(&device_samples[1])
+                            })
+                        );
                         eprintln!(
                             "PACKED_KERNEL rows={rows} cols={cols} codec={codec:?} planes={planes} compact={compact} batch={batch} scalar_us={:.3} warp_us={:.3} scalar_gpu_us={:.3} warp_gpu_us={:.3}",
                             median(samples[0].clone()).as_secs_f64() * 1e6,
