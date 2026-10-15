@@ -9,6 +9,32 @@ exact byte accounting and receipt-backed benchmarks.
 See the [repository README](https://github.com/Quitetall/tritium#readme) and the
 [book](https://github.com/Quitetall/tritium/tree/main/docs/book) for usage.
 
+## Source chat controls
+
+Chat completions accept this optional Tritium extension in buffered or SSE mode:
+
+```json
+{
+  "model": "default",
+  "messages": [{"role": "user", "content": "Hi"}],
+  "max_tokens": 64,
+  "chat_template_kwargs": {"enable_thinking": false}
+}
+```
+
+This supplies a boolean to the loaded tokenizer's own chat template; it does
+not rewrite the template, enforce output policy or guarantee a final answer.
+A template may ignore it. Omission, outer `null` and `{}` preserve source
+defaults. A present `enable_thinking` must be a non-null boolean. Unknown nested
+keys, duplicate fields and nonboolean values are rejected. This is not an
+arbitrary Hugging Face keyword map or a field supported by every compatible server.
+
+Unsupported explicit controls and missing/refused source rendering return
+HTTP400 before tokenization or generation, without legacy formatting fallback.
+Omitting controls preserves the existing fallback only when no source template
+exists; declared template errors never fall back. Clients that support extension
+request bodies can send the object there. No serving default is changed.
+
 ## Typed portable candidates
 
 `--typed /absolute/path/load.json` loads a complete selected `.trit` level through
@@ -148,8 +174,9 @@ Neither this field nor successful streaming changes production readiness.
 
 This route is loopback-only and unqualified. It rejects raw-token mode, spec,
 draft, batching and KV-pool options. Hybrid MTP remains privately Unverified,
-with no draft/tree authority. Qwen3.5 hybrid uses the existing QwenIm template;
-standard graphs use Concat. Strict schema-v3 bundle admission is unchanged.
+with no draft/tree authority. Source-bound templates take precedence; only their
+absence permits the legacy QwenIm/Concat selection when no explicit controls
+were requested. Strict schema-v3 bundle admission is unchanged.
 Compatibility readiness means worker liveness: `production_artifact` is false,
 `startup_receipt` is null, and it is not public-release clearance. Resident
 real-model qualification, typed production readiness, complete memory admission and remaining
