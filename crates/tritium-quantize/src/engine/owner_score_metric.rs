@@ -1,7 +1,8 @@
 //! Actual durable windows -> f64 row Gram -> unchanged common direct fitter.
-use super::calibrated_fit::fit_row_metrics;
+use super::calibrated_fit::{RowMetricSource, fit_row_metrics};
 use super::{DirectFitError, DirectTensorFit, OwnerScoreCache, OwnerScoreCacheError};
 use crate::{CurvatureError, InputGramAccumulator};
+use std::borrow::Cow;
 use tritium_schema::{DirectFitPlan, OriginalSourceId, OwnerMetricStreamId, QuantSourceTensor};
 pub use tritium_schema::{OwnerScoreMetricLimits, WeightedOwnerWindow};
 
@@ -93,9 +94,9 @@ impl<'a> OwnerScoreMetrics<'a> {
         }
         let content = &caches[0].binding().content;
         let columns = usize::try_from(content.tensor.shape[1]).map_err(|_| E::Limit)?;
-        // Transactional updates and finalization clone canonical segment stacks.
-        // Four stacks plus eight temporary matrices conservatively cover the
-        // common reducer, returned Gram and row score, not the downstream fitter.
+        // Retain v1's conservative scalar bound even when consuming finalization
+        // and ownership transfer need fewer matrices. This is not downstream
+        // solver/source/process-RSS admission and does not widen any old limit.
         if !limits.admits(columns as u64, caches.len() as u64, 0) {
             return Err(E::Limit);
         }
@@ -168,22 +169,18 @@ impl<'a> OwnerScoreMetrics<'a> {
                 .accumulate_owner_row(&score, window.weight)
                 .map_err(E::Reduction)?;
         }
-        let gram = reducer.finish().map_err(E::Reduction)?;
-        let mut values = Vec::new();
-        values
-            .try_reserve_exact(gram.as_slice().len())
-            .map_err(|_| E::Limit)?;
-        for (index, &value) in gram.as_slice().iter().enumerate() {
-            let value = value
+        let mut values = reducer.finish_owned().map_err(E::Reduction)?.into_values();
+        for (index, value) in values.iter_mut().enumerate() {
+            let damped = *value
                 + if index / self.columns == index % self.columns {
                     self.damping
                 } else {
                     0.0
                 };
-            if !value.is_finite() {
+            if !damped.is_finite() {
                 return Err(E::Reduction(CurvatureError::NonFiniteAccumulation));
             }
-            values.push(if value == 0.0 { 0.0 } else { value });
+            *value = if damped == 0.0 { 0.0 } else { damped };
         }
         let mut hash = blake3::Hasher::new_derive_key("tritium.owner-window.row-metric.v1");
         hash.update(&self.stream);
@@ -218,7 +215,7 @@ pub(super) fn fit_owner_score_levels_observed(
     model: OriginalSourceId,
     weights: &[f32],
     metrics: &OwnerScoreMetrics<'_>,
-    mut observe: impl FnMut(usize, &OwnerRowMetric) -> Result<(), OwnerScoreMetricError>,
+    observe: impl FnMut(usize, &OwnerRowMetric) -> Result<(), OwnerScoreMetricError>,
 ) -> Result<Vec<DirectTensorFit>, OwnerScoreMetricError> {
     if metrics.source() != model
         || metrics.tensor() != original
@@ -226,12 +223,22 @@ pub(super) fn fit_owner_score_levels_observed(
     {
         return Err(OwnerScoreMetricError::Binding);
     }
-    fit_row_metrics(plan, weights, |row, _, destination| {
-        let metric = metrics.row_metric(row)?;
-        observe(row, &metric)?;
-        destination.copy_from_slice(metric.as_slice());
-        Ok(())
-    })
+    fit_row_metrics(plan, weights, OwnerRows { metrics, observe })
+}
+
+struct OwnerRows<'a, 'b, F> {
+    metrics: &'a OwnerScoreMetrics<'b>,
+    observe: F,
+}
+impl<F: FnMut(usize, &OwnerRowMetric) -> Result<(), OwnerScoreMetricError>> RowMetricSource
+    for OwnerRows<'_, '_, F>
+{
+    type Error = OwnerScoreMetricError;
+    fn metric(&mut self, row: usize, _: usize) -> Result<Cow<'_, [f64]>, Self::Error> {
+        let metric = self.metrics.row_metric(row)?;
+        (self.observe)(row, &metric)?;
+        Ok(Cow::Owned(metric.into_values()))
+    }
 }
 
 fn bits(value: f64) -> u64 {

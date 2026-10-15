@@ -70,6 +70,10 @@ pub struct DensePsdMetric {
 }
 
 impl DensePsdMetric {
+    pub(crate) fn into_values(self) -> Vec<f64> {
+        self.values
+    }
+
     /// Validate and copy a row-major dense PSD matrix.
     ///
     /// # Errors

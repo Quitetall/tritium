@@ -3,7 +3,7 @@
 use super::{ActivationAwareConfig, ScaleRefitMode, fit_tensor_with_scale_refit_mode};
 use crate::{DensePsdMetric, JointFitConfig, JointFitError, JointFitMetric, RelayBasins};
 use half::f16;
-use std::collections::BTreeSet;
+use std::{borrow::Cow, collections::BTreeSet};
 use tritium_core::{AdditiveError, Trit, apply_basis, apply_basis_f64};
 use tritium_format::{AdditiveTensor, AdditiveTensorError};
 use tritium_schema::{
@@ -190,22 +190,32 @@ pub fn fit_direct_levels(
     weights: &[f32],
     gram: Option<&[f64]>,
 ) -> Result<Vec<DirectTensorFit>, DirectFitError> {
-    let (_, cols, count) = admit(plan, weights, gram)?;
-    let mut source = reserved_vec(count)?;
-    source.extend_from_slice(weights);
-    for row in source.chunks_mut(cols) {
-        apply_basis(row, plan.layout.basis).map_err(DirectFitError::Basis)?;
+    fit_direct_levels_metric(plan, weights, gram.map(Cow::Borrowed))
+}
+
+// The same numerical controller accepts borrowed reusable or owned one-shot
+// metrics. Only a basis transform needs mutable source/metric storage.
+pub(super) fn fit_direct_levels_metric(
+    plan: &DirectFitPlan,
+    weights: &[f32],
+    gram: Option<Cow<'_, [f64]>>,
+) -> Result<Vec<DirectTensorFit>, DirectFitError> {
+    let (_, cols, count) = admit(plan, weights, gram.as_deref())?;
+    let mut source = Cow::Borrowed(weights);
+    if plan.layout.basis != Basis::Identity {
+        let mut owned = reserved_vec(count)?;
+        owned.extend_from_slice(weights);
+        for row in owned.chunks_mut(cols) {
+            apply_basis(row, plan.layout.basis).map_err(DirectFitError::Basis)?;
+        }
+        source = Cow::Owned(owned);
     }
     if let Some(index) = source.iter().position(|value| !value.is_finite()) {
         return Err(DirectFitError::NonFiniteBasisWeight { index });
     }
 
     let metric = match (gram, plan.profile) {
-        (Some(values), _) => {
-            let mut owned = reserved_vec(values.len())?;
-            owned.extend_from_slice(values);
-            Some(owned)
-        }
+        (Some(values), _) => Some(values),
         (
             None,
             DirectFitProfile::ActivationAwareLadder(_) | DirectFitProfile::JointFeedbackGroups(_),
@@ -215,7 +225,7 @@ pub fn fit_direct_levels(
             for col in 0..cols {
                 identity[col * cols + col] = 1.0;
             }
-            Some(identity)
+            Some(Cow::Owned(identity))
         }
         _ => None,
     };
@@ -223,9 +233,12 @@ pub fn fit_direct_levels(
     if let Some(values) = &mut metric {
         match plan.layout.basis {
             Basis::Hadamard { block } => {
-                super::activation_aware::rotate_gram(values, cols, block as usize);
+                let mutable = metric_storage(values)?;
+                super::activation_aware::rotate_gram(mutable, cols, block as usize);
             }
-            Basis::SignedRht { .. } => rotate_metric(values, cols, plan.layout.basis)?,
+            Basis::SignedRht { .. } => {
+                rotate_metric(metric_storage(values)?, cols, plan.layout.basis)?
+            }
             _ => {}
         }
     }
@@ -271,6 +284,15 @@ pub fn fit_direct_levels(
         });
     }
     Ok(output)
+}
+
+fn metric_storage<'a>(metric: &'a mut Cow<'_, [f64]>) -> Result<&'a mut [f64], DirectFitError> {
+    if let Cow::Borrowed(values) = metric {
+        let mut owned = reserved_vec(values.len())?;
+        owned.extend_from_slice(values);
+        *metric = Cow::Owned(owned);
+    }
+    Ok(metric.to_mut())
 }
 
 fn admit(

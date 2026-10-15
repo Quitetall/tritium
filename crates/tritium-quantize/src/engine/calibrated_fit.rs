@@ -2,9 +2,8 @@
 //! Runtime context checks are not audited raw-source or model/package provenance.
 
 use super::direct::{admit_payload, admit_plan, reserved_vec};
-use super::{
-    CalibratedTensor, CalibrationError, DirectFitError, DirectTensorFit, fit_direct_levels,
-};
+use super::{CalibratedTensor, CalibrationError, DirectFitError, DirectTensorFit};
+use std::borrow::Cow;
 use tritium_core::Trit;
 use tritium_format::AdditiveTensor;
 use tritium_schema::{
@@ -71,30 +70,61 @@ pub fn fit_calibrated_levels(
     {
         return Err(CalibratedFitError::Binding);
     }
-    fit_row_metrics(plan, weights, |row, cols, metric| {
-        if row == 0 || calibration.output().is_some() {
-            metric.fill(0.0);
-            assemble_metric(calibration, row, cols, metric)?;
+    fit_row_metrics(
+        plan,
+        weights,
+        CalibrationRows {
+            calibration,
+            metric: Vec::new(),
+        },
+    )
+}
+
+pub(super) trait RowMetricSource {
+    type Error: From<DirectFitError>;
+    fn metric(&mut self, row: usize, cols: usize) -> Result<Cow<'_, [f64]>, Self::Error>;
+}
+
+struct CalibrationRows<'a> {
+    calibration: &'a CalibratedTensor,
+    metric: Vec<f64>,
+}
+impl RowMetricSource for CalibrationRows<'_> {
+    type Error = CalibratedFitError;
+    fn metric(&mut self, row: usize, cols: usize) -> Result<Cow<'_, [f64]>, Self::Error> {
+        let calibration = self.calibration;
+        if calibration.inputs().len() == 1 && calibration.inputs()[0].dimension() == cols {
+            return if calibration.output().is_some() {
+                Ok(Cow::Owned(calibration.kfac_metric(0, row)?.into_values()))
+            } else {
+                Ok(Cow::Borrowed(calibration.inputs()[0].as_slice()))
+            };
         }
-        Ok(())
-    })
+        if self.metric.is_empty() {
+            self.metric = reserved_vec(cols * cols)?;
+            self.metric.resize(cols * cols, 0.0);
+        }
+        if row == 0 || calibration.output().is_some() {
+            self.metric.fill(0.0);
+            assemble_metric(calibration, row, cols, &mut self.metric)?;
+        }
+        Ok(Cow::Borrowed(&self.metric))
+    }
 }
 
 // Common row controller: admit the full tensor before any row work and install
 // each unchanged direct fitter output. Consumers provide source-basis metrics,
 // not another solver or basis transform. Errors never publish partial levels.
-pub(super) fn fit_row_metrics<E: From<DirectFitError>>(
+pub(super) fn fit_row_metrics<S: RowMetricSource>(
     plan: &DirectFitPlan,
     weights: &[f32],
-    mut assemble: impl FnMut(usize, usize, &mut [f64]) -> Result<(), E>,
-) -> Result<Vec<DirectTensorFit>, E> {
+    mut source: S,
+) -> Result<Vec<DirectTensorFit>, S::Error> {
     let (rows, cols, count) = admit_plan(plan, true)?;
     let metric_count = cols
         .checked_mul(cols)
         .ok_or(DirectFitError::ShapeOverflow)?;
     admit_payload(weights, None, cols, count, metric_count)?;
-    let mut metric = reserved_vec(metric_count)?;
-    metric.resize(metric_count, 0.0);
     let mut pending = reserved_vec(plan.levels.len())?;
     for level in &plan.levels {
         pending.push(PendingLevel::new(
@@ -108,11 +138,11 @@ pub(super) fn fit_row_metrics<E: From<DirectFitError>>(
     let mut row_plan = plan.clone();
     row_plan.layout.rows = 1;
     for row in 0..rows {
-        assemble(row, cols, &mut metric)?;
-        let fitted = fit_direct_levels(
+        let metric = source.metric(row, cols)?;
+        let fitted = super::direct::fit_direct_levels_metric(
             &row_plan,
             &weights[row * cols..(row + 1) * cols],
-            Some(&metric),
+            Some(metric),
         )?;
         for (target, fitted) in pending.iter_mut().zip(fitted) {
             target.install(row, cols, count, &fitted.tensor);
