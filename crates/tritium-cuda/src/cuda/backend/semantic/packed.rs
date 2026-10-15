@@ -10,6 +10,8 @@ use tritium_spec::{AdditiveMetadata, TENSOR_STREAM_CHUNK_BYTES, TensorStreamSour
 
 const HEADER: usize = 60;
 #[cfg(test)]
+mod kernel_tests;
+#[cfg(test)]
 mod stream_tests;
 
 struct Plan {
@@ -20,6 +22,7 @@ struct Plan {
 
 pub(super) struct PackedAdditive {
     bytes: CudaSlice<u8>,
+    ordered_warp_eligible: bool,
 }
 
 fn narrow(n: usize) -> Result<u32, BackendError> {
@@ -27,6 +30,17 @@ fn narrow(n: usize) -> Result<u32, BackendError> {
 }
 
 impl Plan {
+    fn ordered_warp_eligible(&self) -> bool {
+        // Shape-local heuristic from paired physical diagnostics, not an
+        // arithmetic tier or a performance guarantee. Large output grids keep
+        // scalar rows: replacing them with 32x more threads regresses them.
+        (512..=17408).contains(&self.header[1])
+            && self.header[3] == 128
+            && self.header[4] <= 1
+            && self.header[6] == 1
+            && self.header[7] == 0
+            && self.header[9] > HEADER as u32
+    }
     fn new(view: AdditiveView<'_>) -> Result<Self, BackendError> {
         AdditiveTensor::validate_view(view)
             .map_err(|e| invalid(&format!("CUDA packed semantic input: {e:?}")))?;
@@ -615,7 +629,10 @@ impl PackedAdditive {
             plan.visit_suffix(metadata, |part| writer.push(part))?;
             writer.finish(plan.bytes)?;
         }
-        let result = Self { bytes };
+        let result = Self {
+            bytes,
+            ordered_warp_eligible: plan.ordered_warp_eligible(),
+        };
         result.validate_device_finite(backend, &plan, maximum)?;
         backend
             .stream
@@ -643,11 +660,11 @@ impl PackedAdditive {
         backend: &CudaBackend,
         view: AdditiveView<'_>,
     ) -> Result<Self, BackendError> {
-        let bytes = Self::stage_view(view)?;
-        Self::transfer(backend, &bytes)
+        let (bytes, ordered_warp_eligible) = Self::stage_view(view)?;
+        Self::transfer(backend, &bytes, ordered_warp_eligible)
     }
 
-    fn stage_view(view: AdditiveView<'_>) -> Result<Vec<u8>, BackendError> {
+    fn stage_view(view: AdditiveView<'_>) -> Result<(Vec<u8>, bool), BackendError> {
         let plan = Plan::new(view)?;
         let mut bytes = plan.allocate(AdditiveMetadata::from_view(view))?;
         let mut at = HEADER;
@@ -675,15 +692,22 @@ impl PackedAdditive {
             }
             at += width;
         }
-        Ok(bytes)
+        Ok((bytes, plan.ordered_warp_eligible()))
     }
 
-    fn transfer(backend: &CudaBackend, bytes: &[u8]) -> Result<Self, BackendError> {
+    fn transfer(
+        backend: &CudaBackend,
+        bytes: &[u8],
+        ordered_warp_eligible: bool,
+    ) -> Result<Self, BackendError> {
         let bytes = backend
             .stream
             .clone_htod(bytes)
             .map_err(|e| alloc_or_backend("upload CUDA packed semantic tensor", &e, bytes.len()))?;
-        Ok(Self { bytes })
+        Ok(Self {
+            bytes,
+            ordered_warp_eligible,
+        })
     }
 
     pub(super) fn len_bytes(&self) -> usize {
@@ -796,14 +820,28 @@ impl PackedAdditive {
         if outputs > output.len() {
             return Err(invalid("packed active output extent exceeds workspace"));
         }
-        let cfg = LaunchConfig::for_num_elems(narrow(outputs)?);
-        let mut launch = backend
-            .stream
-            .launch_builder(&backend.func_semantic_additive_matmul);
+        let cooperative = self.ordered_warp_eligible && (512..=8192).contains(&outputs);
+        let (function, cfg) = if cooperative {
+            (
+                &backend.func_semantic_additive_matmul_ordered_warp,
+                LaunchConfig {
+                    grid_dim: (narrow(outputs.div_ceil(4))?, 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+            )
+        } else {
+            (
+                &backend.func_semantic_additive_matmul,
+                LaunchConfig::for_num_elems(narrow(outputs)?),
+            )
+        };
+        let mut launch = backend.stream.launch_builder(function);
         launch.arg(&self.bytes).arg(input).arg(output).arg(&batch);
         #[allow(unsafe_code)]
-        // SAFETY: validated geometry bounds every access; one thread owns each
-        // output and private canonical bytes/indexing were checked at upload.
+        // SAFETY: validated geometry bounds every access. A scalar thread or
+        // complete warp owns each output; all private indexing was checked at
+        // upload. Cooperative early exits are uniform within every warp.
         unsafe { launch.launch(cfg) }
             .map_err(|e| driver_err("launch packed semantic matmul", &e))?;
         Ok(())

@@ -106,7 +106,7 @@ fn encoded_stream_native_envelopes_and_scalar_cursors_match_decoded_oracle_all_p
                             fail: false,
                         };
                         let bytes = PackedAdditive::stage_stream(metadata, &source).unwrap();
-                        assert_eq!(bytes, PackedAdditive::stage_view(view).unwrap());
+                        assert_eq!(bytes, PackedAdditive::stage_view(view).unwrap().0);
                         let plan = Plan::from_metadata(metadata).unwrap();
                         let (payload, workspace, encoded) =
                             PackedAdditive::stream_metadata(metadata).unwrap();

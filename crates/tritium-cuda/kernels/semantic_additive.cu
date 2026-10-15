@@ -289,14 +289,16 @@ __device__ __forceinline__ uint32_t row_meta(const uint8_t *p, uint32_t plane, u
 __device__ __forceinline__ uint32_t plane_start(const uint8_t *p, uint32_t plane) {
     return h(p, 13) ? u32le(p + h(p, 10) + 4 * plane) : 60 + plane * h(p, 12);
 }
-extern "C" __global__ void semantic_additive_matmul(
-    const uint8_t *p, const float *act, float *out, uint32_t batch
+template<bool cooperative>
+__device__ __forceinline__ float semantic_ordered_partial(
+    float partial, const float *a, const uint8_t *data, uint32_t codec,
+    uint32_t coefficient, uint32_t begin, uint32_t end
+);
+template<bool cooperative>
+__device__ __forceinline__ float semantic_additive_dot(
+    const uint8_t *p, const float *a, uint32_t row
 ) {
-    uint64_t at = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     uint32_t rows = h(p, 0), cols = h(p, 1), planes = h(p, 2);
-    if (at >= uint64_t(batch) * rows) return;
-    uint32_t row = at % rows;
-    const float *a = act + (at / rows) * cols;
     bool compact = h(p, 13), tensor = h(p, 7);
     uint32_t group = tensor ? cols : h(p, 3), codec = h(p, 4);
     float sum = 0.0f;
@@ -305,9 +307,8 @@ extern "C" __global__ void semantic_additive_matmul(
         if (!compact) {
             for (uint32_t start = 0; start < cols; start += group) {
                 uint32_t end = min(start + group, cols);
-                float partial = 0.0f;
-                for (uint32_t col = start; col < end; ++col)
-                    partial = add_digit(partial, a[col], digit(data, codec, row * cols + col));
+                float partial = semantic_ordered_partial<cooperative>(
+                    0.0f, a, data, codec, row * cols, start, end);
                 uint32_t unit = tensor ? 0 : row * ((cols + group - 1) / group) + start / group;
                 uint32_t index = h(p, 6) ? plane * h(p, 14) + unit : unit;
                 sum += partial * scale(p, plane, index);
@@ -328,8 +329,8 @@ extern "C" __global__ void semantic_additive_matmul(
                 for (uint32_t start = 0; start < len; start += width) {
                     float partial = tensor ? tensor_partial : 0.0f;
                     uint32_t end = min(start + width, len);
-                    for (uint32_t offset = start; offset < end; ++offset)
-                        partial = add_digit(partial, a[col + offset], digit(data, codec, coefficient + offset));
+                    partial = semantic_ordered_partial<cooperative>(
+                        partial, a + col, data, codec, coefficient, start, end);
                     if (tensor) tensor_partial = partial;
                     else sum += partial * scale(p, plane, si + start / group);
                 }
@@ -339,7 +340,51 @@ extern "C" __global__ void semantic_additive_matmul(
             if (tensor) sum += tensor_partial * scale(p, plane, plane);
         }
     }
-    out[at] = sum;
+    return sum;
+}
+// Cooperative reads, deliberately NOT a parallel reduction: lane zero folds
+// every digit in exactly the scalar kernel's column order. All 32 lanes take
+// the same shuffle path, including ragged tails and skipped compact tiles.
+template<bool cooperative>
+__device__ __forceinline__ float semantic_ordered_partial(
+    float partial, const float *a, const uint8_t *data, uint32_t codec,
+    uint32_t coefficient, uint32_t begin, uint32_t end
+) {
+    if (!cooperative) {
+        for (uint32_t at = begin; at < end; ++at)
+            partial = add_digit(partial, a[at], digit(data, codec, coefficient + at));
+        return partial;
+    }
+    uint32_t lane = threadIdx.x & 31;
+    for (uint32_t start = begin; start < end; start += 32) {
+        uint32_t at = start + lane;
+        float value = at < end ? a[at] : 0.0f;
+        int trit = at < end ? digit(data, codec, coefficient + at) : 0;
+        uint32_t count = min(32u, end - start);
+        for (uint32_t source = 0; source < count; ++source) {
+            float v = __shfl_sync(0xffffffffu, value, source);
+            int t = __shfl_sync(0xffffffffu, trit, source);
+            if (lane == 0) partial = add_digit(partial, v, t);
+        }
+    }
+    return partial;
+}
+extern "C" __global__ void semantic_additive_matmul(
+    const uint8_t *p, const float *act, float *out, uint32_t batch
+) {
+    uint64_t at = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    uint32_t rows = h(p, 0), cols = h(p, 1);
+    if (at >= uint64_t(batch) * rows) return;
+    out[at] = semantic_additive_dot<false>(p, act + (at / rows) * cols, at % rows);
+}
+extern "C" __global__ void semantic_additive_matmul_ordered_warp(
+    const uint8_t *p, const float *act, float *out, uint32_t batch
+) {
+    uint64_t at = (uint64_t(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
+    uint32_t rows = h(p, 0), cols = h(p, 1);
+    if (at >= uint64_t(batch) * rows) return;
+    float sum = semantic_additive_dot<true>(p, act + (at / rows) * cols, at % rows);
+    if ((threadIdx.x & 31) == 0) out[at] = sum;
 }
 __device__ __forceinline__ float semantic_stored_weight(const uint8_t *p, uint32_t row, uint32_t col) {
     uint32_t cols = h(p, 1), planes = h(p, 2), group = h(p, 3), codec = h(p, 4);
