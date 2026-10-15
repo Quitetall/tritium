@@ -14,6 +14,8 @@ use tritium_schema::*;
 
 #[path = "convert_plan_cli/original_stage.rs"]
 mod original_stage;
+#[path = "convert_plan_cli/owner.rs"]
+mod owner;
 #[path = "convert_plan_cli/python.rs"]
 mod python;
 #[path = "convert_plan_cli/quantize.rs"]
@@ -92,6 +94,9 @@ fn recorder() -> EvidenceRecorder {
             CALIBRATED_LEVELS_FITTED_REGISTRATION,
             CALIBRATED_QUANTIZATION_STARTED_REGISTRATION,
             CALIBRATED_QUANTIZATION_COMPLETED_REGISTRATION,
+            OWNER_SCORE_LEVELS_FITTED_REGISTRATION,
+            OWNER_QUANTIZATION_STARTED_REGISTRATION,
+            OWNER_QUANTIZATION_COMPLETED_REGISTRATION,
         ],
     )
     .unwrap()

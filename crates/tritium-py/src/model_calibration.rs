@@ -25,8 +25,10 @@ use tritium_schema::{
     BlobId, CalibratedFitPlan, CalibratedQuantAction, CalibratedQuantPlan,
     CalibratedQuantTensorPlan, CalibrationCacheBinding, CalibrationCacheId,
     CalibrationCacheRequest, CalibrationConsumer, CalibrationOutput, CalibrationPartition,
-    DirectFitMetric, ModelQuantPlan, NamedAssetDigest, OriginalSourceId, OwnerScoreCacheBinding,
-    OwnerScoreCacheLimits, OwnerScoreWindowMeta, QuantAction, QuantPlan, QuantSourceBinding,
+    DirectFitMetric, ModelQuantPlan, NamedAssetDigest, OriginalSourceId, OwnerQuantAction,
+    OwnerQuantPlan, OwnerQuantTensorPlan, OwnerScoreCacheBinding, OwnerScoreCacheLimits,
+    OwnerScoreFitPlan, OwnerScoreWindowMeta, QuantAction, QuantPlan, QuantSourceBinding,
+    WeightedOwnerCache,
 };
 
 fn error(value: impl std::fmt::Display) -> PyErr {
@@ -612,6 +614,108 @@ impl NativeSourceObservation {
         };
         plan.validate().map_err(error)?;
         serde_json::to_string(&plan).map_err(error)
+    }
+
+    /// Complete owner-model plan from actual observed sources and native cache handles.
+    #[pyo3(signature=(plan_json, caches, weights, damping, metric_limits_json,
+        max_row_bindings, max_cache_payload_bytes, max_cache_package_bytes, *, max_plan_bytes=16_777_216))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Explicit PyO3 metric and cache admission"
+    )]
+    fn owner_plan_json(
+        &self,
+        plan_json: &str,
+        caches: Vec<PyRef<'_, NativeOwnerScoreCache>>,
+        weights: Vec<f64>,
+        damping: f64,
+        metric_limits_json: &str,
+        max_row_bindings: u64,
+        max_cache_payload_bytes: u64,
+        max_cache_package_bytes: u64,
+        max_plan_bytes: usize,
+    ) -> PyResult<String> {
+        if max_plan_bytes == 0 || plan_json.len() > max_plan_bytes {
+            return Err(error("owner plan JSON exceeds byte limit"));
+        }
+        let plain: QuantPlan = serde_json::from_str(plan_json).map_err(error)?;
+        plain.validate().map_err(error)?;
+        if plain.architecture != self.architecture
+            || caches.len() != weights.len()
+            || caches.is_empty()
+        {
+            return Err(error("owner architecture/window inventory differs"));
+        }
+        let limits: OwnerScoreMetricLimits = json(metric_limits_json)?;
+        let mut bindings = BTreeMap::<String, Vec<WeightedOwnerCache>>::new();
+        for (cache, weight) in caches.iter().zip(weights) {
+            self.validate_owner_cache(cache)?;
+            let binding = cache.cache.binding();
+            bindings
+                .entry(binding.content.tensor.name.clone())
+                .or_default()
+                .push(WeightedOwnerCache {
+                    binding: binding.clone(),
+                    weight,
+                });
+        }
+        let mut tensors = Vec::new();
+        for tensor in plain.tensors {
+            if !self.tensors.iter().any(|t| t.source == tensor.source) {
+                return Err(error("owner source interpretation changed"));
+            }
+            let action = match tensor.action {
+                QuantAction::KeepDense => OwnerQuantAction::KeepDense,
+                QuantAction::Fit {
+                    plan,
+                    metric: DirectFitMetric::Identity,
+                } => {
+                    let windows = bindings
+                        .remove(&tensor.source.name)
+                        .ok_or_else(|| error("selected owner missing calibration"))?;
+                    OwnerQuantAction::OwnerFit {
+                        plan: Box::new(OwnerScoreFitPlan {
+                            direct: *plan,
+                            windows,
+                            damping,
+                            limits,
+                            max_row_bindings,
+                        }),
+                    }
+                }
+                _ => {
+                    return Err(error(
+                        "owner adapter cannot reinterpret raw-Gram or unsupported actions",
+                    ));
+                }
+            };
+            tensors.push(OwnerQuantTensorPlan {
+                source: tensor.source,
+                action,
+            });
+        }
+        if !bindings.is_empty()
+            || tensors.len() != self.tensors.len()
+            || plain.assets.iter().ne(self.assets.iter().map(|a| &a.name))
+        {
+            return Err(error("owner source/cache inventory differs"));
+        }
+        let plan = OwnerQuantPlan {
+            architecture: plain.architecture,
+            original_source: self.source,
+            tensors,
+            assets: plain.assets,
+            levels: plain.levels,
+            limits: plain.limits,
+            max_cache_payload_bytes,
+            max_cache_package_bytes,
+        };
+        plan.validate().map_err(error)?;
+        let output = serde_json::to_string(&plan).map_err(error)?;
+        if output.len() > max_plan_bytes {
+            return Err(error("owner plan JSON exceeds byte limit"));
+        }
+        Ok(output)
     }
 }
 

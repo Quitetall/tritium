@@ -10,13 +10,15 @@ use std::{
 use tritium_evidence::{
     CALIBRATED_LEVELS_FITTED_REGISTRATION, CALIBRATED_QUANTIZATION_COMPLETED_REGISTRATION,
     CALIBRATED_QUANTIZATION_STARTED_REGISTRATION, DIRECT_LEVELS_FITTED_REGISTRATION,
-    EvidenceRecorder, QUANTIZATION_COMPLETED_REGISTRATION, QUANTIZATION_STARTED_REGISTRATION,
+    EvidenceRecorder, OWNER_QUANTIZATION_COMPLETED_REGISTRATION,
+    OWNER_QUANTIZATION_STARTED_REGISTRATION, OWNER_SCORE_LEVELS_FITTED_REGISTRATION,
+    QUANTIZATION_COMPLETED_REGISTRATION, QUANTIZATION_STARTED_REGISTRATION,
 };
 use tritium_quantize::engine::{
     DirectoryTensorSink, Engine, FileWeightSource, QuantizedModel, TritCalibrationSource,
-    file_calibration_source,
+    TritOwnerCalibrationSource, file_calibration_source,
 };
-use tritium_schema::{CalibratedQuantPlan, ModelQuantPlan, QuantPlan};
+use tritium_schema::{CalibratedQuantPlan, ModelQuantPlan, OwnerQuantPlan, QuantPlan};
 
 const DEFAULT_MAX_PLAN_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -44,6 +46,9 @@ pub(crate) struct PlanArgs {
     /// Existing Rust CalibratedQuantPlan JSON, with actual bound .trit caches.
     #[arg(long, requires_all = ["conversion_source", "conversion_run_id"])]
     calibrated_plan: Option<PathBuf>,
+    /// Distinct OwnerQuantPlan JSON with ordered immutable scalar-window caches.
+    #[arg(long, requires_all = ["conversion_source", "conversion_run_id"], conflicts_with = "original_captured_stage")]
+    owner_plan: Option<PathBuf>,
     /// Repeat for every original safetensors shard; no source tensor may be omitted.
     #[arg(long, requires = "conversion_plan")]
     source_shard: Vec<PathBuf>,
@@ -54,8 +59,11 @@ pub(crate) struct PlanArgs {
     #[arg(long, requires = "conversion_plan", conflicts_with = "original_captured_stage", value_parser = parse_named_path)]
     input_gram: Vec<NamedPath>,
     /// Actual .trit calibration cache, TENSOR=PATH; exact calibrated inventory required.
-    #[arg(long, requires = "calibrated_plan", conflicts_with = "plan", value_parser = parse_named_path)]
+    #[arg(long, requires = "conversion_plan", conflicts_with = "plan", value_parser = parse_named_path)]
     calibration_cache: Vec<NamedPath>,
+    /// Owner cache binding, TENSOR=LOWER_HEX_CACHE_ID=PATH; repeat for distinct windows.
+    #[arg(long, requires = "owner_plan", value_parser = parse_named_path)]
+    owner_cache: Vec<NamedPath>,
     /// Stable identity for the mandatory conversion log, separate from CLI summary evidence.
     #[arg(long, requires = "conversion_plan")]
     conversion_run_id: Option<String>,
@@ -67,19 +75,21 @@ pub(crate) struct PlanArgs {
 }
 impl PlanArgs {
     pub(crate) fn enabled(&self) -> bool {
-        self.plan.is_some() || self.calibrated_plan.is_some()
+        self.plan.is_some() || self.calibrated_plan.is_some() || self.owner_plan.is_some()
     }
 }
 
 enum Request {
     Plain(QuantPlan),
     Calibrated(CalibratedQuantPlan),
+    Owner(OwnerQuantPlan),
 }
 impl Request {
     fn view(&self) -> ModelQuantPlan<'_> {
         match self {
             Self::Plain(p) => ModelQuantPlan::Uncalibrated(p),
             Self::Calibrated(p) => ModelQuantPlan::Calibrated(p),
+            Self::Owner(p) => ModelQuantPlan::Owner(p),
         }
     }
 }
@@ -100,13 +110,17 @@ fn paths(bindings: &[NamedPath]) -> Result<BTreeMap<String, PathBuf>> {
 pub(crate) fn run(args: &PlanArgs, output: &Path) -> Result<()> {
     let max = args.max_plan_bytes.unwrap_or(DEFAULT_MAX_PLAN_BYTES);
     ensure!(max > 0, "--max-plan-bytes must be positive");
-    let request = match (&args.plan, &args.calibrated_plan) {
-        (Some(path), None) => Request::Plain(
+    let request = match (&args.plan, &args.calibrated_plan, &args.owner_plan) {
+        (Some(path), None, None) => Request::Plain(
             serde_json::from_slice(&read_bounded(path, max)?).context("parse Rust QuantPlan")?,
         ),
-        (None, Some(path)) => Request::Calibrated(
+        (None, Some(path), None) => Request::Calibrated(
             serde_json::from_slice(&read_bounded(path, max)?)
                 .context("parse Rust CalibratedQuantPlan")?,
+        ),
+        (None, None, Some(path)) => Request::Owner(
+            serde_json::from_slice(&read_bounded(path, max)?)
+                .context("parse Rust OwnerQuantPlan")?,
         ),
         _ => bail!("exactly one typed conversion plan is required"),
     };
@@ -115,6 +129,30 @@ pub(crate) fn run(args: &PlanArgs, output: &Path) -> Result<()> {
     let gram_paths = paths(&args.input_gram)?;
     let caches = paths(&args.calibration_cache)?;
     let mut calibration = file_calibration_source(view, caches)?;
+    let mut owner_paths = BTreeMap::<String, BTreeMap<[u8; 32], PathBuf>>::new();
+    for binding in &args.owner_cache {
+        let encoded = binding
+            .path
+            .to_str()
+            .context("owner cache binding must be UTF-8")?;
+        let (id, path) = encoded
+            .split_once('=')
+            .context("expected TENSOR=LOWER_HEX_CACHE_ID=PATH")?;
+        let hash = blake3::Hash::from_hex(id).context("invalid owner cache identity")?;
+        ensure!(
+            id == hash.to_hex().as_str() && !path.is_empty(),
+            "owner cache identity must be canonical lower hex and path nonempty"
+        );
+        ensure!(
+            owner_paths
+                .entry(binding.name.clone())
+                .or_default()
+                .insert(*hash.as_bytes(), path.into())
+                .is_none(),
+            "duplicate owner cache binding"
+        );
+    }
+    let mut owners = TritOwnerCalibrationSource::new(owner_paths)?;
     let run = args
         .conversion_run_id
         .as_deref()
@@ -136,6 +174,14 @@ pub(crate) fn run(args: &PlanArgs, output: &Path) -> Result<()> {
         Request::Calibrated(plan) => {
             Engine::run_calibrated(&plan, &mut source, &mut calibration, &mut sink, recorder)?
         }
+        Request::Owner(plan) => Engine::run_owner(
+            &plan,
+            &mut source,
+            &mut owners,
+            Some(&mut calibration),
+            &mut sink,
+            recorder,
+        )?,
     };
     print_result(output, &result)
 }
@@ -150,6 +196,9 @@ fn recorder(run: &str) -> Result<EvidenceRecorder> {
             CALIBRATED_LEVELS_FITTED_REGISTRATION,
             CALIBRATED_QUANTIZATION_STARTED_REGISTRATION,
             CALIBRATED_QUANTIZATION_COMPLETED_REGISTRATION,
+            OWNER_SCORE_LEVELS_FITTED_REGISTRATION,
+            OWNER_QUANTIZATION_STARTED_REGISTRATION,
+            OWNER_QUANTIZATION_COMPLETED_REGISTRATION,
         ],
     )?)
 }

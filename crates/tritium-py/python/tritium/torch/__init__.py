@@ -94,6 +94,7 @@ from .native_source import convert_native_module
 from .native_load import load_native_module
 from .native_calibration import (NativeModulePreparation, NativeModuleCalibration,
     prepare_native_module, calibrate_native_module, convert_calibrated_native_module)
+from .owner_conversion import convert_owner_native_module
 from .qwen36 import (
     Qwen36ComponentError,
     Qwen36Components,
@@ -166,6 +167,7 @@ __all__ = [
     "prepare_native_module",
     "calibrate_native_module",
     "convert_calibrated_native_module",
+    "convert_owner_native_module",
     "ModuleOnnxArtifact",
     "ModuleOnnxLineage",
     "OnnxBundleManifest",

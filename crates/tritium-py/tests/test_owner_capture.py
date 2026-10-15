@@ -23,9 +23,9 @@ class TiedModel(nn.Module):
         return self.head(hidden), self.head(hidden[:1])
 
 
-def _source(root, *, frozen=False):
+def _source(root, *, frozen=False, dtype=torch.float32):
     torch.manual_seed(512)
-    model = TiedModel()
+    model = TiedModel().to(dtype=dtype)
     if frozen:
         model.requires_grad_(False)
     prepared = prepare(model, TernaryConfig.ptq(profile="compact-v1", planes=2,

@@ -235,7 +235,7 @@ enum Command {
         .requires("conversion_plan")
         .multiple(false)))]
     #[command(group(clap::ArgGroup::new("conversion_plan")
-        .args(["plan", "calibrated_plan"])
+        .args(["plan", "calibrated_plan", "owner_plan"])
         .multiple(false)
         .conflicts_with_all(["model", "calib", "calib_tokens", "fold_alpha",
             "no_rotation", "activation_aware", "gptq_decay", "gptq_scale_refit",
@@ -354,7 +354,7 @@ enum Command {
         .requires("conversion_plan")
         .multiple(false)))]
     #[command(group(clap::ArgGroup::new("conversion_plan")
-        .args(["plan", "calibrated_plan"])
+        .args(["plan", "calibrated_plan", "owner_plan"])
         .multiple(false)
         .conflicts_with_all(["input", "bpw", "scale_group", "sensitivity", "fisher",
             "format", "ladder", "planes", "group", "grid", "rotate"])))]

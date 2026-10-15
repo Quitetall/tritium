@@ -103,12 +103,45 @@ and native loader semantics are unchanged.
 max_total_payload_bytes=...)`. Logical cache/numerical budgets do not cover the
 framework tape, source copies or full RSS. Remaining aggregate cache payload
 allowance is enforced by the shared decoder before decoded-payload copies.
-The first Torch capture adapter
-requires Linear-only consumers; mixed tied embedding/head roles fail explicitly
-and remain full-release work. Existing expert native consumers still support
-gather/indexed factors. Source observation does not freeze concurrent writers,
+This K-FAC capture adapter requires Linear-only consumers; mixed tied
+embedding/head roles fail explicitly. The distinct owner-window path below
+handles those roles without changing this estimator's meaning.
+Source observation does not freeze concurrent writers,
 and callback mutations are detected, not rolled back. No empirical gate is
 cleared by this software lifecycle.
+
+For shared embedding/head weights, call `source.capture_owner_window(window,
+objective, objective_bytes=..., max_observation_bytes=..., max_context_bytes=...,
+max_invocations=..., max_samples=..., max_graph_nodes=..., cache_limits=...,
+max_total_cache_bytes=...)`. Supplying explicit `OwnerScoreCacheLimits` fields
+produces immutable native caches of the actual scalar objective's full owner
+gradients, including repeated gather/matmul uses. These are scalar-window score
+observations, not K-FAC/Fisher estimates or qualified probe recipes.
+
+`convert_owner_native_module(source, captures, output_dir, run_id,
+window_weights=[...], damping=..., metric_limits=..., max_row_bindings=...,
+max_total_cache_bytes=..., max_cache_package_bytes=...)` fits those windows
+through the shared Rust owner-model engine. `captures` and weights must be
+bounded lists/tuples in matching window order. `metric_limits` has positive
+`max_windows`, `max_payload_bytes`, `max_row_bytes` and `max_reduction_entries`.
+Every capture must cover all selected source owners; repeated captures remain
+intentional observations. Distinct numerical payloads are exported once.
+Optional `max_plan_bytes` defaults to 16 MiB for the complete owner plan.
+
+The result uses the ordinary `load_native_module` and package-reopen interfaces.
+Tied embedding/head handles remain tied; selected dense masters are not retained
+by the loaded artifact. Temporary sources/caches are cleaned after success or
+failure, with explicit warnings for post-publication cleanup errors. Capture,
+source snapshots and cache encoding/decoding still overlap in memory. Full RSS,
+GPU/out-of-core fitting, immutable recipe custody and public phased-API/profile
+migration remain separate work.
+
+Expert filesystem callers can use `convert_owner_model_plan` on the native
+extension, or `tritium convert/quantize --owner-plan PLAN --source-shard SOURCE
+--owner-cache TENSOR=LOWER_HEX_CACHE_ID=PATH --conversion-run-id RUN --out OUTPUT`.
+Repeat source/cache/asset bindings for the exact plan inventory. Mixed owner
+plans may also supply legacy `--calibration-cache TENSOR=PATH` bindings. No
+missing cache silently falls back to a plain fit.
 
 See the [repository README](https://github.com/Quitetall/tritium#readme) and the
 [book](https://github.com/Quitetall/tritium/tree/main/docs/book) for usage.

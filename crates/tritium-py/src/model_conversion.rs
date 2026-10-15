@@ -7,14 +7,17 @@ use std::{
 use tritium_evidence::{
     CALIBRATED_LEVELS_FITTED_REGISTRATION, CALIBRATED_QUANTIZATION_COMPLETED_REGISTRATION,
     CALIBRATED_QUANTIZATION_STARTED_REGISTRATION, DIRECT_LEVELS_FITTED_REGISTRATION,
-    EvidenceRecorder, QUANTIZATION_COMPLETED_REGISTRATION, QUANTIZATION_STARTED_REGISTRATION,
-    verify_jsonl,
+    EvidenceRecorder, OWNER_QUANTIZATION_COMPLETED_REGISTRATION,
+    OWNER_QUANTIZATION_STARTED_REGISTRATION, OWNER_SCORE_LEVELS_FITTED_REGISTRATION,
+    QUANTIZATION_COMPLETED_REGISTRATION, QUANTIZATION_STARTED_REGISTRATION, verify_jsonl,
 };
 use tritium_quantize::engine::{
-    DirectoryTensorSink, Engine, FileWeightSource, file_calibration_source,
-    read_original_file_bounded, verify_package_with_fit_log,
+    DirectoryTensorSink, Engine, FileWeightSource, TritOwnerCalibrationSource,
+    file_calibration_source, read_original_file_bounded, verify_package_with_fit_log,
 };
-use tritium_schema::{CalibratedQuantPlan, ModelQuantPlan, QuantPlan, TensorStorage};
+use tritium_schema::{
+    CalibratedQuantPlan, ModelQuantPlan, OwnerQuantPlan, QuantPlan, TensorStorage,
+};
 
 fn error(value: impl std::fmt::Display) -> PyErr {
     PyValueError::new_err(value.to_string())
@@ -33,12 +36,14 @@ fn paths(input: Option<BTreeMap<String, String>>) -> BTreeMap<String, PathBuf> {
 enum Plan {
     Plain(QuantPlan),
     Calibrated(CalibratedQuantPlan),
+    Owner(OwnerQuantPlan),
 }
 impl Plan {
     fn view(&self) -> ModelQuantPlan<'_> {
         match self {
             Self::Plain(plan) => ModelQuantPlan::Uncalibrated(plan),
             Self::Calibrated(plan) => ModelQuantPlan::Calibrated(plan),
+            Self::Owner(plan) => ModelQuantPlan::Owner(plan),
         }
     }
 }
@@ -312,6 +317,85 @@ pub(crate) fn convert_model_plan(
     max_plan_bytes: usize,
 ) -> PyResult<NativeModelConversion> {
     let request = parse_plan(plan_json, calibrated, max_plan_bytes)?;
+    run_conversion(
+        py,
+        request,
+        ConversionInputs {
+            source_shards,
+            output_dir,
+            run_id,
+            asset_paths,
+            input_grams,
+            calibration_caches,
+            owner_cache_paths: BTreeMap::new(),
+        },
+    )
+}
+
+/// Distinct owner-model request; no interpretation change to the old bool route.
+#[pyfunction]
+#[pyo3(signature=(plan_json, source_shards, output_dir, run_id, *, owner_cache_paths,
+    asset_paths=None, input_grams=None, calibration_caches=None, max_plan_bytes=16_777_216))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Explicit PyO3 source and immutable-cache inputs"
+)]
+pub(crate) fn convert_owner_model_plan(
+    py: Python<'_>,
+    plan_json: &str,
+    source_shards: Vec<String>,
+    output_dir: String,
+    run_id: String,
+    owner_cache_paths: BTreeMap<String, BTreeMap<String, String>>,
+    asset_paths: Option<BTreeMap<String, String>>,
+    input_grams: Option<BTreeMap<String, String>>,
+    calibration_caches: Option<BTreeMap<String, String>>,
+    max_plan_bytes: usize,
+) -> PyResult<NativeModelConversion> {
+    if max_plan_bytes == 0 || plan_json.len() > max_plan_bytes {
+        return Err(error("plan JSON exceeds positive byte limit"));
+    }
+    let request = Plan::Owner(serde_json::from_str(plan_json).map_err(error)?);
+    request.view().validate().map_err(error)?;
+    run_conversion(
+        py,
+        request,
+        ConversionInputs {
+            source_shards,
+            output_dir,
+            run_id,
+            asset_paths,
+            input_grams,
+            calibration_caches,
+            owner_cache_paths,
+        },
+    )
+}
+
+struct ConversionInputs {
+    source_shards: Vec<String>,
+    output_dir: String,
+    run_id: String,
+    asset_paths: Option<BTreeMap<String, String>>,
+    input_grams: Option<BTreeMap<String, String>>,
+    calibration_caches: Option<BTreeMap<String, String>>,
+    owner_cache_paths: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+fn run_conversion(
+    py: Python<'_>,
+    request: Plan,
+    inputs: ConversionInputs,
+) -> PyResult<NativeModelConversion> {
+    let ConversionInputs {
+        source_shards,
+        output_dir,
+        run_id,
+        asset_paths,
+        input_grams,
+        calibration_caches,
+        owner_cache_paths,
+    } = inputs;
     if run_id.is_empty() {
         return Err(error("run_id must not be empty"));
     }
@@ -332,8 +416,25 @@ pub(crate) fn convert_model_plan(
     let assets = paths(asset_paths);
     let grams = paths(input_grams);
     let caches = paths(calibration_caches);
+    let owners = owner_cache_paths
+        .into_iter()
+        .map(|(name, files)| {
+            let files = files
+                .into_iter()
+                .map(|(id, path)| {
+                    let hash = blake3::Hash::from_hex(&id).map_err(error)?;
+                    if id != hex(hash.as_bytes()) {
+                        return Err(error("owner cache identity must be canonical lower hex"));
+                    }
+                    Ok((*hash.as_bytes(), PathBuf::from(path)))
+                })
+                .collect::<PyResult<BTreeMap<_, _>>>()?;
+            Ok((name, files))
+        })
+        .collect::<PyResult<BTreeMap<_, _>>>()?;
     py.detach(move || {
         let mut calibration = file_calibration_source(request.view(), caches).map_err(error)?;
+        let mut owners = TritOwnerCalibrationSource::new(owners).map_err(error)?;
         let mut source =
             FileWeightSource::open(request.view(), &shards, assets, grams).map_err(error)?;
         let recorder = EvidenceRecorder::new(
@@ -345,6 +446,9 @@ pub(crate) fn convert_model_plan(
                 CALIBRATED_LEVELS_FITTED_REGISTRATION,
                 CALIBRATED_QUANTIZATION_STARTED_REGISTRATION,
                 CALIBRATED_QUANTIZATION_COMPLETED_REGISTRATION,
+                OWNER_SCORE_LEVELS_FITTED_REGISTRATION,
+                OWNER_QUANTIZATION_STARTED_REGISTRATION,
+                OWNER_QUANTIZATION_COMPLETED_REGISTRATION,
             ],
         )
         .map_err(error)?;
@@ -354,6 +458,14 @@ pub(crate) fn convert_model_plan(
             Plan::Calibrated(plan) => {
                 Engine::run_calibrated(plan, &mut source, &mut calibration, &mut sink, recorder)
             }
+            Plan::Owner(plan) => Engine::run_owner(
+                plan,
+                &mut source,
+                &mut owners,
+                Some(&mut calibration),
+                &mut sink,
+                recorder,
+            ),
         }
         .map_err(error)?;
         Ok(NativeModelConversion {
