@@ -1568,8 +1568,7 @@ mod tests {
     fn unsupported_hf_architecture_is_rejected_before_export_plan() {
         let unsupported = config().replace("\"model_type\": \"llama\"", "\"model_type\": \"test\"");
         let error = ArtifactExportPlan::build(&unsupported, layout(), 2, provenance(), &growth())
-            .err()
-            .expect("unsupported model type must not create a plan");
+            .expect_err("unsupported model type must not create a plan");
         assert!(
             error.to_string().contains("unsupported model_type `test`"),
             "{error}"
