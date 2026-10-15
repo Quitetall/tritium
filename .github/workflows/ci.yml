@@ -62,8 +62,9 @@ jobs:
   # mismatch, or the cuda-gated imports that broke the cpu clippy gate).
   # TRITIUM_CHECK_ONLY=1 makes the tritium-cuda / tritium-rocm build scripts
   # emit empty placeholder kernel artifacts instead of invoking nvcc / hipcc,
-  # so a plain hosted runner can type-check + lint every gated target. Nothing
-  # built here is ever run; the self-hosted lanes remain the execution gates.
+  # so a plain hosted runner can type-check + lint every gated target. No
+  # device operation built here is ever run; the self-hosted lanes remain the
+  # physical execution gates. Host-only feature contracts below run with GPUs hidden.
   gpu-feature-check:
     name: clippy · gpu-feature code (no toolkit)
     runs-on: ubuntu-24.04
@@ -83,6 +84,10 @@ jobs:
       - run: cargo clippy --locked -p tritium-wgpu --features register --all-targets -- -D warnings
       # Downstream cuda-gated consumers (tritium-cli/nccl implies its cuda).
       - run: cargo clippy --locked -p tritium-nn -p tritium-cli -p tritium-py -p tritium-salt -p tritium-benches --features tritium-nn/cuda,tritium-cli/nccl,tritium-py/cuda,tritium-salt/cuda,tritium-benches/cuda --all-targets -- -D warnings
+      - name: Host campaign artifact contracts (no GPU)
+        env:
+          CUDA_VISIBLE_DEVICES: ""
+        run: cargo test --locked -p tritium-cli --features cuda --bin tritium campaign_artifact::tests -- --test-threads=1
       # Downstream NON-NVIDIA consumers (issue #4). These link the wgpu/rocm backend
       # crates so their registrations reach the shipped `tritium` binary and the bench
       # harness. Checked as a separate invocation from the cuda line above precisely
