@@ -171,7 +171,7 @@ fn streamed_resources_reject_bad_contract_before_backend_initialization() {
                 config.as_object_mut().unwrap().remove("stream_limits");
             }
             1 => {
-                config["execution"] = serde_json::json!({"kind":"resident_device_f32","max_device_payload_bytes":1_000_000})
+                config["execution"] = serde_json::json!({"kind":"resident_device_f32","max_device_payload_bytes":1_000_001})
             }
             2 => config["streamed_resources"]["max_source_workspace_bytes"] = 0.into(),
             3 => config["streamed_resources"]["max_host_workspace_bytes"] = 0.into(),
@@ -313,6 +313,12 @@ fn physical_encoded_streamed_typed_binary_serves_cuda_chat_without_resident_fall
 }
 #[cfg(feature = "cuda")]
 #[test]
+fn physical_encoded_streamed_resident_binary_serves_chat_with_reserved_envelope() {
+    tritium_cuda::CudaBackend::new(0).expect("requires physical CUDA");
+    check_actual_typed_binary(true, true, true, true);
+}
+#[cfg(feature = "cuda")]
+#[test]
 fn actual_resident_typed_binary_serves_gpu_chat_and_sse_with_effective_diagnostics() {
     match tritium_cuda::CudaBackend::new(0) {
         Ok(_) => check_actual_typed_binary(true, true, false, true),
@@ -406,7 +412,14 @@ fn check_actual_typed_binary(resident: bool, bounded: bool, streamed: bool, cuda
                     if cuda && additive { 4 } else { 0 }
                 );
                 assert!(admission["retained_host_bytes"].as_u64().unwrap() > 0);
-                assert_eq!(admission.as_object().unwrap().len(), 5);
+                if resident {
+                    assert_eq!(admission["resident_device_payload_limit"], 1_000_000);
+                    assert!(info["resident_payload_bytes"].as_u64().unwrap() <= 1_000_000);
+                }
+                assert_eq!(
+                    admission.as_object().unwrap().len(),
+                    if resident { 6 } else { 5 }
+                );
             } else {
                 assert!(
                     admission.is_null(),

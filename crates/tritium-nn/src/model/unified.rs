@@ -116,6 +116,7 @@ pub struct Runner {
     resources: Option<(
         super::ModelResourceAdmission,
         tritium_runtime::TensorStorageReservation,
+        tritium_runtime::TensorPayloadBudget,
     )>,
 }
 impl Runner {
@@ -186,15 +187,16 @@ impl Runner {
         &mut self,
         admission: super::ModelResourceAdmission,
         reservation: tritium_runtime::TensorStorageReservation,
+        payload: tritium_runtime::TensorPayloadBudget,
     ) {
-        self.resources = Some((admission, reservation));
+        self.resources = Some((admission, reservation, payload));
     }
     /// Covered logical domains admitted before weight materialization, if selected.
     /// Absent for compatibility loading; never a physical-memory qualification.
     #[cfg(feature = "tokenizer")]
     #[must_use]
     pub fn resource_admission(&self) -> Option<super::ModelResourceAdmission> {
-        self.resources.as_ref().map(|(admission, _)| *admission)
+        self.resources.as_ref().map(|(admission, _, _)| *admission)
     }
     /// Actual immutable graph/configuration used by this stream.
     #[must_use]

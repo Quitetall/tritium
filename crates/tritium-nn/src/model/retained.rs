@@ -211,12 +211,24 @@ fn load_reader<R: Read + Seek>(
                     .map(Projection::Tensor)
                 };
                 let weights = plan.assemble(&config, &spec, embedding, vectors, projections)?;
+                if let Some(r) = &reservations {
+                    super::resources::validate_selection(
+                        backend.as_ref(),
+                        r.admission.resident_device_payload_limit,
+                    )?;
+                }
                 Runner::standard(config, weights, backend, spec, admission)?
             }
             Graph::Hybrid(prepared) => {
                 let config = *prepared;
                 let (weights, mtp_weights) =
                     assemble_prepared(&mut model, level, &mut loader, limits, &config)?;
+                if let Some(r) = &reservations {
+                    super::resources::validate_selection(
+                        backend.as_ref(),
+                        r.admission.resident_device_payload_limit,
+                    )?;
+                }
                 let language = Qwen35TextRunner::new(&config.text, weights, backend)?;
                 let mtp = UnverifiedQwen35Mtp::new(&language, mtp_weights)?;
                 Runner::hybrid(config, language, mtp, admission)?
@@ -224,14 +236,22 @@ fn load_reader<R: Read + Seek>(
         }
     };
     if let Some(reservations) = reservations {
+        // Bind before any late failure so graph state drops before the final
+        // partition owner, even when matrix fields precede workspace fields.
+        runner.bind_resources(
+            reservations.admission,
+            reservations.retained_host,
+            reservations.payload.clone(),
+        );
         if reservations.payload.used_bytes() != reservations.admission.payload_bytes {
             return Err(invalid(
                 "actual aggregate payload differs from pre-decode plan",
             ));
         }
-        runner.bind_resources(reservations.admission, reservations.retained_host);
+        super::resources::validate_runner(&runner, reservations.admission)?;
         // Transient source/upload work is no longer needed. Owned handles keep
-        // the payload partition alive, and the runner owns the retained-host guard.
+        // the payload partition alive. Runner also holds the whole envelope
+        // after its executor, alongside the retained-host guard.
     }
     model.verify().map_err(invalid)?;
     let observation = ModelLoaded {

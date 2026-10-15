@@ -138,8 +138,15 @@ impl TypedLoadConfig {
             return Err("--typed resident execution requires positive device payload and explicit stream_limits".into());
         }
         if let Some(r) = self.streamed_resources {
-            if self.stream_limits.is_none() || !matches!(self.execution, Execution::Host {}) {
-                return Err("--typed streamed_resources requires explicit stream_limits and host graph execution".into());
+            if self.stream_limits.is_none() {
+                return Err("--typed streamed_resources requires explicit stream_limits".into());
+            }
+            if let Execution::ResidentDeviceF32 {
+                max_device_payload_bytes,
+            } = self.execution
+                && max_device_payload_bytes as u64 > self.max_payload_bytes
+            {
+                return Err("--typed resident envelope exceeds max_payload_bytes".into());
             }
             if [
                 r.max_source_workspace_bytes,

@@ -79,7 +79,7 @@ fn tokens(output: &std::process::Output) -> Vec<u32> {
         .find_map(|l| serde_json::from_str(l).ok())
         .expect("token array")
 }
-fn check_binary(backend: &str) {
+fn check_binary(backend: &str, resident: bool) {
     for hybrid in [false, true] {
         for additive in [false, true] {
             let root = Scratch::new();
@@ -92,8 +92,13 @@ fn check_binary(backend: &str) {
             if backend == "cuda" {
                 request["streamed_resources"]["max_device_workspace_bytes"] = 4.into();
             }
+            if resident {
+                request["execution"] =
+                    json!({"kind":"resident_device_f32","max_device_payload_bytes":1_000_000});
+            }
             std::fs::write(&path, request.to_string()).unwrap();
             let mut compatibility = request.clone();
+            compatibility.as_object_mut().unwrap().remove("execution");
             compatibility
                 .as_object_mut()
                 .unwrap()
@@ -140,13 +145,19 @@ fn check_binary(backend: &str) {
 }
 #[test]
 fn typed_cpu_binary_matches_decoded_oracle_across_segments_and_exact_context_boundary() {
-    check_binary("cpu");
+    check_binary("cpu", false);
 }
 #[cfg(feature = "cuda")]
 #[test]
 fn physical_typed_cuda_binary_matches_small_cpu_oracle() {
     tritium_cuda::CudaBackend::new(0).expect("physical typed generation requires CUDA");
-    check_binary("cuda");
+    check_binary("cuda", false);
+}
+#[cfg(feature = "cuda")]
+#[test]
+fn physical_typed_resident_binary_streams_weights_without_host_fallback() {
+    tritium_cuda::CudaBackend::new(0).expect("requires physical CUDA");
+    check_binary("cuda", true);
 }
 #[test]
 fn typed_configuration_and_selection_refusals_emit_no_token_report() {
@@ -168,7 +179,7 @@ fn typed_configuration_and_selection_refusals_emit_no_token_report() {
             3 => request["unknown"] = true.into(),
             4 => {
                 request["execution"] =
-                    json!({"kind":"resident_device_f32","max_device_payload_bytes":1_000_000})
+                    json!({"kind":"resident_device_f32","max_device_payload_bytes":1_000_001})
             }
             _ => {}
         }

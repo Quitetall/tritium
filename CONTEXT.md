@@ -45,3 +45,8 @@ _Avoid_: QAT checkpoint, dense master
 Evidence bound to a declared artifact, source, workload, and execution scope.
 It is distinct from a structural plan or a claim of human authorization.
 _Avoid_: capability declaration, approval
+
+**Resident payload envelope**:
+A reserved logical ceiling covering a resident model's matrices and execution
+state. It is distinct from actual payload consumption and measured physical memory.
+_Avoid_: peak VRAM, exact allocation plan, physical fit

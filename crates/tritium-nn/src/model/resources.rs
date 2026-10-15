@@ -15,11 +15,13 @@ use tritium_spec::{
 
 /// Explicit logical storage domains for resource-planned retained loading.
 /// Reuse the same ledger to charge overlapping domains to one aggregate cap.
-/// Source metadata, tokenizer heap, allocator/driver costs and execution scratch
-/// are excluded/unknown. This is not a physical fit or release qualification.
+/// Source metadata, tokenizer heap, allocator/driver, host execution scratch
+/// and resident host metadata are excluded/unknown. This is not a physical fit
+/// or release qualification.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelLoadResources<'a> {
-    /// Whole-model matrix payload, including MTP and counting tied handles once.
+    /// Matrix payload, including MTP and tied handles once; resident selection
+    /// reserves its complete configured device envelope in this parent ledger.
     pub payload: &'a TensorPayloadBudget,
     /// Maximum source working storage during assembly: current encoded+decoded
     /// pair in compatibility mode, bounded matrix windows/preserved pairs in
@@ -39,6 +41,9 @@ pub struct ModelLoadResources<'a> {
 pub struct ModelResourceAdmission {
     /// Aggregate backend-declared owned matrix payload.
     pub payload_bytes: u64,
+    /// Reserved configured matrix/vector/cache/workspace ceiling, if resident.
+    /// Not an exact graph estimate, actual payload or physical VRAM measurement.
+    pub resident_device_payload_limit: Option<u64>,
     /// Conservative maximum encoded+decoded current tensor pair.
     pub source_workspace_bytes: u64,
     /// Conservative maximum additional explicit backend host upload workspace.
@@ -47,6 +52,57 @@ pub struct ModelResourceAdmission {
     pub device_workspace_bytes: u64,
     /// Preserved f32 coefficients plus admitted maximum host language cache.
     pub retained_host_bytes: u64,
+}
+impl ModelResourceAdmission {
+    /// Parent payload reservation: exact matrix plan or conservative resident
+    /// envelope including those matrices. Never a physical-memory measurement.
+    #[must_use]
+    pub fn reserved_payload_bytes(&self) -> u64 {
+        self.resident_device_payload_limit
+            .unwrap_or(self.payload_bytes)
+    }
+}
+
+fn resident_limit(backend: &dyn TernaryBackend) -> Result<Option<u64>, NnError> {
+    match (
+        backend.resident_decoder_requested(),
+        backend.resident_decoder_payload_limit(),
+    ) {
+        (false, None) => Ok(None),
+        (true, Some(limit)) if limit > 0 => u64::try_from(limit).map(Some).map_err(invalid),
+        _ => Err(invalid(
+            "resident payload envelope is unknown or inconsistent",
+        )),
+    }
+}
+pub(super) fn validate_selection(
+    backend: &dyn TernaryBackend,
+    expected: Option<u64>,
+) -> Result<(), NnError> {
+    if resident_limit(backend)? != expected {
+        return Err(invalid(
+            "resident payload envelope changed before graph construction",
+        ));
+    }
+    Ok(())
+}
+pub(super) fn validate_runner(
+    runner: &super::Runner,
+    admission: ModelResourceAdmission,
+) -> Result<(), NnError> {
+    if let Some(limit) = admission.resident_device_payload_limit {
+        let actual = runner
+            .resident_payload_bytes()
+            .and_then(|n| u64::try_from(n).ok());
+        if runner.execution() != tritium_spec::DecoderExecution::ResidentDeviceF32
+            || !actual.is_some_and(|n| n >= admission.payload_bytes && n <= limit)
+        {
+            return Err(invalid(
+                "resident executor payload or execution differs from envelope",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(super) struct LoadReservations {
@@ -91,13 +147,11 @@ pub(super) fn reserve<R: Read + Seek>(
     resources: ModelLoadResources<'_>,
     streamed: bool,
 ) -> Result<LoadReservations, NnError> {
-    if backend.resident_decoder_requested() {
-        return Err(invalid("resident graph resource planning is unavailable"));
-    }
+    let resident_limit = resident_limit(backend)?;
     let AggregatePlan {
         plans,
         stream_plans,
-        admission,
+        mut admission,
     } = calculate(
         model,
         level,
@@ -123,11 +177,17 @@ pub(super) fn reserve<R: Read + Seek>(
             }
         },
     )?;
+    admission.resident_device_payload_limit = resident_limit;
+    if resident_limit.is_some_and(|limit| limit < admission.payload_bytes) {
+        return Err(invalid(
+            "resident payload envelope is smaller than matrix payload",
+        ));
+    }
     // All domains are reserved before any complete tensor is read/decompressed.
     // A later refusal drops earlier guards/partitions, including on shared ledgers.
     let payload = resources
         .payload
-        .partition(admission.payload_bytes)
+        .partition(admission.reserved_payload_bytes())
         .map_err(invalid)?;
     let retained_host = resources
         .retained_host
@@ -172,6 +232,7 @@ fn calculate<R: Read + Seek>(
 ) -> Result<AggregatePlan, NnError> {
     let mut admission = ModelResourceAdmission {
         payload_bytes: 0,
+        resident_device_payload_limit: None,
         source_workspace_bytes: if streamed {
             TENSOR_STREAM_CHUNK_BYTES as u64
         } else {

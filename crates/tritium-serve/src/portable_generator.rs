@@ -236,6 +236,7 @@ fn resource_admission(
         .resource_admission()
         .map(|a| crate::generator::RunnerResourceAdmission {
             payload_bytes: a.payload_bytes,
+            resident_device_payload_limit: a.resident_device_payload_limit,
             source_workspace_bytes: a.source_workspace_bytes,
             host_workspace_bytes: a.host_workspace_bytes,
             device_workspace_bytes: a.device_workspace_bytes,

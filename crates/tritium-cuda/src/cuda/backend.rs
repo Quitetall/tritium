@@ -9246,6 +9246,9 @@ impl TernaryBackend for CudaBackend {
     fn resident_decoder_requested(&self) -> bool {
         self.resident_decoder_budget.is_some()
     }
+    fn resident_decoder_payload_limit(&self) -> Option<usize> {
+        self.resident_decoder_budget
+    }
     fn resident_decoder(
         self: Arc<Self>,
         graph: tritium_spec::DecoderGraph<'_>,

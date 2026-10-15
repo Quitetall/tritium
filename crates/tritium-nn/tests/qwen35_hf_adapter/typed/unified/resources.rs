@@ -202,7 +202,7 @@ fn changed_predecode_plan_and_unknown_resident_resources_refuse_without_upload()
         let error = result.err().unwrap().to_string();
         assert!(
             error.contains(if resident {
-                "resident graph resource planning is unavailable"
+                "resident payload envelope is unknown"
             } else {
                 "upload plan changed after aggregate admission"
             }),
@@ -212,6 +212,150 @@ fn changed_predecode_plan_and_unknown_resident_resources_refuse_without_upload()
         assert!(evidence.events().is_empty());
         empty(&budgets);
     }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn physical_streamed_resident_envelopes_cover_the_complete_runner_lifetime() {
+    use tritium_spec::DecoderExecution;
+    const LIMIT: usize = 1_000_000;
+    let mut cases = 0;
+    for uniform in [false, true] {
+        let bytes = text_package(uniform, false).bytes();
+        let source = ModelSource::Trit {
+            bytes: &bytes,
+            level: "typed",
+        };
+        let budgets = ledgers();
+        let mut evidence = recorder();
+        let mut loaded = guarded_mode(
+            source,
+            Box::new(
+                tritium_cuda::CudaBackend::new(0)
+                    .expect("requires physical CUDA")
+                    .with_resident_decoder(LIMIT),
+            ),
+            &budgets,
+            &mut evidence,
+            true,
+        )
+        .unwrap();
+        let admission = loaded.runner.resource_admission().unwrap();
+        assert_eq!(admission.resident_device_payload_limit, Some(LIMIT as u64));
+        assert_eq!(admission.reserved_payload_bytes(), LIMIT as u64);
+        assert_eq!(budgets[0].used_bytes(), LIMIT as u64);
+        assert!(budgets[1..4].iter().all(|b| b.used_bytes() == 0));
+        assert_eq!(
+            loaded.runner.execution(),
+            DecoderExecution::ResidentDeviceF32
+        );
+        let actual = loaded.runner.resident_payload_bytes().unwrap();
+        assert!(actual > admission.payload_bytes as usize && actual <= LIMIT);
+        let uploaded = evidence
+            .events()
+            .iter()
+            .filter(|e| e.schema == tritium_evidence::TensorUploaded::SCHEMA_ID)
+            .map(|e| e.payload["caps"]["payload_bytes"].as_u64().unwrap())
+            .sum::<u64>();
+        assert_eq!(uploaded, admission.payload_bytes);
+        let mut cpu = guarded_mode(
+            source,
+            Box::new(tritium_cpu::CpuBackend::new()),
+            &ledgers(),
+            &mut recorder(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            cpu.runner
+                .resource_admission()
+                .unwrap()
+                .resident_device_payload_limit,
+            None
+        );
+        for tokens in [&[1, 2][..], &[3][..]] {
+            let at = loaded.runner.cache_len();
+            let positions = (at..at + tokens.len()).collect::<Vec<_>>();
+            let got = loaded.runner.forward(tokens, &positions).unwrap();
+            let expected = cpu.runner.forward(tokens, &positions).unwrap();
+            for (a, b) in got.iter().zip(&expected) {
+                assert!((a - b).abs() <= 2e-4 + 2e-4 * b.abs(), "{a} != {b}");
+            }
+        }
+        loaded.runner.reset();
+        cpu.runner.reset();
+        assert!(
+            loaded
+                .runner
+                .prefill(&[1, 2])
+                .unwrap()
+                .iter()
+                .zip(cpu.runner.prefill(&[1, 2]).unwrap())
+                .all(|(a, b)| (a - b).abs() <= 2e-4 + 2e-4 * b.abs())
+        );
+        // A second model cannot borrow this reserved envelope while the first runs.
+        let mut refused = recorder();
+        assert!(
+            guarded_mode(
+                source,
+                Box::new(
+                    tritium_cuda::CudaBackend::new(0)
+                        .unwrap()
+                        .with_resident_decoder(LIMIT)
+                ),
+                &budgets,
+                &mut refused,
+                true
+            )
+            .is_err()
+        );
+        assert!(refused.events().is_empty());
+        assert_eq!(budgets[0].used_bytes(), LIMIT as u64);
+        let runner = loaded.runner;
+        assert_eq!(budgets[0].used_bytes(), LIMIT as u64);
+        drop(runner);
+        empty(&budgets);
+        // Parent one byte short rejects before upload. A matrix-only ceiling
+        // admits uploads but the real factory rejects its additional state.
+        for cap in [LIMIT, admission.payload_bytes as usize, 1, 0] {
+            let mut rejected_budgets = ledgers();
+            if cap == LIMIT {
+                rejected_budgets[0] = TensorPayloadBudget::new(LIMIT as u64 - 1);
+            }
+            let mut rejected = recorder();
+            let result = guarded_mode(
+                source,
+                Box::new(
+                    tritium_cuda::CudaBackend::new(0)
+                        .unwrap()
+                        .with_resident_decoder(cap),
+                ),
+                &rejected_budgets,
+                &mut rejected,
+                true,
+            );
+            assert!(result.is_err());
+            if cap == LIMIT || cap < admission.payload_bytes as usize {
+                assert!(rejected.events().is_empty());
+            } else {
+                assert!(
+                    rejected
+                        .events()
+                        .iter()
+                        .any(|e| e.schema == tritium_evidence::TensorUploaded::SCHEMA_ID)
+                );
+            }
+            assert!(
+                !rejected
+                    .events()
+                    .iter()
+                    .any(|e| e.schema == ModelLoaded::SCHEMA_ID)
+            );
+            empty(&rejected_budgets);
+        }
+        cases += 1;
+    }
+    eprintln!("PHYSICAL_STREAMED_RESIDENT_ENVELOPES={cases}");
 }
 
 #[test]

@@ -78,8 +78,9 @@ is allowed only when the backend explicitly plans zero. Other ceilings must be
 positive. Unknown streaming/resource support refuses before matrix upload.
 Reservations follow the loaded runner into the serving worker; failure drops
 private partial handles. Preserved host vectors retain their bounded decode path.
-Metadata/tokenizer heaps, allocator/driver/pinned costs and activation scratch
-remain excluded: this is logical admission, not complete physical fit.
+Metadata/tokenizer heaps, allocator/driver/pinned costs, host execution scratch
+and resident host metadata remain excluded: this is logical admission, not
+complete physical fit.
 CUDA streams into unpublished device storage using bounded host windows. Its
 logical plan charges192KiB additive/384KiB dense host upload workspace, including
 its bounded pinned double buffers, plus a
@@ -88,15 +89,29 @@ its bounded pinned double buffers, plus a
 Driver registration/page-rounding/compiler/allocator overhead and physical peaks
 remain unknown. Per-buffer completion events protect reuse and cleanup; final
 stream checks still precede exposure. Actual overlap/throughput is not qualified.
-`streamed_resources` currently requires host graph execution (CUDA
-matrix operations are allowed), not `resident_device_f32`. Omitting it preserves
-the explicit compatibility loader and does not invent resource admission.
+`streamed_resources` also supports explicit `resident_device_f32` execution.
+For that combination, `max_payload_bytes` must cover the entire configured
+`execution.max_device_payload_bytes` envelope. The caller's payload ledger
+reserves that full ceiling before weight upload, including matrices and resident
+vectors/cache/workspace; matrix leases do not charge the parent twice. The real
+CUDA factory still computes and checks its complete allocation before graph
+allocation. An unavailable/changed backend ceiling or insufficient envelope
+refuses rather than falling back to host execution.
+
+Readiness keeps `payload_bytes` as the exact declared matrix payload and adds
+`resident_device_payload_limit` only for a reserved resident envelope. The
+separate `runtime_info.resident_payload_bytes` is the actual declared graph
+payload. A reserved ceiling is neither an exact estimate nor measured VRAM.
+Runner retains the envelope until its executor has dropped, including after
+handoff to the worker. Omitting `streamed_resources` preserves the explicit
+compatibility loader and does not invent resource admission.
 
 Optional `execution` defaults to `{"kind":"host"}`. To request the common CUDA
-device-f32 graph, build with `--features cuda`, use `--backend cuda`, and add both:
+device-f32 graph, build with `--features cuda`, use `--backend cuda`, and merge:
 
 ```json
 {
+  "max_payload_bytes": 17179869184,
   "stream_limits": {
     "max_context": 4096,
     "max_segment_tokens": 128,

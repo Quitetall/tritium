@@ -357,6 +357,16 @@ pub trait TernaryBackend: Send + Sync {
         false
     }
 
+    /// Fixed configured ceiling for all resident matrices, vectors, cache and
+    /// workspace. `None` is unknown, not a zero-byte plan. Selected adapters may
+    /// expose this for conservative pre-upload envelope reservation only if
+    /// their real factory enforces it before graph allocation. The value must
+    /// remain fixed while the backend is shared; this is not actual or physical
+    /// memory consumption. Defaults preserve fail-closed resource loading.
+    fn resident_decoder_payload_limit(&self) -> Option<usize> {
+        None
+    }
+
     /// Compile existing shared graph weights into an owned resident executor.
     /// Default decline leaves common host dispatch unchanged. The owned Arc
     /// receiver keeps backend resources alive without caller downcasts.

@@ -6,6 +6,9 @@ use tritium_spec::{
     DecoderLayers, DecoderLimits, DecoderSemantics,
 };
 
+#[path = "resident_resources.rs"]
+mod resources;
+
 fn cuda(budget: Option<usize>) -> Option<tritium_cuda::CudaBackend> {
     match tritium_cuda::CudaBackend::new(0) {
         Ok(backend) => Some(match budget {

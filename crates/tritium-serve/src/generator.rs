@@ -508,6 +508,10 @@ impl CancellationCapabilitiesV1 {
 pub struct RunnerResourceAdmission {
     /// Logical matrix payload, including admitted draft weights and tied sharing.
     pub payload_bytes: u64,
+    /// Reserved resident matrix/vector/cache/workspace ceiling, not measured VRAM.
+    /// Omitted for existing host-only resource admissions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resident_device_payload_limit: Option<u64>,
     /// Maximum concurrent source window or preserved encoded/decoded pair.
     pub source_workspace_bytes: u64,
     /// Backend-declared additional host upload workspace.
@@ -530,7 +534,8 @@ pub struct RunnerRuntimeInfo {
     /// Logical resident payload, excluding allocator/driver/host overhead.
     pub resident_payload_bytes: Option<usize>,
     /// Covered logical domains only; absent for compatibility/undeclared loads.
-    /// Excludes metadata/tokenizer heaps, allocator/driver and execution scratch.
+    /// Excludes metadata/tokenizer heaps, allocator/driver, host execution scratch
+    /// and resident host metadata.
     pub resource_admission: Option<RunnerResourceAdmission>,
 }
 
