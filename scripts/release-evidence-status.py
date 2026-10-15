@@ -135,6 +135,11 @@ SOURCE_ADMISSION_RECEIPT = runpy.run_path(
 )
 validate_source_admission = SOURCE_ADMISSION_RECEIPT["validate"]
 SourceAdmissionError = SOURCE_ADMISSION_RECEIPT["SourceAdmissionError"]
+OFFICIAL_SOURCE_IDENTITY = runpy.run_path(
+    Path(__file__).with_name("verify-qwen36-official-source-identity.py")
+)
+validate_official_source_identity = OFFICIAL_SOURCE_IDENTITY["validate_identity_receipt"]
+OfficialSourceIdentityError = OFFICIAL_SOURCE_IDENTITY["OfficialIdentityError"]
 
 SCHEMA = "tritium.release-evidence-registry.v1"
 REPORT_SCHEMA = "tritium.release-gate-report.v1"
@@ -174,7 +179,7 @@ KNOWN_KINDS = frozenset(
         "estimator-validation",
         "refinement",
         "baseline-ablation",
-        "source-admission",
+        "source-admission", "official-source-identity",
     }
 )
 HEX = frozenset("0123456789abcdef")
@@ -183,7 +188,7 @@ MAX_RECEIPT_BYTES = 32 * 1024 * 1024
 # This policy is code, not registry input: a partial or adversarial registry cannot
 # remove release gates. New receipt schemas become useful only after a validator lands.
 GATES = (
-    ("qwen-source-admission", ("source-admission",)),
+    ("qwen-source-admission", ("source-admission", "official-source-identity")),
     (
         "flagship-qwen",
         ("conversion-refinement", "quality", "task-retention", "runtime", "physical-bytes"),
@@ -413,7 +418,7 @@ def evaluate(
                 "conversion-refinement", "quality", "task-retention", "runtime",
                 "physical-bytes", "stage7-recipe-freeze",
             }
-            else "source-admission" if kind == "source-admission"
+            else "source-admission" if kind in {"source-admission", "official-source-identity"}
             else "onnx-bundle" if kind == "onnx-inference"
             else "training-receipt-bundle" if kind in {"backend-manifest", "performance"}
             else "model-bundle" if kind in {"refinement", "baseline-ablation"}
@@ -590,6 +595,19 @@ def evaluate(
                 receipt = validate_source_admission(
                     receipt_path, revision, release, candidate
                 )
+                if receipt["receipt_id"] != receipt_id:
+                    raise SourceAdmissionError(
+                        "registry ID differs from source-admission receipt ID"
+                    )
+            elif kind == "official-source-identity":
+                receipt = validate_official_source_identity(receipt_path)
+                if receipt["receipt_id"] != receipt_id:
+                    raise OfficialSourceIdentityError(
+                        "registry ID differs from official source identity receipt ID"
+                    )
+                receipt["run_id"] = (
+                    "qwen36-official-source-identity-" + receipt["receipt_id"]
+                )
             elif kind in {"oci-runtime-cpu", "oci-runtime-cuda"}:
                 receipt = load_oci_runtime_receipt(
                     receipt_path, revision=revision, release=release,
@@ -672,6 +690,7 @@ def evaluate(
             DispatchCudaReceiptError,
             EstimatorRefinementError,
             SourceAdmissionError,
+            OfficialSourceIdentityError,
             ValueError,
         ) as error:
             raise EvidenceError(f"{label} failed {kind} validation: {error}") from error
@@ -982,7 +1001,7 @@ def evaluate(
                 raise EvidenceError(
                     "source-admission does not bind candidate source_model_id"
                 )
-        elif receipt["artifact"]["kind"] != "python-wheel":
+        elif kind != "official-source-identity" and receipt["artifact"]["kind"] != "python-wheel":
             raise EvidenceError(f"{kind} receipt does not identify a Python wheel")
         run_id = receipt["run_id"]
         if run_id in run_ids:
@@ -998,6 +1017,36 @@ def evaluate(
         paths.add(logical_path)
         portable_paths.add(portable_path)
     _check_ancestry(entries)
+    for receipt_id, kind in kinds.items():
+        if kind != "official-source-identity":
+            continue
+        identity = validated_receipts[receipt_id]
+        parent_ids = entries[receipt_id]["parents"]
+        if len(parent_ids) != 1:
+            raise EvidenceError(
+                "official source identity must have exactly one source-admission parent"
+            )
+        parent_id = parent_ids[0]
+        if kinds.get(parent_id) != "source-admission":
+            raise EvidenceError(
+                "official source identity parent must be source-admission"
+            )
+        admission = validated_receipts[parent_id]["receipt"]
+        if artifact_ids[parent_id] != artifact_ids[receipt_id]:
+            raise EvidenceError(
+                "official source identity and source-admission must bind the same candidate artifact"
+            )
+        if (
+            identity["source_admission_receipt_id"] != parent_id
+            or identity["repository"] != admission["repository"]
+            or identity["revision"] != admission["revision"]
+            or identity["source_model_id"] != admission["source_model_id"]
+            or identity["manifest_content_id"] != admission["manifest_content_id"]
+            or identity["source_proof_id"] != admission["proof_id"]
+        ):
+            raise EvidenceError(
+                "official source identity does not match its exact source-admission parent"
+            )
     backend_ids = [
         receipt_id for receipt_id, kind in kinds.items() if kind == "backend-manifest"
     ]

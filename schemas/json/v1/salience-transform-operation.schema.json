@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SalienceTransformOperation",
+  "description": "One ordered, named paired operation; names do not prove graph eligibility.",
+  "type": "object",
+  "properties": {
+    "alpha_bits": {
+      "description": "Exact little-endian f64 alpha bits, including signed zero.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 8,
+      "minItems": 8
+    },
+    "inverse": {
+      "description": "Distinct norm/linear partner whose channels/output rows are divided.",
+      "type": "string"
+    },
+    "inverse_axis": {
+      "description": "Explicit partner interpretation; no inference from tensor naming.",
+      "$ref": "#/$defs/SalienceInverseAxis"
+    },
+    "moments": {
+      "description": "Exact expected statistics and declared count interpretation.",
+      "$ref": "#/$defs/SalienceMomentBinding"
+    },
+    "name": {
+      "description": "Unique logical operation name, used to select the actual statistics.",
+      "type": "string"
+    },
+    "projections": {
+      "description": "Actual matrices whose input columns are multiplied, in declared order.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "projections",
+    "inverse",
+    "inverse_axis",
+    "moments",
+    "alpha_bits"
+  ],
+  "$defs": {
+    "BlobId": {
+      "description": "Content identity for stored tensor or asset bytes.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "SalienceInverseAxis": {
+      "description": "Explicit axis of the graph partner divided by each stored scale.",
+      "oneOf": [
+        {
+          "description": "Rank-one preceding norm, one channel per projection input column.",
+          "type": "string",
+          "const": "NormChannels"
+        },
+        {
+          "description": "Rank-two linear partner, one output row per projection input column.",
+          "type": "string",
+          "const": "LinearOutputRows"
+        }
+      ]
+    },
+    "SalienceMomentBinding": {
+      "description": "Exact actual moment content plus explicitly declared interpretation.",
+      "type": "object",
+      "properties": {
+        "channels": {
+          "description": "One moment per projection input column and partner output channel.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "content": {
+          "description": "BLAKE3 of row-major little-endian f64 second-moment sums, not an activation hash.",
+          "$ref": "#/$defs/BlobId"
+        },
+        "rows": {
+          "description": "Declared positive sample count; not proof of observed row execution.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "content",
+        "channels",
+        "rows"
+      ]
+    }
+  }
+}

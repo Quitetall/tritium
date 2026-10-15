@@ -7,7 +7,8 @@ comparison requires the pinned RTX 4090 plus the BitNet 2B4T model, which this
 book's CI does not have. The committed numbers live in code
 (`benches/src/lib.rs`) with explicit provenance, and the harness is built so a
 CPU-hosted CI can prove the *logic* of the gates without ever owning a GPU. The
-methodology follows the v0.30 performance ADR (see the [research repository](https://github.com/Quitetall/tritium-research)).
+methodology follows the v0.30 performance ADR; see the
+[research-record access policy](./research-records.md).
 
 <!-- BEGIN TRITIUM GENERATED RELEASE CLAIMS -->
 ## Release-claim boundary
@@ -203,9 +204,8 @@ the methodology above splits decode from prefill:
 > zero-sparsity is exploited" is the central claim of those research docs, and
 > the corollary is that **Tritium does not yet exploit P1 (sparsity)** — its CUDA
 > kernels do not skip zeros. That is a documented gap, not a shipped capability.
-> The research notes live in the [research repository](https://github.com/Quitetall/tritium-research) (they are
-> working analysis, not part of this guide), so they are referenced by path
-> rather than linked here.
+> The research notes are internal working analysis, not part of this guide;
+> see the [research-record access policy](./research-records.md).
 
 ## What CPU-hosted CI proves vs what needs the pinned hardware
 
@@ -224,5 +224,5 @@ ceiling formula, the gate arithmetic, the baseline provenance, the SALT error
 math) runs on the hosted CPU lane, so a regression in the *methodology* fails
 fast and free. The *physical* numbers — and any claim of beating a competitor —
 are fenced behind the pinned hardware, exactly as the
-v1.0 release gate (see the [research repository](https://github.com/Quitetall/tritium-research)) requires for a
-third-party-reproducible benchmark report.
+v1.0 release gate (see the [research-record access policy](./research-records.md))
+requires for a third-party-reproducible benchmark report.

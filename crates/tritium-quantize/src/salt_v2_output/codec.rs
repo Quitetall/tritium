@@ -6,15 +6,17 @@ use super::{
     RECEIPT_HASH_CONTEXT, select_output_reconstruction,
 };
 use std::collections::BTreeSet;
+use tritium_format::{RuntimeOutputScope, RuntimeOutputScopeEvidence};
 
 const RECEIPT_MAGIC: [u8; 8] = *b"TSV2OUT\0";
 const LEGACY_RECEIPT_VERSION: u16 = 1;
-const RECEIPT_VERSION: u16 = 2;
+const RECEIPT_VERSION_V2: u16 = 2;
+const RECEIPT_VERSION: u16 = 3;
 const MAX_RECEIPT_BYTES: usize = 4 * 1024 * 1024;
 const FIXED_RECEIPT_BYTES: usize = 8 + 2 + 2 + 32 + 32 + 32 + 4 + 32;
 const LEGACY_CANDIDATE_BYTES: usize = 224;
 const CANDIDATE_BYTES: usize = 272;
-const MAX_CANDIDATES: usize = (MAX_RECEIPT_BYTES - FIXED_RECEIPT_BYTES) / CANDIDATE_BYTES;
+const V3_SCOPE_BYTES: usize = 1 + 4 + 4 + 8 + 8 + 32;
 
 impl OutputReconstructionReceipt {
     /// Encode the complete matched-basin receipt in canonical binary form.
@@ -24,10 +26,31 @@ impl OutputReconstructionReceipt {
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, OutputReconstructionError> {
         let count = u32::try_from(self.candidates.len())
             .map_err(|_| OutputReconstructionError::ReceiptTooLarge)?;
+        let has_scope_evidence = self
+            .candidates
+            .first()
+            .is_some_and(|candidate| !candidate.scope_evidence.is_empty());
+        if self
+            .candidates
+            .iter()
+            .any(|candidate| !candidate.scope_evidence.is_empty() != has_scope_evidence)
+        {
+            return Err(OutputReconstructionError::CandidateSpecMismatch);
+        }
+        let version = if has_scope_evidence {
+            RECEIPT_VERSION
+        } else {
+            RECEIPT_VERSION_V2
+        };
+        let per_candidate = if has_scope_evidence {
+            v3_candidate_bytes(self.candidates[0].scope_evidence.len())?
+        } else {
+            CANDIDATE_BYTES
+        };
         let candidate_bytes = self
             .candidates
             .len()
-            .checked_mul(CANDIDATE_BYTES)
+            .checked_mul(per_candidate)
             .ok_or(OutputReconstructionError::ReceiptTooLarge)?;
         let capacity = FIXED_RECEIPT_BYTES
             .checked_add(candidate_bytes)
@@ -40,14 +63,14 @@ impl OutputReconstructionReceipt {
             .try_reserve_exact(capacity)
             .map_err(|_| OutputReconstructionError::ReceiptAllocationFailed)?;
         output.extend_from_slice(&RECEIPT_MAGIC);
-        output.extend_from_slice(&RECEIPT_VERSION.to_le_bytes());
+        output.extend_from_slice(&version.to_le_bytes());
         output.extend_from_slice(&0u16.to_le_bytes());
         output.extend_from_slice(&self.spec_id);
         output.extend_from_slice(&self.teacher_evidence_digest);
         output.extend_from_slice(&self.selected_candidate_id);
         output.extend_from_slice(&count.to_le_bytes());
         for candidate in &self.candidates {
-            encode_candidate(&mut output, candidate);
+            encode_candidate(&mut output, candidate, version);
         }
         output.extend_from_slice(&self.receipt_id);
         debug_assert_eq!(output.len(), capacity);
@@ -73,7 +96,8 @@ impl OutputReconstructionReceipt {
         if cursor.take(8)? != RECEIPT_MAGIC {
             return Err(OutputReconstructionError::MalformedReceipt("magic"));
         }
-        if cursor.u16()? != RECEIPT_VERSION {
+        let version = cursor.u16()?;
+        if version != RECEIPT_VERSION_V2 && version != RECEIPT_VERSION {
             return Err(OutputReconstructionError::MalformedReceipt("version"));
         }
         if cursor.u16()? != 0 {
@@ -93,11 +117,16 @@ impl OutputReconstructionReceipt {
                 got: count,
             });
         }
-        if count > MAX_CANDIDATES {
+        let per_candidate = if version == RECEIPT_VERSION {
+            v3_candidate_bytes(spec.scopes().len())?
+        } else {
+            CANDIDATE_BYTES
+        };
+        if count > (MAX_RECEIPT_BYTES - FIXED_RECEIPT_BYTES) / per_candidate {
             return Err(OutputReconstructionError::ReceiptTooLarge);
         }
         let expected_bytes = count
-            .checked_mul(CANDIDATE_BYTES)
+            .checked_mul(per_candidate)
             .and_then(|candidate_bytes| FIXED_RECEIPT_BYTES.checked_add(candidate_bytes))
             .ok_or(OutputReconstructionError::ReceiptTooLarge)?;
         if bytes.len() != expected_bytes {
@@ -108,7 +137,7 @@ impl OutputReconstructionReceipt {
             .try_reserve_exact(count)
             .map_err(|_| OutputReconstructionError::ReceiptAllocationFailed)?;
         for _ in 0..count {
-            candidates.push(decode_candidate(spec, &mut cursor)?);
+            candidates.push(decode_candidate(spec, &mut cursor, version)?);
         }
         let receipt_id = cursor.digest()?;
         if !cursor.is_empty() {
@@ -219,7 +248,7 @@ impl OutputReconstructionReceipt {
     }
 }
 
-fn encode_candidate(output: &mut Vec<u8>, candidate: &OutputCandidateReceipt) {
+fn encode_candidate(output: &mut Vec<u8>, candidate: &OutputCandidateReceipt, version: u16) {
     output.extend_from_slice(&candidate.spec_id);
     output.extend_from_slice(&candidate.candidate_id);
     output.extend_from_slice(&candidate.initialization_seed.to_le_bytes());
@@ -239,29 +268,150 @@ fn encode_candidate(output: &mut Vec<u8>, candidate: &OutputCandidateReceipt) {
     ] {
         output.extend_from_slice(&value.to_bits().to_le_bytes());
     }
+    if version == RECEIPT_VERSION {
+        output.extend_from_slice(
+            &u32::try_from(candidate.scope_evidence.len())
+                .expect("validated v3 scope count fits u32")
+                .to_le_bytes(),
+        );
+        for evidence in &candidate.scope_evidence {
+            encode_scope_evidence(output, evidence);
+        }
+    }
     output.extend_from_slice(&candidate.receipt_id);
+}
+
+fn encode_scope_evidence(output: &mut Vec<u8>, evidence: &RuntimeOutputScopeEvidence) {
+    match evidence.scope() {
+        RuntimeOutputScope::Block { start, end } => {
+            output.push(1);
+            output.extend_from_slice(&start.to_le_bytes());
+            output.extend_from_slice(&end.to_le_bytes());
+        }
+        RuntimeOutputScope::FinalLogits => {
+            output.push(2);
+            output.extend_from_slice(&0_u32.to_le_bytes());
+            output.extend_from_slice(&0_u32.to_le_bytes());
+        }
+    }
+    output.extend_from_slice(&evidence.observation_count().to_le_bytes());
+    output.extend_from_slice(&evidence.value_count().to_le_bytes());
+    output.extend_from_slice(evidence.digest());
+}
+
+fn decode_scope(
+    expected: &super::OutputReconstructionScope,
+    cursor: &mut OutputReceiptCursor<'_>,
+) -> Result<RuntimeOutputScope, OutputReconstructionError> {
+    let tag = cursor.u8()?;
+    let start = cursor.u32()?;
+    let end = cursor.u32()?;
+    let actual = match tag {
+        1 => RuntimeOutputScope::Block { start, end },
+        2 if start == 0 && end == 0 => RuntimeOutputScope::FinalLogits,
+        _ => {
+            return Err(OutputReconstructionError::MalformedReceipt(
+                "candidate scope tag",
+            ));
+        }
+    };
+    let expected = match expected {
+        super::OutputReconstructionScope::Block { start, end } => RuntimeOutputScope::Block {
+            start: *start,
+            end: *end,
+        },
+        super::OutputReconstructionScope::FinalLogits => RuntimeOutputScope::FinalLogits,
+    };
+    if actual != expected {
+        return Err(OutputReconstructionError::MalformedReceipt(
+            "candidate scope order",
+        ));
+    }
+    Ok(actual)
+}
+
+fn v3_candidate_bytes(scope_count: usize) -> Result<usize, OutputReconstructionError> {
+    scope_count
+        .checked_mul(V3_SCOPE_BYTES)
+        .and_then(|bytes| CANDIDATE_BYTES.checked_add(4)?.checked_add(bytes))
+        .ok_or(OutputReconstructionError::ReceiptTooLarge)
 }
 
 fn decode_candidate(
     spec: &OutputReconstructionSpec,
     cursor: &mut OutputReceiptCursor<'_>,
+    version: u16,
 ) -> Result<OutputCandidateReceipt, OutputReconstructionError> {
+    let spec_id = cursor.digest()?;
+    let candidate_id = cursor.digest()?;
+    let initialization_seed = cursor.u64()?;
+    let teacher_evidence_digest = cursor.digest()?;
+    let student_output_digest = cursor.digest()?;
+    let runtime_final_logits_digest = cursor.digest()?;
+    let runtime_batch_count = cursor.u64()?;
+    let runtime_logit_count = cursor.u64()?;
+    let observations = cursor.u64()?;
+    let block_elements = cursor.u64()?;
+    let final_tokens = cursor.u64()?;
+    let block_output_mse = cursor.f64()?;
+    let teacher_cross_entropy = cursor.f64()?;
+    let teacher_kl = cursor.f64()?;
+    let objective = cursor.f64()?;
+    let scope_evidence = if version == RECEIPT_VERSION {
+        let count = usize::try_from(cursor.u32()?)
+            .map_err(|_| OutputReconstructionError::ReceiptTooLarge)?;
+        if count != spec.scopes().len() {
+            return Err(OutputReconstructionError::MalformedReceipt(
+                "candidate scope count",
+            ));
+        }
+        let mut scopes = Vec::new();
+        scopes
+            .try_reserve_exact(count)
+            .map_err(|_| OutputReconstructionError::ReceiptAllocationFailed)?;
+        for expected in spec.scopes() {
+            let scope = decode_scope(expected, cursor)?;
+            let observation_count = cursor.u64()?;
+            let value_count = cursor.u64()?;
+            let digest = cursor.digest()?;
+            let scope = RuntimeOutputScopeEvidence::from_canonical_parts(
+                scope,
+                spec_id,
+                candidate_id,
+                initialization_seed,
+                digest,
+                observation_count,
+                value_count,
+            )
+            .map_err(|_| OutputReconstructionError::MalformedReceipt("candidate scope"))?;
+            if observation_count != u64::from(spec.batches_per_scope()) {
+                return Err(OutputReconstructionError::MalformedReceipt(
+                    "candidate scope observations",
+                ));
+            }
+            scopes.push(scope);
+        }
+        scopes
+    } else {
+        Vec::new()
+    };
     let candidate = OutputCandidateReceipt {
-        spec_id: cursor.digest()?,
-        candidate_id: cursor.digest()?,
-        initialization_seed: cursor.u64()?,
-        teacher_evidence_digest: cursor.digest()?,
-        student_output_digest: cursor.digest()?,
-        runtime_final_logits_digest: cursor.digest()?,
-        runtime_batch_count: cursor.u64()?,
-        runtime_logit_count: cursor.u64()?,
-        observations: cursor.u64()?,
-        block_elements: cursor.u64()?,
-        final_tokens: cursor.u64()?,
-        block_output_mse: cursor.f64()?,
-        teacher_cross_entropy: cursor.f64()?,
-        teacher_kl: cursor.f64()?,
-        objective: cursor.f64()?,
+        spec_id,
+        candidate_id,
+        initialization_seed,
+        teacher_evidence_digest,
+        student_output_digest,
+        runtime_final_logits_digest,
+        runtime_batch_count,
+        runtime_logit_count,
+        observations,
+        block_elements,
+        final_tokens,
+        block_output_mse,
+        teacher_cross_entropy,
+        teacher_kl,
+        objective,
+        scope_evidence,
         receipt_id: cursor.digest()?,
     };
     if candidate.candidate_id == [0; 32]
@@ -483,6 +633,10 @@ impl<'a> OutputReceiptCursor<'a> {
             .ok_or(OutputReconstructionError::MalformedReceipt("truncated"))?;
         self.offset = end;
         Ok(bytes)
+    }
+
+    fn u8(&mut self) -> Result<u8, OutputReconstructionError> {
+        Ok(self.take(1)?[0])
     }
 
     fn u16(&mut self) -> Result<u16, OutputReconstructionError> {

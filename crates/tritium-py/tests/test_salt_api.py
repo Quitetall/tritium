@@ -21,6 +21,8 @@ def test_python_wrapper_preserves_paths_and_explicit_recipe(monkeypatch, tmp_pat
         revision="revision",
         work_dir=tmp_path / "work",
         evidence_dir=tmp_path / "evidence",
+        source_admission_receipt=tmp_path / "source-admission.json",
+        official_identity_receipt=tmp_path / "official-source-identity.json",
         packing="s34",
         max_evidence_bytes=1234,
     )
@@ -35,6 +37,8 @@ def test_python_wrapper_preserves_paths_and_explicit_recipe(monkeypatch, tmp_pat
     assert captured["kwargs"] == {
         "packing": "s34",
         "max_evidence_bytes": 1234,
+        "source_admission_receipt": str(tmp_path / "source-admission.json"),
+        "official_identity_receipt": str(tmp_path / "official-source-identity.json"),
     }
 
 
@@ -74,6 +78,8 @@ def test_package_wrapper_preserves_exact_ceilings_and_output(monkeypatch, tmp_pa
         revision="revision",
         work_dir=tmp_path / "work",
         evidence_dir=tmp_path / "evidence",
+        source_admission_receipt=tmp_path / "source-admission.json",
+        official_identity_receipt=tmp_path / "official-source-identity.json",
         output_dir=tmp_path / "artifact",
         compact_max_bytes=100,
         compact_max_resident_bytes=200,
@@ -98,6 +104,8 @@ def test_package_wrapper_preserves_exact_ceilings_and_output(monkeypatch, tmp_pa
         "near_lossless_max_resident_bytes": 400,
         "packing": "d2",
         "max_evidence_bytes": 500,
+        "source_admission_receipt": str(tmp_path / "source-admission.json"),
+        "official_identity_receipt": str(tmp_path / "official-source-identity.json"),
     }
 
 
@@ -115,6 +123,8 @@ def test_native_boundary_rejects_revision_before_source_io(tmp_path):
             "wrong-revision",
             str(tmp_path / "work"),
             str(tmp_path / "evidence"),
+            source_admission_receipt=str(tmp_path / "source-admission.json"),
+            official_identity_receipt=str(tmp_path / "official-source-identity.json"),
         )
 
     with pytest.raises(ValueError, match="pinned Qwen3.6 revision"):
@@ -128,6 +138,8 @@ def test_native_boundary_rejects_revision_before_source_io(tmp_path):
             compact_max_resident_bytes=1,
             near_lossless_max_bytes=1,
             near_lossless_max_resident_bytes=1,
+            source_admission_receipt=str(tmp_path / "source-admission.json"),
+            official_identity_receipt=str(tmp_path / "official-source-identity.json"),
         )
 
 

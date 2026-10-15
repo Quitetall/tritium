@@ -3,8 +3,166 @@
 //! the individually-gradchecked ops) must match a finite difference end-to-end.
 
 use tritium_train::Tape;
-use tritium_train::nn::{attention, attention_heads};
+use tritium_train::nn::{
+    AttentionQkNorm, attention, attention_heads, attention_heads_traced,
+    attention_heads_traced_with_qk_norm,
+};
 use tritium_train::ops::{dense, rope, shape, softmax};
+
+#[test]
+fn qk_normalized_attention_gradchecks_inputs_projections_and_learned_norms() {
+    let (x, q, k, v, _) = weights();
+    let inputs = [x, q, k, v, vec![0.8, 1.3], vec![1.2, 0.7]];
+    let build = |t: &mut Tape, inputs: &[Vec<f32>; 6]| {
+        let ids: Vec<_> = inputs.iter().map(|v| t.leaf(v.clone())).collect();
+        let trace = attention_heads_traced_with_qk_norm(
+            t,
+            ids[0],
+            ids[1],
+            ids[2],
+            ids[3],
+            SEQ,
+            N_EMBD,
+            N_HEAD,
+            N_KV_HEAD,
+            HEAD_DIM,
+            THETA,
+            Some(AttentionQkNorm {
+                query: ids[4],
+                key: ids[5],
+                eps: 1e-5,
+            }),
+        );
+        (trace, ids)
+    };
+    let target = seeded(19, SEQ * QD);
+    let mut tape = Tape::new();
+    let (trace, ids) = build(&mut tape, &inputs);
+    for (out, weight) in [(trace.query, 1), (trace.key, 2), (trace.value, 3)] {
+        let width = if weight == 1 { QD } else { KVD };
+        assert_eq!(
+            tape.value(out),
+            dense::forward(&inputs[0], &inputs[weight], SEQ, width, N_EMBD)
+        );
+    }
+    let target_id = tape.leaf(target.clone());
+    let loss = tape.mse(trace.heads, target_id);
+    let gradients = tape.backward(loss);
+    let evaluate = |inputs: &[Vec<f32>; 6]| {
+        let mut tape = Tape::new();
+        let (trace, _) = build(&mut tape, inputs);
+        let target_id = tape.leaf(target.clone());
+        let loss = tape.mse(trace.heads, target_id);
+        tape.value(loss)[0]
+    };
+    for (which, input) in inputs.iter().enumerate() {
+        assert!(gradients[ids[which]].iter().any(|g| g.abs() > 1e-7));
+        for index in [0, input.len() / 2, input.len() - 1] {
+            let mut plus = inputs.clone();
+            let mut minus = inputs.clone();
+            let h = 1e-3;
+            plus[which][index] += h;
+            minus[which][index] -= h;
+            let numeric = (evaluate(&plus) - evaluate(&minus)) / (2.0 * h);
+            let actual = gradients[ids[which]][index];
+            assert!(
+                (numeric - actual).abs() < 2e-3 + 0.03 * actual.abs(),
+                "input={which} index={index} numeric={numeric} gradient={actual}"
+            );
+        }
+    }
+}
+
+#[test]
+fn absent_qk_normalization_preserves_values_and_gradients_exactly() {
+    let (x, q, k, v, _) = weights();
+    let build = |normalized_entry: bool| {
+        let mut tape = Tape::new();
+        let ids: Vec<_> = [&x, &q, &k, &v]
+            .iter()
+            .map(|v| tape.leaf((*v).clone()))
+            .collect();
+        let trace = if normalized_entry {
+            attention_heads_traced_with_qk_norm(
+                &mut tape, ids[0], ids[1], ids[2], ids[3], SEQ, N_EMBD, N_HEAD, N_KV_HEAD,
+                HEAD_DIM, THETA, None,
+            )
+        } else {
+            attention_heads_traced(
+                &mut tape, ids[0], ids[1], ids[2], ids[3], SEQ, N_EMBD, N_HEAD, N_KV_HEAD,
+                HEAD_DIM, THETA,
+            )
+        };
+        let values = [trace.query, trace.key, trace.value, trace.heads].map(|id| {
+            tape.value(id)
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        });
+        let target = tape.leaf(seeded(19, SEQ * QD));
+        let loss = tape.mse(trace.heads, target);
+        let grads = tape.backward(loss);
+        (
+            values,
+            ids.iter()
+                .map(|id| grads[*id].iter().map(|g| g.to_bits()).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(build(false), build(true));
+}
+
+#[test]
+fn invalid_qk_norm_rejects_before_recording_attention_operations() {
+    for invalid in 0..7 {
+        let (x, q, k, v, _) = weights();
+        let mut query = vec![1.; HEAD_DIM];
+        let mut key = vec![1.; HEAD_DIM];
+        let mut eps = 1e-5;
+        match invalid {
+            0 => {
+                query.pop();
+            }
+            1 => key.push(1.),
+            2 => query[0] = f32::NAN,
+            3 => key[0] = f32::INFINITY,
+            4 => eps = 0.,
+            5 => eps = f32::NAN,
+            _ => eps = -1.,
+        }
+        let mut tape = Tape::new();
+        let ids: Vec<_> = [x, q, k, v, query, key]
+            .into_iter()
+            .map(|v| tape.leaf(v))
+            .collect();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            attention_heads_traced_with_qk_norm(
+                &mut tape,
+                ids[0],
+                ids[1],
+                ids[2],
+                ids[3],
+                SEQ,
+                N_EMBD,
+                N_HEAD,
+                N_KV_HEAD,
+                HEAD_DIM,
+                THETA,
+                Some(AttentionQkNorm {
+                    query: ids[4],
+                    key: ids[5],
+                    eps,
+                }),
+            )
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            tape.leaf(vec![0.]),
+            6,
+            "validation must precede graph mutation"
+        );
+    }
+}
 
 // Real GQA shape: 4 query heads share 2 KV heads (group size 2).
 const SEQ: usize = 3;

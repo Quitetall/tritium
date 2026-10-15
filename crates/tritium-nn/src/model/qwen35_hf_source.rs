@@ -1,9 +1,11 @@
 //! Once-opened, content-bound Hugging Face sources for Qwen3.5-family models.
 
+use std::cell::RefCell;
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
 
 use tritium_format::{
     ModelId, SafeTensorsError, SemanticModelManifest, SemanticTensor, SemanticTensorHasher,
@@ -11,6 +13,7 @@ use tritium_format::{
 use tritium_spec::TernaryBackend;
 
 use crate::error::NnError;
+use crate::layers::{HostSaltV2Linear, Projection};
 use crate::model::hf::read_config_json;
 use crate::model::hf_shards::{HfShardSet, HfTensorBytesError};
 use crate::model::qwen35_hf::{
@@ -382,6 +385,73 @@ impl Qwen35ContentVerifiedHfSource {
         ))
     }
 
+    /// Assemble a dense language reference with exactly one host SALT V2 matrix
+    /// substituted. This is a crate-internal measurement seam for controlled
+    /// one-tensor ablations; the complete dense source identity is still verified
+    /// and the original source tensor is re-read before the replacement is used.
+    #[allow(dead_code)] // The GDN probe producer is the next consumer of this internal seam.
+    pub(crate) fn load_language_with_host_salt_projection(
+        self,
+        tensor_name: &str,
+        replacement: Arc<HostSaltV2Linear>,
+        backend: Box<dyn TernaryBackend>,
+    ) -> Result<Qwen35HfLanguageModel, NnError> {
+        let source_spec = language_schema(&self.source.config.text)?;
+        let spec = source_spec.get(tensor_name).ok_or_else(|| {
+            NnError::MissingTensor(format!(
+                "one-tensor Qwen ablation target `{tensor_name}` is not in the language schema"
+            ))
+        })?;
+        let [rows, columns] = spec.shape.as_slice() else {
+            return Err(NnError::Shape {
+                expected: spec.shape.len(),
+                got: 2,
+            });
+        };
+        if spec.role != super::qwen35_hf::TensorRole::Matrix
+            || replacement.rows() != *rows
+            || replacement.columns() != *columns
+        {
+            return Err(NnError::Backend(format!(
+                "one-tensor Qwen ablation replacement for `{tensor_name}` does not match its rank-two matrix schema"
+            )));
+        }
+
+        // Confirm the selected source tensor still matches the admitted model
+        // identity without widening a second copy into memory.
+        self.try_visit_tensor_bytes(tensor_name, SOURCE_STREAM_CHUNK_BYTES, |_| {
+            Ok::<(), Infallible>(())
+        })
+        .map_err(|error| match error {
+            Qwen35TensorStreamError::Source(source) => source,
+            Qwen35TensorStreamError::Sink(never) => match never {},
+        })?;
+
+        let overlay = HostSaltProjectionOverlay {
+            source: &self,
+            tensor_name,
+            replacement: RefCell::new(Some(Projection::HostSaltV2(replacement))),
+        };
+        let weights = load_language_weights(&overlay, &self.source.config.text)?;
+        if overlay.replacement.borrow().is_some() {
+            return Err(NnError::MissingTensor(format!(
+                "one-tensor Qwen ablation target `{tensor_name}` was not consumed by the language loader"
+            )));
+        }
+        let runner = Qwen35TextRunner::new(&self.source.config.text, weights, backend)?;
+        let Self {
+            source,
+            identity,
+            language_receipt,
+        } = self;
+        Ok(Qwen35HfLanguageModel::from_verified_source(
+            source.config,
+            runner,
+            language_receipt,
+            identity,
+        ))
+    }
+
     /// Consume the verified source into exact-fp32 language and MTP graphs.
     ///
     /// The combined loader requires exactly the official 15-tensor `mtp.*`
@@ -415,6 +485,47 @@ impl Qwen35ContentVerifiedHfSource {
             receipt,
             identity,
         ))
+    }
+}
+
+/// Borrows the content-verified dense source and substitutes one SALT matrix.
+/// The target's original tensor is still read through the verified path first,
+/// so a post-verification source mutation is not hidden by the overlay.
+#[allow(dead_code)] // Constructed by the crate-internal GDN probe seam above.
+struct HostSaltProjectionOverlay<'a, S: Qwen35HfTensorSource + ?Sized> {
+    source: &'a S,
+    tensor_name: &'a str,
+    replacement: RefCell<Option<Projection>>,
+}
+
+impl<S: Qwen35HfTensorSource + ?Sized> Qwen35HfTensorSource for HostSaltProjectionOverlay<'_, S> {
+    fn tensor_f32_exact(&self, name: &str, expected: &[usize]) -> Result<Vec<f32>, NnError> {
+        self.source.tensor_f32_exact(name, expected)
+    }
+
+    fn projection_exact(
+        &self,
+        name: &str,
+        rows: usize,
+        columns: usize,
+    ) -> Result<Projection, NnError> {
+        if name != self.tensor_name {
+            return self.source.projection_exact(name, rows, columns);
+        }
+
+        match self.replacement.borrow_mut().take() {
+            Some(Projection::HostSaltV2(matrix))
+                if matrix.rows() == rows && matrix.columns() == columns =>
+            {
+                Ok(Projection::HostSaltV2(matrix))
+            }
+            Some(_) => Err(NnError::Backend(format!(
+                "one-tensor Qwen ablation replacement for `{name}` has an unsupported type or mismatched shape"
+            ))),
+            None => Err(NnError::Backend(format!(
+                "one-tensor Qwen ablation target `{name}` was requested more than once"
+            ))),
+        }
     }
 }
 
@@ -912,6 +1023,42 @@ const fn vision_scope_tag(value: Qwen35VisionScope) -> u8 {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct FakeTensorSource {
+        reads: RefCell<Vec<String>>,
+    }
+
+    impl Qwen35HfTensorSource for FakeTensorSource {
+        fn tensor_f32_exact(&self, name: &str, expected: &[usize]) -> Result<Vec<f32>, NnError> {
+            self.reads.borrow_mut().push(name.to_owned());
+            let count = expected.iter().product();
+            Ok(vec![0.0; count])
+        }
+    }
+
+    fn tiny_host_salt_projection() -> Arc<HostSaltV2Linear> {
+        use half::f16;
+        use std::io::Cursor;
+        use tritium_format::salt_v2::SaltV2Codec;
+        use tritium_format::salt_v2_package::{
+            SaltV2Package, SaltV2PackageReader, SaltV2Plane, SaltV2Tensor, SaltV2Tile,
+            write_salt_v2_package,
+        };
+
+        let plane = SaltV2Plane::new(vec![1, 0, -1, 1], vec![f16::from_f32(0.5)]).unwrap();
+        let tensor = SaltV2Tensor::new(
+            "probe.weight",
+            vec![2, 2],
+            vec![SaltV2Tile::new(vec![plane]).unwrap()],
+        )
+        .unwrap();
+        let encoded =
+            write_salt_v2_package(&SaltV2Package::new(SaltV2Codec::B3, vec![tensor]).unwrap())
+                .unwrap();
+        let mut reader = SaltV2PackageReader::new_strict(Cursor::new(encoded.bytes)).unwrap();
+        Arc::new(HostSaltV2Linear::from_reader(&mut reader, "probe.weight").unwrap())
+    }
+
     const PINNED_CONFIG: &str = include_str!("../../tests/fixtures/qwen36-27b-config.json");
 
     #[test]
@@ -924,5 +1071,26 @@ mod tests {
             canonical_source_config(&parsed).unwrap(),
             qwen36_27b_canonical_source_config().unwrap()
         );
+    }
+
+    #[test]
+    fn host_salt_overlay_replaces_only_one_verified_projection_once() {
+        let source = FakeTensorSource::default();
+        let overlay = HostSaltProjectionOverlay {
+            source: &source,
+            tensor_name: "probe.weight",
+            replacement: RefCell::new(Some(Projection::HostSaltV2(tiny_host_salt_projection()))),
+        };
+
+        assert!(matches!(
+            overlay.projection_exact("probe.weight", 2, 2).unwrap(),
+            Projection::HostSaltV2(_)
+        ));
+        assert!(matches!(
+            overlay.projection_exact("other.weight", 1, 2).unwrap(),
+            Projection::Dense(_)
+        ));
+        assert_eq!(*source.reads.borrow(), ["other.weight"]);
+        assert!(overlay.projection_exact("probe.weight", 2, 2).is_err());
     }
 }

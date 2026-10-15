@@ -1,0 +1,80 @@
+{
+  "methods": {
+    "adaptive12": {
+      "accuracy_percent": 73.3,
+      "accuracy_sd_pp": 4.896267711226584,
+      "mean_loss": 41007.3663,
+      "mean_work": 20212900218.2,
+      "mean_state_bytes": 1031008,
+      "mean_growth": 792.8,
+      "mean_rescalings": 0,
+      "mean_reversals": 93620.4,
+      "loss_difference_vs_adaptive24": 0.0,
+      "paired_t_95_ci": [
+        0.0,
+        0.0
+      ]
+    },
+    "adaptive24": {
+      "accuracy_percent": 73.3,
+      "accuracy_sd_pp": 4.896267711226584,
+      "mean_loss": 41007.3663,
+      "mean_work": 20212900218.2,
+      "mean_state_bytes": 1031008,
+      "mean_growth": 792.8,
+      "mean_rescalings": 0,
+      "mean_reversals": 93620.4,
+      "loss_difference_vs_adaptive24": 0.0,
+      "paired_t_95_ci": [
+        0.0,
+        0.0
+      ]
+    },
+    "fixed8": {
+      "accuracy_percent": 74.65,
+      "accuracy_sd_pp": 4.405536289715477,
+      "mean_loss": 39823.4935,
+      "mean_work": 20533836351.2,
+      "mean_state_bytes": 1029344,
+      "mean_growth": 0,
+      "mean_rescalings": 20.8,
+      "mean_reversals": 95849.8,
+      "loss_difference_vs_adaptive24": -1183.8727999999999,
+      "paired_t_95_ci": [
+        -3590.7788819021507,
+        1223.0332819021507
+      ]
+    },
+    "fixed24": {
+      "accuracy_percent": 73.3,
+      "accuracy_sd_pp": 4.896267711226584,
+      "mean_loss": 41007.3663,
+      "mean_work": 20212900218.2,
+      "mean_state_bytes": 2350560,
+      "mean_growth": 0,
+      "mean_rescalings": 0,
+      "mean_reversals": 93620.4,
+      "loss_difference_vs_adaptive24": 0.0,
+      "paired_t_95_ci": [
+        0.0,
+        0.0
+      ]
+    },
+    "integer32": {
+      "accuracy_percent": 73.3,
+      "accuracy_sd_pp": 4.896267711226584,
+      "mean_loss": 41007.3663,
+      "mean_work": 20212900218.2,
+      "mean_state_bytes": 1994848,
+      "mean_growth": 0,
+      "mean_rescalings": 0,
+      "mean_reversals": 93620.4,
+      "loss_difference_vs_adaptive24": 0.0,
+      "paired_t_95_ci": [
+        0.0,
+        0.0
+      ]
+    }
+  },
+  "advance_to_language_model": false
+}

@@ -21,11 +21,13 @@ half = { workspace = true }
 
 [dev-dependencies]
 divan = { workspace = true }
+rayon = { workspace = true }
 # The runtime registry is how the GPU + e2e benches obtain an owned backend trait
 # object (find the registered `init` by name), exactly as `tests/acceptance.rs` does.
 tritium-runtime = { workspace = true }
 # The end-to-end tokens/sec bench drives the v0.20 `ModelRunner` over the real GGUF.
 tritium-nn = { workspace = true }
+tritium-quantize = { workspace = true }
 # The CUDA backend, linked ONLY for the GPU lane. It is a dev-dependency with its own
 # `cuda` feature off by default, so the standard cpu-only build/bench of this crate
 # pulls in no `cudarc` and runs no `nvcc`. The crate-level `cuda` feature below turns
@@ -42,6 +44,7 @@ tritium-metal = { workspace = true }
 # perplexity) the end-to-end bench couples its tokens/sec to.
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 
 # `cargo bench -p tritium-benches --features cuda` enables the CUDA backend (and its
 # build.rs `nvcc` PTX compile) so the GPU mpGEMM microbenches and the end-to-end
@@ -82,9 +85,17 @@ name = "e2e"
 harness = false
 
 [[bench]]
+name = "decode_gate"
+harness = false
+
+[[bench]]
 name = "roofline"
 harness = false
 
 [[bench]]
 name = "salt_codec"
+harness = false
+
+[[bench]]
+name = "salt_fit"
 harness = false

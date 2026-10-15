@@ -13,12 +13,13 @@ build_receipt = MODULE["build_receipt"]
 canonical = MODULE["canonical"]
 NativeReferenceError = MODULE["NativeReferenceError"]
 source_admission = MODULE["source_admission"]
+release_version = MODULE["release_version"]
 
 
 def metadata():
     result = {
         "backend_id": "cpu.reference.v1",
-        "backend_build": "tritium-train@1.1.0-rc.1+source-git:" + "a" * 40,
+        "backend_build": f"tritium-train@{release_version()}+source-git:" + "a" * 40,
         "physical_device": "cpu:linux:x86_64:test",
         "manifest_digest": MODULE["MANIFEST_DIGEST"],
     }
@@ -41,6 +42,25 @@ def metadata():
 
 
 class NativeBrowserReferenceTests(unittest.TestCase):
+    def test_release_version_comes_from_workspace_manifest(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "Cargo.toml").write_text(
+                '[workspace.package]\nversion = "1.1.0-rc.12"\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(release_version(root), "1.1.0-rc.12")
+
+    def test_release_version_rejects_non_candidate_workspace_version(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "Cargo.toml").write_text(
+                '[workspace.package]\nversion = "1.1.0"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(NativeReferenceError, "canonical v1.1"):
+                release_version(root)
+
     def test_source_admission_rejects_nonignored_untracked_files(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

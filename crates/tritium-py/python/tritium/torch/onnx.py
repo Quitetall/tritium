@@ -258,6 +258,188 @@ class QwenOnnxCausalLM(nn.Module):
         return torch.tensor([generated], dtype=torch.int64)
 
 
+def as_transformers_generation_model(model: QwenOnnxCausalLM, config: Any) -> Any:
+    """Adapt a dynamic-cache Qwen ONNX model to Transformers ``generate``.
+
+    ``config`` must be the matching Transformers decoder config, normally from
+    ``AutoConfig.from_pretrained`` for the pinned source revision. The adapter
+    supports batch-one decoder-only generation; Tritium's tuple cache is passed
+    through without converting it into a Transformers cache object.
+    """
+    if not isinstance(model, QwenOnnxCausalLM):
+        raise TypeError("model must be a loaded QwenOnnxCausalLM")
+    if model.manifest.sequence_mode != "dynamic-cache-v1":
+        raise TritiumError(
+            "Transformers generation requires a dynamic-cache ONNX bundle",
+            code="dynamic_onnx_generation_unavailable",
+            stage="transformers_generation",
+        )
+    if getattr(config, "is_encoder_decoder", False) is not False:
+        raise ValueError("config must describe a decoder-only Transformers model")
+
+    try:
+        from transformers.generation import GenerationConfig, GenerationMixin
+        from transformers.modeling_outputs import CausalLMOutputWithPast
+    except ImportError as error:
+        raise TritiumError(
+            "Transformers generation requires the optional transformers package",
+            code="transformers_unavailable",
+            stage="transformers_generation",
+        ) from error
+
+    class _QwenOnnxGenerationAdapter(nn.Module, GenerationMixin):
+        main_input_name = "input_ids"
+
+        @classmethod
+        def _supports_default_dynamic_cache(cls) -> bool:
+            return False
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.model = model
+            self.config = config
+            self.generation_config = GenerationConfig.from_model_config(config)
+
+        @property
+        def device(self) -> torch.device:
+            return self.model.device
+
+        @property
+        def dtype(self) -> torch.dtype:
+            return torch.float32
+
+        def _prepare_cache_for_generation(
+            self,
+            generation_config: Any,
+            model_kwargs: Dict[str, Any],
+            generation_mode: Any,
+            batch_size: int,
+            max_cache_length: int,
+        ) -> None:
+            supplied = model_kwargs.get("past_key_values")
+            if supplied is not None:
+                if not isinstance(supplied, tuple):
+                    raise TypeError("Tritium ONNX past_key_values must be a tuple of tensors")
+                return
+            # The parent sees _supports_default_dynamic_cache=False and leaves
+            # cache construction to Tritium's native runtime.
+            return super()._prepare_cache_for_generation(
+                generation_config,
+                model_kwargs,
+                generation_mode,
+                batch_size,
+                max_cache_length,
+            )
+
+        def prepare_inputs_for_generation(
+            self,
+            input_ids: Tensor,
+            *,
+            past_key_values: Optional[Tuple[Tensor, ...]] = None,
+            attention_mask: Optional[Tensor] = None,
+            use_cache: bool = True,
+            next_sequence_length: Optional[int] = None,
+            is_first_iteration: Optional[bool] = None,
+            **kwargs: Any,
+        ) -> Dict[str, Any]:
+            if kwargs:
+                names = ", ".join(sorted(kwargs))
+                raise TypeError(f"unsupported Transformers generation inputs: {names}")
+            tokens = _batch_one_tokens(input_ids, "input_ids")
+            if attention_mask is not None:
+                if (
+                    not isinstance(attention_mask, Tensor)
+                    or attention_mask.device.type != "cpu"
+                    or attention_mask.ndim not in (1, 2)
+                    or (attention_mask.ndim == 2 and attention_mask.shape[0] != 1)
+                    or attention_mask.shape[-1] != tokens.numel()
+                ):
+                    raise ValueError("attention_mask must match batch-one input_ids")
+                if not bool(torch.all(attention_mask != 0).item()):
+                    raise TritiumError(
+                        "padded attention masks are not represented by this ONNX graph",
+                        code="onnx_padding_unavailable",
+                        stage="transformers_generation",
+                    )
+            if past_key_values is not None:
+                if not isinstance(past_key_values, tuple):
+                    raise TypeError("Tritium ONNX past_key_values must be a tuple of tensors")
+                length = 1 if next_sequence_length is None else next_sequence_length
+                if type(length) is not int or length <= 0:
+                    raise ValueError("next_sequence_length must be a positive integer")
+                input_ids = input_ids[:, -length:]
+            return {
+                "input_ids": input_ids,
+                "past_key_values": past_key_values,
+                "attention_mask": attention_mask,
+                "use_cache": use_cache,
+            }
+
+        def forward(
+            self,
+            input_ids: Tensor,
+            past_key_values: Optional[Tuple[Tensor, ...]] = None,
+            attention_mask: Optional[Tensor] = None,
+            *,
+            use_cache: bool = True,
+            return_dict: bool = True,
+        ) -> Any:
+            tokens = _batch_one_tokens(input_ids, "input_ids")
+            if attention_mask is not None:
+                _validate_generation_attention_mask(attention_mask)
+            result = self.model.forward(
+                tokens,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+            )
+            expected_vocab = getattr(self.config, "vocab_size", None)
+            if expected_vocab is not None and result.logits.shape[-1] != expected_vocab:
+                raise ValueError("Transformers config vocabulary does not match ONNX logits")
+            cache = result.past_key_values if use_cache else None
+            if return_dict:
+                return CausalLMOutputWithPast(
+                    logits=result.logits,
+                    past_key_values=cache,
+                )
+            return (result.logits, cache)
+
+        def generate(self, inputs: Optional[Tensor] = None, **kwargs: Any) -> Any:
+            if "input_ids" in kwargs:
+                if inputs is not None:
+                    raise TypeError("pass either inputs or input_ids, not both")
+                inputs = kwargs.pop("input_ids")
+            config_override = kwargs.get("generation_config") or self.generation_config
+            beams = kwargs.get("num_beams", config_override.num_beams)
+            returns = kwargs.get("num_return_sequences", config_override.num_return_sequences)
+            beams = 1 if beams is None else beams
+            returns = 1 if returns is None else returns
+            if beams != 1 or returns != 1:
+                raise TritiumError(
+                    "Tritium ONNX generation supports one sequence and no beam search",
+                    code="onnx_generation_batch_unavailable",
+                    stage="transformers_generation",
+                )
+            return super().generate(inputs=inputs, **kwargs)
+
+    return _QwenOnnxGenerationAdapter()
+
+
+def _validate_generation_attention_mask(attention_mask: Tensor) -> None:
+    if (
+        not isinstance(attention_mask, Tensor)
+        or attention_mask.device.type != "cpu"
+        or attention_mask.ndim not in (1, 2)
+        or (attention_mask.ndim == 2 and attention_mask.shape[0] != 1)
+    ):
+        raise ValueError("attention_mask must be a batch-one CPU tensor")
+    if not bool(torch.all(attention_mask != 0).item()):
+        raise TritiumError(
+            "padded attention masks are not represented by this ONNX graph",
+            code="onnx_padding_unavailable",
+            stage="transformers_generation",
+        )
+
+
 def export_onnx(
     source: Any,
     output_dir: Union[os.PathLike[str], str],
@@ -753,6 +935,7 @@ __all__ = [
     "OnnxCausalLMOutput",
     "OnnxMtpOutput",
     "QwenOnnxCausalLM",
+    "as_transformers_generation_model",
     "export_onnx",
     "load_onnx",
 ]

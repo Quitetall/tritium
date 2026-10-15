@@ -16,7 +16,10 @@ tritium-core = { workspace = true }
 tritium-spec = { workspace = true }
 tritium-format = { workspace = true }
 tritium-runtime = { workspace = true }
+tritium-evidence = { workspace = true }
+tritium-schema = { workspace = true }
 tritium-train = { workspace = true }
+tritium-quantize = { workspace = true }
 half = { workspace = true }
 blake3 = { workspace = true }
 # Data-parallel host matmul for DenseLinear (the SALT/fp accuracy-eval projection).
@@ -37,6 +40,8 @@ serde_json = { workspace = true }
 # HuggingFace `tokenizers` pipeline from the vocab/merges a GGUF embeds (single-file
 # UX — no sidecar tokenizer.json). Optional so the default build stays lean.
 tokenizers = { workspace = true, optional = true }
+# Fixed no-import chat renderer: model-provided templates never execute natively.
+wasmi = { version = "=2.0.0", default-features = false, features = ["std", "validate", "portable-dispatch"], optional = true }
 
 [dev-dependencies]
 # Golden vectors pinning the DeltaNet activation kernels, which are duplicated in tritium-onnx
@@ -48,9 +53,6 @@ proptest = { workspace = true }
 # speak the `tritium-spec` contract, so the tests drive them through the CPU
 # ternary mpGEMM. Not a runtime dependency of the crate.
 tritium-cpu = { workspace = true }
-# SALT accuracy and output-reconstruction harnesses are test-only here. Runtime
-# promotion evidence is owned by tritium-salt, which can bind package execution.
-tritium-quantize = { workspace = true }
 # `cargo test -p tritium-nn --features cuda` enables the CUDA backend (and its
 # build.rs `nvcc` PTX compile) so the GPU acceptance + CPU↔CUDA parity tests in
 # `tests/acceptance.rs` can build a `ModelRunner` on the `"cuda"` backend, and the
@@ -61,7 +63,7 @@ tritium-quantize = { workspace = true }
 default = []
 cuda = ["dep:tritium-cuda", "tritium-cuda/cuda"]
 # Real text tokenization (GGUF-embedded byte-level BPE via the `tokenizers` crate).
-tokenizer = ["dep:tokenizers"]
+tokenizer = ["dep:tokenizers", "dep:wasmi"]
 # Small non-pinned Qwen bundle fixtures used only by cross-crate integration tests.
 test-fixtures = []
 

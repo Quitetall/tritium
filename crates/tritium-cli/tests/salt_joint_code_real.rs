@@ -5,7 +5,8 @@
 //! - **dense** — the TQ2_0 bundle as shipped. 2 bits per trit (a ternary value needs log2(3) = 1.585,
 //!   so the unused fourth code wastes 20% before any statistics), plus whole-block padding: a
 //!   576-wide row occupies three 256-trit blocks, 33% of which hold nothing.
-//! - **byte transport** — `tritium transport pack`, canonical Huffman over the packed *bytes*. It
+//! - **byte transport** — `tritium transport pack`, selecting raw, canonical
+//!   Huffman, or rANS over the packed *bytes*. It
 //!   collapses the padding and the dead code, but a byte holds four trits of *one plane* across four
 //!   *different* weights, so it cannot see how one weight's digits relate across planes.
 //! - **joint symbol** — [`tritium_format::salt_joint_code`], one code word per weight over its `3^T`

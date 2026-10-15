@@ -14,6 +14,7 @@ from typing import Any
 
 import torch
 
+from ._installed_candidate import verify_installed_candidate
 from ..nn import TernaryLinear
 from .config import TernaryConfig
 from .conversion import inspect, prepare_qat
@@ -256,6 +257,10 @@ def run(
         raise ValueError("source revision must be 40 lowercase hexadecimal")
     if not release or not run_id:
         raise ValueError("release and run id must be non-empty")
+    verify_installed_candidate(
+        wheel_artifact=wheel, source_revision=source_revision, release=release,
+        executing_files=(Path(__file__),),
+    )
     cases = [_case(*spec) for spec in ESTIMATORS]
     plugin = _plugin(run_id)
     passed = all(

@@ -35,6 +35,18 @@
 //! dispatch path — its production form is the per-ISA SIMD gather (deferred). The
 //! independent `M` rows are spread across `rayon`'s thread pool without changing
 //! per-row arithmetic, so results are deterministic regardless of thread count.
+//!
+//! ## Unified semantic tensors
+//!
+//! [`CpuBackend::upload_tensor`], [`CpuBackend::matmul`] and
+//! [`CpuBackend::embed_rows`] accept additive and dense semantic tensors. This
+//! path retains canonical D2/B3/S34 plane bytes and exact f16/f32 scales, or dense
+//! f32 values. Additive matmul executes add/subtract/skip directly over packed
+//! coefficients, with independent output rows parallelized. Basis transforms
+//! use the shared core; gather applies the inverse transform. Buffer byte counts
+//! include owned packed coefficients and stored-precision scales, not container bytes.
+//! The ISA flags above describe legacy packed kernel availability, not SIMD
+//! acceleration for these semantic operations; the packed arithmetic is scalar.
 //
 // `linkme`'s `distributed_slice` expands to a static with a custom
 // `#[link_section]`, and the AVX2 kernel needs hand-written `unsafe` for its
@@ -51,7 +63,8 @@ use tritium_format::{
 };
 use tritium_runtime::BackendEntry;
 use tritium_spec::{
-    BackendError, DeviceBuffer, DeviceCaps, MpGemm, MpGemmProjectedVjp, TernaryBackend,
+    BackendError, DeviceBuffer, DeviceCaps, MpGemm, MpGemmProjectedVjp, TensorMatmul, TensorView,
+    TernaryBackend,
 };
 
 #[cfg(test)]
@@ -79,6 +92,7 @@ mod simd;
 
 /// Exact, allocation-accounted SALT V2 CPU semantic reference.
 pub mod salt_v2;
+mod semantic;
 
 /// Owned host-memory buffer of packed weight bytes.
 ///
@@ -218,6 +232,51 @@ impl CpuBackend {
 }
 
 impl TernaryBackend for CpuBackend {
+    fn tensor_stream_plan(
+        &self,
+        metadata: tritium_spec::TensorMetadata<'_>,
+        encoding: tritium_spec::TensorStreamEncoding,
+    ) -> Result<Option<tritium_spec::TensorStreamPlan>, BackendError> {
+        semantic::CpuTensor::stream_plan(metadata, encoding)
+    }
+    fn upload_tensor_stream(
+        &self,
+        source: &dyn tritium_spec::TensorStreamSource,
+    ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        semantic::CpuTensor::upload_stream(source)
+    }
+    fn tensor_upload_plan(
+        &self,
+        metadata: tritium_spec::TensorMetadata<'_>,
+    ) -> Result<Option<tritium_spec::TensorUploadPlan>, BackendError> {
+        semantic::CpuTensor::plan(metadata)
+    }
+    fn tensor_caps(
+        &self,
+        tensor: TensorView<'_>,
+    ) -> Result<Option<tritium_spec::TensorCaps>, BackendError> {
+        semantic::CpuTensor::caps(tensor)
+    }
+
+    // Unified additive operations retain canonical packed planes; dense and
+    // shared basis arithmetic remain exact scalar f32. No SIMD claim follows.
+    fn upload_tensor(&self, tensor: TensorView<'_>) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        semantic::CpuTensor::upload(tensor)
+    }
+
+    fn matmul(&self, p: TensorMatmul<'_>) -> Result<(), BackendError> {
+        semantic::CpuTensor::matmul(p)
+    }
+
+    fn embed_rows(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        ids: &[usize],
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        semantic::CpuTensor::embed(tensor, ids, out)
+    }
+
     fn device_id(&self) -> &str {
         "cpu"
     }

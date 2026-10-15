@@ -3,14 +3,19 @@
 use core::{convert::Infallible, fmt};
 use std::error::Error;
 
+use tritium_format::{RuntimeOutputScope, RuntimeOutputScopeEvidence};
 use tritium_nn::NnError;
 use tritium_quantize::{
-    OutputReconstructionError, OutputReconstructionReceipt, OutputReconstructionSpec, SaltV2Profile,
+    OutputReconstructionError, OutputReconstructionReceipt, OutputReconstructionScope,
+    OutputReconstructionSpec, SaltV2Profile,
 };
 
 use crate::{ContentId, Qwen36PreservedSafetensorsError};
 
-use super::{PRESERVED_CHUNK_BYTES, Qwen36AdmittedExecutionReceipt, execution_authority};
+use super::{
+    PRESERVED_CHUNK_BYTES, Qwen36AdmittedExecutionReceipt, Qwen36AdmittedExecutionSession,
+    execution_authority,
+};
 use crate::Qwen36PackageAdmittedCampaignStore;
 
 const BINDING_MAGIC: [u8; 8] = *b"TSQ36OB\0";
@@ -21,6 +26,11 @@ const CANDIDATE_ID_CONTEXT: &str = "tritium qwen3.6 admitted output candidate v1
 const BOUND_DIGESTS: usize = 13;
 const BINDING_BYTES: usize = 8 + 2 + 1 + 1 + 4 + BOUND_DIGESTS * 32 + 2 * 8 + 32;
 const BINDING_BODY_BYTES: usize = BINDING_BYTES - 32;
+const SCOPE_BINDING_MAGIC: [u8; 8] = *b"TSQ36SB\0";
+const SCOPE_BINDING_VERSION: u16 = 1;
+const SCOPE_BINDING_CHECKSUM_CONTEXT: &str =
+    "tritium qwen3.6 output scope execution binding checksum v1";
+const SCOPE_EVIDENCE_SET_CONTEXT: &str = "tritium qwen3.6 output scope evidence set v1";
 
 /// Failure while binding one selected output candidate to sealed runtime evidence.
 #[derive(Debug)]
@@ -30,7 +40,7 @@ pub enum Qwen36FinalLogitsOutputBindingError {
     Admission(super::super::Qwen36PackageAdmissionError),
     /// Preserved-source reconstruction failed.
     Workspace(crate::Qwen36TensorWorkError),
-    /// Canonical `TSV2OUT` v2 bytes failed strict reopen.
+    /// Canonical `TSV2OUT` bytes failed strict reopen.
     Output(OutputReconstructionError),
     /// Execution evidence, candidate identity, source, tokens, outputs, or counts differ.
     Runtime(NnError),
@@ -82,6 +92,104 @@ pub struct Qwen36FinalLogitsOutputBindingReceipt {
     scope_coverage: u8,
     batch_count: u64,
     logit_count: u64,
+}
+
+/// Campaign-bound proof that every selected block/window and final-logit scope
+/// commitment equals one fresh sealed Qwen execution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Qwen36OutputScopeBindingReceipt {
+    binding_id: ContentId,
+    final_logits_binding: Qwen36FinalLogitsOutputBindingReceipt,
+    scope_evidence_digest: [u8; 32],
+    scope_count: u32,
+    block_scope_count: u32,
+    batch_count: u64,
+    observation_count: u64,
+    value_count: u64,
+}
+
+impl Qwen36OutputScopeBindingReceipt {
+    /// Content identity of exact canonical `TSQ36SB` bytes.
+    #[must_use]
+    pub const fn binding_id(&self) -> ContentId {
+        self.binding_id
+    }
+
+    /// Final-logit binding receipt whose campaign and execution lineage this extends.
+    #[must_use]
+    pub const fn final_logits_binding(&self) -> &Qwen36FinalLogitsOutputBindingReceipt {
+        &self.final_logits_binding
+    }
+
+    /// Whether at least one block/window output is campaign-bound.
+    #[must_use]
+    pub const fn has_block_outputs(&self) -> bool {
+        self.block_scope_count > 0
+    }
+
+    /// Number of output scopes, including final logits.
+    #[must_use]
+    pub const fn scope_count(&self) -> u32 {
+        self.scope_count
+    }
+
+    /// Number of committed block or sliding-window scopes.
+    #[must_use]
+    pub const fn block_scope_count(&self) -> u32 {
+        self.block_scope_count
+    }
+
+    /// Number of fresh execution batches represented by each scope.
+    #[must_use]
+    pub const fn batch_count(&self) -> u64 {
+        self.batch_count
+    }
+
+    /// Total per-scope batch observations committed by this receipt.
+    #[must_use]
+    pub const fn observation_count(&self) -> u64 {
+        self.observation_count
+    }
+
+    /// Total output values across all committed scopes.
+    #[must_use]
+    pub const fn value_count(&self) -> u64 {
+        self.value_count
+    }
+
+    /// Domain-separated identity of every ordered scope commitment.
+    #[must_use]
+    pub const fn scope_evidence_digest(&self) -> &[u8; 32] {
+        &self.scope_evidence_digest
+    }
+
+    /// Encode the final-logit binding and complete scope attestation canonically.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, NnError> {
+        let base = self.final_logits_binding.canonical_bytes()?;
+        let base_len = u32::try_from(base.len()).map_err(|_| {
+            NnError::ResourceExhausted("Qwen scope binding base length exceeds u32".to_owned())
+        })?;
+        let capacity = 8usize + 2 + 2 + 4 + 4 + 4 + 8 + 8 + 8 + 32 + base.len() + 32;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(capacity).map_err(|_| {
+            NnError::ResourceExhausted("allocate Qwen output scope binding".to_owned())
+        })?;
+        bytes.extend_from_slice(&SCOPE_BINDING_MAGIC);
+        bytes.extend_from_slice(&SCOPE_BINDING_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&base_len.to_le_bytes());
+        bytes.extend_from_slice(&self.scope_count.to_le_bytes());
+        bytes.extend_from_slice(&self.block_scope_count.to_le_bytes());
+        bytes.extend_from_slice(&self.batch_count.to_le_bytes());
+        bytes.extend_from_slice(&self.observation_count.to_le_bytes());
+        bytes.extend_from_slice(&self.value_count.to_le_bytes());
+        bytes.extend_from_slice(&self.scope_evidence_digest);
+        bytes.extend_from_slice(&base);
+        let mut checksum = blake3::Hasher::new_derive_key(SCOPE_BINDING_CHECKSUM_CONTEXT);
+        checksum.update(&bytes);
+        bytes.extend_from_slice(checksum.finalize().as_bytes());
+        Ok(bytes)
+    }
 }
 
 impl Qwen36FinalLogitsOutputBindingReceipt {
@@ -145,7 +253,7 @@ impl Qwen36FinalLogitsOutputBindingReceipt {
         &self.output_spec_id
     }
 
-    /// Exact canonical `TSV2OUT` v2 receipt identity.
+    /// Exact canonical `TSV2OUT` receipt identity.
     #[must_use]
     pub const fn output_receipt_id(&self) -> &[u8; 32] {
         &self.output_receipt_id
@@ -280,7 +388,7 @@ impl Qwen36AdmittedExecutionReceipt {
 impl<'allocated, 'parent, 'store, 'source>
     Qwen36PackageAdmittedCampaignStore<'allocated, 'parent, 'store, 'source>
 {
-    /// Bind selected v2 final logits to exact sealed execution and master lineage.
+    /// Bind selected SALT V2 final logits to exact sealed execution and master lineage.
     ///
     /// The output receipt is reopened from canonical bytes. Candidate labels,
     /// aggregate student digests, or matching metrics alone cannot satisfy this
@@ -401,6 +509,301 @@ impl<'allocated, 'parent, 'store, 'source>
     }
 }
 
+impl<'admission, 'allocated, 'parent, 'store, 'source>
+    Qwen36AdmittedExecutionSession<'admission, 'allocated, 'parent, 'store, 'source>
+{
+    /// Bind every TSV2OUT v3 block/window scope to a fresh execution on this sealed model.
+    ///
+    /// This first revalidates final-logit binding and then executes the exact same
+    /// token batches once, with the fitting row masks, through the session's
+    /// campaign-authorized backend. Every runtime scope digest, count, identity,
+    /// and ordering must equal the selected candidate's committed v3 evidence.
+    ///
+    /// # Errors
+    /// Fails closed on v2 receipts without scope evidence, stale campaign authority,
+    /// wrong session/execution lineage, mask/token/scope drift, or runtime failure.
+    pub fn bind_output_reconstruction_scopes<'batch, I>(
+        &self,
+        spec: &OutputReconstructionSpec,
+        output_bytes: &[u8],
+        execution: &Qwen36AdmittedExecutionReceipt,
+        batches: I,
+    ) -> Result<Qwen36OutputScopeBindingReceipt, Qwen36FinalLogitsOutputBindingError>
+    where
+        I: IntoIterator<Item = (&'batch [u32], &'batch [bool])>,
+    {
+        let final_logits_binding = self.admission.bind_output_reconstruction_final_logits(
+            spec,
+            output_bytes,
+            execution,
+        )?;
+        validate_execution(&self.authority, execution)
+            .map_err(Qwen36FinalLogitsOutputBindingError::Runtime)?;
+        self.admission
+            .verify_current()
+            .map_err(Qwen36FinalLogitsOutputBindingError::Admission)?;
+
+        let output = OutputReconstructionReceipt::from_canonical_bytes(spec, output_bytes)
+            .map_err(Qwen36FinalLogitsOutputBindingError::Output)?;
+        let selected = output.selected();
+        let claimed_scope_evidence = selected.scope_evidence();
+        if claimed_scope_evidence.len() != spec.scopes().len()
+            || claimed_scope_evidence.len() < 2
+            || claimed_scope_evidence.iter().any(|evidence| {
+                evidence.spec_id() != spec.spec_id()
+                    || evidence.candidate_id() != selected.candidate_id()
+                    || evidence.initialization_seed()
+                        != claimed_scope_evidence[0].initialization_seed()
+            })
+        {
+            return Err(scope_runtime_error(
+                "selected candidate does not carry complete v3 scope commitments",
+            ));
+        }
+        let mut runtime_scopes = Vec::new();
+        runtime_scopes
+            .try_reserve_exact(spec.scopes().len())
+            .map_err(|_| {
+                Qwen36FinalLogitsOutputBindingError::Runtime(NnError::ResourceExhausted(
+                    "allocate Qwen output scope replay schedule".to_owned(),
+                ))
+            })?;
+        for scope in spec.scopes() {
+            runtime_scopes.push(match scope {
+                OutputReconstructionScope::Block { start, end } => RuntimeOutputScope::Block {
+                    start: *start,
+                    end: *end,
+                },
+                OutputReconstructionScope::FinalLogits => RuntimeOutputScope::FinalLogits,
+            });
+        }
+        let transcript = self
+            .model
+            .try_visit_untrusted_output_scopes(
+                spec.spec_id(),
+                selected.candidate_id(),
+                claimed_scope_evidence[0].initialization_seed(),
+                &runtime_scopes,
+                batches,
+            )
+            .map_err(|error| match error {
+                tritium_nn::Qwen35ExecutionVisitError::Runtime(error) => {
+                    Qwen36FinalLogitsOutputBindingError::Runtime(error)
+                }
+                tritium_nn::Qwen35ExecutionVisitError::Observer(never) => match never {},
+            })?;
+        if transcript.scope_evidence() != claimed_scope_evidence
+            || transcript.token_stream_digest() != spec.token_stream_digest()
+            || transcript.token_stream_digest() != execution.token_stream_digest()
+            || transcript.batch_count() != execution.batch_count()
+            || transcript.token_count() != execution.token_count()
+        {
+            return Err(scope_runtime_error(
+                "fresh Qwen scope outputs differ from selected TSV2OUT v3 commitments",
+            ));
+        }
+        self.admission
+            .verify_current()
+            .map_err(Qwen36FinalLogitsOutputBindingError::Admission)?;
+
+        let scope_count = u32::try_from(claimed_scope_evidence.len()).map_err(|_| {
+            Qwen36FinalLogitsOutputBindingError::Runtime(NnError::ResourceExhausted(
+                "Qwen scope count exceeds u32".to_owned(),
+            ))
+        })?;
+        let block_scope_count = u32::try_from(
+            claimed_scope_evidence
+                .iter()
+                .filter(|evidence| evidence.scope() != RuntimeOutputScope::FinalLogits)
+                .count(),
+        )
+        .map_err(|_| {
+            Qwen36FinalLogitsOutputBindingError::Runtime(NnError::ResourceExhausted(
+                "Qwen block scope count exceeds u32".to_owned(),
+            ))
+        })?;
+        let mut observation_count = 0_u64;
+        let mut value_count = 0_u64;
+        for evidence in claimed_scope_evidence {
+            observation_count = observation_count
+                .checked_add(evidence.observation_count())
+                .ok_or_else(|| {
+                    Qwen36FinalLogitsOutputBindingError::Runtime(NnError::ResourceExhausted(
+                        "Qwen scope observation count overflow".to_owned(),
+                    ))
+                })?;
+            value_count = value_count
+                .checked_add(evidence.value_count())
+                .ok_or_else(|| {
+                    Qwen36FinalLogitsOutputBindingError::Runtime(NnError::ResourceExhausted(
+                        "Qwen scope value count overflow".to_owned(),
+                    ))
+                })?;
+        }
+        let mut receipt = Qwen36OutputScopeBindingReceipt {
+            binding_id: ContentId::from_digest([0; 32]),
+            final_logits_binding,
+            scope_evidence_digest: digest_scope_evidence(claimed_scope_evidence),
+            scope_count,
+            block_scope_count,
+            batch_count: transcript.batch_count(),
+            observation_count,
+            value_count,
+        };
+        let canonical = receipt
+            .canonical_bytes()
+            .map_err(Qwen36FinalLogitsOutputBindingError::Runtime)?;
+        receipt.binding_id = ContentId::of_bytes(&canonical);
+        Ok(receipt)
+    }
+
+    /// Strictly reopen and freshly replay a persisted v3 scope binding.
+    pub fn reopen_output_reconstruction_scopes_binding<'batch, I>(
+        &self,
+        spec: &OutputReconstructionSpec,
+        output_bytes: &[u8],
+        execution: &Qwen36AdmittedExecutionReceipt,
+        batches: I,
+        binding_bytes: &[u8],
+    ) -> Result<Qwen36OutputScopeBindingReceipt, Qwen36FinalLogitsOutputBindingError>
+    where
+        I: IntoIterator<Item = (&'batch [u32], &'batch [bool])>,
+    {
+        let declared = decode_scope_binding(binding_bytes)
+            .map_err(Qwen36FinalLogitsOutputBindingError::Runtime)?;
+        let rebound =
+            self.bind_output_reconstruction_scopes(spec, output_bytes, execution, batches)?;
+        let canonical = rebound
+            .canonical_bytes()
+            .map_err(Qwen36FinalLogitsOutputBindingError::Runtime)?;
+        if declared != rebound || canonical.as_slice() != binding_bytes {
+            return Err(scope_runtime_error(
+                "persisted Qwen scope binding differs from fresh campaign execution",
+            ));
+        }
+        Ok(rebound)
+    }
+}
+
+fn scope_runtime_error(message: &str) -> Qwen36FinalLogitsOutputBindingError {
+    Qwen36FinalLogitsOutputBindingError::Runtime(NnError::Provenance(message.to_owned()))
+}
+
+pub(super) fn digest_scope_evidence(evidence: &[RuntimeOutputScopeEvidence]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(SCOPE_EVIDENCE_SET_CONTEXT);
+    hasher.update(&(evidence.len() as u64).to_le_bytes());
+    for scope in evidence {
+        match scope.scope() {
+            RuntimeOutputScope::Block { start, end } => {
+                hasher.update(&[1]);
+                hasher.update(&start.to_le_bytes());
+                hasher.update(&end.to_le_bytes());
+            }
+            RuntimeOutputScope::FinalLogits => {
+                hasher.update(&[2]);
+            }
+        }
+        hasher.update(scope.spec_id());
+        hasher.update(scope.candidate_id());
+        hasher.update(&scope.initialization_seed().to_le_bytes());
+        hasher.update(&scope.observation_count().to_le_bytes());
+        hasher.update(&scope.value_count().to_le_bytes());
+        hasher.update(scope.digest());
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn decode_scope_binding(bytes: &[u8]) -> Result<Qwen36OutputScopeBindingReceipt, NnError> {
+    const HEADER_BYTES: usize = 80;
+    const CHECKSUM_BYTES: usize = 32;
+    if bytes.len() < HEADER_BYTES + CHECKSUM_BYTES
+        || bytes.get(..8) != Some(&SCOPE_BINDING_MAGIC)
+        || bytes.get(8..10) != Some(&SCOPE_BINDING_VERSION.to_le_bytes())
+        || bytes.get(10..12) != Some(&[0; 2])
+    {
+        return Err(NnError::InvalidArtifact(
+            "malformed Qwen scope binding header".to_owned(),
+        ));
+    }
+    let read_u32 = |range: std::ops::Range<usize>| -> Result<u32, NnError> {
+        let raw: [u8; 4] = bytes
+            .get(range)
+            .ok_or_else(|| NnError::InvalidArtifact("truncated Qwen scope binding".to_owned()))?
+            .try_into()
+            .map_err(|_| NnError::InvalidArtifact("truncated Qwen scope binding".to_owned()))?;
+        Ok(u32::from_le_bytes(raw))
+    };
+    let read_u64 = |range: std::ops::Range<usize>| -> Result<u64, NnError> {
+        let raw: [u8; 8] = bytes
+            .get(range)
+            .ok_or_else(|| NnError::InvalidArtifact("truncated Qwen scope binding".to_owned()))?
+            .try_into()
+            .map_err(|_| NnError::InvalidArtifact("truncated Qwen scope binding".to_owned()))?;
+        Ok(u64::from_le_bytes(raw))
+    };
+    let base_len = usize::try_from(read_u32(12..16)?).map_err(|_| {
+        NnError::InvalidArtifact("Qwen scope binding base length exceeds usize".to_owned())
+    })?;
+    let expected_len = HEADER_BYTES
+        .checked_add(base_len)
+        .and_then(|length| length.checked_add(CHECKSUM_BYTES))
+        .ok_or_else(|| NnError::InvalidArtifact("Qwen scope binding length overflow".to_owned()))?;
+    if bytes.len() != expected_len {
+        return Err(NnError::InvalidArtifact(
+            "Qwen scope binding length mismatch".to_owned(),
+        ));
+    }
+    let body_end = bytes.len() - CHECKSUM_BYTES;
+    let mut checksum = blake3::Hasher::new_derive_key(SCOPE_BINDING_CHECKSUM_CONTEXT);
+    checksum.update(&bytes[..body_end]);
+    if bytes[body_end..] != checksum.finalize().as_bytes()[..] {
+        return Err(NnError::InvalidArtifact(
+            "Qwen scope binding checksum mismatch".to_owned(),
+        ));
+    }
+    let scope_count = read_u32(16..20)?;
+    let block_scope_count = read_u32(20..24)?;
+    let batch_count = read_u64(24..32)?;
+    let observation_count = read_u64(32..40)?;
+    let value_count = read_u64(40..48)?;
+    let scope_evidence_digest: [u8; 32] = bytes[48..80]
+        .try_into()
+        .map_err(|_| NnError::InvalidArtifact("truncated Qwen scope digest".to_owned()))?;
+    if scope_count < 2
+        || block_scope_count == 0
+        || block_scope_count.checked_add(1) != Some(scope_count)
+        || batch_count == 0
+        || observation_count == 0
+        || value_count == 0
+        || scope_evidence_digest == [0; 32]
+    {
+        return Err(NnError::InvalidArtifact(
+            "invalid Qwen scope binding counts or identity".to_owned(),
+        ));
+    }
+    let final_logits_binding = decode_binding(&bytes[HEADER_BYTES..body_end])?;
+    let receipt = Qwen36OutputScopeBindingReceipt {
+        binding_id: ContentId::of_bytes(bytes),
+        final_logits_binding,
+        scope_evidence_digest,
+        scope_count,
+        block_scope_count,
+        batch_count,
+        observation_count,
+        value_count,
+    };
+    if receipt
+        .canonical_bytes()
+        .map_err(|_| NnError::InvalidArtifact("noncanonical Qwen scope binding".to_owned()))?
+        != bytes
+    {
+        return Err(NnError::InvalidArtifact(
+            "noncanonical Qwen scope binding".to_owned(),
+        ));
+    }
+    Ok(receipt)
+}
+
 fn decode_binding(bytes: &[u8]) -> Result<Qwen36FinalLogitsOutputBindingReceipt, NnError> {
     if bytes.len() != BINDING_BYTES
         || bytes[..8] != BINDING_MAGIC
@@ -479,7 +882,7 @@ fn binding_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(value)
 }
 
-fn validate_execution(
+pub(super) fn validate_execution(
     authority: &super::ExecutionAuthority,
     execution: &Qwen36AdmittedExecutionReceipt,
 ) -> Result<(), NnError> {

@@ -10,16 +10,16 @@ policies live at the repository root:
 - [`SECURITY.md`](../../../SECURITY.md)
 - [`COMMUNITY.md`](../../../COMMUNITY.md)
 
-Tritium is planned strategically and executed in small, gated steps. The map:
+Tritium is planned strategically and executed in small, gated steps. Public users
+can inspect shipped decisions in the ADR index; the full active research archive
+is maintainer-only. See the [research-record access policy](./research-records.md)
+for how to request a specific decision or work order.
 
-- **Strategic** — `docs/adr/`: Architecture Decision Records covering stable
-  contracts and release gates. For current platform work, start at
-  ADR 0033 (see the [research repository](https://github.com/Quitetall/tritium-research)).
-- **Index** — the roadmap in the [research repository](https://github.com/Quitetall/tritium-research): the living, ordered set of
-  tactical plans from now to done, with status.
-- **Tactical** — `docs/plans/NNNN-*.md`: one detailed, verification-gated plan
-  per point-release or coherent feature. The v1.1 umbrella is
-  plan 0044 (see the [research repository](https://github.com/Quitetall/tritium-research)).
+- **Strategic** — `docs/adr/`: promoted Architecture Decision Records for
+  shipped contracts and release gates. See the [public ADR index](https://github.com/Quitetall/tritium/tree/main/docs/adr).
+- **Index and tactical plans** — the active roadmap and work orders are
+  maintainer-only; the public [research-record access policy](./research-records.md)
+  explains how to request a specific record.
 
 Milestone work is **gate-blocked, not date-blocked**. Independent work orders may
 proceed in parallel, but no downstream claim becomes green until every declared
@@ -68,9 +68,9 @@ mdbook build docs/book      # one-shot build; runs the link checker
 
 `mdbook build` runs the link checker as a backend (configured in
 `docs/book/book.toml`), so a dead link fails locally exactly as it does in CI
-(the `docs.yml` workflow). Decision records live in the
-[research repository](https://github.com/Quitetall/tritium-research) and are
-referenced by absolute URL, not relative path (see `docs/RESEARCH.md`).
+(the `docs.yml` workflow). Active decision records are maintained in a
+maintainer-only archive; shipped records are promoted into the public ADR index.
+See the [research-record access policy](./research-records.md).
 
 ## License of contributions
 

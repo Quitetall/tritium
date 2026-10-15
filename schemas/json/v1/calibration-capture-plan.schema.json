@@ -1,0 +1,342 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CalibrationCapturePlan",
+  "description": "Controller-owned actual B capture request, not caller provenance assertions.",
+  "type": "object",
+  "properties": {
+    "input": {
+      "description": "Exact actual private inputs, including context boundaries/final labels.",
+      "$ref": "#/$defs/CalibrationCaptureInput"
+    },
+    "limits": {
+      "description": "Actual positive logical admission; not total memory qualification.",
+      "$ref": "#/$defs/CalibrationCaptureLimits"
+    },
+    "profile": {
+      "description": "Explicit actually executed objective and numerical graph profile.",
+      "$ref": "#/$defs/CalibrationCaptureProfile"
+    },
+    "source": {
+      "description": "Actual complete stored-byte B source, not widened-f32 identity.",
+      "$ref": "#/$defs/OriginalSourceId"
+    },
+    "stage_package": {
+      "description": "Actual admitted dense B package.",
+      "$ref": "#/$defs/PackageId"
+    },
+    "tensors": {
+      "description": "Actual ordered projection interpretations, followed by tied head.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/QuantSourceTensor"
+      }
+    },
+    "tokenizer": {
+      "description": "Exact admitted tokenizer.json bytes.",
+      "$ref": "#/$defs/BlobId"
+    },
+    "tokenizer_config": {
+      "description": "Exact admitted tokenizer_config.json bytes for text; absent for token IDs.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BlobId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "transform": {
+      "description": "Actual mandatory A->B transform log reference.",
+      "$ref": "#/$defs/EvidenceReference"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "stage_package",
+    "source",
+    "transform",
+    "tokenizer",
+    "profile",
+    "tensors",
+    "input",
+    "limits"
+  ],
+  "$defs": {
+    "BlobId": {
+      "description": "Content identity for stored tensor or asset bytes.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "CalibrationCacheLimits": {
+      "description": "Logical retained cache bounds, separate from reducer workspace or process RSS.",
+      "type": "object",
+      "properties": {
+        "max_payload_bytes": {
+          "description": "Exact retained scalar/token/mask and recipe bytes; excludes metadata/capacity overhead.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_samples": {
+          "description": "Maximum observed samples, including masked samples.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_windows": {
+          "description": "Maximum declared model-context windows, not reduction replay chunks.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max_payload_bytes",
+        "max_samples",
+        "max_windows"
+      ]
+    },
+    "CalibrationCaptureInput": {
+      "description": "Exact ordered private calibration inputs, not an asserted input digest.",
+      "oneOf": [
+        {
+          "description": "Pretokenized windows, each including its final target.",
+          "type": "object",
+          "properties": {
+            "Tokens": {
+              "type": "object",
+              "properties": {
+                "windows": {
+                  "description": "Ordered complete token-ID windows.",
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer",
+                      "format": "uint32",
+                      "minimum": 0
+                    }
+                  }
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "windows"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Tokens"
+          ]
+        },
+        {
+          "description": "Actual runtime encoding: raw text, no special tokens/padding/truncation.",
+          "type": "object",
+          "properties": {
+            "RawText": {
+              "type": "object",
+              "properties": {
+                "windows": {
+                  "description": "Exact UTF-8 windows; private evidence may contain private corpus text.",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "windows"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "RawText"
+          ]
+        }
+      ]
+    },
+    "CalibrationCaptureLimits": {
+      "description": "Logical model/input/cache bounds, NOT tape/parser/package/evidence/full RSS.",
+      "type": "object",
+      "properties": {
+        "max_config_bytes": {
+          "description": "Actual config input-byte cap before model parsing.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_dense_bytes": {
+          "description": "Retained widened-f32 master matrix/vector cap before decoding.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_text_bytes": {
+          "description": "Aggregate raw UTF-8 text bytes; zero for pretokenized capture.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_tokenizer_config_bytes": {
+          "description": "tokenizer_config.json bytes; zero for pretokenized capture.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_total_payload_bytes": {
+          "description": "Aggregate retained payload, including duplicated context bytes.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_window_tokens": {
+          "description": "Effective maximum input tokens per context (excluding final label).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "per_cache": {
+          "description": "Existing per-cache payload/sample/window admission.",
+          "$ref": "#/$defs/CalibrationCacheLimits"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max_config_bytes",
+        "max_dense_bytes",
+        "max_window_tokens",
+        "per_cache",
+        "max_total_payload_bytes",
+        "max_text_bytes",
+        "max_tokenizer_config_bytes"
+      ]
+    },
+    "CalibrationCaptureProfile": {
+      "description": "The fixed actually executed objective and widened-f32 graph profile.",
+      "oneOf": [
+        {
+          "description": "Per-window mean next-token CE, sparse k1 labels, unit weights/true masks.",
+          "type": "string",
+          "const": "NextTokenWindowMeanK1F32V1"
+        }
+      ]
+    },
+    "EvidenceReference": {
+      "description": "Evidence ancestry reference, not a self-approved quality/release verdict.",
+      "type": "object",
+      "properties": {
+        "root": {
+          "description": "BLAKE3 evidence root, not a blob id or package digest.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0
+          },
+          "maxItems": 32,
+          "minItems": 32
+        },
+        "run": {
+          "description": "Run identity of the evidence producer.",
+          "type": "string"
+        },
+        "span": {
+          "description": "Evidence span within that run.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "run",
+        "span",
+        "root"
+      ]
+    },
+    "OriginalSourceId": {
+      "description": "Candidate identity of original named tensor/asset content, not fitted content or provenance.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "PackageId": {
+      "description": "Content identity for a Tritium package.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "QuantSourceTensor": {
+      "description": "Original tensor interpretation, never an adapter-supplied content hash.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Exact logical tensor name.",
+          "type": "string"
+        },
+        "precision": {
+          "description": "Original stored float precision, before widening or fitting.",
+          "$ref": "#/$defs/ScalePrecision"
+        },
+        "shape": {
+          "description": "Positive row-major dimensions in the original source.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "shape",
+        "precision"
+      ]
+    },
+    "ScalePrecision": {
+      "description": "Precision used to store additive plane scales.",
+      "oneOf": [
+        {
+          "description": "IEEE binary16.",
+          "type": "string",
+          "const": "F16"
+        },
+        {
+          "description": "Brain floating-point 16-bit.",
+          "type": "string",
+          "const": "Bf16"
+        },
+        {
+          "description": "IEEE binary32.",
+          "type": "string",
+          "const": "F32"
+        }
+      ]
+    }
+  }
+}

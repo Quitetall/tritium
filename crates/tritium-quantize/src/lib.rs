@@ -37,6 +37,7 @@ mod allocate;
 mod architecture;
 mod campaign;
 mod conversion;
+pub mod engine;
 pub mod fisher;
 mod plane;
 mod quantize;
@@ -93,6 +94,7 @@ pub use salt_v2::{
 pub use salt_v2_activation::{
     ActivationByteLedger, ActivationCache, ActivationCacheBuilder, ActivationCacheError,
     ActivationCacheSpec, ActivationChunk, ActivationDType, ActivationDigest, ActivationShard,
+    ActivationWindow,
 };
 pub use salt_v2_allocator::{
     ByteDelta, GroupCandidates, NestedProfileAllocation, NestedProfileBudgets, PackedPlaneCounts,
@@ -112,7 +114,7 @@ pub use salt_v2_evidence::{
 };
 pub use salt_v2_feedback::{
     ColumnGroup, FeedbackError, FeedbackMetric, FeedbackProblem, FeedbackRunError, FeedbackState,
-    GroupFitRequest, fit_with_feedback,
+    GroupFitRequest, fit_with_feedback, fit_with_feedback_decay, fit_with_feedback_precision,
 };
 pub use salt_v2_model::{
     CurvatureArtifact, KroneckerCurvature, PhysicalRateTarget, SaltV2Config, SaltV2Curvature,
@@ -129,10 +131,15 @@ pub use salt_v2_model::{
     plan_salt_v2_restartable_tensor_master, plan_salt_v2_tensor_master,
 };
 pub use salt_v2_output::{
-    LegacyOutputReconstructionReceipt, OutputCandidateReceipt, OutputObjectiveWeights,
-    OutputReconstructionAccumulator, OutputReconstructionError, OutputReconstructionReceipt,
-    OutputReconstructionSchedule, OutputReconstructionScope, OutputReconstructionSpec,
-    select_output_reconstruction,
+    FixedTritScaleRefit, FixedTritScaleRefitAccumulator, FixedTritScaleUpdateCandidate,
+    FixedTritScaleUpdateCandidateBuilder, FixedTritTileScaleRefitAccumulator,
+    FixedTritTileScaleUpdate, LegacyOutputReconstructionReceipt, OutputCandidateReceipt,
+    OutputObjectiveWeights, OutputReconstructionAccumulator, OutputReconstructionActivationLayer,
+    OutputReconstructionActivationSet, OutputReconstructionActivationSource,
+    OutputReconstructionActivationWindows, OutputReconstructionError, OutputReconstructionReceipt,
+    OutputReconstructionScaleCandidate, OutputReconstructionSchedule, OutputReconstructionScope,
+    OutputReconstructionSpec, fit_fixed_trit_tile_scale_refit, fit_fixed_trit_tile_scale_update,
+    output_reconstruction_activation_digest, select_output_reconstruction,
 };
 pub use ternary_baselines::{
     BaselineTernaryPlane, TernaryBaselineError, TernaryBaselineProjection, TtqState, TwnConfig,

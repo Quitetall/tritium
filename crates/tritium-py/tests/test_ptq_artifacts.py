@@ -4,6 +4,7 @@ import hashlib
 import json
 import struct
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,7 +13,11 @@ import torch  # noqa: E402
 
 import tritium.torch.artifacts as artifacts  # noqa: E402
 import tritium.torch.ptq as ptq  # noqa: E402
-from tritium.nn import AdditiveTernaryEmbedding, AdditiveTernaryLinear  # noqa: E402
+from tritium.nn import (  # noqa: E402
+    AdditiveTernaryEmbedding,
+    AdditiveTernaryLinear,
+    AdditiveTernaryWeight,
+)
 from tritium.torch import (  # noqa: E402
     TernaryConfig,
     TritiumError,
@@ -20,6 +25,7 @@ from tritium.torch import (  # noqa: E402
     convert,
     inspect,
     load,
+    load_module_conversion,
     load_quantized_module,
     prepare,
     quantize,
@@ -78,6 +84,191 @@ def _fake_verify(path, package_id, serialized, resident):
 def _fake_verify_preserved(path, package_id, tensors, payload, serialized):
     assert Path(path).stat().st_size == serialized
     return package_id, tensors, payload, serialized
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA is unavailable"
+            ),
+        ),
+    ],
+)
+def test_packed_embedding_lookup_matches_dense_reference_without_full_decode(
+    monkeypatch, index_dtype, device
+):
+    trits_a = torch.tensor(
+        [
+            [1, 0, -1, 1, 0],
+            [-1, 1, 0, -1, 1],
+            [0, 1, 1, 0, -1],
+            [1, -1, 0, 1, -1],
+            [0, 0, 1, -1, 1],
+            [-1, 0, 1, 0, 1],
+            [1, 1, -1, 0, 0],
+        ],
+        dtype=torch.int8,
+    )
+    trits_b = torch.tensor(
+        [
+            [0, 1, 0, -1, 0],
+            [1, 0, -1, 0, 1],
+            [-1, 0, 1, 1, 0],
+            [0, 1, -1, 0, 1],
+            [1, -1, 0, 0, 1],
+            [0, 1, 0, 1, -1],
+            [-1, 0, 1, 1, 0],
+        ],
+        dtype=torch.int8,
+    )
+    scales_a = torch.tensor(
+        [
+            [0.5, 1.0],
+            [1.5, 0.25],
+            [0.75, 2.0],
+            [1.0, 1.25],
+            [0.5, 0.5],
+            [1.75, 1.0],
+            [0.25, 1.5],
+        ],
+        dtype=torch.float16,
+    )
+    scales_b = torch.tensor(
+        [
+            [0.25, 0.5],
+            [0.5, 1.0],
+            [1.0, 0.25],
+            [0.75, 0.5],
+            [1.0, 1.5],
+            [0.25, 0.75],
+            [0.5, 0.25],
+        ],
+        dtype=torch.float16,
+    )
+    trits_a = trits_a.to(device)
+    trits_b = trits_b.to(device)
+    scales_a = scales_a.to(device)
+    scales_b = scales_b.to(device)
+    packed = AdditiveTernaryWeight(
+        [
+            SimpleNamespace(trits=trits_a, scales=scales_a, group_size=3),
+            SimpleNamespace(trits=trits_b, scales=scales_b, group_size=3),
+        ]
+    )
+    embedding = AdditiveTernaryEmbedding(packed, padding_idx=0)
+    tokens = torch.tensor([[1, 1, 5], [6, 0, 1]], dtype=index_dtype, device=device)
+    dense_reference = packed.dense(dtype=torch.float32)
+    expected = torch.nn.functional.embedding(tokens, dense_reference, padding_idx=0)
+
+    def reject_full_decode(*, dtype):
+        raise AssertionError(f"full embedding decode requested as {dtype}")
+
+    monkeypatch.setattr(packed, "dense", reject_full_decode)
+    actual = embedding(tokens)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    long_tokens = torch.arange(60_000, dtype=index_dtype, device=device).remainder(7)
+    long_actual = embedding(long_tokens)
+    long_expected = torch.nn.functional.embedding(long_tokens, dense_reference)
+    torch.testing.assert_close(long_actual, long_expected, rtol=0, atol=0)
+    assert embedding(
+        torch.empty((2, 0), dtype=index_dtype, device=device)
+    ).shape == (2, 0, 5)
+    if device == "cpu":
+        with pytest.raises(IndexError):
+            embedding(torch.tensor([7], dtype=index_dtype, device=device))
+
+
+def test_packed_embedding_export_handles_dynamic_sequences_across_chunk_boundary():
+    trits = torch.arange(7 * 576, dtype=torch.int8).reshape(7, 576).remainder(3) - 1
+    scales = torch.ones((7, 1), dtype=torch.float32)
+    packed = AdditiveTernaryWeight(
+        [
+            SimpleNamespace(trits=trits, scales=scales, group_size=576)
+            for _ in range(3)
+        ]
+    )
+    embedding = AdditiveTernaryEmbedding(packed).eval()
+    tokens = torch.tensor([[1, 2, 3], [3, 2, 1]], dtype=torch.int64)
+    tokens = tokens.transpose(0, 1).contiguous()
+    exported = torch.export.export(
+        embedding,
+        (tokens,),
+        dynamic_shapes=(
+            {
+                0: torch.export.Dim("batch", min=1),
+                1: torch.export.Dim("sequence", min=1),
+            },
+        ),
+        strict=False,
+    )
+
+    for replay in (
+        torch.arange(2 * 9, dtype=torch.int64).reshape(2, 9).remainder(7),
+        torch.arange(600, dtype=torch.int64).reshape(1, 600).remainder(7),
+    ):
+        torch.testing.assert_close(
+            exported.module()(replay), embedding(replay), rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA is unavailable"
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_packed_linear_matches_dense_reference_without_full_decode(
+    monkeypatch, device, dtype
+):
+    rows = 40_000
+    columns = 8
+    row_ids = torch.arange(rows, device=device).unsqueeze(1)
+    col_ids = torch.arange(columns, device=device).unsqueeze(0)
+    trits_a = ((row_ids + col_ids * 2).remainder(3) - 1).to(torch.int8)
+    trits_b = ((row_ids * 2 + col_ids).remainder(3) - 1).to(torch.int8)
+    scales_a = ((row_ids.remainder(13) + 1).expand(-1, 2).to(torch.float16)) / 8
+    scales_b = (((row_ids + 3).remainder(11) + 1).expand(-1, 2).to(torch.float16)) / 8
+    packed = AdditiveTernaryWeight(
+        [
+            SimpleNamespace(trits=trits_a, scales=scales_a, group_size=4),
+            SimpleNamespace(trits=trits_b, scales=scales_b, group_size=4),
+        ]
+    )
+    bias = torch.linspace(-0.1, 0.1, rows, dtype=torch.float32, device=device)
+    linear = AdditiveTernaryLinear.from_packed_weight(packed, bias)
+    inputs = (
+        torch.arange(48, dtype=torch.float32, device=device)
+        .reshape(2, 3, 8)
+        .div(17)
+        .to(dtype=dtype)
+    )
+    expected = torch.nn.functional.linear(
+        inputs,
+        packed.dense(dtype=inputs.dtype),
+        linear.bias.to(dtype=inputs.dtype),
+    )
+
+    def reject_full_decode(*, dtype):
+        raise AssertionError(f"full linear decode requested as {dtype}")
+
+    monkeypatch.setattr(packed, "dense", reject_full_decode)
+    actual = linear(inputs)
+
+    assert actual.shape == (2, 3, rows)
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
 
 
 def _upgrade_bundle_to_v3(root: Path) -> None:
@@ -527,25 +718,25 @@ def test_live_module_fit_consumes_bound_curvature_and_rejects_source_drift(tmp_p
     )
     work_dir = tmp_path / "conversion-work"
     result = convert(prepared, receipt, work_dir=work_dir)
-    reopened = ptq.load_module_conversion(result.artifact_dir)
+    reopened = load_module_conversion(result.artifact_dir)
     resumed = convert(prepared, receipt, work_dir=work_dir)
     assert reopened.recipe_id == result.recipe_id
     assert resumed == result
     assert result.artifact_dir == work_dir.resolve()
     assert result.evidence_id == receipt.evidence_id
-    assert result.algorithm_id == "tritium.diagonal-additive-3@1"
+    assert result.algorithm_id == "tritium.salt-v2-joint-diagonal-catq-relays-3@1"
     assert result.recipe_id.startswith("sha256:")
     assert result.config == prepared.config
     assert result.coverage == prepared.coverage
     fitted = result.weight("weight")
     assert result.weight_names == ("weight",)
     assert len(fitted.planes) == 3
-    assert fitted.weighted_mse == pytest.approx(9.7121347e-5)
+    assert fitted.weighted_mse == pytest.approx(5.0651425e-9)
     assert fitted.planes[0].trits[0].tolist() == [1, -1, 0]
-    assert fitted.planes[0].scales[0].item() == 0.7001953125
-    assert fitted.planes[1].trits[0].tolist() == [1, 1, 0]
-    assert fitted.planes[1].scales[0].item() == 0.300048828125
-    assert fitted.planes[2].trits[0].tolist() == [0, 0, 1]
+    assert fitted.planes[0].scales[0].item() == 0.5
+    assert fitted.planes[1].trits[0].tolist() == [1, 0, 0]
+    assert fitted.planes[1].scales[0].item() == 0.39990234375
+    assert fitted.planes[2].trits[0].tolist() == [1, 1, 1]
     assert fitted.planes[2].scales[0].item() == 0.0999755859375
     for plane in fitted.planes:
         assert set(plane.trits.unique().tolist()) <= {-1, 0, 1}
@@ -574,7 +765,7 @@ def test_live_module_fit_consumes_bound_curvature_and_rejects_source_drift(tmp_p
     adaptive_result = convert(
         rate_limited, receipt, work_dir=tmp_path / "rate-work"
     )
-    assert adaptive_result.algorithm_id == "tritium.diagonal-additive-adaptive@1"
+    assert adaptive_result.algorithm_id == "tritium.salt-v2-joint-diagonal-catq-relays-adaptive@1"
     assert adaptive_result.achieved_bpw <= 2.0
     assert len(adaptive_result.weight("weight").planes) == 1
     assert load_quantized_module(model, adaptive_result)(
@@ -586,6 +777,53 @@ def test_live_module_fit_consumes_bound_curvature_and_rejects_source_drift(tmp_p
     with pytest.raises(TritiumError) as caught:
         convert(prepared, receipt, work_dir=tmp_path / "drift-work")
     assert caught.value.code == "source_changed"
+
+
+def test_public_convert_repeats_identically_into_independent_artifacts(tmp_path):
+    """The public PTQ seam must produce identical bytes for fixed inputs."""
+    model = torch.nn.Linear(8, 2, bias=False)
+    with torch.no_grad():
+        model.weight.copy_(
+            torch.tensor(
+                [
+                    [0.91, -0.42, 0.13, 0.72, -0.31, 0.55, -0.08, -0.64],
+                    [-0.23, 0.87, -0.76, 0.18, 0.46, -0.59, 0.34, 0.11],
+                ]
+            )
+        )
+    prepared = prepare(
+        model,
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    batches = [
+        torch.tensor(
+            [
+                [1.0, 0.5, -0.25, 0.75, 0.125, -1.0, 0.375, 0.625],
+                [0.25, -0.5, 1.0, 0.125, -0.75, 0.5, 0.875, -0.25],
+            ]
+        )
+    ]
+    calibration = calibrate(prepared, batches, evidence_dir=tmp_path / "evidence-a")
+    repeated_calibration = calibrate(
+        prepared, batches, evidence_dir=tmp_path / "evidence-b"
+    )
+    assert calibration.evidence_id == repeated_calibration.evidence_id
+
+    first = convert(prepared, calibration, work_dir=tmp_path / "first")
+    second = convert(prepared, repeated_calibration, work_dir=tmp_path / "second")
+
+    assert first.artifact_id == second.artifact_id
+    assert first.recipe_id == second.recipe_id
+    assert first.weight_names == second.weight_names
+    for name in first.weight_names:
+        left = first.weight(name)
+        right = second.weight(name)
+        assert left.weighted_mse == right.weighted_mse
+        assert len(left.planes) == len(right.planes)
+        for left_plane, right_plane in zip(left.planes, right.planes, strict=True):
+            torch.testing.assert_close(left_plane.trits, right_plane.trits, rtol=0, atol=0)
+            torch.testing.assert_close(left_plane.scales, right_plane.scales, rtol=0, atol=0)
 
 
 def test_adaptive_module_artifact_packs_variable_weight_plane_count(tmp_path):
@@ -658,14 +896,192 @@ def test_live_module_convert_fits_later_planes_against_stored_low_precision_scal
     result = convert(prepared, receipt, work_dir=tmp_path / "low-precision-work")
     assert result.weight("weight").planes[2].trits[0].tolist() == [
         1,
-        1,
-        1,
+        -1,
+        -1,
         0,
-        1,
         0,
         -1,
         1,
+        0,
     ]
+
+
+def test_live_module_convert_uses_joint_additive_trit_assignment(tmp_path):
+    weight = torch.tensor(
+        [
+            [
+                0.599121,
+                1.831055,
+                -2.544922,
+                -0.483154,
+                0.517578,
+                -2.634766,
+                1.576172,
+                2.402344,
+            ]
+        ],
+        dtype=torch.float16,
+    )
+    curvature = torch.tensor(
+        [
+            2.540206,
+            3.080229,
+            3.783262,
+            1.873168,
+            2.096422,
+            3.563944,
+            2.739383,
+            1.179104,
+        ],
+        dtype=torch.float32,
+    )
+    model = torch.nn.Linear(8, 1, bias=False, dtype=torch.float16)
+    with torch.no_grad():
+        model.weight.copy_(weight)
+    prepared = prepare(
+        model,
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    calibration = calibrate(
+        prepared,
+        [curvature.sqrt().to(torch.float16).unsqueeze(0)],
+        evidence_dir=tmp_path / "joint-assignment-evidence",
+    )
+
+    result = convert(
+        prepared,
+        calibration,
+        work_dir=tmp_path / "joint-assignment-work",
+    )
+
+    fitted = result.weight("weight")
+    assert len(fitted.planes) == 3
+    # The existing greedy residual fit scores 0.00183255 on this exact fixture.
+    # The native OA-EM and CAT-Q relay basins must beat it after stored-f16
+    # scale rounding.
+    assert fitted.weighted_mse < 0.0011
+    decoded = torch.zeros_like(weight, dtype=torch.float64)
+    for plane in fitted.planes:
+        decoded += plane.trits.to(torch.float64) * plane.scales.to(torch.float64)
+    assert torch.isfinite(decoded).all()
+    assert all(
+        set(plane.trits.unique().tolist()) <= {-1, 0, 1}
+        and torch.isfinite(plane.scales).all()
+        and (plane.scales >= 0).all()
+        for plane in fitted.planes
+    )
+
+
+def test_live_module_convert_matches_exhaustive_single_plane_group_optimum(tmp_path):
+    weight = torch.tensor(
+        [[-0.021139266, -1.6771822, 2.070698, 0.78463697]], dtype=torch.float32
+    )
+    curvature = torch.tensor(
+        [1.9608706, 3.7671776, 1.9031862, 2.4522407], dtype=torch.float32
+    )
+    model = torch.nn.Linear(4, 1, bias=False)
+    with torch.no_grad():
+        model.weight.copy_(weight)
+    config = TernaryConfig(
+        mode="ptq",
+        estimator="salt-v2",
+        target_modules=("Linear",),
+        planes=1,
+        profile="compact-v1",
+        target_bpw=None,
+    )
+    prepared = prepare(model, config, inplace=False)
+    calibration = calibrate(
+        prepared,
+        [curvature.sqrt().unsqueeze(0)],
+        evidence_dir=tmp_path / "single-plane-oracle-evidence",
+    )
+
+    result = convert(
+        prepared,
+        calibration,
+        work_dir=tmp_path / "single-plane-oracle-work",
+    )
+
+    fitted = result.weight("weight")
+    # Independent enumeration of all 3^4 trit vectors, each with its optimal
+    # nonnegative scale, gives this stored-f16 weighted error and code.
+    assert fitted.planes[0].trits[0].tolist() == [0, -1, 1, 0]
+    assert fitted.planes[0].scales[0].item() == 1.8095703125
+    assert fitted.weighted_mse == pytest.approx(0.16922843, rel=1e-6)
+
+
+def test_live_module_convert_uses_sota_native_multistart_diagonal_fit(tmp_path):
+    weight = torch.tensor(
+        [
+            [
+                -1.0564141,
+                -2.4477973,
+                1.8804001,
+                -1.7160861,
+                0.80647516,
+                -3.4003971,
+                0.50037867,
+                1.2027874,
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    curvature = torch.tensor(
+        [
+            0.57307684,
+            1.625573,
+            1.9491633,
+            2.0385289,
+            1.6667923,
+            1.7503928,
+            1.2714134,
+            2.8630955,
+        ],
+        dtype=torch.float32,
+    )
+    model = torch.nn.Linear(8, 1, bias=False)
+    with torch.no_grad():
+        model.weight.copy_(weight)
+    prepared = prepare(
+        model,
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    calibration = calibrate(
+        prepared,
+        [curvature.sqrt().unsqueeze(0)],
+        evidence_dir=tmp_path / "native-multistart-evidence",
+    )
+
+    result = convert(
+        prepared,
+        calibration,
+        work_dir=tmp_path / "native-multistart-work",
+    )
+
+    # The canonical Rust diagonal solver evaluates deterministic OA-EM restarts
+    # with conditioned nonnegative scale solves. Its checked result is below
+    # this independent held-out error bound; the former Python-only solver was
+    # 0.00615 on this fixture.
+    fitted = result.weight("weight")
+    assert fitted.weighted_mse < 0.004
+
+    # Exercise the public artifact boundary too: a passing in-memory fit is not
+    # enough if the durable conversion receipt cannot be reopened with the
+    # same identity and fitted trits/scales.
+    reopened = ptq.load_module_conversion(result.artifact_dir)
+    assert reopened.artifact_id == result.artifact_id
+    assert reopened.algorithm_id == result.algorithm_id
+    reopened_fit = reopened.weight("weight")
+    assert reopened_fit.weighted_mse == fitted.weighted_mse
+    assert len(reopened_fit.planes) == len(fitted.planes)
+    for reopened_plane, fitted_plane in zip(
+        reopened_fit.planes, fitted.planes, strict=True
+    ):
+        torch.testing.assert_close(reopened_plane.trits, fitted_plane.trits, rtol=0, atol=0)
+        torch.testing.assert_close(reopened_plane.scales, fitted_plane.scales, rtol=0, atol=0)
 
 
 def test_live_module_convert_resumes_missing_weight_and_rejects_tampering(tmp_path):
@@ -1036,14 +1452,21 @@ def test_quantize_composes_the_three_public_phases(monkeypatch, tmp_path):
         "calibrate",
         lambda *args, **kwargs: calls.append("calibrate") or sentinel_calibration,
     )
-    monkeypatch.setattr(
-        ptq, "convert", lambda *args, **kwargs: calls.append("convert") or sentinel_result
-    )
+    forwarded = {}
+
+    def fake_convert(*args, **kwargs):
+        calls.append("convert")
+        forwarded.update(kwargs)
+        return sentinel_result
+
+    monkeypatch.setattr(ptq, "convert", fake_convert)
     result = quantize(
         tmp_path / "model",
         TernaryConfig.ptq(profile="near-lossless-v1"),
         revision="revision",
         work_dir=tmp_path / "work",
+        source_admission_receipt=tmp_path / "source-admission.json",
+        official_identity_receipt=tmp_path / "official-identity.json",
         evidence_dir=tmp_path / "evidence",
         output_dir=tmp_path / "output",
         compact_max_bytes=1,
@@ -1053,3 +1476,267 @@ def test_quantize_composes_the_three_public_phases(monkeypatch, tmp_path):
     )
     assert result is sentinel_result
     assert calls == ["prepare", "calibrate", "convert"]
+    assert forwarded["source_admission_receipt"] == tmp_path / "source-admission.json"
+    assert forwarded["official_identity_receipt"] == tmp_path / "official-identity.json"
+
+
+def test_grouped_diagonal_projection_matches_legacy_per_group_fits():
+    torch.manual_seed(19)
+    master = torch.randn(5, 256, dtype=torch.float32)
+    curvature = torch.linspace(0.25, 2.0, master.shape[1], dtype=torch.float64)
+    projection = ptq._joint_additive_projection(master, curvature, planes=2)
+    fitted_planes, objective = ptq._joint_additive_fit(
+        master, curvature, planes=2
+    )
+
+    assert len(fitted_planes) == len(projection.planes)
+    assert all(
+        torch.equal(fit.trits, expected.trits)
+        and torch.equal(fit.scales, expected.scales)
+        for fit, expected in zip(fitted_planes, projection.planes)
+    )
+    expected_objective = float(
+        (
+            (master.to(torch.float64) - projection.dense.to(torch.float64)).square()
+            * curvature
+        ).sum()
+    )
+    assert objective == pytest.approx(expected_objective, rel=1e-6, abs=1e-8)
+
+    rows, columns, group_size, groups = master.shape[0], master.shape[1], 128, 2
+    grouped_master = master.reshape(rows, groups, group_size)
+    grouped_diagonal = curvature.reshape(groups, group_size)
+    expected_trits = [
+        torch.empty((rows, groups, group_size), dtype=torch.int8) for _ in range(2)
+    ]
+    expected_scales = [torch.empty((rows, groups), dtype=torch.float16) for _ in range(2)]
+    for group in range(groups):
+        weights = (
+            grouped_master[:, group, :]
+            .contiguous()
+            .numpy()
+            .astype("<f4", copy=False)
+            .tobytes(order="C")
+        )
+        row_scales, plane_trits = ptq._tritium.fit_joint_ternary_diagonal(
+            weights,
+            rows,
+            group_size,
+            grouped_diagonal[group].tolist(),
+            2,
+            16,
+            1e-8,
+            4,
+            1e6,
+            "f16",
+            True,
+            True,
+        )
+        for plane in range(2):
+            expected_trits[plane][:, group, :] = torch.frombuffer(
+                bytearray(plane_trits[plane]), dtype=torch.int8
+            ).reshape(rows, group_size)
+            expected_scales[plane][:, group] = torch.tensor(
+                [scales[plane] for scales in row_scales], dtype=torch.float16
+            )
+
+    expected_dense = torch.zeros_like(master)
+    for index, plane in enumerate(projection.planes):
+        assert torch.equal(plane.trits, expected_trits[index].reshape_as(master))
+        assert torch.equal(plane.scales, expected_scales[index])
+        expected_dense += expected_trits[index].reshape_as(master).to(master.dtype) * (
+            ptq.expand_plane_scales(
+                expected_scales[index],
+                rows=rows,
+                columns=columns,
+                group_size=group_size,
+            ).to(master.dtype)
+        )
+    assert torch.equal(projection.dense, expected_dense)
+
+
+def test_public_convert_persists_grouped_fit_artifact(tmp_path):
+    torch.manual_seed(23)
+    model = torch.nn.Linear(256, 4, bias=False)
+    prepared = prepare(
+        model,
+        TernaryConfig(
+            mode="ptq",
+            estimator="salt-v2",
+            target_modules=("Linear",),
+            planes=2,
+            profile="compact-v1",
+            target_bpw=None,
+        ),
+        inplace=False,
+    )
+    calibration = calibrate(
+        prepared,
+        [torch.randn(3, 256)],
+        evidence_dir=tmp_path / "grouped-public-calibration",
+    )
+
+    result = convert(
+        prepared,
+        calibration,
+        work_dir=tmp_path / "grouped-public-work",
+        max_working_bytes=40 * 1024,
+    )
+
+    assert result.weights[0].fit_chunk_rows == 1
+    assert result.weights[0].max_working_bytes == 40 * 1024
+    fitted = result.weight("weight")
+    assert len(fitted.planes) == 2
+    assert fitted.planes[0].trits.shape == (4, 256)
+    assert fitted.planes[0].scales.shape == (4, 2)
+    reopened = load_module_conversion(result.artifact_dir)
+    assert reopened.artifact_id == result.artifact_id
+    torch.testing.assert_close(
+        reopened.weight("weight").planes[0].trits,
+        fitted.planes[0].trits,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        reopened.weight("weight").planes[1].scales,
+        fitted.planes[1].scales,
+        rtol=0,
+        atol=0,
+    )
+
+    expected_artifact_sha256 = {
+        "conversion.json": "f963c196f88b71f9a9b1da74a5ff51250eedab6166809559965b5ca3a3778a06",
+        "weight-00000.json": "011e8fb42cab4529ed5064d82a76b2d7cfc58a63deb1178534cb618f25f75610",
+        "weight-00000-plane-0.scales.f16le": "c8de1782128b6c8ef79d641a0dc86a9208f7e60d0b4013c1e9f91956c6b717c9",
+        "weight-00000-plane-0.trits.i8": "e1c9310f5390604cfdb0e5953b59495628895dd5ff298deabd3cfbfac326bd17",
+        "weight-00000-plane-1.scales.f16le": "e5693158a3db67a5e05fa6e08e47120098d2dcaae10d2b4c291259bf650a17b0",
+        "weight-00000-plane-1.trits.i8": "9adb3b527c09db1060b01d6e7802de025cb0bfedaa66271bb1f7e1895703ac12",
+    }
+    for artifact_name, expected_digest in expected_artifact_sha256.items():
+        artifact_path = Path(result.artifact_dir) / artifact_name
+        assert hashlib.sha256(artifact_path.read_bytes()).hexdigest() == expected_digest
+
+    # The public artifact path must be invariant to the memory budget used to
+    # batch row fitting. The second conversion has enough room to fit all four
+    # rows together, so this also checks that chunking is not serialized into
+    # different ternary payload bytes.
+    roomy = convert(
+        prepared,
+        calibration,
+        work_dir=tmp_path / "grouped-public-roomy-work",
+        max_working_bytes=1024 * 1024,
+    )
+    assert roomy.weights[0].fit_chunk_rows == 4
+    roomy_payloads = sorted(
+        path.name
+        for path in Path(roomy.artifact_dir).iterdir()
+        if path.name.endswith((".scales.f16le", ".trits.i8"))
+    )
+    constrained_payloads = sorted(
+        path.name
+        for path in Path(result.artifact_dir).iterdir()
+        if path.name.endswith((".scales.f16le", ".trits.i8"))
+    )
+    assert roomy_payloads == constrained_payloads
+    for artifact_name in constrained_payloads:
+        assert (Path(roomy.artifact_dir) / artifact_name).read_bytes() == (
+            Path(result.artifact_dir) / artifact_name
+        ).read_bytes()
+
+    # Exercise the user-facing replay route from the sealed on-disk package, not
+    # just the in-memory weight receipt above. Compare against the exact hard
+    # additive projection so scale dtype and packed-trit round-tripping are both
+    # covered by the same public convert() fixture.
+    inputs = torch.randn(5, 256)
+    reopened_model = load_quantized_module(model, result.artifact_dir)
+    roomy_model = load_quantized_module(model, roomy.artifact_dir)
+    hard_weight = AdditiveTernaryWeight(fitted.planes).dense(dtype=inputs.dtype)
+    expected_output = torch.nn.functional.linear(inputs, hard_weight)
+    torch.testing.assert_close(
+        reopened_model(inputs), expected_output, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        roomy_model(inputs), reopened_model(inputs), rtol=0, atol=0
+    )
+
+
+def test_public_convert_persists_one_plane_compact_recipe(tmp_path):
+    torch.manual_seed(41)
+    model = torch.nn.Linear(64, 3, bias=False)
+    prepared = prepare(
+        model,
+        TernaryConfig.ptq(
+            profile="compact-v1", target_modules=("Linear",), planes=1
+        ),
+        inplace=False,
+    )
+    calibration = calibrate(
+        prepared,
+        [torch.randn(2, 64)],
+        evidence_dir=tmp_path / "one-plane-calibration",
+    )
+
+    result = convert(
+        prepared,
+        calibration,
+        work_dir=tmp_path / "one-plane-work",
+    )
+
+    fitted = result.weight("weight")
+    assert len(fitted.planes) == 1
+    reopened = load_module_conversion(result.artifact_dir)
+    assert reopened.artifact_id == result.artifact_id
+    inputs = torch.randn(4, 64)
+    replayed = load_quantized_module(model, result.artifact_dir)
+    expected_weight = AdditiveTernaryWeight(fitted.planes).dense(dtype=inputs.dtype)
+    expected = torch.nn.functional.linear(inputs, expected_weight)
+    torch.testing.assert_close(replayed(inputs), expected, rtol=0, atol=0)
+
+
+def test_public_convert_persists_g64_grouped_fit_artifact(tmp_path):
+    """Public conversion must retain G64 scale geometry through reload."""
+
+    torch.manual_seed(29)
+    model = torch.nn.Linear(192, 4, bias=False)
+    prepared = prepare(
+        model,
+        TernaryConfig(
+            mode="ptq",
+            estimator="salt-v2",
+            target_modules=("Linear",),
+            planes=2,
+            profile="compact-v1",
+            target_bpw=None,
+        ),
+        inplace=False,
+    )
+    calibration = calibrate(
+        prepared,
+        [torch.randn(3, 192)],
+        evidence_dir=tmp_path / "g64-public-calibration",
+    )
+
+    result = convert(
+        prepared,
+        calibration,
+        work_dir=tmp_path / "g64-public-work",
+    )
+
+    fitted = result.weight("weight")
+    assert len(fitted.planes) == 2
+    assert all(plane.group_size == 64 for plane in fitted.planes)
+    assert all(plane.trits.shape == (4, 192) for plane in fitted.planes)
+    assert all(plane.scales.shape == (4, 3) for plane in fitted.planes)
+
+    reopened = load_module_conversion(result.artifact_dir)
+    assert reopened.artifact_id == result.artifact_id
+    for expected, actual in zip(fitted.planes, reopened.weight("weight").planes):
+        assert actual.group_size == 64
+        torch.testing.assert_close(actual.trits, expected.trits, rtol=0, atol=0)
+        torch.testing.assert_close(actual.scales, expected.scales, rtol=0, atol=0)
+
+    inputs = torch.randn(5, 192)
+    reopened_model = load_quantized_module(model, result.artifact_dir)
+    hard_weight = AdditiveTernaryWeight(fitted.planes).dense(dtype=inputs.dtype)
+    expected_output = torch.nn.functional.linear(inputs, hard_weight)
+    torch.testing.assert_close(reopened_model(inputs), expected_output, rtol=0, atol=0)

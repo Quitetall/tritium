@@ -175,6 +175,32 @@ exporters publish to a new directory and refuse an existing destination.
 | Refinement result | `load_refinement(path)` | `export_refinement(result, new_path)` |
 | Typed hard ONNX bundle | `load_onnx(path)` | `export_onnx(typed_result, new_path, ...)` |
 
+### Hugging Face generation with a Tritium ONNX bundle
+
+A dynamic-cache Qwen ONNX bundle can be wrapped for the standard Transformers
+generation loop. Supply the `PretrainedConfig` for the exact source revision;
+the ONNX bundle does not embed or download that configuration:
+
+```python
+import torch
+from transformers import AutoConfig
+from tritium.torch import as_transformers_generation_model, load_onnx
+
+runtime = load_onnx("./qwen-onnx")
+config = AutoConfig.from_pretrained("./pinned-qwen-source")
+generator = as_transformers_generation_model(runtime, config)
+output_ids = generator.generate(
+    input_ids=torch.tensor([[1, 2, 3]], dtype=torch.long),
+    max_new_tokens=32,
+)
+```
+
+This inference adapter currently supports batch-one CPU inputs, unpadded
+attention masks, and one sequence without beam search. It uses Tritium's
+authenticated tuple cache; it does not make the ONNX bundle trainable or enable
+`AutoModel` loading. Whole-Qwen candidate qualification remains a separate
+release gate.
+
 QAT-hard artifacts use `tritium.module-qat-hard-v2`. Development-only v1
 bundles did not bind complete per-consumer module semantics and are rejected;
 re-run hard conversion from the retained latent checkpoint and export a new v2

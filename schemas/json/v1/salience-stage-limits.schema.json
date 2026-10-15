@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SalienceStageLimits",
+  "description": "Receiving/producer logical byte limits, not complete process RSS admission.",
+  "type": "object",
+  "properties": {
+    "max_asset_bytes": {
+      "description": "Complete original asset payload, excluding internal statistics.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_manifest_bytes": {
+      "description": "Canonical encoded manifest, before typed metadata allocation.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_package_bytes": {
+      "description": "Complete physical package, including header, directory, metadata and padding.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_statistics_bytes": {
+      "description": "Complete raw f64 moment payload, excluding dedup savings.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_tensor_bytes": {
+      "description": "Complete derived dense tensor payload, excluding dedup savings.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "max_package_bytes",
+    "max_manifest_bytes",
+    "max_tensor_bytes",
+    "max_asset_bytes",
+    "max_statistics_bytes"
+  ]
+}

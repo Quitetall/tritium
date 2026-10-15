@@ -11,10 +11,11 @@
 
 use std::sync::Arc;
 
+use tritium_format::salt_v2_package::SaltV2ScaleUpdate;
 use tritium_spec::TernaryBackend;
 
 use crate::error::NnError;
-use crate::layers::{DenseLinear, HostSaltV2Linear, Q2Linear, SaltLinear, TernaryLinear};
+use crate::layers::{DenseLinear, HostSaltV2Linear, Linear, Q2Linear, SaltLinear, TernaryLinear};
 
 /// Activation arithmetic performed before a projection's weight contraction.
 ///
@@ -51,9 +52,85 @@ pub enum Projection {
     SaltV2(Arc<tritium_cuda::SaltV2ResidentTensor>),
     /// A dense fp32 weight (normally the fp master/reference path).
     Dense(DenseLinear),
+    /// Unified checked tensor, executed only through the shared backend contract.
+    Tensor(Linear),
 }
 
 impl Projection {
+    /// Share the immutable resident storage for one SALT V2 projection.
+    /// Other projection families are intentionally not cloneable through this
+    /// measurement-only helper.
+    pub(crate) fn clone_salt_v2_resident(&self) -> Option<Self> {
+        match self {
+            Projection::HostSaltV2(matrix) => Some(Projection::HostSaltV2(Arc::clone(matrix))),
+            #[cfg(feature = "cuda")]
+            Projection::SaltV2(matrix) => Some(Projection::SaltV2(Arc::clone(matrix))),
+            _ => None,
+        }
+    }
+
+    /// Physical SALT V2 tensor index retained by this resident projection.
+    #[must_use]
+    pub fn salt_v2_tensor_index(&self) -> Option<usize> {
+        match self {
+            Projection::HostSaltV2(matrix) => Some(matrix.tensor_index()),
+            #[cfg(feature = "cuda")]
+            Projection::SaltV2(matrix) => matrix.tensor_index(),
+            _ => None,
+        }
+    }
+
+    /// Apply scale-only candidate updates to a uniquely owned SALT V2 resident.
+    /// Packed trits stay in place; CUDA updates transactionally replace scales.
+    ///
+    /// # Errors
+    /// Returns an error for unsupported projections, shared resident handles,
+    /// or malformed updates. Validation occurs before resident scales change.
+    pub fn apply_salt_v2_scale_updates(
+        &mut self,
+        tensor_index: usize,
+        updates: &[SaltV2ScaleUpdate],
+    ) -> Result<(), NnError> {
+        match self {
+            Projection::HostSaltV2(matrix) => {
+                if matrix.tensor_index() != tensor_index {
+                    return Err(NnError::Backend(format!(
+                        "SALT V2 scale update targets tensor {tensor_index}, but this projection is tensor {}",
+                        matrix.tensor_index()
+                    )));
+                }
+                Arc::get_mut(matrix)
+                    .ok_or_else(|| {
+                        NnError::Backend(
+                            "cannot update shared host SALT V2 resident scales in place".into(),
+                        )
+                    })?
+                    .apply_scale_updates(tensor_index, updates)
+            }
+            #[cfg(feature = "cuda")]
+            Projection::SaltV2(matrix) => {
+                if matrix.tensor_index() != Some(tensor_index) {
+                    return Err(NnError::Backend(format!(
+                        "SALT V2 scale update targets tensor {tensor_index}, but this CUDA projection is tensor {:?}",
+                        matrix.tensor_index()
+                    )));
+                }
+                Arc::get_mut(matrix)
+                    .ok_or_else(|| {
+                        NnError::Backend(
+                            "cannot update shared CUDA SALT V2 resident scales in place".into(),
+                        )
+                    })?
+                    .apply_scale_updates(tensor_index, updates)
+                    .map(|_| ())
+                    .map_err(|error| NnError::Backend(error.to_string()))
+            }
+            _ => Err(NnError::Backend(
+                "scale updates require a SALT V2 projection".into(),
+            )),
+        }
+    }
+
     /// Activation arithmetic used by this projection.
     #[must_use]
     pub fn activation_mode(&self) -> ProjectionActivationMode {
@@ -61,7 +138,7 @@ impl Projection {
             Projection::Ternary(_) | Projection::Q2(_) | Projection::Salt(_) => {
                 ProjectionActivationMode::A8
             }
-            Projection::HostSaltV2(_) => ProjectionActivationMode::F32,
+            Projection::HostSaltV2(_) | Projection::Tensor(_) => ProjectionActivationMode::F32,
             #[cfg(feature = "cuda")]
             Projection::SaltV2(_) => ProjectionActivationMode::F32,
             Projection::Dense(linear) => {
@@ -80,7 +157,7 @@ impl Projection {
             Projection::Ternary(linear) => linear.validate_retained_geometry(),
             Projection::Q2(linear) => linear.validate_retained_geometry(),
             Projection::Dense(linear) => linear.validate_retained_geometry(),
-            Projection::Salt(_) | Projection::HostSaltV2(_) => Ok(()),
+            Projection::Salt(_) | Projection::HostSaltV2(_) | Projection::Tensor(_) => Ok(()),
             #[cfg(feature = "cuda")]
             Projection::SaltV2(_) => Ok(()),
         }
@@ -118,6 +195,9 @@ impl Projection {
             Projection::HostSaltV2(_) => {
                 // Strict package decode validates payload and scales before construction.
             }
+            Projection::Tensor(_) => {
+                // Private loader construction validates immutable geometry and parameters.
+            }
             #[cfg(feature = "cuda")]
             Projection::SaltV2(_) => {
                 // Upload validates the immutable resident allocation.
@@ -127,7 +207,8 @@ impl Projection {
     }
 
     /// Forward through whichever projection this is. Deployed ternary and resident
-    /// SALT V2 weights use `backend`; host-packed SALT and dense weights run on the host.
+    /// SALT V2 and shared tensor weights use `backend`; legacy host-packed SALT
+    /// and inspectable dense masters run on the host.
     ///
     /// # Errors
     /// Propagates the underlying projection's [`NnError`]. Resident SALT V2 returns
@@ -147,6 +228,7 @@ impl Projection {
             #[cfg(feature = "cuda")]
             Projection::SaltV2(tensor) => salt_v2_forward_exact(backend, tensor, act, m, out),
             Projection::Dense(l) => l.forward(act, m, out),
+            Projection::Tensor(l) => l.forward(backend, act, m, out),
         }
     }
 
@@ -160,6 +242,7 @@ impl Projection {
             #[cfg(feature = "cuda")]
             Projection::SaltV2(tensor) => tensor.rows(),
             Projection::Dense(l) => l.n_out,
+            Projection::Tensor(l) => l.n_out(),
         }
     }
 
@@ -173,6 +256,7 @@ impl Projection {
             #[cfg(feature = "cuda")]
             Projection::SaltV2(tensor) => tensor.columns(),
             Projection::Dense(l) => l.k_in,
+            Projection::Tensor(l) => l.k_in(),
         }
     }
 
@@ -184,7 +268,8 @@ impl Projection {
             Projection::Q2(_)
             | Projection::Salt(_)
             | Projection::HostSaltV2(_)
-            | Projection::Dense(_) => None,
+            | Projection::Dense(_)
+            | Projection::Tensor(_) => None,
             #[cfg(feature = "cuda")]
             Projection::SaltV2(_) => None,
         }
@@ -198,7 +283,8 @@ impl Projection {
             Projection::Q2(_)
             | Projection::Salt(_)
             | Projection::HostSaltV2(_)
-            | Projection::Dense(_) => None,
+            | Projection::Dense(_)
+            | Projection::Tensor(_) => None,
             #[cfg(feature = "cuda")]
             Projection::SaltV2(_) => None,
         }
@@ -260,5 +346,73 @@ pub(crate) fn salt_v2_forward_exact(
             Err(NnError::Shape { expected, got })
         }
         Err(error) => Err(NnError::Backend(error.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+    use std::sync::Arc;
+
+    use half::f16;
+    use tritium_format::{
+        salt_v2::SaltV2Codec,
+        salt_v2_package::{
+            SaltV2Package, SaltV2PackageReader, SaltV2Plane, SaltV2ScaleUpdate, SaltV2Tensor,
+            SaltV2Tile, write_salt_v2_package,
+        },
+    };
+
+    use super::Projection;
+    use crate::layers::HostSaltV2Linear;
+
+    fn host_matrix() -> HostSaltV2Linear {
+        let tensor = SaltV2Tensor::new(
+            "weight",
+            vec![2, 128],
+            vec![
+                SaltV2Tile::new(vec![
+                    SaltV2Plane::new(vec![1; 256], vec![f16::ONE, f16::ONE]).unwrap(),
+                ])
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let package = SaltV2Package::new(SaltV2Codec::D2, vec![tensor]).unwrap();
+        let encoded = write_salt_v2_package(&package).unwrap();
+        let mut reader = SaltV2PackageReader::new_strict(Cursor::new(encoded.bytes)).unwrap();
+        HostSaltV2Linear::from_reader(&mut reader, "weight").unwrap()
+    }
+
+    #[test]
+    fn resident_scale_updates_mutate_only_unique_host_projection() {
+        let mut projection = Projection::HostSaltV2(Arc::new(host_matrix()));
+        let update = SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::from_f32(2.0), f16::ONE]).unwrap();
+        projection
+            .apply_salt_v2_scale_updates(0, std::slice::from_ref(&update))
+            .unwrap();
+        let matrix = match &projection {
+            Projection::HostSaltV2(matrix) => matrix,
+            _ => unreachable!(),
+        };
+        let mut output = [0.0; 2];
+        matrix.forward(&vec![1.0; 128], 1, &mut output).unwrap();
+        assert_eq!(output, [256.0, 128.0]);
+
+        let mismatched = SaltV2ScaleUpdate::new(1, 0, 0, vec![f16::ONE, f16::ONE]).unwrap();
+        assert!(
+            projection
+                .apply_salt_v2_scale_updates(1, std::slice::from_ref(&mismatched))
+                .is_err()
+        );
+
+        let shared = Arc::new(host_matrix());
+        let _other_owner = Arc::clone(&shared);
+        let mut shared_projection = Projection::HostSaltV2(shared);
+        assert!(
+            shared_projection
+                .apply_salt_v2_scale_updates(0, std::slice::from_ref(&update))
+                .is_err()
+        );
     }
 }

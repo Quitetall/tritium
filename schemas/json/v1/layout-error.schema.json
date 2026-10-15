@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LayoutError",
+  "description": "Structural validation failure for an [`AdditiveLayout`].",
+  "oneOf": [
+    {
+      "description": "Rows or columns are zero.",
+      "type": "string",
+      "const": "EmptyDimensions"
+    },
+    {
+      "description": "Group width is outside the currently specified aligned-tile set.",
+      "type": "string",
+      "const": "UnsupportedGroup"
+    },
+    {
+      "description": "Tile width is not the canonical 256 coefficients.",
+      "type": "string",
+      "const": "UnsupportedTileSize"
+    },
+    {
+      "description": "The maximum plane count is zero.",
+      "type": "string",
+      "const": "EmptyPlaneStack"
+    },
+    {
+      "description": "A tied scale law has a zero numerator or denominator.",
+      "type": "string",
+      "const": "InvalidScaleRatio"
+    },
+    {
+      "description": "This schema version does not admit the requested scale law.",
+      "type": "string",
+      "const": "UnsupportedLaw"
+    },
+    {
+      "description": "The requested maximum plane count exceeds this law's own cap.",
+      "type": "string",
+      "const": "PlaneCountExceedsLaw"
+    },
+    {
+      "description": "A basis block is not a nonzero power of two.",
+      "type": "string",
+      "const": "InvalidBasisBlock"
+    },
+    {
+      "description": "A basis block does not divide the row width.",
+      "type": "string",
+      "const": "BasisBlockDoesNotDivideColumns"
+    },
+    {
+      "description": "The entropy transport block width is zero.",
+      "type": "string",
+      "const": "EmptyTransportBlock"
+    }
+  ]
+}

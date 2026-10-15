@@ -94,7 +94,14 @@ def test_ternary_config_round_trips_without_a_nominal_bits_control():
 
     ptq = TernaryConfig.ptq(profile="compact-v1", target_bpw=2.25)
     assert ptq.target_bpw == 2.25
+    assert ptq.planes == 3
     assert TernaryConfig.from_dict(ptq.to_dict()) == ptq
+
+    compact = TernaryConfig.ptq(
+        profile="compact-v1", target_modules=("Linear",), planes=1
+    )
+    assert compact.planes == 1
+    assert TernaryConfig.from_dict(compact.to_dict()) == compact
 
 
 def test_root_linear_conversion_and_state_dict_round_trip():
