@@ -445,6 +445,42 @@ extern "C" __global__ void semantic_additive_matmul_b3_rows_32(
     extern __shared__ float shared[];
     semantic_b3_rows<32>(p, act, out, batch, shared);
 }
+// Group-parallel kernel, selected only for measured decode families. Each group starts at +0 and folds
+// its columns in the original order. After a CTA-wide barrier, thread zero
+// folds the completed partials in the original plane/group order, including
+// the separate f32 multiply/add (--fmad=false). This is NOT a tree reduction.
+// At most 3 * ceil(17408/128) = 408 partials fit the 512-float shared scratch;
+// no persistent/global partial buffer, repacking or dense shadow is needed.
+extern "C" __global__ void semantic_additive_matmul_b3_groups(
+    const uint8_t *p, const float *act, float *out, uint32_t batch
+) {
+    uint32_t rows = h(p, 0), cols = h(p, 1), planes = h(p, 2);
+    if (blockDim.x != 128 || blockIdx.x >= rows || blockIdx.y >= batch ||
+        !cols || cols > 17408 || !planes || planes > 3 || h(p, 13) ||
+        h(p, 4) != 1 || h(p, 3) != 128 || h(p, 5) != 2 ||
+        h(p, 6) != 1 || h(p, 7)) return;
+    extern __shared__ float partials[];
+    uint32_t row = blockIdx.x, groups = (cols + 127) / 128;
+    const float *a = act + uint64_t(blockIdx.y) * cols;
+    for (uint32_t unit = threadIdx.x; unit < planes * groups; unit += blockDim.x) {
+        uint32_t plane = unit / groups, group = unit - plane * groups;
+        const uint8_t *data = p + plane_start(p, plane);
+        uint32_t start = group * 128, end = min(start + 128, cols);
+        float partial = 0.0f;
+        for (uint32_t col = start; col < end; ++col)
+            partial = add_digit(partial, a[col], digit(data, 1, row * cols + col));
+        partials[unit] = partial;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float sum = 0.0f;
+        for (uint32_t plane = 0; plane < planes; ++plane)
+            for (uint32_t group = 0; group < groups; ++group)
+                sum += partials[plane * groups + group] *
+                    scale(p, plane, plane * h(p, 14) + row * groups + group);
+        out[uint64_t(blockIdx.y) * rows + row] = sum;
+    }
+}
 __device__ __forceinline__ float semantic_stored_weight(const uint8_t *p, uint32_t row, uint32_t col) {
     uint32_t cols = h(p, 1), planes = h(p, 2), group = h(p, 3), codec = h(p, 4);
     bool compact = h(p, 13), tensor = h(p, 7);

@@ -5,6 +5,9 @@ use tritium_core::{PerTilePlan, Trit, UniformPlan, reference_ternary_matmul};
 use tritium_schema::{ADMITTED_LAWS, AdditiveLayout, PlaneAllocation, Transport};
 use tritium_spec::{TensorMetadata, TensorStreamEncoding, TernaryBackend};
 
+#[path = "group_tests.rs"]
+mod group_tests;
+
 fn fixture(
     rows: usize,
     cols: usize,

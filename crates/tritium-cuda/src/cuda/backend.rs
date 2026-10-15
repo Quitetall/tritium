@@ -811,6 +811,7 @@ pub struct CudaBackend {
     pub(super) func_semantic_additive_matmul: CudaFunction,
     pub(super) func_semantic_additive_matmul_ordered_warp: CudaFunction,
     pub(super) func_semantic_additive_matmul_b3_rows_32: CudaFunction,
+    pub(super) func_semantic_additive_matmul_b3_groups: CudaFunction,
     pub(super) func_semantic_additive_gather: CudaFunction,
     pub(super) func_semantic_additive_validate_finite: CudaFunction,
     pub(super) func_semantic_basis_sign: CudaFunction,
@@ -1507,6 +1508,9 @@ impl CudaBackend {
         let func_semantic_additive_matmul_b3_rows_32 = semantic_module
             .load_function("semantic_additive_matmul_b3_rows_32")
             .map_err(|e| driver_err("resolve cross-row packed matmul", &e))?;
+        let func_semantic_additive_matmul_b3_groups = semantic_module
+            .load_function("semantic_additive_matmul_b3_groups")
+            .map_err(|e| driver_err("resolve ordered-group packed matmul", &e))?;
         let func_semantic_additive_gather = semantic_module
             .load_function("semantic_additive_gather")
             .map_err(|e| driver_err("resolve semantic additive gather", &e))?;
@@ -1575,6 +1579,7 @@ impl CudaBackend {
             func_semantic_additive_matmul,
             func_semantic_additive_matmul_ordered_warp,
             func_semantic_additive_matmul_b3_rows_32,
+            func_semantic_additive_matmul_b3_groups,
             func_semantic_additive_gather,
             func_semantic_additive_validate_finite,
             func_semantic_basis_sign,

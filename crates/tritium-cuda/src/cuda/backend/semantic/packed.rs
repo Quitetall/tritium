@@ -24,6 +24,7 @@ pub(super) struct PackedAdditive {
     bytes: CudaSlice<u8>,
     ordered_warp_eligible: bool,
     b3_rows_eligible: bool,
+    b3_groups_eligible: bool,
 }
 
 fn narrow(n: usize) -> Result<u32, BackendError> {
@@ -31,6 +32,21 @@ fn narrow(n: usize) -> Result<u32, BackendError> {
 }
 
 impl Plan {
+    fn b3_groups_eligible(&self) -> bool {
+        // Two paired physical diagnostics support only these M=1 families.
+        // The one-plane 17408x5120 improvement was small/noisy, so keep its
+        // existing rows32 path. Do not extrapolate to other shapes or laws.
+        matches!(
+            (self.header[0], self.header[1], self.header[2]),
+            (5120, 5120 | 17408, 1 | 3) | (17408, 5120, 3)
+        ) && self.header[3] == 128
+            && self.header[4] == 1
+            && self.header[5] == 2
+            && self.header[6] == 1
+            && self.header[7] == 0
+            && self.header[13] == 0
+    }
+
     fn b3_rows_eligible(&self) -> bool {
         // Paired physical diagnostics cover this decode projection only.
         // The same candidate regresses the wide/down projection, so do not
@@ -648,6 +664,7 @@ impl PackedAdditive {
             bytes,
             ordered_warp_eligible: plan.ordered_warp_eligible(),
             b3_rows_eligible: plan.b3_rows_eligible(),
+            b3_groups_eligible: plan.b3_groups_eligible(),
         };
         result.validate_device_finite(backend, &plan, maximum)?;
         backend
@@ -676,11 +693,18 @@ impl PackedAdditive {
         backend: &CudaBackend,
         view: AdditiveView<'_>,
     ) -> Result<Self, BackendError> {
-        let (bytes, ordered_warp_eligible, b3_rows_eligible) = Self::stage_view(view)?;
-        Self::transfer(backend, &bytes, ordered_warp_eligible, b3_rows_eligible)
+        let (bytes, ordered_warp_eligible, b3_rows_eligible, b3_groups_eligible) =
+            Self::stage_view(view)?;
+        Self::transfer(
+            backend,
+            &bytes,
+            ordered_warp_eligible,
+            b3_rows_eligible,
+            b3_groups_eligible,
+        )
     }
 
-    fn stage_view(view: AdditiveView<'_>) -> Result<(Vec<u8>, bool, bool), BackendError> {
+    fn stage_view(view: AdditiveView<'_>) -> Result<(Vec<u8>, bool, bool, bool), BackendError> {
         let plan = Plan::new(view)?;
         let mut bytes = plan.allocate(AdditiveMetadata::from_view(view))?;
         let mut at = HEADER;
@@ -708,7 +732,12 @@ impl PackedAdditive {
             }
             at += width;
         }
-        Ok((bytes, plan.ordered_warp_eligible(), plan.b3_rows_eligible()))
+        Ok((
+            bytes,
+            plan.ordered_warp_eligible(),
+            plan.b3_rows_eligible(),
+            plan.b3_groups_eligible(),
+        ))
     }
 
     fn transfer(
@@ -716,6 +745,7 @@ impl PackedAdditive {
         bytes: &[u8],
         ordered_warp_eligible: bool,
         b3_rows_eligible: bool,
+        b3_groups_eligible: bool,
     ) -> Result<Self, BackendError> {
         let bytes = backend
             .stream
@@ -725,6 +755,7 @@ impl PackedAdditive {
             bytes,
             ordered_warp_eligible,
             b3_rows_eligible,
+            b3_groups_eligible,
         })
     }
 
@@ -839,7 +870,16 @@ impl PackedAdditive {
             return Err(invalid("packed active output extent exceeds workspace"));
         }
         let cooperative = self.ordered_warp_eligible && (512..=8192).contains(&outputs);
-        let (function, cfg) = if self.b3_rows_eligible && batch == 1 {
+        let (function, cfg) = if self.b3_groups_eligible && batch == 1 {
+            (
+                &backend.func_semantic_additive_matmul_b3_groups,
+                LaunchConfig {
+                    grid_dim: (narrow(outputs)?, 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 512 * 4,
+                },
+            )
+        } else if self.b3_rows_eligible && batch == 1 {
             (
                 &backend.func_semantic_additive_matmul_b3_rows_32,
                 LaunchConfig {
@@ -867,8 +907,9 @@ impl PackedAdditive {
         launch.arg(&self.bytes).arg(input).arg(output).arg(&batch);
         #[allow(unsafe_code)]
         // SAFETY: validated geometry bounds every access. A scalar thread or
-        // complete warp owns each output, or a cross-row CTA stages bounded
-        // packed bytes with uniform barriers. All indexing/eligibility was
+        // complete warp owns each output, a cross-row CTA stages bounded
+        // packed bytes, or a CTA folds independent ordered group partials.
+        // CTA barriers are uniform. All indexing/eligibility was
         // checked at upload. Cooperative early exits are warp/CTA uniform.
         unsafe { launch.launch(cfg) }
             .map_err(|e| driver_err("launch packed semantic matmul", &e))?;
