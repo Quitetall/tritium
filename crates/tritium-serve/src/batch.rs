@@ -3046,7 +3046,7 @@ mod tests {
                 let mut pending = 7;
                 for (offset, &token) in emitted.iter().enumerate() {
                     let logits = reference.forward(&[pending], &[3 + offset]).unwrap();
-                    assert_eq!(token, sample(&logits, &Sampling::Greedy, (0, 0)).unwrap());
+                    assert_eq!(token, tritium_nn::sample_greedy(&logits).unwrap());
                     pending = token;
                 }
                 assert_eq!(
@@ -3228,7 +3228,7 @@ mod tests {
                         panic!("unexpected recovery event: {event:?}");
                     };
                     let logits = reference.forward(&[pending], &[3 + emitted]).unwrap();
-                    assert_eq!(token, sample(&logits, &Sampling::Greedy, (0, 0)).unwrap());
+                    assert_eq!(token, tritium_nn::sample_greedy(&logits).unwrap());
                     pending = token;
                     emitted += 1;
                 }
