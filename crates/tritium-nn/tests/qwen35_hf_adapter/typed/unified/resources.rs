@@ -289,6 +289,7 @@ fn hybrid_structural_payload(runner: &tritium_nn::Runner, matrix_payload_bytes: 
             final_norm: hidden,
             layers: &layers,
             matrix_payload_bytes,
+            retained_matrix_shapes: &[],
             rotation_workspace_width: 0,
         },
         DecoderLimits {
@@ -336,6 +337,20 @@ fn physical_streamed_resident_envelopes_cover_the_complete_runner_lifetime() {
             DecoderExecution::ResidentDeviceF32
         );
         let actual = loaded.runner.resident_payload_bytes().unwrap();
+        assert_eq!(
+            admission
+                .resident_device_payload_plan
+                .unwrap()
+                .payload_bytes(),
+            actual
+        );
+        assert_eq!(
+            admission
+                .resident_device_payload_plan
+                .unwrap()
+                .matrix_payload_bytes(),
+            admission.payload_bytes as usize
+        );
         assert_eq!(
             actual,
             hybrid_structural_payload(
@@ -408,8 +423,7 @@ fn physical_streamed_resident_envelopes_cover_the_complete_runner_lifetime() {
         assert_eq!(budgets[0].used_bytes(), LIMIT as u64);
         drop(runner);
         empty(&budgets);
-        // Parent one byte short rejects before upload. A matrix-only ceiling
-        // admits uploads but the real factory rejects its additional state.
+        // Parent one byte short and a matrix-only ceiling both reject before upload.
         for cap in [LIMIT, admission.payload_bytes as usize, 1, 0] {
             let mut rejected_budgets = ledgers();
             if cap == LIMIT {
@@ -428,16 +442,7 @@ fn physical_streamed_resident_envelopes_cover_the_complete_runner_lifetime() {
                 true,
             );
             assert!(result.is_err());
-            if cap == LIMIT || cap < admission.payload_bytes as usize {
-                assert!(rejected.events().is_empty());
-            } else {
-                assert!(
-                    rejected
-                        .events()
-                        .iter()
-                        .any(|e| e.schema == tritium_evidence::TensorUploaded::SCHEMA_ID)
-                );
-            }
+            assert!(rejected.events().is_empty());
             assert!(
                 !rejected
                     .events()

@@ -119,6 +119,19 @@ policy, overflow and source mutation refuse without a decoded fallback.
 These costs exclude metadata/tokenizer heaps, allocator/driver/activation
 overhead and physical peaks. They do not authorize load, fit, readiness or quality.
 
+For a resident CUDA structural plan, also add
+`--max-device-payload-bytes N` with a positive logical ceiling. This requires
+`--backend cuda` in a CUDA build and all three stream limits, but no GPU context.
+The common source planner includes language matrices, retained MTP matrices,
+preserved device vectors, cache/state and workspace. Its matrix sum must match
+the upload plans and its total must fit the ceiling. The report adds
+`resource_plan.resident_device_payload_limit` and
+`resource_plan.resident_device_payload_plan`, whose five byte fields describe
+matrix, preserved, state, workspace and total logical payload. Unknown resident
+support (including CPU), insufficient capacity and terminal source mutation
+refuse without partial stdout. This plan does not reserve memory or prove that
+the artifact physically fits; ordinary host-only resource reports stay unchanged.
+
 Without `--backend`, status is `source-prepared-not-runtime-admitted` and
 `resource_plan`/`backend_payload_bytes` remain null. The per-name encoded/decode
 sums and maximum encoded+decoded payload pair describe the current compatibility

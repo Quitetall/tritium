@@ -279,9 +279,14 @@ pub(super) fn create(
     };
     check(graph.embedding, g.vocabulary, g.hidden, 1, false)?;
     check(graph.head, g.vocabulary, g.hidden, 1, true)?;
+    let mut retained_matrix_shapes = Vec::new();
+    retained_matrix_shapes
+        .try_reserve_exact(graph.retained_matrices.len())
+        .map_err(|_| invalid("retained decoder shape allocation"))?;
     for handle in graph.retained_matrices {
         let (rows, cols) = CudaTensor::checked(&backend, handle.as_ref())?.dimensions();
         check(handle, rows, cols, 1, false)?;
+        retained_matrix_shapes.push((rows, cols));
     }
     vector(graph.final_norm, g.hidden, false)?;
     let mut allocation_layers = Vec::new();
@@ -369,6 +374,7 @@ pub(super) fn create(
             final_norm: graph.final_norm.len(),
             layers: &allocation_layers,
             matrix_payload_bytes: matrix_bytes,
+            retained_matrix_shapes: &retained_matrix_shapes,
             rotation_workspace_width: rotate_width,
         },
         limits,

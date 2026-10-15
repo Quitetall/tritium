@@ -218,6 +218,55 @@ impl StandardModelPlan {
         self.embedding.shape[0]
     }
 
+    #[cfg(feature = "tokenizer")]
+    pub(super) fn executed_matrices(&self) -> impl Iterator<Item = &TensorRequest> {
+        self.layers
+            .iter()
+            .flat_map(|l| [&l.gate, &l.up, &l.down, &l.q, &l.k, &l.v, &l.o])
+            .chain(std::iter::once(
+                self.lm_head.as_ref().unwrap_or(&self.embedding),
+            ))
+    }
+
+    #[cfg(feature = "tokenizer")]
+    pub(super) fn resident_layers(
+        &self,
+        spec: &ArchSpec,
+        eps: f32,
+    ) -> Result<Vec<tritium_spec::DecoderAllocationLayer>, NnError> {
+        use tritium_spec::{DecoderActivation, DecoderAllocationLayer, DecoderAllocationMixer};
+        let size = |r: &Option<TensorRequest>| r.as_ref().map_or(0, |r| r.shape[0]);
+        let mut layers = Vec::new();
+        layers
+            .try_reserve_exact(self.layers.len())
+            .map_err(|e| NnError::ResourceExhausted(e.to_string()))?;
+        for l in &self.layers {
+            layers.push(DecoderAllocationLayer {
+                input_norm: l.attn_norm.shape[0],
+                post_norm: l.ffn_norm.shape[0],
+                activation: if spec.mlp == MlpKind::Relu2 {
+                    DecoderActivation::Relu2
+                } else {
+                    DecoderActivation::SwiGlu
+                },
+                ffn_sub_norm: size(&l.ffn_sub_norm),
+                ffn_sub_eps: eps,
+                mixer: DecoderAllocationMixer::Attention {
+                    gated: false,
+                    vectors: [
+                        size(&l.attn_sub_norm),
+                        size(&l.q_bias),
+                        size(&l.k_bias),
+                        size(&l.v_bias),
+                        size(&l.q_norm),
+                        size(&l.k_norm),
+                    ],
+                },
+            });
+        }
+        Ok(layers)
+    }
+
     /// Complete name/rank/geometry/storage coverage before any matrix allocation.
     /// The source adapter supplies borrowed geometry only; this plan owns the
     /// expected graph and exact complete-inventory rule for every source.

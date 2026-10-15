@@ -41,6 +41,7 @@ pub(super) struct TensorSpec {
     pub(super) shape: Vec<usize>,
     pub(super) role: TensorRole,
 }
+pub(super) const LANGUAGE_EMBEDDING: &str = "model.language_model.embed_tokens.weight";
 
 /// Physical admission role of one canonical Qwen language/MTP tensor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -714,7 +715,7 @@ pub(super) fn language_schema(
     let mut schema = BTreeMap::new();
     insert_spec(
         &mut schema,
-        "model.language_model.embed_tokens.weight".to_owned(),
+        LANGUAGE_EMBEDDING.to_owned(),
         &[vocab, hidden],
         TensorRole::Matrix,
     )?;
@@ -1072,8 +1073,7 @@ pub(super) fn load_language_weights<S: Qwen35HfTensorSource + ?Sized>(
     let hidden = axis(config.hidden_size);
     let intermediate = axis(config.intermediate_size);
     let vocab = axis(config.vocab_size);
-    let embedding =
-        shards.token_embedding_exact("model.language_model.embed_tokens.weight", vocab, hidden)?;
+    let embedding = shards.token_embedding_exact(LANGUAGE_EMBEDDING, vocab, hidden)?;
     let mut layers = Vec::new();
     layers
         .try_reserve_exact(config.layer_types.len())

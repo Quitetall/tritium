@@ -116,6 +116,14 @@ impl StreamedModelLoadPlan {
     pub const fn payload_bytes(&self) -> u64 {
         self.covered.payload_bytes
     }
+    /// Configured resident envelope, when structural resident planning was requested.
+    pub const fn resident_device_payload_limit(&self) -> Option<u64> {
+        self.covered.resident_device_payload_limit
+    }
+    /// Checked logical device categories, not a reservation or physical measurement.
+    pub const fn resident_device_payload_plan(&self) -> Option<tritium_spec::DecoderPayloadPlan> {
+        self.covered.resident_device_payload_plan
+    }
     /// Maximum bounded matrix source window or preserved encoded/decoded pair.
     pub const fn source_workspace_bytes(&self) -> u64 {
         self.covered.source_workspace_bytes
@@ -327,6 +335,86 @@ pub fn inspect_trit_file_streamed(
     )
         -> Result<Option<tritium_spec::TensorStreamPlan>, tritium_spec::BackendError>,
 ) -> Result<StreamedModelLoadPlan, NnError> {
+    inspect_streamed_with(
+        path,
+        level,
+        receiving,
+        limits,
+        execution,
+        |model, prepared| {
+            super::resources::describe_streamed(
+                model,
+                level,
+                &prepared.graph,
+                &prepared.plan,
+                policy,
+                planner,
+            )
+        },
+    )
+}
+
+/// Describe resident encoded-streaming costs using the common source/resource plan.
+/// Both injected planners must be pure: this does not initialize a backend,
+/// reserve a budget, upload weights, emit ModelLoaded or certify physical fit.
+/// # Errors
+/// Source/preparation errors, unknown/inconsistent structural declarations,
+/// an exceeded positive resident ceiling, overflow or terminal source mutation.
+#[allow(clippy::too_many_arguments)]
+pub fn inspect_trit_file_streamed_resident(
+    path: &Path,
+    level: &str,
+    receiving: TritPackageReadLimits,
+    limits: Qwen35TritReadLimits,
+    execution: StreamLimits,
+    policy: tritium_schema::TensorUploadPolicy,
+    max_device_payload_bytes: u64,
+    planner: impl FnMut(
+        tritium_spec::TensorMetadata<'_>,
+        tritium_spec::TensorStreamEncoding,
+    )
+        -> Result<Option<tritium_spec::TensorStreamPlan>, tritium_spec::BackendError>,
+    decoder: impl FnMut(
+        tritium_spec::DecoderAllocationMetadata<'_>,
+        tritium_spec::DecoderLimits,
+    )
+        -> Result<Option<tritium_spec::DecoderPayloadPlan>, tritium_spec::BackendError>,
+) -> Result<StreamedModelLoadPlan, NnError> {
+    if max_device_payload_bytes == 0 {
+        return Err(invalid("resident payload ceiling must be positive"));
+    }
+    inspect_streamed_with(
+        path,
+        level,
+        receiving,
+        limits,
+        execution,
+        |model, prepared| {
+            super::resources::describe_streamed_resident(
+                model,
+                level,
+                &prepared.graph,
+                &prepared.plan,
+                policy,
+                planner,
+                max_device_payload_bytes,
+                decoder,
+            )
+        },
+    )
+}
+
+fn inspect_streamed_with(
+    path: &Path,
+    level: &str,
+    receiving: TritPackageReadLimits,
+    limits: Qwen35TritReadLimits,
+    execution: StreamLimits,
+    describe: impl FnOnce(
+        &TritModelReader<File>,
+        &Prepared,
+    ) -> Result<super::ModelResourceAdmission, NnError>,
+) -> Result<StreamedModelLoadPlan, NnError> {
     positive(limits)?;
     execution.validate()?;
     let file = File::open(path).map_err(invalid)?;
@@ -336,14 +424,7 @@ pub fn inspect_trit_file_streamed(
     }
     let mut model = TritModelReader::open(file, receiving).map_err(invalid)?;
     let prepared = prepare(&mut model, level, metadata.len(), limits, Some(execution))?;
-    let covered = super::resources::describe_streamed(
-        &model,
-        level,
-        &prepared.graph,
-        &prepared.plan,
-        policy,
-        planner,
-    )?;
+    let covered = describe(&model, &prepared)?;
     model.verify().map_err(invalid)?;
     Ok(StreamedModelLoadPlan {
         source: prepared.plan,

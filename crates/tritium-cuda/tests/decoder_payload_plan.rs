@@ -73,6 +73,7 @@ fn metadata(layers: &[DecoderAllocationLayer], hybrid: bool) -> DecoderAllocatio
         final_norm: 8,
         layers,
         matrix_payload_bytes: 1000,
+        retained_matrix_shapes: &[],
         rotation_workspace_width: 0,
     }
 }
@@ -196,6 +197,14 @@ fn structural_planner_rejects_invalid_lengths_semantics_limits_and_overflow() {
     for bad in [
         DecoderAllocationMetadata {
             final_norm: 7,
+            ..base
+        },
+        DecoderAllocationMetadata {
+            retained_matrix_shapes: &[(0, 1)],
+            ..base
+        },
+        DecoderAllocationMetadata {
+            retained_matrix_shapes: &[(usize::MAX, 2)],
             ..base
         },
         DecoderAllocationMetadata {

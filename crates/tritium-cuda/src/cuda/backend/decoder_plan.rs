@@ -67,6 +67,12 @@ pub(super) fn plan(
     }
     let m = limits.max_segment_tokens;
     CudaBackend::check_grad_launch_bounds(1, g.vocabulary, g.hidden)?;
+    for &(rows, cols) in metadata.retained_matrix_shapes {
+        if rows == 0 || cols == 0 {
+            return Err(invalid("retained decoder matrix has zero extent"));
+        }
+        CudaBackend::check_grad_launch_bounds(1, rows, cols)?;
+    }
     let mut preserved = vector(metadata.final_norm, g.hidden, false)?;
     let mut state_bytes = 0;
     let mut has_attention = false;

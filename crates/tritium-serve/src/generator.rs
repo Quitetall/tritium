@@ -512,6 +512,9 @@ pub struct RunnerResourceAdmission {
     /// Omitted for existing host-only resource admissions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resident_device_payload_limit: Option<u64>,
+    /// Frozen logical graph declaration, distinct from the reserved ceiling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resident_device_payload_plan: Option<tritium_spec::DecoderPayloadPlan>,
     /// Maximum concurrent source window or preserved encoded/decoded pair.
     pub source_workspace_bytes: u64,
     /// Backend-declared additional host upload workspace.

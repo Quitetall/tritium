@@ -27,6 +27,8 @@ mod qwen35_trit;
 #[cfg(feature = "tokenizer")]
 pub(crate) mod resident;
 #[cfg(feature = "tokenizer")]
+mod resident_metadata;
+#[cfg(feature = "tokenizer")]
 mod resources;
 #[cfg(feature = "tokenizer")]
 mod retained;
@@ -91,7 +93,7 @@ pub use resources::{ModelLoadResources, ModelResourceAdmission};
 #[cfg(feature = "tokenizer")]
 pub use retained_plan::{
     ModelLoadPlan, StreamedModelLoadPlan, TensorLoadPlan, inspect_trit_file,
-    inspect_trit_file_streamed,
+    inspect_trit_file_streamed, inspect_trit_file_streamed_resident,
 };
 pub use runner::{ForwardDump, ModelRunner};
 #[cfg(feature = "cuda")]

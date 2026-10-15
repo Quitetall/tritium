@@ -212,10 +212,7 @@ fn load_reader<R: Read + Seek>(
                 };
                 let weights = plan.assemble(&config, &spec, embedding, vectors, projections)?;
                 if let Some(r) = &reservations {
-                    super::resources::validate_selection(
-                        backend.as_ref(),
-                        r.admission.resident_device_payload_limit,
-                    )?;
+                    super::resources::validate_selection(backend.as_ref(), r)?;
                 }
                 Runner::standard(config, weights, backend, spec, admission)?
             }
@@ -224,10 +221,7 @@ fn load_reader<R: Read + Seek>(
                 let (weights, mtp_weights) =
                     assemble_prepared(&mut model, level, &mut loader, limits, &config)?;
                 if let Some(r) = &reservations {
-                    super::resources::validate_selection(
-                        backend.as_ref(),
-                        r.admission.resident_device_payload_limit,
-                    )?;
+                    super::resources::validate_selection(backend.as_ref(), r)?;
                 }
                 let language = Qwen35TextRunner::new(&config.text, weights, backend)?;
                 let mtp = UnverifiedQwen35Mtp::new(&language, mtp_weights)?;

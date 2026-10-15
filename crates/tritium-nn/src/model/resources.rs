@@ -8,9 +8,9 @@ use std::{
 use tritium_format::trit_model::TritModelReader;
 use tritium_runtime::{TensorPayloadBudget, TensorStorageReservation};
 use tritium_spec::{
-    BackendError, TENSOR_STREAM_CHUNK_BYTES, TensorMetadata, TensorStreamEncoding,
-    TensorStreamPlan, TensorUploadPlan, TensorUploadPolicy, TernaryBackend,
-    validate_tensor_upload_policy,
+    BackendError, DecoderAllocationMetadata, DecoderLimits, DecoderPayloadPlan,
+    TENSOR_STREAM_CHUNK_BYTES, TensorMetadata, TensorStreamEncoding, TensorStreamPlan,
+    TensorUploadPlan, TensorUploadPolicy, TernaryBackend, validate_tensor_upload_policy,
 };
 
 /// Explicit logical storage domains for resource-planned retained loading.
@@ -44,6 +44,8 @@ pub struct ModelResourceAdmission {
     /// Reserved configured matrix/vector/cache/workspace ceiling, if resident.
     /// Not an exact graph estimate, actual payload or physical VRAM measurement.
     pub resident_device_payload_limit: Option<u64>,
+    /// Frozen checked structural graph declaration, not actual physical memory.
+    pub resident_device_payload_plan: Option<DecoderPayloadPlan>,
     /// Conservative maximum encoded+decoded current tensor pair.
     pub source_workspace_bytes: u64,
     /// Conservative maximum additional explicit backend host upload workspace.
@@ -77,12 +79,22 @@ fn resident_limit(backend: &dyn TernaryBackend) -> Result<Option<u64>, NnError> 
 }
 pub(super) fn validate_selection(
     backend: &dyn TernaryBackend,
-    expected: Option<u64>,
+    reservations: &LoadReservations,
 ) -> Result<(), NnError> {
-    if resident_limit(backend)? != expected {
+    if resident_limit(backend)? != reservations.admission.resident_device_payload_limit {
         return Err(invalid(
             "resident payload envelope changed before graph construction",
         ));
+    }
+    if let Some(allocation) = &reservations.resident {
+        let current = backend
+            .decoder_payload_plan(allocation.metadata(), allocation.limits)
+            .map_err(invalid)?;
+        if current != reservations.admission.resident_device_payload_plan {
+            return Err(invalid(
+                "resident structural plan changed before graph construction",
+            ));
+        }
     }
     Ok(())
 }
@@ -96,6 +108,9 @@ pub(super) fn validate_runner(
             .and_then(|n| u64::try_from(n).ok());
         if runner.execution() != tritium_spec::DecoderExecution::ResidentDeviceF32
             || !actual.is_some_and(|n| n >= admission.payload_bytes && n <= limit)
+            || admission
+                .resident_device_payload_plan
+                .is_none_or(|p| actual != u64::try_from(p.payload_bytes()).ok())
         {
             return Err(invalid(
                 "resident executor payload or execution differs from envelope",
@@ -113,6 +128,7 @@ pub(super) struct LoadReservations {
     pub(super) stream_plans: Option<BTreeMap<String, TensorStreamPlan>>,
     pub(super) admission: ModelResourceAdmission,
     pub(super) retained_host: TensorStorageReservation,
+    resident: Option<super::resident_metadata::Allocation>,
     _source_workspace: TensorStorageReservation,
 }
 
@@ -183,6 +199,24 @@ pub(super) fn reserve<R: Read + Seek>(
             "resident payload envelope is smaller than matrix payload",
         ));
     }
+    let resident = resident_limit
+        .map(|limit| {
+            let allocation = super::resident_metadata::compile(
+                model,
+                level,
+                graph,
+                source,
+                admission.payload_bytes,
+            )?;
+            admission.resident_device_payload_plan = Some(declare_resident(
+                &allocation,
+                admission.payload_bytes,
+                limit,
+                |m, l| backend.decoder_payload_plan(m, l),
+            )?);
+            Ok::<_, NnError>(allocation)
+        })
+        .transpose()?;
     // All domains are reserved before any complete tensor is read/decompressed.
     // A later refusal drops earlier guards/partitions, including on shared ledgers.
     let payload = resources
@@ -213,6 +247,7 @@ pub(super) fn reserve<R: Read + Seek>(
         stream_plans,
         admission,
         retained_host,
+        resident,
         _source_workspace: source_workspace,
     })
 }
@@ -233,6 +268,7 @@ fn calculate<R: Read + Seek>(
     let mut admission = ModelResourceAdmission {
         payload_bytes: 0,
         resident_device_payload_limit: None,
+        resident_device_payload_plan: None,
         source_workspace_bytes: if streamed {
             TENSOR_STREAM_CHUNK_BYTES as u64
         } else {
@@ -356,4 +392,62 @@ pub(super) fn describe_streamed<R: Read + Seek>(
         },
     )
     .map(|plan| plan.admission)
+}
+
+fn declare_resident(
+    allocation: &super::resident_metadata::Allocation,
+    matrix_bytes: u64,
+    limit: u64,
+    mut planner: impl FnMut(
+        DecoderAllocationMetadata<'_>,
+        DecoderLimits,
+    ) -> Result<Option<DecoderPayloadPlan>, BackendError>,
+) -> Result<DecoderPayloadPlan, NnError> {
+    if limit == 0 {
+        return Err(invalid("resident payload ceiling must be positive"));
+    }
+    let plan = planner(allocation.metadata(), allocation.limits)
+        .map_err(invalid)?
+        .ok_or_else(|| invalid("resident structural plan is unknown"))?;
+    if u64::try_from(plan.matrix_payload_bytes()).map_err(invalid)? != matrix_bytes {
+        return Err(invalid(
+            "resident plan matrix payload differs from upload plans",
+        ));
+    }
+    if u64::try_from(plan.payload_bytes()).map_err(invalid)? > limit {
+        return Err(invalid(
+            "resident structural plan exceeds configured envelope",
+        ));
+    }
+    Ok(plan)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn describe_streamed_resident<R: Read + Seek>(
+    model: &TritModelReader<R>,
+    level: &str,
+    graph: &Graph,
+    source: &ModelLoadPlan,
+    policy: TensorUploadPolicy,
+    planner: impl FnMut(
+        TensorMetadata<'_>,
+        TensorStreamEncoding,
+    ) -> Result<Option<TensorStreamPlan>, BackendError>,
+    limit: u64,
+    decoder: impl FnMut(
+        DecoderAllocationMetadata<'_>,
+        DecoderLimits,
+    ) -> Result<Option<DecoderPayloadPlan>, BackendError>,
+) -> Result<ModelResourceAdmission, NnError> {
+    let mut admission = describe_streamed(model, level, graph, source, policy, planner)?;
+    let allocation =
+        super::resident_metadata::compile(model, level, graph, source, admission.payload_bytes)?;
+    admission.resident_device_payload_limit = Some(limit);
+    admission.resident_device_payload_plan = Some(declare_resident(
+        &allocation,
+        admission.payload_bytes,
+        limit,
+        decoder,
+    )?);
+    Ok(admission)
 }

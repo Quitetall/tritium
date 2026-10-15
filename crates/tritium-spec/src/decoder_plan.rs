@@ -68,18 +68,25 @@ pub struct DecoderAllocationMetadata<'a> {
     pub layers: &'a [DecoderAllocationLayer],
     /// Native matrix payload summed once per owner, including retained MTP.
     pub matrix_payload_bytes: usize,
+    /// Retained nonexecuted matrix extents, checked by the same launch planner.
+    pub retained_matrix_shapes: &'a [(usize, usize)],
     /// Maximum columns of an executed nonidentity-basis projection, or zero.
     /// Retained nonexecuted matrices do not require rotation workspace.
     pub rotation_workspace_width: usize,
 }
 
 /// Checked logical resident payload categories, not a reservation or measurement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct DecoderPayloadPlan {
+    #[serde(rename = "matrix_payload_bytes")]
     matrices: usize,
+    #[serde(rename = "preserved_payload_bytes")]
     preserved: usize,
+    #[serde(rename = "state_payload_bytes")]
     state: usize,
+    #[serde(rename = "workspace_payload_bytes")]
     workspace: usize,
+    #[serde(rename = "payload_bytes")]
     total: usize,
 }
 impl DecoderPayloadPlan {

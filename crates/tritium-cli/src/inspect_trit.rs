@@ -23,6 +23,9 @@ pub(crate) struct InspectTritArgs {
     /// Per-matrix backend payload ceiling, not aggregate or physical memory.
     #[arg(long, requires = "backend")]
     max_tensor_payload_bytes: Option<u64>,
+    /// Plan resident graph payload under this positive ceiling; no device initialization.
+    #[arg(long, requires = "backend")]
+    max_device_payload_bytes: Option<u64>,
     #[arg(long, default_value_t = 2 * 1024 * 1024 * 1024u64)]
     max_package_bytes: u64,
     #[arg(long, default_value_t = 16 * 1024 * 1024u64)]
@@ -52,6 +55,23 @@ enum InspectionBackend {
     Cuda,
 }
 impl InspectionBackend {
+    fn decoder(
+        self,
+        metadata: tritium_spec::DecoderAllocationMetadata<'_>,
+        limits: tritium_spec::DecoderLimits,
+    ) -> Result<Option<tritium_spec::DecoderPayloadPlan>, tritium_spec::BackendError> {
+        match (self, metadata, limits) {
+            (Self::Cpu, _, _) => Ok(None),
+            #[cfg(feature = "cuda")]
+            (Self::Cuda, metadata, limits) => {
+                tritium_cuda::CudaBackend::plan_decoder_metadata(metadata, limits).map(Some)
+            }
+            #[cfg(not(feature = "cuda"))]
+            (Self::Cuda, _, _) => Err(tritium_spec::BackendError::Backend(
+                "CUDA inspection requires a build with --features cuda".into(),
+            )),
+        }
+    }
     fn plan(
         self,
         metadata: tritium_spec::TensorMetadata<'_>,
@@ -82,6 +102,10 @@ impl InspectionBackend {
 #[derive(Serialize)]
 struct ResourcePlan {
     payload_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resident_device_payload_limit: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resident_device_payload_plan: Option<tritium_spec::DecoderPayloadPlan>,
     source_workspace_bytes: u64,
     host_workspace_bytes: u64,
     device_workspace_bytes: u64,
@@ -91,6 +115,8 @@ impl From<&tritium_nn::StreamedModelLoadPlan> for ResourcePlan {
     fn from(plan: &tritium_nn::StreamedModelLoadPlan) -> Self {
         Self {
             payload_bytes: plan.payload_bytes(),
+            resident_device_payload_limit: plan.resident_device_payload_limit(),
+            resident_device_payload_plan: plan.resident_device_payload_plan(),
             source_workspace_bytes: plan.source_workspace_bytes(),
             host_workspace_bytes: plan.host_workspace_bytes(),
             device_workspace_bytes: plan.device_workspace_bytes(),
@@ -183,20 +209,38 @@ pub(crate) fn run(args: InspectTritArgs) -> anyhow::Result<()> {
     let streamed = args
         .backend
         .map(|backend| {
-            tritium_nn::inspect_trit_file_streamed(
-                &args.model,
-                &args.level,
-                receiving,
-                limits,
-                execution
-                    .ok_or_else(|| anyhow::anyhow!("backend inspection requires stream limits"))?,
-                tritium_schema::TensorUploadPolicy {
-                    native_only: args.native_only,
-                    max_payload_bytes: args.max_tensor_payload_bytes,
-                },
-                |metadata, encoding| backend.plan(metadata, encoding),
-            )
-            .map_err(anyhow::Error::from)
+            let execution = execution
+                .ok_or_else(|| anyhow::anyhow!("backend inspection requires stream limits"))?;
+            let policy = tritium_schema::TensorUploadPolicy {
+                native_only: args.native_only,
+                max_payload_bytes: args.max_tensor_payload_bytes,
+            };
+            if let Some(limit) = args.max_device_payload_bytes {
+                ensure!(limit > 0, "resident payload ceiling must be positive");
+                tritium_nn::inspect_trit_file_streamed_resident(
+                    &args.model,
+                    &args.level,
+                    receiving,
+                    limits,
+                    execution,
+                    policy,
+                    limit,
+                    |m, e| backend.plan(m, e),
+                    |m, l| backend.decoder(m, l),
+                )
+                .map_err(anyhow::Error::from)
+            } else {
+                tritium_nn::inspect_trit_file_streamed(
+                    &args.model,
+                    &args.level,
+                    receiving,
+                    limits,
+                    execution,
+                    policy,
+                    |metadata, encoding| backend.plan(metadata, encoding),
+                )
+                .map_err(anyhow::Error::from)
+            }
         })
         .transpose()?;
     let source_only = if streamed.is_none() {

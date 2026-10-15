@@ -414,11 +414,19 @@ fn check_actual_typed_binary(resident: bool, bounded: bool, streamed: bool, cuda
                 assert!(admission["retained_host_bytes"].as_u64().unwrap() > 0);
                 if resident {
                     assert_eq!(admission["resident_device_payload_limit"], 1_000_000);
+                    assert_eq!(
+                        admission["resident_device_payload_plan"]["payload_bytes"],
+                        info["resident_payload_bytes"]
+                    );
+                    assert_eq!(
+                        admission["resident_device_payload_plan"]["matrix_payload_bytes"],
+                        admission["payload_bytes"]
+                    );
                     assert!(info["resident_payload_bytes"].as_u64().unwrap() <= 1_000_000);
                 }
                 assert_eq!(
                     admission.as_object().unwrap().len(),
-                    if resident { 6 } else { 5 }
+                    if resident { 7 } else { 5 }
                 );
             } else {
                 assert!(

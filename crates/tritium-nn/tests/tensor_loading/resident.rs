@@ -171,6 +171,7 @@ fn structural_payload(runner: &tritium_nn::Runner, matrices: usize, rotated: boo
             final_norm: hidden,
             layers: &layers,
             matrix_payload_bytes: matrices,
+            retained_matrix_shapes: &[],
             rotation_workspace_width: if rotated {
                 hidden.max(intermediate).max(q)
             } else {

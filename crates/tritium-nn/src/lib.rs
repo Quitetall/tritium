@@ -35,7 +35,7 @@ mod training;
 #[cfg(feature = "tokenizer")]
 pub use model::{
     ModelLoadPlan, StreamedModelLoadPlan, TensorLoadPlan, inspect_trit_file,
-    inspect_trit_file_streamed,
+    inspect_trit_file_streamed, inspect_trit_file_streamed_resident,
 };
 
 pub use config::{ArchSpec, MlpKind, ModelConfig};

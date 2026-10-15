@@ -94,14 +94,21 @@ For that combination, `max_payload_bytes` must cover the entire configured
 `execution.max_device_payload_bytes` envelope. The caller's payload ledger
 reserves that full ceiling before weight upload, including matrices and resident
 vectors/cache/workspace; matrix leases do not charge the parent twice. The real
-CUDA factory still computes and checks its complete allocation before graph
-allocation. An unavailable/changed backend ceiling or insufficient envelope
-refuses rather than falling back to host execution.
+loader compiles the resident structural payload plan from the admitted source
+metadata before full tensor decoding or upload. The declared matrix sum must
+match the upload plans and its complete total must fit the envelope. Unknown
+planning, an unavailable/changed backend ceiling, or insufficient capacity
+refuses rather than falling back to host execution. Before graph construction,
+the loader rechecks the frozen declaration; the CUDA factory uses the same
+planner and its reported payload must match before the model is exposed.
 
 Readiness keeps `payload_bytes` as the exact declared matrix payload and adds
-`resident_device_payload_limit` only for a reserved resident envelope. The
+`resident_device_payload_limit` only for a reserved resident envelope, together
+with `resident_device_payload_plan` (matrix, preserved-vector, state, workspace
+and total logical bytes). Host admissions omit both optional fields. The
 separate `runtime_info.resident_payload_bytes` is the actual declared graph
-payload. A reserved ceiling is neither an exact estimate nor measured VRAM.
+payload and must equal that planned total. A reserved ceiling and a structural
+plan are neither measured VRAM nor proof of physical fit.
 Runner retains the envelope until its executor has dropped, including after
 handoff to the worker. Omitting `streamed_resources` preserves the explicit
 compatibility loader and does not invent resource admission.

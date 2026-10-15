@@ -156,6 +156,167 @@ fn check_inspection(backend: &str) {
                 if !hybrid {
                     assert_eq!(planned, if tied { 8 } else { 9 });
                 }
+                #[cfg(feature = "cuda")]
+                if backend == "cuda" {
+                    let resident = tritium_nn::inspect_trit_file_streamed_resident(
+                        &path,
+                        "test",
+                        tritium_format::TritPackageReadLimits {
+                            max_source_bytes: 1_000_000,
+                            max_manifest_bytes: 128_000,
+                            max_directory_bytes: 128_000,
+                        },
+                        tritium_nn::Qwen35TritReadLimits {
+                            max_config_bytes: 16_000,
+                            max_tensor_bytes: 16_000,
+                            max_decoded_tensor_bytes: 16_000,
+                        },
+                        tritium_nn::StreamLimits {
+                            max_context: 16,
+                            max_segment_tokens: 2,
+                            max_host_cache_payload_bytes: 1_000_000,
+                        },
+                        tritium_schema::TensorUploadPolicy::default(),
+                        1_000_000,
+                        tritium_cuda::CudaBackend::plan_tensor_stream,
+                        |m, l| {
+                            assert_eq!(m.retained_matrix_shapes.len(), if hybrid { 8 } else { 0 });
+                            tritium_cuda::CudaBackend::plan_decoder_metadata(m, l).map(Some)
+                        },
+                    )
+                    .unwrap();
+                    let cost = resident.resident_device_payload_plan().unwrap();
+                    for unknown in [true, false] {
+                        let refused = tritium_nn::inspect_trit_file_streamed_resident(
+                            &path,
+                            "test",
+                            tritium_format::TritPackageReadLimits {
+                                max_source_bytes: 1_000_000,
+                                max_manifest_bytes: 128_000,
+                                max_directory_bytes: 128_000,
+                            },
+                            tritium_nn::Qwen35TritReadLimits {
+                                max_config_bytes: 16_000,
+                                max_tensor_bytes: 16_000,
+                                max_decoded_tensor_bytes: 16_000,
+                            },
+                            tritium_nn::StreamLimits {
+                                max_context: 16,
+                                max_segment_tokens: 2,
+                                max_host_cache_payload_bytes: 1_000_000,
+                            },
+                            tritium_schema::TensorUploadPolicy::default(),
+                            1_000_000,
+                            tritium_cuda::CudaBackend::plan_tensor_stream,
+                            |_, _| {
+                                if unknown {
+                                    Ok(None)
+                                } else {
+                                    tritium_spec::DecoderPayloadPlan::new(
+                                        cost.matrix_payload_bytes() + 4,
+                                        cost.preserved_payload_bytes(),
+                                        cost.state_payload_bytes(),
+                                        cost.workspace_payload_bytes(),
+                                    )
+                                    .map(Some)
+                                }
+                            },
+                        );
+                        assert!(refused.is_err());
+                    }
+                    assert_eq!(cost.matrix_payload_bytes() as u64, expected.payload_bytes());
+                    assert!(cost.payload_bytes() > cost.matrix_payload_bytes());
+                    for limit in [1_000_000, cost.payload_bytes() as u64] {
+                        let output = command(&path, Some("cuda"))
+                            .args(["--max-device-payload-bytes", &limit.to_string()])
+                            .output()
+                            .unwrap();
+                        assert!(
+                            output.status.success(),
+                            "{}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+                        assert_eq!(report["backend_initialized"], false);
+                        assert_eq!(report["weights_uploaded"], false);
+                        assert_eq!(
+                            report["resource_plan"]["resident_device_payload_limit"],
+                            limit
+                        );
+                        assert_eq!(
+                            report["resource_plan"]["resident_device_payload_plan"],
+                            serde_json::to_value(cost).unwrap()
+                        );
+                    }
+                    for limit in [0, 1, cost.payload_bytes() as u64 - 1] {
+                        let output = command(&path, Some("cuda"))
+                            .args(["--max-device-payload-bytes", &limit.to_string()])
+                            .output()
+                            .unwrap();
+                        assert!(!output.status.success());
+                        assert!(output.stdout.is_empty());
+                    }
+                    let output = command(&path, Some("cuda"))
+                        .args([
+                            "--max-device-payload-bytes",
+                            "1000000",
+                            "--max-output-bytes",
+                            "16",
+                        ])
+                        .output()
+                        .unwrap();
+                    assert!(!output.status.success());
+                    assert!(output.stdout.is_empty());
+                    let changed = std::cell::Cell::new(false);
+                    let mutated = tritium_nn::inspect_trit_file_streamed_resident(
+                        &path,
+                        "test",
+                        tritium_format::TritPackageReadLimits {
+                            max_source_bytes: 1_000_000,
+                            max_manifest_bytes: 128_000,
+                            max_directory_bytes: 128_000,
+                        },
+                        tritium_nn::Qwen35TritReadLimits {
+                            max_config_bytes: 16_000,
+                            max_tensor_bytes: 16_000,
+                            max_decoded_tensor_bytes: 16_000,
+                        },
+                        tritium_nn::StreamLimits {
+                            max_context: 16,
+                            max_segment_tokens: 2,
+                            max_host_cache_payload_bytes: 1_000_000,
+                        },
+                        tritium_schema::TensorUploadPolicy::default(),
+                        1_000_000,
+                        tritium_cuda::CudaBackend::plan_tensor_stream,
+                        |m, l| {
+                            use std::io::Write;
+                            std::fs::OpenOptions::new()
+                                .append(true)
+                                .open(&path)
+                                .unwrap()
+                                .write_all(&[0])
+                                .unwrap();
+                            changed.set(true);
+                            tritium_cuda::CudaBackend::plan_decoder_metadata(m, l).map(Some)
+                        },
+                    );
+                    assert!(changed.get());
+                    assert!(mutated.is_err(), "terminal source mutation must refuse");
+                    std::fs::write(&path, &bytes).unwrap();
+                }
+                if backend == "cpu" {
+                    let output = command(&path, Some("cpu"))
+                        .args(["--max-device-payload-bytes", "1000000"])
+                        .output()
+                        .unwrap();
+                    assert!(!output.status.success());
+                    assert!(output.stdout.is_empty());
+                    assert!(
+                        String::from_utf8_lossy(&output.stderr)
+                            .contains("resident structural plan is unknown")
+                    );
+                }
                 let output = command(&path, Some(backend)).output().unwrap();
                 assert!(
                     output.status.success(),
