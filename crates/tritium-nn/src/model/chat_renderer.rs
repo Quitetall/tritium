@@ -20,6 +20,8 @@ struct ChatMessage<'a> {
 struct RenderContext<'a> {
     messages: Vec<ChatMessage<'a>>,
     add_generation_prompt: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable_thinking: Option<bool>,
     #[serde(flatten)]
     special_tokens: &'a serde_json::Map<String, Value>,
 }
@@ -260,6 +262,19 @@ impl SourceChatTemplate {
         messages: &[(&str, &str)],
         max_output_bytes: usize,
     ) -> Result<String, NnError> {
+        self.render_with_options(
+            messages,
+            super::ChatRenderOptions::default(),
+            max_output_bytes,
+        )
+    }
+
+    pub(super) fn render_with_options(
+        &self,
+        messages: &[(&str, &str)],
+        options: super::ChatRenderOptions,
+        max_output_bytes: usize,
+    ) -> Result<String, NnError> {
         if messages.is_empty()
             || messages.len() > MAX_MESSAGES
             || max_output_bytes == 0
@@ -283,6 +298,7 @@ impl SourceChatTemplate {
                     .map(|&(role, content)| ChatMessage { role, content })
                     .collect(),
                 add_generation_prompt: true,
+                enable_thinking: options.enable_thinking(),
                 special_tokens: &self.special_tokens,
             },
             max_output_bytes,
@@ -317,6 +333,36 @@ mod tests {
                 .render(&[("user", "  Héllo {{ 2 + 2 }} 🌍  ")], 1024)
                 .unwrap(),
             "<bos>user\n  Héllo {{ 2 + 2 }} 🌍  assistant\n<think>\n"
+        );
+    }
+
+    #[test]
+    fn thinking_inputs_preserve_undefined_true_false_and_request_isolation() {
+        let _serial = SERIAL.lock().unwrap();
+        let source = source(
+            "{% if enable_thinking is not defined %}default{% elif enable_thinking is false %}disabled{% else %}enabled{% endif %}|{{ messages[0].content }}",
+        );
+        let message = [("user", "Héllo {{ enable_thinking }} 🌍")];
+        let options = super::super::ChatRenderOptions::default();
+        for (option, expected) in [
+            (options, "default"),
+            (options.with_thinking(false), "disabled"),
+            (options.with_thinking(true), "enabled"),
+            (options, "default"),
+        ] {
+            assert_eq!(
+                source.render_with_options(&message, option, 1024).unwrap(),
+                format!("{expected}|Héllo {{{{ enable_thinking }}}} 🌍")
+            );
+        }
+        assert_eq!(
+            source.render(&message, 1024).unwrap(),
+            source.render_with_options(&message, options, 1024).unwrap()
+        );
+        assert!(
+            source
+                .render_with_options(&message, options.with_thinking(false), 1)
+                .is_err()
         );
     }
 

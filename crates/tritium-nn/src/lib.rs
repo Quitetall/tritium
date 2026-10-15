@@ -53,7 +53,7 @@ pub use layers::{
 };
 pub use model::{ArchitectureSpec, CacheAdmission, LayerKind, Runner, StreamLimits};
 pub use model::{
-    ForwardDump, LayerWeights, ModelRunner, ModelSource, ModelWeights,
+    ChatRenderOptions, ForwardDump, LayerWeights, ModelRunner, ModelSource, ModelWeights,
     QWEN35_HF_SOURCE_ARCHITECTURE, QWEN35_MTP_UNVERIFIED_REASON, QWEN35_MTP_VLLM_ORACLE_REVISION,
     QWEN35_MTP_VLLM_SOURCE_SHA256, QWEN35_REFERENCE_STATE_MAX_BYTES, Qwen35ContentVerifiedHfSource,
     Qwen35ExecutionBlockOutputBatch, Qwen35ExecutionOutputBatch, Qwen35ExecutionVisitError,

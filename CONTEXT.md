@@ -11,6 +11,11 @@ A conversation rendered using the template and token vocabulary belonging to
 the loaded model source. It is distinct from an architecture-based approximation.
 _Avoid_: generic chat wrapper, qualified model response
 
+**Source chat controls**:
+Explicit choices supplied to a source-bound chat template. They are inputs to
+that template, not guarantees about the model's reasoning or generated output.
+_Avoid_: reasoning enforcement, prompt rewrite
+
 **Tensor owner**:
 The single owner of a logical tensor's storage. Tied names and aliases identify
 that owner rather than independent copies.

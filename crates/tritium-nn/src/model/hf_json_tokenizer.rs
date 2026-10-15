@@ -7,7 +7,7 @@ use tokenizers::Tokenizer as InnerTokenizer;
 
 use super::chat_renderer::SourceChatTemplate;
 use crate::error::NnError;
-use crate::model::Tokenizer;
+use crate::model::{ChatRenderOptions, Tokenizer};
 
 // serde_json::Value normally keeps the last duplicate map key. Tokenizer and
 // named-template selection must not depend on that ambiguous interpretation.
@@ -183,6 +183,23 @@ impl HfJsonTokenizer {
 }
 
 impl Tokenizer for HfJsonTokenizer {
+    fn render_chat_prompt_with_options(
+        &self,
+        messages: &[(&str, &str)],
+        options: ChatRenderOptions,
+        max_output_bytes: usize,
+    ) -> Result<Option<String>, NnError> {
+        if options == ChatRenderOptions::default() {
+            return self.render_chat_prompt(messages, max_output_bytes);
+        }
+        let template = self.chat_template.as_ref().ok_or_else(|| {
+            NnError::Tokenizer("explicit source chat controls require a source template".into())
+        })?;
+        template
+            .render_with_options(messages, options, max_output_bytes)
+            .map(Some)
+    }
+
     fn render_chat_prompt(
         &self,
         messages: &[(&str, &str)],
@@ -225,6 +242,54 @@ mod tests {
     use tokenizers::pre_tokenizers::whitespace::Whitespace;
 
     use super::*;
+
+    #[test]
+    fn public_options_bind_source_booleans_and_refuse_missing_template() {
+        let model = WordLevel::builder()
+            .vocab(
+                [("[UNK]".into(), 0), ("eos".into(), 1)]
+                    .into_iter()
+                    .collect(),
+            )
+            .unk_token("[UNK]".into())
+            .build()
+            .unwrap();
+        let bytes = InnerTokenizer::new(model).to_string(false).unwrap();
+        let without =
+            HfJsonTokenizer::from_bytes(bytes.as_bytes(), br#"{"eos_token":"eos"}"#).unwrap();
+        let with = HfJsonTokenizer::from_bytes(bytes.as_bytes(), br#"{"eos_token":"eos","chat_template":"{% if enable_thinking is not defined %}default{% elif enable_thinking is false %}false{% else %}true{% endif %}"}"#).unwrap();
+        let messages = [("user", "Hi")];
+        let options = ChatRenderOptions::default();
+        let absent: &dyn Tokenizer = &without;
+        let present: &dyn Tokenizer = &with;
+        assert_eq!(
+            absent
+                .render_chat_prompt_with_options(&messages, options, 64)
+                .unwrap(),
+            None
+        );
+        for (enabled, expected) in [(false, "false"), (true, "true")] {
+            assert!(
+                absent
+                    .render_chat_prompt_with_options(&messages, options.with_thinking(enabled), 64)
+                    .is_err()
+            );
+            assert_eq!(
+                present
+                    .render_chat_prompt_with_options(&messages, options.with_thinking(enabled), 64)
+                    .unwrap()
+                    .as_deref(),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            present
+                .render_chat_prompt_with_options(&messages, options, 64)
+                .unwrap()
+                .as_deref(),
+            Some("default")
+        );
+    }
 
     #[test]
     fn duplicate_configuration_and_named_template_keys_refuse() {

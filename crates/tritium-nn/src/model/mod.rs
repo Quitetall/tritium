@@ -108,7 +108,7 @@ pub use source::{
     LoadedModel, load, load_streamed_with_resources, load_with_limits, load_with_resources,
 };
 pub(crate) use staged_calibration::{dense_source_weights, dense_stage_weights};
-pub use tokenizer::Tokenizer;
+pub use tokenizer::{ChatRenderOptions, Tokenizer};
 pub use training_salt::{
     TRAINING_SALT_COMPLETED_STEP_KEY, TRAINING_SALT_FORMAT_KEY, TRAINING_SALT_FORMAT_VALUE,
     TRAINING_SALT_GROWTH_RECEIPT_KEY, TRAINING_SALT_HF_CONFIG_KEY,
