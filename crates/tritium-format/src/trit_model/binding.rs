@@ -186,7 +186,9 @@ where
                         );
                     }
                     let plan = PayloadPlan::new(*layout, planes, length)?;
-                    plan.validate(source, index)?;
+                    // The semantic visitors validate canonical trits and every
+                    // scale window before producing the private digest. Avoid
+                    // decoding the same payload once solely for validation.
                     additive_semantics(*layout, planes, &plan, index, source)?
                 }
                 _ => return Err(TritModelError::UnsupportedFeature("tensor storage").into()),
