@@ -32,7 +32,7 @@ forward-only integer training without confounding the levers.
 | WAGEUBN (1909.02384) V | everything to 8-bit; 24-bit integer update accumulator | ResNet50 67.95 vs fp 74.66 |
 | NITI (2009.13108) | int8 weights, int32 accumulation | ImageNet needs 16-bit weight accumulation |
 | Ghaffari 2022 (2207.08822) V | int8 block-fixed-point fwd/bwd, int16 SGD | ResNet18 69.25 vs 69.75 (float glue between layers) |
-| Shalby, Pittorino & Roveri (2610.16298, 2026-10-12) PV | INT8 + power-of-two exponent for every tensor, integer optimizer | ResNet/ViT-B ImageNet claimed, **numbers unread — read first** |
+| Shalby, Pittorino & Roveri (2610.16298, 2026-10-12) V | INT8 mantissa + power-of-two exponent for every tensor, integer SGD+momentum, integer LUT softmax/GELU/LN, **SR everywhere** | ResNet-50 ImageNet 76.4 vs 76.7; ViT-Ti 88.0 vs 90.9; INT4 weights 70.5 (CIFAR-10); no ternary |
 | Bop (1906.02107) V | latent weight → fp EMA + threshold flip (binary) | Bi-Real ImageNet 56.6 vs 56.4 |
 | BOLD (2405.16339) V | per-weight accumulator, xnor threshold flip, **reset** (binary) | ImageNet 66.9 / 70.0 distilled; first/last layers fp |
 | GXNOR / DST (1705.09283) V | ternary, no hidden weights, stochastic adjacent transitions | CIFAR-10 92.50 vs 92.88 |
@@ -40,7 +40,7 @@ forward-only integer training without confounding the levers.
 | ECO (2601.22101) V | master-free; **quantization residual injected into momentum** | FP8 800M loss 2.540 vs master 2.531 (naive SR 2.947); INT4 MoE-16B fine-tune matches |
 | BF16+SR (2502.20566) V | fp32 master | 6.7B ppl 10.05 vs 10.11 |
 | DQT (2412.04787) V | low-bit weights updated by SR | 1B ternary: curves only, simulated in fp32 |
-| QAR (2609.21834) PV | shadow weights; codes updated by a "crossing law" | LLM post-training; **read in full** |
+| QAR (2609.21834) V | no shadow weight; integer codes moved by a Bernoulli "crossing law", AdamW moments kept | post-training only; 2-bit Llama-3.2-3B C4 ppl 359 → 202; loses to QAT at 4 bits |
 
 **Theory that explains our carry result.** Li et al. 2017 (1706.02379, V): pure stochastic
 rounding of weights stalls on non-convex problems, and a float latent's annealing behaviour is what
@@ -53,7 +53,7 @@ reset-on-flip and stochastic-transition methods (BOLD, GXNOR, DQT) should trail.
 | Work | Mechanism | Scale / result | Discrete weights? |
 |---|---|---|---|
 | Dust (qlabs, MIT) V | per-token Gaussian noise on activations; centered Δloss credit with decay; outer product with input | GPT 2M–243M, ≤20M tokens; below backprop at 0.1–1M tokens; 20M "win" is a fitted asymptote | no |
-| EGGROLL (2511.16652) V | low-rank weight-space ES | int8 minGRU LM trained **integer-only**, 3.40 bits/byte; no backprop comparison for pretraining; ~180× GPU-hours | int8 |
+| EGGROLL (2511.16652) V | low-rank weight-space ES | int8 minimal-GRU LM pretrained **integer-only, backprop-free**: 3.40 vs 3.58 bits/byte against an SGD Transformer; ~180× GPU-hours at N = 2²⁰ | int8 |
 | nano-egg (GPL-3.0) V, code read | antithetic sign fitness; int32 `Z = Σ sign·sign`; int8 weight ±1 when `|Z| > θ√pop`; **Z reset every step** | toy | int8 |
 | ElasticZO-INT8 (2501.04287) V | integer ZO, sign-only Δloss, 1-bit SR updates in place | LeNet MNIST **89.8 vs BP 98.8** | int8 |
 | Poor Man's Training (2411.05873) V | INT8 node perturbation × input outer product, layer-wise | MCU fine-tuning matches BP; needs norm-aware scaling | int8 |
@@ -64,6 +64,7 @@ reset-on-flip and stochastic-transition methods (BOLD, GXNOR, DQT) should trail.
 | Hiratani et al. 2022 PV | node perturbation unstable under model mismatch (weight diffusion) | theory + nets | — |
 | Dalm et al. (2310.00965) V | node perturbation + input decorrelation | Tiny ImageNet 13.4 vs BP 14.5 at 100 samples | no; σ² = 1e-6 |
 | MeZO, HiZOO, SubZero, DiZO, ZO-Bench, ES-at-Scale | weight-space SPSA/ES | fine-tuning only (low intrinsic dimension) | no |
+| KronZO (GERAD G-2025-44) V | Kronecker-factored perturbations, directional best-of-q update | GPT-2 125M pretraining: 6.95 vs SGD 3.50 training loss at 25× wall time | no |
 
 Hardware communities (memristor perturbation, stochastic MTJ synapses, reward-gated STDP with
 leaky counters) cover "noise + reward + local leaky counter + threshold write" in pieces, on toy
@@ -117,45 +118,84 @@ Integration lessons:
 - Treat bitnet.cpp and T-MAC as CPU baselines.
 - Do not reuse code from GPL projects (QuIP#, QTIP, nano-egg, NITRO-D, EGGROLL); cite their ideas.
 
-## 3. What our training ideas add, and what they don't
+## 3. What our training ideas add, after full-text reading
 
-Do **not** claim as novel:
-- "No master weights" — WAGE, Bop, GXNOR, LNS-Madam, ECO and torchao int8 all precede it.
-- "The residual lives in the optimizer" — ECO did it at 16B for FP8/INT4.
-- "Node perturbation × input outer product on integer weights" — Poor Man's Training, two years
-  before Dust.
-- "Integer threshold on accumulated noise evidence" — nano-egg, with a per-step reset.
+Nine papers were read in full on 2026-10-16:
+- integer and master-free training: 2610.16298 and ECO 2601.22101;
+- flip and shadow-free update rules: QAR 2609.21834, Gradient-Free Training 2410.09734, and BOLD
+  2405.16339;
+- forward-only training: KronZO (GERAD G-2025-44), EGGROLL 2511.16652 (App. G–H plus the nano-egg
+  code), and TerMeZO 2609.33548.
 
-Defensibly open, as composition and regime:
-1. **Ternary + integer residual-preserving carry as the only weight state + integer evidence path +
-   zero-entry/exit thresholds**, with the measured finding that carry width and model capacity,
-   not optimizer richness, set quality.
-2. **The fused forward-only rule:** activation-space noise credit accumulated straight into a
-   *persistent*, leaky integer carry, where a flip is a sequential test across steps (nano-egg
-   discards evidence each step; Bop and BOLD use gradients).
-3. **Any backprop-free or master-free ternary transformer trained from scratch**, at any scale with
-   published numbers.
+### Claim verdicts
 
-Must read before claiming anything:
-- 2610.16298 (integer-only training, four days old);
-- QAR 2609.21834 (shadow-free code updates);
-- Gradient-Free Training of QNNs 2410.09734 (PV; claims parity, mechanism unverified);
-- full-text BOLD (accumulator type), KronZO (the only ZO pretraining baseline found);
-- EGGROLL Appendix H update rule.
+| Claim | Verdict | Closest prior art |
+|---|---|---|
+| C1. Ternary weights with an integer, **remainder-keeping** carry as the only weight state; threshold flip | **Open, narrowly** | BOLD: real-valued accumulator, **reset** on flip, binary. ECO: residual inside fp32 momentum. QAR: memoryless Bernoulli, no carry. 2610.16298: integer, discards the residual, relies on SR. None keeps the remainder or ablates keep vs reset. |
+| C2. Carry width and capacity, not optimizer richness, set quality | **Open** (no paper ablates accumulator width) | BOLD needs 4× width for fp parity on ImageNet, which supports the capacity half. |
+| C3. Explicit zero-entry/exit thresholds | **Open** | QAR: symmetric cell moves. GFT: ±1 steps. BOLD: binary. |
+| C4. Fused forward-only rule: activation-noise credit into a **persistent, leaky** integer carry; flip as a cross-step sequential test | **Partially pre-empted** | EGGROLL App. H.3: antithetic ternary fitness, int32 accumulator, z-threshold, ±1 int8 step, no master or optimizer state, **but the accumulator is re-zeroed every step** (single-step test) and noise is in weight space (rank-1, acting on the output). TerMeZO: flip when an **fp** latent crosses the boundary. Open: persistence + leak, activation-space per-token noise, ternary weights. Cite EGGROLL H.3 as the closest. |
+| C5. Master-free or backprop-free ternary **transformer** from scratch | **Open for ternary transformers only** | EGGROLL pretrains a backprop-free, master-free **int8 GRU** from scratch (3.40 vs 3.58 bits/byte vs an SGD Transformer, ~180× GPU-hours, N = 2²⁰). ECO pretrains master-free **FP8** transformers to 2.1B. GFT trains a ternary nanoGPT from scratch, but hybrid with fp embeddings and head, and badly (loss 2.55 vs fp 1.57). "First backprop-free low-bit LM" **cannot** be claimed. |
+| C6. The carry predicts which weights cross a cell boundary | **Overlaps QAR** | QAR's residual phase θ and crossing law p = η\|u\|/s are the shadow-weight analysis of the same quantity. Our carry is its persistent integer, master-free counterpart. Cite and differentiate. |
+| C7. Offline estimator cosine vs population size on **discrete** weights | **Open** (one targeted search found none) | cosine curves exist only for continuous nets (Ren 2023; Fournier 2023, unverified). |
 
-Known failure modes for the forward-only direction:
-- **Dimension tax.** Node perturbation is slower than SGD by about the number of outputs per layer.
-- **Global-loss activity perturbation failed on ImageNet** (Ren) without local losses; Dust's
-  per-token population is its substitute.
-- **Coarse integer or ternary noise leaves the linear regime.** Decorrelated NP used σ² = 1e-6;
-  ElasticZO's sign was wrong about 5% of the time; QuZO needed doubly-stochastic rounding to stay
-  unbiased.
-- **Carry random walk.** Noise alone drives the carry like √n; the threshold must be set from the
-  null variance (nano-egg's θ√pop), and the leak caps the window (Hiratani's instability).
-- **Norm-aware scaling is mandatory** (Poor Man's Training did not converge without it).
-- **Attention, LM head and residual scalars need special credit** (Dust).
-- **Integer ZO lags even on LeNet** (ElasticZO 89.8 vs 98.8); every strong ZO result is
-  fine-tuning.
+### Landmines
+
+1. **The carry is a master weight in different units.** ECO App. A proves a stored residual
+   equals master-weight SGD exactly. An i32 carry costs 4 B/weight, the same as an fp32 master.
+   Never pitch the carry on memory except at i16 or narrower. Frame it honestly as a fixed-point
+   master / error-feedback buffer. Its case is integer-only arithmetic, multiply-free compute and
+   narrow width. Our own result (carry-sgd = STE+SGD) says exactly this.
+2. **Stochastic rounding is the field's default, and we don't use it.**
+   - 2610.16298: deterministic rounding costs 5.4 points (89.3 vs 94.7 on ResNet-18/CIFAR-10).
+   - ECO: naive no-master with round-to-nearest diverges at every scale.
+
+   Our answer is that keeping the remainder makes deterministic rounding exact. It needs an SR
+   ablation (rung U7 below).
+3. **Narrow carries can quantize credit away.**
+   - QAR B.4: BF16 shadows stop crossing late in training (sub-half-ulp updates are lost).
+   - ECO §3.4: losing the residual gives a stationary error ∝ 1/η, which diverges as the learning
+     rate decays.
+
+   An i16 carry that clips or underflows falls into that regime. Log underflow and saturation
+   counts with every narrow-carry result.
+4. **Keep-remainder may be read as "just error feedback".** BOLD's convergence proof models
+   accumulate-and-reset as EF-signSGD. Pre-empt this with the measured keep-vs-reset ablation
+   (rung U3) and say plainly that keep-remainder is EF with an identity compressor on the
+   residual.
+5. **QAR finds the ternary phase is not uniform** (it concentrates mid-cell, B(ρ) < ρ). Any
+   uniform-phase assumption in our flip-rate reasoning must be checked against measured carry
+   histograms.
+6. **Forward-only pretraining is very costly or fails:**
+   - KronZO GPT-2 125M: final training loss 6.95 vs SGD 3.50, at 25× wall time per step. At 1.5B:
+     8.21 vs 2.85. The gap widens with scale.
+   - EGGROLL: population ~10⁶ and ~180× GPU-hours to beat a weak SGD baseline on a 6L-256D model.
+     Population 2 fails, and a larger population needs a larger data batch (≈ N/4⁶).
+   - Direct ZO on quantized ternary weights "barely improves" (QuZO on Falcon-E: 14.71 vs 14.0
+     GSM8K).
+   - ES needs σ = o(d^-½) to linearise, and coarse integer or ternary noise cannot get there.
+
+   Treat the forward-only direction as a long shot. Its early kill criterion is real.
+7. **Weak baselines discredit results.** KronZO and EGGROLL compare against plain SGD. Ours must
+   include a tuned AdamW + STE ternary QAT baseline.
+8. **Quote GFT numbers with care.** Its tables are internally inconsistent (Imagenette Hybrid-1
+   4-bit is 84.9 in the main text, 95.6 in the appendix). Its NP-hardness theorem is worst-case
+   binary exact separability and undercuts nothing we claim.
+
+### Required comparators
+
+- **Update rules:** Bop, DQT (= QAR with γ = 0), QAR-γ, and ECO + SR.
+- **Naive master-free:** naive no-master + SR.
+- **Integer baselines:** 2610.16298-style INT8 + SR, and WAGE.
+- **Forward-only:** EGGROLL / nano-egg integer ES (GPL-3.0; run it, don't copy it), MeZO, KronZO's
+  directional update, TerMeZO's boundary mask.
+- **Strong first-order baseline:** AdamW + STE ternary QAT.
+
+### Citations reviewers will expect
+
+ECO, 2610.16298, NITI, WAGE/WAGEUBN, SWALP, Ghaffari 2022, APT (Huang 2022), Lin 2022 (256 KB
+on-device training), error feedback (Seide 2014; EF21), Ozkara 2025, Li et al. 2017, Bop, BOLD,
+GXNOR, QAR, EGGROLL, KronZO, TerMeZO, MeZO, Ren 2023, Werfel/Xie/Seung, Hiratani 2022, Dust.
 
 ## 4. Ablation ladder
 
@@ -210,6 +250,9 @@ property, not more seeds, is what removes confounding.
 | U4 | + leak λ on the carry | λ=0 → U1 | open |
 | U5 | stochastic adjacent transitions, no carry (GXNOR/DST) | — (control) | open |
 | U6 | ECO-style residual into momentum | momentum off → U1 | open |
+| U7 | stochastic rounding of the carry step instead of an exact remainder | SR off → U1 | open (landmine 2) |
+| U8 | carry width i16 → i8, logging underflow and saturation counts | width i32 → U1 | open (landmine 3) |
+| — | external comparators at matched tuning budget: Bop, DQT, QAR-γ, ECO+SR, naive no-master+SR, WAGE | — | open |
 
 **Explaining the EAT-O gap (92% → 73%).** Walk from U1 toward the EAT-O controller, adding one
 controller feature at a time, each with an identity knob:
@@ -236,6 +279,7 @@ do.
 | G4 | ternary noise {−1,0,+1} | matched σ to G3 | ElasticZO, QuZO |
 | G5 | reward quantized to a few bits, then sign-only | full-precision reward → G4 | ElasticZO, nano-egg |
 | G6 | control: weight-space SPSA at matched forward passes | — | MeZO, EGGROLL |
+| G7 | control: EGGROLL-style rank-1 weight noise with a per-step z-test (nano-egg, run as an external binary, GPL) | — | EGGROLL H.3 |
 
 ### Axis F: fusion (best G, U1, M0 fixed)
 
@@ -245,7 +289,7 @@ do.
 | F1 | the same draws applied one per step, flips deferred to the window end | **bit-exact to F0**: ternary weights are piecewise constant, so with flips deferred every forward sees the same model |
 | F2 | flips allowed mid-window (true fusion) | the *only* change from F1 |
 | F3 | + leak | λ=0 → F2 |
-| F4 | carry reset every window (nano-egg's per-step z-test) vs persistent | tests the sequential-test claim |
+| F4 | carry reset every window (EGGROLL H.3 / nano-egg per-step z-test) vs persistent | tests the sequential-test claim, the one element EGGROLL does not have |
 | F5 | all-integer step: ternary noise, quantized reward, integer carry | composes G4/G5 into F3 |
 
 F1 is the key rung. Because it is bit-exact to F0, the F1→F2 difference isolates what fusion
