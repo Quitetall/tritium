@@ -1,0 +1,1 @@
+{"accuracy":0.821,"buffer":1,"elapsed_ms":13483,"gradient":"noise K=1 sigma=2","lr":7,"mean_loss":34635.909,"noisy_layer_evaluations":80000,"params":101632,"qualification":"UNKNOWN","seed":3,"shifts":[8,3],"sizes":[784,128,10],"steps":20000,"transitions":3281058,"us_per_example":{"credit":6.5369969,"forward":51.624756999999995,"total":673.64505535,"update":615.48330145}}
