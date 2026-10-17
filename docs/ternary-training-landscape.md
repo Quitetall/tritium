@@ -283,20 +283,25 @@ do.
 
 ### Axis F: fusion (best G, U1, M0 fixed)
 
-| Rung | Change | Identity |
-|---|---|---|
-| F0 | K draws averaged, then one carry step | the best G rung |
-| F1 | the same draws applied one per step, flips deferred to the window end | **bit-exact to F0**: ternary weights are piecewise constant, so with flips deferred every forward sees the same model |
-| F2 | flips allowed mid-window (true fusion) | the *only* change from F1 |
-| F3 | + leak | λ=0 → F2 |
-| F4 | carry reset every window (EGGROLL H.3 / nano-egg per-step z-test) vs persistent | tests the sequential-test claim, the one element EGGROLL does not have |
-| F5 | all-integer step: ternary noise, quantized reward, integer carry | composes G4/G5 into F3 |
+| Rung | Change | Identity | Status |
+|---|---|---|---|
+| F0 | K draws averaged, then one carry step | the best G rung | **done**: K=4 88.03%, K=16 89.96% at 20k examples |
+| F1 | the same draws applied one per step, flips deferred to the window end | as built: one draw on each of W examples with the forward's trits frozen (a minibatch of W), not K draws on one example, so it is **not** bit-identical to F0; `--defer 1` is the immediate step bit for bit | **done**: deferring gives no benefit (+1,478, unresolved) |
+| F2 | flips allowed mid-window (true fusion) | the *only* change from F1 | **done**: K=1 at equal noisy evals ties K=4 (−279) and beats K=16 (−537 [−988, −87]); 90.11% at 16× data |
+| F3 | + leak | λ=0 → F2 | **done**: hurts (2⁻¹⁶ +1,632; 2⁻¹² +5,555) |
+| F4 | carry reset every window (EGGROLL H.3 / nano-egg per-step z-test) vs persistent | tests the sequential-test claim, the one element EGGROLL does not have | partly done: reset-on-flip unresolved (+1,133), keep 50% hurts; a true per-step z-test arm is still owed |
+| F5 | all-integer step: ternary noise, quantized reward, integer carry | composes G4/G5 into F3 | **done by construction**: the fused default is all-integer (ternary noise, integer credit, integer carry) |
 
-F1 is the key rung. Because it is bit-exact to F0, the F1→F2 difference isolates what fusion
-itself costs or buys: mid-window flips changing the model while evidence is still accumulating.
+As planned, F1 was to be bit-exact to F0 and isolate fusion. As built (2026-10-16) the cleaner
+test of fusion turned out to be **equal noisy evaluations**: K=1 on 4× or 16× the examples vs K=4
+or K=16 on 1×. Both variants spend the same estimator compute; the only difference is whether the
+draws are averaged inside a step or across steps by the carry. F1 (deferred flips) is reported as
+its own control.
 
-Results so far: `docs/experiments/eat-o/rules-20261016/results.md` (U3, U4, U7, U8) and
-`docs/experiments/eat-o/estimator-20261016/results.md` (G1).
+Results so far:
+- `docs/experiments/eat-o/rules-20261016/results.md` (U3, U4, U7, U8);
+- `docs/experiments/eat-o/estimator-20261016/results.md` (G1);
+- `docs/experiments/eat-o/fused-20261016/results.md` (F0–F5 and the training half of G).
 
 ### Axis M: capacity, last
 

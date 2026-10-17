@@ -1,0 +1,191 @@
+{
+ "arms": {
+  "exact": [
+   [],
+   20000
+  ],
+  "exact-defer16": [
+   [
+    "--defer",
+    "16"
+   ],
+   20000
+  ],
+  "K1": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1"
+   ],
+   20000
+  ],
+  "K4": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "4"
+   ],
+   20000
+  ],
+  "K16": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "16"
+   ],
+   20000
+  ],
+  "K1-defer16": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1",
+    "--defer",
+    "16"
+   ],
+   20000
+  ],
+  "K1-defer64": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1",
+    "--defer",
+    "64"
+   ],
+   20000
+  ],
+  "K1-keep0": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1",
+    "--keep-pct",
+    "0"
+   ],
+   20000
+  ],
+  "K1-keep50": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1",
+    "--keep-pct",
+    "50"
+   ],
+   20000
+  ],
+  "K1-leak16": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1",
+    "--leak",
+    "16"
+   ],
+   20000
+  ],
+  "K1-leak12": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1",
+    "--leak",
+    "12"
+   ],
+   20000
+  ],
+  "K1-sigma4": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1",
+    "--sigma",
+    "4"
+   ],
+   20000
+  ],
+  "K1-sigma1": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1",
+    "--sigma",
+    "1"
+   ],
+   20000
+  ],
+  "K1-gauss": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1",
+    "--noise",
+    "gauss"
+   ],
+   20000
+  ],
+  "K1-80k": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1"
+   ],
+   80000
+  ],
+  "K1-320k": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1"
+   ],
+   320000
+  ]
+ },
+ "lr_shift_grid": [
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9
+ ],
+ "selected": {
+  "exact": 4,
+  "exact-defer16": 5,
+  "K1": 4,
+  "K4": 6,
+  "K16": 5,
+  "K1-defer16": 5,
+  "K1-defer64": 8,
+  "K1-keep0": 9,
+  "K1-keep50": 7,
+  "K1-leak16": 5,
+  "K1-leak12": 9,
+  "K1-sigma4": 2,
+  "K1-sigma1": 7,
+  "K1-gauss": 6,
+  "K1-80k": 4,
+  "K1-320k": 7
+ },
+ "tune": "seed 101, half the evaluation steps, validation 0..999",
+ "eval": "seeds 1-5, validation 1000..4999",
+ "binary_sha256": "d78eed0225becfd6dc65602869b0ce4d56418e16dda489842a9ccce452c8bacc",
+ "quality": "UNKNOWN"
+}

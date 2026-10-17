@@ -30,6 +30,8 @@ mod model;
 #[allow(dead_code)]
 #[path = "ternary_lab/numeric.rs"]
 mod numeric;
+#[path = "ternary_carry/noise.rs"]
+mod noise;
 
 use model::{Example, Model};
 use numeric::Rng;
@@ -145,6 +147,10 @@ struct Carry {
     underflows: u64,
     /// Latent updates clipped at the storage range.
     saturations: u64,
+    /// Gradient source: exact STE (None) or the forward-only noise estimate (ladder axes G/F).
+    noise: Option<noise::Config>,
+    /// Separate stream for noise draws, so stochastic rounding's stream is unchanged by it.
+    noise_rng: Rng,
 }
 
 /// Floor square root by integer Newton iteration (no floating point anywhere).
@@ -205,6 +211,8 @@ impl Carry {
             rule: Rule::default(),
             underflows: 0,
             saturations: 0,
+            noise: None,
+            noise_rng: Rng(0x0015_EC0D),
         }
     }
 
@@ -381,9 +389,23 @@ impl Carry {
             self.step_rich(model, x);
             return;
         }
-        let g = Self::gradient(model, x);
+        let g = self.gradient_of(model, x);
+        self.update(model, &g);
+    }
+
+    /// The configured gradient source at `model` (the frozen model when flips are deferred).
+    fn gradient_of(&mut self, model: &Model, x: &Example) -> Vec<i64> {
+        match &self.noise {
+            None => Self::gradient(model, x),
+            Some(c) => noise::gradient(model, x, c, &mut self.noise_rng),
+        }
+    }
+
+    /// Apply one gradient to the latent and set `model`'s trits from it.
+    fn update(&mut self, model: &mut Model, g: &[i64]) {
+        assert_ne!(self.kind, Kind::Rich, "rich computes its own gradient");
         if self.kind == Kind::Sgd && !self.rule.is_original() {
-            self.step_rule(model, &g);
+            self.step_rule(model, g);
             return;
         }
         if self.kind == Kind::Adam {
@@ -625,14 +647,53 @@ fn main() -> Result<(), String> {
         opt = opt.with_rule(&model, rule);
     }
     opt.stochastic = arg(&args, "--stochastic") == Some("yes");
+    if arg(&args, "--grad").unwrap_or("exact") == "noise" {
+        if kind != Kind::Sgd {
+            return Err("--grad noise needs --optimizer carry-sgd".into());
+        }
+        let sigma: f64 = arg(&args, "--sigma")
+            .unwrap_or("2")
+            .parse()
+            .map_err(|_| "invalid --sigma")?;
+        // σ in quantization steps → raw units, once, at configuration time.
+        let raw = |shift: u8| ((sigma * f64::from(1u32 << shift)).round() as i64).max(1);
+        opt.noise = Some(noise::Config {
+            noise: match arg(&args, "--noise").unwrap_or("ternary") {
+                "ternary" => noise::Noise::Ternary,
+                "gauss" => noise::Noise::Gauss,
+                other => return Err(format!("unknown --noise {other}")),
+            },
+            sigma_hidden: raw(model.input_shift),
+            sigma_output: raw(model.output_shift),
+            draws: num("--draws", 1)?.max(1) as u32,
+        });
+    } else if arg(&args, "--grad").is_some_and(|g| g != "exact") {
+        return Err("--grad is exact or noise".into());
+    }
+    // Deferred flips (rung F1): the forward model's trits stay frozen for `defer` steps while the
+    // latent accumulates; then they are re-derived from the latent. defer = 1 is immediate.
+    let defer = num("--defer", 1)?.max(1) as u64;
+    if defer > 1 && kind == Kind::Rich {
+        return Err("--defer does not apply to rich".into());
+    }
     let initial = evaluate(&model, eval);
     let start = std::time::Instant::now();
+    let mut frozen = model.clone();
     for step in 0..steps {
         let mut sampler = Rng(seed
             .wrapping_add(step.wrapping_mul(0x9e37_79b9_7f4a_7c15))
             .max(1));
         let i = sampler.below(train.len() as u64) as usize;
-        opt.step(&mut model, &train[i]);
+        if defer == 1 {
+            opt.step(&mut model, &train[i]);
+        } else {
+            let g = opt.gradient_of(&frozen, &train[i]);
+            opt.update(&mut model, &g);
+            if (step + 1) % defer == 0 {
+                frozen.trits.clone_from(&model.trits);
+                frozen.version += 1;
+            }
+        }
     }
     let elapsed = start.elapsed().as_millis();
     model.validate()?;
@@ -665,6 +726,9 @@ fn main() -> Result<(), String> {
         "rich": format!("{:?}", opt.rich),
         "rule": format!("{:?}", opt.rule),
         "underflows": opt.underflows, "saturations": opt.saturations,
+        "gradient": match &opt.noise { None => "exact".to_string(), Some(c) => format!("{c:?}") },
+        "defer": defer,
+        "noisy_evaluations": opt.noise.as_ref().map_or(0, |c| steps * noise::noisy_evaluations(c)),
         "fast_accuracy": fast_correct as f64 / eval.len() as f64,
         "fast_mean_loss": fast_loss as f64 / eval.len() as f64,
         "seed": seed, "steps": steps, "lr": lr, "latent_units_per_trit": if kind == Kind::Sgd16 { S16 } else { 1i64 << opt.rule.units_log2 },
@@ -909,6 +973,65 @@ mod tests {
         assert!(active > 40, "{active}");
         let (_, sgd) = run(Kind::Sgd, 2, None, false);
         assert!(sgd.transitions > 0);
+    }
+
+    /// defer = 1 through the split gradient/update path is the immediate step, bit for bit.
+    #[test]
+    fn split_step_is_step() {
+        let (mut a, _) = tiny();
+        let mut b = a.clone();
+        let mut oa = Carry::new(&a, Kind::Sgd, 2);
+        let mut ob = Carry::new(&b, Kind::Sgd, 2);
+        for x in &stream() {
+            oa.step(&mut a, x);
+            let g = ob.gradient_of(&b, x);
+            ob.update(&mut b, &g);
+        }
+        assert_eq!(a.trits, b.trits);
+        assert_eq!(oa.latent, ob.latent);
+    }
+
+    fn cos(a: &[i64], b: &[i64]) -> f64 {
+        let dot: f64 = a.iter().zip(b).map(|(&x, &y)| x as f64 * y as f64).sum();
+        let n = |v: &[i64]| v.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
+        dot / (n(a) * n(b))
+    }
+
+    /// The integer noise estimate approaches the exact gradient's direction with many draws, at a
+    /// comparable scale (same 2⁻¹¹ units), for ternary and Gaussian noise.
+    #[test]
+    fn noise_gradient_approaches_exact() {
+        let (m, _) = tiny();
+        for kind in [noise::Noise::Ternary, noise::Noise::Gauss] {
+            let c = noise::Config {
+                noise: kind,
+                // The tiny model's output divides by 8, so a ±2-step hidden perturbation seldom
+                // moves any output and every loss difference is zero: use 8 steps here.
+                sigma_hidden: 8 << m.input_shift,
+                sigma_output: 2 << m.output_shift,
+                draws: 4000,
+            };
+            let mut rng = Rng(9);
+            let (mut ex, mut est) = (vec![0i64; m.trits.len()], vec![0i64; m.trits.len()]);
+            for x in &stream() {
+                for (e, v) in ex.iter_mut().zip(Carry::gradient(&m, x)) {
+                    *e += v;
+                }
+                for (e, v) in est.iter_mut().zip(noise::gradient(&m, x, &c, &mut rng)) {
+                    *e += v;
+                }
+            }
+            let split = m.inputs * m.hidden;
+            for (lo, hi) in [(0, split), (split, m.trits.len())] {
+                let c = cos(&est[lo..hi], &ex[lo..hi]);
+                assert!(c > 0.9, "{kind:?} layer {lo}: cosine {c}");
+                let ratio = est[lo..hi].iter().map(|v| v.abs()).sum::<i64>() as f64
+                    / ex[lo..hi].iter().map(|v| v.abs()).sum::<i64>() as f64;
+                // Scale is only loosely tied to the STE surrogate: large noise on this coarse model
+                // crosses ReLU kinks and truncation, so the finite difference's slope is smaller.
+                assert!((0.3..3.0).contains(&ratio), "{kind:?} layer {lo}: scale {ratio}");
+            }
+        }
     }
 
     #[test]
