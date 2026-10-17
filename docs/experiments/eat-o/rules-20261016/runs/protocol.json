@@ -1,0 +1,140 @@
+{
+ "arms": {
+  "base": [],
+  "keep0": [
+   "--keep-pct",
+   "0"
+  ],
+  "keep50": [
+   "--keep-pct",
+   "50"
+  ],
+  "leak4": [
+   "--leak",
+   "4"
+  ],
+  "leak8": [
+   "--leak",
+   "8"
+  ],
+  "leak12": [
+   "--leak",
+   "12"
+  ],
+  "leak16": [
+   "--leak",
+   "16"
+  ],
+  "nearest": [
+   "--round",
+   "nearest"
+  ],
+  "stochastic": [
+   "--round",
+   "stochastic"
+  ],
+  "i16u12-floor": [
+   "--width",
+   "16",
+   "--units-log2",
+   "12",
+   "--round",
+   "floor"
+  ],
+  "i16u12-nearest": [
+   "--width",
+   "16",
+   "--units-log2",
+   "12",
+   "--round",
+   "nearest"
+  ],
+  "i16u12-stochastic": [
+   "--width",
+   "16",
+   "--units-log2",
+   "12",
+   "--round",
+   "stochastic"
+  ],
+  "i8u4-floor": [
+   "--width",
+   "8",
+   "--units-log2",
+   "4",
+   "--round",
+   "floor"
+  ],
+  "i8u4-nearest": [
+   "--width",
+   "8",
+   "--units-log2",
+   "4",
+   "--round",
+   "nearest"
+  ],
+  "i8u4-stochastic": [
+   "--width",
+   "8",
+   "--units-log2",
+   "4",
+   "--round",
+   "stochastic"
+  ],
+  "i8u6-floor": [
+   "--width",
+   "8",
+   "--units-log2",
+   "6",
+   "--round",
+   "floor"
+  ],
+  "i8u6-nearest": [
+   "--width",
+   "8",
+   "--units-log2",
+   "6",
+   "--round",
+   "nearest"
+  ],
+  "i8u6-stochastic": [
+   "--width",
+   "8",
+   "--units-log2",
+   "6",
+   "--round",
+   "stochastic"
+  ]
+ },
+ "lr_shift_grid": [
+  2,
+  3,
+  4,
+  5,
+  6
+ ],
+ "selected": {
+  "base": 4,
+  "keep0": 5,
+  "keep50": 4,
+  "leak4": 3,
+  "leak8": 4,
+  "leak12": 4,
+  "leak16": 5,
+  "nearest": 5,
+  "stochastic": 5,
+  "i16u12-floor": 5,
+  "i16u12-nearest": 5,
+  "i16u12-stochastic": 5,
+  "i8u4-floor": 3,
+  "i8u4-nearest": 4,
+  "i8u4-stochastic": 5,
+  "i8u6-floor": 5,
+  "i8u6-nearest": 6,
+  "i8u6-stochastic": 6
+ },
+ "tune": "seed 101, 10000 steps, validation 0..999",
+ "eval": "seeds 1-5, 20000 steps, validation 1000..4999",
+ "binary_sha256": "8d7cc3092c41217575d1e1b59bca36065bc41f15857815ca505f6837f9674cef",
+ "quality": "UNKNOWN"
+}

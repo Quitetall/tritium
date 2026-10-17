@@ -70,6 +70,54 @@ struct Rich {
 /// Latent units per trit step for the 16-bit latent: ±8 trit steps fit i16.
 const S16: i64 = 1 << 12;
 
+/// How a `carry-sgd` step `g / 2^shift` becomes an integer latent change.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Round {
+    /// Arithmetic right shift (floor), the original `carry-sgd` rule.
+    Floor,
+    Nearest,
+    /// Add a uniform integer in [0, 2^shift) before the floor: unbiased, sub-unit steps survive.
+    Stochastic,
+}
+
+/// Update-rule rungs on `carry-sgd` (ladder axis U). Every default reproduces the original
+/// `carry-sgd` bit for bit: keep 100%, no leak, floor rounding, 2^16 units per trit, i32 storage.
+#[derive(Clone, Copy, Debug)]
+struct Rule {
+    /// Percent of the in-cell remainder kept when the trit changes (U3); 0 = reset to the new
+    /// cell centre, as BOLD and Bop reset their accumulators.
+    keep_pct: i64,
+    /// Leak the in-cell remainder toward the cell centre by r >> k every step (U4).
+    leak: Option<u32>,
+    round: Round,
+    /// log2 of latent units per trit (U8); the lr shift keeps its meaning in 2^16-unit terms.
+    units_log2: u32,
+    /// Emulated storage width in bits (32, 16 or 8): the latent saturates at that range (U8).
+    width: u32,
+}
+
+impl Rule {
+    fn is_original(&self) -> bool {
+        self.keep_pct == 100
+            && self.leak.is_none()
+            && self.round == Round::Floor
+            && self.units_log2 == 16
+            && self.width == 32
+    }
+}
+
+impl Default for Rule {
+    fn default() -> Self {
+        Self {
+            keep_pct: 100,
+            leak: None,
+            round: Round::Floor,
+            units_log2: 16,
+            width: 32,
+        }
+    }
+}
+
 struct Carry {
     kind: Kind,
     /// SGD: latent += -(g >> shift). Adam: step size in latent units per normalized unit.
@@ -92,6 +140,11 @@ struct Carry {
     damp: Vec<u8>,
     avg: Vec<i32>,
     steps: u64,
+    rule: Rule,
+    /// Nonzero gradients whose latent change rounded to zero (sub-unit credit lost).
+    underflows: u64,
+    /// Latent updates clipped at the storage range.
+    saturations: u64,
 }
 
 /// Floor square root by integer Newton iteration (no floating point anywhere).
@@ -149,6 +202,63 @@ impl Carry {
             damp: Vec::new(),
             avg: Vec::new(),
             steps: 0,
+            rule: Rule::default(),
+            underflows: 0,
+            saturations: 0,
+        }
+    }
+
+    /// Switch `carry-sgd` to an update rule; the latent is re-expressed in the rule's units.
+    fn with_rule(mut self, model: &Model, rule: Rule) -> Self {
+        assert_eq!(self.kind, Kind::Sgd, "update-rule rungs apply to carry-sgd");
+        assert!((1..=16).contains(&rule.units_log2) && [8, 16, 32].contains(&rule.width));
+        let s = 1i32 << rule.units_log2;
+        self.latent = model.trits.iter().map(|&t| i32::from(t) * s).collect();
+        self.rule = rule;
+        self
+    }
+
+    /// The `carry-sgd` step under `self.rule`, for every coordinate.
+    fn step_rule(&mut self, model: &mut Model, g: &[i64]) {
+        let r = self.rule;
+        let s = 1i64 << r.units_log2;
+        // The lr shift is defined in 2^16 units/trit; coarser units shift further.
+        let shift = (self.lr + i64::from(16 - r.units_log2)).clamp(0, 62) as u32;
+        let bound = match r.width {
+            8 => i64::from(i8::MAX),
+            16 => i64::from(i16::MAX),
+            _ => i64::from(i32::MAX),
+        };
+        for (i, &grad) in g.iter().enumerate() {
+            let step = match r.round {
+                Round::Floor => grad >> shift,
+                Round::Nearest if shift > 0 => (grad + (1i64 << (shift - 1))) >> shift,
+                Round::Nearest => grad,
+                Round::Stochastic => (grad + self.rng.below(1u64 << shift) as i64) >> shift,
+            };
+            let mut latent = i64::from(self.latent[i]);
+            if step == 0 && grad != 0 {
+                self.underflows += 1;
+            }
+            if step != 0 {
+                let raw = latent - step;
+                latent = raw.clamp(-bound, bound);
+                if latent != raw {
+                    self.saturations += 1;
+                }
+            }
+            let old = i64::from(model.trits[i]);
+            let t = ((latent + latent.signum() * (s / 2)) / s).clamp(-1, 1);
+            let centre = t * s;
+            if t != old && r.keep_pct != 100 {
+                latent = centre + (latent - centre) * r.keep_pct / 100;
+            }
+            if let Some(k) = r.leak {
+                let rem = latent - centre;
+                latent -= rem >> k;
+            }
+            self.latent[i] = latent as i32;
+            self.apply(model, i, t as i8);
         }
     }
 
@@ -219,7 +329,8 @@ impl Carry {
 
     /// Allocated optimizer state (latent + moments), from actual capacities.
     fn state_bytes(&self) -> usize {
-        4 * (self.latent.capacity() + self.m.capacity() + self.v.capacity())
+        (self.rule.width as usize / 8) * self.latent.capacity()
+            + 4 * (self.m.capacity() + self.v.capacity())
             + 2 * self.latent16.capacity()
             + 4 * (self.mom.capacity() + self.avg.capacity())
             + 8 * self.curv.capacity()
@@ -271,6 +382,10 @@ impl Carry {
             return;
         }
         let g = Self::gradient(model, x);
+        if self.kind == Kind::Sgd && !self.rule.is_original() {
+            self.step_rule(model, &g);
+            return;
+        }
         if self.kind == Kind::Adam {
             // β1 = 1 − 2⁻³, β2 = 1 − 2⁻¹⁰.
             self.b1t -= self.b1t >> 3;
@@ -318,6 +433,9 @@ impl Carry {
                 }
             };
             if delta == 0 {
+                if grad != 0 {
+                    self.underflows += 1;
+                }
                 continue;
             }
             let bound = match self.kind {
@@ -487,7 +605,25 @@ fn main() -> Result<(), String> {
     {
         return Err("rich-state options need --optimizer rich".into());
     }
+    let rule = Rule {
+        keep_pct: num("--keep-pct", 100)?.clamp(0, 100),
+        leak: opt_shift("--leak")?,
+        round: match arg(&args, "--round").unwrap_or("floor") {
+            "floor" => Round::Floor,
+            "nearest" => Round::Nearest,
+            "stochastic" => Round::Stochastic,
+            other => return Err(format!("unknown --round {other}")),
+        },
+        units_log2: num("--units-log2", 16)? as u32,
+        width: num("--width", 32)? as u32,
+    };
     let mut opt = Carry::new(&model, kind, lr).with_rich(rich);
+    if !rule.is_original() {
+        if kind != Kind::Sgd {
+            return Err("--keep-pct/--leak/--round/--units-log2/--width need --optimizer carry-sgd".into());
+        }
+        opt = opt.with_rule(&model, rule);
+    }
     opt.stochastic = arg(&args, "--stochastic") == Some("yes");
     let initial = evaluate(&model, eval);
     let start = std::time::Instant::now();
@@ -510,6 +646,13 @@ fn main() -> Result<(), String> {
         }
         None => (fast_loss, fast_correct),
     };
+    if let Some(path) = arg(&args, "--save-trits") {
+        // The deployed trits (averaged when averaging is on): a frozen checkpoint for the
+        // offline estimator diagnostic (`ternary_estimator`).
+        let trits = opt.averaged_trits().unwrap_or_else(|| model.trits.clone());
+        std::fs::write(path, serde_json::to_string(&trits).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("{path}: {e}"))?;
+    }
     let n = model.trits.len();
     let report = serde_json::json!({
         "optimizer": match kind {
@@ -520,9 +663,11 @@ fn main() -> Result<(), String> {
         },
         "stochastic_rounding": opt.stochastic,
         "rich": format!("{:?}", opt.rich),
+        "rule": format!("{:?}", opt.rule),
+        "underflows": opt.underflows, "saturations": opt.saturations,
         "fast_accuracy": fast_correct as f64 / eval.len() as f64,
         "fast_mean_loss": fast_loss as f64 / eval.len() as f64,
-        "seed": seed, "steps": steps, "lr": lr, "latent_units_per_trit": if kind == Kind::Sgd16 { S16 } else { S },
+        "seed": seed, "steps": steps, "lr": lr, "latent_units_per_trit": if kind == Kind::Sgd16 { S16 } else { 1i64 << opt.rule.units_log2 },
         "evaluation_offset": eval_offset, "evaluation_count": eval.len(),
         "initial_loss_sum": initial.0, "initial_correct": initial.1,
         "loss_sum": loss, "correct": correct,
@@ -552,6 +697,10 @@ mod tests {
         let mut m = Model::new(4, 3, 2, &mut Rng(7));
         m.input_shift = 8;
         m.output_shift = 3;
+        // Fixed trits with every hidden unit able to fire: Rng(7)'s draw leaves all three ReLUs
+        // dead on every input, which made every gradient zero and the tests below vacuous.
+        m.trits = vec![1, 1, 1, 1, 1, 1, 0, 1, 1, 0, 1, 1, 1, -1, 0, 1, -1, 1];
+        m.version += 1;
         (
             m,
             Example {
@@ -575,19 +724,20 @@ mod tests {
     }
 
     /// A latent that stays inside its rounding cell never changes the trit; the remainder carries.
+    /// At a huge shift the floor rule still moves a negative gradient's latent by one unit
+    /// (floor(g / 2^62) = −1 for g < 0) — the floor bias the `--round` rung measures.
     #[test]
     fn remainder_carries_across_steps() {
         let (mut m, x) = tiny();
-        let mut opt = Carry::new(&m, Kind::Sgd, 62); // shift so large every update is zero
+        let g = Carry::gradient(&m, &x);
+        let mut opt = Carry::new(&m, Kind::Sgd, 62);
         let before = m.trits.clone();
         opt.step(&mut m, &x);
         assert_eq!(m.trits, before);
-        assert!(
-            opt.latent
-                .iter()
-                .zip(&before)
-                .all(|(&l, &t)| l == i32::from(t) * S as i32)
-        );
+        for i in 0..g.len() {
+            let expected = i32::from(before[i]) * S as i32 + i32::from(g[i] < 0);
+            assert_eq!(opt.latent[i], expected, "coordinate {i}");
+        }
     }
 
     /// `rich` with every option off is `carry-sgd`, bit for bit.
@@ -623,6 +773,142 @@ mod tests {
             let h = a.hidden[j] as u64;
             assert_eq!(c[split + j], (h * h) << 17);
         }
+    }
+
+    fn stream() -> Vec<Example> {
+        (0..60u8)
+            .map(|k| Example {
+                pixels: vec![k.wrapping_mul(37), 200 - k, k, 255 - k],
+                label: usize::from(k % 2),
+            })
+            .collect()
+    }
+
+    fn run(kind: Kind, lr: i64, rule: Option<Rule>, stochastic: bool) -> (Vec<i8>, Carry) {
+        let (mut m, _) = tiny();
+        let mut opt = Carry::new(&m, kind, lr);
+        if let Some(r) = rule {
+            opt = opt.with_rule(&m, r);
+        }
+        opt.stochastic = stochastic;
+        for x in &stream() {
+            opt.step(&mut m, x);
+        }
+        (m.trits, opt)
+    }
+
+    /// The generic rule path with every knob at its identity value is `carry-sgd` bit for bit
+    /// (forcing the generic path, which the dispatcher would otherwise skip).
+    #[test]
+    fn rule_identity_is_carry_sgd() {
+        let (a, sgd) = run(Kind::Sgd, 2, None, false);
+        let (mut m, _) = tiny();
+        let mut opt = Carry::new(&m, Kind::Sgd, 2);
+        for x in &stream() {
+            let g = Carry::gradient(&m, x);
+            opt.step_rule(&mut m, &g);
+        }
+        assert_eq!(a, m.trits);
+        assert_eq!(sgd.latent, opt.latent);
+    }
+
+    /// 2^12 units/trit in i16 storage with nearest rounding is `carry-sgd16`'s round-to-nearest
+    /// bit for bit, at the equivalent shift (16 − 12 = 4 coarser).
+    #[test]
+    fn rule_i16_nearest_is_carry_sgd16() {
+        let rule = Rule {
+            round: Round::Nearest,
+            units_log2: 12,
+            width: 16,
+            ..Rule::default()
+        };
+        let (a, ra) = run(Kind::Sgd, 1, Some(rule), false);
+        let (b, rb) = run(Kind::Sgd16, 5, None, false);
+        assert_eq!(a, b);
+        let la: Vec<i64> = ra.latent.iter().map(|&v| i64::from(v)).collect();
+        let lb: Vec<i64> = rb.latent16.iter().map(|&v| i64::from(v)).collect();
+        assert_eq!(la, lb);
+    }
+
+    /// keep 0% puts the latent exactly on the new cell centre after every transition.
+    #[test]
+    fn keep_zero_resets_to_cell_centre() {
+        let rule = Rule {
+            keep_pct: 0,
+            ..Rule::default()
+        };
+        let (mut m, _) = tiny();
+        let mut opt = Carry::new(&m, Kind::Sgd, 0).with_rule(&m, rule);
+        let mut checked = 0;
+        for x in &stream() {
+            let before = m.trits.clone();
+            opt.step(&mut m, x);
+            for i in 0..m.trits.len() {
+                if m.trits[i] != before[i] {
+                    assert_eq!(opt.latent[i], i32::from(m.trits[i]) * S as i32);
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "no transition exercised");
+    }
+
+    /// The leak shrinks the in-cell remainder toward the centre (r −= r >> k) after the step,
+    /// and never changes a trit by itself.
+    #[test]
+    fn leak_shrinks_remainder_toward_centre() {
+        let (m0, x) = tiny();
+        let start = |m: &Model, rule: Rule| {
+            let mut opt = Carry::new(m, Kind::Sgd, 62).with_rule(m, rule);
+            opt.latent[0] = i32::from(m.trits[0]) * S as i32 + 3 * (S as i32) / 8;
+            opt
+        };
+        let (mut a, mut b) = (m0.clone(), m0.clone());
+        let mut plain = start(&a, Rule::default());
+        let mut leaky = start(
+            &b,
+            Rule {
+                leak: Some(1),
+                ..Rule::default()
+            },
+        );
+        let g = Carry::gradient(&a, &x);
+        plain.step_rule(&mut a, &g);
+        leaky.step_rule(&mut b, &g);
+        assert_eq!(a.trits, b.trits);
+        assert_eq!(a.trits, m0.trits);
+        for i in 0..g.len() {
+            let centre = i64::from(a.trits[i]) * S;
+            let rem = i64::from(plain.latent[i]) - centre;
+            assert_eq!(i64::from(leaky.latent[i]) - centre, rem - (rem >> 1), "coordinate {i}");
+        }
+    }
+
+    /// i8 storage saturates at ±127 and counts it.
+    #[test]
+    fn i8_width_saturates_and_counts() {
+        let rule = Rule {
+            units_log2: 4,
+            width: 8,
+            ..Rule::default()
+        };
+        let (_, opt) = run(Kind::Sgd, 0, Some(rule), false);
+        assert!(opt.latent.iter().all(|&l| (-127..=127).contains(&l)));
+        assert!(opt.saturations > 0);
+    }
+
+    /// The test streams must exercise nonzero gradients and transitions, or the identity tests
+    /// above prove nothing.
+    #[test]
+    fn test_stream_is_not_vacuous() {
+        let (m, _) = tiny();
+        let active = stream()
+            .iter()
+            .filter(|x| Carry::gradient(&m, x).iter().any(|&g| g != 0))
+            .count();
+        assert!(active > 40, "{active}");
+        let (_, sgd) = run(Kind::Sgd, 2, None, false);
+        assert!(sgd.transitions > 0);
     }
 
     #[test]

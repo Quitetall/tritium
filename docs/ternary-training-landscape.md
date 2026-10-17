@@ -131,7 +131,7 @@ Nine papers were read in full on 2026-10-16:
 
 | Claim | Verdict | Closest prior art |
 |---|---|---|
-| C1. Ternary weights with an integer, **remainder-keeping** carry as the only weight state; threshold flip | **Open, narrowly** | BOLD: real-valued accumulator, **reset** on flip, binary. ECO: residual inside fp32 momentum. QAR: memoryless Bernoulli, no carry. 2610.16298: integer, discards the residual, relies on SR. None keeps the remainder or ablates keep vs reset. |
+| C1. Ternary weights with an integer, **remainder-keeping** carry as the only weight state; threshold flip | **Open, narrowly — and keep-vs-reset is NOT a measured advantage** (rules-20261016: reset +118 [−47, 284], unresolved) | BOLD: real-valued accumulator, **reset** on flip, binary. ECO: residual inside fp32 momentum. QAR: memoryless Bernoulli, no carry. 2610.16298: integer, discards the residual, relies on SR. None keeps the remainder or ablates keep vs reset. |
 | C2. Carry width and capacity, not optimizer richness, set quality | **Open** (no paper ablates accumulator width) | BOLD needs 4× width for fp parity on ImageNet, which supports the capacity half. |
 | C3. Explicit zero-entry/exit thresholds | **Open** | QAR: symmetric cell moves. GFT: ±1 steps. BOLD: binary. |
 | C4. Fused forward-only rule: activation-noise credit into a **persistent, leaky** integer carry; flip as a cross-step sequential test | **Partially pre-empted** | EGGROLL App. H.3: antithetic ternary fitness, int32 accumulator, z-threshold, ±1 int8 step, no master or optimizer state, **but the accumulator is re-zeroed every step** (single-step test) and noise is in weight space (rank-1, acting on the output). TerMeZO: flip when an **fp** latent crosses the boundary. Open: persistence + leak, activation-space per-token noise, ternary weights. Cite EGGROLL H.3 as the closest. |
@@ -246,12 +246,12 @@ property, not more seeds, is what removes confounding.
 | U1 | integer carry, remainder kept | gradient is the exact rational STE gradient | 92.05% ✓ |
 | U1a | carry width i16 | — | 91.61% ✓ |
 | U2 | + latent averaging | average off → U1 | 92.21% ✓ |
-| U3 | remainder kept fraction ρ (ρ=0 is BOLD/Bop reset-on-flip) | ρ=1 → U1 | open |
-| U4 | + leak λ on the carry | λ=0 → U1 | open |
+| U3 | remainder kept fraction ρ (ρ=0 is BOLD/Bop reset-on-flip) | ρ=1 → U1 | **done**: ρ=0 91.73% (unresolved vs U1), ρ=0.5 92.08%; reset cuts transitions 10× |
+| U4 | + leak λ on the carry | λ=0 → U1 | **done**: monotone cost (2⁻¹⁶ +206, 2⁻⁸ +4,404, 2⁻⁴ collapses) |
 | U5 | stochastic adjacent transitions, no carry (GXNOR/DST) | — (control) | open |
 | U6 | ECO-style residual into momentum | momentum off → U1 | open |
-| U7 | stochastic rounding of the carry step instead of an exact remainder | SR off → U1 | open (landmine 2) |
-| U8 | carry width i16 → i8, logging underflow and saturation counts | width i32 → U1 | open (landmine 3) |
+| U7 | stochastic rounding of the carry step instead of an exact remainder | SR off → U1 | **done**: rounding mode irrelevant at 2¹⁶ and 2¹² units/trit |
+| U8 | carry width i16 → i8, logging underflow and saturation counts | width i32 → U1 | **done**: i8 + SR 91.45% at 1 B/weight; i8 floor collapses (65–72%) |
 | — | external comparators at matched tuning budget: Bop, DQT, QAR-γ, ECO+SR, naive no-master+SR, WAGE | — | open |
 
 **Explaining the EAT-O gap (92% → 73%).** Walk from U1 toward the EAT-O controller, adding one
@@ -273,7 +273,7 @@ do.
 | Rung | Change | Identity / check | Prior art |
 |---|---|---|---|
 | G0 | exact STE gradient | anchor | — |
-| G1 | offline estimator diagnostic (no training): cosine and flip agreement vs population K | — | Dust's cos(K) law |
+| G1 | offline estimator diagnostic (no training): cosine and flip agreement vs population K | — | **done** (estimator-20261016): ternary antithetic noise ≥ Gaussian; σ ≥ 1 quantization step; sign-only biased; trained model needs ~4–8× more draws |
 | G2 | node perturbation, Gaussian noise, clean-forward baseline, K draws per step | G1 cosine → c_max as K grows | Dust, Poor Man's |
 | G3 | antithetic ± pairs (no clean forward) | same noise draws as G2 | OpenAI-ES, nano-egg |
 | G4 | ternary noise {−1,0,+1} | matched σ to G3 | ElasticZO, QuZO |
@@ -294,6 +294,9 @@ do.
 
 F1 is the key rung. Because it is bit-exact to F0, the F1→F2 difference isolates what fusion
 itself costs or buys: mid-window flips changing the model while evidence is still accumulating.
+
+Results so far: `docs/experiments/eat-o/rules-20261016/results.md` (U3, U4, U7, U8) and
+`docs/experiments/eat-o/estimator-20261016/results.md` (G1).
 
 ### Axis M: capacity, last
 
