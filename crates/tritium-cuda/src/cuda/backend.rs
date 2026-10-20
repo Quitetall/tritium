@@ -592,6 +592,8 @@ pub struct CudaBackend {
     pub(super) func_salt_v2_gather: CudaFunction,
     /// Tensor-core SALT V2 GEMM (`salt_v2_mma.cu`).
     pub(super) salt_v2_mma: SaltMmaKernels,
+    /// DFlash drafter kernels (`dflash.cu`).
+    pub(super) dflash_module: Arc<CudaModule>,
     /// Device trap used only by destructive release qualification.
     #[cfg(feature = "device-loss-qualification")]
     pub(super) func_qualification_poison: CudaFunction,
@@ -1216,6 +1218,9 @@ impl CudaBackend {
 
         // Same compute_80 floor as the IMMA module above.
         let salt_v2_mma = SaltMmaKernels::load(&ctx)?;
+        let dflash_module = ctx
+            .load_module(Ptx::from_src(DFLASH_PTX))
+            .map_err(|e| driver_err("load dflash ptx", &e))?;
 
         let deltanet_module = ctx
             .load_module(Ptx::from_src(QWEN35_DELTANET_PTX))
@@ -1273,6 +1278,7 @@ impl CudaBackend {
             func_salt_v2_stream_i8_multi,
             func_salt_v2_gather,
             salt_v2_mma,
+            dflash_module,
             #[cfg(feature = "device-loss-qualification")]
             func_qualification_poison,
             func_tiled_f32_sparse,

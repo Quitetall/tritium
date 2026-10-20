@@ -28,6 +28,9 @@ use super::salt_v2_runtime::{
 };
 use super::*;
 
+mod dflash;
+pub use dflash::{DFlashConfig, DFlashFetch};
+
 /// Largest context the executor's attention kernel keeps scores for in shared memory.
 ///
 /// 8192 scores are 32 KiB, inside the default per-block shared budget. Longer contexts
@@ -193,6 +196,27 @@ struct PrefillLayer {
 /// Prompt tokens fed per batched prefill chunk.
 const PREFILL_CHUNK: usize = 64;
 
+/// Most tokens one speculative verification ([`Qwen35Resident::verify`]) checks.
+pub const QWEN35_VERIFY_MAX: usize = 16;
+
+/// Speculative verification state: what a later commit replays, and the head.
+struct Verify {
+    /// Per DeltaNet layer, in layer order: the verified rows' conv input, `b` and
+    /// `a` logits, `[QWEN35_VERIFY_MAX, width]` each.
+    saved: Vec<(CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>)>,
+    /// The language head as a fused group writing `logits`.
+    head: PrefillGroup,
+    /// `[QWEN35_VERIFY_MAX, vocab]`.
+    logits: CudaSlice<f32>,
+    /// `[QWEN35_VERIFY_MAX, ARGMAX_BLOCKS]` stage-one argmax partials.
+    argmax_value: CudaSlice<f32>,
+    argmax_index: CudaSlice<i32>,
+    /// `[QWEN35_VERIFY_MAX]` greedy token after each verified row.
+    tokens: CudaSlice<u32>,
+    /// Rows of the latest verification not yet committed.
+    pending: Option<usize>,
+}
+
 /// Batched prefill: `[PREFILL_CHUNK, width]` activations. The projections run as
 /// multi-row GEMVs whose every output row is bit-identical to the decode GEMV on
 /// that row alone; everything sequential in the token (convolution, recurrence,
@@ -216,14 +240,10 @@ struct Prefill {
     value: CudaSlice<f32>,
     attention_gate: CudaSlice<f32>,
     attended: CudaSlice<f32>,
-    /// Per-token intermediates of the batched mixer kernels.
+    /// Batched attention queries.
     query: CudaSlice<f32>,
-    convolved: CudaSlice<f32>,
-    kk: CudaSlice<f32>,
-    qq: CudaSlice<f32>,
-    beta: CudaSlice<f32>,
-    decay: CudaSlice<f32>,
-    core: CudaSlice<f32>,
+    /// Per-token intermediates of the batched DeltaNet scan.
+    scan: ScanScratch,
     mlp_gate: CudaSlice<f32>,
     mlp_up: CudaSlice<f32>,
     mlp_act: CudaSlice<f32>,
@@ -311,6 +331,41 @@ struct Scratch {
 const ARGMAX_BLOCKS: u32 = 128;
 const ARGMAX_THREADS: u32 = 1024;
 
+/// The residual stream after chosen layers, for the rows of the latest forward.
+struct FeatureCapture {
+    /// Decoder layer indices, in output order.
+    layers: Vec<usize>,
+    /// `[layers.len(), PREFILL_CHUNK, hidden]`, layer-major.
+    buffer: CudaSlice<f32>,
+    /// Rows the latest forward wrote.
+    rows: usize,
+}
+
+/// Copy the first `rows` rows of `residual` (the stream after layer `layer`) into
+/// `capture`'s slot for that layer, if it captures it.
+fn capture_rows(
+    stream: &Arc<CudaStream>,
+    capture: &mut Option<FeatureCapture>,
+    layer: usize,
+    residual: &CudaSlice<f32>,
+    rows: usize,
+    hidden: usize,
+) -> Result<(), BackendError> {
+    let Some(capture) = capture.as_mut() else {
+        return Ok(());
+    };
+    let Some(slot) = capture.layers.iter().position(|&wanted| wanted == layer) else {
+        return Ok(());
+    };
+    let start = slot * PREFILL_CHUNK * hidden;
+    let mut target = capture.buffer.slice_mut(start..start + rows * hidden);
+    stream
+        .memcpy_dtod(&residual.slice(..rows * hidden), &mut target)
+        .map_err(|error| driver_err("capture hidden state", &error))?;
+    capture.rows = rows;
+    Ok(())
+}
+
 /// A saved copy of a [`Qwen35Resident`]'s recurrent state at one position, for
 /// resuming a sequence whose prefix was already decoded (prompt reuse).
 pub struct Qwen35ResidentSnapshot {
@@ -342,6 +397,12 @@ impl Qwen35ResidentSnapshot {
 /// Built by [`CudaBackend::build_qwen35_resident`]. Holds its own KV cache and
 /// recurrent state; [`Self::reset`] starts a new sequence.
 pub struct Qwen35Resident {
+    /// The DFlash drafter, once attached.
+    drafter: Option<dflash::Drafter>,
+    dflash_module: Arc<CudaModule>,
+    verify: Verify,
+    /// Hidden states captured after selected layers, for a speculative drafter.
+    capture: Option<FeatureCapture>,
     /// When set, batched prefill measures every tensor-core projection against the
     /// GEMV on the same input and keeps the worst peak-relative error here, while
     /// the forward itself continues on the GEMV's outputs.
@@ -760,21 +821,35 @@ impl CudaBackend {
             attention_gate: rows(query_width, "allocate prefill attention gate")?,
             attended: rows(query_width, "allocate prefill attended")?,
             query: rows(query_width, "allocate prefill query")?,
-            convolved: rows(conv_width, "allocate prefill convolved")?,
-            kk: rows(key_width, "allocate prefill kk")?,
-            qq: rows(key_width, "allocate prefill qq")?,
-            beta: rows(spec.deltanet_value_heads, "allocate prefill beta")?,
-            decay: rows(spec.deltanet_value_heads, "allocate prefill decay")?,
-            core: rows(value_width, "allocate prefill core")?,
+            scan: ScanScratch {
+                convolved: rows(conv_width, "allocate prefill convolved")?,
+                kk: rows(key_width, "allocate prefill kk")?,
+                qq: rows(key_width, "allocate prefill qq")?,
+                beta: rows(spec.deltanet_value_heads, "allocate prefill beta")?,
+                decay: rows(spec.deltanet_value_heads, "allocate prefill decay")?,
+                core: rows(value_width, "allocate prefill core")?,
+            },
             mlp_gate: rows(intermediate, "allocate prefill mlp gate")?,
             mlp_up: rows(intermediate, "allocate prefill mlp up")?,
             mlp_act: rows(intermediate, "allocate prefill mlp act")?,
             // The widest input is the MLP's intermediate width, the most rows the
             // fused gate|up group (or a DeltaNet's qkv|z|b|a).
+            // Every fused group's (rows, k): mixer inputs, mixer outputs, the MLP
+            // and the language head.
             mma: SaltMmaScratch::new(
                 &self.stream,
-                intermediate.max(hidden).max(value_width).max(query_width),
-                (2 * intermediate).max(conv_width + value_width + 2 * spec.deltanet_value_heads),
+                &[
+                    (
+                        conv_width + value_width + 2 * spec.deltanet_value_heads,
+                        hidden,
+                    ),
+                    (2 * query_width + 2 * kv_width, hidden),
+                    (hidden, value_width),
+                    (hidden, query_width),
+                    (2 * intermediate, hidden),
+                    (hidden, intermediate),
+                    (vocab, hidden),
+                ],
             )?,
         };
         let prefill_group = |members: &[(&SaltV2ResidentTensor, &CudaSlice<f32>)]| {
@@ -832,8 +907,43 @@ impl CudaBackend {
             };
             prefill.layers.push(entry);
         }
+        let logits = zeros(QWEN35_VERIFY_MAX * vocab, "allocate verification logits")?;
+        let head = prefill_group(&[(&spec.lm_head, &logits)])?;
+        let mut saved = Vec::new();
+        for layer in &layers {
+            if let Mixer::DeltaNet(mixer) = &layer.mixer {
+                let vh = spec.deltanet_value_heads;
+                saved.push((
+                    zeros(
+                        QWEN35_VERIFY_MAX * mixer.qkv.rows,
+                        "allocate verification conv input",
+                    )?,
+                    zeros(QWEN35_VERIFY_MAX * vh, "allocate verification b")?,
+                    zeros(QWEN35_VERIFY_MAX * vh, "allocate verification a")?,
+                ));
+            }
+        }
+        let partials = QWEN35_VERIFY_MAX * ARGMAX_BLOCKS as usize;
+        let verify = Verify {
+            saved,
+            head,
+            logits,
+            argmax_value: zeros(partials, "allocate verification argmax")?,
+            argmax_index: self.stream.alloc_zeros::<i32>(partials).map_err(|error| {
+                alloc_or_backend("allocate verification argmax", &error, partials * 4)
+            })?,
+            tokens: self
+                .stream
+                .alloc_zeros::<u32>(QWEN35_VERIFY_MAX)
+                .map_err(|error| alloc_or_backend("allocate verification tokens", &error, 64))?,
+            pending: None,
+        };
 
         Ok(Qwen35Resident {
+            drafter: None,
+            dflash_module: Arc::clone(&self.dflash_module),
+            verify,
+            capture: None,
             tc_probe: None,
             fused_on: true,
             device_token: None,
@@ -1076,6 +1186,236 @@ fn gather_rows(
     )
 }
 
+/// Per-token intermediates of a batched DeltaNet scan, `[PREFILL_CHUNK, width]`.
+struct ScanScratch {
+    convolved: CudaSlice<f32>,
+    kk: CudaSlice<f32>,
+    qq: CudaSlice<f32>,
+    beta: CudaSlice<f32>,
+    decay: CudaSlice<f32>,
+    core: CudaSlice<f32>,
+}
+
+/// DeltaNet geometry in kernel ABI types.
+struct ScanDims {
+    key_width: usize,
+    value_width: usize,
+    value_heads: usize,
+    group: u32,
+    key_heads_i: i32,
+    value_heads_i: i32,
+    key_head_dim_i: i32,
+    kernel_taps: i32,
+    dk: u32,
+    dv: u32,
+    value_head_blocks: u32,
+    delta_prep_blocks: u32,
+    query_scale: f32,
+}
+
+/// The DeltaNet causal conv, gating scalars and recurrence over `count` tokens:
+/// `raw` (`[count, conv_width]`), `b` and `a` (`[count, value_heads]`) in, the
+/// recurrence's `core` rows out in `scan`. With `commit` the conv and recurrent
+/// states advance past the tokens, exactly as `count` decode steps; without it
+/// both stay as they were (speculative verification), which needs the 128-wide
+/// register-state recurrence.
+#[allow(clippy::too_many_arguments)]
+fn deltanet_scan(
+    stream: &CudaStream,
+    kernels: &Kernels,
+    mixer: &mut DeltaNetLayer,
+    raw: &CudaSlice<f32>,
+    b: &CudaSlice<f32>,
+    a: &CudaSlice<f32>,
+    scan: &mut ScanScratch,
+    dims: &ScanDims,
+    count: usize,
+    commit: bool,
+) -> Result<(), BackendError> {
+    let conv_width = mixer.qkv.rows;
+    let width = to_i32(conv_width, "conv width")?;
+    let tokens = to_i32(count, "scan tokens")?;
+    let m = to_u32(count, "scan tokens")?;
+    let commit_flag = i32::from(commit);
+    let mut builder = stream.launch_builder(&kernels.conv_rows);
+    builder
+        .arg(raw)
+        .arg(&mut mixer.conv_state)
+        .arg(&mixer.conv_weight)
+        .arg(&mut scan.convolved)
+        .arg(&width)
+        .arg(&dims.kernel_taps)
+        .arg(&tokens)
+        .arg(&commit_flag);
+    run(
+        &mut builder,
+        elementwise(conv_width),
+        "launch q35_deltanet_conv_rows",
+    )?;
+
+    let l2_epsilon = 1e-6f32;
+    let mut builder = stream.launch_builder(&kernels.prep_rows);
+    builder
+        .arg(&scan.convolved)
+        .arg(b)
+        .arg(a)
+        .arg(&mixer.a_log)
+        .arg(&mixer.dt_bias)
+        .arg(&mut scan.kk)
+        .arg(&mut scan.qq)
+        .arg(&mut scan.beta)
+        .arg(&mut scan.decay)
+        .arg(&dims.key_heads_i)
+        .arg(&dims.value_heads_i)
+        .arg(&dims.key_head_dim_i)
+        .arg(&dims.query_scale)
+        .arg(&l2_epsilon)
+        .arg(&width);
+    run(
+        &mut builder,
+        LaunchConfig {
+            grid_dim: (dims.delta_prep_blocks, m, 1),
+            block_dim: (dims.dk.max(64), 1, 1),
+            shared_mem_bytes: 0,
+        },
+        "launch q35_deltanet_prep_rows",
+    )?;
+
+    let key_width = dims.key_width;
+    let value = scan.convolved.slice(2 * key_width..);
+    if dims.dk == 128 && dims.dv.is_multiple_of(32) {
+        let key_width_u32 = to_u32(key_width, "key width")?;
+        let value_stride = to_u32(conv_width, "conv width")?;
+        let write_state = u32::from(commit);
+        let mut builder = stream.launch_builder(&kernels.recurrent_rows128);
+        builder
+            .arg(&mut mixer.recurrent_state)
+            .arg(&scan.kk)
+            .arg(&scan.qq)
+            .arg(&value)
+            .arg(&scan.beta)
+            .arg(&scan.decay)
+            .arg(&mut scan.core)
+            .arg(&dims.dv)
+            .arg(&dims.group)
+            .arg(&m)
+            .arg(&key_width_u32)
+            .arg(&value_stride)
+            .arg(&dims.value_head_blocks)
+            .arg(&write_state);
+        return run(
+            &mut builder,
+            LaunchConfig {
+                grid_dim: (dims.value_head_blocks, dims.dv / 32, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            "launch DeltaNet recurrence over a token chunk",
+        );
+    }
+    if !commit {
+        return Err(invalid(
+            "speculative verification needs the 128-wide DeltaNet recurrence",
+        ));
+    }
+    let heads_count = dims.value_heads;
+    let value_width = dims.value_width;
+    for t in 0..count {
+        let kk = scan.kk.slice(t * key_width..(t + 1) * key_width);
+        let qq = scan.qq.slice(t * key_width..(t + 1) * key_width);
+        let value = scan
+            .convolved
+            .slice(t * conv_width + 2 * key_width..(t + 1) * conv_width);
+        let beta = scan.beta.slice(t * heads_count..(t + 1) * heads_count);
+        let decay = scan.decay.slice(t * heads_count..(t + 1) * heads_count);
+        let mut core = scan.core.slice_mut(t * value_width..(t + 1) * value_width);
+        let mut builder = stream.launch_builder(&kernels.recurrent);
+        builder
+            .arg(&mut mixer.recurrent_state)
+            .arg(&kk)
+            .arg(&qq)
+            .arg(&value)
+            .arg(&beta)
+            .arg(&decay)
+            .arg(&mut core)
+            .arg(&dims.dk)
+            .arg(&dims.dv)
+            .arg(&dims.group);
+        let (lane_blocks, lane_threads) = if dims.dv.is_multiple_of(32) {
+            (dims.dv / 32, 32)
+        } else {
+            (1, dims.dv)
+        };
+        run(
+            &mut builder,
+            LaunchConfig {
+                grid_dim: (dims.value_head_blocks, lane_blocks, 1),
+                block_dim: (lane_threads, 1, 1),
+                shared_mem_bytes: 2 * dims.dk * core::mem::size_of::<f32>() as u32,
+            },
+            "launch DeltaNet recurrent step",
+        )?;
+    }
+    Ok(())
+}
+
+/// Greedy argmax of `count` logits rows of `verify` starting at `first`, into
+/// `verify.tokens` at the same rows. Same partial/final kernels and tie rule as a
+/// decode step's argmax.
+fn argmax_rows(
+    stream: &CudaStream,
+    kernels: &Kernels,
+    verify: &mut Verify,
+    first: usize,
+    count: usize,
+) -> Result<(), BackendError> {
+    let vocab = verify.logits.len() / QWEN35_VERIFY_MAX;
+    let n_vocab = to_i32(vocab, "vocab")?;
+    let partials = ARGMAX_BLOCKS as usize;
+    let partials_i = ARGMAX_BLOCKS as i32;
+    for t in first..first + count {
+        let logits = verify.logits.slice(t * vocab..(t + 1) * vocab);
+        let mut values = verify
+            .argmax_value
+            .slice_mut(t * partials..(t + 1) * partials);
+        let mut indices = verify
+            .argmax_index
+            .slice_mut(t * partials..(t + 1) * partials);
+        let mut builder = stream.launch_builder(&kernels.argmax_partial);
+        builder
+            .arg(&logits)
+            .arg(&n_vocab)
+            .arg(&mut values)
+            .arg(&mut indices);
+        run(
+            &mut builder,
+            LaunchConfig {
+                grid_dim: (ARGMAX_BLOCKS, 1, 1),
+                block_dim: (ARGMAX_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            "launch q35_argmax_partial",
+        )?;
+        let mut token = verify.tokens.slice_mut(t..t + 1);
+        let mut builder = stream.launch_builder(&kernels.argmax_final);
+        builder
+            .arg(&mut values)
+            .arg(&mut indices)
+            .arg(&partials_i)
+            .arg(&mut token);
+        run(
+            &mut builder,
+            LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            "launch q35_argmax_final",
+        )?;
+    }
+    Ok(())
+}
+
 /// One multi-row prefill projection group over `m` rows of `input`: on the
 /// tensor cores when `mma` is given and the group allows it, otherwise with the
 /// multi-row GEMV that matches decode bit for bit.
@@ -1298,6 +1638,9 @@ impl Qwen35Resident {
             return Err(invalid("snapshot belongs to a different executor"));
         }
         self.position = snapshot.position;
+        if let Some(drafter) = self.drafter.as_mut() {
+            drafter.truncate(snapshot.position);
+        }
         Ok(())
     }
 
@@ -1327,7 +1670,82 @@ impl Qwen35Resident {
             }
         }
         self.position = 0;
+        if let Some(drafter) = self.drafter.as_mut() {
+            drafter.truncate(0);
+        }
         Ok(())
+    }
+
+    /// Capture the residual stream after each of `layers` (decoder layer indices,
+    /// at most the last) on every later forward; an empty slice stops capturing.
+    /// [`Self::captured_features`] reads the latest forward's rows.
+    ///
+    /// The last layer is captured only when the language head runs (a headless
+    /// prefill chunk stops before folding it into the residual).
+    ///
+    /// # Errors
+    /// Rejects a layer index past the model, or returns an allocation failure.
+    pub fn set_feature_capture(&mut self, layers: &[usize]) -> Result<(), BackendError> {
+        if layers.is_empty() {
+            self.capture = None;
+            return Ok(());
+        }
+        if let Some(&bad) = layers.iter().find(|&&layer| layer >= self.layers.len()) {
+            return Err(invalid(format!("capture layer {bad} past the model")));
+        }
+        let len = layers.len() * PREFILL_CHUNK * self.hidden;
+        let buffer = self
+            .stream
+            .alloc_zeros::<f32>(len)
+            .map_err(|error| alloc_or_backend("allocate feature capture", &error, len * 4))?;
+        self.capture = Some(FeatureCapture {
+            layers: layers.to_vec(),
+            buffer,
+            rows: 0,
+        });
+        Ok(())
+    }
+
+    /// The latest forward's captured hidden states: `(rows, data)` with `data`
+    /// laid out `[layers, rows, hidden]` in [`Self::set_feature_capture`]'s order.
+    ///
+    /// # Errors
+    /// Rejects a call with no capture configured, or returns a driver failure.
+    pub fn captured_features(&self) -> Result<(usize, Vec<f32>), BackendError> {
+        let capture = self
+            .capture
+            .as_ref()
+            .ok_or_else(|| invalid("no feature capture configured"))?;
+        let rows = capture.rows;
+        let mut out = vec![0.0f32; capture.layers.len() * rows * self.hidden];
+        for (slot, chunk) in out.chunks_mut(rows * self.hidden).enumerate() {
+            let start = slot * PREFILL_CHUNK * self.hidden;
+            self.stream
+                .memcpy_dtoh(
+                    &capture.buffer.slice(start..start + rows * self.hidden),
+                    chunk,
+                )
+                .map_err(|error| driver_err("read captured features", &error))?;
+        }
+        Ok((rows, out))
+    }
+
+    fn scan_dims(&self) -> Result<ScanDims, BackendError> {
+        Ok(ScanDims {
+            key_width: self.key_heads * self.key_head_dim,
+            value_width: self.value_heads * self.value_head_dim,
+            value_heads: self.value_heads,
+            group: to_u32(self.value_heads / self.key_heads, "group size")?,
+            key_heads_i: to_i32(self.key_heads, "key heads")?,
+            value_heads_i: to_i32(self.value_heads, "value heads")?,
+            key_head_dim_i: to_i32(self.key_head_dim, "key head dim")?,
+            kernel_taps: to_i32(self.conv_kernel, "conv kernel")?,
+            dk: to_u32(self.key_head_dim, "key head dim")?,
+            dv: to_u32(self.value_head_dim, "value head dim")?,
+            value_head_blocks: to_u32(self.value_heads, "value heads")?,
+            delta_prep_blocks: to_u32(self.key_heads + 1, "prep blocks")?,
+            query_scale: 1.0f32 / (self.key_head_dim as f32).sqrt(),
+        })
     }
 
     /// Start (`Some(0.0)`) or stop (`None`) the tensor-core drift probe, returning
@@ -1353,7 +1771,7 @@ impl Qwen35Resident {
         // A8 variants keep the token-by-token loop.
         if batched_prefill_enabled() && fused_enabled() && a8_scope() == A8Scope::Off {
             for chunk in rest.chunks(PREFILL_CHUNK) {
-                self.prefill_chunk(chunk)?;
+                self.forward_rows(chunk, false)?;
             }
         } else {
             for &token in rest {
@@ -1363,12 +1781,23 @@ impl Qwen35Resident {
         self.step(last)
     }
 
-    /// Run `tokens` (at most [`PREFILL_CHUNK`]) through every layer without the
-    /// language head, as [`Self::forward`] would one at a time.
-    fn prefill_chunk(&mut self, tokens: &[u32]) -> Result<(), BackendError> {
+    /// Run `tokens` (at most [`PREFILL_CHUNK`]) through every layer, as
+    /// [`Self::forward`] would one at a time.
+    ///
+    /// Prefill (`verify == false`) is headless and advances the position. A
+    /// verification runs the language head and greedy argmax on every row into
+    /// `self.verify`, saves what [`Self::commit`] replays, and leaves the DeltaNet
+    /// states and the position as they were; its KV rows past the position are
+    /// overwritten as decoding resumes.
+    fn forward_rows(&mut self, tokens: &[u32], verify: bool) -> Result<(), BackendError> {
         let count = tokens.len();
-        if count == 0 || count > PREFILL_CHUNK {
-            return Err(invalid("prefill chunk size out of range"));
+        let limit = if verify {
+            QWEN35_VERIFY_MAX
+        } else {
+            PREFILL_CHUNK
+        };
+        if count == 0 || count > limit {
+            return Err(invalid("token chunk size out of range"));
         }
         if let Some(&token) = tokens.iter().find(|&&token| token as usize >= self.vocab) {
             return Err(invalid(format!(
@@ -1388,21 +1817,10 @@ impl Qwen35Resident {
         }
         let m = to_u32(count, "prefill chunk")?;
         let n = to_i32(self.hidden, "hidden")?;
-        let key_width = self.key_heads * self.key_head_dim;
-        let value_width = self.value_heads * self.value_head_dim;
         let query_width = self.heads * self.head_dim;
-        let group = to_u32(self.value_heads / self.key_heads, "group size")?;
-        let key_heads = to_i32(self.key_heads, "key heads")?;
-        let value_heads = to_i32(self.value_heads, "value heads")?;
-        let key_head_dim = to_i32(self.key_head_dim, "key head dim")?;
         let value_head_dim = to_i32(self.value_head_dim, "value head dim")?;
-        let kernel_taps = to_i32(self.conv_kernel, "conv kernel")?;
-        let dk = to_u32(self.key_head_dim, "key head dim")?;
         let dv = to_u32(self.value_head_dim, "value head dim")?;
         let value_head_blocks = to_u32(self.value_heads, "value heads")?;
-        let delta_prep_blocks = to_u32(self.key_heads + 1, "prep blocks")?;
-        let query_scale = 1.0f32 / (self.key_head_dim as f32).sqrt();
-        let l2_epsilon = 1e-6f32;
         let heads = to_i32(self.heads, "heads")?;
         let kv_heads = to_i32(self.kv_heads, "kv heads")?;
         let head_dim = to_i32(self.head_dim, "head dim")?;
@@ -1417,9 +1835,11 @@ impl Qwen35Resident {
         let attention_scale = 1.0f32 / (self.head_dim as f32).sqrt();
         let eps = self.eps;
         let gated_query = to_i32(count * query_width, "gated query")?;
+        let dims = self.scan_dims()?;
         let tc = tensor_core_prefill_enabled();
         let mut tc_probe = self.tc_probe;
 
+        let hidden = self.hidden;
         let Self {
             stream,
             kernels,
@@ -1427,8 +1847,12 @@ impl Qwen35Resident {
             layers,
             prefill,
             inv_freq,
+            capture,
+            verify: verify_state,
+            final_norm,
             ..
         } = self;
+        let mut deltanet_index = 0usize;
         stream
             .memcpy_htod(&ctrl, &mut prefill.ctrl)
             .map_err(|error| driver_err("upload prefill ctrl", &error))?;
@@ -1457,6 +1881,9 @@ impl Qwen35Resident {
                 index != 0,
                 m,
             )?;
+            if index != 0 {
+                capture_rows(stream, capture, index - 1, &prefill.residual, count, hidden)?;
+            }
             project_rows(
                 kernels,
                 stream,
@@ -1468,124 +1895,37 @@ impl Qwen35Resident {
             )?;
             match &mut layer.mixer {
                 Mixer::DeltaNet(mixer) => {
-                    let conv_width = mixer.qkv.rows;
-                    let width = to_i32(conv_width, "conv width")?;
-                    let tokens = to_i32(count, "prefill chunk")?;
-                    let mut builder = stream.launch_builder(&kernels.conv_rows);
-                    builder
-                        .arg(&prefill.qkv)
-                        .arg(&mut mixer.conv_state)
-                        .arg(&mixer.conv_weight)
-                        .arg(&mut prefill.convolved)
-                        .arg(&width)
-                        .arg(&kernel_taps)
-                        .arg(&tokens);
-                    run(
-                        &mut builder,
-                        elementwise(conv_width),
-                        "launch q35_deltanet_conv_rows",
-                    )?;
-
-                    let mut builder = stream.launch_builder(&kernels.prep_rows);
-                    builder
-                        .arg(&prefill.convolved)
-                        .arg(&prefill.b)
-                        .arg(&prefill.a)
-                        .arg(&mixer.a_log)
-                        .arg(&mixer.dt_bias)
-                        .arg(&mut prefill.kk)
-                        .arg(&mut prefill.qq)
-                        .arg(&mut prefill.beta)
-                        .arg(&mut prefill.decay)
-                        .arg(&key_heads)
-                        .arg(&value_heads)
-                        .arg(&key_head_dim)
-                        .arg(&query_scale)
-                        .arg(&l2_epsilon)
-                        .arg(&width);
-                    run(
-                        &mut builder,
-                        LaunchConfig {
-                            grid_dim: (delta_prep_blocks, m, 1),
-                            block_dim: (dk.max(64), 1, 1),
-                            shared_mem_bytes: 0,
-                        },
-                        "launch q35_deltanet_prep_rows",
-                    )?;
-
-                    let value = prefill.convolved.slice(2 * key_width..);
-                    if dk == 128 && dv.is_multiple_of(32) {
-                        let key_width_u32 = to_u32(key_width, "key width")?;
-                        let value_stride = to_u32(conv_width, "conv width")?;
-                        let mut builder = stream.launch_builder(&kernels.recurrent_rows128);
-                        builder
-                            .arg(&mut mixer.recurrent_state)
-                            .arg(&prefill.kk)
-                            .arg(&prefill.qq)
-                            .arg(&value)
-                            .arg(&prefill.beta)
-                            .arg(&prefill.decay)
-                            .arg(&mut prefill.core)
-                            .arg(&dv)
-                            .arg(&group)
-                            .arg(&m)
-                            .arg(&key_width_u32)
-                            .arg(&value_stride)
-                            .arg(&value_head_blocks);
-                        run(
-                            &mut builder,
-                            LaunchConfig {
-                                grid_dim: (value_head_blocks, dv / 32, 1),
-                                block_dim: (32, 1, 1),
-                                shared_mem_bytes: 0,
-                            },
-                            "launch DeltaNet recurrence over a prefill chunk",
-                        )?;
-                    } else {
-                        let heads_count = self.value_heads;
-                        for t in 0..count {
-                            let kk = prefill.kk.slice(t * key_width..(t + 1) * key_width);
-                            let qq = prefill.qq.slice(t * key_width..(t + 1) * key_width);
-                            let value = prefill
-                                .convolved
-                                .slice(t * conv_width + 2 * key_width..(t + 1) * conv_width);
-                            let beta = prefill.beta.slice(t * heads_count..(t + 1) * heads_count);
-                            let decay = prefill.decay.slice(t * heads_count..(t + 1) * heads_count);
-                            let mut core = prefill
-                                .core
-                                .slice_mut(t * value_width..(t + 1) * value_width);
-                            let mut builder = stream.launch_builder(&kernels.recurrent);
-                            builder
-                                .arg(&mut mixer.recurrent_state)
-                                .arg(&kk)
-                                .arg(&qq)
-                                .arg(&value)
-                                .arg(&beta)
-                                .arg(&decay)
-                                .arg(&mut core)
-                                .arg(&dk)
-                                .arg(&dv)
-                                .arg(&group);
-                            let (lane_blocks, lane_threads) = if dv.is_multiple_of(32) {
-                                (dv / 32, 32)
-                            } else {
-                                (1, dv)
-                            };
-                            run(
-                                &mut builder,
-                                LaunchConfig {
-                                    grid_dim: (value_head_blocks, lane_blocks, 1),
-                                    block_dim: (lane_threads, 1, 1),
-                                    shared_mem_bytes: 2 * dk * core::mem::size_of::<f32>() as u32,
-                                },
-                                "launch DeltaNet recurrent step",
-                            )?;
-                        }
+                    if verify {
+                        let (raw, b, a) = verify_state
+                            .saved
+                            .get_mut(deltanet_index)
+                            .ok_or_else(|| invalid("verification buffers out of step"))?;
+                        let copy = |from: &CudaSlice<f32>, to: &mut CudaSlice<f32>, len: usize| {
+                            stream
+                                .memcpy_dtod(&from.slice(..len), &mut to.slice_mut(..len))
+                                .map_err(|error| driver_err("save verification rows", &error))
+                        };
+                        copy(&prefill.qkv, raw, count * mixer.qkv.rows)?;
+                        copy(&prefill.b, b, count * dims.value_heads)?;
+                        copy(&prefill.a, a, count * dims.value_heads)?;
                     }
+                    deltanet_index += 1;
+                    deltanet_scan(
+                        stream,
+                        kernels,
+                        mixer,
+                        &prefill.qkv,
+                        &prefill.b,
+                        &prefill.a,
+                        &mut prefill.scan,
+                        &dims,
+                        count,
+                        !verify,
+                    )?;
 
                     let mut builder = stream.launch_builder(&kernels.gated_rmsnorm_rows);
                     builder
-                        .arg(&prefill.core)
+                        .arg(&prefill.scan.core)
                         .arg(&prefill.z)
                         .arg(&mixer.norm_weight)
                         .arg(&mut prefill.gated)
@@ -1726,12 +2066,211 @@ impl Qwen35Resident {
                 tc_probe.as_mut(),
             )?;
         }
+        if verify {
+            add_rmsnorm(
+                stream,
+                &kernels.add_rmsnorm,
+                &mut prefill.residual,
+                &prefill.branch,
+                final_norm,
+                &mut prefill.normalized,
+                n,
+                eps,
+                true,
+                m,
+            )?;
+            capture_rows(
+                stream,
+                capture,
+                layers.len() - 1,
+                &prefill.residual,
+                count,
+                hidden,
+            )?;
+            project_rows(
+                kernels,
+                stream,
+                &verify_state.head,
+                &prefill.normalized,
+                m,
+                tc.then_some(&mut prefill.mma),
+                None,
+            )?;
+            argmax_rows(stream, kernels, verify_state, 0, count)?;
+            verify_state.pending = Some(count);
+            self.tc_probe = tc_probe;
+            return Ok(());
+        }
         // The last layer's MLP branch would fold into the residual under the
         // final norm, which only feeds the language head: a headless chunk
         // stops here. Nothing below crosses tokens except the states and caches.
         self.tc_probe = tc_probe;
         self.position += count;
-        Ok(())
+        self.feed_drafter(count)
+    }
+
+    /// Hand the latest forward's first `rows` captured positions to the drafter.
+    fn feed_drafter(&mut self, rows: usize) -> Result<(), BackendError> {
+        let (Some(drafter), Some(capture)) = (self.drafter.as_mut(), self.capture.as_ref()) else {
+            return Ok(());
+        };
+        drafter.ingest(
+            &self.stream,
+            &self.kernels.add_rmsnorm,
+            &capture.buffer,
+            rows,
+        )
+    }
+
+    /// Attach a DFlash drafter (`config`, tensors from `fetch`), quantizing its
+    /// weights to int8 on the way up, and start capturing the target layers it
+    /// conditions on. Attach on a fresh sequence: positions already consumed are
+    /// not in the drafter's context, so [`Self::reset`] first.
+    ///
+    /// # Errors
+    /// Rejects a config the kernels do not serve or a tensor of the wrong shape,
+    /// or returns an allocation or driver failure.
+    pub fn attach_dflash(
+        &mut self,
+        config: DFlashConfig,
+        fetch: &mut DFlashFetch<'_>,
+    ) -> Result<(), BackendError> {
+        if config.hidden != self.hidden {
+            return Err(invalid("drafter hidden width differs from the target's"));
+        }
+        let capacity = self.max_context + QWEN35_VERIFY_MAX;
+        let layers = config.target_layers.clone();
+        self.drafter = None;
+        self.drafter = Some(dflash::Drafter::build(
+            &self.stream,
+            &self.dflash_module,
+            config,
+            capacity,
+            fetch,
+        )?);
+        self.set_feature_capture(&layers)
+    }
+
+    /// Draft the tokens after `anchor`, the next token to feed at the current
+    /// position: `block_size - 1` greedy tokens from the drafter, through the
+    /// target's own language head. Every consumed position must have reached the
+    /// drafter (it follows prefill, steps and commits automatically).
+    ///
+    /// # Errors
+    /// Rejects a call with no drafter attached or an out-of-step context, or
+    /// returns a driver failure.
+    pub fn draft(&mut self, anchor: u32) -> Result<Vec<u32>, BackendError> {
+        let tc = tensor_core_prefill_enabled();
+        let Self {
+            stream,
+            kernels,
+            embedding,
+            drafter,
+            verify,
+            prefill,
+            position,
+            ..
+        } = self;
+        let drafter = drafter
+            .as_mut()
+            .ok_or_else(|| invalid("no drafter attached"))?;
+        drafter.draft_hidden(
+            stream,
+            &kernels.add_rmsnorm,
+            &kernels.gather,
+            embedding,
+            anchor,
+            *position,
+        )?;
+        let block = drafter.block_size();
+        let m = to_u32(block, "block")?;
+        project_rows(
+            kernels,
+            stream,
+            &verify.head,
+            drafter.hidden(),
+            m,
+            tc.then_some(&mut prefill.mma),
+            None,
+        )?;
+        argmax_rows(stream, kernels, verify, 1, block - 1)?;
+        let mut out = vec![0u32; block - 1];
+        stream
+            .memcpy_dtoh(&verify.tokens.slice(1..block), &mut out)
+            .map_err(|error| driver_err("read drafted tokens", &error))?;
+        Ok(out)
+    }
+
+    /// Speculative verification: run `tokens` (the next input token, then drafted
+    /// continuations; at most [`QWEN35_VERIFY_MAX`]) through the model at the
+    /// current position and return the greedy token after each, without advancing
+    /// the sequence. Follow with [`Self::commit`] of the rows to keep.
+    ///
+    /// Projections run on the tensor cores (fast tier, RFC 0001; see
+    /// `TRITIUM_QWEN35_TC_PREFILL`), the rest as in a decode step.
+    ///
+    /// # Errors
+    /// Rejects an empty or oversized block, an out-of-vocabulary token or a full
+    /// context, or returns a driver failure.
+    pub fn verify(&mut self, tokens: &[u32]) -> Result<Vec<u32>, BackendError> {
+        self.forward_rows(tokens, true)?;
+        let mut out = vec![0u32; tokens.len()];
+        self.stream
+            .memcpy_dtoh(&self.verify.tokens.slice(..tokens.len()), &mut out)
+            .map_err(|error| driver_err("read verification tokens", &error))?;
+        Ok(out)
+    }
+
+    /// Keep the first `accepted` rows of the latest [`Self::verify`]: advance the
+    /// DeltaNet conv and recurrent states through exactly those tokens (replaying
+    /// the saved inputs through the same kernels, so the states equal a
+    /// verification of just those rows) and the position past them.
+    ///
+    /// # Errors
+    /// Rejects a commit with no pending verification or more rows than it had, or
+    /// returns a driver failure.
+    pub fn commit(&mut self, accepted: usize) -> Result<(), BackendError> {
+        let pending = self
+            .verify
+            .pending
+            .take()
+            .ok_or_else(|| invalid("commit without a pending verification"))?;
+        if accepted == 0 || accepted > pending {
+            return Err(invalid(format!(
+                "commit of {accepted} rows from a verification of {pending}"
+            )));
+        }
+        let dims = self.scan_dims()?;
+        let Self {
+            stream,
+            kernels,
+            layers,
+            prefill,
+            verify,
+            ..
+        } = self;
+        let mut index = 0usize;
+        for layer in layers.iter_mut() {
+            if let Mixer::DeltaNet(mixer) = &mut layer.mixer {
+                let (raw, b, a) = &verify.saved[index];
+                deltanet_scan(
+                    stream,
+                    kernels,
+                    mixer,
+                    raw,
+                    b,
+                    a,
+                    &mut prefill.scan,
+                    &dims,
+                    accepted,
+                    true,
+                )?;
+                index += 1;
+            }
+        }
+        self.position += accepted;
+        self.device_token = None;
+        self.feed_drafter(accepted)
     }
 
     /// Consume `token` and return the greedy next token. Four bytes cross the bus.
@@ -1812,6 +2351,16 @@ impl Qwen35Resident {
                 index != 0,
                 1,
             )?;
+            if index != 0 {
+                capture_rows(
+                    &self.stream,
+                    &mut self.capture,
+                    index - 1,
+                    &self.scratch.residual,
+                    1,
+                    self.hidden,
+                )?;
+            }
             if matches!(self.layers[index].mixer, Mixer::DeltaNet(_)) {
                 self.deltanet(index, a8)?;
             } else {
@@ -1843,6 +2392,14 @@ impl Qwen35Resident {
             true,
             1,
         )?;
+        capture_rows(
+            &self.stream,
+            &mut self.capture,
+            self.layers.len() - 1,
+            &self.scratch.residual,
+            1,
+            self.hidden,
+        )?;
         if head {
             project(
                 &self.kernels,
@@ -1856,7 +2413,7 @@ impl Qwen35Resident {
             )?;
         }
         self.position += 1;
-        Ok(())
+        self.feed_drafter(1)
     }
 
     fn gather(&mut self) -> Result<(), BackendError> {

@@ -511,6 +511,8 @@ pub(super) const TRAIN_GRAD_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/
 pub(super) const SALT_V2_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/salt_v2.ptx"));
 /// Tensor-core SALT V2 GEMM PTX (compute_80).
 pub(super) const SALT_V2_MMA_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/salt_v2_mma.ptx"));
+/// DFlash speculative drafter kernels PTX (compute_80).
+pub(super) const DFLASH_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/dflash.ptx"));
 /// Gated DeltaNet recurrent-step PTX.
 pub(super) const QWEN35_DELTANET_PTX: &str =
     include_str!(concat!(env!("OUT_DIR"), "/qwen35_deltanet.ptx"));

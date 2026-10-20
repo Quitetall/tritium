@@ -98,7 +98,8 @@ extern "C" __global__ void qwen35_deltanet_recurrent_step(
 //
 // Token t reads `kk`/`qq` row t (`key_width` floats), `value` row t (of
 // `value_stride` floats), `beta`/`decay` row t (`value_heads` floats) and writes
-// `core` row t (`value_heads * value_head_dim` floats). Launched with
+// `core` row t (`value_heads * value_head_dim` floats). With `write_state == 0`
+// the stored state is left untouched (speculative verification). Launched with
 // `blockDim.x == 32` and `gridDim.y * 32 == value_head_dim`.
 template <uint32_t KD>
 __device__ __forceinline__ void recurrent_rows_body(float* state,
@@ -114,6 +115,7 @@ __device__ __forceinline__ void recurrent_rows_body(float* state,
                                                     uint32_t key_width,
                                                     uint32_t value_stride,
                                                     uint32_t value_heads,
+                                                    uint32_t write_state,
                                                     float* projected) {
   const uint32_t head = blockIdx.x;
   const uint32_t value_lane = blockIdx.y * blockDim.x + threadIdx.x;
@@ -167,7 +169,7 @@ __device__ __forceinline__ void recurrent_rows_body(float* state,
          value_lane] = mixed;
   }
 
-  if (live) {
+  if (live && write_state) {
 #pragma unroll
     for (uint32_t key_lane = 0; key_lane < KD; ++key_lane) {
       head_state[static_cast<size_t>(key_lane) * value_head_dim + value_lane] = column[key_lane];
@@ -187,8 +189,9 @@ extern "C" __global__ void __launch_bounds__(32) qwen35_deltanet_recurrent_rows1
                                                              uint32_t tokens,
                                                              uint32_t key_width,
                                                              uint32_t value_stride,
-                                                             uint32_t value_heads) {
+                                                             uint32_t value_heads,
+                                                             uint32_t write_state) {
   __shared__ float projected[2 * 128];
   recurrent_rows_body<128>(state, kk, qq, value, beta, decay, core, value_head_dim, group_size,
-                           tokens, key_width, value_stride, value_heads, projected);
+                           tokens, key_width, value_stride, value_heads, write_state, projected);
 }

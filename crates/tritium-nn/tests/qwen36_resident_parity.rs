@@ -416,3 +416,96 @@ fn tensor_core_prefill_is_within_the_fast_tier_gate() {
     );
     assert!(ratio <= 1.001, "perplexity ratio {ratio:.6} exceeds 1.001");
 }
+
+/// Speculative verification (`verify` + `commit`) reproduces greedy decode.
+///
+/// Runs the draft/verify/commit loop with an oracle drafter (the greedy
+/// continuation itself) and with a corrupting one (every third drafted token
+/// wrong, so blocks accept partially and commit fewer rows than they verified),
+/// at block sizes 4, 8 and 16, and requires the produced tokens to equal plain
+/// greedy decode over 256 tokens: RFC 0001's greedy-identity leg for the
+/// tensor-core verification path. Also reports the verify/step cost ratio.
+#[test]
+#[ignore = "needs TRITIUM_QWEN36_BUNDLE and a CUDA device"]
+fn speculative_verification_reproduces_greedy_decode() {
+    let Ok(bundle) = std::env::var("TRITIUM_QWEN36_BUNDLE") else {
+        eprintln!("skipping: set TRITIUM_QWEN36_BUNDLE");
+        return;
+    };
+    let profile =
+        std::env::var("TRITIUM_QWEN36_PROFILE").unwrap_or_else(|_| "compact-v1".to_owned());
+    let backend = tritium_cuda::CudaBackend::new(0).expect("cuda device");
+    let model = Qwen35SaltV2LanguageMtpModel::load_bundle_profile(
+        &PathBuf::from(bundle),
+        &profile,
+        Box::new(backend),
+    )
+    .expect("load bundle");
+    const STEPS: usize = 256;
+    let mut executor = model
+        .runner()
+        .cuda_resident(PROMPT.len() + STEPS + tritium_cuda::QWEN35_VERIFY_MAX + 1)
+        .expect("build executor")
+        .expect("this bundle should be eligible for the resident executor");
+
+    executor.reset().unwrap();
+    let first = executor.prefill(&PROMPT).unwrap();
+    let mut reference = vec![first];
+    let started = std::time::Instant::now();
+    for _ in 1..STEPS {
+        let next = executor.step(*reference.last().unwrap()).unwrap();
+        reference.push(next);
+    }
+    let step_ms = started.elapsed().as_secs_f64() * 1000.0 / (STEPS - 1) as f64;
+
+    for block in [4usize, 8, 16] {
+        for corrupt in [false, true] {
+            executor.reset().unwrap();
+            let mut produced = vec![executor.prefill(&PROMPT).unwrap()];
+            let mut cycles = 0usize;
+            let mut verify_ms = 0.0f64;
+            while produced.len() < STEPS {
+                let at = produced.len();
+                // Row 0 is the last produced token; rows 1.. are drafts of what
+                // follows it.
+                let mut rows = vec![produced[at - 1]];
+                for offset in 0..block - 1 {
+                    let truth = reference.get(at + offset).copied().unwrap_or(13);
+                    let wrong = corrupt && (at + offset) % 3 == 0;
+                    rows.push(if wrong {
+                        truth.wrapping_add(1) % 150_000
+                    } else {
+                        truth
+                    });
+                }
+                let started = std::time::Instant::now();
+                let greedy = executor.verify(&rows).unwrap();
+                verify_ms += started.elapsed().as_secs_f64() * 1000.0;
+                let mut accepted = 0;
+                while accepted + 1 < rows.len() && rows[accepted + 1] == greedy[accepted] {
+                    accepted += 1;
+                }
+                executor.commit(accepted + 1).unwrap();
+                produced.extend_from_slice(&greedy[..=accepted]);
+                cycles += 1;
+            }
+            produced.truncate(STEPS);
+            let divergence = produced.iter().zip(&reference).position(|(a, b)| a != b);
+            eprintln!(
+                "block {block:2} corrupt {corrupt:5}: {cycles:3} cycles, {:.2} tokens/cycle, \
+                 verify {:.2} ms = {:.2} steps; {}",
+                (STEPS - 1) as f64 / cycles as f64,
+                verify_ms / cycles as f64,
+                verify_ms / cycles as f64 / step_ms,
+                divergence.map_or_else(
+                    || "identical to greedy decode".to_owned(),
+                    |at| format!("DIVERGES at token {at}")
+                )
+            );
+            assert!(
+                divergence.is_none(),
+                "block {block} corrupt {corrupt}: speculative output diverged from greedy at {divergence:?}"
+            );
+        }
+    }
+}

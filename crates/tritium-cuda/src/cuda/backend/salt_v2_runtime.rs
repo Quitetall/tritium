@@ -90,7 +90,7 @@ pub(super) struct SaltMmaScratch {
     act_lo: CudaSlice<u16>,
     /// `[64]` power-of-two row scales.
     row_scale: CudaSlice<f32>,
-    /// `[SALT_V2_MMA_MAX_SPLITS, 64, max_total_rows]` K-split partials.
+    /// K-split partials, `[splits, 64, rows]` for the largest split group.
     partial: CudaSlice<f32>,
     max_k: usize,
     max_total_rows: usize,
@@ -105,11 +105,22 @@ impl SaltMmaScratch {
         self.max_total_rows
     }
 
+    /// Scratch for fused groups of the given `(total_rows, k)` shapes.
     pub(super) fn new(
         stream: &Arc<CudaStream>,
-        max_k: usize,
-        max_total_rows: usize,
+        shapes: &[(usize, usize)],
     ) -> Result<Self, BackendError> {
+        let max_k = shapes.iter().map(|&(_, k)| k).max().unwrap_or(0);
+        let max_total_rows = shapes.iter().map(|&(rows, _)| rows).max().unwrap_or(0);
+        let partial_rows = shapes
+            .iter()
+            .map(|&(rows, k)| {
+                let splits = salt_v2_mma_splits(rows as u32, k as u32) as usize;
+                if splits > 1 { splits * rows } else { 0 }
+            })
+            .max()
+            .unwrap_or(0)
+            .max(1);
         let rows = SALT_V2_MMA_ROWS_MAX as usize;
         let alloc_u16 = |len: usize| {
             stream.alloc_zeros::<u16>(len).map_err(|error| {
@@ -125,7 +136,7 @@ impl SaltMmaScratch {
             act_hi: alloc_u16(rows * max_k)?,
             act_lo: alloc_u16(rows * max_k)?,
             row_scale: alloc_f32(rows)?,
-            partial: alloc_f32(SALT_V2_MMA_MAX_SPLITS as usize * rows * max_total_rows)?,
+            partial: alloc_f32(rows * partial_rows)?,
             max_k,
             max_total_rows,
         })
@@ -957,7 +968,7 @@ impl CudaBackend {
             .stream
             .clone_htod(&words)
             .map_err(|error| driver_err("upload tensor-core probe descriptor", &error))?;
-        let mut scratch = SaltMmaScratch::new(&self.stream, tensor.columns, tensor.rows)?;
+        let mut scratch = SaltMmaScratch::new(&self.stream, &[(tensor.rows, tensor.columns)])?;
         launch_salt_v2_mma_rows_on(
             &self.stream,
             &self.salt_v2_mma,

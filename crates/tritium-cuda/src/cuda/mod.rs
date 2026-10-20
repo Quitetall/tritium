@@ -256,8 +256,8 @@ mod backend;
 // but cuda::tests reaches them through `use super::*` via this glob.
 pub use backend::deltanet::DeltaNetResidentState;
 pub use backend::qwen35_resident::{
-    QWEN35_RESIDENT_MAX_CONTEXT, Qwen35Resident, Qwen35ResidentLayerSpec, Qwen35ResidentMixerSpec,
-    Qwen35ResidentSnapshot, Qwen35ResidentSpec,
+    DFlashConfig, DFlashFetch, QWEN35_RESIDENT_MAX_CONTEXT, QWEN35_VERIFY_MAX, Qwen35Resident,
+    Qwen35ResidentLayerSpec, Qwen35ResidentMixerSpec, Qwen35ResidentSnapshot, Qwen35ResidentSpec,
 };
 #[cfg_attr(not(test), allow(unused_imports))]
 use backend::*;

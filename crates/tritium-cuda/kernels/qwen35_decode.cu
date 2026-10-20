@@ -375,16 +375,25 @@ extern "C" __global__ void q35_deltanet_conv(const float* raw,
 
 // `q35_deltanet_conv` over `tokens` rows in order: each channel's thread steps
 // its state through row 0, 1, ... exactly as that many single-token launches.
+// With `commit == 0` the thread steps a private copy and leaves the stored state
+// as it was (speculative verification; at most 8 taps).
 extern "C" __global__ void q35_deltanet_conv_rows(const float* raw,
                                                   float* conv_state,
                                                   const float* conv_weight,
                                                   float* out,
                                                   int width,
                                                   int kernel,
-                                                  int tokens) {
+                                                  int tokens,
+                                                  int commit) {
   const int channel = blockIdx.x * blockDim.x + threadIdx.x;
   if (channel >= width) return;
-  float* state = conv_state + static_cast<size_t>(channel) * kernel;
+  float* stored = conv_state + static_cast<size_t>(channel) * kernel;
+  float local[8];
+  float* state = stored;
+  if (!commit) {
+    for (int tap = 0; tap < kernel; ++tap) local[tap] = stored[tap];
+    state = local;
+  }
   const float* weight = conv_weight + static_cast<size_t>(channel) * kernel;
   for (int t = 0; t < tokens; ++t) {
     const size_t row = static_cast<size_t>(t) * width;
