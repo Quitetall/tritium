@@ -84,3 +84,111 @@ extern "C" __global__ void qwen35_deltanet_recurrent_step(
 
   core[static_cast<size_t>(head) * value_head_dim + value_lane] = mixed;
 }
+
+// `qwen35_deltanet_recurrent_step` over `tokens` consecutive tokens, the state
+// held in registers between them.
+//
+// Each thread owns one `value_lane` column of its head's state, exactly as in the
+// single-step kernel, and for every token runs the same two passes with the same
+// round-to-nearest intrinsics in the same order. The column is read from global
+// memory once before the first token and written once after the last, instead of
+// once per token; the values in between are the ones the single-step kernel
+// would have stored and re-read, so the result is bit-identical to `tokens`
+// launches of it. `KD` is the key head width (the column's length).
+//
+// Token t reads `kk`/`qq` row t (`key_width` floats), `value` row t (of
+// `value_stride` floats), `beta`/`decay` row t (`value_heads` floats) and writes
+// `core` row t (`value_heads * value_head_dim` floats). Launched with
+// `blockDim.x == 32` and `gridDim.y * 32 == value_head_dim`.
+template <uint32_t KD>
+__device__ __forceinline__ void recurrent_rows_body(float* state,
+                                                    const float* kk,
+                                                    const float* qq,
+                                                    const float* value,
+                                                    const float* beta,
+                                                    const float* decay,
+                                                    float* core,
+                                                    uint32_t value_head_dim,
+                                                    uint32_t group_size,
+                                                    uint32_t tokens,
+                                                    uint32_t key_width,
+                                                    uint32_t value_stride,
+                                                    uint32_t value_heads,
+                                                    float* projected) {
+  const uint32_t head = blockIdx.x;
+  const uint32_t value_lane = blockIdx.y * blockDim.x + threadIdx.x;
+  const uint32_t key_head = head / group_size;
+  const bool live = value_lane < value_head_dim;
+  float* head_state = state + static_cast<size_t>(head) * KD * value_head_dim;
+
+  float column[KD];
+  if (live) {
+#pragma unroll
+    for (uint32_t key_lane = 0; key_lane < KD; ++key_lane) {
+      column[key_lane] = head_state[static_cast<size_t>(key_lane) * value_head_dim + value_lane];
+    }
+  }
+
+  for (uint32_t t = 0; t < tokens; ++t) {
+    const float* head_kk = kk + static_cast<size_t>(t) * key_width + key_head * KD;
+    const float* head_qq = qq + static_cast<size_t>(t) * key_width + key_head * KD;
+    __syncthreads();  // the previous token's reads of `projected` are done
+    for (uint32_t index = threadIdx.x; index < KD; index += blockDim.x) {
+      projected[index] = head_kk[index];
+      projected[KD + index] = head_qq[index];
+    }
+    __syncthreads();
+    if (!live) continue;
+
+    const float head_decay = decay[static_cast<size_t>(t) * value_heads + head];
+    // The single-step kernel computes `decayed` in both passes; it is the same
+    // value, so here pass 1 keeps it in the column for pass 2.
+    float memory = 0.0f;
+#pragma unroll
+    for (uint32_t key_lane = 0; key_lane < KD; ++key_lane) {
+      column[key_lane] = __fmul_rn(column[key_lane], head_decay);
+      memory = __fadd_rn(memory, __fmul_rn(projected[key_lane], column[key_lane]));
+    }
+    // Re-read `projected` in pass 2 instead of holding 128 of its values in
+    // registers next to the column.
+    asm volatile("" ::: "memory");
+    const float delta = __fmul_rn(
+        beta[static_cast<size_t>(t) * value_heads + head],
+        __fsub_rn(value[static_cast<size_t>(t) * value_stride + head * value_head_dim + value_lane],
+                  memory));
+    float mixed = 0.0f;
+#pragma unroll
+    for (uint32_t key_lane = 0; key_lane < KD; ++key_lane) {
+      const float updated = __fadd_rn(column[key_lane], __fmul_rn(projected[key_lane], delta));
+      column[key_lane] = updated;
+      mixed = __fadd_rn(mixed, __fmul_rn(projected[KD + key_lane], updated));
+    }
+    core[static_cast<size_t>(t) * value_heads * value_head_dim + head * value_head_dim +
+         value_lane] = mixed;
+  }
+
+  if (live) {
+#pragma unroll
+    for (uint32_t key_lane = 0; key_lane < KD; ++key_lane) {
+      head_state[static_cast<size_t>(key_lane) * value_head_dim + value_lane] = column[key_lane];
+    }
+  }
+}
+
+extern "C" __global__ void __launch_bounds__(32) qwen35_deltanet_recurrent_rows128(float* state,
+                                                             const float* kk,
+                                                             const float* qq,
+                                                             const float* value,
+                                                             const float* beta,
+                                                             const float* decay,
+                                                             float* core,
+                                                             uint32_t value_head_dim,
+                                                             uint32_t group_size,
+                                                             uint32_t tokens,
+                                                             uint32_t key_width,
+                                                             uint32_t value_stride,
+                                                             uint32_t value_heads) {
+  __shared__ float projected[2 * 128];
+  recurrent_rows_body<128>(state, kk, qq, value, beta, decay, core, value_head_dim, group_size,
+                           tokens, key_width, value_stride, value_heads, projected);
+}

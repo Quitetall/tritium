@@ -427,6 +427,18 @@ pub(super) const KERNEL_NAME_SALT_V2_STREAM_ROWS: &str = "salt_v2_stream_rows_f3
 /// Activation rows one `salt_v2_stream_rows_f32` block applies a weight word to
 /// (its `kStreamRowsMax`); grid.y covers more.
 pub(super) const SALT_V2_STREAM_ROWS_MAX: u32 = 8;
+/// Tensor-core SALT V2 GEMM: activation rows -> permuted f16 hi/lo halves.
+pub(super) const KERNEL_NAME_SALT_V2_MMA_SPLIT_ACT: &str = "salt_v2_mma_split_act";
+/// Tensor-core SALT V2 GEMM over at most 16 activation rows.
+pub(super) const KERNEL_NAME_SALT_V2_MMA_ROWS16: &str = "salt_v2_mma_rows16_f32";
+/// Tensor-core SALT V2 GEMM over at most 64 activation rows.
+pub(super) const KERNEL_NAME_SALT_V2_MMA_ROWS64: &str = "salt_v2_mma_rows64_f32";
+/// Ordered sum of the tensor-core GEMM's K-split partials.
+pub(super) const KERNEL_NAME_SALT_V2_MMA_REDUCE: &str = "salt_v2_mma_reduce";
+/// Activation rows the 64-row tensor-core GEMM takes per launch.
+pub(super) const SALT_V2_MMA_ROWS_MAX: u32 = 64;
+/// Warps (of sixteen weight rows each) per tensor-core GEMM block.
+pub(super) const SALT_V2_MMA_WARPS: u32 = 8;
 /// Per-128-group int8 activation quantizer for the A8 row-stream GEMV.
 pub(super) const KERNEL_NAME_SALT_V2_QUANT_ACT: &str = "salt_v2_quant_act_g128";
 /// A8 (int8 activation, dp4a) row-stream GEMV.
@@ -436,6 +448,9 @@ pub(super) const KERNEL_NAME_SALT_V2_STREAM_I8_MULTI: &str = "salt_v2_stream_i8_
 pub(super) const KERNEL_NAME_SALT_V2_GATHER: &str = "salt_v2_gather_rows";
 /// One Gated DeltaNet recurrent state update for every head of one token.
 pub(super) const KERNEL_NAME_DELTANET_STEP: &str = "qwen35_deltanet_recurrent_step";
+/// The DeltaNet recurrence over several tokens with the state in registers
+/// (128-wide key heads only); bit-identical to that many single steps.
+pub(super) const KERNEL_NAME_DELTANET_ROWS128: &str = "qwen35_deltanet_recurrent_rows128";
 /// Destructive release-qualification kernel. Never used by model dispatch.
 #[cfg(feature = "device-loss-qualification")]
 pub(super) const KERNEL_NAME_QUALIFICATION_POISON: &str = "tritium_qualification_poison_context";
@@ -494,6 +509,8 @@ pub(super) const DECODE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/deco
 pub(super) const TRAIN_GRAD_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/train_grad.ptx"));
 /// Direct SALT V2 D2/B3/S34 kernel, compiled with FMA contraction disabled.
 pub(super) const SALT_V2_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/salt_v2.ptx"));
+/// Tensor-core SALT V2 GEMM PTX (compute_80).
+pub(super) const SALT_V2_MMA_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/salt_v2_mma.ptx"));
 /// Gated DeltaNet recurrent-step PTX.
 pub(super) const QWEN35_DELTANET_PTX: &str =
     include_str!(concat!(env!("OUT_DIR"), "/qwen35_deltanet.ptx"));

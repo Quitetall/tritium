@@ -21,9 +21,10 @@
 use std::sync::Arc;
 
 use super::salt_v2_runtime::{
-    SALT_STREAM_DESCRIPTOR_WORDS, launch_salt_v2_quant_act_on, launch_salt_v2_stream_i8_multi_on,
-    launch_salt_v2_stream_i8_on, launch_salt_v2_stream_multi_on, launch_salt_v2_stream_on,
-    launch_salt_v2_stream_rows_on, salt_stream_descriptor, salt_v2_stream_dispatch,
+    SALT_STREAM_DESCRIPTOR_WORDS, SaltMmaScratch, launch_salt_v2_mma_rows_on,
+    launch_salt_v2_quant_act_on, launch_salt_v2_stream_i8_multi_on, launch_salt_v2_stream_i8_on,
+    launch_salt_v2_stream_multi_on, launch_salt_v2_stream_on, launch_salt_v2_stream_rows_on,
+    salt_stream_descriptor, salt_v2_stream_dispatch,
 };
 use super::*;
 
@@ -171,6 +172,11 @@ struct PrefillGroup {
     group: FusedGroup,
     k: u32,
     table_bytes: u32,
+    /// Every member's row count is a multiple of 16, so the tensor-core GEMM can
+    /// run the group.
+    mma_ok: bool,
+    /// Each member's output buffer and row count, for the drift probe.
+    outputs: Vec<(sys::CUdeviceptr, usize)>,
 }
 
 /// One layer's prefill projections, writing the [`Prefill`] buffers.
@@ -210,9 +216,19 @@ struct Prefill {
     value: CudaSlice<f32>,
     attention_gate: CudaSlice<f32>,
     attended: CudaSlice<f32>,
+    /// Per-token intermediates of the batched mixer kernels.
+    query: CudaSlice<f32>,
+    convolved: CudaSlice<f32>,
+    kk: CudaSlice<f32>,
+    qq: CudaSlice<f32>,
+    beta: CudaSlice<f32>,
+    decay: CudaSlice<f32>,
+    core: CudaSlice<f32>,
     mlp_gate: CudaSlice<f32>,
     mlp_up: CudaSlice<f32>,
     mlp_act: CudaSlice<f32>,
+    /// Tensor-core GEMM scratch, sized for the widest group.
+    mma: SaltMmaScratch,
 }
 
 struct Layer {
@@ -232,11 +248,13 @@ struct Kernels {
     stream_gemv: CudaFunction,
     stream_gemv_multi: CudaFunction,
     stream_rows: CudaFunction,
+    mma: SaltMmaKernels,
     quant_act: CudaFunction,
     stream_i8: CudaFunction,
     stream_i8_multi: CudaFunction,
     gather: CudaFunction,
     recurrent: CudaFunction,
+    recurrent_rows128: CudaFunction,
     add_rmsnorm: CudaFunction,
     attn_prep: CudaFunction,
     attention: CudaFunction,
@@ -245,6 +263,11 @@ struct Kernels {
     conv: CudaFunction,
     prep: CudaFunction,
     gated_rmsnorm: CudaFunction,
+    attn_prep_rows: CudaFunction,
+    attention_rows: CudaFunction,
+    conv_rows: CudaFunction,
+    prep_rows: CudaFunction,
+    gated_rmsnorm_rows: CudaFunction,
     argmax_partial: CudaFunction,
     argmax_final: CudaFunction,
 }
@@ -319,6 +342,10 @@ impl Qwen35ResidentSnapshot {
 /// Built by [`CudaBackend::build_qwen35_resident`]. Holds its own KV cache and
 /// recurrent state; [`Self::reset`] starts a new sequence.
 pub struct Qwen35Resident {
+    /// When set, batched prefill measures every tensor-core projection against the
+    /// GEMV on the same input and keeps the worst peak-relative error here, while
+    /// the forward itself continues on the GEMV's outputs.
+    tc_probe: Option<f32>,
     /// `TRITIUM_QWEN35_FUSED`, read once per step (an environment read takes a
     /// lock and allocates; per layer it was 128 reads a step).
     fused_on: bool,
@@ -576,11 +603,13 @@ impl CudaBackend {
             stream_gemv: self.func_salt_v2_stream.clone(),
             stream_gemv_multi: self.func_salt_v2_stream_multi.clone(),
             stream_rows: self.func_salt_v2_stream_rows.clone(),
+            mma: self.salt_v2_mma.clone(),
             quant_act: self.func_salt_v2_quant_act.clone(),
             stream_i8: self.func_salt_v2_stream_i8.clone(),
             stream_i8_multi: self.func_salt_v2_stream_i8_multi.clone(),
             gather: self.func_salt_v2_gather.clone(),
             recurrent: self.func_deltanet_step.clone(),
+            recurrent_rows128: self.func_deltanet_rows128.clone(),
             add_rmsnorm: function("q35_add_rmsnorm")?,
             attn_prep: function("q35_attn_prep")?,
             attention: function("q35_attention")?,
@@ -589,6 +618,11 @@ impl CudaBackend {
             conv: function("q35_deltanet_conv")?,
             prep: function("q35_deltanet_prep")?,
             gated_rmsnorm: function("q35_gated_rmsnorm")?,
+            attn_prep_rows: function("q35_attn_prep_rows")?,
+            attention_rows: function("q35_attention_rows")?,
+            conv_rows: function("q35_deltanet_conv_rows")?,
+            prep_rows: function("q35_deltanet_prep_rows")?,
+            gated_rmsnorm_rows: function("q35_gated_rmsnorm_rows")?,
             argmax_partial: function("q35_argmax_partial")?,
             argmax_final: function("q35_argmax_final")?,
         };
@@ -725,9 +759,23 @@ impl CudaBackend {
             value: rows(kv_width, "allocate prefill value")?,
             attention_gate: rows(query_width, "allocate prefill attention gate")?,
             attended: rows(query_width, "allocate prefill attended")?,
+            query: rows(query_width, "allocate prefill query")?,
+            convolved: rows(conv_width, "allocate prefill convolved")?,
+            kk: rows(key_width, "allocate prefill kk")?,
+            qq: rows(key_width, "allocate prefill qq")?,
+            beta: rows(spec.deltanet_value_heads, "allocate prefill beta")?,
+            decay: rows(spec.deltanet_value_heads, "allocate prefill decay")?,
+            core: rows(value_width, "allocate prefill core")?,
             mlp_gate: rows(intermediate, "allocate prefill mlp gate")?,
             mlp_up: rows(intermediate, "allocate prefill mlp up")?,
             mlp_act: rows(intermediate, "allocate prefill mlp act")?,
+            // The widest input is the MLP's intermediate width, the most rows the
+            // fused gate|up group (or a DeltaNet's qkv|z|b|a).
+            mma: SaltMmaScratch::new(
+                &self.stream,
+                intermediate.max(hidden).max(value_width).max(query_width),
+                (2 * intermediate).max(conv_width + value_width + 2 * spec.deltanet_value_heads),
+            )?,
         };
         let prefill_group = |members: &[(&SaltV2ResidentTensor, &CudaSlice<f32>)]| {
             let k = members
@@ -735,6 +783,18 @@ impl CudaBackend {
                 .map(|(tensor, _)| tensor.columns)
                 .ok_or_else(|| invalid("empty prefill group"))?;
             Ok::<_, BackendError>(PrefillGroup {
+                mma_ok: members
+                    .iter()
+                    .all(|(tensor, _)| tensor.rows.is_multiple_of(16)),
+                outputs: members
+                    .iter()
+                    .map(|(tensor, output)| {
+                        (
+                            crate::cuda::graph_raw::dptr(*output, &self.stream),
+                            tensor.rows,
+                        )
+                    })
+                    .collect(),
                 group: fuse(members)?,
                 k: to_u32(k, "prefill group width")?,
                 table_bytes: salt_v2_stream_dispatch(k, 128, 1)
@@ -774,6 +834,7 @@ impl CudaBackend {
         }
 
         Ok(Qwen35Resident {
+            tc_probe: None,
             fused_on: true,
             device_token: None,
             fused_table_bytes,
@@ -1015,25 +1076,118 @@ fn gather_rows(
     )
 }
 
-/// One multi-row prefill projection group over `m` rows of `input`.
+/// One multi-row prefill projection group over `m` rows of `input`: on the
+/// tensor cores when `mma` is given and the group allows it, otherwise with the
+/// multi-row GEMV that matches decode bit for bit.
 fn project_rows(
     kernels: &Kernels,
     stream: &CudaStream,
     group: &PrefillGroup,
     input: &CudaSlice<f32>,
     m: u32,
+    mma: Option<&mut SaltMmaScratch>,
+    probe: Option<&mut f32>,
 ) -> Result<(), BackendError> {
-    launch_salt_v2_stream_rows_on(
-        stream,
-        &kernels.stream_rows,
-        &group.group.descriptors,
-        group.group.tensor_count,
-        group.group.total_rows,
-        group.k,
-        group.table_bytes,
-        input,
-        m,
-    )
+    let exact = || {
+        launch_salt_v2_stream_rows_on(
+            stream,
+            &kernels.stream_rows,
+            &group.group.descriptors,
+            group.group.tensor_count,
+            group.group.total_rows,
+            group.k,
+            group.table_bytes,
+            input,
+            m,
+        )
+    };
+    let Some(scratch) = mma.filter(|_| group.mma_ok) else {
+        return exact();
+    };
+    let total = group.group.total_rows;
+    if total as usize > scratch_rows(scratch) {
+        return exact();
+    }
+    let tensor_core = |scratch: &mut SaltMmaScratch| {
+        launch_salt_v2_mma_rows_on(
+            stream,
+            &kernels.mma,
+            scratch,
+            &group.group.descriptors,
+            group.group.tensor_count,
+            total,
+            group.k,
+            input,
+            m,
+        )
+    };
+    let Some(worst) = probe else {
+        return tensor_core(scratch);
+    };
+    // Drift probe: the tensor-core outputs against the GEMV's on this very input,
+    // then the GEMV's are restored so the forward continues on exact values.
+    exact()?;
+    let reference = read_outputs(stream, group, m)?;
+    tensor_core(scratch)?;
+    let candidate = read_outputs(stream, group, m)?;
+    for ((rows, a), b) in group
+        .outputs
+        .iter()
+        .map(|(_, rows)| *rows)
+        .zip(&reference)
+        .zip(&candidate)
+    {
+        for (row_a, row_b) in a.chunks(rows).zip(b.chunks(rows)) {
+            let peak = row_a
+                .iter()
+                .fold(0.0f32, |peak, value| peak.max(value.abs()));
+            let error = row_a
+                .iter()
+                .zip(row_b)
+                .fold(0.0f32, |max, (x, y)| max.max((x - y).abs()))
+                / peak.max(f32::MIN_POSITIVE);
+            *worst = worst.max(error);
+        }
+    }
+    exact()
+}
+
+/// Every member output of `group` for `m` activation rows, synchronously.
+fn read_outputs(
+    stream: &CudaStream,
+    group: &PrefillGroup,
+    m: u32,
+) -> Result<Vec<Vec<f32>>, BackendError> {
+    stream
+        .synchronize()
+        .map_err(|error| driver_err("synchronize drift probe", &error))?;
+    group
+        .outputs
+        .iter()
+        .map(|&(address, rows)| {
+            let mut host = vec![0.0f32; m as usize * rows];
+            // SAFETY: `address` is the member's live `[PREFILL_CHUNK, rows]` output
+            // buffer and `m <= PREFILL_CHUNK`; the stream is synchronized above.
+            #[allow(unsafe_code)]
+            unsafe {
+                cudarc::driver::result::memcpy_dtoh_sync(&mut host, address)
+                    .map_err(|error| driver_err("read drift probe output", &error))?;
+            }
+            Ok(host)
+        })
+        .collect()
+}
+
+fn scratch_rows(scratch: &SaltMmaScratch) -> usize {
+    scratch.max_total_rows()
+}
+
+/// Whether batched prefill projections run on the tensor cores (default on;
+/// `TRITIUM_QWEN35_TC_PREFILL=0` keeps the multi-row GEMV, which is bit-identical
+/// to token-by-token decode). The tensor-core GEMM is fast tier under RFC 0001:
+/// gated on relative error and greedy identity, not equality.
+fn tensor_core_prefill_enabled() -> bool {
+    std::env::var("TRITIUM_QWEN35_TC_PREFILL").as_deref() != Ok("0")
 }
 
 /// Whether prompts prefill in batched chunks (default on;
@@ -1176,6 +1330,13 @@ impl Qwen35Resident {
         Ok(())
     }
 
+    /// Start (`Some(0.0)`) or stop (`None`) the tensor-core drift probe, returning
+    /// the worst peak-relative projection error seen since it was started. Only
+    /// batched prefill chunks are probed; their forward stays exact.
+    pub fn set_tensor_core_probe(&mut self, probe: Option<f32>) -> Option<f32> {
+        std::mem::replace(&mut self.tc_probe, probe)
+    }
+
     /// Feed `tokens` in order, returning the greedy token after the last one.
     ///
     /// Every token but the last runs headless (nobody reads its logits): in
@@ -1230,7 +1391,6 @@ impl Qwen35Resident {
         let key_width = self.key_heads * self.key_head_dim;
         let value_width = self.value_heads * self.value_head_dim;
         let query_width = self.heads * self.head_dim;
-        let kv_width = self.kv_heads * self.head_dim;
         let group = to_u32(self.value_heads / self.key_heads, "group size")?;
         let key_heads = to_i32(self.key_heads, "key heads")?;
         let value_heads = to_i32(self.value_heads, "value heads")?;
@@ -1257,13 +1417,14 @@ impl Qwen35Resident {
         let attention_scale = 1.0f32 / (self.head_dim as f32).sqrt();
         let eps = self.eps;
         let gated_query = to_i32(count * query_width, "gated query")?;
+        let tc = tensor_core_prefill_enabled();
+        let mut tc_probe = self.tc_probe;
 
         let Self {
             stream,
             kernels,
             embedding,
             layers,
-            scratch,
             prefill,
             inv_freq,
             ..
@@ -1296,171 +1457,210 @@ impl Qwen35Resident {
                 index != 0,
                 m,
             )?;
-            project_rows(kernels, stream, &rows.input, &prefill.normalized, m)?;
+            project_rows(
+                kernels,
+                stream,
+                &rows.input,
+                &prefill.normalized,
+                m,
+                tc.then_some(&mut prefill.mma),
+                tc_probe.as_mut(),
+            )?;
             match &mut layer.mixer {
                 Mixer::DeltaNet(mixer) => {
                     let conv_width = mixer.qkv.rows;
                     let width = to_i32(conv_width, "conv width")?;
-                    let heads_count = self.value_heads;
-                    for t in 0..count {
-                        let raw = prefill.qkv.slice(t * conv_width..(t + 1) * conv_width);
-                        let mut builder = stream.launch_builder(&kernels.conv);
-                        builder
-                            .arg(&raw)
-                            .arg(&mut mixer.conv_state)
-                            .arg(&mixer.conv_weight)
-                            .arg(&mut scratch.convolved)
-                            .arg(&width)
-                            .arg(&kernel_taps);
-                        run(
-                            &mut builder,
-                            elementwise(conv_width),
-                            "launch q35_deltanet_conv",
-                        )?;
+                    let tokens = to_i32(count, "prefill chunk")?;
+                    let mut builder = stream.launch_builder(&kernels.conv_rows);
+                    builder
+                        .arg(&prefill.qkv)
+                        .arg(&mut mixer.conv_state)
+                        .arg(&mixer.conv_weight)
+                        .arg(&mut prefill.convolved)
+                        .arg(&width)
+                        .arg(&kernel_taps)
+                        .arg(&tokens);
+                    run(
+                        &mut builder,
+                        elementwise(conv_width),
+                        "launch q35_deltanet_conv_rows",
+                    )?;
 
-                        let b = prefill.b.slice(t * heads_count..(t + 1) * heads_count);
-                        let a = prefill.a.slice(t * heads_count..(t + 1) * heads_count);
-                        let mut builder = stream.launch_builder(&kernels.prep);
-                        builder
-                            .arg(&scratch.convolved)
-                            .arg(&b)
-                            .arg(&a)
-                            .arg(&mixer.a_log)
-                            .arg(&mixer.dt_bias)
-                            .arg(&mut scratch.kk)
-                            .arg(&mut scratch.qq)
-                            .arg(&mut scratch.beta)
-                            .arg(&mut scratch.decay)
-                            .arg(&key_heads)
-                            .arg(&value_heads)
-                            .arg(&key_head_dim)
-                            .arg(&query_scale)
-                            .arg(&l2_epsilon);
-                        run(
-                            &mut builder,
-                            LaunchConfig {
-                                grid_dim: (delta_prep_blocks, 1, 1),
-                                block_dim: (dk.max(64), 1, 1),
-                                shared_mem_bytes: 0,
-                            },
-                            "launch q35_deltanet_prep",
-                        )?;
+                    let mut builder = stream.launch_builder(&kernels.prep_rows);
+                    builder
+                        .arg(&prefill.convolved)
+                        .arg(&prefill.b)
+                        .arg(&prefill.a)
+                        .arg(&mixer.a_log)
+                        .arg(&mixer.dt_bias)
+                        .arg(&mut prefill.kk)
+                        .arg(&mut prefill.qq)
+                        .arg(&mut prefill.beta)
+                        .arg(&mut prefill.decay)
+                        .arg(&key_heads)
+                        .arg(&value_heads)
+                        .arg(&key_head_dim)
+                        .arg(&query_scale)
+                        .arg(&l2_epsilon)
+                        .arg(&width);
+                    run(
+                        &mut builder,
+                        LaunchConfig {
+                            grid_dim: (delta_prep_blocks, m, 1),
+                            block_dim: (dk.max(64), 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        "launch q35_deltanet_prep_rows",
+                    )?;
 
-                        let value = scratch.convolved.slice(2 * key_width..);
-                        let mut builder = stream.launch_builder(&kernels.recurrent);
+                    let value = prefill.convolved.slice(2 * key_width..);
+                    if dk == 128 && dv.is_multiple_of(32) {
+                        let key_width_u32 = to_u32(key_width, "key width")?;
+                        let value_stride = to_u32(conv_width, "conv width")?;
+                        let mut builder = stream.launch_builder(&kernels.recurrent_rows128);
                         builder
                             .arg(&mut mixer.recurrent_state)
-                            .arg(&scratch.kk)
-                            .arg(&scratch.qq)
+                            .arg(&prefill.kk)
+                            .arg(&prefill.qq)
                             .arg(&value)
-                            .arg(&scratch.beta)
-                            .arg(&scratch.decay)
-                            .arg(&mut scratch.core)
-                            .arg(&dk)
+                            .arg(&prefill.beta)
+                            .arg(&prefill.decay)
+                            .arg(&mut prefill.core)
                             .arg(&dv)
-                            .arg(&group);
-                        let (lane_blocks, lane_threads) = if dv.is_multiple_of(32) {
-                            (dv / 32, 32)
-                        } else {
-                            (1, dv)
-                        };
+                            .arg(&group)
+                            .arg(&m)
+                            .arg(&key_width_u32)
+                            .arg(&value_stride)
+                            .arg(&value_head_blocks);
                         run(
                             &mut builder,
                             LaunchConfig {
-                                grid_dim: (value_head_blocks, lane_blocks, 1),
-                                block_dim: (lane_threads, 1, 1),
-                                shared_mem_bytes: 2 * dk * core::mem::size_of::<f32>() as u32,
-                            },
-                            "launch DeltaNet recurrent step",
-                        )?;
-
-                        let z = prefill.z.slice(t * value_width..(t + 1) * value_width);
-                        let mut gated = prefill
-                            .gated
-                            .slice_mut(t * value_width..(t + 1) * value_width);
-                        let mut builder = stream.launch_builder(&kernels.gated_rmsnorm);
-                        builder
-                            .arg(&scratch.core)
-                            .arg(&z)
-                            .arg(&mixer.norm_weight)
-                            .arg(&mut gated)
-                            .arg(&value_head_dim)
-                            .arg(&eps);
-                        run(
-                            &mut builder,
-                            LaunchConfig {
-                                grid_dim: (value_head_blocks, 1, 1),
-                                block_dim: (dv.max(64), 1, 1),
+                                grid_dim: (value_head_blocks, dv / 32, 1),
+                                block_dim: (32, 1, 1),
                                 shared_mem_bytes: 0,
                             },
-                            "launch q35_gated_rmsnorm",
+                            "launch DeltaNet recurrence over a prefill chunk",
                         )?;
+                    } else {
+                        let heads_count = self.value_heads;
+                        for t in 0..count {
+                            let kk = prefill.kk.slice(t * key_width..(t + 1) * key_width);
+                            let qq = prefill.qq.slice(t * key_width..(t + 1) * key_width);
+                            let value = prefill
+                                .convolved
+                                .slice(t * conv_width + 2 * key_width..(t + 1) * conv_width);
+                            let beta = prefill.beta.slice(t * heads_count..(t + 1) * heads_count);
+                            let decay = prefill.decay.slice(t * heads_count..(t + 1) * heads_count);
+                            let mut core = prefill
+                                .core
+                                .slice_mut(t * value_width..(t + 1) * value_width);
+                            let mut builder = stream.launch_builder(&kernels.recurrent);
+                            builder
+                                .arg(&mut mixer.recurrent_state)
+                                .arg(&kk)
+                                .arg(&qq)
+                                .arg(&value)
+                                .arg(&beta)
+                                .arg(&decay)
+                                .arg(&mut core)
+                                .arg(&dk)
+                                .arg(&dv)
+                                .arg(&group);
+                            let (lane_blocks, lane_threads) = if dv.is_multiple_of(32) {
+                                (dv / 32, 32)
+                            } else {
+                                (1, dv)
+                            };
+                            run(
+                                &mut builder,
+                                LaunchConfig {
+                                    grid_dim: (value_head_blocks, lane_blocks, 1),
+                                    block_dim: (lane_threads, 1, 1),
+                                    shared_mem_bytes: 2 * dk * core::mem::size_of::<f32>() as u32,
+                                },
+                                "launch DeltaNet recurrent step",
+                            )?;
+                        }
                     }
-                    project_rows(kernels, stream, &rows.out, &prefill.gated, m)?;
+
+                    let mut builder = stream.launch_builder(&kernels.gated_rmsnorm_rows);
+                    builder
+                        .arg(&prefill.core)
+                        .arg(&prefill.z)
+                        .arg(&mixer.norm_weight)
+                        .arg(&mut prefill.gated)
+                        .arg(&value_head_dim)
+                        .arg(&eps);
+                    run(
+                        &mut builder,
+                        LaunchConfig {
+                            grid_dim: (value_head_blocks, m, 1),
+                            block_dim: (dv.max(64), 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        "launch q35_gated_rmsnorm_rows",
+                    )?;
+                    project_rows(
+                        kernels,
+                        stream,
+                        &rows.out,
+                        &prefill.gated,
+                        m,
+                        tc.then_some(&mut prefill.mma),
+                        tc_probe.as_mut(),
+                    )?;
                 }
                 Mixer::Attention(mixer) => {
-                    for t in 0..count {
-                        let fused_query = prefill
-                            .fused_query
-                            .slice(t * 2 * query_width..(t + 1) * 2 * query_width);
-                        let key = prefill.key.slice(t * kv_width..(t + 1) * kv_width);
-                        let value = prefill.value.slice(t * kv_width..(t + 1) * kv_width);
-                        let ctrl = prefill.ctrl.slice(t * 4..(t + 1) * 4);
-                        let mut attention_gate = prefill
-                            .attention_gate
-                            .slice_mut(t * query_width..(t + 1) * query_width);
-                        let mut builder = stream.launch_builder(&kernels.attn_prep);
-                        builder
-                            .arg(&fused_query)
-                            .arg(&key)
-                            .arg(&value)
-                            .arg(&mixer.q_norm)
-                            .arg(&mixer.k_norm)
-                            .arg(&*inv_freq)
-                            .arg(&mut scratch.query)
-                            .arg(&mut attention_gate)
-                            .arg(&mut mixer.key_cache)
-                            .arg(&mut mixer.value_cache)
-                            .arg(&ctrl)
-                            .arg(&heads)
-                            .arg(&kv_heads)
-                            .arg(&head_dim)
-                            .arg(&rotary_dim)
-                            .arg(&eps);
-                        run(
-                            &mut builder,
-                            LaunchConfig {
-                                grid_dim: (attn_prep_blocks, 1, 1),
-                                block_dim: (threads, 1, 1),
-                                shared_mem_bytes: threads * core::mem::size_of::<f32>() as u32,
-                            },
-                            "launch q35_attn_prep",
-                        )?;
+                    // Every token's key and value reach the cache before any
+                    // token attends, and each attends only up to its own position.
+                    let mut builder = stream.launch_builder(&kernels.attn_prep_rows);
+                    builder
+                        .arg(&prefill.fused_query)
+                        .arg(&prefill.key)
+                        .arg(&prefill.value)
+                        .arg(&mixer.q_norm)
+                        .arg(&mixer.k_norm)
+                        .arg(&*inv_freq)
+                        .arg(&mut prefill.query)
+                        .arg(&mut prefill.attention_gate)
+                        .arg(&mut mixer.key_cache)
+                        .arg(&mut mixer.value_cache)
+                        .arg(&prefill.ctrl)
+                        .arg(&heads)
+                        .arg(&kv_heads)
+                        .arg(&head_dim)
+                        .arg(&rotary_dim)
+                        .arg(&eps);
+                    run(
+                        &mut builder,
+                        LaunchConfig {
+                            grid_dim: (attn_prep_blocks, m, 1),
+                            block_dim: (threads, 1, 1),
+                            shared_mem_bytes: threads * core::mem::size_of::<f32>() as u32,
+                        },
+                        "launch q35_attn_prep_rows",
+                    )?;
 
-                        let mut attended = prefill
-                            .attended
-                            .slice_mut(t * query_width..(t + 1) * query_width);
-                        let mut builder = stream.launch_builder(&kernels.attention);
-                        builder
-                            .arg(&scratch.query)
-                            .arg(&mixer.key_cache)
-                            .arg(&mixer.value_cache)
-                            .arg(&mut attended)
-                            .arg(&ctrl)
-                            .arg(&heads)
-                            .arg(&kv_heads)
-                            .arg(&head_dim)
-                            .arg(&attention_scale);
-                        run(
-                            &mut builder,
-                            LaunchConfig {
-                                grid_dim: (head_blocks, 1, 1),
-                                block_dim: (threads, 1, 1),
-                                shared_mem_bytes: score_bytes,
-                            },
-                            "launch q35_attention",
-                        )?;
-                    }
+                    let mut builder = stream.launch_builder(&kernels.attention_rows);
+                    builder
+                        .arg(&prefill.query)
+                        .arg(&mixer.key_cache)
+                        .arg(&mixer.value_cache)
+                        .arg(&mut prefill.attended)
+                        .arg(&prefill.ctrl)
+                        .arg(&heads)
+                        .arg(&kv_heads)
+                        .arg(&head_dim)
+                        .arg(&attention_scale);
+                    run(
+                        &mut builder,
+                        LaunchConfig {
+                            grid_dim: (head_blocks, m, 1),
+                            block_dim: (threads, 1, 1),
+                            shared_mem_bytes: score_bytes,
+                        },
+                        "launch q35_attention_rows",
+                    )?;
                     let mut builder = stream.launch_builder(&kernels.sigmoid_mul);
                     builder
                         .arg(&mut prefill.attended)
@@ -1471,7 +1671,15 @@ impl Qwen35Resident {
                         elementwise(count * query_width),
                         "launch q35_sigmoid_mul",
                     )?;
-                    project_rows(kernels, stream, &rows.out, &prefill.attended, m)?;
+                    project_rows(
+                        kernels,
+                        stream,
+                        &rows.out,
+                        &prefill.attended,
+                        m,
+                        tc.then_some(&mut prefill.mma),
+                        tc_probe.as_mut(),
+                    )?;
                 }
             }
             add_rmsnorm(
@@ -1486,7 +1694,15 @@ impl Qwen35Resident {
                 true,
                 m,
             )?;
-            project_rows(kernels, stream, &rows.mlp, &prefill.normalized, m)?;
+            project_rows(
+                kernels,
+                stream,
+                &rows.mlp,
+                &prefill.normalized,
+                m,
+                tc.then_some(&mut prefill.mma),
+                tc_probe.as_mut(),
+            )?;
             let intermediate = layer.gate.rows;
             let act = to_i32(count * intermediate, "mlp activations")?;
             let mut builder = stream.launch_builder(&kernels.swiglu);
@@ -1500,11 +1716,20 @@ impl Qwen35Resident {
                 elementwise(count * intermediate),
                 "launch q35_swiglu",
             )?;
-            project_rows(kernels, stream, &rows.down, &prefill.mlp_act, m)?;
+            project_rows(
+                kernels,
+                stream,
+                &rows.down,
+                &prefill.mlp_act,
+                m,
+                tc.then_some(&mut prefill.mma),
+                tc_probe.as_mut(),
+            )?;
         }
         // The last layer's MLP branch would fold into the residual under the
         // final norm, which only feeds the language head: a headless chunk
         // stops here. Nothing below crosses tokens except the states and caches.
+        self.tc_probe = tc_probe;
         self.position += count;
         Ok(())
     }

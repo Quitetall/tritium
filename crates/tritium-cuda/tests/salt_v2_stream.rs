@@ -260,3 +260,56 @@ fn multi_row_stream_is_bit_identical_to_the_per_row_kernel() {
         }
     }
 }
+
+/// The tensor-core GEMM (`salt_v2_mma_rows*`) is fast tier under RFC 0001: every
+/// output within 1e-4 of the row-stream kernel relative to its row's peak (it
+/// carries ~22 significant bits per product, so the measured error is far
+/// smaller), and batch-invariant -- an activation row's outputs are bit-identical
+/// whatever other rows share the launch, which spec-decode verification relies
+/// on. Shapes cover ragged planes, a rank-prefix crossing, several K-splits, and
+/// both the 16- and 64-row kernels.
+#[test]
+fn tensor_core_gemm_is_within_the_fast_tier_and_batch_invariant() {
+    let Ok(cuda) = CudaBackend::new(0) else {
+        eprintln!("skipping SALT V2 tensor-core parity: no CUDA device");
+        return;
+    };
+    for (label, tensor) in [
+        ("ragged", tensor(32, 1024, |tile| tile % 3 + 1)),
+        ("crossing", tensor(128, 768, |tile| (tile * 7) % 3 + 1)),
+        ("deep", tensor(16, 4096, |_| 3)),
+    ] {
+        let rows = tensor.dims()[0] as usize;
+        let columns = tensor.dims()[1] as usize;
+        let resident = cuda.upload_salt_v2(&tensor, SaltV2Codec::B3).unwrap();
+        let full = activation(64, columns);
+        let mut worst = 0.0f32;
+        let mut first_rows = Vec::new();
+        for m in [1usize, 5, 16, 17, 64] {
+            let act = &full[..m * columns];
+            let reference = cuda.salt_v2_forward_rows_probe(&resident, act, m).unwrap();
+            let got = cuda.salt_v2_forward_mma_probe(&resident, act, m).unwrap();
+            assert_eq!(got.len(), reference.len(), "{label} m {m}: length");
+            for (want, have) in reference.chunks(rows).zip(got.chunks(rows)) {
+                let peak = want
+                    .iter()
+                    .fold(0.0f32, |peak, value| peak.max(value.abs()));
+                for (&w, &h) in want.iter().zip(have) {
+                    worst = worst.max((w - h).abs() / peak.max(f32::MIN_POSITIVE));
+                }
+            }
+            first_rows.push(got[..rows].iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        }
+        eprintln!("{label}: worst peak-relative error {worst:.3e}");
+        assert!(
+            worst <= 1e-4,
+            "{label}: tensor-core error {worst:.3e} exceeds 1e-4"
+        );
+        for (index, bits) in first_rows.iter().enumerate() {
+            assert_eq!(
+                bits, &first_rows[0],
+                "{label}: row 0 changed with batch size (case {index})"
+            );
+        }
+    }
+}

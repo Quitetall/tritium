@@ -30,6 +30,7 @@
 //!   (fast tier) instead of the host-orchestrated forward; usable as an A/B toggle
 //! - `TRITIUM_QWEN36_PROMPT_LEN` prompt tokens (default 26, the prompt below; longer
 //!   prompts repeat it), for time-to-first-token, which every round also reports
+//! - `TRITIUM_QWEN36_PRINT_TOKENS` `1` prints the first round's generated token ids
 
 fn main() {
     #[cfg(not(feature = "cuda"))]
@@ -262,6 +263,9 @@ mod cuda_qwen36 {
             );
         }
         let reference = &results[0].tokens;
+        if std::env::var("TRITIUM_QWEN36_PRINT_TOKENS").as_deref() == Ok("1") {
+            println!("  tokens: {reference:?}");
+        }
         let identical = results.iter().all(|round| &round.tokens == reference);
         println!(
             "  generated tokens identical across all rounds: {identical}{}",

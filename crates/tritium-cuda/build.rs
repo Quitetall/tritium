@@ -56,6 +56,8 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/qwen35_deltanet.cu");
     // Qwen3.5/3.6 resident decode kernels (fast tier; see the file header).
     println!("cargo:rerun-if-changed=kernels/qwen35_decode.cu");
+    // SALT V2 B3 x f32 GEMM on the f16 tensor cores (prefill, verification).
+    println!("cargo:rerun-if-changed=kernels/salt_v2_mma.cu");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
@@ -84,6 +86,7 @@ fn main() {
             "salt_v2.ptx",
             "qwen35_deltanet.ptx",
             "qwen35_decode.ptx",
+            "salt_v2_mma.ptx",
         ] {
             std::fs::write(out_dir.join(ptx), "")
                 .expect("tritium-cuda: failed to write check-only placeholder PTX");
@@ -185,6 +188,17 @@ fn main() {
         Path::new("kernels/qwen35_decode.cu"),
         &out_dir.join("qwen35_decode.ptx"),
         add_min_arch,
+        &[],
+    );
+
+    // The tensor-core SALT V2 GEMM uses `mma.m16n8k16` with f32 accumulation and
+    // `cp.async`, both sm_80+: it shares the IMMA kernel's compute_80 floor. Fast
+    // tier (see the file header), so FMA contraction is allowed.
+    compile_ptx(
+        &nvcc,
+        Path::new("kernels/salt_v2_mma.cu"),
+        &out_dir.join("salt_v2_mma.ptx"),
+        IMMA_MIN_ARCH,
         &[],
     );
 }

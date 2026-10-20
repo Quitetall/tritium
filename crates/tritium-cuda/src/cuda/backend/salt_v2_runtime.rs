@@ -80,6 +80,184 @@ pub(super) fn launch_salt_v2_stream_multi_on(
     }
 }
 
+/// Device scratch for the tensor-core SALT V2 GEMM, sized once for up to
+/// [`SALT_V2_MMA_ROWS_MAX`] activation rows of width `max_k` and fused groups of
+/// up to `max_total_rows` rows.
+pub(super) struct SaltMmaScratch {
+    /// `[64, max_k]` f16 bits: the activation's high halves, in slot order.
+    act_hi: CudaSlice<u16>,
+    /// `[64, max_k]` f16 bits: the remainders.
+    act_lo: CudaSlice<u16>,
+    /// `[64]` power-of-two row scales.
+    row_scale: CudaSlice<f32>,
+    /// `[SALT_V2_MMA_MAX_SPLITS, 64, max_total_rows]` K-split partials.
+    partial: CudaSlice<f32>,
+    max_k: usize,
+    max_total_rows: usize,
+}
+
+/// Most K-splits the tensor-core GEMM launches.
+const SALT_V2_MMA_MAX_SPLITS: u32 = 8;
+
+impl SaltMmaScratch {
+    /// The most fused rows one launch can take.
+    pub(super) const fn max_total_rows(&self) -> usize {
+        self.max_total_rows
+    }
+
+    pub(super) fn new(
+        stream: &Arc<CudaStream>,
+        max_k: usize,
+        max_total_rows: usize,
+    ) -> Result<Self, BackendError> {
+        let rows = SALT_V2_MMA_ROWS_MAX as usize;
+        let alloc_u16 = |len: usize| {
+            stream.alloc_zeros::<u16>(len).map_err(|error| {
+                alloc_or_backend("allocate tensor-core GEMM scratch", &error, len * 2)
+            })
+        };
+        let alloc_f32 = |len: usize| {
+            stream.alloc_zeros::<f32>(len).map_err(|error| {
+                alloc_or_backend("allocate tensor-core GEMM scratch", &error, len * 4)
+            })
+        };
+        Ok(Self {
+            act_hi: alloc_u16(rows * max_k)?,
+            act_lo: alloc_u16(rows * max_k)?,
+            row_scale: alloc_f32(rows)?,
+            partial: alloc_f32(SALT_V2_MMA_MAX_SPLITS as usize * rows * max_total_rows)?,
+            max_k,
+            max_total_rows,
+        })
+    }
+}
+
+/// K-splits for a fused group: enough blocks to cover the device about four
+/// times over (measured on the 4090 across the Qwen3.6 projection shapes), never
+/// more splits than K has tiles. A function of the weight shape only, so a row's
+/// result never depends on how many activation rows share the launch.
+fn salt_v2_mma_splits(total_rows: u32, k: u32) -> u32 {
+    let blocks = total_rows.div_ceil(16 * SALT_V2_MMA_WARPS).max(1);
+    let tiles = k / SALT_V2_ALLOCATION_TILE_SIZE as u32;
+    512u32
+        .div_ceil(blocks)
+        .clamp(1, SALT_V2_MMA_MAX_SPLITS.min(tiles.max(1)))
+}
+
+/// Tensor-core SALT V2 GEMM over a fused group: `m` (at most 64) activation rows
+/// of `k` floats in `input`, each tensor writing an `[m, rows]` output.
+///
+/// Fast tier within RFC 0001: every product carries ~22 significant bits and the
+/// K-sum order is fixed by the weight shape, so outputs are close to, but not
+/// bit-identical with, the row-stream GEMV's, and do not depend on `m`.
+/// Requires every tensor's row count to be a multiple of 16 (the caller checks).
+///
+/// # Errors
+/// Rejects `m` or `k` beyond the scratch, or returns a driver failure.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn launch_salt_v2_mma_rows_on(
+    stream: &CudaStream,
+    kernels: &SaltMmaKernels,
+    scratch: &mut SaltMmaScratch,
+    descriptors: &CudaSlice<u64>,
+    tensor_count: u32,
+    total_rows: u32,
+    k: u32,
+    input: &CudaSlice<f32>,
+    m: u32,
+) -> Result<(), BackendError> {
+    if m == 0
+        || m > SALT_V2_MMA_ROWS_MAX
+        || k as usize > scratch.max_k
+        || total_rows as usize > scratch.max_total_rows
+        || !(k as usize).is_multiple_of(SALT_V2_ALLOCATION_TILE_SIZE)
+        || !total_rows.is_multiple_of(16)
+    {
+        return Err(BackendError::InvalidInput(format!(
+            "tensor-core SALT V2 GEMM cannot take m={m}, k={k}, rows={total_rows}"
+        )));
+    }
+    let padded = m.div_ceil(8) * 8;
+    let run = |builder: &mut cudarc::driver::LaunchArgs<'_>, cfg: LaunchConfig, name: &str| {
+        // SAFETY: the scratch holds `64 * max_k` halves per array and
+        // `MAX_SPLITS * 64 * max_total_rows` partials, both checked above against
+        // this launch's `m`, `k` and rows; the caller sized `input` for `m * k`
+        // floats and every descriptor's output for `m * rows` floats.
+        #[allow(unsafe_code)]
+        unsafe {
+            builder
+                .launch(cfg)
+                .map(|_| ())
+                .map_err(|error| driver_err(name, &error))
+        }
+    };
+    let mut builder = stream.launch_builder(&kernels.split_act);
+    builder
+        .arg(input)
+        .arg(&mut scratch.act_hi)
+        .arg(&mut scratch.act_lo)
+        .arg(&mut scratch.row_scale)
+        .arg(&m)
+        .arg(&k);
+    run(
+        &mut builder,
+        LaunchConfig {
+            grid_dim: (padded, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        },
+        "launch tensor-core GEMM activation split",
+    )?;
+
+    let splits = salt_v2_mma_splits(total_rows, k);
+    let (function, staged_rows) = if m <= 16 {
+        (&kernels.rows16, 16)
+    } else {
+        (&kernels.rows64, SALT_V2_MMA_ROWS_MAX)
+    };
+    let mut builder = stream.launch_builder(function);
+    builder
+        .arg(&scratch.act_hi)
+        .arg(&scratch.act_lo)
+        .arg(&scratch.row_scale)
+        .arg(descriptors)
+        .arg(&tensor_count)
+        .arg(&total_rows)
+        .arg(&k)
+        .arg(&m)
+        .arg(&mut scratch.partial);
+    run(
+        &mut builder,
+        LaunchConfig {
+            grid_dim: (total_rows.div_ceil(16 * SALT_V2_MMA_WARPS), splits, 1),
+            block_dim: (SALT_V2_MMA_WARPS * 32, 1, 1),
+            shared_mem_bytes: salt_v2_mma_shared_bytes(staged_rows),
+        },
+        "launch tensor-core SALT V2 GEMM",
+    )?;
+    if splits > 1 {
+        let outputs = m * total_rows;
+        let mut builder = stream.launch_builder(&kernels.reduce);
+        builder
+            .arg(&scratch.partial)
+            .arg(descriptors)
+            .arg(&tensor_count)
+            .arg(&total_rows)
+            .arg(&m)
+            .arg(&splits);
+        run(
+            &mut builder,
+            LaunchConfig {
+                grid_dim: (outputs.div_ceil(256), 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            "launch tensor-core GEMM split reduce",
+        )?;
+    }
+    Ok(())
+}
+
 /// Launch the multi-row (prefill) fused row-stream GEMV over `tensor_count`
 /// descriptors: `m` activation rows of `k` floats, each tensor writing an
 /// `[m, rows]` output. Every output equals `launch_salt_v2_stream_multi_on` run
@@ -729,6 +907,71 @@ impl CudaBackend {
         self.stream
             .clone_dtoh(&output)
             .map_err(|error| driver_err("read multi-row probe output", &error))
+    }
+
+    /// Tensor-core SALT V2 GEMM with host input and output, for gates and probes:
+    /// `m` (at most 64) activation rows, `[m, rows]` outputs.
+    ///
+    /// # Errors
+    /// Rejects a tensor the kernel cannot serve (not row-stream shaped, or a row
+    /// count that is not a multiple of 16) or a wrong activation length, or
+    /// returns a driver failure.
+    pub fn salt_v2_forward_mma_probe(
+        &self,
+        tensor: &SaltV2ResidentTensor,
+        activation: &[f32],
+        m: usize,
+    ) -> Result<Vec<f32>, BackendError> {
+        self.validate_salt_v2_resident_context(tensor)?;
+        salt_v2_stream_dispatch(tensor.columns, tensor.scale_group_size, tensor.codec_tag)
+            .ok_or_else(|| {
+                BackendError::InvalidInput("the tensor-core GEMM needs a row-stream tensor".into())
+            })?;
+        if m == 0 || activation.len() != m * tensor.columns {
+            return Err(BackendError::ShapeMismatch {
+                expected: m * tensor.columns,
+                got: activation.len(),
+            });
+        }
+        let narrow = |value: usize| {
+            u32::try_from(value)
+                .map_err(|_| BackendError::InvalidInput("exceeds the u32 kernel ABI".into()))
+        };
+        let input = self
+            .stream
+            .clone_htod(activation)
+            .map_err(|error| driver_err("upload tensor-core probe input", &error))?;
+        let output = self
+            .stream
+            .alloc_zeros::<f32>(m * tensor.rows)
+            .map_err(|error| {
+                alloc_or_backend("allocate tensor-core probe output", &error, m * tensor.rows)
+            })?;
+        let words = salt_stream_descriptor(
+            tensor,
+            &self.stream,
+            crate::cuda::graph_raw::dptr(&output, &self.stream),
+            0,
+        )?;
+        let descriptors = self
+            .stream
+            .clone_htod(&words)
+            .map_err(|error| driver_err("upload tensor-core probe descriptor", &error))?;
+        let mut scratch = SaltMmaScratch::new(&self.stream, tensor.columns, tensor.rows)?;
+        launch_salt_v2_mma_rows_on(
+            &self.stream,
+            &self.salt_v2_mma,
+            &mut scratch,
+            &descriptors,
+            1,
+            narrow(tensor.rows)?,
+            narrow(tensor.columns)?,
+            &input,
+            narrow(m)?,
+        )?;
+        self.stream
+            .clone_dtoh(&output)
+            .map_err(|error| driver_err("read tensor-core probe output", &error))
     }
 
     /// A8 row-stream projection with host input and output, for gates and probes.

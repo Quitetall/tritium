@@ -206,6 +206,9 @@ fn batched_prefill_is_bit_identical_to_token_by_token() {
                 "TRITIUM_QWEN35_BATCHED_PREFILL",
                 if batched { "1" } else { "0" },
             );
+            // The bit-identity claim is the multi-row GEMV's; the tensor-core
+            // projections are gated separately below.
+            std::env::set_var("TRITIUM_QWEN35_TC_PREFILL", "0");
         }
         executor.reset().unwrap();
         if prefix {
@@ -251,4 +254,165 @@ fn batched_prefill_is_bit_identical_to_token_by_token() {
             );
         }
     }
+}
+
+/// Tensor-core prefill (`TRITIUM_QWEN35_TC_PREFILL`, default on) against the
+/// multi-row GEMV it replaces, on RFC 0001's fast-tier legs:
+///
+/// - in situ: every tensor-core projection inside real prefill forwards, against
+///   the GEMV on the same input, max peak-relative error <= 1e-4;
+/// - final logits after the prompt, peak-relative error <= 2e-3 (reported);
+/// - greedy decode after the prompt identical token for token over 256 tokens;
+/// - teacher-forced perplexity of text continuations after a prefilled context,
+///   ratio <= 1.001.
+///
+/// Decode itself is the same GEMV path in both arms, so every difference here is
+/// the prefill's. Needs `TRITIUM_QWEN36_CORPUS` (a `{"eval_ids": [...]}` JSON of
+/// Qwen-tokenized text, e.g. `~/.cache/tritium-corpora/wikitext2_400k_32k_qwen35.json`)
+/// for the perplexity leg.
+#[test]
+#[ignore = "needs TRITIUM_QWEN36_BUNDLE, TRITIUM_QWEN36_CORPUS and a CUDA device"]
+fn tensor_core_prefill_is_within_the_fast_tier_gate() {
+    let Ok(bundle) = std::env::var("TRITIUM_QWEN36_BUNDLE") else {
+        eprintln!("skipping: set TRITIUM_QWEN36_BUNDLE");
+        return;
+    };
+    let Ok(corpus) = std::env::var("TRITIUM_QWEN36_CORPUS") else {
+        eprintln!("skipping: set TRITIUM_QWEN36_CORPUS");
+        return;
+    };
+    let corpus: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(corpus).expect("read corpus")).expect("corpus json");
+    let text: Vec<u32> = corpus["eval_ids"]
+        .as_array()
+        .expect("eval_ids")
+        .iter()
+        .map(|id| u32::try_from(id.as_u64().expect("token id")).expect("u32 id"))
+        .collect();
+    let profile =
+        std::env::var("TRITIUM_QWEN36_PROFILE").unwrap_or_else(|_| "compact-v1".to_owned());
+    let backend = tritium_cuda::CudaBackend::new(0).expect("cuda device");
+    let model = Qwen35SaltV2LanguageMtpModel::load_bundle_profile(
+        &PathBuf::from(bundle),
+        &profile,
+        Box::new(backend),
+    )
+    .expect("load bundle");
+    const GREEDY: usize = 256;
+    const CONTEXT: usize = 192;
+    const CONTINUATION: usize = 64;
+    let mut executor = model
+        .runner()
+        .cuda_resident(CONTEXT + GREEDY + CONTINUATION + 8)
+        .expect("build executor")
+        .expect("this bundle should be eligible for the resident executor");
+    let set_tc = |on: bool| {
+        // SAFETY: run filtered; the executor reads the variable on this thread only.
+        unsafe { std::env::set_var("TRITIUM_QWEN35_TC_PREFILL", if on { "1" } else { "0" }) };
+    };
+    let peak_relative = |a: &[f32], b: &[f32]| {
+        let peak = a.iter().fold(0.0f32, |peak, value| peak.max(value.abs()));
+        a.iter()
+            .zip(b)
+            .fold(0.0f32, |max, (x, y)| max.max((x - y).abs()))
+            / peak.max(f32::MIN_POSITIVE)
+    };
+
+    let chat: Vec<u32> = PROMPT.iter().copied().cycle().take(200).collect();
+    let prompts: [&[u32]; 3] = [&chat, &text[..201], &text[4096..4096 + 130]];
+
+    // In situ.
+    set_tc(true);
+    executor.set_tensor_core_probe(Some(0.0));
+    for prompt in prompts {
+        executor.reset().unwrap();
+        executor.prefill(prompt).unwrap();
+    }
+    let in_situ = executor
+        .set_tensor_core_probe(None)
+        .expect("probe was running");
+    eprintln!("in-situ projection drift: worst peak-relative error {in_situ:.3e}");
+
+    // Final logits and greedy identity.
+    let mut worst_logits = 0.0f32;
+    let mut greedy_mismatches = Vec::new();
+    for (index, prompt) in prompts.iter().enumerate() {
+        let mut arm = |tc: bool| {
+            set_tc(tc);
+            executor.reset().unwrap();
+            let (&last, rest) = prompt.split_last().unwrap();
+            executor.prefill(rest).unwrap();
+            let logits = executor.step_logits(last).unwrap();
+            let mut next = sample_greedy(&logits).expect("greedy token");
+            let mut tokens = vec![next];
+            for _ in 1..GREEDY {
+                next = executor.step(next).unwrap();
+                tokens.push(next);
+            }
+            (logits, tokens)
+        };
+        let (exact_logits, exact_tokens) = arm(false);
+        let (tc_logits, tc_tokens) = arm(true);
+        let error = peak_relative(&exact_logits, &tc_logits);
+        worst_logits = worst_logits.max(error);
+        let first_divergence = exact_tokens
+            .iter()
+            .zip(&tc_tokens)
+            .position(|(a, b)| a != b);
+        eprintln!(
+            "prompt {index} ({} tokens): logits {error:.3e}, greedy {}",
+            prompt.len(),
+            first_divergence.map_or_else(
+                || format!("identical over {GREEDY}"),
+                |at| format!("diverges at token {at}")
+            )
+        );
+        if let Some(at) = first_divergence {
+            greedy_mismatches.push((index, at));
+        }
+    }
+
+    // Teacher-forced perplexity of continuations after a prefilled context.
+    let mut nll = [0.0f64; 2];
+    let mut scored = 0usize;
+    for window in 0..8 {
+        let start = 8192 + window * (CONTEXT + CONTINUATION);
+        let context = &text[start..start + CONTEXT];
+        let continuation = &text[start + CONTEXT..start + CONTEXT + CONTINUATION];
+        for (arm, tc) in [false, true].into_iter().enumerate() {
+            set_tc(tc);
+            executor.reset().unwrap();
+            let (&last, rest) = context.split_last().unwrap();
+            executor.prefill(rest).unwrap();
+            let mut logits = executor.step_logits(last).unwrap();
+            for &target in continuation {
+                let peak = logits.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+                let sum: f64 = logits.iter().map(|&v| f64::from(v - peak).exp()).sum();
+                nll[arm] += sum.ln() - f64::from(logits[target as usize] - peak);
+                logits = executor.step_logits(target).unwrap();
+            }
+        }
+        scored += CONTINUATION;
+    }
+    let ppl = nll.map(|total| (total / scored as f64).exp());
+    let ratio = ppl[1] / ppl[0];
+    eprintln!(
+        "perplexity over {scored} positions: exact {:.6}, tensor-core {:.6}, ratio {ratio:.6}",
+        ppl[0], ppl[1]
+    );
+    eprintln!("final-logit drift: worst peak-relative error {worst_logits:.3e}");
+
+    assert!(
+        in_situ <= 1e-4,
+        "in-situ projection drift {in_situ:.3e} exceeds 1e-4"
+    );
+    assert!(
+        worst_logits <= 2e-3,
+        "final-logit drift {worst_logits:.3e} exceeds 2e-3"
+    );
+    assert!(
+        greedy_mismatches.is_empty(),
+        "greedy decode diverged after tensor-core prefill: {greedy_mismatches:?}"
+    );
+    assert!(ratio <= 1.001, "perplexity ratio {ratio:.6} exceeds 1.001");
 }
