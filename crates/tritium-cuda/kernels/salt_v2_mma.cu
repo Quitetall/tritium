@@ -392,6 +392,27 @@ __device__ __forceinline__ void mma_rows(const __half* __restrict__ act_hi,
           asm volatile("prefetch.global.L1 [%0];" ::"l"(first + bytes - 1U));
         }
       }
+      // Quad lanes split the tile's payload loads: lane c loads words c, c + 4,
+      // c + 8 and c + 12 of every plane-tile of both rows, all issued up front,
+      // and each step takes the word it needs from the owning lane by shuffle.
+      // Every quad lane needs every word (each decodes its own byte of it), so
+      // loading them all per lane re-requested each line four times and thrashed
+      // L1 (33% hit rate, 375 MB of L2 reads for 59 MB of weights).
+      uint32_t held[2][3][4];
+#pragma unroll
+      for (uint32_t r = 0; r < 2U; ++r) {
+#pragma unroll
+        for (uint32_t p = 0; p < 3U; ++p) {
+#pragma unroll
+          for (uint32_t j = 0; j < 4U; ++j) {
+            const uint32_t word = 4U * j + c;
+            held[r][p][j] = p < planes[r] && word < 13U
+                                ? __ldg(words + static_cast<size_t>(rank[r] + p) * 13U + word)
+                                : 0U;
+          }
+        }
+      }
+      const uint32_t quad_base = lane & ~3U;
       // Scales of every plane-tile of the two rows, doubled for the half trits.
       float2 sc[2][3];
 #pragma unroll
@@ -425,8 +446,9 @@ __device__ __forceinline__ void mma_rows(const __half* __restrict__ act_hi,
               w4[r][s] = 0.0f;
 #pragma unroll
               for (uint32_t p = 0; p < 3U; ++p) {
+                const uint32_t bits =
+                    __shfl_sync(0xFFFFFFFFU, held[r][p][word >> 2U], quad_base | (word & 3U));
                 if (p < planes[r]) {
-                  const uint32_t bits = __ldg(words + static_cast<size_t>(rank[r] + p) * 13U + word);
                   const uint2 entry = byte_entry(table, bits, select);
 #pragma unroll
                   for (uint32_t d = 0; d < 5U; ++d) {
@@ -591,7 +613,9 @@ extern "C" __global__ void salt_v2_mma_split_act(const float* __restrict__ activ
   }
 }
 
-// Up to 16 activation rows (verification).
+// Up to 16 activation rows (verification). Single-buffered activation tile: the
+// shared memory a second buffer took is worth more as L1 for the payload words
+// (launched with a 50% shared-memory carveout; measured ~12% faster).
 extern "C" __global__ void __launch_bounds__(256) salt_v2_mma_rows16_f32(const __half* __restrict__ act_hi,
                                                   const __half* __restrict__ act_lo,
                                                   const float* __restrict__ row_scale,
@@ -601,7 +625,7 @@ extern "C" __global__ void __launch_bounds__(256) salt_v2_mma_rows16_f32(const _
                                                   uint32_t k,
                                                   uint32_t m,
                                                   float* __restrict__ partial) {
-  salt_mma::mma_rows<2U, true>(act_hi, act_lo, row_scale, tensors, tensor_count, total_rows, k, m,
+  salt_mma::mma_rows<2U, false>(act_hi, act_lo, row_scale, tensors, tensor_count, total_rows, k, m,
                          partial);
 }
 

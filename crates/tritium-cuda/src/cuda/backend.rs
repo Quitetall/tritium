@@ -8852,9 +8852,18 @@ impl SaltMmaKernels {
                 salt_v2_mma_shared_bytes(SALT_V2_MMA_ROWS_MAX) as i32,
             )
             .map_err(|e| driver_err("raise tensor-core SALT V2 shared memory", &e))?;
+        let rows16 = get(KERNEL_NAME_SALT_V2_MMA_ROWS16)?;
+        // Half the unified L1/shared array as shared memory: two blocks' staged
+        // activation tiles fit, and the rest caches payload words.
+        rows16
+            .set_attribute(
+                sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                50,
+            )
+            .map_err(|e| driver_err("set tensor-core SALT V2 carveout", &e))?;
         Ok(Self {
             split_act: get(KERNEL_NAME_SALT_V2_MMA_SPLIT_ACT)?,
-            rows16: get(KERNEL_NAME_SALT_V2_MMA_ROWS16)?,
+            rows16,
             rows64,
             reduce: get(KERNEL_NAME_SALT_V2_MMA_REDUCE)?,
             _module: module,
@@ -8863,13 +8872,13 @@ impl SaltMmaKernels {
 }
 
 /// Dynamic shared memory of the tensor-core GEMM variant that serves `rows`
-/// activation rows: the 16-row kernel double-buffers its activation tile, the
-/// 64-row kernel single-buffers it. Mirrors `mma_rows` in `salt_v2_mma.cu`.
+/// activation rows: one staged activation tile of 16 or 64 rows. Mirrors
+/// `mma_rows` in `salt_v2_mma.cu`.
 pub(super) const fn salt_v2_mma_shared_bytes(rows: u32) -> u32 {
     // kActStride halves per staged row, hi and lo, two bytes each.
     let row_bytes = (256 + 16) * 2 * 2;
     if rows <= 16 {
-        2 * 16 * row_bytes
+        16 * row_bytes
     } else {
         64 * row_bytes
     }
