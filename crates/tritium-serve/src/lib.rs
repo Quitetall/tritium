@@ -65,5 +65,6 @@ pub use router::{
 pub use startup::{
     AdmittedArtifactV1, AdmittedGeneratorV1, ProductionReadiness, QwenAdmitOptions, StartupError,
     StartupReceiptV1, admit_qwen36_salt_v3, admit_qwen36_salt_v3_provisional,
-    admit_qwen36_salt_v3_with, prepare_production_generator, prepare_provisional_generator,
+    admit_qwen36_salt_v3_with, admit_qwen36_salt_v3_with_draft, prepare_production_generator,
+    prepare_provisional_generator,
 };

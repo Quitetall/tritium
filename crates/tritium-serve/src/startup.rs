@@ -272,6 +272,40 @@ pub fn admit_qwen36_salt_v3_with(
     physical_device_id: &str,
     options: QwenAdmitOptions,
 ) -> Result<AdmittedGeneratorV1, StartupError> {
+    admit_qwen36_salt_v3_with_draft(
+        model,
+        eos,
+        server_source_revision,
+        server_build_id,
+        backend_policy,
+        effective_backend,
+        physical_device_id,
+        options,
+        None,
+        None,
+    )
+}
+
+/// [`admit_qwen36_salt_v3_with`] plus an optional DFlash speculative drafter
+/// directory (see [`QwenGenerator::with_dflash`]), with an optional verify block
+/// size. The drafter needs [`QwenNumerics::Fast`] on a CUDA backend.
+///
+/// # Errors
+/// As [`admit_qwen36_salt_v3_with`]; and [`StartupError::Backend`] when the
+/// drafter cannot be attached.
+#[allow(clippy::too_many_arguments)]
+pub fn admit_qwen36_salt_v3_with_draft(
+    model: tritium_nn::Qwen35SaltV2LanguageMtpModel,
+    eos: u32,
+    server_source_revision: &str,
+    server_build_id: &str,
+    backend_policy: &str,
+    effective_backend: &str,
+    physical_device_id: &str,
+    options: QwenAdmitOptions,
+    draft: Option<&std::path::Path>,
+    draft_block: Option<usize>,
+) -> Result<AdmittedGeneratorV1, StartupError> {
     let artifact = if options.provisional {
         AdmittedArtifactV1::from_qwen36_salt_v3_provisional(
             model.receipt(),
@@ -291,8 +325,14 @@ pub fn admit_qwen36_salt_v3_with(
             physical_device_id,
         )?
     };
-    let generator = QwenGenerator::with_numerics(model, eos, options.numerics, options.max_context)
-        .map_err(StartupError::Backend)?;
+    let mut generator =
+        QwenGenerator::with_numerics(model, eos, options.numerics, options.max_context)
+            .map_err(StartupError::Backend)?;
+    if let Some(dir) = draft {
+        generator = generator
+            .with_dflash(dir, draft_block)
+            .map_err(StartupError::Backend)?;
+    }
     Ok(AdmittedGeneratorV1 {
         generator: Box::new(generator),
         artifact,

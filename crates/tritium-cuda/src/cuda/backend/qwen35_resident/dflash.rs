@@ -39,17 +39,41 @@ pub struct DFlashConfig {
     /// Per layer: causal sliding-window attention (`true`) or full attention over
     /// the context and the whole block (`false`).
     pub sliding: Vec<bool>,
+    /// Weight precision on the device: 8 (one scale per row) or 4 (one f16 scale
+    /// per 64 columns of a row). The drafter's numerics never reach the output.
+    pub weight_bits: u8,
 }
 
 /// Head width the drafter kernels are written for.
 const HEAD_DIM: usize = 128;
 
-/// An int8 weight with one f32 scale per row.
-struct W8 {
-    weight: CudaSlice<i8>,
-    scale: CudaSlice<f32>,
-    rows: usize,
-    columns: usize,
+/// A drafter weight on the device.
+enum W8 {
+    /// int8 with one f32 scale per row.
+    Int8 {
+        weight: CudaSlice<i8>,
+        scale: CudaSlice<f32>,
+        rows: usize,
+        columns: usize,
+    },
+    /// Offset-8 nibbles with one f16 scale per 64 columns, laid out for
+    /// `dflash_w4_rows*` (see `dflash.cu`).
+    Int4 {
+        weight: CudaSlice<u8>,
+        scale: CudaSlice<u16>,
+        rows: usize,
+        columns: usize,
+    },
+}
+
+impl W8 {
+    const fn shape(&self) -> (usize, usize) {
+        match self {
+            Self::Int8 { rows, columns, .. } | Self::Int4 { rows, columns, .. } => {
+                (*rows, *columns)
+            }
+        }
+    }
 }
 
 struct DraftLayer {
@@ -74,6 +98,8 @@ struct Functions {
     split_act: CudaFunction,
     rows16: CudaFunction,
     rows64: CudaFunction,
+    w4_rows16: CudaFunction,
+    w4_rows64: CudaFunction,
     concat: CudaFunction,
     norm_rope: CudaFunction,
     attention: CudaFunction,
@@ -132,6 +158,7 @@ fn quantize(
     rows: usize,
     columns: usize,
     name: &str,
+    bits: u8,
 ) -> Result<W8, BackendError> {
     if values.len() != rows * columns || !rows.is_multiple_of(16) || !columns.is_multiple_of(64) {
         return Err(invalid(format!(
@@ -139,6 +166,9 @@ fn quantize(
              multiple of 16, columns of 64)",
             values.len()
         )));
+    }
+    if bits == 4 {
+        return quantize4(stream, values, rows, columns);
     }
     let mut weight = vec![0i8; values.len()];
     let mut scale = vec![0f32; rows];
@@ -156,7 +186,60 @@ fn quantize(
             *slot = (value / step).round().clamp(-127.0, 127.0) as i8;
         }
     }
-    Ok(W8 {
+    Ok(W8::Int8 {
+        weight: stream
+            .clone_htod(&weight)
+            .map_err(|error| driver_err("upload drafter weight", &error))?,
+        scale: stream
+            .clone_htod(&scale)
+            .map_err(|error| driver_err("upload drafter scale", &error))?,
+        rows,
+        columns,
+    })
+}
+
+/// 4-bit quantization: per row and 64-column chunk, `scale = max|w| / 7` and
+/// nibble `round(w / scale) + 8` clamped to 1..=15, packed so quad thread c's
+/// sixteen columns of a chunk are two words with each column pair at
+/// `(word >> 4k) & 0x000F000F`.
+fn quantize4(
+    stream: &Arc<CudaStream>,
+    values: &[f32],
+    rows: usize,
+    columns: usize,
+) -> Result<W8, BackendError> {
+    let chunks = columns / 64;
+    let mut weight = vec![0u8; rows * columns / 2];
+    let mut scale = vec![0u16; rows * chunks];
+    for row in 0..rows {
+        for chunk in 0..chunks {
+            let source = &values[row * columns + chunk * 64..row * columns + chunk * 64 + 64];
+            let peak = source
+                .iter()
+                .fold(0.0f32, |peak, value| peak.max(value.abs()));
+            let step = half::f16::from_f32(if peak > 0.0 { peak / 7.0 } else { 1.0 });
+            scale[row * chunks + chunk] = step.to_bits();
+            let step = step.to_f32();
+            let nibble = |value: f32| ((value / step).round().clamp(-7.0, 7.0) as i32 + 8) as u32;
+            for quad in 0..4 {
+                for word in 0..2 {
+                    let mut packed = 0u32;
+                    for j in 0..8 {
+                        let column = 16 * quad + 8 * word + j;
+                        let shift = if j % 2 == 0 {
+                            4 * (j / 2)
+                        } else {
+                            16 + 4 * (j / 2)
+                        };
+                        packed |= nibble(source[column]) << shift;
+                    }
+                    let at = row * columns / 2 + chunk * 32 + quad * 8 + word * 4;
+                    weight[at..at + 4].copy_from_slice(&packed.to_le_bytes());
+                }
+            }
+        }
+    }
+    Ok(W8::Int4 {
         weight: stream
             .clone_htod(&weight)
             .map_err(|error| driver_err("upload drafter weight", &error))?,
@@ -188,6 +271,10 @@ impl Drafter {
                 "drafter config: no layers, or a block above the verify limit",
             ));
         }
+        let bits = config.weight_bits;
+        if bits != 4 && bits != 8 {
+            return Err(invalid("drafter weight bits must be 4 or 8"));
+        }
         let function = |name: &str| {
             module
                 .load_function(name)
@@ -197,6 +284,8 @@ impl Drafter {
             split_act: function("dflash_split_act")?,
             rows16: function("dflash_w8_rows16")?,
             rows64: function("dflash_w8_rows64")?,
+            w4_rows16: function("dflash_w4_rows16")?,
+            w4_rows64: function("dflash_w4_rows64")?,
             concat: function("dflash_concat_features")?,
             norm_rope: function("dflash_norm_rope")?,
             attention: function("dflash_attention")?,
@@ -209,7 +298,7 @@ impl Drafter {
                     "drafter tensor {name} has shape {shape:?}"
                 )));
             }
-            quantize(stream, &values, rows, columns, name)
+            quantize(stream, &values, rows, columns, name, bits)
         };
         let fc = matrix("fc.weight", hidden, config.target_layers.len() * hidden)?;
         let mut vector = |name: &str, len: usize| {
@@ -244,7 +333,7 @@ impl Drafter {
                         return Err(invalid(format!("drafter tensor {b} has shape {shape:?}")));
                     }
                     first.extend_from_slice(&second);
-                    quantize(stream, &first, 2 * rows, columns, a)
+                    quantize(stream, &first, 2 * rows, columns, a, bits)
                 };
             let kv = fuse(
                 fetch,
@@ -261,11 +350,18 @@ impl Drafter {
                 hidden,
             )?;
             let (values, _) = fetch(&name("self_attn.q_proj.weight"))?;
-            let q = quantize(stream, &values, q_width, hidden, "q_proj")?;
+            let q = quantize(stream, &values, q_width, hidden, "q_proj", bits)?;
             let (values, _) = fetch(&name("self_attn.o_proj.weight"))?;
-            let o = quantize(stream, &values, hidden, q_width, "o_proj")?;
+            let o = quantize(stream, &values, hidden, q_width, "o_proj", bits)?;
             let (values, _) = fetch(&name("mlp.down_proj.weight"))?;
-            let down = quantize(stream, &values, hidden, config.intermediate, "down_proj")?;
+            let down = quantize(
+                stream,
+                &values,
+                hidden,
+                config.intermediate,
+                "down_proj",
+                bits,
+            )?;
             let mut vector = |suffix: &str, len: usize| {
                 let (values, shape) = fetch(&name(suffix))?;
                 if shape != [len] {
@@ -341,8 +437,9 @@ impl Drafter {
         m: usize,
         out: &mut CudaSlice<f32>,
     ) -> Result<(), BackendError> {
-        let k = to_u32(weight.columns, "drafter columns")?;
-        let n = to_u32(weight.rows, "drafter rows")?;
+        let (rows, columns) = weight.shape();
+        let k = to_u32(columns, "drafter columns")?;
+        let n = to_u32(rows, "drafter rows")?;
         let m_u32 = to_u32(m, "drafter rows")?;
         let padded = m_u32.div_ceil(8) * 8;
         let mut builder = stream.launch_builder(&functions.split_act);
@@ -356,30 +453,49 @@ impl Drafter {
             },
             "launch dflash_split_act",
         )?;
-        let function = if m <= 16 {
-            &functions.rows16
-        } else {
-            &functions.rows64
+        let cfg = LaunchConfig {
+            grid_dim: (n / 16, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
         };
-        let mut builder = stream.launch_builder(function);
-        builder
-            .arg(&weight.weight)
-            .arg(&weight.scale)
-            .arg(&*act16)
-            .arg(out)
-            .arg(&n)
-            .arg(&k)
-            .arg(&m_u32)
-            .arg(&n);
-        run(
-            &mut builder,
-            LaunchConfig {
-                grid_dim: (n / 16, 1, 1),
-                block_dim: (128, 1, 1),
-                shared_mem_bytes: 0,
-            },
-            "launch dflash W8 GEMM",
-        )
+        match weight {
+            W8::Int8 { weight, scale, .. } => {
+                let function = if m <= 16 {
+                    &functions.rows16
+                } else {
+                    &functions.rows64
+                };
+                let mut builder = stream.launch_builder(function);
+                builder
+                    .arg(weight)
+                    .arg(scale)
+                    .arg(&*act16)
+                    .arg(out)
+                    .arg(&n)
+                    .arg(&k)
+                    .arg(&m_u32)
+                    .arg(&n);
+                run(&mut builder, cfg, "launch dflash W8 GEMM")
+            }
+            W8::Int4 { weight, scale, .. } => {
+                let function = if m <= 16 {
+                    &functions.w4_rows16
+                } else {
+                    &functions.w4_rows64
+                };
+                let mut builder = stream.launch_builder(function);
+                builder
+                    .arg(weight)
+                    .arg(scale)
+                    .arg(&*act16)
+                    .arg(out)
+                    .arg(&n)
+                    .arg(&k)
+                    .arg(&m_u32)
+                    .arg(&n);
+                run(&mut builder, cfg, "launch dflash W4 GEMM")
+            }
+        }
     }
 
     /// Project `rows` positions' captured target features (`features`,

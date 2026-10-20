@@ -406,7 +406,10 @@ serving:
   --backend <name>          compute backend: cpu (default) | cuda
   --profile <name>          bundle profile (default compact-v1)
   --spec lookup             prompt-lookup speculative decoding (greedy only)
-  --draft-model <gguf>      model-drafter speculative decoding (needs --backend cuda)
+  --draft-model <path>      model-drafter speculative decoding (needs --backend cuda):
+                            a GGUF drafter for --model, or a DFlash drafter directory
+                            for --bundle (also needs --numerics fast; greedy only;
+                            TRITIUM_DFLASH_BLOCK overrides its verify block)
   --batch-slots <N>         continuous-batching slots (default 1 = single stream)
   --queue-cap <N>           admission queue depth (default 32)
   --kv-pool-tokens <N>      paged-KV pool size in tokens (default: dense per-slot KV)
@@ -916,13 +919,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Arc<dyn tritium_nn::Tokenizer + Send + Sync>,
         tritium_serve::ChatTemplate,
     ) = if let Some(bundle) = bundle_path {
-        if raw_tokens
-            || spec_lookup
-            || draft_model.is_some()
-            || batch_slots != 1
-            || kv_pool_tokens.is_some()
+        if raw_tokens || spec_lookup || batch_slots != 1 || kv_pool_tokens.is_some() {
+            return Err(
+                "--bundle forbids --raw-tokens, --spec, --batch-slots != 1, and --kv-pool-tokens"
+                    .into(),
+            );
+        }
+        // With --bundle, --draft-model names a DFlash drafter directory, which
+        // runs on the fast tier's resident CUDA executor.
+        if draft_model.is_some()
+            && (backend_name != "cuda" || numerics != tritium_serve::QwenNumerics::Fast)
         {
-            return Err("--bundle forbids --raw-tokens, --spec, --draft-model, --batch-slots != 1, and --kv-pool-tokens".into());
+            return Err("--bundle --draft-model needs --backend cuda and --numerics fast".into());
         }
         // Bundle serving needs a binary built from one clean Git revision (checked
         // again at admission). Refuse here, before a multi-gigabyte load.
@@ -1170,9 +1178,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "tritium-serve:{}:{source_revision}",
                 env!("CARGO_PKG_VERSION")
             );
+            // DFlash verify block size override (default: the drafter's own).
+            let draft_block = parse_env::<usize>("TRITIUM_DFLASH_BLOCK")?;
             let admitted = if allow_incomplete_bundle {
                 eprintln!("WARNING: provisional bundle; language/MTP only; not release-qualified");
-                tritium_serve::admit_qwen36_salt_v3_with(
+                tritium_serve::admit_qwen36_salt_v3_with_draft(
                     *model,
                     eos,
                     source_revision,
@@ -1183,10 +1193,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     tritium_serve::QwenAdmitOptions::new(true)
                         .with_numerics(numerics)
                         .with_max_context(ctx),
+                    draft_model.as_deref().map(std::path::Path::new),
+                    draft_block,
                 )
                 .map_err(fatal(EXIT_MODEL_INVALID, "model_invalid"))?
             } else {
-                tritium_serve::admit_qwen36_salt_v3_with(
+                tritium_serve::admit_qwen36_salt_v3_with_draft(
                     *model,
                     eos,
                     source_revision,
@@ -1197,6 +1209,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     tritium_serve::QwenAdmitOptions::new(false)
                         .with_numerics(numerics)
                         .with_max_context(ctx),
+                    draft_model.as_deref().map(std::path::Path::new),
+                    draft_block,
                 )
                 .map_err(fatal(EXIT_MODEL_INVALID, "model_invalid"))?
             };

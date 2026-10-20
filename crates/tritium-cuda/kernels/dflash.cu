@@ -148,6 +148,94 @@ __device__ __forceinline__ void w8_rows(const int8_t* __restrict__ weight,
   }
 }
 
+// Y = X . W for 4-bit weights: each 64-column chunk of a row has one f16 scale
+// and 32 bytes of offset-8 nibbles. Quad thread c owns columns 16c .. 16c + 15 of
+// a chunk as two words; word w holds columns 8w .. 8w + 7 (of the 16) with
+// column 2k in bits 4k .. 4k + 3 and column 2k + 1 in bits 16 + 4k .. 19 + 4k,
+// so `(word >> 4k) & 0x000F000F` is a column pair.
+__device__ __forceinline__ uint32_t nibble_pair(uint32_t word, uint32_t k, __half2 scale) {
+  const uint32_t bits = ((word >> (4U * k)) & 0x000F000FU) | 0x64006400U;
+  const __half2 value = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&bits),
+                                        __float2half2_rn(1032.0f)),
+                                scale);
+  return *reinterpret_cast<const uint32_t*>(&value);
+}
+
+template <uint32_t NT>
+__device__ __forceinline__ void w4_rows(const uint8_t* __restrict__ weight,
+                                        const __half* __restrict__ scale,
+                                        const __half* __restrict__ act,
+                                        float* __restrict__ out,
+                                        uint32_t n,
+                                        uint32_t k,
+                                        uint32_t m,
+                                        uint32_t out_stride) {
+  __shared__ float partial[kWarps][NT][4][32];
+  const uint32_t lane = threadIdx.x & 31U;
+  const uint32_t warp = threadIdx.x >> 5U;
+  const uint32_t g = lane >> 2U;
+  const uint32_t c = lane & 3U;
+  const uint32_t row0 = blockIdx.x * 16U + g;
+  const uint32_t n_tiles = (m + 7U) / 8U;
+  const uint32_t chunks = k / kChunk;
+
+  float acc[NT][4];
+#pragma unroll
+  for (uint32_t t = 0; t < NT; ++t) {
+#pragma unroll
+    for (uint32_t e = 0; e < 4U; ++e) acc[t][e] = 0.0f;
+  }
+  const uint8_t* w0 = weight + static_cast<size_t>(row0) * (k / 2U) + 8U * c;
+  const uint8_t* w1 = w0 + static_cast<size_t>(8U) * (k / 2U);
+  const __half* s0 = scale + static_cast<size_t>(row0) * chunks;
+  const __half* s1 = s0 + static_cast<size_t>(8U) * chunks;
+  for (uint32_t chunk = warp; chunk < chunks; chunk += kWarps) {
+    const uint2 r0 = __ldcs(reinterpret_cast<const uint2*>(w0 + chunk * 32U));
+    const uint2 r1 = __ldcs(reinterpret_cast<const uint2*>(w1 + chunk * 32U));
+    const __half2 scale0 = __half2half2(s0[chunk]);
+    const __half2 scale1 = __half2half2(s1[chunk]);
+#pragma unroll
+    for (uint32_t s = 0; s < 4U; ++s) {
+      const uint32_t word0 = s < 2U ? r0.x : r0.y;
+      const uint32_t word1 = s < 2U ? r1.x : r1.y;
+      const uint32_t pair = (s & 1U) * 2U;
+      uint32_t a[4];
+      a[0] = nibble_pair(word0, pair, scale0);
+      a[1] = nibble_pair(word1, pair, scale1);
+      a[2] = nibble_pair(word0, pair + 1U, scale0);
+      a[3] = nibble_pair(word1, pair + 1U, scale1);
+      const size_t slot = (static_cast<size_t>(chunk) * 16U + s * 4U + c) * 4U;
+#pragma unroll
+      for (uint32_t t = 0; t < NT; ++t) {
+        if (t >= n_tiles) break;
+        const uint2 b = __ldg(reinterpret_cast<const uint2*>(act + static_cast<size_t>(t * 8U + g) * k + slot));
+        mma16816(acc[t], a, b.x, b.y);
+      }
+    }
+  }
+#pragma unroll
+  for (uint32_t t = 0; t < NT; ++t) {
+#pragma unroll
+    for (uint32_t e = 0; e < 4U; ++e) partial[warp][t][e][lane] = acc[t][e];
+  }
+  __syncthreads();
+  if (warp != 0U) return;
+#pragma unroll
+  for (uint32_t t = 0; t < NT; ++t) {
+    if (t >= n_tiles) break;
+#pragma unroll
+    for (uint32_t e = 0; e < 4U; ++e) {
+      float value = 0.0f;
+#pragma unroll
+      for (uint32_t w = 0; w < kWarps; ++w) value += partial[w][t][e][lane];
+      const uint32_t token = t * 8U + 2U * c + (e & 1U);
+      if (token >= m) continue;
+      const uint32_t row = e < 2U ? row0 : row0 + 8U;
+      out[static_cast<size_t>(token) * out_stride + row] = value;
+    }
+  }
+}
+
 }  // namespace dflash
 
 // f32 activation rows -> f16 in the W8 GEMM's slot order: slot
@@ -325,4 +413,26 @@ extern "C" __global__ void dflash_swiglu_fused(const float* __restrict__ gate_up
   const float gate = gate_up[static_cast<size_t>(row) * 2U * width + column];
   const float up = gate_up[static_cast<size_t>(row) * 2U * width + width + column];
   out[index] = gate / (1.0f + __expf(-gate)) * up;
+}
+
+extern "C" __global__ void __launch_bounds__(128) dflash_w4_rows16(const uint8_t* __restrict__ weight,
+                                                                   const __half* __restrict__ scale,
+                                                                   const __half* __restrict__ act,
+                                                                   float* __restrict__ out,
+                                                                   uint32_t n,
+                                                                   uint32_t k,
+                                                                   uint32_t m,
+                                                                   uint32_t out_stride) {
+  dflash::w4_rows<2U>(weight, scale, act, out, n, k, m, out_stride);
+}
+
+extern "C" __global__ void __launch_bounds__(128) dflash_w4_rows64(const uint8_t* __restrict__ weight,
+                                                                   const __half* __restrict__ scale,
+                                                                   const __half* __restrict__ act,
+                                                                   float* __restrict__ out,
+                                                                   uint32_t n,
+                                                                   uint32_t k,
+                                                                   uint32_t m,
+                                                                   uint32_t out_stride) {
+  dflash::w4_rows<8U>(weight, scale, act, out, n, k, m, out_stride);
 }

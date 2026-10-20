@@ -63,6 +63,12 @@ pub fn dflash_config(dir: &Path) -> Result<DFlashConfig, NnError> {
         rms_eps: json["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32,
         sliding_window: json["sliding_window"].as_u64().unwrap_or(0) as usize,
         sliding,
+        // 4-bit by default (half the VRAM of int8); TRITIUM_DFLASH_WEIGHT_BITS=8
+        // keeps int8.
+        weight_bits: match std::env::var("TRITIUM_DFLASH_WEIGHT_BITS").as_deref() {
+            Ok("8") => 8,
+            _ => 4,
+        },
     })
 }
 

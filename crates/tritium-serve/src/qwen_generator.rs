@@ -71,6 +71,11 @@ impl QwenGenerator {
                     .cuda_resident(context)
                     .map_err(|error| format!("resident executor: {error}"))?
                     .map(|executor| Resident::new(executor, context));
+                if let Some(resident) = generator.resident.as_mut() {
+                    resident
+                        .preallocate()
+                        .map_err(|error| format!("resident executor snapshots: {error}"))?;
+                }
             }
             if generator.is_resident() {
                 eprintln!("tritium-serve: numerics fast: device-resident executor");
@@ -82,6 +87,47 @@ impl QwenGenerator {
             }
         }
         Ok(generator)
+    }
+
+    /// Attach a DFlash speculative drafter (a `z-lab/*-DFlash` directory) to the
+    /// fast tier's executor, optionally with a smaller verify block. Greedy
+    /// requests without logprobs then decode by draft, batched verification and
+    /// commit; the output is the target's own greedy choice at every position
+    /// (fast tier: verification runs on the tensor-core projections, gated by
+    /// `qwen36_dflash` on greedy identity with plain decode).
+    ///
+    /// # Errors
+    /// Returns a message when no resident executor was built (the drafter needs
+    /// the fast tier on CUDA) or the drafter fails to load.
+    pub fn with_dflash(
+        #[allow(unused_mut)] mut self,
+        dir: &std::path::Path,
+        block: Option<usize>,
+    ) -> Result<Self, String> {
+        #[cfg(feature = "cuda")]
+        {
+            let resident = self.resident.as_mut().ok_or_else(|| {
+                "--draft-model with --bundle needs --numerics fast on a CUDA backend".to_owned()
+            })?;
+            resident
+                .executor
+                .reset()
+                .map_err(|error| error.to_string())?;
+            resident.invalidate();
+            tritium_nn::attach_dflash_drafter(&mut resident.executor, dir, block)
+                .map_err(|error| format!("DFlash drafter {}: {error}", dir.display()))?;
+            resident.speculative = true;
+            eprintln!(
+                "tritium-serve: DFlash drafter attached ({}): greedy requests decode speculatively",
+                dir.display()
+            );
+            Ok(self)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (dir, block);
+            Err("--draft-model with --bundle needs a CUDA build".to_owned())
+        }
     }
 
     /// Whether requests run on the fast tier's resident executor.
@@ -188,6 +234,8 @@ struct Resident {
     prompt_end: Checkpoint,
     shared: Checkpoint,
     reuse: bool,
+    /// A DFlash drafter is attached: greedy requests decode speculatively.
+    speculative: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -201,7 +249,18 @@ impl Resident {
             prompt_end: Checkpoint::default(),
             shared: Checkpoint::default(),
             reuse: std::env::var("TRITIUM_PREFIX_REUSE").as_deref() != Ok("0"),
+            speculative: false,
         }
+    }
+
+    /// Allocate both checkpoints' device buffers now, so a model that leaves no
+    /// room for them fails at startup rather than on a request.
+    fn preallocate(&mut self) -> Result<(), tritium_spec::BackendError> {
+        if self.reuse {
+            self.executor.save_snapshot(&mut self.prompt_end.snapshot)?;
+            self.executor.save_snapshot(&mut self.shared.snapshot)?;
+        }
+        Ok(())
     }
 
     fn invalidate(&mut self) {
@@ -326,6 +385,9 @@ impl QwenGenerator {
         resident.prepare(prompt)?;
         let fast_greedy =
             matches!(request.sampling, Sampling::Greedy) && request.logprobs.is_none();
+        if fast_greedy && resident.speculative {
+            return Self::generate_speculative(resident, eos, request, max_new, on_step);
+        }
         if fast_greedy {
             let mut token = resident.feed(&[final_prompt])?;
             resident.checkpoint(false, prompt)?;
@@ -357,6 +419,66 @@ impl QwenGenerator {
             resident.kv_tokens.push(token);
         }
         Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl QwenGenerator {
+    /// Greedy decode by draft, verification and commit: each cycle the drafter
+    /// proposes a block after the last emitted token, one batched pass returns
+    /// the target's greedy token after every row, the agreeing prefix plus the
+    /// target's next token are kept, and the rest is discarded before it
+    /// touches any recurrent state. Every emitted token is the target's greedy
+    /// choice given the tokens before it.
+    fn generate_speculative(
+        resident: &mut Resident,
+        eos: u32,
+        request: &GenRequest,
+        max_new: usize,
+        on_step: &mut dyn FnMut(Step) -> bool,
+    ) -> Result<(), GenError> {
+        let backend = |error: tritium_spec::BackendError| GenError::Backend(error.to_string());
+        let prompt = &request.prompt_tokens;
+        let (&final_prompt, _) = prompt.split_last().ok_or(GenError::ContextOverflow)?;
+        let mut token = resident.feed(&[final_prompt])?;
+        resident.checkpoint(false, prompt)?;
+        let mut index = 0usize;
+        loop {
+            let (step, last) = step_for(token, index, max_new, eos, request, None);
+            if !on_step(step) || last {
+                return Ok(());
+            }
+            index += 1;
+            let room = resident
+                .context
+                .saturating_sub(resident.executor.position());
+            if room < 2 {
+                // No room for a block: the last token or two go one step at a time.
+                let next = resident.executor.step(token).map_err(backend)?;
+                resident.kv_tokens.push(token);
+                token = next;
+                continue;
+            }
+            let drafts = resident.executor.draft(token).map_err(backend)?;
+            let mut rows = Vec::with_capacity(drafts.len() + 1);
+            rows.push(token);
+            rows.extend(drafts.into_iter().take(room - 1));
+            let greedy = resident.executor.verify(&rows).map_err(backend)?;
+            let mut accepted = 0;
+            while accepted + 1 < rows.len() && rows[accepted + 1] == greedy[accepted] {
+                accepted += 1;
+            }
+            resident.executor.commit(accepted + 1).map_err(backend)?;
+            resident.kv_tokens.extend_from_slice(&rows[..=accepted]);
+            for &kept in &rows[1..=accepted] {
+                let (step, last) = step_for(kept, index, max_new, eos, request, None);
+                if !on_step(step) || last {
+                    return Ok(());
+                }
+                index += 1;
+            }
+            token = greedy[accepted];
+        }
     }
 }
 
