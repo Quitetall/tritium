@@ -830,6 +830,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // The fast tier is a bundle executor; for other sources it falls back to
     // exact like any other place it cannot run, so a manager can pass one tier
     // flag for every source a binary serves.
+    // With --bundle, --draft-model is a DFlash directory attached at admission,
+    // not a GGUF drafter runner.
+    let bundle_serving = bundle_path.is_some();
     if numerics == tritium_serve::QwenNumerics::Fast && bundle_path.is_none() {
         eprintln!("tritium-serve: numerics fast applies to --bundle serving; serving exact");
     }
@@ -1123,7 +1126,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // (its own KV + decode graphs). Load failures are loud — a missing or
     // unloadable draft must never silently degrade to lookup drafting. A
     // device-OOM here also fails at startup, not mid-request.
-    let draft_runner = match &draft_model {
+    let draft_runner = match draft_model.as_ref().filter(|_| !bundle_serving) {
         None => None,
         Some(path) => {
             // The spec path needs the CUDA resident decoder; a draft that can
