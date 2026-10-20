@@ -5617,6 +5617,101 @@ fn lm_head_i8_warp_and_tiled_match_host_oracle_bitwise() {
     );
 }
 
+/// `lm_head_warp_f16` pins its fold order: lane `l` folds `k = l, l+32, ...`
+/// ascending as `__fadd_rn(acc, __fmul_rn(h[k], f16(row[k])))`, then the
+/// 16/8/4/2/1 shuffle-down tree. A host emulation of exactly that order must
+/// match bit for bit, including a width with a partial last trip, so a loop
+/// restructuring (unrolling, prefetching) cannot silently reorder the sum.
+#[test]
+fn lm_head_warp_f16_matches_lane_fold_oracle_bitwise() {
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+    use cudarc::nvrtc::Ptx;
+
+    let ctx = match CudaContext::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping lm_head f16 fold gate: no device ({e})");
+            return;
+        }
+    };
+    let stream = ctx.default_stream();
+    let dm = ctx
+        .load_module(Ptx::from_src(DECODE_PTX))
+        .expect("load decode module");
+    let f_f16 = dm.load_function("lm_head_warp_f16").expect("f16 fn");
+
+    let mut s = 0x1F16_C0DEu64;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        ((s >> 11) as f32 / (1u64 << 53) as f32) * 2.0 - 1.0
+    };
+    for (vocab, n_embd) in [(1031usize, 2560usize), (517, 2600), (64, 40)] {
+        let table: Vec<u16> = (0..vocab * n_embd)
+            .map(|_| half::f16::from_f32(next()).to_bits())
+            .collect();
+        let h: Vec<f32> = (0..n_embd).map(|_| next()).collect();
+        let want: Vec<f32> = (0..vocab)
+            .map(|v| {
+                let row = &table[v * n_embd..(v + 1) * n_embd];
+                let mut lanes = [0.0f32; 32];
+                for (lane, acc) in lanes.iter_mut().enumerate() {
+                    let mut k = lane;
+                    while k < n_embd {
+                        *acc += h[k] * half::f16::from_bits(row[k]).to_f32();
+                        k += 32;
+                    }
+                }
+                let mut off = 16;
+                while off > 0 {
+                    let prev = lanes;
+                    for lane in 0..32 {
+                        if lane + off < 32 {
+                            lanes[lane] = prev[lane] + prev[lane + off];
+                        }
+                    }
+                    off >>= 1;
+                }
+                lanes[0]
+            })
+            .collect();
+
+        let d_table = stream.clone_htod(&table).expect("table htod");
+        let d_h = stream.clone_htod(&h).expect("h htod");
+        let mut d_logits: cudarc::driver::CudaSlice<f32> =
+            stream.alloc_zeros(vocab).expect("logits");
+        let (ne_i, v_i) = (n_embd as i32, vocab as i32);
+        let mut launch = stream.launch_builder(&f_f16);
+        launch
+            .arg(&d_h)
+            .arg(&d_table)
+            .arg(&ne_i)
+            .arg(&v_i)
+            .arg(&mut d_logits);
+        // SAFETY: one warp per vocab row over a [vocab, n_embd] f16 table and an
+        // n_embd f32 vector, both sized above; the kernel bounds-checks the warp.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(LaunchConfig {
+                    grid_dim: ((vocab as u32).div_ceil(8), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .expect("launch lm_head_warp_f16");
+        }
+        let got = stream.clone_dtoh(&d_logits).expect("logits dtoh");
+        for (v, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "lm_head_warp_f16 [{vocab}x{n_embd}] row {v}: got {g} want {w}"
+            );
+        }
+    }
+}
+
 /// ADR 0036 L2 head-format kernel A/B at equal M=1 shapes (the ≥1.6× gate):
 /// `lm_head_warp_i8` vs `lm_head_warp_f16` on the 2B4T head shape
 /// (vocab 128256 × n_embd 2560 — 656 MB f16 / 328 MB i8 + 20.5 MB scales, both
