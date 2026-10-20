@@ -277,23 +277,23 @@ impl Drop for Server {
     }
 }
 #[cfg(unix)]
+fn wait_test_child(child: &mut Server) -> Option<std::process::ExitStatus> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+#[cfg(unix)]
 #[test]
 fn actual_typed_binary_refuses_nonregular_sources_without_blocking() {
     use std::process::Stdio;
-    use std::time::{Duration, Instant};
-
-    fn wait(child: &mut Server) -> Option<std::process::ExitStatus> {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if let Some(status) = child.0.try_wait().unwrap() {
-                return Some(status);
-            }
-            if Instant::now() >= deadline {
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
 
     let root = Scratch::new("nonregular");
     let fifo = root.0.join("source.pipe");
@@ -305,7 +305,11 @@ fn actual_typed_binary_refuses_nonregular_sources_without_blocking() {
             .spawn()
             .expect("Unix file-source regression requires mkfifo"),
     );
-    assert!(wait(&mut make).expect("mkfifo did not exit").success());
+    assert!(
+        wait_test_child(&mut make)
+            .expect("mkfifo did not exit")
+            .success()
+    );
     drop(make);
     let fifo_alias = root.0.join("pipe-alias");
     std::os::unix::fs::symlink(&fifo, &fifo_alias).unwrap();
@@ -332,7 +336,7 @@ fn actual_typed_binary_refuses_nonregular_sources_without_blocking() {
                 .spawn()
                 .unwrap(),
         );
-        let status = wait(&mut child).unwrap_or_else(|| {
+        let status = wait_test_child(&mut child).unwrap_or_else(|| {
             panic!(
                 "typed source open blocked instead of rejecting {}",
                 source.display()
@@ -344,6 +348,94 @@ fn actual_typed_binary_refuses_nonregular_sources_without_blocking() {
         assert!(error.contains(expected), "{source:?}: {error}");
         assert!(!error.contains("listening"), "{error}");
         assert!(!error.contains("typed runtime diagnostics"), "{error}");
+    }
+}
+#[cfg(unix)]
+#[test]
+fn actual_typed_binary_refuses_nonregular_load_json_before_backend_init() {
+    use std::process::Stdio;
+    let root = Scratch::new("load-json");
+    let fifo = root.0.join("load.pipe");
+    let mut make = Server(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    assert!(
+        wait_test_child(&mut make)
+            .expect("mkfifo did not exit")
+            .success()
+    );
+    drop(make);
+    let fifo_alias = root.0.join("pipe-alias");
+    std::os::unix::fs::symlink(&fifo, &fifo_alias).unwrap();
+    let valid = root.0.join("load.json");
+    std::fs::write(
+        &valid,
+        typed_config(&root.0.join("missing.trit")).to_string(),
+    )
+    .unwrap();
+    let valid_alias = root.0.join("load-alias.json");
+    std::os::unix::fs::symlink(&valid, &valid_alias).unwrap();
+    let oversized = root.0.join("oversized.json");
+    std::fs::write(&oversized, vec![b' '; 16 * 1024 + 1]).unwrap();
+    let malformed = root.0.join("malformed.json");
+    std::fs::write(&malformed, b"{").unwrap();
+    for (path, expected) in [
+        (
+            &fifo,
+            "--typed load JSON must be a regular file of at most 16KiB",
+        ),
+        (
+            &fifo_alias,
+            "--typed load JSON must be a regular file of at most 16KiB",
+        ),
+        (
+            &root.0,
+            "--typed load JSON must be a regular file of at most 16KiB",
+        ),
+        (
+            &oversized,
+            "--typed load JSON must be a regular file of at most 16KiB",
+        ),
+        (&malformed, "EOF while parsing"),
+        (&valid, "is not in the registry"),
+        (&valid_alias, "is not in the registry"),
+    ] {
+        let mut child = Server(
+            clean_command()
+                .arg("--typed")
+                .arg(path)
+                .args([
+                    "--backend",
+                    "not-linked",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "0",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let status = wait_test_child(&mut child).unwrap_or_else(|| {
+            panic!(
+                "typed load JSON open blocked instead of rejecting {}",
+                path.display()
+            )
+        });
+        assert!(!status.success());
+        let mut error = String::new();
+        std::io::Read::read_to_string(&mut child.0.stderr.take().unwrap(), &mut error).unwrap();
+        assert!(error.contains(expected), "{path:?}: {error}");
+        assert!(!error.contains("listening"), "{error}");
+        if expected != "is not in the registry" {
+            assert!(!error.contains("is not in the registry"), "{error}");
+        }
     }
 }
 fn http(port: u16, method: &str, path: &str, body: &str) -> std::io::Result<String> {

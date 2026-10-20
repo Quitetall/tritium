@@ -1,6 +1,6 @@
 //! Shared bounded typed load request; no production/release authority.
 use serde::Deserialize;
-use std::{fs::File, io::Read, path::Path};
+use std::{io::Read, path::Path};
 const MAX_LOAD_JSON: u64 = 16 * 1024;
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -64,7 +64,7 @@ impl TypedLoadConfig {
     /// # Errors
     /// I/O, malformed/unknown JSON fields, invalid paths/levels/limits/selections.
     pub fn read(path: &Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let file = File::open(path)?;
+        let file = super::retained_plan::open_source_file(path)?;
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.len() > MAX_LOAD_JSON {
             return Err("--typed load JSON must be a regular file of at most 16KiB".into());
