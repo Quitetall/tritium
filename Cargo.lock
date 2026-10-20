@@ -371,7 +371,7 @@ dependencies = [
  "log",
  "num-traits",
  "portable-atomic",
- "spin",
+ "spin 0.10.1",
 ]
 
 [[package]]
@@ -391,7 +391,7 @@ dependencies = [
  "rand 0.10.2",
  "rand_distr 0.6.0",
  "serde",
- "spin",
+ "spin 0.10.1",
  "thiserror 2.0.20",
 ]
 
@@ -443,7 +443,7 @@ dependencies = [
  "num-traits",
  "serde",
  "smallvec",
- "spin",
+ "spin 0.10.1",
 ]
 
 [[package]]
@@ -951,7 +951,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
- "spin",
+ "spin 0.10.1",
  "toml 1.1.4+spec-1.1.0",
  "tynm",
  "wasm-bindgen-futures",
@@ -1113,7 +1113,7 @@ dependencies = [
  "md5",
  "serde",
  "serde_json",
- "spin",
+ "spin 0.10.1",
  "thiserror 2.0.20",
  "toml 1.1.4+spec-1.1.0",
  "wasm-bindgen-futures",
@@ -1460,6 +1460,12 @@ checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
 dependencies = [
  "litrs",
 ]
+
+[[package]]
+name = "dyn-clone"
+version = "1.0.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "dyn-stack"
@@ -3667,6 +3673,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ref-cast"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e440fb4e4b4147295338efb76001ab9e4efc0e5839df2c47fc5ac2381d365c3"
+dependencies = [
+ "ref-cast-impl",
+]
+
+[[package]]
+name = "ref-cast-impl"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92ecd8964f8453721699a1ed72037b0db49ce2f5a5138486ee89bed6f67cdf3a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
+]
+
+[[package]]
 name = "regex"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3794,9 +3820,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",
@@ -3852,6 +3878,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "ryu-js"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714"
+
+[[package]]
 name = "safetensors"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3880,6 +3912,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc984f4f9ceb736a7bb755c3e3bd17dc56370af2600c9780dcc48c66453da34d"
 dependencies = [
  "regex",
+]
+
+[[package]]
+name = "schemars"
+version = "1.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "687274d293b6cdc6e73e0fee520bf2049650090d7164f87672d212a3c530cf4a"
+dependencies = [
+ "dyn-clone",
+ "ref-cast",
+ "schemars_derive",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "schemars_derive"
+version = "1.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d98c67716b46af2f0b8cf752abc930f6f9aecfbf671ecfb531db8a31dbe4e2ba"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde_derive_internals",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -3941,6 +3998,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_derive_internals"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f852137cce035d6a4df67ccce505ff6b3e9fd3a10e3e52b24dc71e650bb1a9bd"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
+]
+
+[[package]]
 name = "serde_json"
 version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3951,6 +4019,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_json_canonicalizer"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe52319a927259afbfa5180c5157cd8167edfd3e8c254f9558c7fef44c5649f2"
+dependencies = [
+ "ryu-js",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4083,6 +4162,12 @@ dependencies = [
 
 [[package]]
 name = "spin"
+version = "0.9.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
+
+[[package]]
+name = "spin"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
@@ -4138,6 +4223,16 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "string-interner"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23de088478b31c349c9ba67816fa55d9355232d63c3afea8bf513e31f0f1d2c0"
+dependencies = [
+ "hashbrown 0.15.5",
+ "serde",
+]
 
 [[package]]
 name = "strsim"
@@ -4621,14 +4716,17 @@ version = "1.1.0-rc.2"
 dependencies = [
  "divan",
  "half",
+ "rayon",
  "serde",
  "serde_json",
+ "sha2",
  "tritium-core",
  "tritium-cpu",
  "tritium-cuda",
  "tritium-format",
  "tritium-metal",
  "tritium-nn",
+ "tritium-quantize",
  "tritium-rocm",
  "tritium-runtime",
  "tritium-spec",
@@ -4683,6 +4781,7 @@ dependencies = [
  "tritium-core",
  "tritium-cpu",
  "tritium-cuda",
+ "tritium-evidence",
  "tritium-format",
  "tritium-metal",
  "tritium-nn",
@@ -4690,6 +4789,7 @@ dependencies = [
  "tritium-rocm",
  "tritium-runtime",
  "tritium-salt",
+ "tritium-schema",
  "tritium-spec",
  "tritium-testkit",
  "tritium-train",
@@ -4703,6 +4803,7 @@ version = "1.1.0-rc.2"
 dependencies = [
  "proptest",
  "serde",
+ "tritium-schema",
 ]
 
 [[package]]
@@ -4714,8 +4815,10 @@ dependencies = [
  "proptest",
  "rayon",
  "tritium-core",
+ "tritium-evidence",
  "tritium-format",
  "tritium-runtime",
+ "tritium-schema",
  "tritium-spec",
  "tritium-testkit",
 ]
@@ -4724,6 +4827,7 @@ dependencies = [
 name = "tritium-cuda"
 version = "1.1.0-rc.2"
 dependencies = [
+ "anyhow",
  "cudarc",
  "half",
  "linkme",
@@ -4732,11 +4836,25 @@ dependencies = [
  "tritium-build-info",
  "tritium-core",
  "tritium-cpu",
+ "tritium-evidence",
  "tritium-format",
  "tritium-runtime",
+ "tritium-schema",
  "tritium-spec",
  "tritium-testkit",
  "tritium-train",
+]
+
+[[package]]
+name = "tritium-evidence"
+version = "1.1.0-rc.2"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "tritium-format",
+ "tritium-schema",
 ]
 
 [[package]]
@@ -4755,11 +4873,13 @@ version = "1.1.0-rc.2"
 dependencies = [
  "blake3",
  "bytemuck",
+ "ciborium",
  "half",
  "proptest",
  "serde",
  "serde_json",
  "tritium-core",
+ "tritium-schema",
 ]
 
 [[package]]
@@ -4798,12 +4918,15 @@ dependencies = [
  "tritium-core",
  "tritium-cpu",
  "tritium-cuda",
+ "tritium-evidence",
  "tritium-format",
  "tritium-quantize",
  "tritium-runtime",
+ "tritium-schema",
  "tritium-spec",
  "tritium-testkit",
  "tritium-train",
+ "wasmi",
 ]
 
 [[package]]
@@ -4830,6 +4953,7 @@ dependencies = [
  "ndarray",
  "ort",
  "pyo3",
+ "rayon",
  "rustix",
  "serde",
  "serde_json",
@@ -4838,12 +4962,14 @@ dependencies = [
  "tritium-core",
  "tritium-cpu",
  "tritium-cuda",
+ "tritium-evidence",
  "tritium-format",
  "tritium-nn",
  "tritium-onnx",
  "tritium-quantize",
  "tritium-runtime",
  "tritium-salt",
+ "tritium-schema",
  "tritium-spec",
  "tritium-train",
 ]
@@ -4853,12 +4979,17 @@ name = "tritium-quantize"
 version = "1.1.0-rc.2"
 dependencies = [
  "blake3",
+ "ciborium",
  "half",
  "proptest",
  "rayon",
+ "serde",
  "serde_json",
  "tritium-core",
+ "tritium-evidence",
  "tritium-format",
+ "tritium-schema",
+ "tritium-testkit",
 ]
 
 [[package]]
@@ -4880,6 +5011,9 @@ version = "1.1.0-rc.2"
 dependencies = [
  "linkme",
  "tritium-core",
+ "tritium-evidence",
+ "tritium-format",
+ "tritium-schema",
  "tritium-spec",
 ]
 
@@ -4902,6 +5036,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tritium-schema"
+version = "1.1.0-rc.2"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "tritium-serve"
 version = "1.1.0-rc.2"
 dependencies = [
@@ -4910,12 +5053,14 @@ dependencies = [
  "blake3",
  "futures-core",
  "getrandom 0.3.4",
+ "http-body",
  "http-body-util",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "serde",
  "serde_json",
+ "tokenizers 0.23.1",
  "tokio",
  "tower",
  "tracing",
@@ -4923,11 +5068,14 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "tritium-build-info",
+ "tritium-core",
  "tritium-cpu",
  "tritium-cuda",
+ "tritium-evidence",
  "tritium-format",
  "tritium-nn",
  "tritium-runtime",
+ "tritium-schema",
  "tritium-spec",
 ]
 
@@ -4939,6 +5087,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tritium-core",
+ "tritium-schema",
 ]
 
 [[package]]
@@ -4952,6 +5101,8 @@ dependencies = [
  "serde_json",
  "tritium-core",
  "tritium-format",
+ "tritium-runtime",
+ "tritium-schema",
  "tritium-spec",
 ]
 
@@ -5001,6 +5152,7 @@ dependencies = [
  "serde_json",
  "tritium-build-info",
  "tritium-core",
+ "tritium-evidence",
  "tritium-format",
  "tritium-runtime",
  "tritium-spec",
@@ -5290,6 +5442,56 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc1b4cb0cc549fcf58d7dfc081778139b3d283a081644e833e84682ad71cea24"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasmi"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78693fcdd618e0fc34af59c6b8efa9ac5d58c68df940beff4bedddb6acfe7c27"
+dependencies = [
+ "spin 0.9.9",
+ "wasmi_collections",
+ "wasmi_core",
+ "wasmi_ir",
+ "wasmparser",
+]
+
+[[package]]
+name = "wasmi_collections"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a8be2aa467cf2d29e96ff759472c36eeb44a3c81c67fc9cb76c9a24c519c557"
+dependencies = [
+ "string-interner",
+]
+
+[[package]]
+name = "wasmi_core"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69372d5fda3ea3d1e0aa6603c7888110e0187e88ea17cd8fc2e2df0a0e1f37fa"
+dependencies = [
+ "libm",
+]
+
+[[package]]
+name = "wasmi_ir"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f17b774caa13c618c7244f1ee51fe23c5e7b8538a471fa46d9949779758aed6"
+dependencies = [
+ "wasmi_core",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.228.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4abf1132c1fdf747d56bbc1bb52152400c70f336870f968b85e89ea422198ae3"
+dependencies = [
+ "bitflags 2.13.1",
+ "indexmap",
 ]
 
 [[package]]

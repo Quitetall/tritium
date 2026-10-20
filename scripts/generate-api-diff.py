@@ -9,7 +9,7 @@ import hashlib
 import json
 import re
 import shlex
-import subprocess
+import runpy
 from pathlib import Path
 
 
@@ -213,14 +213,14 @@ def build_report(
     return report
 
 
+_git_result = runpy.run_path(Path(__file__).with_name("_qualification_git.py"))["git_result"]
+
+
 def _git(root: Path, *arguments: str) -> str:
-    try:
-        return subprocess.check_output(
-            ["git", *arguments], cwd=root, text=True, stderr=subprocess.PIPE
-        )
-    except subprocess.CalledProcessError as error:
-        message = error.stderr.strip() or str(error)
-        raise ApiDiffError(message) from error
+    result = _git_result(root, *arguments, error_type=ApiDiffError)
+    if result.returncode:
+        raise ApiDiffError(result.stderr.strip() or "git command failed")
+    return result.stdout
 
 
 def _workspace_version(root: Path) -> str:

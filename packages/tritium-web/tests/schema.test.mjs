@@ -19,10 +19,7 @@ const vectorsPath = resolve("../../spec/training/v2/vectors/v2.json");
 
 test("package schema mirrors the frozen language-neutral manifest", async () => {
   const manifest = await readFile(manifestPath);
-  assert.equal(
-    Buffer.compare(Buffer.from(canonicalTrainingManifestJson()), manifest),
-    0,
-  );
+  assert.equal(Buffer.compare(Buffer.from(canonicalTrainingManifestJson()), manifest), 0);
   assert.equal(parseTrainingManifest(manifest).operations.length, 36);
   assert.equal(bytesToHex(blake3(manifest)), TRAINING_MANIFEST_DIGEST_V2);
 });
@@ -39,10 +36,7 @@ test("package vector identity is frozen and bound to the manifest", async () => 
 test("packed parser fails closed on schema drift", async () => {
   const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
   manifest.schema_version = 1;
-  assert.throws(
-    () => parseTrainingManifest(JSON.stringify(manifest)),
-    TrainingManifestError,
-  );
+  assert.throws(() => parseTrainingManifest(JSON.stringify(manifest)), TrainingManifestError);
   assert.throws(
     () => parseTrainingManifest('{"schema_id":"x","schema_id":"y"}'),
     TrainingManifestError,

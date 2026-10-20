@@ -155,6 +155,8 @@ class Qwen36PtqStatusTests(unittest.TestCase):
         self.assertEqual(snapshot["campaign_tensor_count"], 1)
         self.assertEqual(snapshot["campaign_expected_payload_bytes"], 10)
         self.assertEqual(snapshot["campaign_expected_record_bytes"], 607)
+        self.assertEqual(snapshot["expected_master_count"], 1)
+        self.assertEqual(snapshot["remaining_master_count"], 1)
         self.assertIsNone(snapshot["campaign_estimated_seconds_remaining"])
 
     def test_negative_target_bytes_is_rejected(self):

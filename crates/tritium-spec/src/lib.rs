@@ -27,10 +27,39 @@ use core::fmt;
 
 // Re-export the core vocabulary types the contract speaks so a backend author
 // needs only depend on `tritium-spec` to implement [`TernaryBackend`].
-pub use tritium_core::{DType, GemmShape, TernaryFormat, TritError};
+pub use tritium_core::{AdditiveView, DType, GemmShape, TernaryFormat, TritError};
+pub use tritium_schema::{
+    Basis, TensorCaps, TensorExecution, TensorUploadPolicy, admitted_execution_group,
+};
 
 mod caps;
+mod tensor_plan;
+mod tensor_stream;
 pub use caps::DeviceCaps;
+pub use tensor_plan::{AdditiveMetadata, TensorMetadata, TensorUploadPlan};
+pub use tensor_stream::{
+    TENSOR_STREAM_CHUNK_BYTES, TensorStreamEncoding, TensorStreamPlan, TensorStreamSource,
+};
+mod deltanet;
+pub use deltanet::{DeltaNetGeometry, DeltaNetStep, ResidentDeltaNet};
+mod delta_mixer;
+pub use delta_mixer::{
+    DeltaMixerGeometry, DeltaMixerSegment, DeltaMixerWeightLengths, DeltaMixerWeights,
+    ResidentDeltaMixer,
+};
+mod decoder_plan;
+pub use decoder_plan::{
+    DecoderAllocationKind, DecoderAllocationLayer, DecoderAllocationMetadata,
+    DecoderAllocationMixer, DecoderPayloadPlan,
+};
+mod decoder;
+pub use decoder::{
+    DecoderActivation, DecoderDeltaNet, DecoderExecution, DecoderFullAttention, DecoderGeometry,
+    DecoderGraph, DecoderHybridLayer, DecoderLayer, DecoderLayers, DecoderLimits, DecoderMixer,
+    DecoderSemantics, ResidentDecoder,
+};
+mod attention;
+pub use attention::{AttentionGeometry, AttentionLimits, AttentionSegment, ResidentAttention};
 mod train_backend;
 pub use train_backend::{
     TrainAttributeV1, TrainAttributeValueV1, TrainBackendError, TrainBackendV1,
@@ -52,6 +81,31 @@ pub use training_vectors::{
     TrainingVectorErrorCategoryV1, TrainingVectorExpectedV1, TrainingVectorSetV1,
     TrainingVectorSetV2, TrainingVectorSetV3,
 };
+
+/// Validate declared execution tier and per-tensor owned-payload policy.
+///
+/// Shared by checked backend upload and aggregate-budget preflight. This does
+/// not allocate, measure physical memory or approve a model load.
+///
+/// # Errors
+/// Returns native-only or per-tensor payload-budget rejection.
+pub fn validate_tensor_upload_policy(
+    caps: TensorCaps,
+    policy: TensorUploadPolicy,
+) -> Result<(), BackendError> {
+    if policy.native_only && caps.execution != TensorExecution::Native {
+        return Err(BackendError::NativeTensorRequired);
+    }
+    if let Some(limit) = policy.max_payload_bytes
+        && caps.payload_bytes > limit
+    {
+        return Err(BackendError::TensorPayloadBudgetExceeded {
+            requested: caps.payload_bytes,
+            limit,
+        });
+    }
+    Ok(())
+}
 
 /// Parameters for a ternary mixed-precision GEMM call.
 ///
@@ -139,6 +193,100 @@ impl fmt::Debug for MpGemmProjectedVjp<'_> {
     }
 }
 
+/// Host-side tensor input for the unified tensor upload contract.
+#[derive(Clone, Copy, Debug)]
+pub enum TensorView<'a> {
+    /// Validated additive-ternary tensor with its scale law and basis.
+    Additive(AdditiveView<'a>),
+    /// Dense row-major f32 matrix. `rows` are output channels, `cols` inputs.
+    Dense {
+        /// Number of output rows.
+        rows: usize,
+        /// Number of input columns.
+        cols: usize,
+        /// Row-major dense values, exactly `rows * cols` elements.
+        values: &'a [f32],
+    },
+}
+
+impl TensorView<'_> {
+    /// Checked size of the decoded scalar payload, without allocating.
+    ///
+    /// This is not packed residency, full memory admission or backend support.
+    /// Additive storage uses decoded i8 trits and f32 scales; dense uses f32.
+    pub fn decoded_payload_bytes(self) -> Result<u64, BackendError> {
+        let bytes = match self {
+            Self::Additive(view) => view
+                .trits()
+                .len()
+                .checked_add(core::mem::size_of_val(view.scales())),
+            Self::Dense { rows, cols, values } => {
+                tritium_core::DenseView::new(rows, cols, values).map_err(|e| {
+                    BackendError::InvalidInput(format!("invalid dense tensor: {e:?}"))
+                })?;
+                values.len().checked_mul(core::mem::size_of::<f32>())
+            }
+        }
+        .ok_or_else(|| BackendError::InvalidInput("tensor payload size overflows".into()))?;
+        u64::try_from(bytes)
+            .map_err(|_| BackendError::InvalidInput("tensor payload size exceeds u64".into()))
+    }
+}
+
+/// Inputs for unified tensor-level matrix multiplication.
+pub struct TensorMatmul<'a> {
+    /// `[batch, K]` row-major activations.
+    pub act: &'a [f32],
+    /// Tensor returned by [`TernaryBackend::upload_tensor`].
+    pub tensor: &'a dyn DeviceBuffer,
+    /// Number of activation rows (`M`).
+    pub batch: usize,
+    /// `[batch, K]` scratch for basis-transformed activations.
+    pub transformed_act: &'a mut [f32],
+    /// `[batch, N]` output, overwritten.
+    pub out: &'a mut [f32],
+}
+
+impl fmt::Debug for TensorMatmul<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TensorMatmul")
+            .field("act_len", &self.act.len())
+            .field("tensor_bytes", &self.tensor.len_bytes())
+            .field("batch", &self.batch)
+            .field("transformed_act_len", &self.transformed_act.len())
+            .field("out_len", &self.out.len())
+            .finish()
+    }
+}
+
+/// Optional device-f32 SwiGLU region over existing typed weight handles.
+/// `gate`/`up` are `[F,K]`, `down` is `[K,F]`; activations/output are `[batch,K]`.
+/// Device exponential rounding may differ from the ordinary host expression;
+/// an implementation must require explicit numerical-policy opt-in.
+pub struct TensorSwiGlu<'a> {
+    /// Input activations.
+    pub act: &'a [f32],
+    /// Gate projection.
+    pub gate: &'a dyn DeviceBuffer,
+    /// Up projection.
+    pub up: &'a dyn DeviceBuffer,
+    /// Down projection.
+    pub down: &'a dyn DeviceBuffer,
+    /// Number of activation rows.
+    pub batch: usize,
+    /// Final output, unchanged on unsupported/error.
+    pub out: &'a mut [f32],
+}
+impl fmt::Debug for TensorSwiGlu<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TensorSwiGlu")
+            .field("batch", &self.batch)
+            .field("act_len", &self.act.len())
+            .field("out_len", &self.out.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Opaque handle to device-resident memory owned by a backend.
 ///
 /// The runtime treats this as an opaque token; the owning backend downcasts it
@@ -177,6 +325,231 @@ pub trait TernaryBackend: Send + Sync {
 
     /// What this device can do — used by the runtime to pick a backend.
     fn capabilities(&self) -> DeviceCaps;
+
+    /// Explicitly request device-f32 causal convolution, gates, recurrence and
+    /// gated normalization over projected operands. None means unsupported,
+    /// never successful host fallback or whole-model residency.
+    /// # Errors
+    /// Geometry/vector/limits/payload rejection and allocation/driver errors.
+    fn resident_delta_mixer(
+        &self,
+        geometry: DeltaMixerGeometry,
+        weights: DeltaMixerWeights<'_>,
+        limits: DecoderLimits,
+        max_device_payload_bytes: usize,
+    ) -> Result<Option<Box<dyn ResidentDeltaMixer>>, BackendError> {
+        geometry.payload_bytes(weights, limits, max_device_payload_bytes)?;
+        Ok(None)
+    }
+
+    /// Select mandatory resident decoder execution on a registry-created backend,
+    /// before model construction. Records configuration only; it must not allocate
+    /// a graph or silently accept unsupported execution. Success must make
+    /// [`Self::resident_decoder_requested`] true. The ceiling is logical payload,
+    /// not physical VRAM admission. Defaults reject and preserve host dispatch.
+    /// # Errors
+    /// Unsupported execution or an invalid/nonpositive payload ceiling.
+    fn request_resident_decoder(
+        &mut self,
+        _max_device_payload_bytes: usize,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedTensor)
+    }
+
+    /// Whether the caller selected mandatory resident decoder execution.
+    /// Defaults preserve host dispatch. Selected adapters must reject unsupported
+    /// graphs rather than silently using a host or partial-graph implementation.
+    fn resident_decoder_requested(&self) -> bool {
+        false
+    }
+
+    /// Fixed configured ceiling for all resident matrices, vectors, cache and
+    /// workspace. `None` is unknown, not a zero-byte plan. Selected adapters may
+    /// expose this for conservative pre-upload envelope reservation only if
+    /// their real factory enforces it before graph allocation. The value must
+    /// remain fixed while the backend is shared; this is not actual or physical
+    /// memory consumption. Defaults preserve fail-closed resource loading.
+    fn resident_decoder_payload_limit(&self) -> Option<usize> {
+        None
+    }
+
+    /// Declare structural graph payload without allocations or numerical checks.
+    /// Defaults remain unknown; this is not a reservation or physical-fit receipt.
+    /// # Errors
+    /// Unsupported geometry/semantics, coefficient lengths or checked overflow.
+    fn decoder_payload_plan(
+        &self,
+        _metadata: DecoderAllocationMetadata<'_>,
+        _limits: DecoderLimits,
+    ) -> Result<Option<DecoderPayloadPlan>, BackendError> {
+        Ok(None)
+    }
+
+    /// Compile existing shared graph weights into an owned resident executor.
+    /// Default decline leaves common host dispatch unchanged. The owned Arc
+    /// receiver keeps backend resources alive without caller downcasts.
+    ///
+    /// # Errors
+    /// Explicit resident adapters reject unsupported graphs, admission failures
+    /// and allocation/driver errors rather than silently falling back.
+    fn resident_decoder(
+        self: std::sync::Arc<Self>,
+        _graph: DecoderGraph<'_>,
+        _limits: DecoderLimits,
+    ) -> Result<Option<Box<dyn ResidentDecoder>>, BackendError> {
+        Ok(None)
+    }
+
+    /// Explicitly request bounded backend-owned causal attention (device-f32).
+    /// `None` is unsupported, never a successful fallback. Existing host model
+    /// dispatch remains unchanged; this does not imply whole-model residency.
+    ///
+    /// # Errors
+    /// Invalid geometry/limits, payload rejection and allocation/driver failures.
+    fn resident_attention(
+        &self,
+        geometry: AttentionGeometry,
+        limits: AttentionLimits,
+    ) -> Result<Option<Box<dyn ResidentAttention>>, BackendError> {
+        geometry.payload_bytes(limits)?;
+        Ok(None)
+    }
+
+    /// Create a zeroed backend-owned transactional DeltaNet recurrence.
+    ///
+    /// `None` means unsupported backend/geometry, not an allocation failure.
+    /// The executor owns resource lifetimes; callers validate its owner before
+    /// each segment. This optional module does not imply whole-model residency.
+    ///
+    /// # Errors
+    /// Malformed geometry and allocation/driver failures are errors, never
+    /// permission to silently continue with stale host state.
+    fn resident_deltanet(
+        &self,
+        geometry: DeltaNetGeometry,
+    ) -> Result<Option<Box<dyn ResidentDeltaNet>>, BackendError> {
+        geometry.elements()?;
+        Ok(None)
+    }
+
+    /// Query support for this exact law/basis/plane/group combination.
+    ///
+    /// `None` means no declared semantic support, never a native fallback.
+    /// Defaults fail closed independently of legacy packed kernels or ISA
+    /// flags. A declaration must be backed by frozen conformance vectors.
+    fn tensor_caps(&self, _tensor: TensorView<'_>) -> Result<Option<TensorCaps>, BackendError> {
+        Ok(None)
+    }
+
+    /// Plan structural payload/workspace without decoding coefficients or allocating.
+    /// None is unknown/unsupported, never a zero-byte fit. Actual upload still
+    /// validates values/coding and checks declared versus returned payload bytes.
+    fn tensor_upload_plan(
+        &self,
+        _metadata: TensorMetadata<'_>,
+    ) -> Result<Option<TensorUploadPlan>, BackendError> {
+        Ok(None)
+    }
+
+    /// Plan explicit encoded streaming without reading/decoding source values.
+    /// None is unknown/unsupported, never a full-decoding compatibility fallback.
+    fn tensor_stream_plan(
+        &self,
+        _metadata: TensorMetadata<'_>,
+        _encoding: TensorStreamEncoding,
+    ) -> Result<Option<TensorStreamPlan>, BackendError> {
+        Ok(None)
+    }
+
+    /// Stage privately from a bounded encoded source, validating lengths, values,
+    /// canonical coding/padding and exact semantic metadata. Default refuses.
+    /// Caller must enforce policy/resources and enclosing terminal source custody.
+    fn upload_tensor_stream(
+        &self,
+        _source: &dyn TensorStreamSource,
+    ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        Err(BackendError::UnsupportedTensor)
+    }
+
+    /// Enforce capability, native-only and payload-budget policy before upload.
+    ///
+    /// Returns the declared execution tier explicitly with the buffer.
+    /// Production emulation additionally needs evidence events and aggregate
+    /// physical-memory admission (ADR 0044
+    /// D9); this per-payload guard alone does not satisfy those obligations.
+    /// Legacy/raw [`Self::upload_tensor`] remains policy-unchecked during
+    /// migration. The returned payload size must match the declaration.
+    fn upload_tensor_checked(
+        &self,
+        tensor: TensorView<'_>,
+        policy: TensorUploadPolicy,
+    ) -> Result<(Box<dyn DeviceBuffer>, TensorCaps), BackendError> {
+        let caps = self
+            .tensor_caps(tensor)?
+            .ok_or(BackendError::UnsupportedTensor)?;
+        validate_tensor_upload_policy(caps, policy)?;
+        let buffer = self.upload_tensor(tensor)?;
+        let actual = u64::try_from(buffer.len_bytes())
+            .map_err(|_| BackendError::InvalidInput("uploaded payload size exceeds u64".into()))?;
+        if actual != caps.payload_bytes {
+            return Err(BackendError::TensorPayloadMismatch {
+                advertised: caps.payload_bytes,
+                actual,
+            });
+        }
+        Ok((buffer, caps))
+    }
+
+    /// Upload a semantic tensor without exposing its wire-format encoding.
+    ///
+    /// Compatibility default fails closed; backend implementations opt into
+    /// the tensor contract explicitly while the legacy packed path remains.
+    fn upload_tensor(
+        &self,
+        _tensor: TensorView<'_>,
+    ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        Err(BackendError::Backend(format!(
+            "backend `{}` does not implement semantic tensor upload",
+            self.device_id()
+        )))
+    }
+
+    /// Multiply activations by a tensor uploaded through [`Self::upload_tensor`].
+    ///
+    /// Compatibility default fails closed. A backend must not silently route
+    /// an unsupported tensor through an unrelated packed format.
+    fn matmul(&self, _p: TensorMatmul<'_>) -> Result<(), BackendError> {
+        Err(BackendError::Backend(format!(
+            "backend `{}` does not implement semantic tensor matmul",
+            self.device_id()
+        )))
+    }
+
+    /// Execute an explicitly enabled device-f32 SwiGLU region.
+    /// False is unsupported/disabled, with output untouched. Errors are not
+    /// fallback; successful execution returns true. Default preserves host
+    /// behavior. This does not grant model-quality or whole-graph residency.
+    fn try_tensor_swiglu(&self, _p: TensorSwiGlu<'_>) -> Result<bool, BackendError> {
+        Ok(false)
+    }
+
+    /// Gather `[ids.len(), K]` original-coordinate rows from an uploaded tensor.
+    ///
+    /// Additive tensors undo their declared input-axis basis after decoding;
+    /// dense tensors copy rows directly. Preserve ID order and duplicates,
+    /// and reject invalid IDs/output lengths before writing. Empty gathers
+    /// are valid. Compatibility defaults fail closed, never return rotated rows.
+    fn embed_rows(
+        &self,
+        _tensor: &dyn DeviceBuffer,
+        _ids: &[usize],
+        _out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        Err(BackendError::Backend(format!(
+            "backend `{}` does not implement semantic tensor gather",
+            self.device_id()
+        )))
+    }
 
     /// Upload host-side packed weight bytes (`format`, shape `[N, K]`) to device
     /// memory, returning an opaque handle for reuse across `mpgemm` calls.
@@ -319,7 +692,7 @@ pub trait TernaryBackend: Send + Sync {
 
     /// Downcast hook for a backend-specific fast path. Returns `None` by default;
     /// a backend that exposes a concrete accelerated forward (e.g. the CUDA
-    /// device-resident decode, [`tritium_cuda::CudaDecodeModel`]) overrides this to
+    /// device-resident decode, `tritium_cuda::CudaDecodeModel`) overrides this to
     /// return `Some(self)` so a caller holding a `&dyn TernaryBackend` can recover
     /// the concrete type with `downcast_ref`. Keeping it defaulted means the generic
     /// trait stays object-safe and host-slice-oriented; only the one backend that has
@@ -391,6 +764,24 @@ pub enum BackendError {
     },
     /// The backend cannot consume this packing format.
     UnsupportedFormat(TernaryFormat),
+    /// No support was declared for this semantic tensor combination.
+    UnsupportedTensor,
+    /// Native-only upload refused a declared non-native execution tier.
+    NativeTensorRequired,
+    /// Declared payload exceeds the caller's per-tensor budget.
+    TensorPayloadBudgetExceeded {
+        /// Declared payload bytes, checked before allocation.
+        requested: u64,
+        /// Caller-supplied maximum payload bytes.
+        limit: u64,
+    },
+    /// Uploaded buffer contradicts its pre-upload capability declaration.
+    TensorPayloadMismatch {
+        /// Payload size declared by the backend.
+        advertised: u64,
+        /// Actual payload size reported by the buffer.
+        actual: u64,
+    },
     /// Device allocation failed for the requested byte count.
     OutOfMemory {
         /// Bytes requested.
@@ -413,6 +804,16 @@ impl fmt::Display for BackendError {
             BackendError::UnsupportedFormat(fmt_) => {
                 write!(f, "unsupported ternary format: {fmt_:?}")
             }
+            BackendError::UnsupportedTensor => write!(f, "unsupported semantic tensor combination"),
+            BackendError::NativeTensorRequired => write!(f, "native tensor execution required"),
+            BackendError::TensorPayloadBudgetExceeded { requested, limit } => write!(
+                f,
+                "tensor payload budget exceeded: requested {requested}, limit {limit} bytes"
+            ),
+            BackendError::TensorPayloadMismatch { advertised, actual } => write!(
+                f,
+                "tensor payload declaration mismatch: advertised {advertised}, actual {actual} bytes"
+            ),
             BackendError::OutOfMemory { requested } => {
                 write!(f, "out of device memory: requested {requested} bytes")
             }
@@ -449,6 +850,140 @@ fn _assert_object_safe(backend: &dyn TernaryBackend, buffer: &dyn DeviceBuffer) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct AdmissionBackend {
+        caps: Option<TensorCaps>,
+        actual_bytes: usize,
+        uploads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TernaryBackend for AdmissionBackend {
+        fn device_id(&self) -> &str {
+            "admission-control"
+        }
+        fn capabilities(&self) -> DeviceCaps {
+            DeviceCaps::new("test", "policy negative control")
+        }
+        fn tensor_caps(&self, _: TensorView<'_>) -> Result<Option<TensorCaps>, BackendError> {
+            Ok(self.caps)
+        }
+        fn upload_tensor(&self, _: TensorView<'_>) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+            self.uploads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Box::new(MockBuffer {
+                trits: vec![0; self.actual_bytes],
+            }))
+        }
+        fn upload_weights(
+            &self,
+            _: &[u8],
+            _: GemmShape,
+            _: TernaryFormat,
+        ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+            Err(BackendError::InvalidInput("unused policy control".into()))
+        }
+        fn mpgemm(&self, _: MpGemm<'_>) -> Result<(), BackendError> {
+            Err(BackendError::InvalidInput("unused policy control".into()))
+        }
+    }
+
+    #[test]
+    fn checked_upload_rejects_unknown_emulation_and_budget_before_upload() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tensor = TensorView::Dense {
+            rows: 1,
+            cols: 2,
+            values: &[1., 2.],
+        };
+        for (caps, policy, expected) in [
+            (
+                None,
+                TensorUploadPolicy::default(),
+                BackendError::UnsupportedTensor,
+            ),
+            (
+                Some(TensorCaps {
+                    execution: TensorExecution::Emulated,
+                    payload_bytes: 8,
+                }),
+                TensorUploadPolicy {
+                    native_only: true,
+                    max_payload_bytes: None,
+                },
+                BackendError::NativeTensorRequired,
+            ),
+            (
+                Some(TensorCaps {
+                    execution: TensorExecution::Native,
+                    payload_bytes: 8,
+                }),
+                TensorUploadPolicy {
+                    native_only: false,
+                    max_payload_bytes: Some(7),
+                },
+                BackendError::TensorPayloadBudgetExceeded {
+                    requested: 8,
+                    limit: 7,
+                },
+            ),
+        ] {
+            let backend = AdmissionBackend {
+                caps,
+                actual_bytes: 8,
+                uploads: AtomicUsize::new(0),
+            };
+            let object: &dyn TernaryBackend = &backend;
+            assert_eq!(
+                object.upload_tensor_checked(tensor, policy).err().unwrap(),
+                expected
+            );
+            assert_eq!(backend.uploads.load(Ordering::Relaxed), 0);
+        }
+        // An inference-only backend does not inherit native tensor support.
+        assert_eq!(MockBackend.tensor_caps(tensor).unwrap(), None);
+    }
+
+    #[test]
+    fn checked_upload_retains_tier_and_rejects_inaccurate_size_declarations() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tensor = TensorView::Dense {
+            rows: 1,
+            cols: 2,
+            values: &[1., 2.],
+        };
+        let caps = TensorCaps {
+            execution: TensorExecution::Emulated,
+            payload_bytes: 8,
+        };
+        let backend = AdmissionBackend {
+            caps: Some(caps),
+            actual_bytes: 8,
+            uploads: AtomicUsize::new(0),
+        };
+        let (buffer, reported) = backend
+            .upload_tensor_checked(tensor, TensorUploadPolicy::default())
+            .unwrap();
+        assert_eq!(reported, caps);
+        assert_eq!(buffer.len_bytes(), 8);
+        assert_eq!(backend.uploads.load(Ordering::Relaxed), 1);
+        for actual_bytes in [7, 9] {
+            let backend = AdmissionBackend {
+                caps: Some(caps),
+                actual_bytes,
+                uploads: AtomicUsize::new(0),
+            };
+            assert_eq!(
+                backend
+                    .upload_tensor_checked(tensor, TensorUploadPolicy::default())
+                    .err()
+                    .unwrap(),
+                BackendError::TensorPayloadMismatch {
+                    advertised: 8,
+                    actual: actual_bytes as u64
+                }
+            );
+        }
+    }
 
     /// The host-quant default must match `transformers` `ActQuant` on the same
     /// golden row `tritium-nn::ops::act_quant` pins, so the two copies cannot

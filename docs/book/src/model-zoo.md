@@ -1,12 +1,14 @@
 # Model Zoo
 
-This chapter is about **what Tritium actually loads** — which on-disk model
-formats the loader accepts, the one reference model the test/perf gates exercise,
-and how to drive a compatible GGUF through the [`tritium` CLI](./quickstart.md).
+This chapter describes **the low-level GGUF inference path** — which on-disk
+types its loader handles, the reference model its legacy test/performance gates
+target, and how to drive a compatible GGUF through the [`tritium` CLI](./quickstart.md).
 It is deliberately conservative: a model is listed as **verified-compatible**
-only where the repo's tests run it end-to-end, and as **expected-compatible**
-where the loader's type handling implies it should work but no committed test
-exercises that exact artifact. The source of truth is the loader
+only where a recorded test or receipt exercises the exact artifact, and as
+**expected-compatible** where loader behavior suggests compatibility but that
+artifact has not been tested. Model names in the generated v1.1 ladder are
+release targets, not evidence that their weights are bundled or qualified. The
+source of truth for low-level loader behavior is the loader
 (`crates/tritium-nn/src/model/weights.rs`) and the GGUF reader
 (`crates/tritium-format/src/gguf.rs`) — when this page and the code disagree, the
 code wins.
@@ -68,8 +70,10 @@ packing — the file `ggml-model-i2_s.gguf` (1 187 801 280 bytes ≈ 1.106 GiB; 
 exact byte count is committed as `tritium_benches::BITNET_2B4T_I2S_BYTES` and is
 the denominator of the decode roofline — see [Benchmarks](./benchmarks.md)).
 
-This is the **only** model the repo runs end-to-end. The geometry the code is
-built around (`crates/tritium-nn/src/config.rs`,
+For the legacy native GGUF inference path, this is the reference model used by
+the model-gated accuracy and performance harnesses. It is separate from the
+PyTorch/Hugging Face SmolLM2 tutorial and the SALT PTQ campaign paths. The
+geometry the native GGUF code is built around (`crates/tritium-nn/src/config.rs`,
 `crates/tritium-nn/tests/bench_cpu_hotpaths.rs`): `n_embd = 2560`,
 `feed_forward_length = 6912`, `n_head = 20`, `n_head_kv = 5` (GQA),
 `head_dim = 128`, 30 transformer blocks, a ReLU² MLP, and `attn_sub_norm` /
@@ -170,13 +174,22 @@ tritium report decode --model ggml-model-i2_s.gguf --tokens tokens.json \
 > plain build exposes `cpu`; building the CLI `--features cuda` makes `cuda`
 > selectable for `report --backend cuda`.
 
-## Caveats and pre-1.0 status
+## Release-status boundaries
 
 - **Token-ID interface.** The CLI consumes/produces token IDs, not text. A
   tokenizer is the caller's responsibility.
-- **One verified model.** The acceptance gates are written for BitNet 2B4T in
-  `I2_S`. Other architectures are out of scope until a test pins them.
-- **Pre-1.0.** A real-model, fresh-environment capstone (download → infer →
-  SALT-quantize → fine-tune) is a **v1.0 exit gate** that requires hardware this
-  book's CI does not have; it is tracked in
-  ADR 0012 (see the [research repository](https://github.com/Quitetall/tritium-research)) and is **not** claimed complete here.
+- **Loader coverage is not zoo admission.** The BitNet tables above describe
+  the low-level GGUF inference path. They do not establish support for every
+  model in the generated v1.1 admission ladder, nor do they replace the
+  candidate-bound receipts required for an audited model card.
+- **No model weights are bundled.** The generated ladder names release targets;
+  it is not a list of downloadable Tritium artifacts. Check the current
+  [release-candidate evidence](../../release-candidate.md) for each target's
+  admitted status. In particular, the pinned Qwen language-plus-MTP conversion
+  remains open until all 506 matrix masters, artifact sealing, and quality and
+  runtime gates are evidenced.
+- **v1.1 is not yet qualified.** A parser, layer fixture, source-admission
+  receipt, or passing small-model test is narrower than full-model fidelity,
+  physical-byte accounting, runtime, or independent reproduction. The
+  tracked [release evidence record](../../release-candidate.md) shows which
+  gates have evidence. A pending or missing receipt is not a pass.

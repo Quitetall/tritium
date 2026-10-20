@@ -1,0 +1,516 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OriginalCapturedSalienceSourceStageManifest",
+  "description": "Distinct mandatory original-capture ancestry, not a numerical qualification.\nOld Declared lineage is preserved, never silently promoted or unwrapped.",
+  "type": "object",
+  "properties": {
+    "lineage": {
+      "description": "Complete unchanged transform/source/moment vocabulary.",
+      "$ref": "#/$defs/SalienceSourceStageManifest"
+    },
+    "original_capture": {
+      "description": "Required standalone original-A forward salience capture run/span/root.",
+      "$ref": "#/$defs/EvidenceReference"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "lineage",
+    "original_capture"
+  ],
+  "$defs": {
+    "BlobId": {
+      "description": "Content identity for stored tensor or asset bytes.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "EvidenceReference": {
+      "description": "Evidence ancestry reference, not a self-approved quality/release verdict.",
+      "type": "object",
+      "properties": {
+        "root": {
+          "description": "BLAKE3 evidence root, not a blob id or package digest.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0
+          },
+          "maxItems": 32,
+          "minItems": 32
+        },
+        "run": {
+          "description": "Run identity of the evidence producer.",
+          "type": "string"
+        },
+        "span": {
+          "description": "Evidence span within that run.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "run",
+        "span",
+        "root"
+      ]
+    },
+    "NamedAssetDigest": {
+      "description": "Exact named asset-content binding in the candidate model preimage.",
+      "type": "object",
+      "properties": {
+        "content": {
+          "description": "Exact stored asset-content digest, not a shard/package identity.",
+          "$ref": "#/$defs/BlobId"
+        },
+        "name": {
+          "description": "Asset basename; names affect model semantics.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "content"
+      ]
+    },
+    "OriginalSourceId": {
+      "description": "Candidate identity of original named tensor/asset content, not fitted content or provenance.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "QuantSourceBinding": {
+      "description": "Actual original raw tensor-byte binding computed by the engine itself.",
+      "type": "object",
+      "properties": {
+        "content": {
+          "description": "BLAKE3 of exact original raw bytes; not original container/HF identity.",
+          "$ref": "#/$defs/BlobId"
+        },
+        "source": {
+          "description": "Original interpretation, not fitted layout.",
+          "$ref": "#/$defs/QuantSourceTensor"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "content"
+      ]
+    },
+    "QuantSourceTensor": {
+      "description": "Original tensor interpretation, never an adapter-supplied content hash.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Exact logical tensor name.",
+          "type": "string"
+        },
+        "precision": {
+          "description": "Original stored float precision, before widening or fitting.",
+          "$ref": "#/$defs/ScalePrecision"
+        },
+        "shape": {
+          "description": "Positive row-major dimensions in the original source.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "shape",
+        "precision"
+      ]
+    },
+    "SalienceInverseAxis": {
+      "description": "Explicit axis of the graph partner divided by each stored scale.",
+      "oneOf": [
+        {
+          "description": "Rank-one preceding norm, one channel per projection input column.",
+          "type": "string",
+          "const": "NormChannels"
+        },
+        {
+          "description": "Rank-two linear partner, one output row per projection input column.",
+          "type": "string",
+          "const": "LinearOutputRows"
+        }
+      ]
+    },
+    "SalienceMomentBinding": {
+      "description": "Exact actual moment content plus explicitly declared interpretation.",
+      "type": "object",
+      "properties": {
+        "channels": {
+          "description": "One moment per projection input column and partner output channel.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "content": {
+          "description": "BLAKE3 of row-major little-endian f64 second-moment sums, not an activation hash.",
+          "$ref": "#/$defs/BlobId"
+        },
+        "rows": {
+          "description": "Declared positive sample count; not proof of observed row execution.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "content",
+        "channels",
+        "rows"
+      ]
+    },
+    "SalienceNumerics": {
+      "description": "Ordered numerical semantics, never an implicit recipe fallback.",
+      "oneOf": [
+        {
+          "description": "Legacy ordered f64 RMS/log-mean/powf, f32 cast and multiply/divide.",
+          "type": "string",
+          "const": "LegacyF64ScaleF32V1"
+        }
+      ]
+    },
+    "SalienceOperationOutput": {
+      "description": "Actual stored scales for one executed pair; bits are JSON-safe byte arrays.",
+      "type": "object",
+      "properties": {
+        "operation": {
+          "description": "Exact operation name in executed order.",
+          "type": "string"
+        },
+        "scale_bits": {
+          "description": "Actual finite positive f32 scale bits, in channel order.",
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0
+            },
+            "maxItems": 4,
+            "minItems": 4
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "scale_bits"
+      ]
+    },
+    "SalienceSourceStageManifest": {
+      "description": "Mandatory typed B stage manifest, distinct from a fitted model manifest.",
+      "type": "object",
+      "properties": {
+        "observation": {
+          "description": "Complete observation; agreement with log/actual bytes is checked separately.",
+          "$ref": "#/$defs/SalienceTransformObservation"
+        },
+        "schema": {
+          "description": "The only admitted candidate metadata version is 1.0.",
+          "$ref": "#/$defs/SchemaId"
+        },
+        "transform": {
+          "description": "Mandatory actual standalone transform run/span/root.",
+          "$ref": "#/$defs/EvidenceReference"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "transform",
+        "observation"
+      ]
+    },
+    "SalienceStatisticsKind": {
+      "description": "What the statistics observation actually establishes.",
+      "oneOf": [
+        {
+          "description": "Supplied moments/rows only; no claim of executed graph/token/teacher capture.",
+          "type": "string",
+          "const": "Declared"
+        }
+      ]
+    },
+    "SalienceTransformLimits": {
+      "description": "Logical payload/numeric-vector budgets, not process RSS admission.",
+      "type": "object",
+      "properties": {
+        "max_asset_bytes": {
+          "description": "Complete unchanged asset payload total.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_derived_bytes": {
+          "description": "Complete derived tensor payload total, including touched tensors widened to F32.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_pair_working_bytes": {
+          "description": "Pair decoded vectors, replacement bytes and RMS/scales; excludes metadata and RSS.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_source_bytes": {
+          "description": "Complete consumed original tensor payload total.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_statistics_bytes": {
+          "description": "Complete supplied moment vectors, in raw f64 bytes.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max_source_bytes",
+        "max_asset_bytes",
+        "max_derived_bytes",
+        "max_statistics_bytes",
+        "max_pair_working_bytes"
+      ]
+    },
+    "SalienceTransformObservation": {
+      "description": "Actual complete source-stage observation, not a sealed log or release receipt.",
+      "type": "object",
+      "properties": {
+        "assets": {
+          "description": "Exact unchanged asset content bindings.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/NamedAssetDigest"
+          }
+        },
+        "derived_source": {
+          "description": "Actual produced complete B identity, using the same raw-content domain.",
+          "$ref": "#/$defs/OriginalSourceId"
+        },
+        "derived_tensors": {
+          "description": "Actual complete derived tensor raw-content/dtype bindings.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/QuantSourceBinding"
+          }
+        },
+        "operations": {
+          "description": "Actual ordered pair output scales.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SalienceOperationOutput"
+          }
+        },
+        "original_source": {
+          "description": "Actual consumed complete A identity.",
+          "$ref": "#/$defs/OriginalSourceId"
+        },
+        "original_tensors": {
+          "description": "Actual complete original tensor raw-content bindings.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/QuantSourceBinding"
+          }
+        },
+        "plan": {
+          "description": "Executed request, explicitly declaring statistics rather than captured-graph truth.",
+          "$ref": "#/$defs/SalienceTransformPlan"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "plan",
+        "original_source",
+        "derived_source",
+        "original_tensors",
+        "derived_tensors",
+        "assets",
+        "operations"
+      ]
+    },
+    "SalienceTransformOperation": {
+      "description": "One ordered, named paired operation; names do not prove graph eligibility.",
+      "type": "object",
+      "properties": {
+        "alpha_bits": {
+          "description": "Exact little-endian f64 alpha bits, including signed zero.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0
+          },
+          "maxItems": 8,
+          "minItems": 8
+        },
+        "inverse": {
+          "description": "Distinct norm/linear partner whose channels/output rows are divided.",
+          "type": "string"
+        },
+        "inverse_axis": {
+          "description": "Explicit partner interpretation; no inference from tensor naming.",
+          "$ref": "#/$defs/SalienceInverseAxis"
+        },
+        "moments": {
+          "description": "Exact expected statistics and declared count interpretation.",
+          "$ref": "#/$defs/SalienceMomentBinding"
+        },
+        "name": {
+          "description": "Unique logical operation name, used to select the actual statistics.",
+          "type": "string"
+        },
+        "projections": {
+          "description": "Actual matrices whose input columns are multiplied, in declared order.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "projections",
+        "inverse",
+        "inverse_axis",
+        "moments",
+        "alpha_bits"
+      ]
+    },
+    "SalienceTransformPlan": {
+      "description": "Candidate complete source-stage request, not a captured-statistics qualification.",
+      "type": "object",
+      "properties": {
+        "architecture": {
+          "description": "Original source architecture identifier; execution admission is separate.",
+          "type": "string"
+        },
+        "assets": {
+          "description": "Complete strictly sorted unchanged asset basenames.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "limits": {
+          "description": "Explicit logical bounds; no out-of-core/full-memory claim follows.",
+          "$ref": "#/$defs/SalienceTransformLimits"
+        },
+        "numerics": {
+          "description": "Explicit ordered numerical policy.",
+          "$ref": "#/$defs/SalienceNumerics"
+        },
+        "operations": {
+          "description": "Order is significant, e.g. up input columns before up output rows.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SalienceTransformOperation"
+          }
+        },
+        "original_source": {
+          "description": "Observed expected A identity; the controller must derive its own consumed identity.",
+          "$ref": "#/$defs/OriginalSourceId"
+        },
+        "statistics_kind": {
+          "description": "Initial profile must stay Declared until an executed capture is admitted.",
+          "$ref": "#/$defs/SalienceStatisticsKind"
+        },
+        "tensors": {
+          "description": "Complete strictly sorted original tensor interpretations.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/QuantSourceTensor"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "architecture",
+        "original_source",
+        "tensors",
+        "assets",
+        "operations",
+        "numerics",
+        "statistics_kind",
+        "limits"
+      ]
+    },
+    "ScalePrecision": {
+      "description": "Precision used to store additive plane scales.",
+      "oneOf": [
+        {
+          "description": "IEEE binary16.",
+          "type": "string",
+          "const": "F16"
+        },
+        {
+          "description": "Brain floating-point 16-bit.",
+          "type": "string",
+          "const": "Bf16"
+        },
+        {
+          "description": "IEEE binary32.",
+          "type": "string",
+          "const": "F32"
+        }
+      ]
+    },
+    "SchemaId": {
+      "description": "Stable identifier for a schema family and its version.",
+      "type": "object",
+      "properties": {
+        "major": {
+          "description": "Major version; incompatible schemas require a new major version.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "minor": {
+          "description": "Minor version; additive compatible schema evolution increments this.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "major",
+        "minor"
+      ]
+    }
+  }
+}

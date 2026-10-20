@@ -1,0 +1,16 @@
+{
+  "schema": "tritium.wheel-smoke.v1",
+  "cell_id": "linux-x86_64-cpu-cp3.11",
+  "target_id": "linux-x86_64-cpu",
+  "source_revision": "70974aeaba2924d7d864f5f961dd91e421e97bc7",
+  "passed": true,
+  "python_implementation": "CPython",
+  "python_version": "3.11.17",
+  "host_os": "linux",
+  "host_arch": "x86_64",
+  "wheel": "pytritium-1.1.0rc2-cp39-abi3-manylinux_2_28_x86_64.whl",
+  "sha256": "5ec84fcb7c7e03b522e23560871f09368ac084d6cca04be76160a824a5ac3ccc",
+  "bytes": 10560923,
+  "version": "1.1.0rc2",
+  "platform_tag": "manylinux_2_28_x86_64"
+}

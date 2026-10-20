@@ -7,7 +7,968 @@ every byte and prints `CANDIDATE_EVIDENCE_VALID`. That status does **not** mean
 `LOCAL_RC_READY`; model-zoo, browser, serving, package-matrix, signing and
 second-machine gates remain separate.
 
+The `release` Actions workflow has a non-publishing `candidate` dispatch mode.
+It accepts only a full commit ID reachable from the default branch (or uses
+that branch's current tip), then builds the same wheel, crate, npm, SBOM, and
+release-input bundle as the tag-based path. Candidate mode must leave PyPI,
+GitHub Releases, and crates.io untouched. The default dispatch mode remains
+`publish` and requires an existing reviewed release tag; tag pushes also retain
+the existing publish behavior. This workflow creates package evidence, not a
+release-candidate admission or activation receipt.
+
+### Packed embedding selected-row decode (2026-10-05)
+
+`AdditiveTernaryEmbedding` now decodes packed trit bytes only for token IDs in
+the current input, in bounded chunks of at most 2^18 weight elements before
+per-plane accumulation. It does not build a dense vocabulary-by-hidden-size
+weight table. A CPU/CUDA regression compares outputs exactly with the dense
+reference for duplicate IDs, two planes, a partial final scale group and long
+inputs spanning multiple chunks; it also checks int32/int64 IDs and empty
+sequences while making the full-matrix decoder unavailable to the layer.
+`PYTHONPATH=crates/tritium-py/python python3 -m pytest -q
+crates/tritium-py/tests` passed 369 tests, with 27 skips. This is correctness
+and bounded-temporary evidence for the Python reference path, not a native
+fused-kernel or speed claim.
+
+### Packed linear output-row decode (2026-10-07)
+
+`AdditiveTernaryLinear` decodes packed weights in output-row tiles capped at
+2^22 weight elements, instead of materializing the entire output-by-input
+matrix on every forward call. Bias is cast to the input dtype as before, and
+the input feature dimension is checked explicitly. The chunk-bound regression
+constructs a 300,000-by-16 layer and verifies the exact two tiles (262,144 and
+37,856 rows); the full `test_module_onnx.py` file passed all 9 tests.
+
+The exact local candidate wheel
+`pytritium-1.1.0rc2-cp39-abi3-linux_x86_64.whl` (SHA-256
+`b21343f103aec89c0e843f72730dafb23dbdc49c639677e531d96f684888c94b`) ran the
+pinned SmolLM2-135M tutorial on CPU in 255.23 seconds, excluding first model
+download. The wheel binds source-tree object
+`88fa42cf1b29b4f4d07bd36c99234ce316eb3fd4` (commit `917fd4ae`), model revision
+`12fd25f77366fa6b3b4b768ec3050bf629380bac`, and receipt run ID
+`local-4m-88fa42cf`. The receipt SHA-256 is
+`fe61ada1279767f06c8891b0683de35f1443a66e759e49e776aceed552f0125e`; it records
+ONNX replay max absolute error `8.01e-5`, max tolerance ratio `0.368`, and
+selected dense/checkpoint bytes `537,919,488` / `92,192,265` (5.83x). The wheel
+and complete 2.2 GiB tutorial output are preserved under
+`/mnt/2tb/tritium-smollm2-917fd4ae-local/`.
+
+This is local CPU evidence only: the wheel's `linux_x86_64` tag is not a
+manylinux release artifact, and the hosted candidate-wheel/tutorial gate had
+not completed when this record was updated. It does not establish a native
+fused kernel or cross-machine performance claim.
+
+### Hosted SmolLM2 ONNX parity diagnosis (2026-10-09)
+
+Hosted Actions run [`37936540167`](https://github.com/Quitetall/tritium/actions/runs/37936540167)
+tested exact PR head `be644fb2b9fdc0b9ad7583950717d124348042dd`. The pinned
+SmolLM2 tutorial failed its frozen parity assertion by 4 elements out of
+344,064. Its diagnostic artifact (`11617749672`, 32,789,616 bytes) was
+downloaded; its manifest and recorded array hashes verified. The terminal graph
+had seven output-projection MatMul shards sharing one activation. Their
+concatenation reproduced the hosted ONNX logits exactly. Failures were spread
+across three shards, so no single shard was established as the source.
+
+The next exact-source hosted run,
+[`37938221670`](https://github.com/Quitetall/tritium/actions/runs/37938221670),
+tested `d717ca4ec732c63268ffc32474bc2b2ecfaecf35`. All CPU wheel builds, the
+installed-wheel suite, the full abi3 matrix and the source-free tutorial passed;
+the pinned tutorial still failed parity by 3 of 344,064 elements. Its uploaded
+diagnostic (`smollm2-onnx-parity-diagnostic`, artifact ID `11619396796`,
+35,186,496 bytes) passed file-hash verification. The second PyTorch reference
+forward reproduced the original expected logits byte-for-byte. Its final
+hidden state differed from the ONNX shared activation by at most
+`0.00011158`, with zero failures under the frozen hidden-state tolerance.
+
+As a localized probe, the terminal projection subgraph was extracted from that
+hosted ONNX artifact and replayed locally with ONNX Runtime 1.30. Feeding it the
+captured ONNX activation retained the same three failing output coordinates
+against the reference logits; feeding it the captured PyTorch final hidden
+state produced zero failures. Replaying the captured ONNX activation through
+that extracted head differed from the original hosted ONNX logits by at most
+`1.24e-5` and remained within tolerance. This makes upstream activation drift
+the leading diagnosis, not a proven first-divergent layer; the local replay is
+not a substitute for hosted ONNX Runtime 1.27 evidence.
+
+The parity gate remains FAIL and its tolerance is unchanged. The next
+diagnostic now captures all 30 Llama-style decoder residual boundaries plus the
+reference model's layer hidden states; it accepts hidden-state tuples with
+either `num_hidden_layers` or `num_hidden_layers + 1` entries. The capture
+selector was exercised against the hosted graph and selected exactly 30 block
+outputs; the full diagnostic replay retained 39 ONNX arrays without altering
+the source artifact. A tiny Llama model using Transformers 5.5.3 also exercised
+the real output-capture path and exact replay. A new hosted run must locate the
+first divergent block before a numerical fix can be chosen. None of this
+evidence qualifies model quality, release readiness or GPU performance.
+
+### Local SmolLM2 PTQ repeatability probe (2026-10-09)
+
+At branch commit `a4722e32f52bd4f3857cd165429018809aa62c72`, the public
+`prepare → calibrate → convert()` path was run twice in one CPU process on the
+pinned `HuggingFaceTB/SmolLM2-135M-Instruct` revision
+`12fd25f77366fa6b3b4b768ec3050bf629380bac`. Both runs used the same in-memory
+source model, tokenized calibration prompt, `compact-v1` recipe, independent
+calibration directories and independent conversion directories. Torch, OMP
+and MKL were limited to four threads. The environment used PyTorch
+`2.11.0+cpu` and Transformers `5.5.3`; the loaded native extension SHA-256 was
+`b5dfa449617303a5ab856b181d30da569dabff3362a55002c2176ac888cbde4b`.
+
+Both calibration receipts matched byte-for-byte: source model digest
+`sha256:07b6b933f97ef0d84d39eab5f6761de34eb07f1d14c43f1f22f70a06d54266b7`,
+activation digest
+`sha256:1d2d330288e5fa4335e2d1800616140a7900d7d18f9de9d3cba543ab42267dea`,
+token stream digest
+`sha256:5acad51abbb317a90c2b286ffa90e1d8a37b5c63c33c645843f20f245e85f737`,
+and evidence ID
+`sha256:bfdf8ddcd58a33c50196566d0bb02593aa745ae06e8381d6368c84e3c0167ae6`.
+The two conversion directories also compared byte-for-byte equal; both
+reported artifact ID
+`sha256:e6c97ef3265a863571796a71eec08a6a792472574a0fb0e3d7b53be6705ae18c`
+and algorithm `tritium.salt-v2-joint-diagonal-catq-relays-1@1`.
+
+A follow-up local sensitivity probe held the loaded source model and data fixed
+while collecting calibration with Torch intra-op thread counts 1 and 4, then
+with MKLDNN enabled and disabled at four threads. All four receipts had the
+same activation digest and evidence ID as the repeated four-thread run above.
+This rules out those two toggles as causes on this local CPU/runtime only; it
+does not rule out CPU-vendor kernels, Torch build differences, or other hosted
+environment differences.
+
+This is positive repeatability evidence for one controlled local CPU run, not
+an explanation of the differing hosted external-data bytes: those runs may
+differ in source/build or execution environment, and their exact environment
+was not reproduced here. It is not the full SmolLM2 release tutorial, an ONNX
+parity pass, GPU evidence, model-quality evidence, or release qualification.
+
+The two preceding hosted failures were observed on different 4-core CPU
+models: run [`37946168132`](https://github.com/Quitetall/tritium/actions/runs/37946168132)
+reported AMD EPYC 9V74, while run
+[`37948541947`](https://github.com/Quitetall/tritium/actions/runs/37948541947)
+reported Intel Xeon Platinum 8573C. Both had `OMP_NUM_THREADS` and
+`MKL_NUM_THREADS` unset. This makes hardware-dependent calibration drift
+plausible, but the old logs do not record calibration or PTQ artifact IDs, so
+the host difference is not a proven cause. The tutorial now prints the source,
+activation, evidence, recipe, algorithm and conversion content identities;
+compare those fields in the next exact-source hosted run before selecting a
+numerical or thread-pinning change.
+
+#### Exact-source hosted identity capture (2026-10-09)
+
+The follow-up wheels run
+[`37951055368`](https://github.com/Quitetall/tritium/actions/runs/37951055368)
+tested exact source commit `f53f0868986e5416c333be2f31f62d96553132c8`. Its
+Linux tutorial runner was AMD EPYC 7763, with four online CPUs and OMP/MKL
+thread variables unset. The source model digest exactly matched the local
+repeatability probe, but its activation/evidence IDs did not:
+
+| Identity | Local four-thread probe | Hosted run 37951055368 |
+|---|---|---|
+| Source model digest | `07b6b933f97ef0d84d39eab5f6761de34eb07f1d14c43f1f22f70a06d54266b7` | same |
+| Activation cache digest | `1d2d330288e5fa4335e2d1800616140a7900d7d18f9de9d3cba543ab42267dea` | `650266cc917befb52f54a996d3d9faf085d2a5c1d6eef5f45075086c0b370f71` |
+| Calibration evidence ID | `bfdf8ddcd58a33c50196566d0bb02593aa745ae06e8381d6368c84e3c0167ae6` | `e616fa4122200a6a74d61f96d3d965d7756d8d26bef62fb30c146aa51d9b803a` |
+| PTQ artifact ID | `e6c97ef3265a863571796a71eec08a6a792472574a0fb0e3d7b53be6705ae18c` | `e8558ba5bf7a3291e13061a0cac5e5a771c805a08c22657f9b42aad705fa83cb` |
+
+The hosted tutorial failed the unchanged `rtol=atol=1e-4` ONNX gate at 4 of
+344,064 logits: maximum failing absolute error `0.00010919570922851562` at
+`(0, 0, 34041)`, maximum relative error `1.7615385`. Its opt-in diagnostic
+artifact (`11626392613`, 37,075,617 compressed bytes; archive SHA-256
+`3a580fc517d4cec562431c7c4f8d41de3ff514cbd249048c49eb0c43465452b6`) was
+downloaded and all 112 referenced model/replay files passed size and SHA-256
+verification. The diagnostic manifest SHA-256 is
+`de1e997a6933f3264526b5a4df1bfed812ca35870171dfb8422561107ec62afb`.
+
+The checkpoint digest (`sha256:057411d950e9d681f3bcea79e1378eaada734e0a3556ff64590e200144fbd3e2`)
+and ONNX external-data digest (`sha256:5a8c3e5330da8e5a57ea2f0af81502aacbccbd43a1ed192fc8ea97afc860103b`) match the earlier AMD-hosted failure `37946168132`. The intervening Intel Xeon-hosted run `37948541947` had different checkpoint and external-data digests (`3bb026489b8ca00f2696a040bd48a0b4055906f097c7952348dc89259fffae2` and `6fe77ebb594aad20ac6c44896d83d9c1f9b20e9805b0986b8f5885a67cabf2d3`). This supports platform-sensitive activation calibration as an explanation for cross-run PTQ bytes, but does not isolate CPU ISA from native build, math libraries, or thread scheduling; the older runs did not log calibration IDs. The same PTQ checkpoint can still fail ONNX parity, so calibration-byte reproducibility and the terminal numerical parity defect are separate open problems.
+
+The block-11 trace again places the first large in-tolerance jump in the MLP
+down projection: `linear_83` differs from the reference by at most `0.0322266`
+with zero failures at that boundary; all 29 residual boundaries remain within
+tolerance, with peak ratio `0.663240` at `add_6606`. The failing terminal
+logits remain unchanged from the AMD run. Required CI, docs, capstone CPU smoke,
+CodeQL, platform wheel builds, installed-wheel checks, source-free tutorial,
+and abi3 matrix passed for this commit; CUDA, fuzz, GPU/backend physical, and
+performance gates were skipped. The overall wheels workflow remains FAIL
+because the pinned SmolLM2 ONNX parity gate fails.
+
+#### Bounded down-projection replay (2026-10-09)
+
+A follow-up diagnostic decoded the exact `linear_83` packed ternary weight and
+scales from the verified hosted artifact, then replayed the captured projection
+inputs through local PyTorch `F.linear`. With the captured ONNX product as input,
+the local output matched hosted ONNX `linear_83` within `3.05176e-5` maximum
+absolute error (maximum tolerance ratio `0.02550`, zero failures). With the
+reference product (`activation * up`) and the same reconstructed weight, the
+local output matched the captured reference MLP output within `0.001953125`
+(maximum tolerance ratio `0.02586`, zero failures). The captured ONNX product
+and reference product differed by up to `0.00390625`; applying the same local
+kernel and weight to those two inputs changed the projection output by up to
+`0.0302734375` (maximum tolerance ratio `0.06952`, zero failures), close to the
+observed `0.0322265625` down-projection boundary drift.
+
+The saved block-11 arrays further decompose the product: `silu_11 * linear_82`
+reconstructs `mul_3418` exactly. At the largest product-error element (flattened
+index 1229, token 0 / feature 1229), the ONNX activation and up value are about
+`28.809845` and `52.649776`, versus reference values `28.809803` and
+`52.649719`. Replacing only the ONNX activation with the reference activation
+reduces the maximum product error from `0.00390625` to `0.00219727`; replacing
+only the ONNX up value reduces it to `0.00170898`. Both upstream differences
+contribute, and neither single-input swap eliminates the mismatch. Across all
+captured elements, maximum absolute gate, up, and activation differences are
+`4.19617e-5`, `5.72205e-5`, and `4.19617e-5`, respectively. These are still
+cross-host array comparisons and do not establish which runtime operation or
+hardware path introduced the upstream differences.
+
+This supports the MLP product input as the main contributor to the large
+absolute down-projection drift, rather than showing a standalone down-projection
+kernel error. It is not an exact same-host replay: ONNX ran on AMD EPYC 7763,
+while this local PyTorch replay ran on Intel Core i9-14900K. It therefore
+localizes a likely source but does not prove causality, establish backend parity,
+or satisfy any release gate. The fixed `1e-4` terminal-logit parity gate remains
+red; no tolerance or release contract changed.
+
+#### Local parity and CPU accumulation sensitivity (2026-10-09)
+
+The pinned source model was then run through the public PTQ and ONNX path on
+the local Core i9-14900K CPU. The source digest remained
+`sha256:07b6b933f97ef0d84d39eab5f6761de34eb07f1d14c43f1f22f70a06d54266b7`;
+the deterministic local calibration and conversion matched the earlier local
+identities (`bfdf8ddc…` and `e6c97ef3…`). `export_module_onnx` passed the same
+`1e-4` parity check and produced artifact `d95d6f40436410cc84da7e68c9c4072b6b420bcfcb5e85a309d3ecb9d247e72f`.
+This is a same-host result for the local PTQ artifact, not the hosted artifact
+or a model-quality gate.
+
+A separate replay used the exact hosted ONNX graph and its captured AMD
+quantized-model reference on this Intel host with the CI-pinned ONNX Runtime
+1.27.0 and `ORT_DISABLE_ALL`. The terminal outputs passed at explicit
+intra-op thread counts 2 and 4 (max tolerance ratios `0.862` and `0.707`), but
+failed at 1 thread (3 logits; max ratio `1.036`) and ORT's automatic thread
+count (334 logits; max ratio `1.886`). Thus thread configuration materially
+changes this near-threshold result even on one host. However, this does not
+explain the original AMD-hosted failure: the runner had four available CPUs,
+yet the exact graph still failed there. A fixed thread count alone is not an
+established cross-host remedy.
+
+As a numerical diagnostic only, all 216 `node_linear_*` MatMul operations in
+the hosted graph were rewritten in scratch to cast operands to FP64, multiply,
+then cast outputs back to FP32. The hosted captured reference then passed on
+this Intel host at 1, 4, and automatic thread counts (maximum tolerance ratio
+`0.646`); casting only block 11's three projections did not remove the
+thread-sensitive failures. A corresponding local-artifact replay also passed
+at all three thread settings. This suggests accumulation behavior distributed
+across projections is worth investigating, but it is not a source change or a
+fix: the rewrite was cross-host, only one 7-token sample, and not measured
+reliably for performance, peak memory, or accelerator/browser compatibility.
+Do not adopt FP64 projection math without those gates. The terminal parity
+failure on the AMD runner remains unresolved, and the `1e-4` contract remains
+unchanged.
+
 ## Gate status (measured 2026-09-03)
+
+### Hugging Face distributed CPU software checks (2026-10-04)
+
+At source commit `e8362849`,
+`/home/brianklam/.cache/tritium-py313-ci/bin/python -m pytest -q
+crates/tritium-py/tests/test_huggingface_distributed.py` passed three checks:
+two-rank CPU DDP training plus checkpoint reload, two-rank CPU FSDP training
+plus sharded checkpoint resume/export, and Accelerate CPU bf16 execution. The
+CUDA-only Accelerate test was skipped because this environment has CPU-only
+PyTorch (`2.11.0+cpu`; Transformers `5.5.3`).
+
+This verifies useful distributed software paths, but it is not the
+candidate-bound `distributed-training` release receipt and does not qualify
+multi-GPU execution, CUDA checkpointing, or performance. The `pytorch-hf` gate
+remains PARTIAL until its required two-or-more-GPU evidence is registered.
+
+At source `3a7c1309`, the two-rank CPU FSDP worker was rerun with
+`PYTHONPATH=crates/tritium-py/python
+/home/brianklam/.cache/tritium-py313-ci/bin/python -m pytest -q
+crates/tritium-py/tests/test_huggingface_distributed.py::test_two_rank_cpu_fsdp_step_and_sharded_state_resume`;
+it passed (`1 passed` in `2.62s`). The test exports by merging the already-saved
+sharded DCP checkpoint into a fresh ordinary model; it does not call the
+segfaulting PyTorch 2.11 CPU FSDP full-state API. This confirms the bounded CPU
+workaround, not that upstream full-state export is fixed or that accelerator
+DDP/FSDP release evidence is complete.
+
+The source-tree PyTorch dispatcher checks also passed on this branch head:
+`/home/brianklam/.cache/tritium-py313-ci/bin/python -m pytest -q
+crates/tritium-py/tests/test_torch_dispatch.py -k
+'opcheck_and_fullgraph_compile or supports_functorch_grad_and_vmap'` reported
+2 passed, 34 deselected. This checks the CPU ternary op's `torch.library`
+opcheck, full-graph eager-backend compilation, `torch.func.grad`, and vmap
+behavior. It is narrow local software evidence, not a built-wheel check, GPU
+qualification, or a distributed-training receipt.
+
+The focused Qwen3.6 capture integration suite also passed on CPU:
+`/home/brianklam/.cache/tritium-py313-ci/bin/python -m pytest -q
+crates/tritium-py/tests/test_kronecker_capture.py
+crates/tritium-py/tests/test_qwen36_components.py` reported 41 passed and 1
+CUDA-only skip. These synthetic checks cover Qwen component resolution,
+capture-session resume/publication, token-stream binding, and small-model
+capture behavior. They do not establish the pinned checkpoint's real 506-record
+calibration capture, MTP production parity, or a release receipt.
+
+### PR CI on release-input-admission (2026-10-04)
+
+GitHub CI, docs, capstone CPU smoke, wheels, and CodeQL all passed for branch
+head `cecf528bce32d000fe7cb1e116cd3c9dcb276d46` in run
+[`37218555369`](https://github.com/Quitetall/tritium/actions/runs/37218555369).
+The CI matrix included the receipt-backed compatibility-matrix job. However,
+the downloaded crate and npm qualification receipts bind source revision
+`b4b475da036791e93015439095eb5829bd13ae94`, the PR merge tree, rather than the
+branch-head candidate. They are not admissible as package evidence for the
+branch-head revision. The exact-source workflow supports an explicit source
+revision, but no separate run has been dispatched for `cecf528`; package-matrix
+admission therefore remains open for that candidate. Hardware and release
+qualification are not implied by this PR CI result.
+
+### Exact-source PR CI refresh (2026-10-04)
+
+GitHub Actions run
+[`37253818275`](https://github.com/Quitetall/tritium/actions/runs/37253818275)
+completed successfully for exact branch head
+`f2b2b3a35058638171df4928f8e120f453bcb760` on
+`feat/release-input-admission`. The workflow's source-bound jobs verified and
+used the PR head revision. The required CI aggregate passed, including the
+cross-platform CPU test/lint/format matrix, source-bound compatibility and
+package checks, CPU serving contract, ONNX CPU custom op, Burn/Candle CPU
+interop, MSRV, API stability, supply-chain, SBOM, and workflow lint checks.
+
+The run explicitly skipped fuzz parsers, CUDA conformance/parity, real-model
+serving E2E, ROCm, performance regression, wgpu, and Metal. This is exact-source
+software CI evidence only. It does not replace the package-matrix release
+receipt, physical backend evidence, real-model serving or quality gates, or
+independent release qualification.
+
+The next exact-source run for head
+`d32b2cab40b4f5ccedd74ea878062997485c7405` also completed successfully:
+[CI run `37254882104`](https://github.com/Quitetall/tritium/actions/runs/37254882104)
+passed its required aggregate, and
+[wheel run `37254882146`](https://github.com/Quitetall/tritium/actions/runs/37254882146)
+passed. CI skipped fuzz parsers, CUDA conformance/parity, real-model serving
+E2E, ROCm, performance regression, wgpu, and Metal. The result validates the
+exact software revision and package workflow, but does not close the omitted
+hardware, performance, real-model, or independent release gates.
+
+### PR CI refresh — research note commit (2026-10-04)
+
+GitHub CI run
+[`37256062399`](https://github.com/Quitetall/tritium/actions/runs/37256062399)
+completed successfully for PR head `8289f9103a329c06dabca62856d7dc529bd280d3`
+on `feat/release-input-admission`. The required aggregate and all enabled jobs
+passed, including Linux/macOS/Windows CPU formatting, lint and tests, the
+receipt-backed compatibility matrix, web package, crate packaging, API
+stability, WASI, mocked serving, ONNX CPU, Burn/Candle interop, MSRV, supply
+chain, SBOM and workflow lint. Source-bound evidence jobs use the PR head and
+verify it with `verify-workflow-source.py`; the general PR CPU matrix validates
+GitHub's merge result, as the workflow documents. The run skipped fuzz,
+CUDA/ROCm/Metal/wgpu execution, real-model serving and performance regression.
+This is software-CI evidence only; it does not close physical backend, model
+quality, runtime-performance, flagship, or independent release gates.
+
+### Installed CPU wheel, HF lifecycle, and ONNX smoke (2026-10-04)
+
+At source revision `2f53bf00658f9d8412b98acff387763efb4e191d`, a CPU abi3 wheel
+was built from a clean `git archive` of that commit, keeping unrelated dirty
+working-tree edits out of the artifact. `scripts/verify-wheel.py
+/mnt/2tb/tritium-wheel-2f53bf00-clean --install-smoke` passed. The wheel is
+`pytritium-1.1.0rc2-cp39-abi3-linux_x86_64.whl`, SHA-256
+`ea6b94ca7ee1f8fc766ec6d63dd2d13fa1e20af6c068bd1413bb17767442701a`,
+10,228,737 bytes. Its `linux_x86_64` tag is host-local and is **not** a
+manylinux/release wheel.
+
+The installed-wheel functional smoke passed on CPU with PyTorch 2.11.0+cu130,
+Transformers 5.5.3, and safetensors 0.8.0. It exercised native ternary matmul,
+Hugging Face QAT forward/backward and optimizer update/resume, safe checkpoint
+save/reload, and tied-weight identity. Receipt:
+`/mnt/2tb/tritium-wheel-2f53bf00-clean/functional-receipt.json`, SHA-256
+`e6882d1179f54b694bbde145bdcff373a948a11445c79b2701c4a0d5e463376c`, receipt
+ID `sha256:ae75353764ac5c4fa7ebc7680f3e4ed07e0bb040e8f3f6e153f3566327b57eae`.
+Its Tritium package and extension were loaded from the isolated wheel venv and
+checked against the forbidden source-checkout path; dependency packages were
+available from the host Python site packages, so this is not a fully isolated
+dependency-install qualification.
+
+From outside the checkout, the installed-wheel HF lifecycle receipt tests and
+QAT tutorial receipt tests passed (2 + 5). The ONNX tests passed 28/28 using
+ONNX 1.23.1, ONNX Runtime 1.30.0, and ONNX Script 0.7.2; they exercise tiny
+module/graph artifacts, not whole-Qwen inference. Separately, the source-tree
+Python suite passed 363 tests and skipped 27: CUDA-extension tests, the two
+installed-wheel-only files, ONNX before its dependencies were added, and
+external cross-project migration tests. These local checks do not close the
+manylinux package matrix, CUDA wheel, two-physical-GPU distributed training,
+full-Qwen ONNX, model-quality, or independent-release gates.
+
+### Installed CUDA manylinux wheel smoke (2026-10-04)
+
+At source revision `a6487b23f84c248f1440c5b71488db10621ad44c`,
+`scripts/build-cuda-manylinux-wheel.sh` built the CUDA-enabled abi3 wheel in
+the pinned manylinux 2.28 container against the host CUDA 13.4 toolkit. The
+wheel is
+`pytritium-1.1.0rc2-cp39-abi3-manylinux_2_28_x86_64.whl`, SHA-256
+`7e4bfe1c8ffc8e16a165a77b9a3807af2f873c8c49224379e1ab1a240655c35a`,
+2,889,220 bytes. `scripts/verify-wheel.py` passed its exact platform-tag,
+wheel-integrity, and isolated-install checks. Its wheel smoke receipt is
+`/mnt/2tb/tritium-cuda-wheel-a6487b23/wheel-smoke.json` (SHA-256
+`e94562b037e033415505b62b63c65411869a510095a71cba48c4f423e18e25b3`),
+bound to CPython 3.14.7 and target `linux-x86_64-cuda13-sm89`.
+
+The installed-wheel functional smoke then passed on the RTX 4090 with native
+device `cuda:0`: native ternary matmul, Hugging Face QAT forward/backward,
+optimizer update and resume, safetensors save/reload, and tied-weight identity.
+Receipt:
+`/mnt/2tb/tritium-cuda-wheel-a6487b23/functional-receipt.json`, SHA-256
+`feb46e27d24534bdbb92352d867b3f7b302e67bb035f9d616d3f6b3fe39bb1d0`,
+receipt ID `sha256:2a8af2b9db4d1923e2b63af848002d341c56d6b760dc97352c406ab002f301b6`.
+The native ternary operation used CUDA; the tiny PyTorch/HF QAT lifecycle ran
+on CPU. This is one local Linux/Python/GPU package smoke, not a wheel-matrix
+qualification, Qwen test, CUDA QAT proof, performance result, or independent
+release gate. The wheel and receipts are durable local evidence under
+`/mnt/2tb/tritium-cuda-wheel-a6487b23/`.
+
+The installed-wheel QAT tutorial was also run separately on `cuda:0` from
+outside the checkout. It completed a two-plane tied-embedding QAT step with a
+finite nonzero gradient, optimizer save/resume, hard export, and strict artifact
+reload; `--check-receipt` reopened the receipt and artifact successfully. Its
+receipt is
+`/mnt/2tb/tritium-cuda-wheel-a6487b23/tutorial-cuda/receipt.json` (SHA-256
+`4de946cc4128bf3595e341d9351ba62d4f737837623015f87eccbc79441cdc98`,
+receipt ID `sha256:abc1f22c92faa68093ff9e7cedc162548c6e7c2a639871062c10f71462ed8ed0`).
+The hard artifact is a 2,533-byte tiny fixture, not a language model. This run
+used the venv's normal Python mode so its CUDA-enabled PyTorch from host
+user-site packages was visible; isolated `python -I` saw a non-CUDA PyTorch and
+did not run this tutorial. It therefore verifies installed Tritium wheel
+behavior on this host, but not a self-contained dependency environment or the
+cross-platform CUDA packaging matrix.
+
+### Current-revision CPU manylinux wheel and installed facade (2026-10-04)
+
+At exact source revision `d885a80a770c19332d09b79bb844773d1aadb7b3`,
+`/home/brianklam/.cache/tritium-prepush/worktree` was a clean detached worktree.
+`scripts/build-cpu-manylinux-wheel.sh` produced
+`/mnt/2tb/tritium-wheel-d885a80/pytritium-1.1.0rc2-cp39-abi3-manylinux_2_28_x86_64.whl`,
+10,514,698 bytes, SHA-256
+`7cb0e9c2ffb0adc3c6d132625e6341369b99984e50f7ea71a224a435643ac299`. The
+manylinux platform and isolated install check passed. The wheel-smoke receipt
+at `/mnt/2tb/tritium-wheel-d885a80/wheel-smoke.json` has SHA-256
+`509b8809b940475407fc49fc29d27d45ef4ac2ad75bcc85ac6a9d10bd758bf7b`.
+
+The installed-wheel functional smoke passed on CPU. Its receipt at
+`/mnt/2tb/tritium-wheel-d885a80/functional-receipt.json` has SHA-256
+`8e48e3eb7ae9f579e5367e3b0610b1ccfa8544212d0582b17fdc176610315e10` and
+receipt ID
+`sha256:c5b03196e628321d3e8995bc533a510581a8d892f15668d3d99da69e7225349c`.
+It exercised native CPU ternary matmul, HF QAT forward/backward, optimizer
+update/resume, safetensors save/reload, and tied-weight identity under CPython
+3.14.7, PyTorch 2.11.0+cu130, Transformers 5.5.3, and safetensors 0.7.0. The
+test venv installed the Tritium wheel but inherited dependency packages from
+the host Python site; it is not a fully isolated dependency-install test.
+
+The 24 tests in `crates/tritium-py/tests/test_torch_onnx.py` also passed from
+that installed-wheel venv, with `tritium` resolved under the venv's
+`site-packages`. The generation-adapter test uses a fake native runtime; this
+does not qualify a real ORT session or whole-Qwen generation. These are
+current-revision local package checks, not the cross-platform matrix, aggregate
+package gate, or independent release qualification.
+
+### Current-head CPU manylinux wheel refresh (2026-10-04)
+
+The exact clean candidate worktree at
+`/home/brianklam/.cache/tritium-prepush/worktree` was advanced to
+`9f19b20b53a2d19aca3c6839b2d67611ce592811` and remained clean. The pinned
+manylinux build produced
+`/mnt/2tb/tritium-wheel-9f19b20/pytritium-1.1.0rc2-cp39-abi3-manylinux_2_28_x86_64.whl`,
+10,514,737 bytes, SHA-256
+`4f7770f7cfd9c0d877c7e11926e04995a6c3051dcc6985b79842f32069724662`. Its
+platform-tag and install smoke passed. The verifier receipt is
+`/mnt/2tb/tritium-wheel-9f19b20/wheel-smoke.json`, SHA-256
+`aaaec33867016cdafca1e81d881a3ee60098bbe7ed4a548eca41d823a900173d`.
+
+The installed-wheel CPU functional smoke passed from the wheel's venv. Its
+receipt is `/mnt/2tb/tritium-wheel-9f19b20/functional-receipt.json`, SHA-256
+`228debaf0ef27a5b76864a0147d000106cec293a54ed71702d47c8ad4288bd3f`, receipt
+ID `sha256:270d6d4c8caf6270b1e30257500124e7b5652ef1c636288c5d8810983d68e7a2`.
+It exercises native ternary matmul, HF QAT forward/backward, optimizer
+step/checkpoint resume, safetensors save/reload and tied-weight identity on
+CPython 3.14.7 with PyTorch 2.11.0+cu130, Transformers 5.5.3 and safetensors
+0.7.0. The venv installed the Tritium wheel but inherited dependency packages
+from host site-packages, so this is not a fully isolated dependency test.
+
+All 24 `test_torch_onnx.py` tests also passed from that installed-wheel venv;
+the import resolved to its `site-packages`. The generation facade tests use a
+fake native runtime, not a real ONNX Runtime session or whole-Qwen execution.
+These checks are local candidate-revision package evidence only. They do not
+close the aggregate package gate, cross-platform matrix, real-Qwen ONNX,
+model-quality or independent-release gates.
+
+### Current-revision browser npm archive (2026-10-04)
+
+At clean detached source revision
+`7867ee606b1c273e7dc2b72e762db4fba79fdb1d`, the offline browser package
+workflow passed with `npm run check`: generated-file checks, the pinned WASM
+build, strict TypeScript, package build, 145 Node tests, and archive
+verification. The locally built runtime was Node `v24.21.0` with npm `12.0.2`;
+this does not establish a Node 22 run or the cross-platform package matrix.
+
+The exact archive is
+`/mnt/2tb/tritium-npm-archive-7867ee60/tritium-ai-web-1.1.0-rc.2.tgz`,
+627,367 bytes, SHA-256
+`1d6363c21e49ffcbb80ddbd85f9eb4857706f43779070d3606aa4d154459200b`.
+Its strict npm qualification receipt
+`/mnt/2tb/tritium-npm-archive-7867ee60/npm-archive-receipt.json` validated
+with receipt ID
+`sha256:30ecad1f696cc44005a5426147517613ec73ed576e91c996c504309ea98d4659`.
+The package-lock CycloneDX SBOM was reproduced exactly from the archive-bound
+receipt and locked dependency inventory; it contains 49 dependency components.
+This is local package evidence, not a physical-browser WebGPU result or a
+release-candidate package-matrix pass.
+
+### Current-head browser npm archive on Node 22 (2026-10-05)
+
+At clean detached source revision
+`f003db81e7de8429325db114c7c8467becc5280c`, the full offline browser package
+workflow passed with Node `v22.23.3` and npm `12.0.2`. Generated-file checks,
+the pinned WASM build, strict TypeScript, all 145 Node tests, offline install,
+and archive verification passed. The strict receipt was independently reopened
+by `scripts/verify-npm-archive-receipt.py`'s validator.
+
+Archive: `release/v1.1/evidence/npm-node22-f003/tritium-ai-web-1.1.0-rc.2.tgz`,
+628,405 bytes, SHA-256
+`5c2e1eed2fd6ad5540f006fca8d0a2b9b684a2e313518af7d7b8fad91b306447`.
+Receipt: `release/v1.1/evidence/npm-node22-f003/npm-archive-receipt.json`,
+ID `sha256:67408cc2fa5f088d107402bc81ebd43db7dda47cda732a1867e765bcb520bfc3`.
+The SBOM is retained beside the archive. This adds a Node 22 local package
+result for the exact current head; it does not establish the cross-platform
+package matrix, candidate CI admission, or physical-browser WebGPU conformance.
+
+### Physical browser WebGPU lane fragments (2026-10-04)
+
+The exact RC.2 npm archive for clean source revision
+`7523eb94e4d9d092eee78c155daa4ef0d2473d63` (627,893 bytes, SHA-256
+`f9a869590467156dbb7d9aee83ff7eeb0d8b37246e95442ae5eb6243cef5cda4`) was
+run through the physical WebGPU WebDriver lane in Chrome 154.0.8037.92 and
+Firefox 157. Both traces report all 72 valid and 45 expected-invalid vectors,
+zero skipped cases, the complete prepare/forward/backward/step/checkpoint/
+resume/export/reload lifecycle, all six injected fault classes, zero
+steady-state readbacks, and an exported artifact byte-identical to the native
+reference. Chrome reports an NVIDIA RTX 4090 adapter. Firefox reports a
+browser-sanitized NVIDIA renderer string; its exact adapter model is unknown.
+
+The lane fragments and npm archive are retained at
+`/mnt/2tb/tritium-v11-browser-7523eb94/`. Trace SHA-256 values are
+`90ca8a1d6f8254760e8d25666b584de418d78474b61188bca8ab464caa288903` (Chrome)
+and `991bca2c5458d8daa90d4688ee74aaaeabffc2109622da9c2d4233a3bcc78ad4`
+(Firefox). These are contributor-run lane fragments, not a combined
+`browser-conformance` receipt: physical Safari, same-candidate aggregation and
+registry admission remain open. This also does not establish Node 22 or
+cross-platform package-matrix coverage.
+
+The same lane producer was rerun against the exact RC.2 npm archive for source
+revision `b95092301a544a460df0d90dc3771c26f44c2baf` (628,123 bytes, SHA-256
+`822bbaeeda9278b21a1791c18f0f403509e2681f8af13032936ce7fd0b49376e`) using
+the clean source worktree, its exact-source native reference, and retained npm
+qualification receipt. Chrome 157.0.8081.0 and Firefox 157 each completed all
+72 valid and 45 invalid-input cases with zero skips; both passed the full
+prepare/forward/backward/optimizer/checkpoint/resume/export/reload lifecycle,
+six injected fault classes, native artifact parity, and zero steady-state
+readbacks. Chrome identifies a non-fallback NVIDIA RTX 4090 adapter. Firefox
+identifies a non-fallback NVIDIA renderer but sanitizes the exact adapter model.
+Their trace SHA-256 values are
+`5294b2569e1486d3ab4a6d7a7ae1012d88f587189be52ae049c819dfe6c1c5b8` (Chrome)
+and `129b34281c53d44e009b7ada46341b266e6bce185a015ed048674b0a65eb980d`
+(Firefox). Lane and trace files are retained under
+`release/v1.1/evidence/browser-ci-b950923/`. These exact-source fragments still
+do not satisfy `browser-conformance`: the physical Safari lane, same-candidate
+aggregation, and registry admission remain open.
+
+### Browser-lane producer regression checks — 2026-10-09
+
+At source revision `b350a166ee38b99949c524751bc1b11325d4ca8e`,
+`node --test packages/tritium-web/tests/browser-lane-producer.test.mjs`
+passed all 7 tests. The suite covers npm/native-reference receipt binding,
+browser-trace assembly, canonical vector inventory, cancellation/allocation
+fault evidence, and WebDriver session/script routes. This is local producer and
+validator software evidence only; it creates no physical browser trace and does
+not close Safari, same-candidate aggregation, or browser-conformance registry
+gates.
+
+### ONNX Python facade source regression refresh (2026-10-04)
+
+`python -m pytest crates/tritium-py/tests/test_torch_onnx.py -q` passed 24
+tests on the current source checkout. In addition to strict manifest admission,
+typed artifact routing, batch-one forward and MTP calls, and greedy cached
+generation, the suite now exercises an opt-in Transformers `GenerationMixin`
+adapter that carries Tritium's tuple cache through the standard `.generate()`
+loop. The adapter is limited to batch-one CPU decoding without padding or beam
+search. The test uses a fake native runtime: it does not execute the candidate
+installed wheel, export a real authenticated Qwen bundle, or qualify whole-model
+Qwen generation. Those candidate-bound ONNX gates remain open. The same focused
+suite was rerun on 2026-10-05 at source revision
+`5afd487b6dcc97b3447c70ca8852adc19ecdd17a` with
+`/home/brianklam/.cache/tritium-py313-ci/bin/python -m pytest -q
+crates/tritium-py/tests/test_torch_onnx.py`; it again passed 24 tests. The
+rerun confirms the source-level facade result at the current release branch
+head only; it does not upgrade the test's fake runtime to real Qwen ORT evidence.
+
+### Serving software regression refresh (2026-10-04)
+
+At source revision `c12812ada218dfbd8cfb524e31852b09deab18df`, the local
+CPU-feature serving suite passed with
+`RUSTC_WRAPPER='' cargo test --locked -p tritium-serve --features serve`:
+42 library tests, 4 binary tests, 2 CLI tests, 31 contract tests, and 1
+OpenTelemetry parentage test passed (80 total, 0 failed). The `batch_serve`,
+`e2e`, and `spec_lookup` integration targets registered zero tests under this
+feature selection; this run does not qualify CUDA, real-artifact serving, OCI,
+Kubernetes deployment, or model quality. The matching local check
+`RUSTC_WRAPPER='' cargo clippy --locked -p tritium-serve --features serve
+--all-targets -- -D warnings` also passed. These are contributor-run software
+checks, not independent release receipts; the serving gates below remain open.
+
+### Stage-7 campaign orchestration regression checks (2026-10-04)
+
+At source revision `b127fae2ee094647e5d6c61dadf465903701dd99`, Python 3.14.7
+ran
+`python -m pytest -q scripts/tests/test_run_stage7_recipe_freeze.py
+scripts/tests/test_qualify_stage7_recipe_freeze.py
+scripts/tests/test_verify_stage7_qualification_receipt.py`: 63 passed in
+16.32 seconds. These synthetic tests exercise campaign orchestration, resume,
+qualification, and strict receipt verification. They do not run the SmolLM2
+recipe-freeze measurements, establish a terminal recipe decision, or create a
+candidate-bound `stage7-recipe-freeze` release receipt. That empirical gate
+remains open.
+
+### GDN sensitivity receipt verifier alignment (2026-10-05)
+
+The local GDN sensitivity receipt verifier now requires both output- and
+state-divergence curves at every frozen sequence-depth point. It reports
+DeltaNet maximum and full-attention median terminal state divergence as
+diagnostics; the frozen routing decision remains based only on terminal output
+divergence. The focused verifier and probe-preflight suites pass (16 tests),
+Python compilation passes, and `git diff --check` passes. These are local
+software checks only: no measurement receipt was produced and no Qwen weights
+were loaded.
+
+The production measurement producer is still missing. The Qwen runtime now has
+an internal paired-sampling seam that can collect final hidden rows and selected
+DeltaNet recurrent states at frozen token positions; fixture tests exercise it.
+Proposed [ADR 0049](adr/0049-qwen36-gdn-sensitivity-metric.md) now defines
+absolute RMS output/state metrics, fixed sample positions and state-layer
+selection, but it is still `PROPOSED`; the v2 receipt schema and verifier are
+not implemented. Therefore no accepted metric contract or source-bound
+measurement producer exists yet. No eight-probe measurement has run against the
+approved calibration pack, and no measurement receipt has been produced. Do not
+start those probes until ADR 0049 is accepted, the v2 verifier and producer are
+implemented and independently checked, and campaign authorization is explicit.
+No probe execution or flagship campaign was started for this software change.
+
+### Admitted scale-refined child execution (2026-10-05)
+
+`Qwen36AdmittedExecutionSession::replay_refined_candidate` now reopens an
+immutable scale-update child under the exact admitted parent profile, validates
+parent/child identity and physical ledgers, freshly executes final logits and
+the frozen output scopes on the sealed built-in backend, and mints the separate
+`TSQ36RC v1` refined-execution receipt. The focused synthetic end-to-end test
+`admitted_qwen_execution_binds_campaign_packages_backend_tokens_and_outputs`
+passed, and `cargo test --locked -p tritium-salt --lib` passed (65 passed, 2
+ignored). `cargo clippy --locked -p tritium-salt --all-targets -- -D warnings`
+also passed. This verifies the campaign API and receipt path on a small CPU fixture
+only. No pinned Qwen checkpoint was loaded; this is not Stage-9 quality,
+performance, physical-size, CUDA, or release evidence.
+
+#### B3 lineage decision (2026-10-06)
+
+The user selected the immutable-child-package path for sliding-window scale
+updates. The existing `TSQ36RC v1` path is the required replay/lineage mechanism;
+the base `TSQ36EX v1` stays final-logit-only, and child scope evidence must not
+be mislabeled as a `TSQ36SB` binding. This decision resolves the lineage choice,
+not the B3 optimizer. On 2026-10-07, commits `2689b865`, `e032d89e`, and
+`7537780c` added a bounded-memory `FixedTritScaleUpdateCandidateBuilder`: it
+streams activation windows, emits canonical f16 scale updates, binds the owned
+candidate to the frozen spec/parent/seed, and derives residuals as
+`teacher - (current projection - active tile-plane contribution)`. The builder
+now computes that active contribution directly from the fixed trits, base scales,
+and activation window. Shape and finite-value errors are rejected. The
+output-reconstruction integration suite passed (23 tests), package Clippy passed
+with warnings denied, formatting passed, and the focused Qwen admission fixture
+(1 test) passed. That fixture covers the existing immutable-child replay path
+separately; the new builder is not yet connected to it. These are CPU fixtures,
+not Qwen quality or hardware evidence. Production B3 remains open: a Qwen adapter
+must supply aligned teacher/current projection outputs and exact base trits/scales;
+deterministic per-window candidates must be scored and selected against the frozen
+objective; selected updates must then be joined to child materialization and exact
+replay. No full Qwen campaign or paid compute is authorized by this decision.
+
+On 2026-10-06, the bounded Qwen paired-projection visitor was exposed as a
+campaign-facing API. It resolves canonical MLP, DeltaNet, and full-attention
+projection names, validates teacher/current geometry and activation arithmetic,
+and synchronously lends finite outputs to the caller without retaining them.
+The loaded SALT V2 fixture exercises it. The local ADR 0028 working copy records
+the provenance boundary: callers bind teacher identity, activation identity,
+projection name/index, spec, and parent. That amendment has not been promoted
+from the private research repository into this public checkout. This visitor is
+only an adapter seam; dense teacher acquisition, full campaign data capture,
+and production candidate orchestration remain open.
+
+The admitted-child CPU fixture now closes another software seam: it fits two
+seeded scale candidates under a two-restart spec, materializes each as its own
+immutable child, evaluates each loaded child into an output candidate receipt,
+selects through the frozen objective, maps the winning receipt back to the exact
+fitted candidate and child lineage, and freshly replays that child into
+`TSQ36RC`. The fixture uses each child's own outputs as its teacher, so it
+exercises identity joining and deterministic tie selection, not dense-teacher
+quality ranking. The full `tritium-salt` suite passed (65 unit tests, 2 ignored;
+all integration suites passed) and Clippy passed with warnings denied. This
+proves software composition on synthetic CPU data, not Qwen quality, full-model
+coordination, CUDA, or production qualification.
+
+`OutputReconstructionReceipt::selected_fitted_scale_update_candidate` now
+provides that join as a reusable checked API. It verifies spec and parent
+identity, the full frozen restart count, unique fitted IDs/seeds, and an exact
+ID-plus-seed match for every scored restart before returning the selected owned
+update set. Focused tests reject wrong-parent and missing-restart inputs; the
+admitted-child fixture now uses this resolver instead of manually matching
+candidate IDs. Additional tests prove candidate-list reordering is harmless and
+substituting an unscored fit is rejected. This adds no receipt fields or
+wire-version changes, and enforces ADR 0050's exact child-candidate binding.
+
+The admitted-session API now composes the visitor with the frozen spec, a
+verified parent execution, an activation source, and a parent-bound scale-fit
+builder. It reopens each requested block window against the activation-cache
+digest, chooses the cache for the named projection's layer, and feeds paired
+teacher/current outputs into the active plane fit. It checks package admission
+again after the window. The builder accepts zero scales only when the matching
+trit group is all zero, matching the SALT V2 package contract; it rejects
+negative zero and zero-scaled nonzero groups. A synthetic admitted-Qwen fixture
+now starts a fit from a strict packed parent plane and produces a spec- and
+parent-bound candidate. The focused fixture, quantize tests, formatting, and
+scoped Clippy passed. This is software-path evidence only: the fixture uses
+synthetic activations and teacher weights, not the pinned Qwen teacher or
+admitted production captures. Full deterministic candidate scoring/selection
+and Qwen empirical evidence remain open.
+
+The fixture now feeds the actual fitted candidate through the existing child
+package writer. It reopens the candidate under its exact frozen spec, checks the
+parent digest against a strict reader, emits `SaltV2ScaleUpdateChild` lineage,
+then reloads the child and replays it through `TSQ36RC v1`; it no longer
+substitutes hand-authored scales. The focused fixture and `tritium-salt` Clippy
+passed. This proves the synthetic candidate-to-child-to-replay composition,
+not a shipped campaign coordinator. A production admission-bound materializer
+still needs its ADR/API decision; deterministic whole-model scoring/selection,
+restart orchestration, admitted production captures, and Qwen empirical evidence
+remain open.
+
+The quantize suite now also composes four independently seeded fits with the
+frozen output scorer and restart selector. It verifies that the selected
+`OutputCandidateReceipt` maps back to the exact fitted scale-update candidate,
+not merely a separately hand-labeled candidate ID. All 26 output-reconstruction
+tests and quantize Clippy passed. This remains synthetic: it does not score a
+loaded child model against dense Qwen teacher outputs or establish model quality.
+
+### Dynamic packed-embedding ONNX export repair (2026-10-07)
+
+Commit `cf87c4fc` removes the dynamic-slice `copy_` from the `torch.export`
+capture path in `AdditiveTernaryWeight._dense_rows`. Dynamo capture decodes the
+selected token rows as one functional tensor; ordinary eager execution retains
+the bounded 2^18-weight-element chunk path. The regression uses a 576-wide,
+three-plane embedding and replays dynamic sequences on both sides of the eager
+chunk threshold. The full source-tree Python suite passed (374 passed, 27
+skipped), and the focused test passed on Python 3.13 / Torch 2.11.0 CPU with a
+tiny tied-weight Llama through the public ONNX exporter. That local environment
+used ONNX 1.23.1, ONNX Runtime 1.30.0 and ONNXScript 0.7.2, not the pinned
+SmolLM2 lane's exact ONNX dependency versions. The pinned model is not cached
+locally, so no second full tutorial run was started.
+
+Exact-source hosted run `37570157130` for `cf87c4fc` built Linux, macOS and
+Windows wheels, and its source-free tutorial and installed-wheel checks passed.
+At the last status check, the pinned SmolLM2 CPU tutorial was still running; it
+has no terminal result yet. Therefore the previously observed SmolLM2 exporter
+failure is not yet confirmed fixed by the exact candidate-wheel gate. This
+source-tree evidence does not qualify the release candidate.
+
+### Large flattened-index ONNX parity repair (2026-10-07)
+
+Commit `41dc1f4c` replaces `torch.div(..., rounding_mode="floor")` in packed
+row decoding with integer `torch.floor_divide`. ONNX had lowered the former to
+float32 divide/floor; flattened positions above 2^24 could therefore select
+incorrect packed-byte indices in large linear layers. The regression test
+crosses the first affected index and checks exported ONNX output against eager
+execution. The `test_module_onnx.py` suite passed (8 tests), as did the related
+dynamic-sequence embedding export test and `git diff --check`.
+
+Exact-revision hosted wheel workflow `37572547065` completed successfully.
+Its pinned SmolLM2-1.7B CPU PTQ/QAT tutorial step passed against revision
+`41dc1f4c`, including the ONNX replay/parity gate; Linux, macOS, and Windows
+wheel builds, the installed-wheel Torch test, source-free tutorial, and the
+abi3 matrix also passed. The tutorial evidence artifact was uploaded as
+`smollm2-cpu-tutorial` (artifact `11461188114`, 1,298,452,082 bytes). At this
+recording, Rust CodeQL remained in progress. CUDA, ROCm, Metal, wgpu, real-model
+serving, and performance lanes were skipped by runner policy, so this does not
+close those release gates or qualify the flagship Qwen artifact.
+
+The restart seed now also controls the actual initial scale vector: a
+domain-separated BLAKE3 derivation binds each initial scale to the frozen spec,
+parent package, seed, tensor, tile, plane, and scale-group index. The synthetic
+rank-deficient fit verifies that the seeded starts can produce distinct f16
+update vectors, and repeating one seed reproduces the exact candidate ID and
+update bytes. This closes a software mismatch where distinct candidate IDs
+previously labeled the same zero-start fit. It remains a synthetic solver test,
+not evidence that four starts improve Qwen quality; the production scorer must
+choose among candidates using the frozen output objective.
+
+### Flagship campaign status refresh (2026-10-04)
+
+The canonical read-only probe was rerun against the durable workspace
+`/mnt/4tb/tritium-qwen36-campaign-20260813` with
+`python scripts/qwen36-ptq-status.py --work-dir
+/mnt/4tb/tritium-qwen36-campaign-20260813 --json`. It still reports
+`status=stalled`, 0 of 506 published masters, zero seals, and one staged
+447,083,070-byte record whose recorded PID is not alive. This does not change
+the prior provenance finding: the legacy S2KF evidence is not admitted for
+fitting without a source-bound capture transcript or a recapture from the
+approved calibration pack. No campaign was started or modified for this
+refresh.
+
+The probe was repeated on 2026-10-04. It again reports `stalled`, 0/506
+published masters, zero seals, and the same 447,083,070-byte temporary record
+with a dead recorded PID. The durable workspace contains 506 `.s2kf` capture
+records (about 3.8 GiB); these are activation/evidence records, not fitted
+master tensors. The source-admission receipt describes 27,318,026,240
+additive coefficients across the 506 target tensors, but a matching tensor
+count does not establish that these old captures used the approved 512-sequence
+calibration pack. The capture-binding receipt is still missing. The campaign
+was not restarted, and no fitting or model replay was run.
+
+The local synthetic resume/seal regression
+`RUSTC_WRAPPER='' cargo test --locked -p tritium-salt
+campaign_resumes_seals_and_preserves_the_base_workspace -- --nocapture`
+passed (1 test, 0 failed). It exercises restart, sealing, and preservation of
+the base workspace using a fixture. It does not reopen the recovered 506 Qwen
+captures, fit model tensors, or establish model quality or release readiness.
+
+### Local pinned-checkpoint inventory refresh (2026-10-04)
+
+Read-only inventory found all 15 named safetensors shards plus config, index,
+and tokenizer files in each of these local directories:
+
+- `/mnt/4tb/models/Qwen3.6-27B`
+- `/mnt/4tb/models/qwen36-27b-6a9e13bd`
+- `/mnt/4tb/qwen36-27b-source-6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`
+
+The inspected Hugging Face cache metadata names pinned revision
+`6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`. The durable source directory
+`/mnt/4tb/qwen36-27b-source-6a9e13bd6fc8f0983b9b99948120bc37f49c13e9` was
+checked against the existing pinned official identity receipt
+`sha256:154f7807dc5aa829dd061020c4cf8e10db1aefafd2f6f95d6ab8301d5c01dbc9`:
+all 29 file sizes and declared digests matched (15 safetensors shards and
+`tokenizer.json` by SHA-256; 13 small repository files by Git blob SHA-1).
+Its source-admission parent is `sha256:0a45d3b593893aaf660d34ecd31cc66bf28ae4fd19d411ffa0671d2747ca2fd4`.
+The shard files total 55,563,006,400 bytes; this is 150,496 bytes above the
+campaign's 55,562,855,904-byte raw tensor payload because the safetensors files
+also contain headers/metadata. That difference is expected and is not a model
+weight mismatch. This verifies that one local snapshot matches the pinned
+official file manifest; it does not turn the base source-admission receipt's
+`official_payload_authenticated: false` field into true or admit calibration
+evidence. The other two directories have the expected filenames and sizes but
+were not independently rehashed. Campaign status remains stalled (0/506
+published masters, zero seals). No source weights were altered, deleted, or
+fitted.
+
+### Qwen source and calibration preflight recovery (2026-10-04)
+
+The source-admission receipt still referenced a proof under `/mnt/4tb/tmp` that
+no longer exists. The same 221,951-byte `ingest.tq36` proof was found in both
+`/mnt/4tb/qwen36-source-admission/...` and the durable campaign workspace; both
+copies hash to the receipt's expected SHA-256
+`09b59e8e41d7e0f947e31d2fc8f4fb635804f162f0c7558a2df6ff6d98b834e0`. The
+old campaign receipt did not match the parent of the existing official-source
+identity receipt, so the strict no-overwrite
+`scripts/rebind-qwen36-source-evidence.py` was used with the matching admitted
+receipt and verified proof. It produced a fresh, strictly reopened receipt pair
+and copied proof under
+`/mnt/4tb/qwen36-source-admission/rebound-20261004/` (rebind receipt
+`sha256:f316adcfe1da1343f1cdf52168ade72e48b59b6275e0dd3a9c5ed721234ee7f8`).
+Original evidence was left unchanged.
+
+Using the verified local checkpoint, rebound official-source identity, and the
+existing token pack, `scripts/verify-qwen36-calibration-pack.py` passed and
+produced calibration-pack receipt
+`sha256:b5b2ba2801cc5125e6cc7561117268bf29a20f153a7e662c47a1ca2f078beb63` plus
+pre-capture replay contract
+`sha256:089f3800c6817c3a079fc146d9f087093031bee6b416c58eff708e28e0c5b55a`.
+The pack contains 512 calibration sequences (1,048,576 ordered tokens). The
+`scripts/capture-qwen36-from-pack.py` preflight passed against these exact
+identities and batch digest
+`sha256:ca913e334bf22c73755d27b11848599008790f672600b8085daf5ec53022202c`;
+it explicitly reported `NOT STARTED` because `--execute` was not supplied.
+
+The campaign workspace has 506 existing `.s2kf` files but no discovered
+pack-linked capture-binding receipt. These records are not admitted as the new
+verified pack's captured calibration evidence merely because the count matches
+the tensor count. The canonical fitter still reports 0/506 published masters
+and no seals. Next gates are a candidate-bound Stage-7 qualification, actual
+pack-linked model replay/capture, strict capture-binding verification of all
+506 records, and only then fitting. No GPU model load or capture was started.
+
+### CUDA paged-KV cancellation smoke (2026-10-03)
+
+At source revision `8e8f6e0eecd6521adaf7e5911b580af4ffebba2a`, the focused
+CUDA BitNet serving test
+`cargo test --locked -p tritium-serve --features cuda --test batch_serve
+cuda_batched_admission_interleaves_live_slot -- --exact --nocapture
+--test-threads=1` passed on the local RTX 4090: one test passed, zero failed,
+in 249.85 seconds. The 2,048-token admission window took 428 ms while the
+other slot emitted 16 tokens (maximum measured inter-token gap 35.5 ms); the
+test's active, prefill, and queued-cancellation assertions also observed exact
+KV reservation release and zero release failures. The cold warm-up request
+logged 183 seconds, so this is not a decode-performance claim. This was a
+source-tree integration test using the local BitNet GGUF compatibility fixture,
+not a candidate-bound production-bundle receipt or the strict schema-v3
+readiness gate. The checkout also contained unrelated, uncommitted EAT-O work.
+
+### CUDA cold-start phase diagnosis (2026-10-04)
+
+The same focused test was rerun with phase sums emitted after its first warm-up
+request. It passed (1 passed, 0 failed; 255.64 seconds). The first request
+measured 197.641 seconds from HTTP acceptance to decode-worker admission,
+0.006 seconds in prefill, 0.141 seconds in decode, 197.649 seconds to first
+token, and 197.791 seconds end to end. This localizes the cold delay before
+model prefill/decode; it is not evidence of slow ternary token execution.
+
+Source inspection explains the phase boundary: the batched worker constructs
+the resident decoder and paged-KV pool before it receives queued jobs, while
+the router previously marked the worker alive as soon as the thread was
+spawned. That let chat requests queue during CUDA batch initialization while
+`/readyz` incorrectly reported ready. The router now tracks batch-worker
+readiness separately from liveness, rejects chat until decoder and KV-pool
+initialization succeeds, and clears readiness if the worker exits. The focused
+RTX 4090 test passed (1 passed, 0 failed; 223.90 seconds): `/readyz` was 503,
+`/healthz` was 200, and early chat was 503 during startup; readiness later
+became 200 after 165.043 seconds, and the existing admission/interleaving
+checks passed. This is local source-tree evidence using the BitNet GGUF fixture,
+not a candidate-bound schema-v3 readiness/deployment receipt, Qwen evidence, or
+a release qualification. Plan 0052's production artifact and deployment gates
+remain open.
+
+### IMMA startup policy comparison (2026-10-04)
+
+The same RTX 4090 integration test was repeated with only
+`TRITIUM_IMMA_TUNE` changed. Readiness time was measured from immediately before
+`build_router_batched` until `/readyz` returned 200:
+
+| Policy | Readiness time | Meaning |
+|---|---:|---|
+| default (`tune`) | 175.060 s | Runtime may search for tile choices, then load/compile the selected functions. |
+| `load` | 55.486 s | Avoids the runtime search; loads cached choices or uses the AOT choice. |
+| `off` | 10.004 s | Skips IMMA prefill setup; this is not performance-equivalent to the other policies. |
+
+Each run passed the same focused CUDA admission/interleaving test. These are
+single-run observations on one GPU, one BitNet fixture, and this source tree;
+they identify IMMA policy/setup as a major contributor to this cold-start case,
+but do not provide a general startup guarantee or isolate exact additive costs.
+`load` is a useful current operator workaround when its precomputed/AOT choice
+is acceptable. The default policy has not been changed: altering it would affect
+runtime behavior and needs a contract decision plus broader cold/warm and
+performance validation. `off` is diagnostic only, not a recommended equivalent
+serving configuration.
 
 ### Flagship campaign verification refresh (2026-09-29)
 
@@ -36,6 +997,400 @@ useful conversion outputs, not admissible complete-model release artifacts.
 Neither variant is bound to a candidate-specific flagship receipt. The
 historical gate inventory below predates this refresh and must not be read as
 current campaign liveness.
+
+### Source identity and retained-bundle follow-up (2026-09-30)
+
+A second read-only probe compared the dead staged record's header with its
+actual length: it declares a 1,077,709,406-byte record but contains only
+447,083,070 bytes (about 41.5%). This is an incomplete tensor stream, not a
+recoverable published master. Resuming the current campaign store scavenges
+crash-left temporary records; do not promote this file or describe it as a
+completed tensor.
+
+The two observed bundles are
+`/mnt/4tb/tmp/qwen36-ptq-b3-r2-r3-565abdee` and
+`/mnt/4tb/tmp/qwen36-ptq-b56b4b7-v1-bundle`. Their manifests carry the same
+campaign ID, completion ID, and measured source-model ID, but distinct
+selection IDs. Both remain explicitly unauthenticated and incomplete; their
+different profile sizes do not establish two independently completed master
+campaigns.
+
+The inspected durable source directory,
+`/mnt/4tb/qwen36-27b-source-6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`, holds
+about 1.1 GiB of Hugging Face cache data, including partial shard downloads,
+not the complete checkpoint. The pinned
+[official Qwen revision](https://huggingface.co/Qwen/Qwen3.6-27B/tree/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9)
+contains 15 weight shards totaling 55,562,855,904 bytes; its
+[revision API metadata](https://huggingface.co/api/models/Qwen/Qwen3.6-27B/revision/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9?blobs=true)
+provides the pinned per-file SHA-256 values for source verification.
+
+There is also a code-level admission prerequisite: `Qwen36SourceIdentityStatus`
+currently has only `MeasuredAwaitingOfficialRegistration`, whose
+`official_payload_authenticated()` result is false. A manifest edit cannot
+authenticate these bundles. Before another flagship run can produce admissible
+evidence, an independently verified official source identity must be
+registered through a separate source-identity path, and the complete pinned
+source payload must be available and verified. No download or campaign restart
+was performed for this follow-up.
+
+### Pinned source fetch and checksum verification (2026-09-30)
+
+The complete pinned Hugging Face snapshot has since been downloaded into the
+durable source directory above. `hf cache verify Qwen/Qwen3.6-27B --revision
+6a9e13bd6fc8f0983b9b99948120bc37f49c13e9 --local-dir
+/mnt/4tb/qwen36-27b-source-6a9e13bd6fc8f0983b9b99948120bc37f49c13e9
+--fail-on-missing-files` verified all 29 repository files and reported that all
+checksums match. Excluding Hugging Face's local `.cache` metadata, the directory
+contains exactly those 29 files totaling 55,586,107,940 bytes. Passing
+`--fail-on-extra-files` is not appropriate on this `--local-dir`: the CLI counts
+its own `.cache/huggingface` lock/metadata files as extras. Those files were
+preserved; no cleanup was needed.
+
+This verifies the downloaded files against the pinned Hub revision but does
+not by itself satisfy Tritium's code-level source identity admission. The
+source-admission receipt intentionally remains unauthenticated. A separate
+official-identity verifier and registration are still required before source
+admission can authorize the 506-tensor campaign. That campaign has not been
+restarted, and the prior incomplete bundle variants remain inadmissible.
+
+The Rust `qwen36-preflight` then completed against this verified snapshot. It
+measured source model ID
+`trm1_126eb094f936c87bf7aeff60e57dadf5351ff082a48b8d63c7553919029cd3ca`,
+manifest content ID
+`tsc1_9553bf20975ed88ab3a673522930f9b585ae2e205959ea3dd00ee79c9587c0ba`,
+and proof ID
+`tsc1_7e0c191fefc020e74bb0ea1da33d11f69a517a231970d6c9174ee66494e52aa1`.
+The generated 221,951-byte proof is byte-identical to the proof already in the
+stalled campaign workspace (SHA-256
+`09b59e8e41d7e0f947e31d2fc8f4fb635804f162f0c7558a2df6ff6d98b834e0`). This
+confirms the preserved workspace used the exact same content-bound source.
+
+The source-admission receipt produced with the matching CI wheel and accepted
+by `verify-qwen36-source-admission-receipt.py` has receipt ID
+`sha256:718abe3e52eab53cc7e945fc0232dc18a42e3bac413544b855494594ae7ba08b`.
+It confirms the 1,199-tensor inventory (506 additive, 360 preserved, 15 MTP)
+but correctly still reports
+`identity_status=measured-awaiting-official-registration` and
+`official_payload_authenticated=false`. The current master-campaign status
+probe still reports `stalled`, zero of 506 published master receipts, no seal,
+and the same dead 447,083,070-byte staged record. Source admission is not
+fitting completion or a deployable model.
+
+### Separate official source identity verification (2026-09-30)
+
+The new `verify-qwen36-official-source-identity.py` path separately fetches
+the pinned Hugging Face revision metadata, verifies every local file against
+the official file inventory (LFS SHA-256 for 16 files and Git blob SHA-1 for
+13 ordinary Git files), and requires the measured source-admission IDs to
+match the frozen Qwen3.6 identity. It verified 29 files totaling
+55,586,107,940 bytes, with official manifest digest
+`7911b682b615162590074c15baa429ff23c64b7c1d66bd2e134ef6fa3a2a3a3f`.
+
+Its generated receipt is
+`release/v1.1/evidence/qwen36-official-source-identity-2026-09-30/receipt.json`
+(receipt ID
+`sha256:154f7807dc5aa829dd061020c4cf8e10db1aefafd2f6f95d6ab8301d5c01dbc9`),
+bound to the measured source-admission receipt
+`sha256:0a45d3b593893aaf660d34ecd31cc66bf28ae4fd19d411ffa0671d2747ca2fd4`.
+This receipt does not mutate or replace source-admission evidence, and it is
+not yet a registered release gate. It establishes exact official snapshot
+bytes bound to the already measured semantic ID; integrating that registration
+into campaign authorization and the release registry remains open. The prior
+incomplete bundle variants remain inadmissible, and the 506-tensor campaign
+has not been restarted.
+
+### Source identity release-registry linkage (2026-10-01)
+
+The release evidence evaluator now requires both `source-admission` and
+`official-source-identity` receipts for the `qwen-source-admission` gate. The
+official receipt must name the exact source-admission receipt ID as its sole
+registry parent; both entries must bind the same candidate source artifact, and
+repository, revision, semantic model ID, manifest ID, and proof ID must agree.
+Each registry entry ID must also equal the ID derived from its immutable
+receipt bytes. An admission receipt by itself therefore remains `MISSING`, not
+a source-identity pass.
+
+This implements the registry-side linkage only. The no-replace producer is
+`scripts/register-qwen36-source-identity.py`; it copies the verified identity
+receipt into the evidence root, adds the exact admission parent, and validates
+the full candidate registry before retaining the new registry. Its fixture
+tests pass. An attempt to extend the retained `3662cc3f` registry rolled back
+its outputs because the old crate-archive receipt's lock digest no longer
+matches the current Cargo.lock. A current same-revision candidate and refreshed
+package evidence are needed for actual registry publication. The Python Qwen
+reconciliation wrapper and both public Rust PTQ reconciliation entrypoints now
+require a validated source-identity authorization. The shared Rust driver binds
+that authorization to the retained preflight before it opens or resumes the
+campaign workspace. Candidate-only source admission remains available for
+research, but cannot invoke the canonical Qwen PTQ reconciler without the
+official-identity receipt pair. This closes the execution-path gap; it does not
+register the source gate or refresh stale package evidence. No fitting or
+campaign restart was performed.
+
+### Durable source-proof copy (2026-10-01)
+
+The 221,951-byte proof named by the retained source-admission receipt was copied
+byte-for-byte from `/mnt/4tb/tmp` to
+`/mnt/2tb/tritium-release-evidence/qwen-source-admission/sha256-0a45d3b593893aaf660d34ecd31cc66bf28ae4fd19d411ffa0671d2747ca2fd4/source-proof.tq36`.
+Its SHA-256 is
+`09b59e8e41d7e0f947e31d2fc8f4fb635804f162f0c7558a2df6ff6d98b834e0`, matching
+the receipt. `scripts/rebind-qwen36-source-evidence.py` then produced a new
+durable receipt pair under
+`/mnt/2tb/tritium-release-evidence/qwen-source-admission/rebound-2026-10-01/`.
+The admission receipt changes only the proof path; the official-identity
+receipt changes only its admission parent and derived receipt ID. The
+`rebind.json` records both parent IDs, both new IDs, and the exact changed
+fields. The reissued pair passes the source-admission and official-identity
+receipt validators. This is a host-local relocation that reuses the existing
+official inventory and Hub-response digest; it is not a fresh Hub/checkpoint
+verification or a new release-registry admission. A standalone Rust check
+using the in-progress `Qwen36SourceIdentityAuthorization` consumer opened this
+reissued pair and verified the proof bytes and receipt IDs. The current tracked
+registry still references the original receipt pair, so `/mnt/4tb/tmp` must
+not be pruned until a new validated registry is published against the current
+candidate.
+
+### Revalidated durable source identity (2026-10-01)
+
+The official-identity verifier was rerun against the complete pinned snapshot
+at `/mnt/4tb/qwen36-27b-source-6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`.
+It passed all 29 files (55,586,107,940 bytes) against the pinned Hub inventory
+and emitted
+`/mnt/2tb/tritium-release-evidence/qwen-source-admission/recheck-2026-10-01/official-source-identity.json`
+with receipt ID
+`sha256:868dd248ff845a39e7a02414196649730b492b8b625f27b2815dc4594e2582df`.
+The receipt binds the rebound durable source-admission receipt
+`sha256:abfb820bbc4fd65aff43b2c11e1471bd7bf7e9b72acd42073ff857a7cefe03d2`
+and the same measured source-model, manifest and proof IDs. This is a refreshed
+official-byte check and an authorization input; it does not rewrite the
+source-admission receipt's `official_payload_authenticated=false`, register the
+pair to a current release candidate, or produce tensor masters. The 506-master
+campaign remains stalled and was not restarted.
+
+### Fresh pinned-source identity check (2026-10-07)
+
+The official-source verifier was rerun against the durable 52-GiB snapshot and
+the rebound source-admission receipt. It passed all 29 local files against the
+immutable Hugging Face revision `6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`,
+covering 55,586,107,940 bytes. The fresh receipt is
+`/mnt/2tb/tritium-release-evidence/qwen-source-admission/recheck-2026-10-07/official-source-identity.json`
+with ID
+`sha256:c045300d5de262d4d72887d711ddfc6f413e83adc3b560332e32abecc6414eca`.
+It binds source-admission receipt
+`sha256:abfb820bbc4fd65aff43b2c11e1471bd7bf7e9b72acd42073ff857a7cefe03d2`
+and the already measured model, manifest, and proof identities. This confirms
+the durable source bytes still match the pinned public snapshot; it does not
+register a current release candidate, change
+`official_payload_authenticated: false`, admit calibration evidence, or prove
+PTQ quality. No model replay, fitting, or campaign was started.
+
+The frozen calibration pack was revalidated against this fresh identity using
+`/mnt/4tb/tritium-qwen36-campaign-20260813/token-pack/manifest.json`. The new
+pack receipt is
+`/mnt/2tb/tritium-release-evidence/qwen-calibration/recheck-2026-10-07/calibration-pack.json`
+(`sha256:5faa6dafa3d05fca967a19b9516d0c80aa69a3a330b14e3156c7c4ff0cc15e9f`);
+its replay contract is
+`/mnt/2tb/tritium-release-evidence/qwen-calibration/recheck-2026-10-07/replay-contract.json`
+(`sha256:3df79a3aac599069dd88dd98e77e74866a5153ca42d37c0ea81a7797456120b3`).
+Both preserve the existing frozen pack ID and batch digest
+`sha256:ca913e334bf22c73755d27b11848599008790f672600b8085daf5ec53022202c`
+for 512 sequences / 1,048,576 calibration tokens. The capture-from-pack
+preflight passed against these exact receipts and printed `NOT STARTED` because
+`--execute` was not supplied. The new receipts establish source/pack/replay
+consistency; they do not prove actual model replay or admit the legacy 506 S2KF
+records. Candidate-bound Stage-7 qualification and actual capture remain gates.
+
+### Legacy Qwen calibration evidence audit (2026-10-01)
+
+The 506-file S2KF directory
+`/mnt/4tb/tmp/qwen36-evidence-a417374-1seq-clean-20260821` passes the
+installed native structural inspector `inspect_qwen36_ptq_evidence`: evidence
+ID `tsc1_11df78c64eaa9a27ec43f4a226d701c30bd897bbeca5c0b8692bae24631e2c71`,
+506 records, input-Hessian curvature, pinned source-model ID
+`126eb094f936c87bf7aeff60e57dadf5351ff082a48b8d63c7553919029cd3ca`, and
+common activation-cache/token-stream identities. Its token-stream digest is
+`d30fbc02209285448253dde628fe4c5285700cf86d66296c500eb6b1c38dcd2b`.
+
+That digest exactly matches the first 2,048-token member of token pack
+`sha256:e17652c928e5d378f19c3d3344c167844101df9ab2ff4362a05f117ff5889f38`.
+The pack's calibration partition contains 512 members (1,048,576 tokens), with
+the frozen C4/OpenWebMath/StarCoderData 50/25/25 composition. ADR 0043 requires
+that coverage for scored rungs 2–4. This is therefore a provenance mismatch
+that blocks treating the legacy evidence as campaign-grade; it is not proof
+that the capture consumed only one sequence, because the capture API accepts
+the token-stream digest from its caller and the old capture invocation ledger
+has not been found. Do not start fitting from this evidence. Recover a
+source-bound capture transcript or recapture from the admitted frozen pack,
+recording the exact partition/window receipt, before resuming tensor masters.
+The pack receipt records the full calibration partition token digest as
+`sha256:98008cb043f6df722a81cca127f71eb8cb84f05445fbd7a35f1aff948f63fe15`,
+which differs from the legacy S2KF token-stream identity above. It does not
+change the unknown about what the historical capture actually consumed.
+
+The evidence remains preserved in `/mnt/4tb/tmp`; no file was moved or removed.
+The source-model ID match and structural inspection do not establish calibration
+coverage, accuracy, or a completed master campaign.
+
+A fresh read-only `scripts/qwen36-ptq-status.py` probe of the durable campaign
+workspace reports `stalled`, 0 of 506 published masters, no seal, and one dead
+temporary record of 447,083,070 bytes (its recorded PID is no longer alive).
+That partial file is retained; it is not a complete tensor master and is not
+evidence that the campaign can resume against approved calibration provenance.
+
+The probe was refreshed on 2026-10-08 using
+`python scripts/qwen36-ptq-status.py --work-dir
+/mnt/4tb/tritium-qwen36-campaign-20260813 --json`. It still reports zero
+published masters, zero seals, and that same dead staged record; expected
+payload for the 506 fitted tensors is 23,156,295,680 bytes. No rate or ETA is
+available without a live writer. This operational probe made no campaign
+changes. The historical S2KF records remain calibration-evidence inputs, not
+fitted weights, and the missing capture-to-approved-token-pack binding still
+prevents resuming fitting from them.
+A targeted search for the legacy and approved token-stream digests and
+capture/replay transcript markers across the campaign workspace, the recovered
+506-record evidence directory, and the Qwen calibration evidence directory
+found only the calibration-pack and replay-contract receipts; no capture
+invocation transcript surfaced. This search is bounded to those roots and file
+types, so it does not establish that no copy exists elsewhere.
+
+The Qwen token pack is distinct from Stage 7's SmolLM2-1.7B recipe-freeze pack.
+The Qwen pack declares tokenizer digest
+`sha256:72943ec7247b68e70aa6e5651a5b0abb870b07a1c1f90bd5da9badece7294407`,
+vocabulary size 248,320, and 512 calibration sequences. The pinned Qwen source
+config also declares text vocabulary size 248,320. By contrast,
+`release/v1.1/campaign-84284a4-cuda.json` names
+`HuggingFaceTB/SmolLM2-1.7B`, binds a different token-evidence manifest digest
+(`sha256:2664bb998a231865baf55cb76806c67e53022b479ddfa901346f9a1d7cb9a0ae`),
+and records tokenizer digest
+`sha256:4b0c039b16d1fb8cb6d06c8e1698671d03c9ef51372f1ffff1fe0aa0fd555ced`.
+Its Stage 7 recipe-freeze receipt cannot qualify Qwen's calibration tokenizer
+or capture.
+
+The tokenizer identity and token pack have now been independently verified by
+`scripts/verify-qwen36-calibration-pack.py` against the official source-identity
+receipt. The content-addressed receipt
+`/mnt/2tb/tritium-release-evidence/qwen-calibration/calibration-pack-e464c020.json`
+binds the official tokenizer identity, complete pack, exact 512-sequence
+calibration partition, dataset revisions and source-member identities. It
+confirms that the pack's tokenizer digest
+`sha256:72943ec7247b68e70aa6e5651a5b0abb870b07a1c1f90bd5da9badece7294407`
+matches the canonical inventory of the four pinned Qwen tokenizer assets, and
+that the calibration partition contains 1,048,576 ordered tokens. This receipt
+is pack-provenance evidence only: it does not prove that the model replay
+consumed those tokens or bind an actual replay digest to an ordered S2KF
+evidence-set digest. Those capture/evidence links remain required before
+fitting; the legacy 506-record set is still not admitted for campaign use.
+
+A deterministic pre-capture replay contract is now persisted at
+`/mnt/2tb/tritium-release-evidence/qwen-calibration/replay-contract-2026-10-01.json`
+with ID
+`sha256:bb1e8d9d4f7a8564a76c6ca14378a0d1698dba01a3170c0e473c7c8936aadfcc`.
+It binds the verified pack receipt to the expected PyTorch batch digest
+`sha256:ca913e334bf22c73755d27b11848599008790f672600b8085daf5ec53022202c`
+under a fixed one-sequence-per-batch policy. The capture API already checks
+that digest against each replay before publishing records. The contract is not
+evidence that replay occurred. `scripts/qwen36_calibration_replay.py` now
+reopens the official pack and receipt, retains only the verified 4,194,304-byte
+calibration token window, and yields the exact batches required by that digest.
+Opening it against the durable Qwen pack reproduced the same pack receipt,
+contract ID, and capture batch digest. This remains tooling verification, not a
+model replay: the actual capture must use this factory, persist a native capture
+receipt binding its digest to the ordered S2KF set, and freshly reopen all 506
+records before fitting.
+
+The replay helper now exposes `capture_binding()` and durable
+`write_capture_binding()` for the native capture result. The separate
+`scripts/verify-qwen36-capture-binding.py` command revalidates the source pack,
+contract, native session identity and ordered S2KF evidence-set digest. Its
+reopen path is covered with a fake native session in unit tests only; no real
+Qwen capture receipt or complete 506-record evidence namespace exists yet.
+On 2026-10-05, the capture-from-pack, calibration-replay, and calibration-pack
+validator suites passed locally (22 tests and 10 subtests). They validate
+software behavior with fixtures; they do not provide a real native reopen or
+admit the recovered legacy captures.
+
+### Hosted package evidence from PR #51 (2026-10-01)
+
+PR #51 (`bbbafd99cada6dab821cea63e5cdf971f1ce79fb`) has successful hosted
+package workflows. Its artifacts are retained under
+`/mnt/2tb/tritium-release-evidence/ci-bbbafd99/`. The workflows ran against
+the PR synthetic merge revision
+`fb670342ee85e340397c68705127b0268648261b`, not the branch head. The
+`crate-archive`, `npm-archive`, `compatibility-matrix`, and `clean-install`
+receipts each pass their owning validator at that exact revision. The
+compatibility receipt covers 16 CPython/platform cells; the clean-install
+receipt validates an installed Linux CPU wheel with PyTorch QAT forward and
+backward, optimizer update and resume, Hugging Face safetensors save/reload,
+and tied-weight identity checks.
+
+This harvest does **not** close the `packages` release gate: these receipts
+are not registered against a candidate manifest, and their synthetic merge
+revision differs from the checked-out branch head. Do not transplant them into
+the older `release/v1.1` candidate or registry. Rebuild/harvest from the final
+release revision and validate all four receipt kinds against one candidate
+before recording a gate pass. Hosted CUDA, Metal, ROCm, wgpu, real-model
+serving, fuzz, and performance-regression lanes were skipped by runner policy;
+those remain unqualified.
+
+### Local exact-source CUDA dispatcher evidence (`577bdb2e`)
+
+At source revision `577bdb2e21faf2b43ff35dd1101a5079d5dbf331`, the portable
+`manylinux_2_28_x86_64` CUDA wheel passed the physical RTX 4090 dispatcher
+qualifier: 8/8 native CUDA tests passed, and the two selected tail-path tests
+passed Compute Sanitizer 2026.3.0 with zero errors. The independently verified
+receipt is
+`sha256:f2f8b3c62503e419ae9ff8ea5b7195f2d9132e5c0fa3c06f9bc9b381cd25afaf`;
+it binds wheel SHA-256
+`295b3bb9f6a22c9276bfffb346e28179a6f2cc6c1aa94f80554da1ee439d93d9`, CUDA
+13.0, driver 615.71.09, Torch 2.11.0+cu130, and RTX 4090 UUID
+`1790118a-a6d7-4eaf-fcac-dcacac5f4351`. The verifier passed against that exact
+source worktree and wheel. Receipt and raw outputs are retained in the local
+candidate workspace at `release/v1.1/evidence/torch-dispatch-cuda-577bdb2/`.
+
+This run used Python 3.14.7, while the hosted CUDA workflow is pinned to
+Python 3.13. It is local, source-bound hardware evidence; it is not registered
+to a candidate manifest, does not replace the hosted pinned-environment run,
+and does not close the release gate. Re-run and register against the final
+release candidate before making a release claim.
+
+### Exact pushed-head CUDA rerun (`08a52cba`)
+
+The receipt was rebuilt and rerun on the exact pushed PR head
+`08a52cba8b8104018cc427500f43b708ba829ae9`, eliminating the source-revision
+gap from the earlier `577bdb2e` run. The portable CUDA wheel passed all eight
+native CUDA dispatcher tests on the RTX 4090; both selected tail-path tests
+passed Compute Sanitizer 2026.3.0 with zero errors. The independently verified
+receipt is
+`sha256:49ea0d53fe3417bcaa93fc69af71a6183a9a035eae53ba9782d28b636dec10a9`.
+It binds wheel SHA-256
+`0556e947831803a67597e4718600655aa4e3c387812c06e631e80c86ecbccb9a`, CUDA
+13.0, driver 615.71.09, Torch 2.11.0+cu130, and the same RTX 4090 UUID. Raw
+outputs are retained under
+`release/v1.1/evidence/torch-dispatch-cuda-08a52cba/` in the local candidate
+workspace.
+
+The wheel was built in the pinned manylinux/Python 3.13 image, but qualification
+executed with the host's Python 3.14.7. The hosted Python 3.13 CUDA job remains
+skipped. This exact-source local receipt is not registered to a candidate
+manifest and does not close the release gate.
+
+### Physical native-wgpu training corpus (`b3a556d1`)
+
+The native wgpu receipt sealer ran from a clean detached worktree at
+`b3a556d1c6eec85772ea2ed9aa95018705aece57` on the physical RTX 4090 via
+Vulkan. The receipt binds manifest digest
+`9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098`, vector
+digest `38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7`,
+36 operations and all 117 frozen cases. The reopened development capability
+table reports 4,192 peak resident bytes and 132,032 peak scratch bytes. Receipt
+digest:
+`adeeeff34a2c3a7b8fe3952af9aa2144492aaf7e9583849baf0f42afa40ecb08`.
+
+This is physical development evidence, not candidate-registry admission or
+the seven-backend release gate. The hosted/self-hosted wgpu CI lane was skipped;
+candidate artifact binding, release admission, and the other required backend
+receipts remain separate obligations. The receipt is retained at
+`/mnt/2tb/tritium-wgpu-b3a-receipts/` in the local candidate workspace.
 
 ### Latest local verification (2026-09-18, `570a8802`)
 
@@ -184,16 +1539,16 @@ already exist as an ordinary file — run `trivy image --download-db-only
 | Gate | Status | Missing kinds | What the missing kinds require |
 |---|---|---|---|
 | `qwen-source-admission` | EVIDENCE | — | — |
-| `packages` | PARTIAL | `compatibility-matrix` | **Not blocked — CI produces this on every release and the release workflow now carries it into the payload.** The rc.2 `abi3-compatibility-receipt` passes `aggregate-wheel-smoke.py`'s own validator: `tritium.abi3-matrix-qualification.v1`, bound to `d16c0dda`, `passed: true`, 16 cells spanning CPython 3.9.25–3.14.7 across three platforms and three distinct wheels. Harvesting it advances the union 15→16. It does **not** by itself close the gate: crate, npm, clean-install, and compatibility receipts still must bind one exact revision before a coherent `packages` PASS. |
+| `packages` | PARTIAL | `compatibility-matrix` | **Not blocked — CI produces this on every release and the release workflow now carries it into the payload.** The rc.2 `abi3-compatibility-receipt` passes `aggregate-wheel-smoke.py`'s own validator: `tritium.abi3-matrix-qualification.v1`, bound to `d16c0dda`, `passed: true`, 16 cells spanning CPython 3.9.25–3.14.7 across three platforms and three distinct wheels. Harvesting it advances the union 15→16. It does **not** by itself close the gate: crate, npm, clean-install, and compatibility receipts still must bind one exact revision before a coherent `packages` PASS. For local candidate `6723dcda`, the PR-150 wheels run (`37157008596`) records the GitHub merge commit `16fff0db` (base plus PR head) in its receipt, while the candidate manifest binds only PR head `6723dcda`; that matrix is not admissible to this candidate. |
 | `pytorch-hf` | PARTIAL | `distributed-training` | Two or more GPUs. |
 | `native-backends` | PARTIAL | `backend-manifest`, `performance` | All seven trace families, in order — `FAMILIES = ("cpu", "cuda", "rocm", "metal", "wgpu", "wasi", "mcu")`. Needs AMD *and* Apple *and* an MCU board. |
-| `estimators-refinement` | PARTIAL | `refinement`, `baseline-ablation` | Local SALT campaign runs. No new dependency; queued until the flagship conversion releases the CPU. |
-| `flagship-qwen` | **IN FLIGHT** | `conversion-refinement`, `quality`, `task-retention`, `runtime`, `physical-bytes` | The pinned Qwen3.6-27B PTQ conversion, running since 2026-09-01 (rev `6a9e13bd`, `packing="b3"`). |
-| `stage7-freeze` | NONE | `stage7-recipe-freeze` | The 1.7B recipe freeze — downstream of the flagship conversion. |
+| `estimators-refinement` | PARTIAL | `refinement`, `baseline-ablation` | Separate local SALT campaign runs and baseline ablations; no current receipt is registered for these kinds. |
+| `flagship-qwen` | **NOT RUNNING — canonical record says stalled** | `conversion-refinement`, `quality`, `task-retention`, `runtime`, `physical-bytes` | The durable workspace `/mnt/4tb/tritium-qwen36-campaign-20260813` exists and the 2026-10-04 canonical probe found 0/506 published masters, no seal, and one dead incomplete staged record. The 506 legacy captures still lack an admitted capture-binding receipt for the approved pack. Complete the Stage 7 recipe freeze and establish capture provenance before any fitting resume. |
+| `stage7-freeze` | NONE | `stage7-recipe-freeze` | Complete the 1.7B recipe freeze before unsealing/running the pinned Qwen flagship, as required by plan 0043. |
 | `onnx` | NONE | `onnx-inference` | Whole-Qwen ONNX execution traces — downstream of the flagship artifact. |
-| `browser` | NONE | `browser-conformance` | **Three** lanes, all required: `--chrome-lane`, `--firefox-lane`, `--safari-lane`. The Safari lane is gated on a macOS `os.name`, so this needs Apple hardware, not merely a browser. |
-| `serving` | PARTIAL | `oci-runtime-{cpu,cuda}`, `serving-deployment-{cpu,cuda}` | Both `oci-security-*` kinds are **done** (2026-09-03). The remaining four all need an **admissible serving bundle**, which does not exist on this box: `tritium-serve` rejects the only complete-looking candidate with `InvalidAdmission("manifest package")` because its `tritium.json` carries no top-level `manifest_package_id` and is marked `complete_model: false`. Deployment additionally needs Kubernetes, a Helm chart archive, and a `--bundle-manifest`. |
-| `zoo-community` | NONE | `model-zoo`, `generated-claims`, `governance-docs` | All three come from **one** `qualify-zoo-community.py` call. It requires a `--governance-review` whose `independent_from_maintainers` field must be `True` (`verify-zoo-community-receipt.py:426-429`) and a named reviewer with an `organization` — i.e. a second person. It also requires four frozen model entries, the fourth being the flagship. |
+| `browser` | **UNREGISTERED FRAGMENTS** | `browser-conformance` | Chrome and Firefox traces exist for source `7523eb94`, but no combined receipt is registered. **Three** lanes are required: `--chrome-lane`, `--firefox-lane`, `--safari-lane`. Safari is gated on macOS and needs Apple hardware. |
+| `serving` | PARTIAL | `oci-runtime-{cpu,cuda}`, `serving-deployment-{cpu,cuda}` | Both `oci-security-*` kinds are **done** (2026-09-03). The remaining four need an admissible serving bundle, which is not available. The loader computes `manifest_package_id` from exact `tritium.json` bytes (raw lowercase BLAKE3); SALT, preserved, and config packages use domain-separated `trp1_…` IDs. ADR 0033 now records that distinction, and local startup/OCI validators plus regression tests enforce it. This fixes the identified software contract mismatch, but no production runtime or deployment receipt has been produced from the current source; serving remains open. Deployment additionally needs Kubernetes, a Helm chart archive, and a `--bundle-manifest`. |
+| `zoo-community` | NONE | `model-zoo`, `generated-claims`, `governance-docs` | All three come from **one** `qualify-zoo-community.py` call. It requires a `--governance-review` whose `independent_from_maintainers` field must be `True` (`verify-zoo-community-receipt.py:426-429`) and a named reviewer with an `organization` — i.e. a second person. It also requires four frozen model entries, the fourth being the flagship. Source-to-generated drift checks passed locally on 2026-10-04 (`generate-release-claims.py --check`, `generate-compatibility.py --check`; 9 focused tests passed), but these checks are not candidate-bound zoo/community receipts. |
 | `reproduction-signoff` | NONE | `second-machine`, `independent-review` | A second machine, plus a reviewer whose identity differs from the reproduction operator. |
 
 **Three kinds require a second person, not two.** `independent-review` and
@@ -255,7 +1610,7 @@ unmanifested file.
     {
       "id": "pytritium-linux-cpu",
       "kind": "python-wheel",
-      "path": "pytritium-1.1.0rc1-cp39-abi3-manylinux_2_28_x86_64.whl",
+      "path": "pytritium-1.1.0rc2-cp39-abi3-manylinux_2_28_x86_64.whl",
       "sbom": "pytritium-linux-cpu.cdx.json"
     }
   ]
@@ -465,6 +1820,65 @@ tail, cache-lifetime, stream-ordering, or memcheck coverage.
 Public activation is always `EXTERNAL_AUTH_REQUIRED` and is not inferred from
 local evidence.
 
+### Exact-source wheel CI evidence — 2026-10-04
+
+GitHub Actions wheel run [37220268418](https://github.com/Quitetall/tritium/actions/runs/37220268418)
+completed successfully from branch source revision
+`6ad03ea7fdc9731a428e2f94bdd3a244bd81bb01` (not the synthetic pull-request
+merge tree). It built Linux x86_64, Windows x64, and macOS arm64 CPU wheels;
+the source-free tutorial and installed PyTorch 2.11 / Python 3.13 functional
+job also passed. The Linux wheel SHA-256 was
+`7fbceb2182d0e6b418222cba54a1ed757bbb277a05aa607f0e96612457c0e3cd`.
+
+The run's ABI3 matrix passed for CPython 3.9–3.14 on Linux x86_64, Windows
+x64, and macOS arm64. Its matrix receipt is
+`sha256:2a87b3316fb9431e80e6a402497bcfb1419c896df9a57db7aa7cd8fd187ef730`
+(`github-37220268418-1-abi3-matrix`). The installed-wheel functional receipt
+is `sha256:2928c47113038399cd579cb6d7f01f2ab899f039291b9d0587d56d2d7b34e850`
+(`github-37220268418-1-cpu-functional`); it covers native ternary matmul,
+QAT forward/backward, optimizer update/resume, Hugging Face safetensors
+save/reload, and tied-weight identity. These are exact-source package checks,
+not a flagship-model quality result.
+
+The installed-wheel PyTorch dispatch-overhead receipt
+`sha256:5140cf6a73f0d1f739cf5e634fbdb451c8868b22dcc88987a2fcc3474120b3ec`
+(`github-37220268418-1-torch-dispatch-overhead`) independently verified
+against the exact wheel and source. All six decode, microbatch, and prefill
+forward/backward cases passed the 5% ceiling; the largest measured bootstrap
+upper ratio was `1.00925`. This is CPU wrapper-overhead evidence on a four-vCPU
+AMD EPYC 7763 runner. It does not qualify CUDA dispatch or replace the separate
+physical-GPU `torch-dispatch-cuda` receipt.
+
+The CUDA wheel lane was skipped because this was a pull-request run. The
+workflow receipts are not yet a complete v1.1 candidate registry: crate/npm
+archives, physical-GPU and other hardware gates, model-quality evidence,
+second-machine reproduction, independent release review, and explicit human
+activation remain separate requirements. Other required checks for the pull
+request were still running when this record was written.
+
+### Serving deployment contract checks — 2026-10-04
+
+At source revision `34acd332e5bce398d1c59324108e6fc7feb58047`, the focused
+deployment contract suite passed 117 tests and 61 subtests:
+
+```text
+pytest -q scripts/tests/test_deployment_contract.py \
+  scripts/tests/test_qualify_kubernetes_deployment.py \
+  scripts/tests/test_qualify_oci_security.py \
+  scripts/tests/test_qualify_oci_runtime.py \
+  scripts/tests/test_verify_oci_archive.py
+117 passed, 61 subtests passed
+```
+
+`./scripts/check-deployment-manifests` also passed using the repository's
+digest-pinned Helm 3.18.4 container with networking disabled and image pulls
+disabled. It linted the chart, rejected CUDA configuration without GPU
+resources, and rendered the default and CUDA/KEDA/ServiceMonitor configurations
+with the required CUDA `Recreate` strategy. These are contract and chart
+rendering checks only: no Kubernetes cluster, schema-v3 model bundle, OCI
+runtime, NVIDIA deployment, autoscaling event or rollback was exercised.
+Plan 0052's empirical serving and deployment gates remain open.
+
 ## Local sign-off
 
 Evidence readiness and maintainer sign-off are separate layers. A complete
@@ -506,3 +1920,2899 @@ The statement binds candidate-manifest, registry and report SHA-256 identities,
 release revision and signer principal. Any evidence change invalidates it. Key
 generation, signer authorization and the local tag remain explicit maintainer
 actions; no publication or tag push is inferred.
+
+### Portable training contract CPU checks — 2026-10-04
+
+At source revision `1cb50800ceebeb02d9262ebaaee4fef6848e3b4a`, focused local
+contract checks passed:
+
+```text
+cargo test --locked -p tritium-spec --test train_backend_contract --test training_vectors
+4 backend-contract tests passed; 6 vector/schema tests passed
+cargo test --locked -p tritium-train --test portable_vectors
+5 tests passed, including canonical V2 and V3 CPU corpus replay
+PYTHONPATH=crates/tritium-py/python pytest -q crates/tritium-py/tests/test_training_manifest.py
+10 passed
+```
+
+These results check the CPU reference and cross-language Python manifest
+reader. They do not qualify an accelerator, browser runtime, physical backend,
+performance, or release candidate. The planned TypeScript check
+(`npx tsc -p bindings/typescript/tsconfig.json --noEmit`) could not run because
+the TypeScript compiler is not installed in this checkout; `npx` reported that
+it would not supply the missing compiler implicitly. No dependency was
+installed. The language-parity and physical-backend gates therefore remain
+open.
+
+### Estimator and refinement CPU regression checks — 2026-10-04
+
+At working revision `361b9b08aee5e4376a3d70453934dbeed129dd69`, the local
+estimator, refinement-core and PyTorch stage-4 regression suites reported:
+User-owned EAT-O files were modified in the worktree during these runs; these
+suites do not cover those files.
+
+```text
+PYTHONPATH=crates/tritium-py/python pytest -q -rs \
+  crates/tritium-py/tests/test_estimator_catalog.py \
+  crates/tritium-py/tests/test_refinement_core.py \
+  crates/tritium-py/tests/test_torch_stage4.py
+28 passed, 7 skipped
+```
+
+All seven skips were optional LamQuant codec-neural or BLUT-LAMU integrations
+not installed on this machine. These CPU/synthetic tests cover estimator
+projection, gradient, conversion, refinement, and adapter-parity behavior;
+they do not measure a large-model quality gain or qualify Qwen PTQ/refinement,
+accelerator execution, or release readiness. The absent integrations remain
+unverified rather than passing.
+
+### TypeScript and generated-web-source check correction — 2026-10-04
+
+The previous note that the TypeScript compiler was unavailable was too broad:
+the compiler exists under `packages/tritium-web/node_modules`, but is not on
+the repository-root `npx` path. At revision
+`0fd7685c26b687f3e846237a23c39adfb2108d9b`, these direct checks passed:
+
+```text
+packages/tritium-web/node_modules/.bin/tsc -p bindings/typescript/tsconfig.json --noEmit
+packages/tritium-web/node_modules/.bin/tsc -p packages/tritium-web/tsconfig.json --noEmit
+```
+
+The generated-web-source check also passed as the first stage of
+`npm --prefix packages/tritium-web run typecheck`. That combined command then
+stopped at `build:wasm`: the script requires a completely clean Git worktree,
+and this checkout contains unrelated user-owned EAT-O changes. It did not
+compile the WASM guest or reach its own TypeScript stage. `wasm-bindgen` is not
+installed on this machine, so the complete WASM build remains unverified. The
+direct TypeScript passes do not close browser or physical WebGPU gates.
+
+### Clean-worktree web package recheck — 2026-10-05
+
+The earlier WASM limitation is now superseded for the current pushed source
+revision `fd927eab0b3db893f3fe59e272907d9e026125e6`. A clean detached worktree
+passed the full `npm --prefix packages/tritium-web run check` with exit code 0:
+generated-file checks, pinned release WASM build, strict TypeScript, 145 Node
+tests, and offline archive verification. `wasm-bindgen 0.2.126` is installed
+under the isolated local cache path
+`/home/brianklam/.cache/tritium-release-tools/bin`; unrelated dirty EAT-O files
+in the main checkout were not included.
+
+The retained local receipt
+`release/v1.1/evidence/npm-archive-fd927eab/npm-archive-receipt.json` has ID
+`sha256:84349d4888e0dd92ab65668f9535d736500a7f4f0a245ded48f3b4b58de1e3f5` and
+independently validates against the adjacent 627,849-byte archive
+`tritium-ai-web-1.1.0-rc.2.tgz` (SHA-256
+`e556029b3fc5531abf265d3bd2b556c722ae60ce3488b61c1b31bcf4939a8fbd`). Its
+CycloneDX SBOM is retained in the same directory. This remains exact-revision
+local package evidence, not candidate-registry admission, a cross-platform
+package matrix, or physical browser/WebGPU qualification; regenerate it for a
+later source revision.
+
+### PyTorch and browser-source software checks — 2026-10-04
+
+At code baseline `0fd7685c26b687f3e846237a23c39adfb2108d9b`, the broader local
+reference suite reported:
+
+```text
+PYTHONPATH=crates/tritium-py/python pytest -q -rs \
+  crates/tritium-py/tests/test_torch_api.py \
+  crates/tritium-py/tests/test_autograd.py \
+  crates/tritium-py/tests/test_hf_lifecycle_receipt.py
+24 passed, 2 skipped
+npm --prefix packages/tritium-web run check:generated
+passed
+```
+
+Both skips require the installed `pytritium` wheel; no local wheel was
+qualified by this run. The two TypeScript projects pass direct `tsc --noEmit`
+checks as recorded above. This verifies local reference/package source
+behavior only; the full wheel build/install, WebAssembly build and physical
+browser WebGPU checks remain separate gates.
+
+### Hosted CI and wheel matrix — 2026-10-04
+
+For pushed revision `93ec04188bab40fc0b9308507f6e049c0ac9ca03`, hosted checks
+completed without failures:
+
+| Workflow | Result | Scope limit |
+|---|---:|---|
+| CI (`37258090450`) | 19 passed, 7 skipped | CUDA/ROCm/Metal/wgpu hardware, fuzz, performance, and real-model serving jobs were skipped |
+| Wheels (`37258090477`) | 22 passed, 1 skipped | CUDA wheel job skipped; CPU wheel builds and installed-wheel/tutorial checks passed |
+| CodeQL (`37258090452`) | passed | Static analysis only |
+| Docs (`37258090451`) | passed | Documentation build/link checks |
+| Capstone CPU smoke (`37258090459`) | passed | CPU E2E smoke; not a GPU or model-quality result |
+
+The CI run covered CPU Linux/macOS/Windows checks, GPU-feature compilation,
+WASI conformance, API stability, packaging readiness, compatibility/community
+contract checks, serving contract mocks and the source-free web archive. These
+hosted checks improve release confidence but do not close the skipped physical
+backend, real-model, performance, or model-quality release gates.
+
+### Hugging Face QAT/PTQ and distributed CPU integration — 2026-10-04
+
+At code revision `d80c8a8255eac2015d26c69cf28fd83572e803bb`, local CPU tests
+passed for the tiny randomly initialized Llama fixture:
+
+```text
+PYTHONPATH=crates/tritium-py/python pytest -q -rs crates/tritium-py/tests/test_huggingface_qat.py
+7 passed
+PYTHONPATH=crates/tritium-py/python pytest -q -rs \
+  crates/tritium-py/tests/test_huggingface_distributed.py::test_two_rank_cpu_ddp_step_and_checkpoint \
+  crates/tritium-py/tests/test_huggingface_distributed.py::test_two_rank_cpu_fsdp_step_and_sharded_state_resume \
+  crates/tritium-py/tests/test_huggingface_distributed.py::test_accelerate_cpu_bf16_in_fresh_runtime
+3 passed
+```
+
+These checks cover QAT and PTQ save/reload, tied embedding/head storage,
+Trainer checkpoint resume, Accelerate state/RNG resume, and two-rank CPU/Gloo
+DDP/FSDP semantics. They use a synthetic tiny model and are not Qwen quality or
+performance evidence. Accelerator DDP/FSDP on two distinct physical GPUs,
+CUDA-specific qualification, and the known PyTorch CPU full-state-export issue
+remain open. User-owned EAT-O files were modified during these tests and were
+not part of their scope.
+
+### Exact-wheel CUDA/fp16 smoke — 2026-10-05
+
+At pushed source revision `dc4ea62b792d159cc1785258ae9d9baca692f0c2`, the
+exact Linux x86-64 CPU wheel from hosted workflow `37259200813` was installed
+in an isolated virtual environment and exercised on the physical RTX 4090 by
+`crates/tritium-py/tests/hf_cuda_worker.py`. The installed `tritium` import
+resolved inside that virtual environment, not from the source checkout. The
+worker completed five fp16 training steps on a one-layer randomly initialized
+Llama fixture, observed zero host transfers in the profiled ternary operator,
+and exactly restored the saved Accelerate checkpoint. The receipt is
+`/mnt/2tb/tritium-release-evidence/hf-cuda-dc4ea62-20261004/cuda-training-receipt.json`
+(`sha256:aa999302ab9349c89ca74fb4696998bc86e8a46c7b1496a2246e9cecaf929431`),
+verified with `scripts/verify-cuda-training-receipt.py` against the exact
+wheel SHA-256 `cfde3d156cc2dfcd57e92f66f6493c4e0f9f82153ac4381c3fc19211ee301cc3`.
+The five measured steps took 62.55 ms; this tiny synthetic smoke is not a
+training-performance claim, multi-GPU qualification, Qwen quality result, or
+candidate-wide release receipt. The temporary venv and checkpoint were used
+only for this run and are not release evidence.
+
+### PTQ public `convert()` artifact seam — 2026-10-07
+
+At pushed source revision `0ac608ab94f4c37e5dd85da7dd89245a06c8d466`, the
+focused source-tree PTQ artifact suite passed:
+
+```text
+PYTHONPATH=crates/tritium-py/python pytest -q -rs crates/tritium-py/tests/test_ptq_artifacts.py
+37 passed in 3.08s
+```
+
+This verifies the public `prepare`/`calibrate`/`convert()` artifact path chosen
+for the PTQ test seam. It is a local CPU software test, not a real-checkpoint
+quality, performance, wheel-install, or release-receipt result. The clean-tree
+web package check passed generated-file validation and compiled the Rust WASM
+guest, but stopped because the pinned `wasm-bindgen 0.2.126` executable was not
+available on this host's `PATH`; TypeScript, package tests, and archive
+verification therefore remain unverified locally for this checkout.
+
+The current Hugging Face and ONNX paths also passed focused CPU checks:
+
+```text
+PYTHONPATH=crates/tritium-py/python pytest -q -rs crates/tritium-py/tests/test_huggingface_qat.py
+7 passed in 1.62s
+PYTHONPATH=crates/tritium-py/python /tmp/tritium-onnx-check/bin/python -m pytest -q -rs \
+  crates/tritium-py/tests/test_module_onnx.py::test_public_facade_executes_qat_ptq_and_refinement_artifacts_in_ort
+1 passed in 6.19s
+```
+
+The ONNX test used an isolated Python 3.14 environment with the CI-pinned
+`onnx==1.22.0`, `onnxruntime==1.27.0`, and `onnxscript==0.7.1`, while reusing
+the host's PyTorch installation. These are small-model software checks; they
+do not establish flagship quality, hardware performance, or release readiness.
+
+### Portable web package source build and archive — 2026-10-07
+
+At clean source revision `09f2e9021fca33163f98d33bb3cee45057203c21`,
+`packages/tritium-web` passed its complete local check in a detached worktree:
+
+```text
+npm run check
+generated-file checks: passed
+wasm32-unknown-unknown release build and wasm-bindgen: passed
+strict TypeScript: passed
+Node tests: 145 passed, 0 failed, 0 skipped
+source-free npm archive verification: passed
+```
+
+The durable output is `/mnt/2tb/tritium-release-evidence/npm-web-09f2e902/`:
+`npm-archive-receipt.json` has receipt ID
+`sha256:09826a94ef97a870cdd48b5eb5efb909a0c06ec99ed877536e3b1497e70bef2d`,
+and binds the 627,707-byte `tritium-ai-web-1.1.0-rc.2.tgz` with SHA-256
+`7a852ad0ca43d5998c0aeb3d9686ff0ec4b0a602261e13c2599d0c808959de47`.
+The SBOM is `tritium-web-node22.cdx.json`. The build used Node 24.21.0/npm
+12.0.2 and the upstream checksum-verified `wasm-bindgen 0.2.126` Linux binary.
+This qualifies the local source-free package path only; it is not physical
+Chrome/Firefox/Safari WebGPU evidence, a browser performance result, or
+candidate-registry admission.
+
+### Candidate-source Python and release-admission regression checks — 2026-10-07
+
+At source revision `6ac1c040d3908a39301e437088a0052812770ec9`, the complete
+Python binding suite passed on the local CPU environment:
+
+```text
+PYTHONPATH=crates/tritium-py/python pytest -q -rs crates/tritium-py/tests
+377 passed, 27 skipped, 15 warnings in 223.15s
+python -m unittest scripts.tests.test_release_evidence_status scripts.tests.test_release_status -v
+Ran 44 tests in 3.056s — OK
+```
+
+The Python skips were explicit: ONNX was not installed in the host environment,
+seven checks require an installed candidate wheel, eight checks require the
+CUDA-enabled Tritium extension, and the remaining checks require external
+LamQuant/BLUT checkouts. They are not release passes. Separately, hosted CI run
+[`37588299083`](https://github.com/Quitetall/tritium/actions/runs/37588299083)
+completed successfully for this source revision; its CUDA, ROCm, wgpu, Metal,
+physical-model-serving and performance jobs were skipped on hosted runners.
+
+Existing local RC manifests are still bound to older source revisions, and the
+local release CLI is not installed on this host. These software regressions do
+not qualify candidate artifacts, physical backends, flagship model quality,
+performance, or v1.1 release readiness.
+
+### Current-source Linux CPU abi3 wheel — 2026-10-07
+
+At exact source revision `671cef6698717a5da7a66607f2493d02525348f3`, a CPU
+abi3 wheel was built from a clean detached worktree with the pinned
+`manylinux_2_28_x86_64` image, Rust 1.98.0, and maturin 1.10.2. The durable
+artifact and receipts are under
+`/mnt/2tb/tritium-release-evidence/pytritium-cpu-671cef66/`.
+`verify-wheel.py --install-smoke` passed; the 10,526,236-byte wheel SHA-256 is
+`4082854acf38e1ffb4f7cf28178654e4ae7f06f446baef981a7b92f0415b2318`.
+
+The exact wheel then passed the installed functional smoke on CPU under
+CPython 3.14.7, PyTorch 2.11.0+cu130, Transformers 5.5.3, and safetensors
+0.7.0. The receipt ID is
+`sha256:6be8b85d8906e3974940ddf5c59e1cf7de3dfd8f4b55324de20b2ba0a2f66113`
+(file SHA-256
+`3db36d8083e4b73afd2ef80b648a230ca81b4814483c9913ac1288889fa6bdbe`). It
+proves native CPU matmul, Hugging Face QAT forward/backward, optimizer update
+and resume, safetensors save/reload, and tied-weight identity. The compatibility
+receipt for this one Linux x86-64 CPython 3.14 cell is
+`compatibility-receipt-cp314.json` (SHA-256
+`6bfc30d333e1ae92fcb2d5a261e7280027271b2d4ecfa8f5e96b60aefd27aa53`). The
+functional smoke used a venv with host dependencies visible; it proves exact
+wheel loading and runtime behavior but is not a fully isolated dependency
+installation. Other platforms/interpreters, CUDA, full package-matrix,
+model-quality, and public-release gates remain open.
+
+The wheel is now bound to an explicitly partial package-probe candidate at
+`/mnt/2tb/tritium-release-evidence/pytritium-cpu-671cef66/candidate/manifest.json`
+(manifest SHA-256
+`6be0b70b10416dea9f917a7859bb26329711a9806ba7f01c727c6e94e605c796`). The
+clean worktree's `release-status` check accepted the manifest as
+`CANDIDATE_EVIDENCE_VALID`; its registry binds the functional receipt above to
+the exact wheel. The durable report is
+`/mnt/2tb/tritium-release-evidence/pytritium-cpu-671cef66/registry/report.json`
+(SHA-256
+`bce08e2fcd1a04835d80e67e4ad27fd06e9d035a691555800af2fb4c38932a3c`). It
+correctly reports `LOCAL_RC_BLOCKED`: the `packages` row has only `clean-install`
+and still misses `compatibility-matrix`, `crate-archive`, and `npm-archive`;
+the other eleven release gates also remain missing. This one-wheel probe is not
+the complete public RC and does not replace the prior candidate records.
+
+### Current-source publishable crate archive qualification — 2026-10-07
+
+From the same clean source revision `671cef6698717a5da7a66607f2493d02525348f3`,
+the following command produced the crate archives:
+
+```text
+CARGO_TARGET_DIR=/mnt/2tb/tritium-crates-cargo-package-671cef66 cargo package --locked --workspace --no-verify --allow-dirty --target-dir /mnt/2tb/tritium-crates-cargo-package-671cef66
+```
+
+The command also packages the two workspace members marked `publish = []`; the
+original output is preserved under
+`/mnt/2tb/tritium-crates-cargo-package-671cef66/`. The exact 23 publishable
+archives, excluding only those two non-published members, are retained under
+`/mnt/2tb/tritium-crate-archives-671cef66/`.
+
+`scripts/qualify-crate-archives.py` passed its exact inventory and source/VCS
+checks, then built an isolated consumer with vendored dependencies and
+`CARGO_NET_OFFLINE=true`:
+
+```text
+python scripts/qualify-crate-archives.py --archives /mnt/2tb/tritium-crate-archives-671cef66 \
+  --source-revision 671cef6698717a5da7a66607f2493d02525348f3 \
+  --release 1.1.0-rc.2 --run-id local-crates-671cef66-20261007 \
+  --output /mnt/2tb/tritium-release-evidence/pytritium-cpu-671cef66/crate-archive-receipt.json
+qualify-crate-archives: PASS: 23 crates
+```
+
+Receipt schema is `tritium.crate-archive-qualification.v1`, ID
+`sha256:bbce29000f8a5a12add933e34d2bc7846596bd90d06d255f230c83270cfd05e6`,
+file SHA-256
+`8e75bce8c49195d156983531a71d53f91294d9748d28ba705c7832bd47b75443`. This
+is a successful local offline crate-consumer check, but the receipt is not yet
+registered against a candidate manifest; it does not close the package gate.
+
+### Exact-source CI crate archive qualification — 2026-10-07
+
+The successful CI run [37596503849](https://github.com/Quitetall/tritium/actions/runs/37596503849)
+on source revision `2587652f2b7862c84b3a5f236d0c62860cfb60bb` uploaded the
+`crate-candidates-2587652f2b7862c84b3a5f236d0c62860cfb60bb` artifact. It retains
+the exact 23 publishable `.crate` files, their 23 CycloneDX documents, and the
+offline consumer receipt. The receipt is
+`sha256:ca07a50bbb5e32da291d9bd87b7d69ca7b7f6c7ae9717bd8ec8d9e192da8004d`
+(`tritium.crate-archive-qualification.v1`, run
+`github-37596503849-1-crate-archives`).
+
+The receipt was independently revalidated against the downloaded archives and
+the exact-source `Cargo.lock`; all 23 packages are recorded as compiled in the
+offline, isolated Cargo-home consumer. All 23 SBOM roots also match their
+archive SHA-256, byte count, release identity, and source revision. This is
+candidate-revision package evidence, but it is not yet registered against a
+complete candidate manifest and therefore does not close the aggregate package
+gate.
+
+### PTQ parallelism probe on a loaded workstation — 2026-10-07
+
+The public `prepare`/`calibrate`/`convert()` parallelism probe was run against
+source revision `44869608` and the installed `1.1.0rc2` abi3 wheel with SHA-256
+`b21343f103aec89c0e843f72730dafb23dbdc49c639677e531d96f684888c94b`:
+
+```text
+PYTHONPATH=crates/tritium-py/python \
+  /tmp/tritium-release-wheel-perf/bin/python -m unittest \
+  scripts.tests.test_ptq_parallelism -v
+serial_seconds=36.949 parallel_seconds=36.595 speedup=1.01x
+FAIL: expected at least 1.5x speedup
+```
+
+The artifact identity and weighted-error assertions passed before the speedup
+assertion failed. The workstation was heavily contended at the time: a
+contemporaneous reading showed load average `35.90` with 32 CPUs available, and
+multiple unrelated Rust builds were active. Treat this as a noisy local
+performance result, not proof that parallel fitting regressed or that the
+performance target passed. The test now prints CPU count, affinity, and load
+average with its timings so a clean rerun can distinguish host contention from
+a solver regression. The exact-source hosted tutorial run `37621206763` was
+still active when this entry was recorded. It has now completed and failed the
+300-second end-to-end limit at 1,088.645 seconds. Stage receipts in the job log
+show conversion from 0.605 seconds after calibration to 864.038 seconds
+(863.433 seconds of conversion), ONNX export in 127.408 seconds, and 224.607
+seconds for the remaining measured work. Memory stayed available (at least
+about 11 GiB in sampled logs) and temporary disk stayed above 80 GiB. This
+confirms a CPU-time blocker rather than OOM or disk pressure. It does not isolate
+a single solver hotspot within conversion; profiler-backed optimization and an
+exact-candidate rerun are still required. The gate remains red and unchanged.
+
+### Exact-source installed-wheel PTQ parallelism — 2026-10-07
+
+On source revision `19656644ad3c26c9e4f6f3948ba08c304c6b4b24`, the exact
+Linux CPU abi3 wheel passed the installed-wheel `qualify public PTQ row-fitting
+parallelism` step in Actions run
+[37626387409](https://github.com/Quitetall/tritium/actions/runs/37626387409)
+(job `112810906163`). The test exercises public `prepare` → `calibrate` →
+`convert()` and passed its assertions that serial and four-thread runs produce
+the same algorithm ID, fitted-artifact digest, and weighted error, with at least
+1.5× measured speedup. The pinned SmolLM2 CPU tutorial in the same workflow
+finished with `1,081.175s` elapsed against the unchanged `300s` budget. Its
+stage markers place public conversion at `853.208s` total elapsed, or about
+`852.602s` after the `0.606s` calibration point. The prior exact-source run
+`37621206763` recorded `863.433s` of conversion, so this run is roughly 1.3%
+faster by wall clock on different hosted runners—not a statistically isolated
+solver improvement and nowhere near sufficient for the five-minute gate. The
+entire tutorial still fails the time gate. The separate general Python unit-test
+job correctly skips the PTQ probe because PyTorch is absent there; the
+installed-wheel lane is its authoritative execution environment. The passing
+parallelism probe is a bounded row-fitting result, not a whole-model throughput
+or release-performance claim.
+
+The run's remaining measured stages were approximately `20.784s` for native
+checkpoint round-trip, `43.831s` for generation, `129.405s` for ONNX export,
+`26.648s` for ONNX replay, and `7.161s` from QAT reload start through resume.
+Sampled available memory remained at least `12.2 GiB`, and runner temp disk
+remained above `83 GiB`; this was a CPU-time failure, not OOM or disk pressure.
+The exact-source workflow is
+[37626387409](https://github.com/Quitetall/tritium/actions/runs/37626387409)
+on revision `19656644ad3c26c9e4f6f3948ba08c304c6b4b24`.
+
+### Public PTQ artifact-path regression — 2026-10-07
+
+The chosen PTQ test seam is the public `prepare` → `calibrate` → `convert()`
+artifact path, not a direct private solver call. On branch head
+`8bef95b6fb7acc8320d77823d6ef001f4bb3a78f`, the focused source-tree test
+`test_live_module_fit_consumes_bound_curvature_and_rejects_source_drift` passed
+(1 passed, 36 deselected). It writes and reloads the conversion artifact,
+checks fitted trits/scales and weighted error, exercises deterministic resume,
+and rejects source-weight drift. This confirms the public artifact contract on
+a small CPU fixture; it is not a model-level quality or performance result.
+
+### Exact-source hosted SmolLM2 tutorial rerun — 2026-10-07
+
+Actions run [37629720595](https://github.com/Quitetall/tritium/actions/runs/37629720595)
+completed with only the pinned SmolLM2 CPU tutorial failing; the CI aggregate,
+CodeQL, CPU wheels, abi3 matrix, publish readiness, docs, and source-free wheel
+tutorial passed. The tutorial ran on exact source revision
+`8bef95b6fb7acc8320d77823d6ef001f4bb3a78f` and finished at `690.001s` against
+the unchanged `300s` budget. Stage markers show calibration at `0.441s`,
+conversion at `552.095s` (about `551.654s` after calibration), native checkpoint
+round-trip at `565.363s`, generation at `593.501s`, ONNX export at `665.686s`,
+ONNX replay at `685.167s`, and QAT resume at `690.001s`.
+
+Sampled memory stayed above about `12.8 GiB` and runner temp disk above `83.5
+GiB`; this remains a CPU-time failure, not OOM or disk pressure. Conversion was
+about 35% faster than the preceding hosted run's `852.602s`, but the code was
+unchanged and hosted runner variation was not controlled. Treat this as noisy
+measurement, not evidence of an optimization. The gate is still red by
+`390.001s`, and profiler-backed optimization plus an exact-candidate rerun
+remain required.
+
+A second exact-source run, Actions run
+[37632137262](https://github.com/Quitetall/tritium/actions/runs/37632137262),
+again used revision `15bc7e25739a136637e14a5cb4a21e226491ff1c` (before the
+local Python/Rust bridge edit described below). It failed the same tutorial
+time gate at `1074.451s`; conversion completed at `852.649s`. Memory remained
+above roughly `11.2 GiB` and runner temp disk above `81.8 GiB`, so this was
+again a CPU-time failure rather than memory or disk exhaustion. The run's
+conversion time differs substantially from the earlier exact-source run, so
+the pair confirms that hosted CPU timing is variable; neither result alone
+identifies a code regression or improvement. At the time of this run, the
+local bridge edit had only been checked on a smaller deterministic fixture;
+the later exact-candidate hosted run is recorded below.
+
+The exact-candidate hosted run
+[37637322050](https://github.com/Quitetall/tritium/actions/runs/37637322050)
+then exercised commit `44942a8a156a3350cbbb613791ef1c09e6eb5e77`, including
+the binary bridge. It completed the tutorial's functional stages but failed
+the unchanged 300-second limit at `1033.296s`; conversion completed at
+`805.704s`. Sampled available memory stayed above about `12.0 GiB` and runner
+temp disk above `83.4 GiB`. This remains a CPU-time failure. Relative to run
+`37632137262`, the observed conversion was about 47 seconds shorter, but the
+hosted runs were not controlled or same-runner A/B comparisons. Do not
+attribute that difference to the bridge or claim a speedup.
+
+### Local dev-build PTQ profile — 2026-10-07
+
+Commit `44942a8a156a3350cbbb613791ef1c09e6eb5e77` was profiled through the
+public `prepare → calibrate → convert()` tutorial on the cached, pinned
+`HuggingFaceTB/SmolLM2-135M-Instruct` revision
+`12fd25f77366fa6b3b4b768ec3050bf629380bac`. This used the checked-out Python
+package and its locally built abi3 extension in
+`/tmp/tritium-release-wheel-perf`, Python 3.14.7, PyTorch 2.11.0+cu130,
+Transformers 5.5.3, CPU on an Intel i9-14900K host (32 logical CPUs). The
+extension came from `maturin develop` without `--release`, so it used the
+development profile, not the optimized wheel profile. The tutorial passed
+functionally in `779.871s` with an explicit `max_seconds=1800`; this is not a
+pass of the frozen 300-second hosted gate, a release-wheel timing result, or a
+model-quality qualification. Its receipt SHA-256 is
+`a980e19b48b46d94078222d56465cd69642b8e2106ebcd99f42e47a9657b3ff6`; the
+selected dense/checkpoint byte counts were `537,919,488` / `92,192,265` (5.83x).
+
+In this development-build trace, `convert()` took `559.044s` and the native
+`fit_joint_ternary_diagonal` bridge was called 2,106 times. This identifies a
+candidate area to inspect, but does not prove it is the optimized wheel's
+dominant cost. Python-side timings are inclusive across the checkpointing call
+tree and must not be summed. The host was concurrently loaded (1-minute load
+average peaked near 70), so elapsed time is diagnostic, not a comparative
+benchmark. Raw pstats remain at
+`/tmp/tritium-ptq-profile-44942a8a.pstats` (SHA-256
+`ad8871ac616d73ceb6f5b418f1bd255ed2efc75e73cdfcdc047e6a1cb7dc2f8b`); the
+receipt and profile are local temporary evidence, not yet part of the release
+evidence bundle. The same commit's hosted tutorial later failed the 300-second
+gate as recorded above.
+
+### Release-wheel grouped PTQ bridge experiment — 2026-10-07
+
+The optimized Linux wheel from run `37637322050` was compared with a local
+release-profile wheel that batches scale groups into one private native call.
+Both used the public `prepare → calibrate → convert()` path, the same cached
+SmolLM2-135M source and calibration receipt, `max_working_bytes=256 MiB`, and
+the same `tritium.salt-v2-joint-diagonal-catq-relays-3@1` algorithm. The
+baseline wheel SHA-256 is
+`962f9a8d057d316be5bfe992e5c4ac271ba5c8eb62461cb5b9b462480e105b06`; the
+experimental local release wheel SHA-256 is
+`64fb7adf0f999ce166744dccb0495f9af6e916f629e3b68c1abf07fc5cffb398`.
+
+Across two unprofiled local conversions per wheel, baseline times were
+`105.094s` and `125.474s`; grouped-call times were `87.340s` and `91.390s`.
+The observed medians were `115.284s` and `89.365s` (22.5% lower for the
+grouped build). All four conversions emitted the identical artifact ID
+`sha256:2beb214271ee9e1581e721f4f87937a3e12c1266ba4bc2e8bc99ab57b56059d4`.
+The accompanying cProfile runs reduced calls to
+`fit_joint_ternary_diagonal*` from 2,106 to 224 (89.4% fewer). Its profile is
+at `/tmp/tritium-ptq-groups-convert.pstats` (SHA-256
+`d7c6a02b6aaf11e7cf294efc99b481363bb82392154fa03903be9f0bb846e1aa`).
+The grouped cProfile run took `88.697s` total; `_joint_additive_projection`
+accounted for `78.124s` cumulative, and the native
+`fit_joint_ternary_diagonal_groups` call accounted for `66.955s` self time.
+Thus the measured local hot path is still native solver work, not Python/native
+call count or artifact sealing. These figures are profiled local timings and
+should guide optimization only; they do not explain the hosted runner's roughly
+ninefold slower conversion by themselves.
+
+### Installed-wheel SmolLM2 CPU tutorial — 2026-10-07
+
+Built and installed the Linux CPU abi3 wheel (`pytritium 1.1.0rc2`) into an
+isolated Python 3.14 environment with its optional ONNX dependencies, then ran
+the pinned SmolLM2 tutorial through the public `prepare` → `calibrate` →
+`convert()` path. The tutorial completed PTQ, generation, native checkpoint
+round-trip, ONNX export/replay, and a QAT update plus optimizer resume in
+`190.242s`, below its frozen `300s` local limit. Receipt:
+`/tmp/tritium-ptq-installed-wheel-final-1791390391/receipt.json`.
+
+The receipt records 211 selected and 61 preserved parameters, `537,919,488`
+selected dense bytes versus a `92,192,265`-byte compact checkpoint (5.83× for
+this small fixture), ONNX replay max absolute error `8.01e-5` against `1e-4`
+tolerance, and PTQ artifact `sha256:2beb214271ee9e1581e721f4f87937a3e12c1266ba4bc2e8bc99ab57b56059d4`.
+The generated sample was a short sentence; this is functional CPU smoke evidence,
+not a model-quality claim. It does not qualify the hosted CI tutorial, GPU
+performance, Qwen, or public release. The first attempt used an environment
+missing ONNX optional dependencies and stopped at ONNX export; the successful
+rerun used the existing isolated environment containing ONNX and ONNX Runtime.
+
+This is promising local evidence for the bridge change, not release
+qualification or a controlled performance claim: the baseline is the hosted
+wheel, the new wheel was built locally with a different manylinux tag, and
+host load varied substantially during the trials. The algorithm/configuration
+was unchanged. The PTQ artifact suite passed 39/39, including exact
+legacy-per-group parity and a public `convert()` two-group artifact
+round-trip; the row-parallelism regression also passed. The grouped bridge is
+committed as `9248f275`; its CI, docs, CodeQL, capstone, and wheel-platform
+matrix passed. Its pinned tutorial had not completed when that wheel workflow
+was superseded by the next candidate.
+
+### SALT G128 joint-fit microbenchmark — 2026-10-07
+
+A deterministic Divan benchmark now exercises the production diagonal-F64
+solver configuration on one 128-weight group, separately for one, two, and
+three planes. It uses the public bridge's 16-iteration cap, four deterministic
+restarts, f16 scale scoring, `1e-8` ridge, `1e6` conditioning limit, and both
+relay basins. Fixture construction and an output-shape/finite-objective
+preflight are outside the timed loop. The source under test was solver commit
+`0969789962b8be74366b3116552e987d81b5a263`; the benchmark harness SHA-256 is
+`cd969158503fc0409348632534eef9ecf3f319497ddbdacc42f76318e744036d`.
+
+On the Intel i9-14900K, Rust 1.98.0 optimized build, one Divan run measured
+median fit times of `83.56 µs` (P=1), `318.1 µs` (P=2), and `780.3 µs` (P=3),
+with 100 samples per case. This is a local microbenchmark baseline, not a
+before/after speedup claim or hosted tutorial evidence: the host load average
+was about `29.8` across 32 logical CPUs, and no matched pre-optimization run was
+made. Re-run both variants under matched conditions before attributing
+performance changes to the fused diagonal-statistic pass.
+
+Command: `RUSTC_WRAPPER= cargo bench --offline -p tritium-benches --bench
+salt_fit`.
+
+### Hosted pinned SmolLM2 PTQ/QAT tutorial — 2026-10-07
+
+Wheel workflow [37644673976](https://github.com/Quitetall/tritium/actions/runs/37644673976)
+tested source commit `0969789962b8be74366b3116552e987d81b5a263`. The platform
+wheel builds, clean-install checks, source-free tutorial, abi3 matrix, and matrix
+admission passed, but the pinned SmolLM2 PTQ/QAT tutorial job failed its frozen
+300-second wall-time limit after completing its stages in `1017.603s`. PTQ
+conversion completed at `788.529s`; native checkpoint round-trip, generation,
+ONNX export/replay, QAT step, and QAT resume also completed before the runner
+raised the budget error. This is a functional tutorial run that fails the timing
+gate, not an OOM or a model-quality result. The separately selected test seam
+for future regression coverage is the public `tritium.torch.convert()` artifact
+path; the existing focused public grouped-fit artifact round-trip passed locally.
+
+The next hosted wheel workflow, run
+[37652633017](https://github.com/Quitetall/tritium/actions/runs/37652633017),
+tested pushed source commit `46bf27caf8e68edc9993b758ff39435e26119b00` and
+failed the same frozen tutorial gate at `818.029s` against `300s`. The run
+completed rather than timing out at the job level; this is still a wall-time
+failure, not an OOM. The optimization that skips assignment reconstruction when
+the current trit assignment is unchanged was committed as `ee55d6dc` and pushed
+after that run finished. Workflow run
+[37655145029](https://github.com/Quitetall/tritium/actions/runs/37655145029)
+for `ee55d6dc` completed with an overall failure, although its job API lists
+only three passing platform-wheel jobs and one skipped CUDA job; it contains no
+SmolLM2 tutorial job and exposes no failed job log. The wheel artifacts passed,
+but this run gives no timing result for the solver change. No performance
+effect is claimed. The exact cause of the workflow-level failure and the absent
+tutorial job are unresolved. CUDA, ROCm, Metal, wgpu, real-model serving, and
+performance-regression jobs were skipped and remain unverified.
+
+The following run,
+[37655983490](https://github.com/Quitetall/tritium/actions/runs/37655983490),
+did execute the tutorial on source `d2e072c62d7b3c775b3c19105d84216d10ce2dac`
+and Linux CPU wheel SHA-256
+`f572e4695a1d134e9ddfb903c1e086cf2bc93b409e698dbd220c9b76cc5536e4`. PTQ,
+checkpoint round-trip, generation, ONNX export/replay, and QAT/resume all
+completed, but the frozen 300-second tutorial budget failed at `1035.006s`.
+The stage log reports PTQ conversion at `814.560s`; the preceding hosted run
+`37652633017` reported conversion at `646.857s` and total time `818.029s`.
+These are not a controlled A/B and do not establish that the solver change
+caused the slower result. The runner reported roughly 12–14 GiB available
+memory and over 80 GiB temporary disk during the run; this is not an OOM or
+disk-pressure failure. The upload step was skipped after the timing failure,
+so the stage log is the available hosted evidence; the wheel, abi3 matrix, and
+other independent smoke artifacts were uploaded successfully.
+
+The exact-source follow-up on commit `aec05035d992dd6fdd24628bfbd8fc80815bb6fd`
+is Actions run
+[37660642998](https://github.com/Quitetall/tritium/actions/runs/37660642998).
+Platform wheels, installed-wheel smoke, source-free tutorial, abi3 matrix, and
+matrix admission passed; the CUDA wheel was skipped. The pinned tutorial
+completed its functional path but failed the unchanged 300-second budget at
+`1001.291s`. Stage timings were calibration `0.620s`, conversion `778.364s`,
+native checkpoint round-trip `800.979s`, generation `851.183s`, ONNX export
+`965.086s`, ONNX replay `994.313s`, QAT step `999.878s`, and optimizer resume
+`1001.291s`. The runner retained at least `12,398,168 KiB` available memory
+and `87,492,580 KiB` temporary disk; this was neither OOM nor disk pressure.
+The tutorial error was raised only after those functional stages completed.
+
+Compared with run `37655983490`, conversion was about 36 seconds shorter and
+total time about 34 seconds shorter, but hosted runs are not controlled
+same-runner A/B measurements. No speedup is attributed to the assignment-skip
+change. The frozen hosted timing gate remains red; local installed-wheel pass
+evidence does not replace it. CUDA, ROCm, Metal, wgpu, physical performance, and
+real-model serving remain unverified or skipped.
+
+### Native PTQ row-fit allocation reduction — 2026-10-07
+
+The native SALT V2 row fitter now borrows validated `DiagonalF64` evidence
+instead of copying the 128-value group diagonal for every row, and uses an
+in-place unstable sort for deterministic weighted-absolute initialization
+ordering. The original index remains the unique tie-breaker, so the total order
+and all quantile anchors are unchanged. The quantize crate's 235 unit tests,
+public diagonal/affine bit-conformance test, and strict Clippy check passed.
+
+The optimized local microbenchmark medians were 76.66 µs (P=1), 311.3 µs
+(P=2), and 769.0 µs (P=3), 30 samples per case. Nearby runs on this busy host
+varied by roughly 2×, so these numbers do not establish a speedup. This is a
+software allocation reduction only; the pinned hosted 300-second tutorial
+gate remains unverified for this change and must be rerun before any timing
+claim.
+
+### G128 PTQ row-parallelism benchmark — 2026-10-07
+
+The `salt_fit` benchmark now includes a 64-row P=2 throughput case. It uses
+the same deterministic G128 fixture and SALT fit configuration as the
+single-group microbenchmark, with a Rayon pool created outside the timed loop.
+On the Intel i9-14900K (32 logical CPUs), Rust 1.98.0, the one-worker median
+was `19.77ms` per 64 rows and the four-worker median was `6.283ms` (`3.15x`);
+30 samples per case. The exact solver output is checked by the existing
+exhaustive and bit-conformance tests. This indicates that the row-parallel
+path scales well on this local CPU. It is not a hosted-runner measurement or a
+full-model conversion timing, so it does not establish that the pinned tutorial
+will meet its `300s` gate.
+
+### SALT V2 assignment/scale temporary storage reduction — 2026-10-07
+
+The exact assignment codebook now uses fixed stack storage for its bounded
+`3^P` states and an in-place deterministic sort (state ID is the unique tie
+breaker). Scale canonicalization also moves each sign-corrected trit plane
+through one owning vector instead of cloning it again after ordering. The
+exhaustive assignment/tie oracle, scale-sign/order reconstruction test, public
+solver conformance test, full quantizer unit suite (235 tests), and strict
+quantizer Clippy passed.
+
+The same local G128 benchmark measured medians of 77.46 µs (P=1), 323.1 µs
+(P=2), and 797.8 µs (P=3), versus the immediately preceding run's 77.24 µs,
+324.7 µs, and 811.7 µs. The differences are within the observed host noise and
+do not establish a speedup. The benefit claimed here is bounded temporary
+storage/allocation reduction only; the hosted 300-second tutorial has not yet
+run against this source.
+
+### Telemetry-enabled hosted SmolLM2 tutorial — 2026-10-07
+
+Wheel workflow [37664061975](https://github.com/Quitetall/tritium/actions/runs/37664061975)
+tested source commit `e35e6b25d7b53aa3971b5922fa622f62955fe751`. All functional
+tutorial stages completed, but the frozen 300-second gate failed at
+`828.685s`. Calibration took `0.520s`; conversion completed at `646.665s`,
+native checkpoint round-trip at `665.490s`, generation at `707.171s`, ONNX
+export at `799.370s`, replay at `822.754s`, and QAT optimizer resume at
+`828.685s`.
+
+The runner reported four logical CPUs. Samples retained about 13.4–14.5 GiB
+available memory and 83.4–84.3 GiB temporary disk. Across the logged
+`cpu.stat` samples, `nr_throttled` and `throttled_usec` stayed at zero. Load
+average rose from below one to roughly five while the Python conversion ran.
+This rules out OOM, disk pressure, and observed cgroup throttling as causes;
+the measured failure is concentrated in native PTQ solver CPU time on the
+four-CPU runner. It does not establish whether additional CPU parallelism,
+per-core throughput, or both explain the gap to local timing. The frozen gate
+remains red, and no model-quality or release qualification follows from the
+functional completion.
+
+### Native PTQ fit-result memory reduction baseline — 2026-10-07
+
+Wheel workflow [37676403818](https://github.com/Quitetall/tritium/actions/runs/37676403818)
+tested parent commit `369f69f3bc7d2c19db180fd2da2b6f7966a3b7ea`, before the
+two follow-up bridge-memory commits. The pinned tutorial completed its full
+functional path but failed the unchanged 300-second wall-time gate at
+`624.605s`. Calibration took `0.428s`; PTQ conversion completed at `488.073s`,
+native checkpoint round-trip at `501.302s`, generation at `529.505s`, ONNX
+export at `603.480s`, replay at `619.631s`, and QAT optimizer resume at
+`624.605s`.
+
+The runner had four logical CPUs, at least about 12 GiB available memory during
+the final sample, and over 83 GiB temporary disk. It was not an OOM or disk
+failure. This result establishes the hosted parent baseline for commits
+`ea2c7cd5` and `909add9c`; it does not qualify those changes or pass the frozen
+timing gate. The candidate workflows must be inspected separately before
+claiming any performance effect.
+
+### Hosted compact-fit batching regression and bounded-batch follow-up — 2026-10-08
+
+Wheel workflow [37678462152](https://github.com/Quitetall/tritium/actions/runs/37678462152)
+tested `909add9c0a8136753eba94a80aca738836ec21ed`. All functional stages
+completed, but the pinned tutorial failed the unchanged 300-second limit at
+`983.764s`; PTQ conversion took `764.628s`. Checkpoint round-trip completed at
+`785.224s`, generation at `827.808s`, ONNX export at `951.673s`, replay at
+`976.718s`, and QAT resume at `983.764s`. The exact source-free tutorial,
+platform wheels, ABI matrix, CI, docs, CodeQL, and capstone smoke passed; GPU,
+ROCm, Metal, wgpu, and real-model serving lanes were skipped.
+
+During PTQ, both the parent and candidate runners exposed four logical CPUs,
+about 13.7–13.9 GiB mean available memory, similar mean load-1 (4.91 vs. 4.85),
+and zero cgroup CPU-throttle events. The candidate accumulated about 2,956
+cgroup CPU-seconds during conversion vs. about 1,817 for the parent. This is a
+strong regression signal for the candidate execution path, but not a controlled
+same-host A/B: CPU model/frequency and runner placement are not pinned, so the
+source change is not yet proven to be the sole cause.
+
+A new four-thread `salt_fit` bridge-collection benchmark compares flat full-fit
+collection, flat compact collection, one-group-at-a-time compact collection,
+and eight-group batches on the same deterministic 2,048-row fixture. All four
+paths assert exact equality of scales, trits, and aggregate objective before
+timing. The two exploratory runs were noisy and contradictory: the first
+measured medians of 189.7 ms (flat full), 191.8 ms (flat compact), and 255.2 ms
+(one-group compact); the second measured 207.7 ms, 292.3 ms, 210.1 ms, and
+196.5 ms (eight-group batch), respectively. These do not support a stable
+speedup or regression claim; local load was high and changed during the runs.
+
+The unpushed follow-up `e4aadccc` now decodes weights per bounded group batch,
+fits multiple adjacent groups in each Rayon pass, and limits retained fit
+results to an 8 MiB trit-output estimate or 4,096 rows, whichever is smaller.
+Local Rust tests (16), public PTQ/refinement tests (43), strict Clippy, and
+exact-output benchmark preflights pass. It has not yet been measured by hosted
+CI; the frozen 300-second gate remains open.
+
+### Hosted PTQ timing confirmation and G64/P3 benchmark — 2026-10-08
+
+Wheel workflow [37846314955](https://github.com/Quitetall/tritium/actions/runs/37846314955)
+tested source `314c9f53e7df659e3819455e67abe414b2f85579`. Its pinned
+SmolLM2-135M CPU tutorial completed conversion at `756.593s` and all later
+functional stages (checkpoint round-trip, generation, ONNX export/replay, QAT
+step and optimizer resume) at `972.244s`, then failed the unchanged 300-second
+gate. The runner reported four logical CPUs, about 11.4–15.3 GiB available
+memory and over 83 GiB temporary disk; observed cgroup throttling remained
+zero. This is consistent with the previously identified native solver CPU
+cost, not an OOM, disk-pressure, or tutorial-functionality failure. It is not
+a controlled performance comparison or model-quality result.
+
+To match the production compact recipe more closely, `salt_fit` now includes
+64-column, three-plane independent row fits at one and four threads. A local
+optimized-build sample on the i9-14900K measured a four-thread median of
+`9.999ms` for 64 rows (`6.400 K rows/s`); the one-thread median was `24.10ms`.
+A shorter initial sample measured `8.514ms`, showing material run-to-run
+variation. This is an exploratory microbenchmark only: fixture values are
+synthetic, there is no before/after candidate comparison, and it does not
+qualify the hosted tutorial. The user's selected PTQ regression seam remains the public
+`convert()` artifact path; `test_public_convert_persists_grouped_fit_artifact`
+already exercises it. Next action is a controlled solver-level optimization
+experiment that preserves artifact bytes on the fixed fixture, followed by a
+fresh hosted tutorial rerun; do not relax its budget or reduce the model/profile
+to make the gate pass.
+
+### Exact weighted-quantile total cache — 2026-10-08
+
+The production row fitter reuses the same ordered absolute-weight/curvature
+context across all three plane-count basins, but recomputed its total curvature
+for each restart quantile. `WeightedAbsOrder` now stores the total in the same
+sorted summation order, eliminating those repeated sums while keeping each
+prefix scan allocation-free. The quantile regression checks total and selected
+value bits against the previous ordered fold, and the three-plane solver
+fingerprint remains unchanged. The full quantizer suite passed (235 unit tests
+plus integration tests), as did strict Clippy and formatting.
+
+The local G64/P3 benchmark sample after the first implementation (which also
+allocated a cumulative-prefix vector) measured medians of `23.10ms`/64 rows
+at one thread and `6.085ms`/64 rows at four threads. The earlier same-host
+candidate-free sample measured `24.10ms` and `9.999ms`, respectively. A shorter
+pre-change sample had measured `8.514ms` at four threads, so host/run variation
+is material. These are not a controlled before/after, and no speedup is
+claimed. The final allocation-free revision measured `23.03ms` and `5.971ms`
+medians under the same G64/P3 harness, again with no matched old/new run.
+Full-model PTQ artifact identity and the hosted 300-second tutorial remain
+unverified for this change. Next: perform
+a matched old/new public `convert()` artifact comparison, then rerun the exact
+hosted tutorial before attributing any runtime effect.
+
+The exact pre-optimization wheel workflow [37849611144](https://github.com/Quitetall/tritium/actions/runs/37849611144)
+then completed on source `cab6c07555c1d5e32cdde9f17b2cff1d80746e86` with the
+same CPU-time failure. The pinned tutorial converted at `757.190s` and finished
+all functional stages at `978.399s`, exceeding the unchanged `300.000s` limit.
+Checkpoint round-trip completed at `777.949s`, generation at `820.966s`, ONNX
+export at `945.624s`, replay at `971.381s`, and QAT optimizer resume at
+`978.399s`. The hosted runner had four logical CPUs, roughly 13.5 GiB or more
+available memory during the late stages, over 83 GiB temporary disk, and no
+recorded cgroup CPU-throttle events. This is a baseline for the subsequent
+solver-cache candidate, not evidence that candidate improves performance or
+model quality. The next gates remain an exact public `convert()` artifact
+comparison and the hosted tutorial on the candidate commit.
+
+### PR #51 exact-head ABI3 matrix — 2026-10-08
+
+The wheel workflow for candidate `74d57c6a5397a650b0e858515cbe59c092a5c67b`
+produced `abi3-compatibility-receipt` at
+[run 37852101721](https://github.com/Quitetall/tritium/actions/runs/37852101721).
+The owning validator in `scripts/aggregate-wheel-smoke.py` accepted the
+downloaded receipt against the exact source revision and release
+`1.1.0-rc.2`: schema `tritium.abi3-matrix-qualification.v1`, `passed: true`,
+16 CPython/platform cells, receipt ID
+`sha256:69e0d6a0c40b53bbd72a461bfc35088079c8bc810a931c27df255d129e0290d6`.
+This closes the compatibility-matrix evidence requirement for that exact
+source revision, but it is not yet attached to a release-candidate manifest or
+registered in the release evidence registry; the `packages` gate therefore
+remains open.
+
+### Matched public `convert()` artifact comparison — 2026-10-08
+
+The selected regression seam is the public Python `prepare` → `calibrate` →
+`convert()` path, exercised by
+`test_public_convert_persists_grouped_fit_artifact`. The test passed once with
+a freshly built `tritium-py` extension from baseline `c1aec7b9` and once from
+candidate `1b38b8007be85166e8fa6cd1cf3f1c54fa059be5`, using the same unchanged
+Python PTQ wrapper, fixture, locked dependencies, and test source. The resulting
+conversion manifest, weight manifest, both plane trit payloads, and both plane
+scale payloads were byte-identical (matching SHA-256 per file). This closes
+artifact-identity coverage for this deterministic small CPU fixture; it does
+not establish a full-model quality/runtime result or SOTA behavior.
+
+The exact-head wheel workflow
+[37853447148](https://github.com/Quitetall/tritium/actions/runs/37853447148)
+was still running at the time of this check, with the pinned SmolLM2 CPU
+tutorial active. Do not push a new commit until that `cancel-in-progress`
+workflow finishes. Its final tutorial timing remains the next authoritative
+measurement for this candidate.
+
+The same machine's existing `salt_fit` G128 single-group microbench was run
+with `CARGO_BUILD_JOBS=1 cargo bench --locked -p tritium-benches --bench
+salt_fit -- joint_diagonal_g128 --min-time 1 --sample-count 10`. On the
+i9-14900K, median latency was `73.78µs` for P1, `294.3µs` for P2, and `745µs`
+for P3 (the bench config uses four deterministic restarts, 16 max iterations,
+F16 scoring, and both relay basins). The P3 distribution had a `2.156ms`
+slowest sample, so this short fixture benchmark is an algorithm-scaling signal,
+not a stable performance claim or a function-level profile. `samply` could not
+start a recording in this environment (`mmap failed`), and `gdb` attach was
+denied by ptrace policy, so the next code optimization still needs finer
+attribution before changes are chosen.
+
+### Exact-head tutorial and ABI3 result — 2026-10-08
+
+The workflow on source revision
+`1b38b8007be85166e8fa6cd1cf3f1c54fa059be5` completed as
+[run 37853447148](https://github.com/Quitetall/tritium/actions/runs/37853447148).
+All wheel builds, installed-wheel functional smoke, source-free tutorial, and
+the ABI3 matrix passed; the pinned SmolLM2 CPU tutorial alone failed its frozen
+`300s` wall-time gate. It completed every function stage, with conversion at
+`756.794s` and total tutorial time `972.680s` (`672.680s` over budget).
+Checkpoint round-trip completed at `777.183s`, generation at `819.440s`, ONNX
+export at `941.074s`, replay at `965.791s`, and QAT optimizer resume at
+`972.680s`. The matching pre-cache baseline run `37849611144` recorded
+`757.190s` conversion and `978.399s` total. This small difference across
+separate hosted runners does not demonstrate a speedup; treat the cache as
+artifact-preserving, not as a meaningful tutorial optimization.
+
+The candidate runner had four logical CPUs, at least about `12.0 GiB` available
+memory in late samples, more than `83 GiB` temporary disk, and zero recorded
+cgroup CPU throttling. This remains a CPU-time failure, not an OOM or storage
+failure. The exact-source ABI3 receipt downloaded from the same run passed the
+owning `validate_receipt` check for release `1.1.0-rc.2`: schema
+`tritium.abi3-matrix-qualification.v1`, 16 cells, run ID
+`github-37853447148-1-abi3-matrix`, receipt ID
+`sha256:c30797a66685f64c294c4309f4264d5c4d846ff3fab0ac3a9f59ee878ff76c4f`.
+As before, matrix evidence alone does not close the full `packages` gate.
+
+### Exact assignment codebook deduplication probe — 2026-10-08
+
+The solver's exact ternary assignment codebook now removes duplicate
+reconstructions after total-order sorting. Equal reconstruction values have
+identical error for every weight; retaining the first (lowest state) preserves
+the prior tie order while avoiding a second search for the start of a duplicate
+run. The exhaustive assignment-oracle tests pass. A test-only ignored phase
+profile was added to attribute G64/P3 work without changing the production API.
+
+The public `prepare` → `calibrate` → `convert()` artifact test was rebuilt
+against this exact working-tree Rust extension and passed (`1 passed`). All six
+persisted files matched the previously recorded baseline/candidate comparison:
+conversion manifest `503ddde4…cec57d6`, weight manifest
+`976cf130…bb6765f`, plane-0 scales `c8de1782…b717c9`, plane-0 trits
+`e1c9310f…326bd17`, plane-1 scales `e5693158…0a17b0`, and plane-1 trits
+`9adb3b52…703ac12`. This is deterministic small-fixture artifact identity,
+not full-model equivalence or quality evidence.
+
+The test-only phase profile over 256 deterministic G64/P3 rows measured
+`552.816ms` total: assignment `211.214ms`, scale solving `118.757ms`,
+reconstruction `141.629ms`, and uninstrumented remainder `81.216ms`. An earlier
+same-harness profile before codebook deduplication measured `565.809ms` total,
+with assignment at `252.060ms`; this instrumentation is diagnostic, not a
+release benchmark. Matched optimized `salt_fit` runs on this host varied across
+roughly `20.2–23.2ms` (one thread) and `5.4–6.9ms` (four threads) per 64-row
+fixture, with candidate samples overlapping baseline samples. Therefore no
+production speedup is established. Strict quantizer tests (235 passed, 1
+ignored), strict Clippy, formatting, and the public artifact test pass. The
+hosted run [37856071971](https://github.com/Quitetall/tritium/actions/runs/37856071971)
+has passed its wheel, install-smoke, and ABI3 jobs. The pinned SmolLM2 CPU
+tutorial completed every functional stage but failed the frozen `300s` budget:
+PTQ conversion completed at `757.355s`, checkpoint round-trip at `777.642s`,
+generation at `819.383s`, ONNX export at `942.070s`, replay at `966.852s`, and
+QAT optimizer resume at `973.779s` (`673.779s` over budget). This is effectively
+unchanged from run `37853447148` (`756.794s` conversion, `972.680s` total), and
+does not test the codebook-deduplication change because it was not in the tested
+source revision. It reinforces that the release tutorial gate is still a
+substantial CPU optimization blocker.
+
+### Move solver receipts instead of cloning — 2026-10-08
+
+`fit_joint_ternary_prepared` used to clone every restart receipt, including its
+nested accepted-update and scale-solve vectors, into the result, then drop the
+originals with the candidate states. It now moves those receipts out of the
+internal fit states. Public `JointTernaryFit` fields, receipt ordering, solver
+decisions, and artifact schema are unchanged; the existing bitwise-determinism
+test compares full results, including receipts.
+
+Validation on this working tree: full `tritium-quantize` suite (235 passed, 1
+ignored), strict Clippy, formatting, and the freshly rebuilt public
+`prepare` → `calibrate` → `convert()` artifact test all pass. The six persisted
+files retain the baseline fixture hashes recorded above. One optimized G64/P3
+benchmark sample measured `20.56ms`/64 rows at one thread and `9.409ms` at four
+threads; the host load average was 8.58 and unrelated CPU-heavy processes were
+active. This is not a controlled before/after and establishes no speedup. The
+change removes redundant nested-vector copies by construction, but its runtime
+impact and contribution to the frozen tutorial gate remain unqualified.
+
+A matched short `salt_fit` comparison was then run on this host, pinned to CPU
+IDs 27–30, using the same command and one sample per revision:
+`taskset -c 27-30 env CARGO_BUILD_JOBS=1 cargo bench --locked -p
+tritium-benches --bench salt_fit -- joint_diagonal_g64_p3_ptq_rows
+--min-time 1 --sample-count 10`. At one thread, baseline `f4398109` measured
+`36.49ms`/64 rows and candidate `61af063a` measured `36.95ms`; at four threads,
+baseline measured `9.414ms` and candidate `9.581ms`. This is neutral to slightly
+slower within a single sample per revision and establishes no runtime benefit.
+The allocation reductions are supported structurally and by correctness tests,
+but wall-time impact remains unproven. This microbenchmark is not a substitute
+for the hosted full-model tutorial gate.
+
+The previously active exact-head workflow has now completed as
+[run 37858286157](https://github.com/Quitetall/tritium/actions/runs/37858286157)
+on source `f439810937b96f487b8f0164d3009b5cd93899f5`. Wheel builds, installed
+wheel smoke, the source-free tutorial, and ABI3 qualification passed; the CUDA
+wheel was skipped. The pinned CPU tutorial completed all functions but failed
+the unchanged `300s` gate at `919.186s`. Stage timings were calibration
+`0.599s`, PTQ conversion `700.368s`, native checkpoint round-trip `721.012s`,
+generation `763.559s`, ONNX export `887.330s`, ONNX replay `912.259s`, and QAT
+resume `919.186s`. Compared with the earlier hosted conversion near `757s`,
+this run is about 7.5% faster, but separate-run variance prevents attributing
+that difference to a specific code change. The tutorial remains roughly
+`619s` over budget, with ONNX export also taking about `124s`; both require
+optimization without changing the frozen model or recipe. This run predates
+the local receipt-move and deferred-plane-copy commits, which are now eligible
+for an exact-head hosted measurement.
+
+To narrow the next optimization target without another full-model run, the
+existing ignored native phase profiler was run with
+`cargo test --locked -p tritium-quantize profile_g64_p3_solver_phases --
+--ignored --nocapture`. Its synthetic 256-row G64/P3 fixture reported
+`526.671ms` total: assignment `209.351ms` (39.7%), scale solve `113.536ms`
+(21.6%), reconstruction/objective `121.110ms` (23.0%), and other fit work
+`82.675ms` (15.7%). This debug-test fixture is not a full-model or optimized
+build measurement, but it makes solver assignment and reconstruction the
+leading code-level targets; receipt/bridge copies are not the only plausible
+cost. No quality-affecting solver iteration or basin settings were changed.
+
+The same allocation pass also changes scale-solve candidates to carry a
+three-plane sign/permutation map instead of cloned trit vectors. Candidate
+reconstruction/objective is evaluated through that map with the existing fused
+diagonal scoring order; the state planes are transformed in place only after
+the candidate is accepted. This removes per-iteration plane copies, including
+for rejected M-step candidates, without changing public receipts or canonical
+plane ordering. The full Rust suite and strict Clippy pass, and the rebuilt
+public `convert()` test again preserves all six artifact hashes. No fresh
+runtime comparison is claimed: during the attempted local bench window, host
+load exceeded 10 with unrelated multi-core work active. The optimization remains
+an evidence-backed allocation reduction whose wall-time impact is unmeasured.
+
+The preceding exact-head run
+[37856071971](https://github.com/Quitetall/tritium/actions/runs/37856071971)
+on source `5f0feca67a31b4c1634c868550894cdeb465bdc9` confirms the same result:
+the pinned CPU tutorial completed all functions but failed `300s`, with PTQ
+conversion at `757.355s` and total time `973.779s`. Wheel, installed-wheel
+smoke, and ABI3 jobs passed. Because this revision predates the codebook
+deduplication, it is a control only and provides no hosted performance evidence
+for that change.
+
+### Relay-basin hot-loop reuse — 2026-10-09
+
+The release-mode test-only phase profiler was extended to separate metric
+validation, weighted-order construction, deterministic starts, and relay-basin
+scale initialization. On its synthetic 256-row G64/P3 fixture, baseline source
+`4550a1ba` reported `83.722ms` total and `37.965ms` in relay initialization.
+The candidate reuses the already-computed two edge `tanh` values for both the
+relay value and its derivatives; this preserves the old f64 operation order and
+outputs. Its diagnostic profile reported `65.895ms` total and `21.103ms` in
+relay initialization. The test-only timing is directional, not a production
+claim.
+
+The optimized `salt_fit` benchmark was then run on pinned CPU IDs 27–30 with
+separate Cargo target directories, preventing one checkout from reusing the
+other checkout's compiled quantizer. Same-command medians over 64 G64/P3 rows:
+
+| Source | One thread | Four threads |
+|---|---:|---:|
+| Baseline `4550a1ba` | `37.36ms` | `9.792ms` |
+| Candidate | `29.65ms` | `7.859ms` |
+
+This fixture indicates about 20% lower solver latency locally; it is not a
+full-model result and the hosted 300-second gate is still authoritative. A
+bitwise reference test covers both relay variants over lengths 1–128 and eight
+deterministic inputs. The public `prepare` → `calibrate` → `convert()` artifact
+test passes and now asserts SHA-256 identities for all six persisted output
+files; all match the existing fixed-fixture values. The full quantizer suite
+passes (236 passed, 1 ignored), strict Clippy and formatting pass. Exact-head
+hosted qualification remains open: workflows on `4550a1ba` predate this change.
+
+A second matched benchmark used the larger G128 fixture with separate target
+directories and the same CPU pinning. Single-fit medians were `146.2µs`,
+`505µs`, and `1.17ms` for baseline P1/P2/P3, versus `107µs`, `398.7µs`, and
+`957µs` for the candidate. The P2 64-row batch measured `32.76ms` baseline vs
+`25.82ms` candidate at one thread, and `8.22ms` vs `6.462ms` at four threads.
+These synthetic local results indicate a consistent reduction, but do not
+establish full-model quality, end-to-end PTQ time, or release performance.
+
+The exact-head hosted workflow
+[run 37860276563](https://github.com/Quitetall/tritium/actions/runs/37860276563)
+on `4550a1bac07f3c5d610db7ad092ffa14be02d108` has completed. Wheel builds,
+installed-wheel smoke, and ABI3 qualification passed; the CUDA wheel was
+skipped. The pinned SmolLM2 CPU tutorial completed all stages but failed the
+unchanged `300s` gate at `919.186s`: PTQ conversion was `700.368s`, native
+checkpoint round-trip `721.012s`, generation `763.559s`, ONNX export
+`887.330s`, ONNX replay `912.259s`, and QAT resume `919.186s` (calibration
+was `0.599s`). The optimization is not yet measured by hosted end-to-end
+qualification; the candidate exact-head run remains required and the tutorial
+is still far over budget.
+
+### Portable training CPU backend receipt — 2026-10-08
+
+On clean source commit `672ad1bd1325229a13bd2a0125b77dfca73b2d66`, the V2 CPU
+training backend was run on the physical i9-14900K host against the frozen
+36-operation/117-case corpus. The source-free receipt was independently
+reopened under `ReleaseCandidate` policy by
+`training_capability_table`; it records peak resident bytes `4192` and peak
+scratch bytes `132032`. Bundle BLAKE3 is
+`2c9e9ffcc9720fc0518078c391ebbf6f9a8dbeba6e4f502a78be8e1c41a66d04`, its
+SHA-256 is
+`395eb08bb873509e0ce069fdcd785cd2e53e05273c678af59e2e7111b0585a29`, and its
+size is 41,317 bytes. The durable receipt is stored at
+`/mnt/2tb/tritium-release-evidence/training-backends/672ad1bd/cpu-v2/`.
+This qualifies the CPU family at that exact source revision only; it is not a
+seven-backend aggregate, a performance receipt, or final release qualification.
+The other six target families and final-source regeneration remain open.
+
+### Matched portable-training CPU/CUDA receipts — 2026-10-08
+
+At clean source `cea334e0c681422e9ee72d8e0e902193c9dcb92e`, the V2 CPU and
+CUDA backends independently executed and reopened against the same frozen
+36-operation/117-case corpus. CPU ran on the i9-14900K; CUDA ran on the
+physical RTX 4090. The paired admission command was
+`cargo run --locked -p tritium-testkit --example training_capability_table --
+--schema v2 <CPU_DIGEST>=<CPU_RECEIPT> <CUDA_DIGEST>=<CUDA_RECEIPT>`.
+Both receipts report peak resident bytes `4192` and peak scratch bytes
+`132032`.
+
+| Backend | BLAKE3 bundle ID | SHA-256 | Bytes | Durable receipt directory |
+|---|---|---|---:|---|
+| CPU | `e6712fadbf08b6470b6c00c10f5ee9c15057d51886c23ff2563b871cab9f5a10` | `f326baadc08606ced3f05d1a58220c8f8bd131d7b4b41bf4a7e32002865c5b52` | 41,317 | `/mnt/2tb/tritium-release-evidence/training-backends/cea334e0/cpu-v2/` |
+| CUDA | `521cbd37d2857d78813f9a70bfcf15f43c27d363dd2021b66e265e86c7592868` | `cfafb62826188b9b63dc8124f14cf53c13435814cabb238b04fc05b0d8b544d9` | 41,259 | `/mnt/2tb/tritium-release-evidence/training-backends/cea334e0/cuda-v2/` |
+
+These are two of the seven required backend families at one exact source
+revision. They do not yet form an aggregate release receipt, cover WASI/MCU,
+ROCm, Metal or native wgpu, or qualify the separate performance gate. The
+bundles must be regenerated if the source changes before candidate freeze.
+
+### Exact-head SmolLM2 tutorial outcome — 2026-10-09
+
+The completed hosted wheel workflow
+[run 37861626145](https://github.com/Quitetall/tritium/actions/runs/37861626145)
+tested source `8c5a994e11763503dd35d38e8a128b08dbf47266`. Wheel builds for
+Linux, macOS, and Windows, installed-wheel smoke, the source-free tutorial, and
+the ABI3 matrix passed. The CUDA wheel lane was skipped as configured. The
+pinned SmolLM2 CPU tutorial completed its functional path but failed the frozen
+`300s` budget at `749.959s`. Stage markers recorded conversion at `526.575s`,
+native checkpoint round-trip at `547.678s`, generation at `591.284s`, ONNX
+export at `717.628s`, ONNX replay at `742.924s`, and QAT resume at `749.959s`;
+calibration took `0.610s`. The job failed only when enforcing the wall-time
+budget after QAT resume. No tutorial receipt artifact was uploaded by this
+failed job, so these timings are preserved from its hosted job log.
+
+This run is about `169s` faster end-to-end than the prior recorded hosted run at
+`919.186s`, but the runs are not a controlled before/after experiment and this
+result remains `450s` over budget. It therefore does not attribute the
+difference to a particular optimization and does not pass the release gate.
+The public `prepare` → `calibrate` → `convert()` artifact-path test
+`test_public_convert_persists_grouped_fit_artifact` passes locally and verifies
+the persisted artifact hashes; the latest hosted failure confirms that this
+software seam is functional but does not yet make full-model PTQ fast enough.
+
+The exact-head CI and wheel runs for pushed revision
+`2960a097e14dd30f98785a273c17e197c35cc4ee` then completed. CI run
+[37863291103](https://github.com/Quitetall/tritium/actions/runs/37863291103)
+passed its executed jobs; hardware-only and real-model lanes were skipped.
+Wheel run
+[37863291107](https://github.com/Quitetall/tritium/actions/runs/37863291107)
+passed platform wheel builds, installed-wheel smoke, source-free tutorial, and
+the ABI3 matrix; its CUDA wheel lane was skipped. The pinned SmolLM2 tutorial
+completed functionally but failed the frozen `300s` gate at `527.413s`.
+Recorded stages were calibration `0.469s`, conversion `369.797s`, native
+checkpoint round-trip `385.945s`, generation `421.026s`, ONNX export
+`500.457s`, ONNX replay `521.624s`, and QAT resume `527.413s`. No tutorial
+receipt artifact was uploaded by the failed job.
+
+Compared with the immediately preceding hosted result of `749.959s`, this is
+`222.546s` faster end-to-end and `156.778s` faster at conversion. The runs are
+not controlled for runner variability, and both fail the same frozen gate; the
+difference is not attributed to a code change. The latest run is still
+`227.413s` over budget and does not qualify the full-model tutorial. It tested
+`2960a097`, before the locally committed relay-normalization buffer reuse, so a
+new exact-head wheel/tutorial run is required for that source change.
+
+### Matched portable training CPU/CUDA V3 receipts — 2026-10-08
+
+On clean source `4256284069e0135da1f62e2853eafc96f764cc53`, the V3 CPU and CUDA
+training backends independently executed against the same current
+37-operation/122-case corpus. CPU ran on the physical i9-14900K host; CUDA ran
+on the physical RTX 4090 (`cuda:0`). The source-free
+`training_capability_table --schema v3` admission reopened both bundles
+together. Both report peak resident bytes `4192` and peak scratch bytes
+`132032`. The source identity is
+`tritium-train@1.1.0-rc.2+source-git:4256284069e0135da1f62e2853eafc96f764cc53`;
+the manifest digest is
+`fda9e905f09151ae4fa55183e460bf9bc9b3dd35d77be7b225bb210da8b40fc5`, the
+vector digest is
+`c8df31ee8ac867d9009909f11fc9513d3b7464e403ebd88ea6437a26ab78009f`. CPU
+receipt digest:
+`038176fdb5deace9f37826ddccb4573f0290eafa74fccfdee702bd32d5802fe7`; CUDA
+receipt digest:
+`712c52a905c6cc99c8927abf8555e95da6d794faca1b4d51535af338b52c7d59`. Durable
+receipts are stored under
+`/mnt/2tb/tritium-release-evidence/training-backends/42562840/{cpu-v3,cuda-v3}/`.
+
+These qualify two of seven backend families at this exact candidate source.
+They are not a seven-backend aggregate, a performance receipt, or final release
+qualification; the other backend families and final-source regeneration
+remain open.
+
+### Matched portable-training V2 CPU/CUDA/wgpu/WASI receipts — 2026-10-08
+
+The frozen V2 release corpus was executed and independently admitted for four
+backend families at clean source `4256284069e0135da1f62e2853eafc96f764cc53`.
+CPU ran on the i9-14900K, CUDA on the RTX 4090, native wgpu on the discrete
+RTX 4090/Vulkan adapter, and WASI in a Wasmtime 48.0.1 guest on `x86_64`. The
+WASI bundle came from exact-head CI run
+[37864560574](https://github.com/Quitetall/tritium/actions/runs/37864560574)
+and was reopened locally from the clean source checkout. The four-way
+`training_capability_table --schema v2` admission reports 36 operations, 117
+cases, peak resident bytes `4192`, and peak scratch bytes `132032` for each
+family. Manifest digest:
+`9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098`; vector
+digest:
+`38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7`.
+
+| Backend | Receipt bundle | Durable receipt directory |
+|---|---|---|
+| CPU | `cc5b2af1ed0ca930b9deb0311db55f1dbd88dc9bd2c4ce1c1c678ef283d90973` | `/mnt/2tb/tritium-release-evidence/training-backends/42562840/cpu-v2/` |
+| CUDA | `fc7f02867170e96832596a0c61b7994690d66a59a07213449bce9ee9d9d49f46` | `/mnt/2tb/tritium-release-evidence/training-backends/42562840/cuda-v2/` |
+| Native wgpu | `f9335ff2d90932d07b32805bf3c0cadf62953027c06c6482115fb9e648b27e93` | `/mnt/2tb/tritium-release-evidence/training-backends/42562840/wgpu-v2/` |
+| WASI | `dda13a83c8f6c22f9daf5a4f18d80384a767eb4b18686c5d5c4b7a5ac712b0ff` | `/mnt/2tb/tritium-release-evidence/training-backends/42562840/wasi-v2/` |
+
+These are four of seven required V2 release families at this exact source;
+they do not form the aggregate qualification or the separate performance
+receipt. ROCm, Metal, MCU, and final-source regeneration remain open. V3
+CPU/CUDA receipts above are separate extension evidence and are not substituted
+into the frozen V2 release corpus.
+
+### Exact-source hosted SmolLM2 CPU tutorial timing — 2026-10-09
+
+Wheel workflow
+[37864560617](https://github.com/Quitetall/tritium/actions/runs/37864560617)
+tested source `4256284069e0135da1f62e2853eafc96f764cc53`. Platform wheel
+builds, installed-wheel checks, source-free tutorial, and ABI3 jobs passed; the
+pinned SmolLM2 CPU tutorial was the failing job. It completed the functional
+path, then failed the unchanged `300s` budget at `731.451s`. Stage markers
+recorded calibration at `0.596s`, PTQ conversion at `518.445s`, native
+checkpoint round-trip at `540.157s`, generation at `587.918s`, ONNX export at
+`695.296s`, ONNX replay at `724.651s`, and QAT resume at `731.451s`. Thus PTQ
+conversion consumed `517.849s` after calibration; ONNX export consumed another
+`107.271s`. Runner samples showed about `12.0 GiB` or more available memory,
+about `83.4 GiB` or more temporary disk, four logical CPUs, and no CPU
+throttling. This is a CPU-time failure, not memory/disk exhaustion or cgroup
+throttling. The functional checks completing do not qualify the frozen timing
+gate.
+
+To narrow the next optimization, an ignored release-mode solver profile was
+added and run with the tutorial's two-plane, four-restart, dual-relay recipe
+and G64 groups (the SmolLM2 hidden/intermediate widths use G64). On a
+deterministic synthetic 256-row fixture it measured `30.176ms` total:
+assignment `11.472ms`, relay initialization `9.874ms`, scale solve `2.453ms`,
+reconstruction `3.773ms`, and remaining validation/overhead `2.604ms`. This
+identified assignment and relay initialization as the largest sampled phases,
+but it was not model-backed and was not extrapolated to the tutorial.
+
+A pinned-model profile then used the public `prepare` → `calibrate` → `convert()`
+path on `model.layers.0.mlp.up_proj` (1536x576), with four PyTorch/Rayon threads.
+Calibration took `0.003s`; public conversion took `1.328s` and produced artifact
+`sha256:4059a7c249fbf4d3aaa58a56d4d6c630da175d2c440a365fef025ea3e0b58c44`
+with weighted MSE `8.28580185e-05`. The fixture binds model
+`HuggingFaceTB/SmolLM2-135M-Instruct` revision
+`12fd25f77366fa6b3b4b768ec3050bf629380bac`, calibration
+`sha256:7c42611e41b1e60300c1a123a6a3107e1d33becbd1129a4c3fd6b13d3f310dfd`,
+and fixture digest
+`2b4f5a522531a5894e98b2a0593db9764f1cef34962e62ecf9594e618437ff18`. The
+matching release-mode row profile measured `36.303ms` for 256 real rows:
+assignment `14.810ms` (40.8%), relay initialization `11.131ms` (30.7%), scale
+solve `2.744ms` (7.6%), reconstruction `4.453ms` (12.3%), and other work
+`3.165ms` (8.7%). This supports the synthetic phase ranking on this layer.
+The one-layer timing is not a full-model or hosted-CI result; it does not
+qualify the `300s` gate or establish model quality. The updated
+`profile-smollm2-ptq-solver.py` harness captures a fresh fixture without saving
+model weights into the repository. Next, optimize the assignment/relay solver
+without changing recipe semantics, validate byte/quality behavior, then rerun
+the exact-source hosted tutorial. No threshold or solver recipe was changed.
+
+The exact-assignment inner loop now binary-searches precomputed f64 midpoints
+between adjacent unique f32 reconstructions, avoiding per-weight squared-error
+comparisons in the ordinary case. It retains exhaustive assignment for
+ill-conditioned values and the original state-order tie rule. The exhaustive
+oracle test covers each codebook midpoint and its neighboring f32 values; the
+three exact-assignment tests pass. On the same pinned 256-row release-mode
+fixture, the solver phase profile measured `29.607ms` total with assignment at
+`7.385ms`, versus the preceding single profile at `36.303ms` total and
+`14.810ms` assignment. Relay initialization remains dominant at `11.954ms`.
+These are single-run phase observations, not a controlled benchmark result.
+
+After rebuilding the Python extension in release mode, three public
+`prepare → calibrate → convert()` runs measured `1.045s`, `0.972s`, and
+`0.998s` (median `0.998s`) for the selected SmolLM2 layer. All three produced
+the same PTQ artifact identity
+`sha256:4059a7c249fbf4d3aaa58a56d4d6c630da175d2c440a365fef025ea3e0b58c44`,
+weighted MSE `8.28580185e-05`, calibration identity, and fixture digest
+`2b4f5a522531a5894e98b2a0593db9764f1cef34962e62ecf9594e618437ff18`. The
+previous public-path observation was one `1.328s` run, so it is not a paired
+baseline and no speedup claim is made. This remains a one-layer profile, not a
+full-model qualification or hosted 300-second gate result.
+
+Follow-up relay profiling added an exact binary64 saturation shortcut for
+`tanh` inputs at or beyond `±20`; the configured sharpness denominator is
+exactly `2.0` because the schedule starts at `30`. The bitwise relay descent
+reference passes, with a boundary/extreme-value test added for the shortcut.
+On the same pinned Rust fixture, one release profile recorded `28.595ms`
+total and `10.576ms` relay initialization (the prior single profile was
+`29.607ms` and `11.954ms`). Three public artifact-path conversions measured
+`0.977s`, `0.936s`, and `0.937s` (median `0.937s`), with the same artifact
+identity, weighted error, calibration identity, and fixture digest. These are
+not paired controlled benchmarks; no speedup claim is made. The result is
+limited to the same one-layer profile and does not satisfy full-model or hosted
+release gates.
+
+An ignored release-mode paired ablation on the same pinned 256-row SmolLM2
+layer compares the compact-v1 relay starts with the identical solver recipe
+minus either/both relay basins. Each value is the average over five repeats;
+all candidates use the same weights, diagonal curvature, plane count, EM
+restarts, iteration budget and scale precision:
+
+| Initialization | Mean time (ms) | Relay init (ms) | Aggregate weighted objective |
+|---|---:|---:|---:|
+| no relay | 11.867 | 0.000 | 0.130944935 |
+| softened only | 20.223 | 5.103 | 0.130882743 |
+| modulated only | 19.674 | 5.097 | 0.130848182 |
+| both (current compact-v1) | 27.127 | 9.837 | 0.130786244 |
+
+On this single layer, softened-only reduced the aggregate objective by 0.0475%
+for 70.4% more row-fit time; modulated-only reduced it by 0.0739% for 65.8%
+more time; both reduced it by 0.1212% for 128.6% more time. This quantifies a
+local compute/fit tradeoff, not held-out model quality, and is not sufficient
+evidence to remove a relay or change the frozen recipe. It does make relay
+basins a high-priority target for more efficient initialization and broader
+matched-quality ablation.
+
+The exact-source hosted wheel run on `345fde73aa5239b5e12067480d0389bf2cec7794`
+([run 37868066052](https://github.com/Quitetall/tritium/actions/runs/37868066052))
+completed the SmolLM2 workflow but still failed the frozen `300s` limit at
+`369.647s`. Stage markers recorded calibration `0.408s`, PTQ conversion
+`244.956s`, native checkpoint round trip `257.560s`, generation `282.985s`,
+ONNX export `349.426s`, ONNX replay `365.033s`, and QAT resume `369.647s`.
+The hosted runner exposed four logical CPUs, about 11.7 GiB or more available
+memory, about 83 GiB or more temporary disk, and no recorded cgroup CPU
+throttling. CI, CodeQL, capstone, and docs passed for the same source; the
+only failed gate was tutorial wall time. The earlier source `f169c7d3` run was
+`752.183s`, including `526.230s` conversion. The newer observation is
+`382.536s` lower end-to-end and `281.274s` lower for conversion, but these are
+not a controlled before/after experiment and do not qualify the timing gate.
+
+On the local Intel i9-14900K, Python 3.13.14 / PyTorch 2.11.0 CPU developmental
+run of the same public tutorial completed in `231.704s`; stage timings and the
+complete 2.2 GiB output tree are retained at
+`/mnt/4tb/tritium-evidence/smollm2-local-dev-345fde73/`. This is editable-source
+development evidence, not an installed exact-source wheel receipt. It shows
+the complete local flow can meet five minutes while the exact-source hosted
+wheel still misses by `69.647s`; neither result changes the hosted release
+gate.
+
+The existing public conversion golden test was rerun after both solver changes
+against the current release-built Python extension:
+`PYTHONPATH=crates/tritium-py/python RAYON_NUM_THREADS=4 OMP_NUM_THREADS=4
+MKL_NUM_THREADS=4 /home/brianklam/.cache/tritium-py313-ci/bin/python -m
+pytest -q crates/tritium-py/tests/test_ptq_artifacts.py::test_public_convert_persists_grouped_fit_artifact`.
+It passed and matched every pinned file hash for the public artifact, proving
+that these internal search/saturation changes preserve the fixture's emitted
+artifact bytes. This is a focused development-tree check, not candidate-wheel
+or release admission.
+
+The subsequent exact-source hosted wheel workflow for `11c8295418edcb7f843a4f832bc4b8de40dad142`
+([run 37869695032](https://github.com/Quitetall/tritium/actions/runs/37869695032))
+also failed only its frozen tutorial-time gate. The same workflow recorded
+calibration `0.490s`, conversion `292.793s`, native checkpoint round trip
+`308.949s`, generation `344.480s`, ONNX export `426.530s`, ONNX replay
+`448.500s`, and QAT resume/final `454.424s` / `454.425s`, exceeding `300s` by
+`154.425s`. Its resource samples showed four logical CPUs, available memory
+around 13.4 GiB, temporary disk above 83 GiB, and no cgroup CPU throttling;
+sampled load average peaked at `5.64` (1 minute) on those four CPUs. The
+preceding exact-source run at `345fde73` measured `369.647s` total and
+`244.956s` conversion. These runs are not controlled repeats, and the changed
+runner load makes attribution of the slowdown uncertain; they do confirm the
+hosted gate remains red without any threshold change. CI, CodeQL, docs and
+capstone passed at `11c82954`; the pinned tutorial was the only wheel-workflow
+failure.
+
+### Exact QAT hard-code ONNX round-trip (2026-10-08)
+
+At source `5c03ee0d`,
+`/home/brianklam/.cache/tritium-py313-ci/bin/python -m pytest -q
+crates/tritium-py/tests/test_module_onnx.py` passed (`11 passed`). The real CPU
+ONNX gates now compare raw initializer bytes for every packed ternary plane and
+FP16 scale against the hard model, including direct and strictly reopened
+QAT-hard exports. A deterministic tiny Linear case checks values immediately
+below, at, and above the AbsMean half-step for FP32 and BF16 source weights,
+then requires exact artifact-code/scale parity and exact ORT output parity. A
+BF16-input ONNX Runtime limitation was avoided by running the exported compact
+artifact with FP32 activations; it is not evidence for BF16 runtime operators.
+This is tiny source-tree functional evidence only, not whole-model quality,
+candidate-wheel, or release qualification.
+
+### Exact-head browser package prerequisites — 2026-10-08
+
+On clean source revision `df14566869b10246ceee4b014eb690606c245767`, the
+`@tritium-ai/web@1.1.0-rc.2` package gate passed locally with 145 tests and
+zero skips. Its source-free offline npm archive receipt is
+`sha256:db55fea699a9316f3d5f647c41e063c8febbb03556185a28abadebafec01b473`;
+the archive is SHA-256
+`2baa1a628ef80290cce954f73ba58b13a17b5e0c0e22237de3ce1a1e67f83dec`.
+The same exact source produced the native CPU reference receipt
+`sha256:e84e871399076c4860342c46a2213c8b0b0fbed31f10b4f95c849816cd8f2dd3`,
+with `native.salt` SHA-256
+`6e889858c06a7eb91133f69a948ab8356a444c677eecd9e800ec689380a6e17e`.
+Both evidence bundles are retained at
+`/mnt/2tb/tritium-release-evidence/web-df145668/`.
+
+This does not qualify browser WebGPU. A local ChromeDriver endpoint was not
+available. The RTX 4090 also had 20,191 MiB allocated, 3,950 MiB free, and 36%
+utilization at inspection, so the exclusive-device browser lane was not
+started against an active shared GPU workload. Physical Firefox and physical
+macOS Safari lanes remain separately required. The Chrome lane can be attempted
+after a compatible local WebDriver is available and exclusive GPU use is safe;
+the three-lane candidate receipt remains open.
+
+### Hosted exact-source SmolLM2 tutorial — 2026-10-08
+
+The hosted wheel workflow for `df14566869b10246ceee4b014eb690606c245767`
+([run 37870797284](https://github.com/Quitetall/tritium/actions/runs/37870797284))
+passed platform wheel builds, the installed-wheel functional suite, the full
+ABI3 matrix, and the source-free tutorial. The pinned SmolLM2 PTQ/QAT tutorial
+completed every functional stage but failed the frozen `300s` wall-time gate at
+`508.990s` (`208.990s` over budget). Stage markers were calibration `0.511s`,
+conversion `338.983s` cumulative, native checkpoint round-trip `355.219s`,
+generation `389.199s`, ONNX export `482.411s`, ONNX replay `503.237s`, and QAT
+resume `508.990s`. Thus conversion itself took `338.472s`; ONNX export added
+`93.091s`. The runner exposed four logical CPUs, roughly 12–14 GiB available
+memory, over 83 GiB temporary disk, and no cgroup CPU throttling. This is a
+compute-time miss, not an OOM, disk-space failure, or skipped functionality.
+The recipe and `300s` gate are unchanged; the CPU PTQ conversion remains the
+dominant software optimization target. CI, CodeQL, docs and capstone passed at
+this source; the pinned tutorial was the only failed wheel job.
+
+The following exact-source wheel workflow on `20568878414404cbd674f520a01e20fddf32561e`
+([run 37871960575](https://github.com/Quitetall/tritium/actions/runs/37871960575))
+again passed CI, CodeQL, docs, capstone, platform wheels, installed-wheel
+checks and ABI3. Its pinned tutorial failed the unchanged `300s` gate at
+`576.953s`. Stage markers were calibration `0.541s`, conversion `377.213s`
+cumulative (`376.672s` conversion time), native checkpoint round-trip
+`397.353s`, generation `442.564s`, ONNX export `543.937s`, ONNX replay
+`570.468s`, and QAT resume `576.953s`. The four-CPU runner had roughly 11–14
+GiB available memory, over 81 GiB temporary disk, and no cgroup CPU
+throttling; sampled five-minute load average was about 3. This run is not a
+controlled comparison with the prior `508.990s` run, and does not identify a
+specific cause for the slower result. It used the same solver code as the prior
+run and predates the midpoint-allocation change below. Functional completion
+is not a timing pass.
+
+### Pinned SmolLM2 row-fit phase profile — 2026-10-08
+
+To separate solver work from the full-model timing, the public
+`prepare` → `calibrate` → `convert()` path captured the pinned
+`model.layers.0.mlp.up_proj` source/evidence block at G64. Conversion took
+`1.006s` for the complete projection and reproduced artifact
+`sha256:4059a7c249fbf4d3aaa58a56d4d6c630da175d2c440a365fef025ea3e0b58c44`,
+weighted MSE `8.28580185e-05`, calibration identity
+`sha256:7c42611e41b1e60300c1a123a6a3107e1d33becbd1129a4c3fd6b13d3f310dfd`,
+and fixture identity
+`2b4f5a522531a5894e98b2a0593db9764f1cef34962e62ecf9594e618437ff18`. The
+64.5 KiB native profiling fixture is retained at
+`/mnt/2tb/tritium-release-evidence/ptq-profile-df145668/`.
+
+The release-mode Rust profiler ran five repeats of 256 rows for each matched
+initialization on that exact fixture. Mean time per 256-row set was relay-off
+`12.123ms`, softened-only `18.770ms`, modulated-only `19.126ms`, and dual-relay
+`26.637ms`. The corresponding aggregate weighted objectives were
+`0.130944935`, `0.130882743`, `0.130848182`, and `0.130786244`: dual-relay
+remains the best of these four on this fixture, with a `0.1212%` lower
+objective than relay-off. In the dual-relay run, assignment consumed
+`7.146ms`, relay initialization `9.661ms`, reconstruction `4.342ms`, and scale
+solve `2.728ms`. This 64.5 KiB fixture is not a full-model timing
+or held-out quality result. It prioritizes exact assignment and reconstruction
+as well as relay initialization for further profiling; no recipe change or
+performance claim is made.
+
+### CPU FSDP DCP export route and bounded PTQ artifact regression — 2026-10-08
+
+At source commit `d99feaff`, the two-rank CPU FSDP QAT step, sharded DCP
+checkpoint/resume, offline shard merge into a fresh model, exact-logit
+comparison, and safe-serialization export passed:
+
+```text
+PYTHONPATH=crates/tritium-py/python \
+  /home/brianklam/.cache/tritium-py313-ci/bin/python -m pytest -q \
+  crates/tritium-py/tests/test_huggingface_distributed.py::test_two_rank_cpu_fsdp_step_and_sharded_state_resume
+1 passed in 3.17s
+```
+
+This supported route avoids the known crashing PyTorch 2.11 CPU
+`FSDP.state_dict()` full-state gather; it does not establish that upstream
+full-state gathering is fixed or qualify accelerator DDP/FSDP. The separate
+public `prepare → calibrate → convert()` PTQ artifact test now caps the live
+fit at one output row (`40 KiB`), reopens the exported artifact, and pins all
+six payload/manifest hashes. The PTQ artifact suite passed (`39 passed`); this
+is a bounded-memory regression check, not a full-model memory or timing gate.
+
+### Exact-assignment midpoint scratch reduction — 2026-10-08
+
+The exact assignment loop now stores its at-most 26 f64 codebook midpoints in
+a fixed stack array instead of allocating a `Vec` for every row fit. Midpoint
+arithmetic, ordering, exact ties, and ill-conditioned exhaustive fallback are
+unchanged. `cargo test --locked -p tritium-quantize --no-fail-fast` passed
+(`238` unit tests, all applicable integration tests, and three intentionally
+ignored model/manual-profile tests); strict Clippy and all three exhaustive
+exact-assignment oracle tests passed. After rebuilding the release Python
+bridge, the public `convert()` artifact test passed with all six pinned file
+hashes unchanged. The same pinned model layer retained the same artifact ID,
+weighted MSE, and fixture identity; public conversion measured `1.006s` before
+and `1.011s` after this edit. Release row-fit measurements also varied by less
+than 1% for the dual-relay profile. These single-run differences are within
+measurement noise and establish no speedup. This is an allocation reduction
+with byte-preservation evidence, not a release timing-gate pass.
+
+### Repeated exact-source hosted SmolLM2 tutorial — 2026-10-08
+
+Wheel run [37873233844](https://github.com/Quitetall/tritium/actions/runs/37873233844)
+tested commit `cdf782997a7544865bb43ec8ddff7c29ba422ab0`. All platform wheels,
+ABI3 jobs, installed-wheel checks and the source-free tutorial passed. The
+pinned SmolLM2 tutorial completed its functional path but failed the unchanged
+`300s` limit at `521.387s`. Calibration completed at `0.508s`; conversion
+completed at `345.197s` cumulative (`344.689s` conversion); native checkpoint
+round-trip at `361.661s`; generation at `396.508s`; ONNX export at `494.346s`;
+ONNX replay at `515.632s`; and QAT resume at `521.387s`. Samples recorded four
+logical CPUs, at least `12.2 GiB` available memory, at least `81.5 GiB`
+temporary disk, and zero cgroup CPU throttling. The tutorial remains
+functionally complete but misses the frozen timing gate. Conversion is still
+the dominant stage; the available evidence does not yet isolate a new
+model-scale optimization beyond the existing row-fit profile.
+
+### Exact-head hosted SmolLM2 tutorial rerun — 2026-10-09
+
+Wheel run [37874448345](https://github.com/Quitetall/tritium/actions/runs/37874448345)
+tested pushed commit `fadfd45efac8e1074a7808980e3d31f252b12b94`. Platform
+wheels, the ABI3 matrix, installed-wheel smoke, and the source-free tutorial
+passed; the CUDA wheel lane was skipped. The pinned SmolLM2 CPU tutorial
+completed its functional path but failed the unchanged `300s` wall-time limit
+at `506.230s`. Calibration completed at `0.506s`; conversion at `335.681s`
+cumulative (`335.175s` conversion); native checkpoint round-trip at
+`351.884s`; generation at `386.017s`; ONNX export at `479.440s`; ONNX replay
+at `500.475s`; and QAT resume at `506.230s`. Resource samples show four
+logical CPUs, roughly `12.1–14.6 GiB` available memory, roughly `83.4–84.3
+GiB` temporary disk, and zero cgroup CPU throttling. CI and CodeQL passed on
+the same pushed commit. The local assignment-buffer reuse commit
+`5740deae` is not part of this run and still requires exact-revision hosted
+verification; this rerun does not clear the timing gate.
+
+### Exact-revision Web package and browser-reference prerequisites — 2026-10-09
+
+On clean detached worktree `7b4163e814e3705dbe63639c3382a92b1f6a07d0`,
+`npm --prefix packages/tritium-web run check` passed: generated-file drift
+checks, pinned `wasm-bindgen 0.2.126` WASM build, strict TypeScript, all 145
+package tests, and offline source-free archive verification. The retained npm
+archive evidence is under
+`/mnt/4tb/tritium-release-evidence/web-7b4163e8/`:
+
+- Archive `tritium-ai-web-1.1.0-rc.2.tgz`: `627649` bytes,
+  SHA-256 `b0acf28f66dda7675e6cf773eb6db14fbc0891c00b31c1ee86f3d1adb5ee7d39`.
+- npm archive receipt ID:
+  `sha256:5a0f2eca8bd120a083e23cf0a7c215d4b21957fa454bec5e04a684b39c1c44a2`;
+  it binds source revision `7b4163e8`, the exact archive, strict types, offline
+  install and WASM guest digest
+  `4d29c529718a0b7b7811988a5a7f277c64fca100915297d9dceaf0c819382718`.
+- The native CPU browser-reference producer passed its export/reload byte
+  identity check. Receipt ID:
+  `sha256:dccab7242c6d2900148cc2dd68eb1432bc1b51d4ca18607461b026fdabbd62f6`;
+  its exact 224-byte SALT package has SHA-256
+  `6e889858c06a7eb91133f69a948ab8356a444c677eecd9e800ec689380a6e17e`.
+
+These close local package and native-reference prerequisite evidence only.
+They are not a physical WebGPU browser lane: this Linux host lacks the
+candidate-bound WebDriver/browser inputs, and Chrome is Canary rather than the
+stable release required by plan 0050. Firefox and Safari physical lanes and the
+combined three-browser receipt remain open.
+
+### Compact PTQ batch-cap experiment — 2026-10-09
+
+On branch HEAD `12f64c43` (PTQ implementation identical to `7b4163e8`; the
+worktree also contained unrelated EAT-O edits), a public `prepare` →
+`calibrate` → `convert()` probe used a seeded `Linear(2048, 576)` layer, four
+Rayon threads, and a 256 MiB working cap. With
+`MAX_COMPACT_FIT_BATCH_ROWS=4096`, three conversions
+measured `0.867s`, `0.857s`, and `0.868s` (median `0.867s`). Temporarily raising
+the internal row cap to `16384` measured `0.896s`, `0.872s`, and `0.880s`
+(median `0.880s`). All six trit/scale digests and weighted objectives matched
+exactly, but the larger cap was about 1.4% slower, so the constant was restored
+to `4096`. After restoration, the public PTQ artifact suite passed
+(`35 passed, 4 skipped`) and the 8,192×64 parallel-conversion test passed
+(`3.48×` four-thread speedup, identical fitted artifact). This rejects the
+larger-cap tuning for this fixture; it is not full-model timing evidence.
+
+### Score-before-reconstruction solver experiment — 2026-10-08 (rejected)
+
+A candidate implementation scored diagonal-fit candidates without a
+reconstruction buffer, materializing the buffer only after acceptance. The P2
+objective sum remained `91.314144321` on every run. The code passed the
+quantizer all-target suite, focused public PyTorch PTQ artifact suite (`39
+passed`), strict Clippy, and format checks while under test; it is **not** in the
+current source because optimized-profile measurements did not show a win.
+
+The ignored `profile_g64_p2_compact_solver_phases` test ran three times on
+baseline `6cd455bc` and three times on the experimental candidate, in separate
+Cargo target directories. Each invocation profiles 256 synthetic G64/P2 rows
+over five repeats. In the default test profile the baseline median was
+`201.513 ms` and the candidate median `191.992 ms` (4.7% lower). In the
+optimized release profile the baseline median was `21.726 ms`; the candidate
+median was `22.070 ms` (1.6% slower). A single optimized G64/P3 pair measured
+`50.666 ms` baseline and `50.144 ms` candidate, too little evidence to offset
+the P2 regression. The change is rejected and the existing fused
+reconstruction/objective path is retained. These are local synthetic CPU
+profiles, not full-model or hosted evidence; the SmolLM2 `300s` timing gate
+remains open.
+
+### Pinned SmolLM2 public-convert solver phase profile — 2026-10-09
+
+The source-matched fixture is the first 256 rows of
+`model.layers.0.mlp.up_proj`, group width 64, from the locally cached
+`HuggingFaceTB/SmolLM2-135M-Instruct` revision
+`12fd25f77366fa6b3b4b768ec3050bf629380bac`. Its serialized SHA-256 is
+`2b4f5a522531a5894e98b2a0593db9764f1cef34962e62ecf9594e618437ff18`;
+calibration ID is
+`sha256:7c42611e41b1e60300c1a123a6a3107e1d33becbd1129a4c3fd6b13d3f310dfd`;
+source digest is
+`sha256:6b00494f0d31aec4f41e418d1719ca349cec86843ffb786bedf97564f90ce341`.
+The artifact generated by a wheel built from source revision `37614555` was
+`sha256:4059a7c249fbf4d3aaa58a56d4d6c630da175d2c440a365fef025ea3e0b58c44`,
+with weighted MSE `8.28580185e-05`.
+
+Correction: the original `1.564s` public-conversion timing and artifact ID
+`sha256:f7fca859f0f982406cbd579886b01abf66239c555394c65e79f5f26b883955b5`
+came from the globally installed Python package, not a wheel built from this
+checkout. They are not current-source conversion evidence and are excluded.
+Regenerating the fixture with the source-built wheel produced the same fixture
+hash, calibration ID, and source digest; the Rust solver phase measurements
+below use that byte-identical fixture.
+
+In the optimized local CPU test profile, five repeats across 256 rows measured
+relay-off `11.338ms`, softened-only `18.757ms`, modulated-only `18.982ms`, and
+dual-relay `26.403ms`. For dual-relay, relay-scale initialization accounts for
+`9.739ms` and assignment for `6.864ms`; the objective sum improved from
+`0.130944935` relay-off to `0.130786244` dual-relay. This identifies relay
+initialization as a substantial local solver cost, but does not establish a
+full-model speed or quality improvement. The exact ignored test passed with:
+
+```sh
+TRITIUM_SMOLLM2_PROFILE_FIXTURE=/tmp/tritium-smollm2-profile-fixture.bin \
+  CARGO_TARGET_DIR=/mnt/4tb/tritium-smollm2-profile-target \
+  cargo test --locked --release -p tritium-quantize \
+  salt_v2::tests::profile_smollm2_g64_p2_solver_phases -- \
+  --ignored --exact --nocapture
+```
+
+This identified repeated relay initialization during recursive P3 → P2 → P1
+fits. The current source sets both relays on in the generic public PTQ path.
+No full-model speed claim follows from this per-row-group profile; the pinned
+hosted tutorial timing gate remains independently open.
+
+### Reuse deterministic relay prefixes — 2026-10-09 (local candidate)
+
+The recursive P3 → P2 → P1 solver previously reran each relay descent for
+prefix planes. The candidate computes each enabled basin once and reuses the
+independently sorted prefixes; relay parameters, exact assignment, objective
+acceptance, and artifact schema are unchanged. A test-only reference
+implementation compared all cached prefixes bit-for-bit across 80 groups
+(lengths 1, 3, 16, 64, 128; both relay variants), and the existing P3 output
+fingerprint still passes.
+
+On the same optimized G64/P3 synthetic 256-row profile, three baseline runs
+were `48.724`, `53.186`, and `50.279 ms` (median `50.279 ms`); three candidate
+runs were `41.706`, `40.267`, and `41.651 ms` (median `41.651 ms`, 17.2% lower).
+Median relay-scale phase time fell from `16.797 ms` to `8.919 ms` (46.9%
+lower). On the pinned SmolLM2 G64/P3 slice, the baseline was `68.650 ms`; four
+candidate runs ranged `58.689–60.113 ms`. Treat that slice comparison as
+supporting diagnostic evidence, not a full-model timing claim.
+
+Three source-built public `convert()` runs on the selected full projection had
+no reliable wall-time comparison because local CPU timings varied widely
+(baseline `0.937–3.359 s`, candidate `0.833–4.477 s`). Baseline and candidate
+artifact IDs and weighted MSE were identical. The focused public conversion
+artifact test passed (`1 passed`); all 39 PyTorch PTQ artifact tests passed;
+the quantizer suite passed (`239 passed`, `4 ignored` plus all applicable
+integration tests); strict quantizer Clippy passed. This candidate still
+requires whole-model hosted timing verification before any release-speed claim.
+
+### Exact-head hosted SmolLM2 tutorial rerun — 2026-10-09
+
+Wheel run [37877221634](https://github.com/Quitetall/tritium/actions/runs/37877221634)
+tested branch head `6cd455bc`. All platform wheels, the ABI3 matrix,
+installed-wheel smoke, and source-free tutorial passed; the CUDA wheel lane
+was skipped. The pinned SmolLM2 CPU tutorial completed every functional phase
+but failed the unchanged `300s` wall-time gate at `589.759s`. Conversion
+completed at `392.150s` cumulative (`391.601s` conversion); native checkpoint
+round-trip at `411.585s`; generation at `454.995s`; ONNX export at `557.836s`;
+ONNX replay at `583.514s`; and QAT resume at `589.759s`. At the final resource
+sample the runner reported four logical CPUs, `11.1 GiB` available memory,
+`81.9 GiB` temporary disk, and zero cgroup CPU throttling. This is functional
+success with a timing-gate failure, not a release pass; optimizing full-model
+PTQ conversion remains the dominant software task.
+
+### Inline weighted-absolute ordering experiment — 2026-10-09 (rejected)
+
+To remove one small heap allocation for the common G64/G128 initialization
+path, a candidate stored weighted absolute values in a 128-entry stack array
+with a heap fallback for wider groups. The candidate preserved the reference
+sort order, weighted totals and quantiles at lengths 128 and 129, and the full
+quantizer suite passed (`240 passed`, `4 ignored`, plus applicable integration
+tests). Strict Clippy initially objected to the intentionally large inline
+enum; the allowance was local to that candidate. The optimized pinned G64/P3
+profile measured `57.731`, `57.558`, and `57.300 ms` (median `57.558 ms`) over
+five repeats. The measured weighted-order phase was `0.255–0.257 ms`, versus
+`0.246 ms` in the immediately preceding single run. This does not show an
+improvement in the targeted phase; the total-time difference from the prior
+single `58.593 ms` observation is too small and uncontrolled to support a
+speed claim. The candidate was removed. No production source change or
+artifact change remains from this experiment, and the hosted 300-second
+tutorial gate remains open.
+
+### Release-mode public-convert SmolLM2 projection profile — 2026-10-09
+
+After rebuilding the mixed Rust/Python extension in optimized release mode
+from the current checkout (quantizer source matches `fdd5bd17`; unrelated
+working-tree edits were present), the pinned public `prepare` → `calibrate` →
+`convert()` profiler was run four times on
+`model.layers.0.mlp.up_proj` (`1536 × 576`, G64). Conversion times were
+`0.249s`, `0.250s`, `0.256s`, and `0.256s`; all runs emitted fixture SHA-256
+`2b4f5a522531a5894e98b2a0593db9764f1cef34962e62ecf9594e618437ff18`, artifact
+ID `sha256:4059a7c249fbf4d3aaa58a56d4d6c630da175d2c440a365fef025ea3e0b58c44`,
+weighted MSE `8.28580185e-05`, calibration ID
+`sha256:7c42611e41b1e60300c1a123a6a3107e1d33becbd1129a4c3fd6b13d3f310dfd`,
+and source digest
+`sha256:6b00494f0d31aec4f41e418e1719ca349cec86843ffb786bedf97564f90ce341`.
+The fixture is retained under `/mnt/4tb/tritium-evidence/`.
+
+The rebuilt source-tree extension passed
+`test_public_convert_persists_grouped_fit_artifact` (`1 passed`). This is
+optimized local evidence for one real-model projection, not a full-model
+conversion, hosted runner comparison, or model-quality/runtime gate. The
+hosted tutorial job on commit `fdd5bd17` remains in progress; do not infer its
+result from this layer profile.
+
+### Hosted tutorial failure and matching four-thread local run — 2026-10-09
+
+The pinned tutorial on pushed commit `fdd5bd17` finished functionally but
+failed its frozen `300s` wall-time gate. Hosted run
+[37881266653](https://github.com/Quitetall/tritium/actions/runs/37881266653)
+recorded conversion at `307.782s`, native checkpoint round-trip at
+`327.208s`, generation at `370.675s`, ONNX export at `471.288s`, replay at
+`496.596s`, and QAT resume/final at `502.895s`. Calibration took `0.529s`.
+The runner exposed four logical CPUs, roughly `14.5 GiB` available memory,
+over `80 GiB` free temporary disk, and zero cgroup throttling. The peak sampled
+Python RSS was about `3.3 GiB`. This is not an OOM, disk-pressure, or tutorial
+functionality failure; it remains a strict timing failure.
+
+For comparison, the exact cached SmolLM2 revision and tutorial were run through
+the optimized local source-tree extension with PyTorch and Rayon capped at four
+threads. The complete tutorial passed in `213.921s`; its receipt passed the
+release tutorial validator. Stage times were conversion `113.738s`, native
+checkpoint round-trip `122.403s`, generation `138.602s`, ONNX export
+`189.739s`, ONNX replay `202.824s`, QAT step `205.949s`, and resume
+`213.921s`. Its PTQ artifact ID was
+`sha256:26dc412dfbb432458e4a85386c77a6bae895de89b7e14a1d8a192a4ae50fbaf6`;
+the durable local evidence bundle is
+`/mnt/4tb/tritium-evidence/smollm2-cpu-tutorial-fdd-local/` (about `2.2 GiB`).
+
+The local run proves this source-tree machine can finish the tutorial within
+the budget; it does not qualify the candidate wheel or satisfy the hosted gate.
+The hosted/local total-time ratio is about `2.35×`, and the conversion-stage
+ratio about `2.71×`. The runner's four-core quota was not throttled, but this
+comparison does not isolate CPU model, sustained frequency, or wheel/compiler
+differences. Keep the CI gate unchanged and investigate portable CPU
+throughput plus the hosted runner's effective compute before attributing the
+full gap to Tritium solver code.
+
+### Pinned SmolLM2 solver phase breakdown — 2026-10-09
+
+The release-mode `tritium-quantize` phase profiler was run against the retained
+real SmolLM2 `model.layers.0.mlp.up_proj` row-group fixture
+`/mnt/4tb/tritium-evidence/ptq-profile-fdd5bd17-exact.bin` (SHA-256
+`2b4f5a522531a5894e98b2a0593db9764f1cef34962e62ecf9594e618437ff18`). The
+locked P2 dual-relay profile averaged `23.245ms` per 256-row batch over five
+repeats: assignment `6.768ms`, scale solve `2.726ms`, reconstruction
+`4.261ms`, relay-scale initialization `7.125ms`, with weighted-order setup
+`0.234ms`. The P3 dual-relay profile averaged `57.634ms`: assignment
+`20.809ms` (36%), scale solve `10.662ms` (18%), reconstruction `10.241ms`
+(18%), relay-scale initialization `11.283ms` (20%), and weighted-order setup
+`0.242ms` (under 1%). The P2 relay-off profile was `11.098ms`; adding both
+relay basins improved this fixture's summed objective from `0.130944935` to
+`0.130786244`, but that local row-batch objective is not a model-quality
+result.
+
+Both focused profiles passed using the same fixture and environment, with the
+respective filters `profile_smollm2_g64_p2_solver_phases` and
+`profile_smollm2_g64_p3_solver_phases`. This shifts the
+next optimization investigation toward exact assignment and relay work, not
+weighted-order allocation. Measurements are local and isolated to one real
+projection's row group; they do not establish whole-model speed, hosted-gate
+improvement, or quality. Preserve the frozen objective and compare deterministic
+public `convert()` artifact bytes before accepting a solver change.
+
+A sequential public-conversion thread-count check on the same pinned projection
+then measured `3.189s` and `3.026s` with one Rayon/PyTorch thread, and `1.109s`
+and `1.076s` with four. The median of these two samples per setting is `3.108s`
+versus `1.093s` (about `2.84×`); all four conversions emitted the same
+`sha256:4059a7c249fbf4d3aaa58a56d4d6c630da175d2c440a365fef025ea3e0b58c44`
+artifact and weighted MSE. An initial pair accidentally overlapped and is
+excluded. This indicates useful row-level thread scaling on the local
+i9-14900K for this layer, but it is a small sample and does not account for the
+hosted runner gap or qualify whole-model conversion.
+
+### Exact-head hosted tutorial rerun — 2026-10-09
+
+Wheel workflow [37882565847](https://github.com/Quitetall/tritium/actions/runs/37882565847)
+tested `c36fc676b21d5906117589be0f9afe42ce702091`, which contains the same
+quantizer implementation as `fdd5bd17` plus documentation-only commits. Linux,
+macOS, and Windows wheels, installed-wheel checks, the source-free Python 3.13
+tutorial, and the ABI3 matrix passed; the opt-in CUDA lane was skipped. The
+pinned SmolLM2 CPU tutorial completed the full functional path but failed its
+unchanged `300s` wall-time gate at `608.171s`. Calibration completed at
+`0.710s`, conversion at `376.087s` cumulative (`375.377s` conversion), native
+checkpoint round-trip at `399.035s`, generation at `449.399s`, ONNX export at
+`565.891s`, ONNX replay at `601.133s`, and QAT resume at `608.171s`.
+
+The runner exposed four logical CPUs and over `12 GiB` available memory and
+`81 GiB` free temporary disk in the final sample; no cgroup throttling events
+were recorded. Sampled one-minute host load peaked at `5.53`, above the four
+logical CPUs, so host contention is plausible but not proven as the cause of
+the slower result. This is another functional-but-over-budget result, not an
+OOM or disk failure. The hosted timing gate remains unchanged and failed; local
+four-thread success and single-layer scaling do not qualify the hosted wheel
+or explain the whole-model gap. The next performance work must remain matched
+to this exact tutorial and preserve the deterministic public `convert()`
+artifact; if portable CPU optimization cannot close the gap, the runner
+contract itself needs an evidence-backed ADR rather than a relaxed timeout.
+
+### Diagonal objective deferred-check experiment — 2026-10-09 (rejected)
+
+A candidate removed the per-coefficient finite-check branch from fused
+nonnegative diagonal-objective reconstruction and checked the final sum once.
+The change kept the ordered f64 additions, and a new extreme-value regression
+verified that overflow still returns `NonFiniteObjective`. The complete
+quantizer suite passed (`240` unit tests plus applicable integration tests,
+`4` ignored), strict Clippy and formatting passed, and the selected public
+`prepare` → `calibrate` → `convert()` artifact test passed after rebuilding the
+release extension. Three candidate public conversions all retained artifact
+ID `sha256:4059a7c249fbf4d3aaa58a56d4d6c630da175d2c440a365fef025ea3e0b58c44`
+and weighted MSE `8.28580185e-05`.
+
+Matched release-mode profiles against the same pinned 256-row SmolLM2 fixture
+were mixed. P2 dual-relay median time was `23.104ms` for the candidate
+(`22.551`, `23.230`, `23.104`) versus `23.245ms` for baseline (`23.104`,
+`23.245`, `23.618`). P3 median was `58.805ms` for the candidate (`58.067`,
+`58.805`, `59.111`) versus `57.743ms` for baseline (`57.268`, `57.634`,
+`57.743`, `57.779`, `59.723`). Public one-projection conversion medians were
+`0.797s` candidate (`0.792–0.800s`) versus `0.810s` baseline
+(`0.802–0.813s`). The small local conversion difference is not a repeatable
+whole-model or hosted result, and P3 regressed. The candidate was removed; no
+production source change remains. Do not attribute a speedup or use this
+experiment to explain the hosted `608.171s` failure.
+
+### Local 14900K tutorial with expanded Rayon parallelism — 2026-10-09
+
+The pinned SmolLM2 tutorial was rerun from the source-tree Python package on
+the local i9-14900K with `RAYON_NUM_THREADS=16` and Torch/OMP/MKL limited to
+four threads. It completed in `145.838s` against the tutorial's `300s` limit.
+The receipt passed the release tutorial's schema, storage, ONNX parity, and
+elapsed-time validator. Conversion completed at `51.905s` cumulative;
+checkpoint round-trip at `60.297s`, generation at `76.091s`, ONNX export at
+`126.107s`, ONNX replay at `140.766s`, and QAT resume at `145.838s`.
+
+The receipt records `211` selected and `61` preserved parameters out of
+`134,515,008` total, with `537,919,488` selected dense bytes versus
+`92,192,265` compact checkpoint bytes (`5.835×`). Its PTQ artifact is
+`sha256:26dc412dfbb432458e4a85386c77a6bae895de89b7e14a1d8a192a4ae50fbaf6`;
+the native checkpoint digest is
+`sha256:e78430ab2461da6a78ee2ef9d9d813d302f399cca756bc7cc49d6fbdb5edbd18`,
+and ONNX replay's maximum tolerance ratio is `0.415`. The durable bundle is
+`/mnt/4tb/tritium-evidence/smollm2-cpu-tutorial-14900k-r16-73687d9a/`.
+
+This is local source-tree evidence only: it is not a wheel-installed run, a
+matched thread-count experiment, hosted CI qualification, a model-quality
+result, or evidence that the runner gap is solved. The unchanged hosted gate
+still fails at `608.171s`; keep its `300s` contract intact until an
+evidence-backed portable fix or an ADR-approved contract change clears it.
+
+### Exact manylinux wheel tutorial on the local 14900K — 2026-10-09
+
+The Linux x86_64 CPU wheel built by hosted workflow
+[37884828952](https://github.com/Quitetall/tritium/actions/runs/37884828952)
+was downloaded for the exact pushed source revision `87f744b02ef5eab04fe12b8942a4061bb4620a4f`.
+Its provenance receipt passed, and the wheel passed `scripts/verify-wheel.py`
+including clean-install smoke. Wheel SHA-256 is
+`208943db3d895ddb3639a0ad307c701070336e4f05b1c755e883f234d4ca8bd1`.
+
+The same installed wheel, pinned local SmolLM2 cache, 14900K host, Torch/OMP/MKL
+four-thread settings, and qualification script were run once with four Rayon
+threads and once with sixteen. Both receipts passed the frozen validator and
+produced the same PTQ artifact ID
+`sha256:26dc412dfbb432458e4a85386c77a6bae895de89b7e14a1d8a192a4ae50fbaf6`
+and storage ratio `5.835×`. Four Rayon threads completed in `207.174s`, with
+conversion at `112.451s` cumulative (`112.111s` after calibration), checkpoint
+round-trip `121.025s`, generation `137.143s`, ONNX export `189.414s`, ONNX
+replay `202.852s`, and QAT resume `207.174s`. Sixteen Rayon threads completed
+in `138.501s`, with conversion at `46.675s` cumulative (`46.354s` after
+calibration), checkpoint `55.088s`, generation `70.875s`, ONNX export
+`121.596s`, replay `134.453s`, and QAT resume `138.501s`.
+
+On this host and workload, sixteen threads were about `2.42×` faster for
+conversion and `1.50×` faster end-to-end. The measured receipts are
+`/mnt/4tb/tritium-evidence/smollm2-installed-wheel-87f744b0-r4/receipt.json`
+and
+`/mnt/4tb/tritium-evidence/smollm2-installed-wheel-87f744b0-r16/receipt.json`;
+the downloaded wheel and its provenance/install receipts are under
+`/mnt/4tb/tritium-evidence/wheel-smollm2-87f744b0/`.
+
+This is a matched local thread-count result, not hosted-runner evidence. It
+supports testing explicit Rayon oversubscription as a hosted configuration
+experiment, but does not establish that sixteen workers help a four-vCPU
+shared runner. The hosted 300-second gate remains independent and unchanged.
+
+### Exact-head hosted SmolLM2 rerun after wheel installation — 2026-10-09
+
+Hosted workflow
+[37884828952](https://github.com/Quitetall/tritium/actions/runs/37884828952)
+tested source revision `87f744b02ef5eab04fe12b8942a4061bb4620a4f`. Linux,
+macOS and Windows wheel builds, clean installed-wheel smoke, source-free
+tutorial, installed-wheel dependency lane, and the complete abi3 matrix passed;
+the opt-in CUDA lane was skipped. The pinned SmolLM2 CPU tutorial completed
+every functional phase but failed the unchanged `300s` budget at `564.452s`.
+Calibration finished at `0.598s`, conversion at `342.597s` cumulative
+(`341.999s` after calibration), native checkpoint round-trip at `363.302s`,
+generation at `406.141s`, ONNX export at `532.269s`, ONNX replay at
+`557.504s`, and QAT resume at `564.452s`.
+
+Forty resource samples showed at least `12.00 GiB` available memory and
+`83.45 GiB` temporary disk; one-minute host load peaked at `5.68` on four
+logical CPUs, while cgroup CPU throttling remained zero. The repeated result
+confirms the failure is CPU wall time, not a failed functional phase, OOM, disk
+pressure or cgroup quota throttling. The local exact-wheel 4-versus-16 Rayon
+comparison motivates a single hosted `RAYON_NUM_THREADS=16` configuration
+experiment; the result must be measured on hosted CI before drawing a conclusion.
+The `300s` release gate is unchanged.
+
+### Hosted Rayon oversubscription trial — 2026-10-09 (rejected)
+
+Hosted workflow
+[37886032266](https://github.com/Quitetall/tritium/actions/runs/37886032266)
+ran the same pinned tutorial with `RAYON_NUM_THREADS=16` on four logical
+CPUs. Every functional phase completed, but the frozen budget still failed at
+`558.784s`. Conversion was `340.113s` cumulative (`339.513s` after
+calibration), versus `342.597s` cumulative (`341.999s` after calibration) in
+the immediately preceding default-thread hosted run. End-to-end time changed
+from `564.452s` to `558.784s` (about `1%`); because these were separate hosted
+runners, this small difference is not controlled evidence of a speedup.
+
+The 16-thread run's 39 resource samples showed four logical CPUs, at least
+`12.82 GiB` available memory, `83.28 GiB` temporary disk, zero cgroup throttle
+events, and a peak one-minute host load of `17.82`. The preceding default
+thread run peaked at `5.68`; different runners and external load prevent
+causal attribution, but the 16-thread setting clearly did not close the gate
+and coincided with substantial runnable-thread pressure. The speculative
+setting was removed; the workflow again uses the runtime's default Rayon pool.
+Keep the `300s` contract unchanged and pursue solver-level improvements with
+matched artifact/quality checks.
+
+### Release-mode plane reconstruction unrolling probe — 2026-10-09 (rejected)
+
+The exact pinned G64 SmolLM2 profile fixture
+(`/mnt/4tb/tritium-evidence/ptq-profile-fdd5bd17-exact.bin`, SHA-256
+`2b4f5a522531a5894e98b2a0593db9764f1cef34962e62ecf9594e618437ff18`) was
+used to test explicit one-to-three-plane reconstruction unrolling. The probe
+preserved the established f32 summation order and retained the exact same
+P3 objective sum (`0.015994445`). The `tritium-quantize` suite passed with the
+candidate, including `fused_reconstruction_objective_is_bit_identical_to_reference_paths`.
+
+This did not demonstrate a production improvement. On the same host and
+release test profile, one baseline run at `fedf1b0a` measured `57.953ms` total
+for the five-repeat P3 fixture, while one candidate run measured `57.369ms`
+(about 1%). Reconstruction phase time changed from `10.401ms` to `10.071ms`;
+the compiler had already optimized away most loop overhead. The difference is
+within run-to-run noise and was not confirmed on the public conversion or
+hosted tutorial. The implementation was discarded; no production code change
+remains. Do not count this as a speedup or release-gate evidence.
+
+### Stage-7 production runner gap — 2026-10-09
+
+The source-bound Stage-7 orchestrator and strict qualifier are present, but
+the documented `measure-one-recipe.py` and
+`measure-baselines-and-refinements.py` commands are placeholders, not
+repository executables. A current tracked-file search found no measurement or
+auxiliary runner. The existing `run_stage7_smollm2_smoke` path proves capture,
+generic additive conversion, package writing/reopen, and causal-loss replay on
+the 135M smoke model; plan 0043 explicitly says this is not the full S2KF
+recipe used for Stage-7 quality decisions. It cannot emit the required
+one-layer, four-layer, and full-model grid measurements or matched baselines
+and refinement records. The Stage-7 gate therefore remains open before any
+recipe-freeze compute is authorized. Implement and test source-bound runners
+against the frozen request/capability schemas; do not claim the smoke path or
+synthetic runner responses as recipe-freeze evidence.
+
+The separate Qwen PTQ evidence path does have a high-level adapter:
+`capture_qwen36_kronecker_evidence` resolves canonical language/MTP and
+embedding/output-head tasks through the resumable native catalog session. Its
+focused synthetic CPU coverage passed on this checkout (three dispatch,
+containing-oracle, and grouped-replay tests). This does not close the Stage-7
+runner gap, and it is not evidence from the pinned Qwen checkpoint: production
+model loading, calibration replay, and the complete 506-record collection have
+not run.
+
+An interface audit on 2026-10-09 confirmed that the missing producer is not
+just command-line glue. Keep two geometries distinct: ADR 0035 freezes the
+durable S2KF curvature evidence at G128, while ADR 0028 and plan 0043 make
+G64/G128/G256 *deployment scale groups* recipe ablations. The current
+`SaltV2Config` reference fitter and Python `fit_kronecker_group` bridge both
+only fit G128 deployment groups against G128 curvature blocks, so candidate
+group geometries need an explicit adapter or fitter generalization that
+preserves the frozen S2KF bytes and meaning. The lower-level Rust tree contains
+separate feedback and output-reconstruction primitives, but no tracked runner
+binds those primitives, curvature capture, recipe identity, model evaluation,
+packed artifacts, and physical reports into the orchestrator's one-row
+response contract. Keep the runner work scoped to that full evidence path
+rather than advertising partial capabilities. The current orchestrator,
+qualifier, and causal-data protocol tests pass (`66 passed` across
+`test_run_stage7_recipe_freeze.py`, `test_qualify_stage7_recipe_freeze.py`,
+and `test_stage7_causal_data.py`); these are contract tests, not model
+measurements or Stage-7 qualification evidence.
+
+### Exact-head hosted tutorial rerun — 2026-10-09 (still over budget)
+
+Hosted wheels workflow
+[37888637013](https://github.com/Quitetall/tritium/actions/runs/37888637013)
+ran source revision `fedf1b0a2fbf603d29d138b5c9fb0163acb4b383`. All functional
+phases completed, but the pinned SmolLM2 tutorial took `352.656s`, exceeding
+the frozen `300s` limit by `52.656s`. Stage markers were calibration `0.412s`,
+conversion `212.031s`, checkpoint round-trip `225.738s`, generation
+`254.709s`, ONNX export `330.528s`, ONNX replay `347.456s`, and QAT resume
+`352.656s`. The job failed only on the elapsed-time gate; this is not a
+candidate-wide package pass or model-quality result. The prior exact-head run
+on `df661840` took `564.452s`; because these were separate hosted runners, the
+large difference is not attributable to this test-only change. Retain the
+`300s` contract and require repeatable, matched software/configuration evidence
+before claiming a timing improvement.
+
+### Hosted tutorial regression confirmation — 2026-10-09 (still over budget)
+
+Hosted wheels workflow
+[37889580756](https://github.com/Quitetall/tritium/actions/runs/37889580756)
+ran source revision `097c9e2ba5c6ff38ddae05744800a39db9a9c0c8`. All functional
+phases completed, but the exact pinned SmolLM2 PTQ/QAT tutorial took `562.706s`,
+exceeding the unchanged `300s` limit by `262.706s`. Stage markers were
+calibration `0.602s`, conversion `342.267s`, checkpoint round-trip `363.097s`,
+generation `406.660s`, ONNX export `531.140s`, ONNX replay `555.810s`, and QAT
+resume `562.706s`. The failure is the wall-time assertion after QAT resume, not
+a functional or quality failure; no passing tutorial receipt was published.
+
+The resource samples show four logical CPUs and no cgroup CPU-throttle events;
+host load rose during conversion and later fell, so these data do not isolate
+whether the additional time came from host contention or software variance.
+Conversion accounts for `342.267s` and ONNX export adds `124.347s`, making both
+the immediate optimization targets. Keep the `300s` gate unchanged and require
+matched artifact/quality checks plus hosted confirmation before retaining any
+optimization.
+
+### Installed-wheel PTQ test ownership correction — 2026-10-09
+
+The exact-wheel PTQ test added to the Torch wheel lane initially failed in run
+[37891962910](https://github.com/Quitetall/tritium/actions/runs/37891962910)
+before test collection. The shared `conftest.py` unconditionally prepended the
+source package; importing it then failed because the source checkout does not
+contain the wheel's native `_tritium` extension. This was a test-harness
+ownership error, not a PTQ conversion or artifact failure.
+
+Commit `082123ce` adds the explicit `TRITIUM_TEST_INSTALLED_WHEEL=1` mode. It
+skips source rebinding and fails closed unless the imported `tritium` module is
+owned by the installed `pytritium` distribution. Ordinary source-tree pytest
+continues to bind to the checkout. In rerun
+[37893322305](https://github.com/Quitetall/tritium/actions/runs/37893322305),
+the installed-wheel Torch job passed, including exact-wheel public PTQ artifact
+tests, the differentiable lifecycle, tutorial QAT, API signature, and CPU
+dispatcher-overhead checks. Linux, macOS, Windows, and the ABI3 matrix also
+passed. The pinned SmolLM2 CPU tutorial is a separate job and remained in
+progress at the time of this record; its required `300s` result is not yet
+established by the PTQ-lane pass.
+
+### Exact-head hosted tutorial result — 2026-10-09 (over budget)
+
+Hosted wheels workflow
+[37894032395](https://github.com/Quitetall/tritium/actions/runs/37894032395)
+ran source revision `4125338a91d8bd1fccc847a950c5985ea0a7f949`. The installed
+wheel PTQ tests, source-free tutorial, cross-platform wheel builds, ABI3 matrix,
+CI, and CodeQL passed. The pinned SmolLM2 PTQ/QAT tutorial completed every
+functional phase but took `553.777s`, failing the unchanged `300s` wall-time
+gate by `253.777s`. Calibration completed at `0.643s`; conversion at
+`337.492s`; native checkpoint round-trip at `358.487s`; generation at
+`403.171s`; ONNX export at `520.114s`; ONNX replay at `546.504s`; and QAT
+resume at `553.777s`. No tutorial qualification receipt was published.
+
+The runner exposed four logical CPUs, more than `12 GiB` available memory and
+`83 GiB` temporary disk, with zero cgroup CPU-throttle periods; load average
+peaked at `5.70`. The result is therefore another wall-time failure, not an
+observed OOM, disk shortage, or cgroup-throttle failure. Conversion dominates
+and ONNX export is the next largest interval. Relative to the preceding hosted
+run at `562.706s`, this separate-run result is about `1.6%` lower, which is not
+controlled evidence of an improvement. Keep the frozen budget unchanged; the
+next software work must target conversion and export separately, preserve exact
+PTQ artifact/quality checks, and earn a fresh hosted rerun.
+
+### Exact-head hosted tutorial rerun — 2026-10-09 (still over budget)
+
+Hosted wheels workflow
+[37896910296](https://github.com/Quitetall/tritium/actions/runs/37896910296)
+ran source revision `a5ca03cf58daf1c7417f321b56e0d2f931c29b6b`. Every
+functional phase completed, but the pinned SmolLM2 CPU tutorial took
+`564.266s`, exceeding the unchanged `300s` gate by `264.266s`. Stage markers
+were calibration `0.600s`, conversion `341.395s`, native checkpoint
+round-trip `361.967s`, generation `404.932s`, ONNX export `531.289s`, ONNX
+replay `557.243s`, and QAT resume `564.266s`. The export interval was
+`126.225s`. No qualification receipt was published.
+
+The conversion interval is about `0.3%` below the separate preceding hosted
+run's `342.314s`, and end-to-end time is about `0.8%` below its `568.999s`;
+these are not controlled measurements and establish no speedup. Across 40
+resource samples the runner exposed four logical CPUs, at least about
+`11.5 GiB` available memory, and at least about `81.7 GiB` temporary disk; no
+cgroup CPU throttling was observed. This remains a wall-time failure, not an
+observed memory, disk, or CPU-throttle failure. CI, docs, capstone CPU smoke,
+and CodeQL passed for this same source revision; the wheels workflow failed
+only on the tutorial timing gate.
+
+### Reject default ONNX graph optimization for packed artifacts — 2026-10-09
+
+The PyTorch 2.11 ONNX `optimize=True` setting was tested against the existing
+public QAT/PTQ/refinement ONNX integration test by overriding only the exporter
+argument at runtime. The first QAT export failed closed in Tritium's graph
+audit with `dense_shadow_detected`: optimization removed a required packed
+ternary initializer. No artifact was published and no runtime or performance
+result was claimed. Keep `optimize=False` until a selective packed-preserving
+optimization path passes strict initializer reachability, no-dense-shadow,
+exact ORT parity, and full artifact tests. The pinned PyTorch exporter
+documentation says `optimize` defaults to true since 2.7, so Tritium's explicit
+false is intentional, not a stale default assumption ([PyTorch 2.11 ONNX
+exporter documentation](https://docs.pytorch.org/docs/2.11/onnx.html)).
+
+The hosted export phase log measured graph capture at `32.396s`, decompositions
+at about `55.587s`, and translation at about `11.088s`. Roughly `30.611s` of
+the `129.682s` export phase is outside those three logged spans. These timings
+identify capture and decomposition as investigation targets, not guaranteed
+optimization wins; any replacement must retain packed initializer reachability
+and exact ONNX Runtime parity.
+
+### Relay scale-prefix allocation reduction — 2026-10-09
+
+Commit `6aa06c19` replaces the relay initializer's per-prefix heap-backed
+scale vectors with fixed three-element prefixes. Prefix ordering and values
+remain bit-identical to the independent reference; an explicit all-zero case
+also checks each prefix length. The `tritium-quantize` suite passed (240 unit
+tests and all applicable integration tests; four declared ignores), strict
+crate Clippy passed, and `cargo fmt --all -- --check` passed.
+
+Three optimized synthetic G64/P3 profile runs measured `40.524`, `43.672`, and
+`41.095ms` (median `41.095ms`) versus the previous candidate's recorded
+`41.651ms` median. The roughly `1.3%` difference is not a reliable speedup and
+does not establish full-model improvement. This is retained as a bounded
+allocation-footprint reduction, not a performance claim; hosted public-wheel
+PTQ and the pinned tutorial remain the authority.
+
+### Exact-head hosted tutorial rerun — 2026-10-09 (still over budget)
+
+Hosted wheels workflow
+[37895510065](https://github.com/Quitetall/tritium/actions/runs/37895510065)
+ran the exact pushed revision `291df8fafa5a71417b352d51ed314d3eb44ec31e`.
+All functional phases completed, but the pinned SmolLM2 tutorial took
+`568.999s`, exceeding the unchanged `300s` gate by `268.999s`. Stage markers
+recorded calibration at `0.605s`, conversion at `342.314s`, native checkpoint
+round-trip at `363.153s`, generation at `406.494s`, ONNX export at `536.318s`,
+ONNX replay at `561.959s`, and QAT resume at `568.999s`. No qualification
+receipt was published.
+
+The hosted runner exposed four logical CPUs, at least `12.5 GiB` available
+memory, at least `83 GiB` temporary disk, and zero cgroup CPU-throttle periods
+through the final sample. This again rules out observed memory exhaustion,
+disk exhaustion, and cgroup throttling as explanations. The result is about
+`2.7%` slower than the preceding `553.777s` separate run, which is not a
+controlled regression measurement. Conversion and ONNX export remain the
+dominant work; keep the frozen gate and optimize them independently with
+artifact/quality parity before the next hosted rerun.
+
+### Optimized solver phase profile on cached SmolLM2 rows — 2026-10-09
+
+The existing exact-checkpoint-derived 256-row G64 fixture
+`/mnt/4tb/tritium-evidence/ptq-profile-fdd5bd17-exact.bin` was profiled with
+the optimized Rust test binary, without running a full-model conversion:
+
+```sh
+TRITIUM_SMOLLM2_PROFILE_FIXTURE=/mnt/4tb/tritium-evidence/ptq-profile-fdd5bd17-exact.bin \
+  cargo test --release --locked -p tritium-quantize --lib \
+  profile_smollm2_g64_p2_solver_phases -- --ignored --nocapture
+TRITIUM_SMOLLM2_PROFILE_FIXTURE=/mnt/4tb/tritium-evidence/ptq-profile-fdd5bd17-exact.bin \
+  cargo test --release --locked -p tritium-quantize --lib \
+  profile_smollm2_g64_p3_solver_phases -- --ignored --nocapture
+```
+
+For P3 with both production relay flags enabled, the mean of five 256-row
+passes was `58.444ms`: assignment `20.960ms` (35.9%), scale solving
+`10.686ms` (18.3%), reconstruction/objective `10.734ms` (18.4%), relay scale
+initialization `11.443ms` (19.6%), and other measured/uninstrumented work
+`4.621ms` (7.9%). P2 dual-relay measured `27.631ms` per 256 rows, of which
+`8.865ms` (32.1%) was relay initialization. The P2 relay-off/softened-only/
+modulated-only/dual-relay objectives remained respectively
+`0.130944935`/`0.130882743`/`0.130848182`/`0.130786244`.
+
+These are optimized local kernel-profile measurements, not a full public
+`prepare` → `calibrate` → `convert()` timing or a release-performance claim.
+The fixture is G64 while public PTQ uses G128 when geometry permits, and the
+standalone solver profile does not include public batching or recursive
+lower-plane fallback cost. The result rules out treating relay initialization
+as negligible and makes the exact assignment and relay routines the next
+semantics-preserving investigation targets. Do not change the frozen relay
+iteration schedule, basin flags, group-size recipe, or 300-second tutorial
+gate based on this profile.
+
+### Reuse exact-assignment reconstruction — 2026-10-09
+
+The joint solver's initial exact assignment now returns the selected additive
+codebook value alongside the trits. For identity and diagonal metrics, the
+initial objective scorer consumes that reconstruction rather than summing the
+same planes again in a second pass. Dense-metric coordinate correction retains
+its existing path. Code choices, scale solves, relay basins, and the stored
+representation are unchanged.
+
+The focused bitwise test covers P1/P2/P3, ordinary values, and extreme values
+that take the ill-conditioned exhaustive-assignment fallback. The complete
+`tritium-quantize` suite passed (241 passed, 4 ignored), as did strict Clippy
+and formatting. A fresh isolated local abi3 wheel was installed into a
+temporary environment, and the public `prepare` → `calibrate` → `convert()`
+tests `test_live_module_fit_consumes_bound_curvature_and_rejects_source_drift`
+and `test_public_convert_persists_grouped_fit_artifact` passed. The latter
+checks all six existing artifact SHA-256 values and reloads the sealed output.
+
+Local optimized solver-profile timings were noisy and do not establish a
+runtime improvement; no full-model timing or hosted tutorial result is claimed
+for this change. The exact-head 300-second tutorial gate remains open.
+
+### Exact-head hosted tutorial rerun — 2026-10-09 (still over budget)
+
+Hosted wheels workflow
+[37898468521](https://github.com/Quitetall/tritium/actions/runs/37898468521)
+ran source revision `d9951794e9a0c16a265b93dab2e9e1fa580e420a`. All tutorial
+functions completed, but the pinned SmolLM2 CPU tutorial took `563.955s`,
+exceeding the unchanged `300s` budget by `263.955s`. Stage markers recorded
+calibration at `0.605s`, conversion at `340.657s` (about `340.052s` after
+calibration), native checkpoint round-trip at `361.435s`, generation at
+`404.654s`, ONNX export at `531.236s`, ONNX replay at `556.975s`, and QAT
+resume at `563.955s`. No qualification receipt was published.
+
+The runner exposed four logical CPUs, at least about `11.5 GiB` available
+memory, at least about `81.8 GiB` temporary disk, and zero recorded cgroup CPU
+throttling. The run is another CPU wall-time failure, not observed OOM, disk
+pressure, or cgroup throttling. Its total is `0.311s` lower than the prior
+separate-source run (`564.266s`); this is not controlled evidence of a
+performance change. Wheel builds, installed-wheel smoke, source-free tutorial,
+and ABI3 cells passed; CUDA was skipped. This run predates the assignment
+reconstruction reuse change and does not measure it.
+
+### Exact-head hosted tutorial after assignment-reconstruction reuse — 2026-10-09
+
+Hosted wheels workflow
+[37900294298](https://github.com/Quitetall/tritium/actions/runs/37900294298)
+ran exact source revision `d0d9cbbd8f8960d31a2086cedf2b0ea74729985d`. The
+pinned SmolLM2 CPU tutorial completed every functional phase, but the release
+gate rejected its `563.814s` total against the unchanged `300s` budget, a
+`263.814s` overrun. Stage markers recorded calibration at `0.604s`, conversion
+at `341.168s` (`340.564s` after calibration), native checkpoint round-trip at
+`361.850s`, generation at `404.756s`, ONNX export at `531.509s`, ONNX replay
+at `556.860s`, and QAT resume at `563.814s`. No qualification receipt was
+published.
+
+The hosted runner exposed four logical CPUs, at least `11.1 GiB` available
+memory, at least `81.7 GiB` temporary disk, and zero sampled cgroup CPU-throttle
+periods. There is no observed OOM, disk exhaustion, or CPU throttling to explain
+the failure. The total is `0.141s` below the separate `563.955s` run on
+`d9951794`; this uncontrolled difference does not establish a speedup from
+commit `d0d9cbbd`. CI run [37900294261](https://github.com/Quitetall/tritium/actions/runs/37900294261)
+passed. macOS, Linux and Windows CPU wheels, the source-free tutorial,
+installed-wheel smoke and all ABI3 matrix cells passed in the wheels workflow;
+the CUDA wheel lane was skipped. The frozen tutorial gate remains open, with
+conversion and ONNX export still the dominant timed stages.
+
+### Public PTQ artifact invariance across fit chunk sizes — 2026-10-09
+
+Extended `test_public_convert_persists_grouped_fit_artifact` to run the public
+`prepare` → `calibrate` → `convert()` path twice with different working-memory
+budgets. The constrained run fits one row per chunk; the roomier run fits all
+four rows together. Their persisted ternary/scale payload bytes and reloaded
+module outputs match exactly. The existing constrained-run artifact digests
+remain pinned. The focused test passed, and the complete PTQ artifact file
+passed (`39 passed`); this is deterministic CPU regression coverage, not model
+quality, performance, or release qualification evidence.
+
+### Exact-head release CI and frontend receipt harvest — 2026-10-09
+
+Hosted workflows ran source revision `7ada97b07dc367be2e82b100965b13c6942c597f`.
+The wheels run [37907965102](https://github.com/Quitetall/tritium/actions/runs/37907965102)
+passed Linux, Windows, and macOS wheel builds, all 16 ABI3 compatibility cells,
+installed-wheel functional smoke, API-signature, dispatch-overhead, installed
+QAT tutorial, and source-free Hugging Face lifecycle/export/observability jobs.
+The pinned SmolLM2 CPU tutorial completed every function but failed the unchanged
+300-second gate at `562.013s`: calibration `0.597s`, PTQ conversion `341.725s`,
+checkpoint round-trip `362.344s`, generation `405.068s`, ONNX export `530.135s`,
+ONNX replay `555.090s`, and QAT resume `562.013s`. No tutorial qualification
+receipt was emitted. Preserve the timeout and improve the measured bottlenecks.
+
+The exact-CI-wheel candidate and a new local evidence registry were assembled
+under ignored `release/v1.1/` outputs. The receipt validators accept the newly
+harvested frontend lifecycle, export/reload, and observability evidence alongside
+the earlier API, CPU dispatch, and installed tutorial receipts. The evaluated
+registry passes `packages`; PyTorch/HF still lacks distributed-training and
+CUDA-dispatch receipts. This local registry evaluation is not release activation
+or a clean-worktree release check.
+
+The same revision's general CI and capstone CPU E2E smoke workflows
+([37907964977](https://github.com/Quitetall/tritium/actions/runs/37907964977),
+[37907965003](https://github.com/Quitetall/tritium/actions/runs/37907965003))
+passed their required checks. GPU/device tests were skipped or unavailable; CPU
+smoke does not qualify serving deployment, GPU performance, or model quality.
+The general CI's single WASI training bundle was independently validated against
+all 117 frozen cases and 36 operations. Its exact raw artifact is retained at
+`release/v1.1/ci-wasi-training-receipts/7ada97b07dc367be2e82b100965b13c6942c597f-wasi-portable.json`
+(SHA-256 `00e594f23ca34be48c83dde7cd6385a109f47cd54c57f512239c0ac5cb6896ee`).
+It establishes only the `wasi` family; the seven-family backend-manifest and
+performance gates remain open.
+
+### Current release-registry validator regression checks — 2026-10-09
+
+At source revision `727a505a279a7fbcf723346a5f533af13712b740`, the focused
+local release-gate suites passed:
+
+```text
+python3 -m pytest -q \
+  scripts/tests/test_release_evidence_status.py \
+  scripts/tests/test_assemble_release_candidate.py \
+  scripts/tests/test_verify_zoo_community_receipt.py
+42 passed, 3 subtests passed in 6.07s
+```
+
+This exercises registry admission, candidate assembly, and model-zoo/community
+receipt validation on fixtures. It is software regression evidence only; it
+does not create a current-revision candidate registry, satisfy the second-person
+governance review, or qualify any release gate. No GitHub Actions run was
+visible for this revision when checked.
+
+The broader `scripts/tests` suite was also run at this revision. It reported
+`633 passed, 1 failed, 4 warnings, 177 subtests passed in 60.17s`. The sole
+failure was `test_public_convert_parallelizes_rows_without_changing_fitted_artifact`:
+serial conversion took `0.130s`, four-thread conversion `0.095s` (1.36× versus
+the unchanged 1.5× assertion), with load average `30.60` during the probe. The
+separate Qwen coded-plane CPU test was concurrently live at roughly 12 CPU cores;
+host load later read `37.10` on a 32-CPU machine. Artifact identity and weighted
+error assertions passed. Treat the speed result as **inconclusive under
+contention**, not as a pass or a demonstrated regression; rerun this probe after
+the external workload ends. No performance threshold was changed.
+
+### Current Tritium Python source-tree suite — 2026-10-09
+
+At source revision `4fa3c6a55fda0cbe843b441ca4a9799180425e97`, the complete
+`crates/tritium-py/tests` suite passed with the timing-sensitive parallelism
+probe excluded:
+
+```text
+PYTHONPATH=crates/tritium-py/python python3 -m pytest -q \
+  crates/tritium-py/tests \
+  --ignore=crates/tritium-py/tests/test_ptq_parallelism.py
+383 passed, 27 skipped, 15 warnings in 52.17s
+```
+
+This source-tree result includes PTQ artifact, Hugging Face/QAT lifecycle,
+checkpoint, ONNX, and dispatch correctness tests. Skips and warnings remain
+visible in the test output; the excluded PTQ timing assertion is still
+unresolved pending an uncontended rerun. This does not establish installed-wheel
+qualification, full-Qwen quality, multi-GPU training, whole-model ONNX,
+performance, or candidate-bound release evidence.
+
+### Current PyTorch/Hugging Face and ONNX source checks — 2026-10-09
+
+At source revision `44530ec99d9ef95d0c6f096a7f403aee6fce0a1f`, the focused
+CPU source-tree suites passed:
+
+```text
+PYTHONPATH=crates/tritium-py/python python3 -m pytest -q \
+  crates/tritium-py/tests/test_huggingface_qat.py \
+  crates/tritium-py/tests/test_torch_onnx.py
+31 passed in 1.25s
+```
+
+The WebGPU package's generated-source check and direct TypeScript type-check
+also passed (`npm run check:generated` and
+`node_modules/.bin/tsc -p tsconfig.json --noEmit`). These are local source
+checks, not installed-wheel or whole-Qwen evidence; they do not satisfy
+multi-GPU training, physical browser, full-model ONNX, or candidate-bound
+release gates. The WASM build was not run because the shared Cargo target is
+still occupied by the independent Qwen coded-plane test.
+
+### Exact-head CI and ABI3 matrix — 2026-10-09
+
+For committed source revision
+`650bddc5ddbb7401c7a693b4ff6f23bae550ecbb` (PR #51), required CI run
+[37919058237](https://github.com/Quitetall/tritium/actions/runs/37919058237)
+completed successfully. This includes CPU Linux/macOS/Windows checks, the
+receipt-backed compatibility workflow, CPU benchmark smoke, mock serving,
+Helm contract, source-free Web package, WASI training vectors, supply-chain,
+semver, packaging, SBOM, and GPU-feature Clippy. CUDA parity, ROCm, Metal,
+WGPU hardware conformance, real-model serving, parser fuzzing, and performance
+regression jobs were skipped; none is counted as a pass here.
+
+The matching wheels run
+[37919058210](https://github.com/Quitetall/tritium/actions/runs/37919058210)
+produced a 16-cell `tritium.abi3-matrix-qualification.v1` receipt for CPython
+3.9–3.14 across Linux x86_64, Windows x64, and macOS arm64. The downloaded
+receipt passed `scripts/aggregate-wheel-smoke.py`'s `validate_receipt` for the
+exact source SHA and release `1.1.0-rc.2`; receipt ID is
+`sha256:1369e8ef87078a426dc27a3bb6bcc81fbf685c79dbbea1a33590c3b077666452`,
+run ID `github-37919058210-1-abi3-matrix`. Its SHA-256 is
+`52d37e775cb3c2161af864bb66115af885d27124fc0150f7d389c865301f9de5`; retained
+at `release/v1.1/evidence/abi3-37919058210/python-abi3-39-plus.json`.
+This closes only the ABI3 compatibility-matrix evidence for this exact source.
+No candidate manifest/registry currently binds this receipt and the matching
+package artifacts, so the full `packages` gate remains open. At the time of
+recording (2026-10-09 10:53 UTC), the wheels run's pinned SmolLM2 CPU tutorial
+was still in progress; its timing/quality result is not inferred from the
+successful matrix or other wheel jobs.
+
+### Exact-head SmolLM2 CPU ONNX parity failure — 2026-10-09
+
+The next exact-head wheels run, [37926625146](https://github.com/Quitetall/tritium/actions/runs/37926625146)
+for `bc995de7753b9492c1e1e70dc42307bd77bec904`, completed the pinned tutorial's
+conversion and native checkpoint round-trip in 44.268 seconds, then failed the
+unchanged ONNX CPU parity assertion. On the 4-vCPU AMD EPYC 9V45 runner, with
+roughly 14 GiB available memory, over 80 GiB temporary disk, no CPU throttling,
+and OMP/MKL thread caps unset, the comparison had 3 mismatches among 344,064
+logit elements. Maximum absolute error was `0.00010390579700469971` against
+`atol=1e-4`; the worst relative error was `1.671875` against `rtol=1e-4`.
+The workflow's ABI3 matrix and other wheel jobs passed, but the overall wheels
+run and required pinned tutorial gate did not.
+
+A local standalone check of the first `model.layers.0.self_attn.q_proj` on the
+i9-14900K compared PyTorch with both ONNX `MatMul+Add` and `Gemm` lowerings;
+each differed by at most `9.53674316406e-07`. This rules out neither later
+layers nor the full-graph numerical path. The mismatch remains unresolved;
+do not change the frozen tolerance or infer a general hardware-specific cause
+from the available samples. Next diagnostic: localize the full-model difference
+to intermediate graph boundaries, then rerun the exact hosted tutorial after a
+source-backed correction.
+
+### Retained exact-head parity graph — 2026-10-09
+
+The next run, [37930189844](https://github.com/Quitetall/tritium/actions/runs/37930189844)
+for commit `2152c3a8`, exercised the opt-in failure capture. The pinned tutorial
+again failed at whole-model ONNX CPU parity: 4 of 344,064 logits, maximum
+absolute difference `0.00010919570922851562`, and maximum relative difference
+`1.7615385055541992` at output index `(0, 0, 34041)`. The runner was a 4-vCPU
+AMD EPYC 9V74 80-Core Processor with about 14 GiB available memory, over 80 GiB
+temporary disk, and no CPU throttling. Conversion and native checkpoint replay
+completed; the failure is still numerical parity, not resource exhaustion.
+
+GitHub artifact `smollm2-onnx-parity-diagnostic` (29,196,868 bytes, seven-day
+retention) was downloaded and independently hash-checked. Its ONNX graph is
+47,492,097 bytes (`sha256:15a9b51b73ef991b4d8e1080ef872f090d19920f142dc47bf0eb4a8bb1022877`);
+external data is 30,828,135 bytes
+(`sha256:5a8c3e5330da8e5a57ea2f0af81502aacbccbd43a1ed192fc8ea97afc860103b`).
+Static graph inspection found 23,676 opset-18 nodes, 483 external initializers,
+and logits shaped `[1, sequence, 49152]`. This capture omitted replay inputs and
+reference/observed output tensors, so it is not sufficient to reproduce the
+failure offline by itself. The next diagnostic revision adds those bounded
+replay tensors to the failure-only ledger; it must remain opt-in and must not
+change the frozen tolerance.
+
+### Exact-head parity replay capture — 2026-10-09
+
+Commit `162fbd86db7cc02d070578ce75ce7ea392201b87` reran the pinned CPU tutorial
+in wheels run
+[37932163696](https://github.com/Quitetall/tritium/actions/runs/37932163696).
+The required ABI3 wheel matrix and clean-install wheel jobs passed. The pinned
+tutorial again failed only at whole-model ONNX CPU parity, with 4 of 344,064
+logits outside the unchanged `rtol=atol=1e-4` bound; maximum absolute
+difference was `0.00010919570922851562`, maximum relative difference was
+`1.7615385055541992`, at `(0, 0, 34041)`. Conversion, native checkpoint
+round-trip, and generation completed first. The 4-vCPU AMD EPYC 7763 runner
+reported about 14 GiB available memory, over 80 GiB temporary disk, no cgroup
+CPU throttling, and unset OMP/MKL thread caps. This repeated failure is not a
+resource-exhaustion result and does not justify changing tolerance.
+
+The opt-in failure artifact uploaded successfully (`smollm2-onnx-parity-diagnostic`,
+31,578,834 bytes; artifact SHA-256
+`80ed584b565f01888927096917e55e517a46f40849d854af9d2421400e925bb5`, seven-day
+retention). Downloaded files were verified against the manifest:
+
+| Role | File | Bytes | SHA-256 |
+|---|---|---:|---|
+| ONNX graph | `model.onnx` | 47,492,097 | `15a9b51b73ef991b4d8e1080ef872f090d19920f142dc47bf0eb4a8bb1022877` |
+| External initializers | `model.onnx.data` | 30,828,135 | `5a8c3e5330da8e5a57ea2f0af81502aacbccbd43a1ed192fc8ea97afc860103b` |
+| Input IDs | `replay-000.bin` | 56 | `9149d0808454c31f025f663e24d89b7df315bc11117df48a58890547aefd8f97` |
+| PyTorch reference logits | `replay-001.bin` | 1,376,256 | `c18126bdc8174f10b1d879eb417631c7a9e22e628a70821ce85ac0f6f40f897d` |
+| ORT observed logits | `replay-002.bin` | 1,376,256 | `62708bdb40f16dc66aeaf8a8eda349ff38cd665f904db1d37e36c567141a20ab` |
+
+The arrays bind checkpoint digest
+`sha256:057411d950e9d681f3bcea79e1378eaada734e0a3556ff64590e200144fbd3e2`,
+input shape `[1, 7]`, and output shape `[1, 7, 49152]`; the diagnostic manifest
+SHA-256 is `02b8699ab5cfab8becc4412b562db22be93f56e6ef056e3a8130557bc9e84671`.
+This is now sufficient for exact offline replay. It is still a failure, not a
+parity pass. Next: reproduce ORT's captured output locally, then expose and
+compare intermediate graph boundaries against the original model to locate the
+first divergent operation before proposing a correction.
+
+#### Local runtime replay — 2026-10-09
+
+The captured graph and input were replayed on the i9-14900K with ORT 1.27.0,
+the package's `_session_options()` (`ORT_DISABLE_ALL`), CPUExecutionProvider,
+and otherwise identical settings while changing only `intra_op_num_threads`.
+The local output hash differs from the hosted output at both settings, so this
+is a numerical replay, not byte-identical reproduction:
+
+| ORT intra-op threads | Local max abs vs PyTorch | Tolerance failures | Max tolerance ratio | Max abs vs hosted ORT |
+|---:|---:|---:|---:|---:|
+| 1 | `0.0001380443572998047` | 3 / 344,064 | `1.0363115` | `0.0000476837158203125` |
+| 4 | `0.00009250640869140625` | 0 / 344,064 | `0.7068673` | `0.000057220458984375` |
+
+Both local runs had their worst normalized error at `(0, 0, 34041)`. This
+confirms that CPU intra-op scheduling changes the observed drift on this host,
+but it does not explain the hosted EPYC's four-thread failure. Do not treat
+thread pinning as a fix or a hardware-agnostic parity result. The next
+diagnostic must compare intermediate model/graph boundaries on both the
+captured input and the matching compact model, then isolate the first operation
+whose error grows across the bound.
+
+#### Exact packed-model reconstruction and hidden-state boundary replay
+
+The local compact model was reconstructed from the captured graph by copying
+its packed-trit and row-scale initializers into the matching
+`AdditiveTernaryWeight` buffers. Its recomputed source-model digest exactly
+matched the captured checkpoint digest
+`sha256:057411d950e9d681f3bcea79e1378eaada734e0a3556ff64590e200144fbd3e2`.
+This makes the local comparison use the hosted quantized weights rather than a
+fresh PTQ conversion. The reconstruction is diagnostic-only; no model weights
+were added to the repository or released.
+
+On the captured input, the reconstructed PyTorch model produced logits with
+SHA-256
+`ba06ae53bf3d99698da81211cf541d597318389a9058c0d8d11dda29fb27afac`. Compared
+with the captured hosted PyTorch reference, maximum absolute difference was
+`5.14984130859375e-05`, with zero tolerance violations. Against that same
+reference, local four-thread ORT had maximum absolute difference
+`9.250640869140625e-05`, also with zero violations (maximum normalized
+tolerance ratio `0.7068673`).
+
+The instrumented graph exposed 455 hidden-size-shaped intermediate values.
+For every one of the 31 PyTorch hidden-state boundaries, a matching graph value
+was found with normalized error below the frozen tolerance. The highest
+reported best-match boundary ratio was about `0.69` in the four-thread run; the
+final hidden-state boundary ratio was about `0.124`. Thus this local replay
+does not identify an intermediate hidden-state value that independently
+crosses tolerance. It does not reproduce the hosted AMD failure and does not
+establish the source of the hosted mismatch. Final LM-head amplification of
+accumulated drift remains a hypothesis, not a finding.
+
+The matched local final-projection comparison is now complete. The last
+hidden-state candidate was `mul_8378`. Applying the reconstructed model's
+PyTorch `lm_head` to that ORT-produced hidden state differed from local ORT
+logits by at most `1.5020370483398438e-05`; compared with the captured hosted
+PyTorch reference, it differed by at most `8.58306884765625e-05`, with zero
+tolerance violations. This weakens the hypothesis that final-projection
+amplification alone explains the local replay, but it does not exclude an
+AMD-specific interaction or earlier accumulated drift.
+
+The hosted AMD failure remains unresolved. The next diagnostic must capture
+the final graph's individual LM-head output shards and their shared hidden-state
+input on the failing runner, while leaving the frozen tolerance unchanged.
+Until that hosted evidence is available and a source-backed correction passes
+the pinned tutorial, ONNX parity remains RED and the v1.1 release gate is not
+cleared.
+
+#### Failure-only terminal shard capture
+
+The pinned wheels tutorial now enables
+`TRITIUM_ONNX_PARITY_CAPTURE_TERMINAL=1`. On an ONNX parity failure, the
+diagnostic path identifies a bounded final `Concat` of `MatMul`/`Gemm` shards,
+replays the original inputs through a temporary graph that exposes those shard
+outputs and their shared non-input activation, then removes that temporary
+graph. The original exported graph and qualification run are unchanged. These
+additional arrays include the secondary graph's output as a scheduling-drift
+control and are stored with the original graph/reference/observed ledger. The
+secondary replay is diagnostic, not qualification evidence. If optional
+intermediate capture fails, the primary parity artifact is still retained.
+Capture is capped at 64 MiB based on inferred runtime tensor shapes; unknown or
+oversized geometry skips the secondary replay rather than allocating
+unboundedly. The local module suite passed (`16 passed`), and `actionlint`
+passed for the edited wheel workflow. A local smoke against the retained
+SmolLM2 graph estimated 2,768,640 bytes and retrieved all seven shards plus
+`slice_187`; its temporary graph was removed. This is local diagnostic-path
+evidence only; no hosted AMD shard capture has been collected yet.
+
+#### Hosted decoder-boundary replay — 2026-10-09
+
+The next exact-source wheels run, [37940378594](https://github.com/Quitetall/tritium/actions/runs/37940378594)
+for `6078b2c12d0df2f15926dc121c1d342c886328e2`, passed the Linux, macOS arm64,
+and Windows x64 wheel jobs. The opt-in CUDA job was skipped by policy. The
+pinned SmolLM2 tutorial again failed only at ONNX CPU parity: 4 of 344,064
+logits exceeded the frozen `rtol=atol=1e-4` bound. The greatest failing
+absolute difference was `0.00010919570922851562` at `(0, 0, 34041)`; the
+greatest failing relative difference was `1.7615385055541992`.
+
+The run uploaded diagnostic artifact `smollm2-onnx-parity-diagnostic`
+(artifact ID `11621208335`, 36,083,548 bytes; archive SHA-256
+`7211101791c87b7397bb3112c1cb83dc72d07c8aab8adbc2a5fbe3aaf62a0345`). The
+downloaded manifest SHA-256 is
+`73d17201e9bc4f5a64cdc3030a929102733c40a823fb96dfa0f1168aedf79aab`; all 74
+replay arrays and both ONNX files passed the manifest's byte-count and
+SHA-256 checks. The graph and external-data hashes match the preceding
+capture, and the quantized checkpoint digest is
+`sha256:057411d950e9d681f3bcea79e1378eaada734e0a3556ff64590e200144fbd3e2`.
+
+On a local replay with ONNX Runtime 1.27.0 and the captured input, the first
+29 captured decoder residuals (`add_390` through `add_6606`) each had zero
+elementwise tolerance violations against the corresponding PyTorch hidden
+states `[1]` through `[29]`. The first residual already differed by up to
+`5.7220458984375e-06`; the largest normalized tolerance ratio among these
+boundaries was `0.6632399559` at `add_6606` versus `hidden_states[29]` (maximum
+absolute difference `0.0322265625`). The final normalized hidden tensor
+`slice_187` differed from the PyTorch terminal hidden state by at most
+`0.000118255615234375`, with zero tolerance violations (maximum normalized
+ratio `0.1101463139`). These are boundary checks, not proof that every internal
+operation is equivalent; the final pre-normalization residual is not directly
+comparable to the post-normalization terminal state.
+
+An isolated replay of the terminal ONNX head produced zero failing logits when
+fed the PyTorch terminal hidden tensor, but reproduced the same four failing
+logits when fed ONNX's `slice_187`. The isolated replay is not byte-identical
+to the full-graph replay (maximum output difference `1.239776611328125e-05`),
+so it is diagnostic only. This localizes the observed failure to differences
+already present in the ONNX-produced terminal hidden input, which the output
+head then carries across the logit tolerance for four elements. It does not
+identify the first divergent internal operation or establish a correction.
+Keep the parity gate RED and the tolerance unchanged; next compare earlier
+in-block activation boundaries to locate where the small drift first appears
+and test a source-backed numerical fix on the exact hosted gate.
+
+#### Output-shard breakdown for the same replay
+
+The retained seven-shard outputs were compared with slices of the captured
+PyTorch logits using the same per-element tolerance. Their vocabulary ranges
+and failures were:
+
+| ONNX output | Vocabulary range | Failing values | Maximum normalized tolerance ratio |
+|---|---:|---:|---:|
+| `linear_210` | `[0, 7281)` | 1 | 1.0498 |
+| `linear_211` | `[7281, 14562)` | 0 | 0.9412 |
+| `linear_212` | `[14562, 21843)` | 0 | 0.8652 |
+| `linear_213` | `[21843, 29124)` | 0 | 0.9041 |
+| `linear_214` | `[29124, 36405)` | 1 | 1.0919 |
+| `linear_215` | `[36405, 43686)` | 2 | 1.0720 |
+| `linear_216` | `[43686, 49152)` | 0 | 0.9979 |
+
+The four failing values are therefore sparse across three shards rather than
+concentrated in one output shard. The largest absolute difference in some
+non-failing values is larger than the largest failing difference, because
+those logits have a larger relative tolerance allowance. Together with the
+reference-hidden-input replay, this weighs against a shard-specific LM-head
+bug; it does not rule out the shared head kernel's sensitivity to its input.
+This is additional diagnostic evidence from the same captured model and input,
+not an independent run or a parity pass.
+
+#### First decoder attention-residual comparison — 2026-10-09
+
+Commit `69a469ab3074aab8f19b0505b11c7dcf1a82cf5a` adds an opt-in diagnostic
+capture of the first Llama-style decoder block's attention residual on both
+the ONNX and PyTorch paths. The focused ONNX module suite passed (`18 passed`),
+and the hosted installed-wheel job passed its public PTQ artifact test. The
+exact-source tutorial in
+[run 37942531392](https://github.com/Quitetall/tritium/actions/runs/37942531392)
+still failed the same four logits at the frozen tolerance.
+
+The new failure artifact (`11622647303`, 36,113,907 bytes; archive SHA-256
+`57f51e0be3065c048d909e9395abcf8af19ed5467a9b45de3761c19171d51ed5`;
+manifest SHA-256
+`b8afac589f7ac21f70679ac3a8d3d89db86025db2316a2792561a6830f3e2de0`) passed
+all manifest file-size and SHA-256 checks locally. It carries the same
+quantized checkpoint digest as the prior run.
+
+The captured ONNX first attention residual `add_340` differs from the
+PyTorch input to `layers[0].post_attention_layernorm` by at most
+`3.5762786865234375e-07` (maximum normalized tolerance ratio `0.001263`, zero
+violations). The first full-block residual `add_390`, compared with
+`hidden_states[1]`, differs by at most `5.7220458984375e-06` (maximum
+normalized ratio `0.02114`, zero violations). The numerical difference is
+therefore still very small at block one, but grows between the attention
+residual and the full block output. This narrows the next search to
+post-attention normalization, MLP projections/activation, and the second
+residual add; it does not identify which of those operations introduces the
+additional drift. No tolerance or inference behavior was changed.
+
+Next diagnostic: failure-only capture the first block's
+`post_attention_layernorm` output and MLP output on the reference path, plus
+the matching hidden-size ONNX values. Compare these before any solver or
+export-kernel change, then rerun the exact pinned tutorial.
+
+#### First decoder MLP-path comparison — 2026-10-09
+
+The follow-up capture in commit `f327be170e3af683209eb07cf3697d795ae5026c`
+passed the Linux, macOS arm64, and Windows x64 wheel builds, and the hosted
+installed-wheel public PTQ artifact test passed. The pinned tutorial in
+[run 37944234191](https://github.com/Quitetall/tritium/actions/runs/37944234191)
+still failed at ONNX parity with the same 4 of 344,064 logits outside the
+unchanged tolerance.
+
+The failure artifact (`11622579947`, 36,220,278 bytes; archive SHA-256
+`b77d0d9bf3b54062436f3a9ad2a745f1b0f874c8b0673eab56fe049290c2eb17`; manifest
+SHA-256 `20e906c662363ed99f2a3c849058a816bbbca78eb91ca08d424007c92eacedb6`)
+passed local byte-count and SHA-256 verification. It binds the same quantized
+checkpoint digest as the preceding diagnostic.
+
+The mapped first-block values are:
+
+| Boundary | ONNX value | PyTorch value | Maximum absolute difference | Tolerance failures |
+|---|---|---|---:|---:|
+| Attention residual | `add_340` | `layers[0].attention_residual` | `3.5762786865234375e-07` | 0 |
+| Post-attention norm output | `mul_381` | `layers[0].post_attention_layernorm.output` | `4.023313522338867e-07` | 0 |
+| MLP output | `linear_6` | `layers[0].mlp.output` | `4.76837158203125e-06` | 0 |
+| Block output | `add_390` | `hidden_states[1]` | `5.7220458984375e-06` | 0 |
+
+This makes the post-attention norm an unlikely source of the larger first-block
+drift: its output is nearly identical, while the MLP output differs by about
+an order of magnitude more. The MLP branch therefore adds measurable but
+in-tolerance drift in block zero. Its gate/up projections, activation, and
+down projection were not separately compared, so the responsible operation
+remains unknown. Next capture and compare the gate/up projection outputs and
+activation before changing numerical kernels or release tolerances.
+
+#### First-block projection comparison and latest hosted replay — 2026-10-09
+
+Commit `ab7ae2cc4ef367482b22b874a97a8c662dba126a` adds failure-only capture
+of the first block's intermediate-width ONNX values and reference gate, up,
+and activation outputs. The exact-source wheels run
+[37946168132](https://github.com/Quitetall/tritium/actions/runs/37946168132)
+built Linux x86_64, macOS arm64, and Windows x64 wheels successfully; the
+CUDA wheel job was skipped. CI, docs, and CPU capstone checks passed. The
+SmolLM2 tutorial still failed at the frozen `rtol=atol=1e-4` check with the
+same 4 of 344,064 logits, maximum failing absolute difference
+`0.00010919570922851562` at `(0, 0, 34041)`, and maximum failing relative
+difference `1.7615385055541992`. The gate remains RED; no tolerance or runtime
+behavior changed.
+
+The retained `smollm2-onnx-parity-diagnostic` artifact (ID `11624157673`,
+36,579,643 bytes; archive SHA-256
+`a836dc444fcb3b4e624dac6dc9f2e2d4e4eb2a03b366046159527d0e229cd81b`) contains
+95 files. Its manifest SHA-256 is
+`81edaaad70b40ffcf9139b7db47e26e752972206f289a4a0612ddb362eb91fee`. All 94
+listed replay arrays and ONNX files passed the manifest's byte-count and
+SHA-256 checks. The checkpoint digest remains
+`sha256:057411d950e9d681f3bcea79e1378eaada734e0a3556ff64590e200144fbd3e2`.
+
+The newly mapped first-block path is numerically close at every captured
+boundary. The ONNX `linear_4` maps to the PyTorch gate projection, and
+`linear_5` maps to the up projection; swapping those mappings fails across all
+10,752 values, so the correspondence is unambiguous. `silu` is the activation
+output and `linear_6` is the down projection/MLP output.
+
+| Boundary | ONNX value | PyTorch value | Maximum absolute difference | Maximum tolerance ratio | Failures |
+|---|---|---|---:|---:|---:|
+| Gate projection | `linear_4` | `layers[0].mlp.gate_proj.output` | `7.152557373046875e-07` | `0.006249` | 0 |
+| Up projection | `linear_5` | `layers[0].mlp.up_proj.output` | `8.344650268554688e-07` | `0.006286` | 0 |
+| Activation | `silu` | `layers[0].mlp.act_fn.output` | `7.152557373046875e-07` | `0.003380` | 0 |
+| Down projection / MLP output | `linear_6` | `layers[0].mlp.output` | `4.76837158203125e-06` | `0.024855` | 0 |
+
+All 29 block residual comparisons remain within the elementwise tolerance;
+their maximum normalized tolerance ratio is `0.663240` at `add_6606` versus
+`hidden_states[29]`. The final normalized hidden state also has zero failures
+(maximum absolute difference `0.000118255615234375`, maximum ratio
+`0.110146`). This moves the investigation away from a first-block MLP
+projection/activation defect. The small residual differences accumulate
+across the model and the terminal output head produces four out-of-tolerance
+logits. The exact source of this accumulated numerical drift is still
+unidentified; do not call this a fix or a parity pass.
+
+The installed-wheel job in the same run failed earlier at
+`qualify public PTQ row-fitting parallelism`, so the selected public
+`prepare → calibrate → convert()` artifact test was skipped. The performance
+probe retained output equality but measured only `1.35x` speedup on a
+four-CPU hosted runner (`2.130s` serial, `1.576s` parallel), below its existing
+`1.5x` guard. The focused probe passed locally at `2.30x` (`3.105s` serial,
+`1.349s` parallel) with 32 CPUs in affinity and a heavily loaded host; this is
+not comparable hosted qualification. Neither result justifies weakening the
+guard. Revisit the probe's measurement stability and the actual parallel fit
+performance, then rerun the exact-wheel artifact test.
+
+The follow-up diagnostic now retains the first-block traces and additionally
+selects decoder block index 11 (or the last available block for a smaller
+model), including its attention residual, MLP input, gate/up projections,
+activation, and MLP output. The target is evidence-driven: the captured
+residual drift first jumps at block output `add_2832`, which is block index
+11. Local tests cover multi-block ONNX name selection and reference hooks
+(`18 passed`), and the public grouped-fit artifact test passed locally
+(`1 passed`). A local replay of the captured graph selected the expected
+block-11 ONNX names (`add_2782`, `linear_81`, `linear_82`, `silu_11`, and
+`linear_83`) within the 64 MiB capture bound. This diagnostic has not yet run
+against the hosted pinned model, and the installed-wheel version of the PTQ
+artifact test remains skipped after the separate row-fitting performance
+gate failed.
+
+Next compare those block-11 internals against PyTorch on the exact pinned
+tutorial, then test a source-backed numerical correction. Keep the tolerance
+frozen and the gate RED until that tutorial passes.
+
+#### Block-11 trace and PTQ artifact result — 2026-10-09
+
+The next exact-wheel run,
+[37948541947](https://github.com/Quitetall/tritium/actions/runs/37948541947)
+for `3fefc60ab99674354daef0acb3780a7c1ea1f462`, built the Linux x86_64,
+macOS arm64, and Windows x64 wheels. Its installed-wheel job passed the public
+row-fitting qualification and the public `prepare → calibrate → convert()`
+artifact test, along with the differentiable lifecycle and installed QAT
+tutorial. Thus the prior `1.35x` hosted row-fit measurement did not reproduce;
+its check is still a performance guard and should not be weakened. The pinned
+SmolLM2 tutorial still failed the unchanged tolerance with 4 of 344,064 logits
+outside bounds: maximum failing absolute difference
+`0.0001201331615447998` at `(0, 0, 45178)` and maximum failing relative
+difference `2.28125` at `(0, 0, 34041)`. The tutorial remains RED.
+
+The diagnostic artifact (`11625330761`, 37,075,459 bytes; archive SHA-256
+`d911a644a443ba7c2bc88c1a83f8e0a13fd4fa6090c780e3f38804b7ec721dd0`) has
+manifest SHA-256
+`ad9b6ef2644d28144a90e8fd2d37fb2cca126c00fe982360dbdf27a02e103014`. Its
+110 replay arrays and two ONNX files passed manifest byte-count and SHA-256
+verification. The new reference hooks and ONNX values for `layers[11]` agree
+on the MLP path:
+
+| Boundary | ONNX value | Maximum absolute difference | Maximum tolerance ratio | Failures |
+|---|---|---:|---:|---:|
+| Attention residual | `add_2782` | `0.000194549560546875` | `0.244010` | 0 |
+| Post-attention norm | `mul_3395` | `2.115964889526367e-06` | `0.015906` | 0 |
+| Gate projection | `linear_81` | `4.00543212890625e-05` | `0.033786` | 0 |
+| Up projection | `linear_82` | `6.4849853515625e-05` | `0.050380` | 0 |
+| Activation | `silu_11` | `4.00543212890625e-05` | `0.017944` | 0 |
+| Product before down projection | `mul_3418` | `0.00390625` | `0.048836` | 0 |
+| Down projection / MLP output | `linear_83` | `0.0322265625` | `0.135166` | 0 |
+| Block output | `add_2832` | `0.0322265625` | `0.192853` | 0 |
+
+The largest first outlier appears at the down-projection output, at token 0,
+hidden coordinate 507 (`12212.943` ONNX versus `12212.911` reference). This is
+still inside the frozen elementwise tolerance. The attention, normalization,
+and gate/up/activation boundaries before it are also within tolerance. This
+narrows the numeric investigation to the down-projection input/reduction and
+subsequent accumulation, but does not yet distinguish small input drift from
+matmul accumulation behavior or establish a correction.
+
+The two adjacent hosted runs also expose a separate reproducibility issue.
+The ONNX graph bytes are identical (`model.onnx` SHA-256
+`15a9b51b73ef991b4d8e1080ef872f090d19920f142dc47bf0eb4a8bb1022877`), but
+the provisional packed checkpoint digest changed from
+`sha256:057411d950e9d681f3bcea79e1378eaada734e0a3556ff64590e200144fbd3e2`
+to `sha256:3bb026489b8ca00f2696a040bd48a0b4055906f097c7952348dc89259fffae2a`.
+The external tensor payloads have equal size (30,828,135 bytes) but different
+hashes. A byte comparison found 270 changed bytes across 113 packed tensors:
+253 bytes in scale tensors (106 tensors) and 17 bytes in packed-trit tensors
+(7 tensors). The tutorials use the same pinned base-model revision and fixed
+prompt, and this commit changed only diagnostic capture and docs. Treat the
+cause as UNKNOWN, not as proof of solver nondeterminism; next verify source
+checkpoint identity and repeat conversion under controlled thread settings.
+This variation means the two parity traces are not byte-for-byte the same
+candidate and must not be described as one model's repeatability evidence.
+
+Next: investigate and make PTQ artifact production reproducible (or identify
+and explicitly receipt a supported source of nondeterminism), then run the
+block-11 analysis on that stable candidate and test a source-backed numeric
+correction. Keep the parity and release gates RED until the exact pinned
+tutorial passes.
+
+#### Exact-candidate replay and ORT thread sensitivity — 2026-10-09
+
+The next exact-source wheels run
+[37957402595](https://github.com/Quitetall/tritium/actions/runs/37957402595)
+tested commit `350331f86b799fb33b17f2032cd91732521b9fca`. Platform wheel jobs,
+the installed-wheel suite, source-free tutorial and abi3 matrix passed; the
+pinned SmolLM2 tutorial still failed 4 of 344,064 logits. Its maximum failing
+absolute difference was `0.0001201331615447998` at `(0, 0, 45178)` and its
+maximum failing relative difference was `2.28125` at `(0, 0, 34041)`. The
+failure tolerance remains unchanged. The new diagnostic identifies the runner
+as Intel Xeon Platinum 8573C, with four logical/affinity CPUs, Python 3.13.16,
+PyTorch 2.11.0+cpu and ONNX Runtime 1.27.0. ORT requested
+`intra_op_num_threads=0` and `inter_op_num_threads=0`; the effective runtime
+thread count was not captured.
+
+The retained diagnostic (`11630785486`, 37,075,831 bytes; archive SHA-256
+`a64fc3f023317af7234df71653f60a74712de06a8704a5191aeed6c1085da724`) has
+manifest SHA-256
+`5f4e246482d3f4022c1c84bc1f2025fa03cce64eff86cfef841f9bf04f77bd97`.
+All 110 replay arrays and both ONNX files passed byte-count and SHA-256
+verification. The checkpoint digest and both ONNX file hashes match the
+earlier Intel-hosted candidate in run `37948541947` exactly, so this repeats
+that candidate's same four failing coordinates and block-11 trace rather than
+introducing another PTQ artifact. The previously observed AMD candidate from
+run `37955929152` remains a distinct checkpoint and external-data payload.
+
+Both exact hosted ONNX candidates were replayed locally on the Core i9-14900K
+with pinned ORT 1.27.0 and graph optimization disabled. For the Intel-hosted
+candidate, explicit intra-op thread counts 1, 2, 4 and automatic (`0`) produced
+4, 0, 0 and 112 failing logits respectively; thread count 1 reproduced the
+hosted observed logits byte-for-byte. For the distinct AMD-hosted candidate,
+the same sweep produced 3, 0, 0 and 334 failing logits; again, thread count 1
+reproduced the hosted output byte-for-byte. These local replays make ORT thread
+policy a concrete numerical sensitivity and a candidate for the next
+controlled experiment. They do not establish the effective hosted thread
+count, prove a cross-host fix, or measure performance. Do not silently change
+the runtime default: choose and validate a configurable policy, then rerun the
+hosted parity and installed-wheel performance gates before claiming repair.

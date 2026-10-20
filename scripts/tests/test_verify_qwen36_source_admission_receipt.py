@@ -101,10 +101,15 @@ def test_source_admission_is_a_distinct_release_gate():
     release_module = runpy.run_path(
         Path(__file__).resolve().parents[1] / "release-evidence-status.py"
     )
-    assert ("qwen-source-admission", ("source-admission",)) in release_module["GATES"]
+    assert (
+        "qwen-source-admission",
+        ("source-admission", "official-source-identity"),
+    ) in release_module["GATES"]
 
 
-def test_release_evaluator_accepts_source_receipt_identity(tmp_path: Path):
+def test_release_evaluator_accepts_exact_official_identity_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     release_module = runpy.run_path(
         Path(__file__).resolve().parents[1] / "release-evidence-status.py"
     )
@@ -136,19 +141,45 @@ def test_release_evaluator_accepts_source_receipt_identity(tmp_path: Path):
     validated = MODULE.validate(
         receipt_path, MODULE.PINNED_REVISION, "1.1.0-rc.1", candidate
     )
+    identity = {
+        "receipt_id": "sha256:" + "5" * 64,
+        "source_admission_receipt_id": validated["receipt_id"],
+        "repository": "Qwen/Qwen3.6-27B",
+        "revision": MODULE.PINNED_REVISION,
+        "source_model_id": receipt["receipt"]["source_model_id"],
+        "manifest_content_id": receipt["receipt"]["manifest_content_id"],
+        "source_proof_id": receipt["receipt"]["proof_id"],
+    }
+    monkeypatch.setitem(
+        release_module["evaluate"].__globals__,
+        "validate_official_source_identity",
+        lambda _path: identity,
+    )
+    identity_path = evidence_root / "official-identity.json"
+    identity_path.write_text("{}\n")
     registry = {
         "schema": "tritium.release-evidence-registry.v1",
         "release": candidate_document["release"],
         "source_revision": candidate_document["source_revision"],
         "candidate_manifest_sha256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
-        "receipts": [{
-            "id": validated["receipt_id"],
-            "kind": "source-admission",
-            "path": receipt_path.name,
-            "sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
-            "artifact_id": "qwen-source",
-            "parents": [],
-        }],
+        "receipts": [
+            {
+                "id": validated["receipt_id"],
+                "kind": "source-admission",
+                "path": receipt_path.name,
+                "sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+                "artifact_id": "qwen-source",
+                "parents": [],
+            },
+            {
+                "id": identity["receipt_id"],
+                "kind": "official-source-identity",
+                "path": identity_path.name,
+                "sha256": hashlib.sha256(identity_path.read_bytes()).hexdigest(),
+                "artifact_id": "qwen-source",
+                "parents": [validated["receipt_id"]],
+            },
+        ],
     }
     registry_path = evidence_root / "registry.json"
     write(registry_path, registry)
@@ -157,3 +188,89 @@ def test_release_evaluator_accepts_source_receipt_identity(tmp_path: Path):
     )
     source_gate = next(row for row in report["rows"] if row["id"] == "qwen-source-admission")
     assert source_gate["status"] == "PASS"
+    registry["receipts"] = registry["receipts"][:1]
+    write(registry_path, registry)
+    report = release_module["evaluate"](
+        registry_path, candidate, candidate_document
+    )
+    source_gate = next(row for row in report["rows"] if row["id"] == "qwen-source-admission")
+    assert source_gate["status"] == "MISSING"
+
+
+def test_release_evaluator_rejects_identity_receipt_bound_to_different_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    release_module = runpy.run_path(
+        Path(__file__).resolve().parents[1] / "release-evidence-status.py"
+    )
+    candidate_root = tmp_path / "candidate"
+    candidate_root.mkdir()
+    artifact = candidate_root / "qwen-source.json"
+    candidate_source = record()
+    artifact.write_bytes(canonical(candidate_source) + b"\n")
+    candidate_document = {
+        "schema": "tritium.release-candidate.v1",
+        "release": "1.1.0-rc.1",
+        "source_revision": MODULE.PINNED_REVISION,
+        "artifacts": [{
+            "id": "qwen-source",
+            "kind": "source-admission",
+            "path": artifact.name,
+            "identity": {},
+            "sbom": {},
+            "provenance": {},
+        }],
+    }
+    candidate = candidate_root / "manifest.json"
+    write(candidate, candidate_document)
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    receipt_path = evidence_root / "source.json"
+    write(receipt_path, candidate_source)
+    admission = MODULE.validate(
+        receipt_path, MODULE.PINNED_REVISION, "1.1.0-rc.1", candidate
+    )
+    identity = {
+        "receipt_id": "sha256:" + "5" * 64,
+        "source_admission_receipt_id": "sha256:" + "0" * 64,
+        "repository": "Qwen/Qwen3.6-27B",
+        "revision": MODULE.PINNED_REVISION,
+        "source_model_id": candidate_source["receipt"]["source_model_id"],
+        "manifest_content_id": candidate_source["receipt"]["manifest_content_id"],
+        "source_proof_id": candidate_source["receipt"]["proof_id"],
+    }
+    monkeypatch.setitem(
+        release_module["evaluate"].__globals__,
+        "validate_official_source_identity",
+        lambda _path: identity,
+    )
+    identity_path = evidence_root / "official-identity.json"
+    identity_path.write_text("{}\n")
+    registry = {
+        "schema": "tritium.release-evidence-registry.v1",
+        "release": candidate_document["release"],
+        "source_revision": candidate_document["source_revision"],
+        "candidate_manifest_sha256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
+        "receipts": [
+            {
+                "id": admission["receipt_id"],
+                "kind": "source-admission",
+                "path": receipt_path.name,
+                "sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+                "artifact_id": "qwen-source",
+                "parents": [],
+            },
+            {
+                "id": identity["receipt_id"],
+                "kind": "official-source-identity",
+                "path": identity_path.name,
+                "sha256": hashlib.sha256(identity_path.read_bytes()).hexdigest(),
+                "artifact_id": "qwen-source",
+                "parents": [admission["receipt_id"]],
+            },
+        ],
+    }
+    registry_path = evidence_root / "registry.json"
+    write(registry_path, registry)
+    with pytest.raises(release_module["EvidenceError"], match="exact source-admission parent"):
+        release_module["evaluate"](registry_path, candidate, candidate_document)

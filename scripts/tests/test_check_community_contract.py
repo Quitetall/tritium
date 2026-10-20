@@ -5,15 +5,102 @@ from pathlib import Path
 import runpy
 import tempfile
 import unittest
+from urllib.parse import unquote, urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = runpy.run_path(ROOT / "scripts" / "check-community-contract.py")
 check = MODULE["check"]
 CommunityContractError = MODULE["CommunityContractError"]
+check_local_link = MODULE["_check_local_link"]
+github_anchors = MODULE["_github_anchors"]
+check_public_docs = MODULE["_check_public_docs"]
+governance_files = MODULE["GOVERNANCE_FILES"]
+markdown_targets = MODULE["_targets"]
+
+
+def copy_contract_fixture(destination: Path) -> None:
+    """Copy only governance inputs and their local-link targets for mutation tests."""
+    checked = {ROOT / "README.md", ROOT / "CONTRIBUTING.md"}
+    checked.update(ROOT / relative for relative in governance_files)
+    checked.update((ROOT / "docs" / "book" / "src").rglob("*.md"))
+
+    paths = {path.relative_to(ROOT) for path in checked}
+    for source in checked:
+        try:
+            text = source.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for target in markdown_targets(text):
+            parsed = urlsplit(target)
+            if parsed.scheme or parsed.netloc or not parsed.path:
+                continue
+            resolved = (source.parent / unquote(parsed.path)).resolve()
+            try:
+                paths.add(resolved.relative_to(ROOT))
+            except ValueError:
+                continue
+
+    for relative in sorted(paths, key=lambda path: (len(path.parts), path.as_posix())):
+        source = ROOT / relative
+        target = destination / relative
+        if source.is_dir():
+            shutil.copytree(source, target, dirs_exist_ok=True)
+        elif source.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
 
 
 class CommunityContractTests(unittest.TestCase):
+    def test_github_heading_ids_handle_duplicates_and_fenced_code(self):
+        anchors = github_anchors(
+            "# Release sign-off\n\n# Release sign-off\n\n"
+            "```md\n# not-a-heading\n```\n\n<a id=\"explicit-route\"></a>\n"
+        )
+        self.assertIn("release-sign-off", anchors)
+        self.assertIn("release-sign-off-1", anchors)
+        self.assertNotIn("not-a-heading", anchors)
+        self.assertIn("explicit-route", anchors)
+
+    def test_local_markdown_fragments_must_resolve(self):
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            source = repo / "guide.md"
+            source.write_text("# Ready\n", encoding="utf-8")
+            self.assertTrue(check_local_link(repo, source, "guide.md", "#ready"))
+            self.assertTrue(
+                check_local_link(repo, source, "guide.md", "guide.md#ready")
+            )
+            with self.assertRaisesRegex(CommunityContractError, "missing-anchor"):
+                check_local_link(
+                    repo, source, "guide.md", "guide.md#missing-anchor"
+                )
+
+    def test_public_docs_reject_private_research_repository_links(self):
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            book = repo / "docs" / "book" / "src"
+            book.mkdir(parents=True)
+            (repo / "README.md").write_text("public\n", encoding="utf-8")
+            (repo / "CONTRIBUTING.md").write_text("public\n", encoding="utf-8")
+            (book / "SUMMARY.md").write_text("# Summary\n", encoding="utf-8")
+            (book / "research-records.md").write_text(
+                "https://github.com/Quitetall/tritium/issues\n", encoding="utf-8"
+            )
+            chapter = book / "chapter.md"
+            chapter.write_text("public\n", encoding="utf-8")
+            self.assertEqual(check_public_docs(repo), 5)
+
+            chapter.write_text(
+                "https://github.com/Quitetall/tritium-research\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(CommunityContractError, "private research"):
+                check_public_docs(repo)
+
+            chapter.write_text("[missing](missing.md)\n", encoding="utf-8")
+            with self.assertRaisesRegex(CommunityContractError, "missing.md"):
+                check_public_docs(repo)
+
     def test_repository_governance_contract_passes(self):
         report = check(ROOT)
         self.assertEqual(report["result"], "pass")
@@ -23,7 +110,7 @@ class CommunityContractTests(unittest.TestCase):
     def test_broken_local_link_fails_closed(self):
         with tempfile.TemporaryDirectory() as raw:
             repo = Path(raw) / "repo"
-            shutil.copytree(ROOT, repo, ignore=shutil.ignore_patterns(".git", "target"))
+            copy_contract_fixture(repo)
             path = repo / "SUPPORT.md"
             path.write_text(
                 path.read_text(encoding="utf-8").replace(
@@ -38,7 +125,7 @@ class CommunityContractTests(unittest.TestCase):
     def test_contact_route_cannot_drift(self):
         with tempfile.TemporaryDirectory() as raw:
             repo = Path(raw) / "repo"
-            shutil.copytree(ROOT, repo, ignore=shutil.ignore_patterns(".git", "target"))
+            copy_contract_fixture(repo)
             path = repo / "SECURITY.md"
             path.write_text(
                 path.read_text(encoding="utf-8").replace(
@@ -52,7 +139,7 @@ class CommunityContractTests(unittest.TestCase):
     def test_public_unstaffed_channel_is_rejected(self):
         with tempfile.TemporaryDirectory() as raw:
             repo = Path(raw) / "repo"
-            shutil.copytree(ROOT, repo, ignore=shutil.ignore_patterns(".git", "target"))
+            copy_contract_fixture(repo)
             path = repo / "COMMUNITY.md"
             path.write_text(
                 path.read_text(encoding="utf-8")

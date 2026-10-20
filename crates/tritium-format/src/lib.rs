@@ -40,6 +40,7 @@ use core::fmt;
 use half::f16;
 use tritium_core::TritError;
 
+mod additive_tensor;
 mod artifact;
 mod codec_bundle;
 mod entropy_transport;
@@ -48,6 +49,7 @@ mod gguf_write;
 mod i2s;
 mod i2s_int8;
 mod le_cursor;
+mod legacy_salt_import;
 mod q2_0;
 mod rows;
 mod runtime_evidence;
@@ -71,7 +73,17 @@ mod tq2;
 mod tqbin;
 mod tqidx;
 mod training_salt;
+pub mod trit_calibration;
+pub mod trit_model;
+pub mod trit_owner_score;
+mod trit_package;
+mod trit_profile;
+pub mod trit_salience;
+pub mod trit_salience_conversion;
 
+pub use additive_tensor::{
+    AdditivePayload, AdditiveStreamValidator, AdditiveTensor, AdditiveTensorError,
+};
 pub use artifact::{
     ArtifactError, ModelId, PackageHasher, PackageId, SemanticModelManifest, SemanticTensor,
     SemanticTensorHasher,
@@ -84,9 +96,10 @@ pub use codec_bundle::{
 pub use entropy_transport::{
     ENTROPY_TRANSPORT_DEFAULT_CHUNK_BYTES, ENTROPY_TRANSPORT_MAGIC,
     ENTROPY_TRANSPORT_MAX_CHUNK_BYTES, ENTROPY_TRANSPORT_MIN_CHUNK_BYTES,
-    ENTROPY_TRANSPORT_VERSION, EntropyChunkInfo, EntropyTransport, EntropyTransportError,
-    SeekableEntropyTransport, read_entropy_transport, read_entropy_transport_seekable,
-    write_entropy_transport, write_entropy_transport_with_chunk_size,
+    ENTROPY_TRANSPORT_VERSION, EntropyChunkInfo, EntropyTransport, EntropyTransportChunkCodec,
+    EntropyTransportError, SeekableEntropyTransport, read_entropy_transport,
+    read_entropy_transport_seekable, write_entropy_transport,
+    write_entropy_transport_with_chunk_size,
 };
 pub use gguf::{
     DEFAULT_ALIGNMENT, GGML_TYPE_Q2_0, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, GgufError, GgufFile,
@@ -100,13 +113,21 @@ pub use i2s::{
 pub use i2s_int8::{
     I2sInt8Weights, IMMA_K, IMMA_N, IMMA_WTILE_BYTES, convert_i2s_to_int8, convert_i2s_to_tq2_0,
 };
+pub use legacy_salt_import::{
+    SaltTensorImportError, SaltTensorImportLimits, SaltTensorSpoolError, SaltTensorSpoolImport,
+    SaltTensorSpoolLimits, SaltTensorSpoolPlan, import_salt_rows, import_salt_v2_tensor,
+    import_salt_v2_tensor_to_spool, inspect_salt_v2_tensor_spool,
+};
 pub use q2_0::{
     Q2_0_BLOCK_BYTES, Q2_0_GROUP_SIZE, pack_q2_0_block, pack_q2_0_row, q2_0_num_blocks,
     unpack_q2_0_block, unpack_q2_0_row,
 };
 pub use rows::{num_blocks, pack_tq1_0_row, pack_tq2_0_row, unpack_tq1_0_row, unpack_tq2_0_row};
 pub use runtime_evidence::{
-    RuntimeEvidenceError, RuntimeFinalLogitsAccumulator, RuntimeFinalLogitsEvidence,
+    RuntimeBlockOutputsAccumulator, RuntimeBlockOutputsEvidence, RuntimeEvidenceError,
+    RuntimeFinalLogitsAccumulator, RuntimeFinalLogitsEvidence,
+    RuntimeOutputReconstructionAccumulator, RuntimeOutputReconstructionEvidence,
+    RuntimeOutputScope, RuntimeOutputScopeAccumulator, RuntimeOutputScopeEvidence,
 };
 pub use safetensors::{
     SafeTensors, SafeTensorsError, SafeTensorsReader, VisitTensorBytesError, read_safetensors,
@@ -151,6 +172,14 @@ pub use tq2::{compute_zero_bitmap, compute_zero_bitmaps, pack_tq2_0_block, unpac
 pub use tqbin::{TQBIN_HEADER_BYTES, TQBIN_MAGIC, TQBIN_VERSION, read_tqbin, write_tqbin};
 pub use tqidx::{ShardEntry, TQIDX_MAGIC, TQIDX_VERSION, TqIndex, read_tqidx, write_tqidx};
 pub use training_salt::{PackedTrainingSaltSnapshot, TernaryStructure, TrainingSaltPlane};
+pub use trit_package::{
+    EncodedSizeBounds, TRIT_BLOB_ALIGNMENT, TRIT_HEADER_BYTES, TRIT_MAGIC, TRIT_PACKAGE_MAJOR,
+    TritBlob, TritBlobInfo, TritBlobKind, TritBlobSize, TritBlobVisitError, TritPackage,
+    TritPackageError, TritPackageReadError, TritPackageReadLimits, TritPackageReader,
+    TritPackageSizeBounds, TritPackageWriteError, TritSpoolBlob, read_trit_package,
+    read_trit_package_with_manifest_limit, trit_package_size_bounds, write_trit_package,
+    write_trit_package_bounded, write_trit_package_from_spool, write_trit_package_to,
+};
 
 /// Weights per quantization block (ggml `QK_K`).
 pub const QK_K: usize = 256;

@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ModelLoaded",
+  "description": "A successful shared text-load observation, not a qualification verdict.\n\nEmitted only after tokenizer, weights, coverage/vocabulary and runner\nconstruction succeed. It describes the initial load, not future mutable\nweights/runner state, full physical memory, model quality or release approval.",
+  "type": "object",
+  "properties": {
+    "architecture": {
+      "description": "Architecture admitted by the shared model builder.",
+      "type": "string"
+    },
+    "backend": {
+      "description": "Logical execution adapter label, not a capability inferred from its name.",
+      "type": "string"
+    },
+    "layer_count": {
+      "description": "Loaded standard transformer layer count.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "physical_device": {
+      "description": "Backend-reported device label; may be unknown rather than a GPU UUID.",
+      "type": "string"
+    },
+    "source": {
+      "description": "Checked package binding, or explicitly unavailable HF identity.",
+      "$ref": "#/$defs/LoadedSourceIdentity"
+    },
+    "vocab_size": {
+      "description": "Loaded embedding vocabulary rows, after tokenizer ID validation.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "source",
+    "architecture",
+    "backend",
+    "physical_device",
+    "vocab_size",
+    "layer_count"
+  ],
+  "$defs": {
+    "LoadedSourceIdentity": {
+      "description": "Initial source identity bound by the actual shared text loader.\n\nDoes not resolve legacy IDs or verify fitting provenance/quality. Paths are\nnot identities and are deliberately absent from this observation.",
+      "oneOf": [
+        {
+          "description": "Checked experimental typed package and explicit complete level.",
+          "type": "object",
+          "properties": {
+            "Trit": {
+              "type": "object",
+              "properties": {
+                "level": {
+                  "description": "Explicit selected level label; labels are not ModelId preimage data.",
+                  "type": "string"
+                },
+                "model_id": {
+                  "description": "Candidate logical identity calculated by the validated reader.",
+                  "$ref": "#/$defs/ModelId"
+                },
+                "package_id": {
+                  "description": "Exact physical package bytes, not logical model content.",
+                  "$ref": "#/$defs/PackageId"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "package_id",
+                "model_id",
+                "level"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Trit"
+          ]
+        },
+        {
+          "description": "HF execution is supported, but its semantic content hashing is not yet.",
+          "type": "object",
+          "properties": {
+            "HuggingFace": {
+              "type": "object",
+              "properties": {
+                "reason": {
+                  "description": "Explicit unavailable-identity reason; never a synthetic hash/path ID.",
+                  "$ref": "#/$defs/UnknownReason"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "reason"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "HuggingFace"
+          ]
+        }
+      ]
+    },
+    "ModelId": {
+      "description": "Content identity for one Tritium model level, not its package or provenance.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "PackageId": {
+      "description": "Content identity for a Tritium package.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "UnknownReason": {
+      "description": "Standardized reason category for an unresolved claim.",
+      "oneOf": [
+        {
+          "description": "The claim has not yet been evaluated.",
+          "type": "string",
+          "const": "NotEvaluated"
+        },
+        {
+          "description": "Required evidence is unavailable.",
+          "type": "string",
+          "const": "MissingEvidence"
+        },
+        {
+          "description": "Required hardware or runtime is unavailable.",
+          "type": "string",
+          "const": "MissingCapability"
+        },
+        {
+          "description": "Independent review is still required.",
+          "type": "string",
+          "const": "AwaitingIndependentReview"
+        },
+        {
+          "description": "The producer supplied a reason not represented by a standard code.",
+          "type": "string",
+          "const": "Other"
+        }
+      ]
+    }
+  }
+}

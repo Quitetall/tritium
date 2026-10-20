@@ -14,6 +14,8 @@ use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, MpGemm, TernaryBacken
 
 use crate::dispatch_catalog::{PORTABLE_DISPATCH_FORMS_V1, portable_shader_source_v1};
 
+mod semantic;
+
 /// Workgroup size for the 1-D flattened-output dispatch (must match the WGSL
 /// `@workgroup_size`).
 const WG_SIZE: u32 = 64;
@@ -338,6 +340,7 @@ impl DeviceBuffer for WgpuBuffer {
 pub struct WgpuBackend {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    semantic: semantic::SemanticExecutor,
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     pointwise_pipeline: wgpu::ComputePipeline,
@@ -368,10 +371,12 @@ pub struct WgpuBackend {
     topk_kd_bind_group_layout: wgpu::BindGroupLayout,
     conv_pipeline: wgpu::ComputePipeline,
     conv_bind_group_layout: wgpu::BindGroupLayout,
-    attention_pipeline: wgpu::ComputePipeline,
+    attention_forward_pipeline: wgpu::ComputePipeline,
+    attention_vjp_pipeline: wgpu::ComputePipeline,
     attention_bind_group_layout: wgpu::BindGroupLayout,
     device_name: String,
     adapter_backend: String,
+    physical_device_id: String,
 }
 
 /// Packed bytes per block for a format this backend supports.
@@ -464,6 +469,10 @@ impl WgpuBackend {
             // Which family actually opened — reported through `capabilities()`, since a
             // hard-coded "vulkan" is a lie the moment the mask admits Metal.
             let adapter_backend = format!("{:?}", info.backend).to_lowercase();
+            let physical_device_id = format!(
+                "wgpu:{adapter_backend}:{:04x}:{:04x}:{}",
+                info.vendor, info.device, info.name
+            );
 
             // Request the adapter's real limits (not the conservative 128 MiB /
             // 65535-workgroup defaults), so production-scale GEMMs are not capped
@@ -980,19 +989,30 @@ impl WgpuBackend {
                 bind_group_layouts: &[&attention_bind_group_layout],
                 push_constant_ranges: &[],
             });
-            let attention_pipeline =
+            let attention_forward_pipeline =
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("portable-attention-pipe"),
+                    label: Some("portable-attention-forward-pipe"),
                     layout: Some(&attention_layout),
                     module: &attention_shader,
-                    entry_point: Some("main"),
+                    entry_point: Some("attention_forward"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
+            let attention_vjp_pipeline =
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("portable-attention-vjp-pipe"),
+                    layout: Some(&attention_layout),
+                    module: &attention_shader,
+                    entry_point: Some("attention_vjp"),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     cache: None,
                 });
 
+            let semantic = semantic::SemanticExecutor::new(&device);
             Ok(WgpuBackend {
                 device,
                 queue,
+                semantic,
                 pipeline,
                 bind_group_layout,
                 pointwise_pipeline,
@@ -1023,10 +1043,12 @@ impl WgpuBackend {
                 topk_kd_bind_group_layout,
                 conv_pipeline,
                 conv_bind_group_layout,
-                attention_pipeline,
+                attention_forward_pipeline,
+                attention_vjp_pipeline,
                 attention_bind_group_layout,
                 device_name,
                 adapter_backend,
+                physical_device_id,
             })
         }
         init().block_on()
@@ -2305,7 +2327,11 @@ impl WgpuBackend {
                 label: Some("portable-attention-pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.attention_pipeline);
+            pass.set_pipeline(if backward {
+                &self.attention_vjp_pipeline
+            } else {
+                &self.attention_forward_pipeline
+            });
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
@@ -3185,8 +3211,39 @@ impl WgpuBackend {
 }
 
 impl TernaryBackend for WgpuBackend {
+    fn tensor_caps(
+        &self,
+        view: tritium_spec::TensorView<'_>,
+    ) -> Result<Option<tritium_spec::TensorCaps>, BackendError> {
+        semantic::SemanticExecutor::caps(self, view)
+    }
+
+    fn upload_tensor(
+        &self,
+        view: tritium_spec::TensorView<'_>,
+    ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        self.semantic.upload(self, view)
+    }
+
+    fn matmul(&self, p: tritium_spec::TensorMatmul<'_>) -> Result<(), BackendError> {
+        self.semantic.matmul(self, p)
+    }
+
+    fn embed_rows(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        ids: &[usize],
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        self.semantic.embed(self, tensor, ids, out)
+    }
+
     fn device_id(&self) -> &str {
         "wgpu"
+    }
+
+    fn physical_device_id(&self) -> &str {
+        &self.physical_device_id
     }
 
     fn capabilities(&self) -> DeviceCaps {

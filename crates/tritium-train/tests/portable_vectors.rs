@@ -2,11 +2,23 @@
 
 use tritium_spec::{
     TrainBackendError, TrainBackendV1, TrainCapabilitiesV1, TrainDTypeV1, TrainOutputV1,
-    TrainReceiptV1, TrainRequestV1, TrainingOpManifestV3, TrainingVectorSetV3,
-    train_output_digest_v1, train_request_digest_v1,
+    TrainReceiptV1, TrainRequestV1, TrainingOpManifestV2, TrainingOpManifestV3,
+    TrainingVectorSetV2, TrainingVectorSetV3, train_output_digest_v1, train_request_digest_v1,
 };
 use tritium_testkit::{TrainingVectorFailureReason, run_training_conformance};
-use tritium_train::CpuTrainBackendV1;
+use tritium_train::{CpuTrainBackendV1, CpuTrainBackendV2};
+
+#[test]
+fn canonical_v2_vectors_pass_on_cpu() {
+    let vectors = TrainingVectorSetV2::parse_json(TrainingVectorSetV2::canonical_json()).unwrap();
+    let backend = CpuTrainBackendV2::new();
+    let report = run_training_conformance(&backend, &vectors);
+    assert!(report.is_ok(), "{:#?}", report.failed);
+    assert_eq!(report.passed.len(), 117);
+    let capabilities = backend.capabilities();
+    assert_eq!(capabilities.manifest_digest, TrainingOpManifestV2::digest());
+    assert_eq!(capabilities.supported_operations.len(), 36);
+}
 
 #[test]
 fn canonical_v3_vectors_cover_hestia_on_cpu() {

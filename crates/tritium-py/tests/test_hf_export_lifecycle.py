@@ -19,7 +19,7 @@ def _qualify(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         lifecycle,
         "_installed_distribution",
-        lambda: ("1.1.0rc0", Path(tritium.__file__).resolve()),
+        lambda **_kwargs: ("1.1.0rc0", Path(tritium.__file__).resolve()),
     )
     output = tmp_path / "evidence"
     receipt = lifecycle.qualify_hf_export(

@@ -77,10 +77,7 @@ function freezeState(state: OwnedState): PortableCheckpointStateV1 {
       state.leaves.map((leaf) =>
         Object.freeze(
           Object.fromEntries(
-            Object.entries(leaf).map(([name, values]) => [
-              name,
-              Object.freeze(Array.from(values)),
-            ]),
+            Object.entries(leaf).map(([name, values]) => [name, Object.freeze(Array.from(values))]),
           ),
         ),
       ),
@@ -90,9 +87,7 @@ function freezeState(state: OwnedState): PortableCheckpointStateV1 {
 
 async function snapshotSource(source: PortableWasmSourceV1): Promise<ArrayBuffer> {
   const bytes = await snapshotPortableWasmSource(source);
-  return bytes.buffer.slice(
-    bytes.byteOffset, bytes.byteOffset + bytes.byteLength,
-  ) as ArrayBuffer;
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
 }
 
 function requireSuccess(
@@ -218,9 +213,10 @@ export class PortableWasmLifecycleState {
         throw new PortableWasmLifecycleError("invalid_state", "options must be an object");
       }
       const keys = Object.keys(options).sort();
-      const expected = options.physicalDevice === undefined
-        ? ["source", "state"]
-        : ["physicalDevice", "source", "state"];
+      const expected =
+        options.physicalDevice === undefined
+          ? ["source", "state"]
+          : ["physicalDevice", "source", "state"];
       if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
         throw new PortableWasmLifecycleError(
           "invalid_state",
@@ -229,10 +225,7 @@ export class PortableWasmLifecycleState {
       }
       const physicalDevice = options.physicalDevice ?? "wasm32:browser";
       if (typeof physicalDevice !== "string" || physicalDevice.length === 0) {
-        throw new PortableWasmLifecycleError(
-          "invalid_state",
-          "physicalDevice must be nonempty",
-        );
+        throw new PortableWasmLifecycleError("invalid_state", "physicalDevice must be nonempty");
       }
       compilePortableCheckpointRequest(options.state, physicalDevice);
       const owned = copyState(options.state);
@@ -299,10 +292,7 @@ export class PortableWasmLifecycleState {
   async resume(checkpoint: Uint8Array): Promise<PortableTrainingReceiptV1> {
     return this.#exclusive(async () => {
       if (!(checkpoint instanceof Uint8Array)) {
-        throw new PortableWasmLifecycleError(
-          "invalid_state",
-          "checkpoint must be a Uint8Array",
-        );
+        throw new PortableWasmLifecycleError("invalid_state", "checkpoint must be a Uint8Array");
       }
       const leafLengths = this.#owned.leaves.map((leaf) => leaf.parameter?.length ?? 0);
       const response = requireSuccess(
@@ -325,10 +315,7 @@ export class PortableWasmLifecycleState {
   async admitExport(packageBytes: Uint8Array): Promise<PortableWasmLifecycleBinaryV1> {
     return this.#exclusive(async () => {
       if (!(packageBytes instanceof Uint8Array)) {
-        throw new PortableWasmLifecycleError(
-          "invalid_state",
-          "SALT package must be a Uint8Array",
-        );
+        throw new PortableWasmLifecycleError("invalid_state", "SALT package must be a Uint8Array");
       }
       const expected = Uint8Array.from(packageBytes);
       const exported = requireSuccess(

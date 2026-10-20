@@ -121,6 +121,8 @@ def source_repo(root: Path):
         if "__file__" in MODULE
         else (Path(__file__).resolve().parents[1] / "qualify-stage7-recipe-freeze.py").read_bytes()
     )
+    helper = repo / "scripts/_qualification_git.py"
+    helper.write_bytes((Path(__file__).resolve().parents[1] / "_qualification_git.py").read_bytes())
     source_vectors = (
         Path(__file__).resolve().parents[2]
         / "crates/tritium-spec/data/training/v3/vectors/v3.json"
@@ -143,6 +145,7 @@ def source_repo(root: Path):
         ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
     ).strip()
     QUALIFIER_GLOBALS["__file__"] = str(qualifier)
+    QUALIFIER_GLOBALS["_GIT_HELPER_PATH"] = helper
     QUALIFIER_GLOBALS["_native_source_identity"] = (
         lambda revision=revision: f"source-git:{revision}"
     )

@@ -193,17 +193,16 @@ def assemble_receipt(
     return receipt
 
 
+_run_git = runpy.run_path(Path(__file__).with_name("_qualification_git.py"))["run_git"]
+
+
 def require_clean_revision(repo: Path, revision: str) -> None:
     try:
-        head = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=repo, text=True, timeout=30
-        ).strip()
-        dirty = subprocess.check_output(
-            ["git", "status", "--porcelain", "--untracked-files=no"],
-            cwd=repo,
-            text=True,
-            timeout=30,
-        ).strip()
+        head = _run_git(repo, "rev-parse", "HEAD", error_type=QualificationError)
+        dirty = _run_git(
+            repo, "status", "--porcelain", "--untracked-files=no",
+            error_type=QualificationError,
+        )
     except (OSError, subprocess.SubprocessError) as error:
         raise QualificationError("cannot verify source revision") from error
     if head != revision or dirty:
@@ -249,6 +248,7 @@ def run_qualification(args: argparse.Namespace) -> dict[str, Any]:
                 "--disable-pip-version-check",
                 "--no-index",
                 "--no-deps",
+                "--force-reinstall",
                 "--only-binary=:all:",
                 str(artifact),
             ],
@@ -280,6 +280,12 @@ def run_qualification(args: argparse.Namespace) -> dict[str, Any]:
                 str(fragment_path),
                 "--checkpoint",
                 str(checkpoint),
+                "--wheel",
+                str(artifact),
+                "--source-revision",
+                args.source_revision,
+                "--release",
+                args.release,
             ]
             completed = subprocess.run(
                 command,

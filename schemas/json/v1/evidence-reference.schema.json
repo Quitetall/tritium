@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EvidenceReference",
+  "description": "Evidence ancestry reference, not a self-approved quality/release verdict.",
+  "type": "object",
+  "properties": {
+    "root": {
+      "description": "BLAKE3 evidence root, not a blob id or package digest.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "run": {
+      "description": "Run identity of the evidence producer.",
+      "type": "string"
+    },
+    "span": {
+      "description": "Evidence span within that run.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "run",
+    "span",
+    "root"
+  ]
+}

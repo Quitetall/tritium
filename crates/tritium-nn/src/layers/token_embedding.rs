@@ -1,23 +1,24 @@
-//! Dense, host-packed, or CUDA-resident token table shared by embedding gather
+//! Dense, shared backend, host-packed, or CUDA-resident token table shared by embedding gather
 //! and a tied LM head.
 
 use core::mem::size_of;
 use std::sync::Arc;
 
 use rayon::prelude::*;
-use tritium_format::PackedSaltRow;
+use tritium_format::{PackedSaltRow, salt_v2_package::SaltV2ScaleUpdate};
 use tritium_spec::TernaryBackend;
 use tritium_train::ops::ste::{fast_hadamard, group_is_rotatable};
 
 use crate::error::NnError;
-use crate::layers::HostSaltV2Linear;
 use crate::layers::packed_salt::PackedSaltMatrix;
 #[cfg(feature = "cuda")]
 use crate::layers::projection::{salt_v2_cuda_backend, salt_v2_forward_exact};
+use crate::layers::{HostSaltV2Linear, Linear};
 
 #[derive(Clone, Debug)]
 enum Storage {
     Dense(Vec<f32>),
+    Tensor(Linear),
     Salt(PackedSaltMatrix),
     HostSaltV2(Arc<HostSaltV2Linear>),
     #[cfg(feature = "cuda")]
@@ -30,6 +31,8 @@ enum Storage {
 /// host-packed matrix or one physically encoded CUDA allocation; gather and
 /// unembedding execute against that same storage, so tying never creates a second
 /// `vocab × hidden` allocation.
+/// Shared backend tensors also retain one admitted handle; capability reporting
+/// distinguishes native execution from dense emulation without host readback.
 #[derive(Clone, Debug)]
 pub struct TokenEmbedding {
     rows: usize,
@@ -58,6 +61,82 @@ fn rotate_row(row: &mut [f32], group: usize) {
 }
 
 impl TokenEmbedding {
+    #[cfg(feature = "tokenizer")]
+    pub(crate) fn shared_linear(&self) -> Option<&Linear> {
+        match &self.storage {
+            Storage::Tensor(linear) => Some(linear),
+            _ => None,
+        }
+    }
+    /// Share an admitted backend tensor between gather and the tied output head.
+    /// Geometry and basis were validated at upload; cloning shares its budget lease.
+    #[must_use]
+    pub fn from_linear(tensor: Linear) -> Self {
+        Self {
+            rows: tensor.n_out(),
+            cols: tensor.k_in(),
+            rotation: None,
+            storage: Storage::Tensor(tensor),
+        }
+    }
+
+    /// Upload capability for shared tensors, including an explicit emulated tier.
+    /// This declaration is not a physical-memory or performance verdict.
+    #[must_use]
+    pub fn tensor_caps(&self) -> Option<tritium_spec::TensorCaps> {
+        match &self.storage {
+            Storage::Tensor(tensor) => Some(tensor.tensor_caps()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn salt_v2_tensor_index(&self) -> Option<usize> {
+        match &self.storage {
+            Storage::HostSaltV2(matrix) => Some(matrix.tensor_index()),
+            #[cfg(feature = "cuda")]
+            Storage::SaltV2(matrix) => matrix.tensor_index(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn apply_salt_v2_scale_updates(
+        &mut self,
+        tensor_index: usize,
+        updates: &[SaltV2ScaleUpdate],
+    ) -> Result<bool, NnError> {
+        match &mut self.storage {
+            Storage::HostSaltV2(matrix) => {
+                if matrix.tensor_index() != tensor_index {
+                    return Ok(false);
+                }
+                Arc::get_mut(matrix)
+                    .ok_or_else(|| {
+                        NnError::Backend(
+                            "cannot update shared host SALT V2 embedding scales in place".into(),
+                        )
+                    })?
+                    .apply_scale_updates(tensor_index, updates)?;
+                Ok(true)
+            }
+            #[cfg(feature = "cuda")]
+            Storage::SaltV2(matrix) => {
+                if matrix.tensor_index() != Some(tensor_index) {
+                    return Ok(false);
+                }
+                Arc::get_mut(matrix)
+                    .ok_or_else(|| {
+                        NnError::Backend(
+                            "cannot update shared CUDA SALT V2 embedding scales in place".into(),
+                        )
+                    })?
+                    .apply_scale_updates(tensor_index, updates)
+                    .map_err(|error| NnError::Backend(error.to_string()))?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// Build a token table around compact host SALT V2 storage.
     ///
     /// # Errors
@@ -190,9 +269,19 @@ impl TokenEmbedding {
     pub fn as_dense(&self) -> Option<&[f32]> {
         match &self.storage {
             Storage::Dense(values) => Some(values),
-            Storage::Salt(_) | Storage::HostSaltV2(_) => None,
+            Storage::Tensor(_) | Storage::Salt(_) | Storage::HostSaltV2(_) => None,
             #[cfg(feature = "cuda")]
             Storage::SaltV2(_) => None,
+        }
+    }
+
+    /// Move an already dense table into calibration masters without cloning it.
+    pub(crate) fn into_dense(self) -> Result<Vec<f32>, NnError> {
+        match self.storage {
+            Storage::Dense(values) => Ok(values),
+            _ => Err(NnError::Backend(
+                "calibration requires an original dense token table".into(),
+            )),
         }
     }
 
@@ -200,13 +289,15 @@ impl TokenEmbedding {
     ///
     /// The historical method name covers both host-packed SALT V1 rows and a
     /// physically encoded resident SALT V2 tensor.
+    /// Shared backend tensors use [`Self::tensor_caps`] instead: native does not
+    /// necessarily mean packed, and emulation can retain dense weights.
     #[must_use]
     pub const fn is_packed_salt(&self) -> bool {
         match self.storage {
             Storage::Salt(_) | Storage::HostSaltV2(_) => true,
             #[cfg(feature = "cuda")]
             Storage::SaltV2(_) => true,
-            Storage::Dense(_) => false,
+            Storage::Dense(_) | Storage::Tensor(_) => false,
         }
     }
 
@@ -215,7 +306,7 @@ impl TokenEmbedding {
     #[must_use]
     pub const fn sparse_plane_count(&self) -> usize {
         match &self.storage {
-            Storage::Dense(_) => 0,
+            Storage::Dense(_) | Storage::Tensor(_) => 0,
             Storage::Salt(matrix) => matrix.sparse_plane_count(),
             Storage::HostSaltV2(_) => 0,
             #[cfg(feature = "cuda")]
@@ -225,10 +316,12 @@ impl TokenEmbedding {
 
     /// Retained payload and metadata bytes, excluding this wrapper.
     /// Cloned packed tables share arenas, so summing this value across clones double-counts them.
+    /// Shared backend tensors report only owned payload, excluding backend overhead.
     #[must_use]
     pub fn resident_bytes(&self) -> usize {
         match &self.storage {
             Storage::Dense(values) => values.capacity().saturating_mul(size_of::<f32>()),
+            Storage::Tensor(tensor) => tensor.payload_bytes(),
             Storage::Salt(matrix) => matrix.resident_bytes(),
             Storage::HostSaltV2(tensor) => tensor.resident_bytes(),
             #[cfg(feature = "cuda")]
@@ -246,6 +339,9 @@ impl TokenEmbedding {
     /// for an out-of-vocabulary token.
     pub fn gather(&self, tokens: &[u32], out: &mut [f32]) -> Result<(), NnError> {
         match &self.storage {
+            Storage::Tensor(_) => Err(NnError::Backend(
+                "backend tensor gather requires gather_with_backend".into(),
+            )),
             Storage::Salt(matrix) => {
                 matrix.gather(tokens, out)?;
                 // The decoded row is `H·w`; the residual stream wants `w`.
@@ -291,7 +387,8 @@ impl TokenEmbedding {
         }
     }
 
-    /// Gather token rows, dispatching resident SALT V2 storage through its owning
+    /// Gather token rows, dispatching shared tensors through the backend contract
+    /// and resident SALT V2 storage through its owning
     /// CUDA backend while retaining the existing host behavior for dense/SALT V1.
     ///
     /// # Errors
@@ -303,9 +400,21 @@ impl TokenEmbedding {
         tokens: &[u32],
         out: &mut [f32],
     ) -> Result<(), NnError> {
-        #[cfg(not(feature = "cuda"))]
-        let _ = backend;
         match &self.storage {
+            Storage::Tensor(tensor) => {
+                let mut ids = Vec::new();
+                ids.try_reserve_exact(tokens.len()).map_err(|error| {
+                    NnError::ResourceExhausted(format!("embedding IDs: {error}"))
+                })?;
+                for &token in tokens {
+                    ids.push(
+                        usize::try_from(token).map_err(|_| {
+                            NnError::MissingTensor(format!("token_embd row {token}"))
+                        })?,
+                    );
+                }
+                tensor.gather(backend, &ids, out)
+            }
             #[cfg(feature = "cuda")]
             Storage::SaltV2(tensor) => {
                 let expected = tokens.len().checked_mul(self.cols).ok_or(NnError::Shape {
@@ -357,6 +466,9 @@ impl TokenEmbedding {
             });
         }
         match &self.storage {
+            Storage::Tensor(_) => Err(NnError::Backend(
+                "backend tensor unembedding requires unembed_exact_with_backend".into(),
+            )),
             Storage::Salt(matrix) => match self.rotation {
                 // `(H·c)·h = c·(H·h)` — move the Hadamard onto the activation rather than
                 // reconstructing `vocab` rows just to turn them back.
@@ -387,7 +499,7 @@ impl TokenEmbedding {
         }
     }
 
-    /// Compute tied-head logits, dispatching resident SALT V2 storage through
+    /// Compute tied-head logits through the shared tensor contract, or resident SALT V2 through
     /// the same exact CUDA projection path used by [`Projection::SaltV2`](super::Projection).
     ///
     /// # Errors
@@ -399,9 +511,8 @@ impl TokenEmbedding {
         hidden: &[f32],
         logits: &mut [f32],
     ) -> Result<(), NnError> {
-        #[cfg(not(feature = "cuda"))]
-        let _ = backend;
         match &self.storage {
+            Storage::Tensor(tensor) => tensor.forward(backend, hidden, 1, logits),
             #[cfg(feature = "cuda")]
             Storage::SaltV2(tensor) => salt_v2_forward_exact(backend, tensor, hidden, 1, logits),
             Storage::Dense(_) | Storage::Salt(_) | Storage::HostSaltV2(_) => {

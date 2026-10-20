@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "QuantSourceBinding",
+  "description": "Actual original raw tensor-byte binding computed by the engine itself.",
+  "type": "object",
+  "properties": {
+    "content": {
+      "description": "BLAKE3 of exact original raw bytes; not original container/HF identity.",
+      "$ref": "#/$defs/BlobId"
+    },
+    "source": {
+      "description": "Original interpretation, not fitted layout.",
+      "$ref": "#/$defs/QuantSourceTensor"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "source",
+    "content"
+  ],
+  "$defs": {
+    "BlobId": {
+      "description": "Content identity for stored tensor or asset bytes.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "QuantSourceTensor": {
+      "description": "Original tensor interpretation, never an adapter-supplied content hash.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Exact logical tensor name.",
+          "type": "string"
+        },
+        "precision": {
+          "description": "Original stored float precision, before widening or fitting.",
+          "$ref": "#/$defs/ScalePrecision"
+        },
+        "shape": {
+          "description": "Positive row-major dimensions in the original source.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "shape",
+        "precision"
+      ]
+    },
+    "ScalePrecision": {
+      "description": "Precision used to store additive plane scales.",
+      "oneOf": [
+        {
+          "description": "IEEE binary16.",
+          "type": "string",
+          "const": "F16"
+        },
+        {
+          "description": "Brain floating-point 16-bit.",
+          "type": "string",
+          "const": "Bf16"
+        },
+        {
+          "description": "IEEE binary32.",
+          "type": "string",
+          "const": "F32"
+        }
+      ]
+    }
+  }
+}

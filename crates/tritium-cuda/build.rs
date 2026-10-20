@@ -54,6 +54,7 @@ fn main() {
     // The Gated DeltaNet recurrent step. Same `--fmad=false` host-bit-match
     // discipline as the decode kernels: the host reduction is the reference.
     println!("cargo:rerun-if-changed=kernels/qwen35_deltanet.cu");
+    println!("cargo:rerun-if-changed=kernels/semantic_additive.cu");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
@@ -81,6 +82,7 @@ fn main() {
             "train_grad.ptx",
             "salt_v2.ptx",
             "qwen35_deltanet.ptx",
+            "semantic_additive.ptx",
         ] {
             std::fs::write(out_dir.join(ptx), "")
                 .expect("tritium-cuda: failed to write check-only placeholder PTX");
@@ -170,6 +172,13 @@ fn main() {
         &nvcc,
         Path::new("kernels/qwen35_deltanet.cu"),
         &out_dir.join("qwen35_deltanet.ptx"),
+        add_min_arch,
+        &["--fmad=false"],
+    );
+    compile_ptx(
+        &nvcc,
+        Path::new("kernels/semantic_additive.cu"),
+        &out_dir.join("semantic_additive.ptx"),
         add_min_arch,
         &["--fmad=false"],
     );

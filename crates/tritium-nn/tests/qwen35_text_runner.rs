@@ -1,15 +1,28 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    cell::Cell,
+    io::Cursor,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
+use half::f16;
 use tritium_core::{GemmShape, TernaryFormat, Trit};
+use tritium_format::{
+    salt_v2::SaltV2Codec,
+    salt_v2_package::{
+        SaltV2Package, SaltV2PackageReader, SaltV2Plane, SaltV2ScaleUpdate, SaltV2Tensor,
+        SaltV2Tile, write_salt_v2_package,
+    },
+};
 use tritium_nn::{
-    DenseLinear, NnError, Projection, Qwen35DeltaNetConfig, Qwen35DeltaNetWeights, Qwen35Dtype,
-    Qwen35FullAttentionConfig, Qwen35FullAttentionWeights, Qwen35LayerType, Qwen35MtpConfig,
-    Qwen35NormWeightSemantics, Qwen35OutputGate, Qwen35RopeConfig, Qwen35RopeType,
-    Qwen35TextConfig, Qwen35TextLayerWeights, Qwen35TextMixerWeights, Qwen35TextRunner,
-    Qwen35TextWeights, SwiGluMlp, TernaryLinear, TokenEmbedding,
+    DenseLinear, HostSaltV2Linear, NnError, Projection, Qwen35DeltaNetConfig,
+    Qwen35DeltaNetWeights, Qwen35Dtype, Qwen35FullAttentionConfig, Qwen35FullAttentionWeights,
+    Qwen35LayerType, Qwen35MtpConfig, Qwen35NormWeightSemantics, Qwen35OutputGate,
+    Qwen35RopeConfig, Qwen35RopeType, Qwen35TextConfig, Qwen35TextLayerWeights,
+    Qwen35TextMixerWeights, Qwen35TextRunner, Qwen35TextWeights, SwiGluMlp, TernaryLinear,
+    TokenEmbedding,
 };
 use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, MpGemm, TernaryBackend};
 
@@ -178,6 +191,427 @@ fn exact_runner() -> Qwen35TextRunner {
         Box::new(tritium_cpu::CpuBackend::new()),
     )
     .unwrap()
+}
+
+fn assert_float_bits(actual: &[f32], expected: &[f32]) {
+    assert_eq!(
+        actual
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    );
+}
+
+fn exercise_cancellable_forward(runner: Qwen35TextRunner, continuation: bool) {
+    let seed: &[u32] = if continuation { &[1, 4, 2] } else { &[] };
+    let tokens: &[u32] = if continuation { &[6] } else { &[1, 4, 2] };
+    let seed_cache = || {
+        let mut cache = runner.new_cache(8).unwrap();
+        if !seed.is_empty() {
+            runner.forward(seed, &mut cache).unwrap();
+        }
+        cache
+    };
+    let mut ordinary = seed_cache();
+    let expected = runner.forward(tokens, &mut ordinary).unwrap();
+    let mut counted = seed_cache();
+    let checks = Cell::new(0);
+    let actual = runner
+        .forward_cancellable(tokens, &mut counted, &|| {
+            checks.set(checks.get() + 1);
+            false
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_float_bits(actual.final_hidden_states(), expected.final_hidden_states());
+    assert_float_bits(actual.last_logits(), expected.last_logits());
+    assert!(
+        checks.get() >= 4,
+        "native phases need cooperative checkpoints"
+    );
+    for cancel_at in 1..=checks.get() {
+        let mut cache = seed_cache();
+        let before = if continuation {
+            Some(runner.reference_states(&cache, 4096).unwrap())
+        } else {
+            None
+        };
+        let count = Cell::new(0);
+        let output = runner
+            .forward_cancellable(tokens, &mut cache, &|| {
+                count.set(count.get() + 1);
+                count.get() == cancel_at
+            })
+            .unwrap();
+        assert!(
+            output.is_none(),
+            "checkpoint {cancel_at} ignored cancellation"
+        );
+        assert_eq!(
+            cache.len(),
+            seed.len(),
+            "checkpoint {cancel_at} committed KV"
+        );
+        if let Some(before) = before {
+            let after = runner.reference_states(&cache, 4096).unwrap();
+            assert_eq!(after, before);
+            for (actual, expected) in after.iter().zip(&before) {
+                assert_float_bits(actual.values(), expected.values());
+            }
+        }
+        let recovered = runner.forward(tokens, &mut cache).unwrap();
+        assert_eq!(
+            recovered, expected,
+            "checkpoint {cancel_at} left stale state"
+        );
+        assert_float_bits(
+            recovered.final_hidden_states(),
+            expected.final_hidden_states(),
+        );
+        assert_float_bits(recovered.last_logits(), expected.last_logits());
+    }
+}
+
+#[test]
+fn cancellable_forward_rolls_back_every_prefill_checkpoint() {
+    exercise_cancellable_forward(exact_runner(), false);
+    exercise_cancellable_forward(runner_with_host_qkv(), false);
+}
+
+#[test]
+fn cancellable_forward_preserves_committed_hybrid_state_and_recovers() {
+    exercise_cancellable_forward(exact_runner(), true);
+    exercise_cancellable_forward(runner_with_host_qkv(), true);
+}
+
+#[test]
+fn cancellable_forward_keeps_runtime_errors_distinct_from_cancellation() {
+    let runner = exact_runner();
+    let mut cache = runner.new_cache(8).unwrap();
+    assert!(matches!(
+        runner.forward_cancellable(&[], &mut cache, &|| false),
+        Err(NnError::Shape { .. })
+    ));
+    assert!(matches!(
+        runner.forward_cancellable(&[V as u32], &mut cache, &|| false),
+        Err(NnError::MissingTensor(_))
+    ));
+    assert!(
+        runner
+            .forward_cancellable(&[1], &mut cache, &|| true)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(cache.len(), 0);
+}
+
+#[test]
+fn reference_states_preserve_hybrid_layout_and_owned_prefill() {
+    let runner = exact_runner();
+    let mut cache = runner.new_cache(8).unwrap();
+    runner.forward(&[1, 4, 2], &mut cache).unwrap();
+    let states = runner.reference_states(&cache, 256).unwrap();
+    assert_eq!(
+        states.iter().map(|state| state.name()).collect::<Vec<_>>(),
+        [
+            "next_conv.0",
+            "next_recurrent.0",
+            "present_k.1",
+            "present_v.1"
+        ]
+    );
+    assert_eq!(
+        states
+            .iter()
+            .map(|state| state.shape().to_vec())
+            .collect::<Vec<_>>(),
+        [vec![8, 4], vec![2, 2, 2], vec![3, 1, 4], vec![3, 1, 4]]
+    );
+    assert_eq!(
+        states
+            .iter()
+            .map(|state| state.values().len())
+            .sum::<usize>(),
+        64
+    );
+    assert!(
+        states
+            .iter()
+            .flat_map(|state| state.values())
+            .all(|v| v.is_finite())
+    );
+    let frozen = states.clone();
+    runner.forward(&[6], &mut cache).unwrap();
+    let decoded = runner.reference_states(&cache, 288).unwrap();
+    assert_eq!(decoded[2].shape(), [4, 1, 4]);
+    assert_eq!(decoded[2].values()[..12], states[2].values()[..]);
+    assert_ne!(decoded[0], states[0]);
+    cache.reset();
+    assert_eq!(states, frozen);
+    assert!(runner.reference_states(&cache, 256).is_err());
+}
+
+#[test]
+fn reference_states_enforce_budget_and_exact_runner_provenance() {
+    let runner = exact_runner();
+    let other = exact_runner();
+    let mut cache = runner.new_cache(8).unwrap();
+    assert!(runner.reference_states(&cache, 256).is_err());
+    runner.forward(&[1, 4, 2], &mut cache).unwrap();
+    for budget in [0, 255, 268_435_457] {
+        assert!(runner.reference_states(&cache, budget).is_err());
+    }
+    assert!(matches!(
+        other.reference_states(&cache, 256),
+        Err(NnError::Provenance(_))
+    ));
+    assert_eq!(cache.len(), 3);
+    let retry = runner.reference_states(&cache, 256).unwrap();
+    assert_eq!(runner.reference_states(&cache, 256).unwrap(), retry);
+}
+
+fn runner_with_host_qkv() -> Qwen35TextRunner {
+    let tensor = SaltV2Tensor::new(
+        "qkv",
+        vec![8, H as u64],
+        vec![
+            SaltV2Tile::new(vec![
+                SaltV2Plane::new(vec![1; 8 * H], vec![f16::ONE]).unwrap(),
+            ])
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let package = SaltV2Package::new(SaltV2Codec::D2, vec![tensor]).unwrap();
+    let encoded = write_salt_v2_package(&package).unwrap();
+    let mut reader = SaltV2PackageReader::new_strict(Cursor::new(encoded.bytes)).unwrap();
+    let host_qkv = Projection::HostSaltV2(Arc::new(
+        HostSaltV2Linear::from_reader(&mut reader, "qkv").unwrap(),
+    ));
+    runner_with_salt_qkv(host_qkv, Box::new(tritium_cpu::CpuBackend::new()))
+}
+
+fn runner_with_salt_qkv(qkv: Projection, backend: Box<dyn TernaryBackend>) -> Qwen35TextRunner {
+    let weights = Qwen35TextWeights::new(
+        TokenEmbedding::from_dense(parameter(0, V * H), V, H).unwrap(),
+        vec![
+            Qwen35TextLayerWeights::new(
+                parameter(13, H),
+                Qwen35TextMixerWeights::DeltaNet(Qwen35DeltaNetWeights::new(
+                    qkv,
+                    dense_exact(7, 4, H),
+                    dense_exact(8, 2, H),
+                    dense_exact(9, 2, H),
+                    dense_exact(5, H, 4),
+                    parameter(3, 8 * 4),
+                    parameter(4, 2),
+                    parameter(1, 2),
+                    parameter(2, 2),
+                )),
+                parameter(14, H),
+                mlp(0, true),
+            ),
+            raw_layer(Qwen35LayerType::FullAttention, 1, true),
+        ],
+        parameter(26, H),
+        dense_exact(27, V, H),
+    );
+    Qwen35TextRunner::new(
+        &config(
+            vec![Qwen35LayerType::DeltaNet, Qwen35LayerType::FullAttention],
+            2,
+        ),
+        weights,
+        backend,
+    )
+    .unwrap()
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_scale_updates_route_by_package_identity_through_qwen_layers() {
+    let cuda = match tritium_cuda::CudaBackend::new(0) {
+        Ok(cuda) => cuda,
+        Err(error) => {
+            eprintln!("skipping Qwen CUDA scale-update routing gate: no device ({error})");
+            return;
+        }
+    };
+    let tensor = SaltV2Tensor::new(
+        "qkv",
+        vec![8, H as u64],
+        vec![
+            SaltV2Tile::new(vec![
+                SaltV2Plane::new(vec![1; 8 * H], vec![f16::ONE]).unwrap(),
+            ])
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let package = SaltV2Package::new(SaltV2Codec::D2, vec![tensor]).unwrap();
+    let encoded = write_salt_v2_package(&package).unwrap();
+    let mut reader = SaltV2PackageReader::new_strict(Cursor::new(encoded.bytes)).unwrap();
+    let resident = cuda.upload_salt_v2_from_reader(&mut reader, "qkv").unwrap();
+    assert_eq!(resident.tensor_index(), Some(0));
+    let mut runner = runner_with_salt_qkv(Projection::SaltV2(Arc::new(resident)), Box::new(cuda));
+
+    let before = runner
+        .forward(&[1, 2], &mut runner.new_cache(8).unwrap())
+        .unwrap();
+    let wrong = SaltV2ScaleUpdate::new(1, 0, 0, vec![f16::from_f32(2.0)]).unwrap();
+    assert!(
+        runner
+            .apply_salt_v2_scale_updates(std::slice::from_ref(&wrong))
+            .is_err()
+    );
+    let update = SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::from_f32(2.0)]).unwrap();
+    runner
+        .apply_salt_v2_scale_updates(std::slice::from_ref(&update))
+        .unwrap();
+    let after = runner
+        .forward(&[1, 2], &mut runner.new_cache(8).unwrap())
+        .unwrap();
+    assert_ne!(before.final_hidden_states(), after.final_hidden_states());
+
+    let erasing = SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::ZERO]).unwrap();
+    assert!(
+        runner
+            .apply_salt_v2_scale_updates(std::slice::from_ref(&erasing))
+            .is_err()
+    );
+    let after_rejection = runner
+        .forward(&[1, 2], &mut runner.new_cache(8).unwrap())
+        .unwrap();
+    assert_eq!(
+        after.final_hidden_states(),
+        after_rejection.final_hidden_states()
+    );
+}
+
+#[test]
+fn scale_updates_route_by_package_tensor_identity_through_qwen_layers() {
+    let mut runner = runner_with_host_qkv();
+    let wrong_tensor = SaltV2ScaleUpdate::new(1, 0, 0, vec![f16::from_f32(2.0)]).unwrap();
+    assert!(
+        runner
+            .apply_salt_v2_scale_updates(std::slice::from_ref(&wrong_tensor))
+            .is_err()
+    );
+
+    let before = runner
+        .forward(&[1, 2], &mut runner.new_cache(8).unwrap())
+        .unwrap();
+    let update = SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::from_f32(2.0)]).unwrap();
+    runner
+        .apply_salt_v2_scale_updates(std::slice::from_ref(&update))
+        .unwrap();
+    let after = runner
+        .forward(&[1, 2], &mut runner.new_cache(8).unwrap())
+        .unwrap();
+    assert_ne!(before.final_hidden_states(), after.final_hidden_states());
+
+    let erasing_update = SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::ZERO]).unwrap();
+    assert!(
+        runner
+            .apply_salt_v2_scale_updates(std::slice::from_ref(&erasing_update))
+            .is_err()
+    );
+    let after_rejection = runner
+        .forward(&[1, 2], &mut runner.new_cache(8).unwrap())
+        .unwrap();
+    assert_eq!(
+        after.final_hidden_states(),
+        after_rejection.final_hidden_states()
+    );
+
+    let mixed_tensor_updates = [
+        SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::ONE]).unwrap(),
+        SaltV2ScaleUpdate::new(1, 0, 0, vec![f16::ONE]).unwrap(),
+    ];
+    assert!(
+        runner
+            .apply_salt_v2_scale_updates(&mixed_tensor_updates)
+            .is_err()
+    );
+}
+
+#[test]
+fn successful_scale_update_rejects_previous_cache_and_output_weight_state() {
+    let mut runner = runner_with_host_qkv();
+    let mut cache = runner.new_cache(8).unwrap();
+    let output = runner.forward(&[1, 2], &mut cache).unwrap();
+    let update = SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::from_f32(2.0)]).unwrap();
+    runner
+        .apply_salt_v2_scale_updates(std::slice::from_ref(&update))
+        .unwrap();
+
+    let rejected = runner.forward(&[3], &mut cache);
+    assert!(
+        matches!(rejected, Err(NnError::Backend(message)) if message.contains("different runner"))
+    );
+    assert_eq!(cache.len(), 2);
+    assert!(matches!(
+        runner.reference_states(&cache, 1024),
+        Err(NnError::Provenance(_))
+    ));
+    assert!(matches!(
+        runner.logits_for_row(&output, 0),
+        Err(NnError::Provenance(_))
+    ));
+    cache.reset();
+    assert!(matches!(
+        runner.forward(&[1], &mut cache),
+        Err(NnError::Backend(message)) if message.contains("different runner")
+    ));
+
+    let mut fresh = runner.new_cache(8).unwrap();
+    let updated = runner.forward(&[1, 2], &mut fresh).unwrap();
+    assert_ne!(output.final_hidden_states(), updated.final_hidden_states());
+    assert!(runner.reference_states(&fresh, 1024).is_ok());
+    assert!(runner.logits_for_row(&updated, 0).is_ok());
+}
+
+#[test]
+fn rejected_scale_updates_preserve_cache_and_output_weight_state() {
+    let mut runner = runner_with_host_qkv();
+    let mut cache = runner.new_cache(8).unwrap();
+    let output = runner.forward(&[1, 2], &mut cache).unwrap();
+    for update in [
+        SaltV2ScaleUpdate::new(1, 0, 0, vec![f16::ONE]).unwrap(),
+        SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::ZERO]).unwrap(),
+    ] {
+        assert!(runner.apply_salt_v2_scale_updates(&[update]).is_err());
+        assert!(runner.reference_states(&cache, 1024).is_ok());
+        assert!(runner.logits_for_row(&output, 0).is_ok());
+    }
+    runner.forward(&[3], &mut cache).unwrap();
+    assert_eq!(cache.len(), 3);
+}
+
+#[test]
+fn successful_identical_scale_update_also_starts_a_new_weight_state() {
+    let mut runner = runner_with_host_qkv();
+    let mut cache = runner.new_cache(8).unwrap();
+    let before = runner.forward(&[1, 2], &mut cache).unwrap();
+    let update = SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::ONE]).unwrap();
+    runner.apply_salt_v2_scale_updates(&[update]).unwrap();
+    assert!(matches!(
+        runner.logits_for_row(&before, 0),
+        Err(NnError::Provenance(_))
+    ));
+    assert!(matches!(
+        runner.forward(&[3], &mut cache),
+        Err(NnError::Backend(message)) if message.contains("different runner")
+    ));
+    let after = runner
+        .forward(&[1, 2], &mut runner.new_cache(8).unwrap())
+        .unwrap();
+    assert_eq!(before.final_hidden_states(), after.final_hidden_states());
 }
 
 fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {

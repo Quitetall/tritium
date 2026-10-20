@@ -122,18 +122,26 @@ JSON
         # The package's WASM release check requires a clean Git tree. Build an
         # independent temporary repository inside the staged snapshot; never
         # call git worktree while the caller's commit index is locked.
-        git -C "$staged_snapshot" init --quiet
-        printf '%s\n' 'packages/tritium-web/node_modules' >>"$staged_snapshot/.gitignore"
-        git -C "$staged_snapshot" add -A
-        git -C "$staged_snapshot" \
-            -c user.name=tritium-precommit \
-            -c user.email=precommit@invalid \
-            commit --quiet --no-verify -m "pre-commit staged snapshot"
-        if [ -d "$repo/packages/tritium-web/node_modules" ]; then
-            ln -s "$repo/packages/tritium-web/node_modules" \
-                "$staged_snapshot/packages/tritium-web/node_modules"
-        fi
+        # commit --only supplies a temporary GIT_INDEX_FILE. Git's other local
+        # repository variables can likewise redirect nested test repositories.
+        # Keep those bindings for staged snapshot capture above, but clear them
+        # only inside this independent repository and its package-check children.
+        git_local_env=$(git rev-parse --local-env-vars)
         (
+            for name in $git_local_env; do
+                unset "$name"
+            done
+            git -C "$staged_snapshot" init --quiet
+            printf '%s\n' 'packages/tritium-web/node_modules' >>"$staged_snapshot/.gitignore"
+            git -C "$staged_snapshot" add -A
+            git -C "$staged_snapshot" \
+                -c user.name=tritium-precommit \
+                -c user.email=precommit@invalid \
+                commit --quiet --no-verify -m "pre-commit staged snapshot"
+            if [ -d "$repo/packages/tritium-web/node_modules" ]; then
+                ln -s "$repo/packages/tritium-web/node_modules" \
+                    "$staged_snapshot/packages/tritium-web/node_modules"
+            fi
             cd "$staged_snapshot"
             run npm --prefix packages/tritium-web run check
         )
@@ -158,8 +166,10 @@ run_model_acceptance() {
 # 51 of its 64 cfg(unix) functions still have no `not(unix)` twin, so the class is one ungated
 # caller away from recurring, and NO amount of Linux checking sees it.
 #
-# `cargo check` does not link, so the gnu target needs only mingw for blake3's C build. The msvc
-# target fails earlier for want of an MSVC compiler -- use gnu.
+# Clippy's check-only compilation does not link, so the gnu target needs only mingw for
+# blake3's C build. It also catches Windows-layout-only lints (the typed convert arguments
+# triggered large_enum_variant on Windows while Linux lint and Windows cargo check passed).
+# The msvc target needs an MSVC compiler; native Windows CI remains authoritative.
 verify_workflows() {
     if ! command -v actionlint >/dev/null 2>&1; then
         echo "SKIPPED workflow lint: install actionlint (CI runs it; a push can still go red)" >&2
@@ -188,8 +198,22 @@ verify_non_unix_cfg() {
     fi
     run env CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc \
         AR_x86_64_pc_windows_gnu=x86_64-w64-mingw32-ar \
-        cargo check --locked --workspace --exclude tritium-py --all-targets \
-        --target x86_64-pc-windows-gnu
+        cargo clippy --locked --workspace --exclude tritium-py --all-targets \
+        --target x86_64-pc-windows-gnu -- -D warnings
+}
+
+verify_no_std_foundations() {
+    # Require the bare-metal target (rustup target add thumbv7em-none-eabihf).
+    # Do not silently pass a host-only check that has access to std. This check
+    # proves compilation only, never physical MCU conformance/performance.
+    run cargo check --locked -p tritium-schema -p tritium-core \
+        --no-default-features --lib --target thumbv7em-none-eabihf
+    # Optional serialization must remain no_std too; a host-only feature-unified
+    # build can hide a serde dependency that incorrectly enables std.
+    run cargo check --locked -p tritium-core --no-default-features \
+        --features serde --lib --target thumbv7em-none-eabihf
+    run cargo check --locked -p tritium-core --no-default-features \
+        --features alloc,serde --lib --target thumbv7em-none-eabihf
 }
 
 case "$tier" in
@@ -200,6 +224,9 @@ case "$tier" in
         ;;
     prepush)
         run cargo fmt --all --check
+        run python scripts/generate-api-diff.py --check
+        run cargo run --locked -p tritium-schema --features schema-gen --bin tritium-schema-projections -- --check
+        verify_no_std_foundations
         run cargo clippy --locked --workspace --all-targets -- -D warnings
         # Default features are NOT the shipped surface. Optional deps and cfg-gated modules do not
         # compile above, so a clean default run says nothing about them -- three separate CI
@@ -219,6 +246,9 @@ case "$tier" in
         ;;
     ci)
         run cargo fmt --all --check
+        run python scripts/generate-api-diff.py --check
+        run cargo run --locked -p tritium-schema --features schema-gen --bin tritium-schema-projections -- --check
+        verify_no_std_foundations
         run cargo clippy --locked --workspace --all-targets -- -D warnings
         # tritium-py is a PyO3 cdylib; standalone cargo-test binaries cannot
         # link Python without a development lib. Its shipped surface is gated
@@ -228,9 +258,13 @@ case "$tier" in
         run_model_acceptance
         run python -m unittest discover -s scripts/tests -p 'test_*.py'
         run python scripts/check-community-contract.py --json
+        run ./scripts/check-deployment-manifests
         ;;
     release)
         run cargo fmt --all --check
+        run python scripts/generate-api-diff.py --check
+        run cargo run --locked -p tritium-schema --features schema-gen --bin tritium-schema-projections -- --check
+        verify_no_std_foundations
         # Type-check every feature-gated surface without requiring GPU toolkits.
         run env TRITIUM_CHECK_ONLY=1 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
         run cargo test --locked --workspace --exclude tritium-py --no-fail-fast -- \
@@ -238,6 +272,7 @@ case "$tier" in
         run_model_acceptance
         run python -m unittest discover -s scripts/tests -p 'test_*.py'
         run python scripts/check-community-contract.py --json
+        run ./scripts/check-deployment-manifests
         require_command cargo-deny
         run cargo deny check
         run python scripts/check-release-version.py

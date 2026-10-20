@@ -2,10 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import {
-  TrainingGeometryError,
-  validateTrainingOperationGeometry,
-} from "../src/geometry.ts";
+import { TrainingGeometryError, validateTrainingOperationGeometry } from "../src/geometry.ts";
 
 const corpus = JSON.parse(
   readFileSync(new URL("../../../spec/training/v2/vectors/v2.json", import.meta.url), "utf8"),
@@ -18,16 +15,10 @@ function f32(bits) {
 }
 
 function attribute(item) {
-  const value = item.type === "f32"
-    ? f32(item.bits)
-    : "values" in item
-      ? [...item.values]
-      : item.value;
-  const kind = item.type === "u32_list"
-    ? "u32-list"
-    : item.type === "u64_list"
-      ? "u64-list"
-      : item.type;
+  const value =
+    item.type === "f32" ? f32(item.bits) : "values" in item ? [...item.values] : item.value;
+  const kind =
+    item.type === "u32_list" ? "u32-list" : item.type === "u64_list" ? "u64-list" : item.type;
   return { name: item.name, kind, value };
 }
 
@@ -44,9 +35,9 @@ function tensor(item, index, namespace) {
 function recipeCase(item) {
   const inputs = item.inputs.map((buffer, index) => tensor(buffer, index, "input"));
   const outputs = item.expected.outputs.map((buffer, index) => tensor(buffer, index, "output"));
-  const attributes = item.attributes.map(attribute).map((value) =>
-    value.name === "step" ? { ...value, value: 0 } : value,
-  );
+  const attributes = item.attributes
+    .map(attribute)
+    .map((value) => (value.name === "step" ? { ...value, value: 0 } : value));
   return {
     operation: {
       id: item.case_id,
@@ -85,9 +76,8 @@ test("every operation rejects output geometry drift", () => {
   for (const [operation, item] of representatives) {
     const candidate = recipeCase(item);
     const first = candidate.outputs[0];
-    const changedShape = first.shape.length === 0
-      ? [1]
-      : [first.shape[0] + 1, ...first.shape.slice(1)];
+    const changedShape =
+      first.shape.length === 0 ? [1] : [first.shape[0] + 1, ...first.shape.slice(1)];
     const outputs = [{ ...first, shape: changedShape }, ...candidate.outputs.slice(1)];
     assert.throws(
       () => validateTrainingOperationGeometry(candidate.operation, candidate.inputs, outputs),
@@ -156,12 +146,13 @@ test("stochastic estimator seed is session-bound", () => {
   const seed = candidate.operation.attributes.find((attribute) => attribute.name === "seed").value;
   validateTrainingOperationGeometry(candidate.operation, candidate.inputs, candidate.outputs, seed);
   assert.throws(
-    () => validateTrainingOperationGeometry(
-      candidate.operation,
-      candidate.inputs,
-      candidate.outputs,
-      seed + 1,
-    ),
+    () =>
+      validateTrainingOperationGeometry(
+        candidate.operation,
+        candidate.inputs,
+        candidate.outputs,
+        seed + 1,
+      ),
     TrainingGeometryError,
   );
 });
@@ -170,37 +161,38 @@ test("convolution scratch admits worst forward and reverse phase", () => {
   for (const operationName of ["graph.conv1d", "graph.conv2d"]) {
     const item = successes.find((candidate) => candidate.operation === operationName);
     const candidate = recipeCase(item);
-    const replacements = operationName === "graph.conv1d"
-      ? {
-          batch: 5000,
-          c_in: 1,
-          c_out: 5000,
-          l_in: 1,
-          k: 1,
-          stride: 1,
-          dilation: 1,
-          pad_left: 0,
-          pad_right: 0,
-          groups: 1,
-        }
-      : {
-          batch: 5000,
-          c_in: 1,
-          c_out: 5000,
-          input_h: 1,
-          input_w: 1,
-          kernel_h: 1,
-          kernel_w: 1,
-          stride_h: 1,
-          stride_w: 1,
-          dilation_h: 1,
-          dilation_w: 1,
-          pad_top: 0,
-          pad_bottom: 0,
-          pad_left: 0,
-          pad_right: 0,
-          groups: 1,
-        };
+    const replacements =
+      operationName === "graph.conv1d"
+        ? {
+            batch: 5000,
+            c_in: 1,
+            c_out: 5000,
+            l_in: 1,
+            k: 1,
+            stride: 1,
+            dilation: 1,
+            pad_left: 0,
+            pad_right: 0,
+            groups: 1,
+          }
+        : {
+            batch: 5000,
+            c_in: 1,
+            c_out: 5000,
+            input_h: 1,
+            input_w: 1,
+            kernel_h: 1,
+            kernel_w: 1,
+            stride_h: 1,
+            stride_w: 1,
+            dilation_h: 1,
+            dilation_w: 1,
+            pad_top: 0,
+            pad_bottom: 0,
+            pad_left: 0,
+            pad_right: 0,
+            groups: 1,
+          };
     const operation = {
       ...candidate.operation,
       attributes: candidate.operation.attributes.map((attribute) => ({
@@ -208,21 +200,22 @@ test("convolution scratch admits worst forward and reverse phase", () => {
         value: replacements[attribute.name],
       })),
     };
-    const inputs = operationName === "graph.conv1d"
-      ? candidate.inputs.map((tensor, index) => ({
-          ...tensor,
-          shape: index === 0 ? [5000, 1, 1] : index === 1 ? [5000, 1, 1] : [5000],
-        }))
-      : candidate.inputs.map((tensor, index) => ({
-          ...tensor,
-          shape: index === 0 ? [5000, 1, 1, 1] : index === 1 ? [5000, 1, 1, 1] : [5000],
-        }));
-    const outputs = [{
-      ...candidate.outputs[0],
-      shape: operationName === "graph.conv1d"
-        ? [5000, 5000, 1]
-        : [5000, 5000, 1, 1],
-    }];
+    const inputs =
+      operationName === "graph.conv1d"
+        ? candidate.inputs.map((tensor, index) => ({
+            ...tensor,
+            shape: index === 0 ? [5000, 1, 1] : index === 1 ? [5000, 1, 1] : [5000],
+          }))
+        : candidate.inputs.map((tensor, index) => ({
+            ...tensor,
+            shape: index === 0 ? [5000, 1, 1, 1] : index === 1 ? [5000, 1, 1, 1] : [5000],
+          }));
+    const outputs = [
+      {
+        ...candidate.outputs[0],
+        shape: operationName === "graph.conv1d" ? [5000, 5000, 1] : [5000, 5000, 1, 1],
+      },
+    ];
     assert.throws(
       () => validateTrainingOperationGeometry(operation, inputs, outputs),
       /scratch exceeds 64 MiB/,

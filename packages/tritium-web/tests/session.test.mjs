@@ -10,9 +10,9 @@ import {
   WebTrainingError,
 } from "../dist/index.js";
 
-const operations = parseTrainingManifest(
-  canonicalTrainingManifestJson(),
-).operations.map((operation) => operation.id);
+const operations = parseTrainingManifest(canonicalTrainingManifestJson()).operations.map(
+  (operation) => operation.id,
+);
 
 const SGD_ATTRIBUTES = [
   { name: "step", kind: "u64", value: 0 },
@@ -52,9 +52,27 @@ const model = {
       { id: "loss", dtype: "f32", shape: [], role: "result", aliasOf: null },
     ],
     operations: [
-      { id: "add", operation: "graph.add", inputs: ["x", "weight"], outputs: ["sum"], attributes: [] },
-      { id: "mse", operation: "loss.mse", inputs: ["sum", "target"], outputs: ["loss"], attributes: [] },
-      { id: "sgd", operation: "optimizer.sgd", inputs: ["weight", "grad"], outputs: ["weight"], attributes: SGD_ATTRIBUTES },
+      {
+        id: "add",
+        operation: "graph.add",
+        inputs: ["x", "weight"],
+        outputs: ["sum"],
+        attributes: [],
+      },
+      {
+        id: "mse",
+        operation: "loss.mse",
+        inputs: ["sum", "target"],
+        outputs: ["loss"],
+        attributes: [],
+      },
+      {
+        id: "sgd",
+        operation: "optimizer.sgd",
+        inputs: ["weight", "grad"],
+        outputs: ["weight"],
+        attributes: SGD_ATTRIBUTES,
+      },
     ],
   },
   payload: Buffer.from([1, 2, 3]),
@@ -220,10 +238,10 @@ test("checked session executes the complete lifecycle in order", async () => {
   assert.equal(tied.byteLength, weight.byteLength);
   assert.ok(Object.isFrozen(session.plan));
   assert.ok(Object.isFrozen(session.plan.buffers));
-  assert.deepEqual(
-    session.plan.operations.find((operation) => operation.id === "sgd").inputs,
-    ["weight", "grad"],
-  );
+  assert.deepEqual(session.plan.operations.find((operation) => operation.id === "sgd").inputs, [
+    "weight",
+    "grad",
+  ]);
   assert.deepEqual(
     session.plan.backwardOperations.map((operation) => [
       operation.sourceOperationId,
@@ -243,9 +261,8 @@ test("checked session executes the complete lifecycle in order", async () => {
     "zero",
   );
   assert.equal(
-    session.plan.backwardOperations[1].outputs.find(
-      (binding) => binding.role === "grad_right",
-    ).bufferId,
+    session.plan.backwardOperations[1].outputs.find((binding) => binding.role === "grad_right")
+      .bufferId,
     "grad",
   );
 
@@ -273,10 +290,7 @@ test("checked session executes the complete lifecycle in order", async () => {
   await session.dispose();
   await session.dispose();
   assert.equal(session.state, "disposed");
-  await rejectsCode(
-    session.forward(batch()),
-    "disposed",
-  );
+  await rejectsCode(session.forward(batch()), "disposed");
   assert.equal(adapter.calls.filter((call) => call === "dispose").length, 1);
 });
 
@@ -290,15 +304,10 @@ test("backend policy and manifest coverage fail before adapter preparation", asy
     ...model,
     recipe: {
       ...model.recipe,
-      operations: [
-        { ...model.recipe.operations[0], operation: "graph.not_real" },
-      ],
+      operations: [{ ...model.recipe.operations[0], operation: "graph.not_real" }],
     },
   };
-  await rejectsCode(
-    prepareTraining(badModel, config, adapter),
-    "invalid_schema",
-  );
+  await rejectsCode(prepareTraining(badModel, config, adapter), "invalid_schema");
   assert.deepEqual(adapter.calls, []);
   await rejectsCode(prepareTraining(model, config), "adapter_unavailable");
 
@@ -330,17 +339,19 @@ test("top-k sparse targets reject invalid values before adapter dispatch", async
         },
         { id: "loss", dtype: "f32", shape: [], role: "result", aliasOf: null },
       ],
-      operations: [{
-        id: "topk",
-        operation: "loss.topk_knowledge_distillation",
-        inputs: ["logits", "indices", "probabilities"],
-        outputs: ["loss"],
-        attributes: [
-          { name: "rows", kind: "u64", value: 1 },
-          { name: "cols", kind: "u64", value: 3 },
-          { name: "k", kind: "u64", value: 2 },
-        ],
-      }],
+      operations: [
+        {
+          id: "topk",
+          operation: "loss.topk_knowledge_distillation",
+          inputs: ["logits", "indices", "probabilities"],
+          outputs: ["loss"],
+          attributes: [
+            { name: "rows", kind: "u64", value: 1 },
+            { name: "cols", kind: "u64", value: 3 },
+            { name: "k", kind: "u64", value: 2 },
+          ],
+        },
+      ],
     },
     payload: Buffer.from([1]),
   };
@@ -427,11 +438,7 @@ test("structural device-loss errors cross constructor realms", async () => {
 test("required SALT export rejects a recipe without a ternary export target before allocation", async () => {
   const adapter = new MockAdapter();
   await rejectsCode(
-    prepareTraining(
-      model,
-      { ...config, requiredOperations: ["lifecycle.export"] },
-      adapter,
-    ),
+    prepareTraining(model, { ...config, requiredOperations: ["lifecycle.export"] }, adapter),
     "invalid_schema",
   );
   assert.deepEqual(adapter.calls, []);
@@ -597,10 +604,7 @@ test("planner rejects operation geometry before adapter allocation", async () =>
     },
   };
   const attributeAdapter = new MockAdapter();
-  await rejectsCode(
-    prepareTraining(badHyperparameter, config, attributeAdapter),
-    "invalid_schema",
-  );
+  await rejectsCode(prepareTraining(badHyperparameter, config, attributeAdapter), "invalid_schema");
   assert.deepEqual(attributeAdapter.calls, []);
 });
 
@@ -638,10 +642,7 @@ test("planner enforces one optimizer and gradient per tied parameter owner", asy
     },
   };
   const duplicateAdapter = new MockAdapter();
-  await rejectsCode(
-    prepareTraining(duplicateUpdate, config, duplicateAdapter),
-    "invalid_schema",
-  );
+  await rejectsCode(prepareTraining(duplicateUpdate, config, duplicateAdapter), "invalid_schema");
   assert.deepEqual(duplicateAdapter.calls, []);
 
   const wrongGradientShape = {
@@ -654,10 +655,7 @@ test("planner enforces one optimizer and gradient per tied parameter owner", asy
     },
   };
   const shapeAdapter = new MockAdapter();
-  await rejectsCode(
-    prepareTraining(wrongGradientShape, config, shapeAdapter),
-    "invalid_schema",
-  );
+  await rejectsCode(prepareTraining(wrongGradientShape, config, shapeAdapter), "invalid_schema");
   assert.deepEqual(shapeAdapter.calls, []);
 
   const orphanGradient = {
@@ -671,10 +669,7 @@ test("planner enforces one optimizer and gradient per tied parameter owner", asy
     },
   };
   const orphanAdapter = new MockAdapter();
-  await rejectsCode(
-    prepareTraining(orphanGradient, config, orphanAdapter),
-    "invalid_schema",
-  );
+  await rejectsCode(prepareTraining(orphanGradient, config, orphanAdapter), "invalid_schema");
   assert.deepEqual(orphanAdapter.calls, []);
 
   const disconnected = {
@@ -699,10 +694,7 @@ test("planner enforces one optimizer and gradient per tied parameter owner", asy
     },
   };
   const disconnectedAdapter = new MockAdapter();
-  await rejectsCode(
-    prepareTraining(disconnected, config, disconnectedAdapter),
-    "invalid_schema",
-  );
+  await rejectsCode(prepareTraining(disconnected, config, disconnectedAdapter), "invalid_schema");
   assert.deepEqual(disconnectedAdapter.calls, []);
 });
 
@@ -736,9 +728,7 @@ test("planner emits deterministic fan-in accumulation for tied parameters", asyn
   assert.equal(reductions.length, 1);
   assert.equal(reductions[0].outputs[0].bufferId, "grad");
   assert.ok(
-    reductions[0].inputs.every((binding) =>
-      binding.bufferId.startsWith("__tritium.contribution."),
-    ),
+    reductions[0].inputs.every((binding) => binding.bufferId.startsWith("__tritium.contribution.")),
   );
   assert.equal(
     session.plan.backwardOperations.filter(
@@ -797,10 +787,7 @@ test("planner rejects an optimized parameter behind a detach barrier", async () 
     },
   };
   const adapter = new MockAdapter();
-  await rejectsCode(
-    prepareTraining(detachedModel, config, adapter),
-    "invalid_schema",
-  );
+  await rejectsCode(prepareTraining(detachedModel, config, adapter), "invalid_schema");
   assert.deepEqual(adapter.calls, []);
 });
 
@@ -850,10 +837,7 @@ test("planner binds stateful optimizer slots exclusively and positionally", asyn
       ),
     },
   };
-  await rejectsCode(
-    prepareTraining(wrongStateRole, config, new MockAdapter()),
-    "invalid_schema",
-  );
+  await rejectsCode(prepareTraining(wrongStateRole, config, new MockAdapter()), "invalid_schema");
 
   const wrongStateShape = {
     ...adamModel,
@@ -864,10 +848,7 @@ test("planner binds stateful optimizer slots exclusively and positionally", asyn
       ),
     },
   };
-  await rejectsCode(
-    prepareTraining(wrongStateShape, config, new MockAdapter()),
-    "invalid_schema",
-  );
+  await rejectsCode(prepareTraining(wrongStateShape, config, new MockAdapter()), "invalid_schema");
 });
 
 test("planner orders multiple groups and rejects shared optimizer state", async () => {
@@ -932,10 +913,7 @@ test("planner orders multiple groups and rejects shared optimizer state", async 
       ),
     },
   };
-  await rejectsCode(
-    prepareTraining(sharedStateModel, config, new MockAdapter()),
-    "invalid_schema",
-  );
+  await rejectsCode(prepareTraining(sharedStateModel, config, new MockAdapter()), "invalid_schema");
 });
 
 test("planner validates int8 AdamW block-state geometry", async () => {
@@ -958,13 +936,7 @@ test("planner validates int8 AdamW block-state geometry", async () => {
       "moment1-scale",
       "moment2-scale",
     ],
-    outputs: [
-      "wide-weight",
-      "moment1-q8",
-      "moment2-q8",
-      "moment1-scale",
-      "moment2-scale",
-    ],
+    outputs: ["wide-weight", "moment1-q8", "moment2-q8", "moment1-scale", "moment2-scale"],
     attributes: ADAM_ATTRIBUTES,
   };
   const int8Model = {
@@ -975,9 +947,7 @@ test("planner validates int8 AdamW block-state geometry", async () => {
         ...model.recipe.tensors
           .filter((tensor) => !["weight", "tied-weight", "grad"].includes(tensor.id))
           .map((tensor) =>
-            ["x", "target", "sum"].includes(tensor.id)
-              ? { ...tensor, shape: [260] }
-              : tensor,
+            ["x", "target", "sum"].includes(tensor.id) ? { ...tensor, shape: [260] } : tensor,
           ),
         ...tensors,
       ],
@@ -1002,12 +972,10 @@ test("planner validates int8 AdamW block-state geometry", async () => {
       peakResidentBytes: plan.preparePeakBytes,
     });
   const session = await prepareTraining(int8Model, int8Config, int8Adapter);
-  assert.deepEqual(session.plan.operations.find((item) => item.id === "int8-adamw").inputs.slice(2), [
-    "moment1-q8",
-    "moment2-q8",
-    "moment1-scale",
-    "moment2-scale",
-  ]);
+  assert.deepEqual(
+    session.plan.operations.find((item) => item.id === "int8-adamw").inputs.slice(2),
+    ["moment1-q8", "moment2-q8", "moment1-scale", "moment2-scale"],
+  );
   await session.dispose();
 
   const badScaleModel = {
@@ -1070,10 +1038,7 @@ test("capability getters are snapshotted exactly once", async () => {
 test("capability snapshot rejects unknown and malformed fields", async () => {
   const unknownAdapter = new MockAdapter();
   unknownAdapter.capabilities = { ...capabilities(), futureField: true };
-  await rejectsCode(
-    prepareTraining(model, config, unknownAdapter),
-    "capability_mismatch",
-  );
+  await rejectsCode(prepareTraining(model, config, unknownAdapter), "capability_mismatch");
   assert.deepEqual(unknownAdapter.calls, []);
 
   const malformedAdapter = new MockAdapter();
@@ -1081,10 +1046,7 @@ test("capability snapshot rejects unknown and malformed fields", async () => {
     ...capabilities(),
     supportedOperations: null,
   };
-  await rejectsCode(
-    prepareTraining(model, config, malformedAdapter),
-    "capability_mismatch",
-  );
+  await rejectsCode(prepareTraining(model, config, malformedAdapter), "capability_mismatch");
   assert.deepEqual(malformedAdapter.calls, []);
 });
 
@@ -1150,8 +1112,7 @@ test("receipt resident and step counters gate state commits", async () => {
   const stepSession = await prepareTraining(model, config, stepAdapter);
   const result = await stepSession.forward(batch());
   await stepSession.backward(result);
-  stepAdapter.step = async () =>
-    receipt("session.step", "webgpu", { completedSteps: 7 });
+  stepAdapter.step = async () => receipt("session.step", "webgpu", { completedSteps: 7 });
   await rejectsCode(stepSession.step(), "adapter_failure");
   assert.equal(stepSession.state, "terminal");
   assert.equal(stepAdapter.calls.at(-1), "dispose");
@@ -1160,10 +1121,7 @@ test("receipt resident and step counters gate state commits", async () => {
 test("forward rejects batches that differ from the compiled plan", async () => {
   const adapter = new MockAdapter();
   const session = await prepareTraining(model, config, adapter);
-  await rejectsCode(
-    session.forward({ inputs: { x: new Float32Array([1]) } }),
-    "invalid_schema",
-  );
+  await rejectsCode(session.forward({ inputs: { x: new Float32Array([1]) } }), "invalid_schema");
   await rejectsCode(
     session.forward({
       inputs: {
@@ -1226,21 +1184,18 @@ test("cancellation is a typed reusable transaction failure", async () => {
   const session = await prepareTraining(model, config, adapter);
   const controller = new AbortController();
   controller.abort("caller cancelled");
-  await assert.rejects(
-    session.forward(batch(), { signal: controller.signal }),
-    (error) => {
-      assert.ok(error instanceof WebTrainingError);
-      assert.equal(error.code, "cancelled");
-      assert.equal(error.state, "prepared");
-      assert.equal(error.failureReceipt.cause, "cancelled");
-      assert.equal(error.failureReceipt.stateBefore, "prepared");
-      assert.equal(error.failureReceipt.stateAfter, "prepared");
-      assert.equal(error.failureReceipt.recoverable, true);
-      assert.equal(error.failureReceipt.completedSteps, 0);
-      assert.ok(Object.isFrozen(error.failureReceipt));
-      return true;
-    },
-  );
+  await assert.rejects(session.forward(batch(), { signal: controller.signal }), (error) => {
+    assert.ok(error instanceof WebTrainingError);
+    assert.equal(error.code, "cancelled");
+    assert.equal(error.state, "prepared");
+    assert.equal(error.failureReceipt.cause, "cancelled");
+    assert.equal(error.failureReceipt.stateBefore, "prepared");
+    assert.equal(error.failureReceipt.stateAfter, "prepared");
+    assert.equal(error.failureReceipt.recoverable, true);
+    assert.equal(error.failureReceipt.completedSteps, 0);
+    assert.ok(Object.isFrozen(error.failureReceipt));
+    return true;
+  });
   assert.deepEqual(adapter.calls, ["validate", "prepare"]);
   assert.equal(session.state, "prepared");
 
@@ -1251,10 +1206,7 @@ test("cancellation is a typed reusable transaction failure", async () => {
       throw new Error("pre-aborted batch must not be inspected");
     },
   };
-  await rejectsCode(
-    session.forward(unreadBatch, { signal: controller.signal }),
-    "cancelled",
-  );
+  await rejectsCode(session.forward(unreadBatch, { signal: controller.signal }), "cancelled");
   assert.equal(batchReads, 0);
 
   const inFlightController = new AbortController();
@@ -1289,10 +1241,7 @@ test("cancellation is a typed reusable transaction failure", async () => {
   assert.equal(session.state, "forward-complete");
   await session.backward(activeResult);
   await session.step();
-  await rejectsCode(
-    session.resume(new Uint8Array(), { signal: controller.signal }),
-    "cancelled",
-  );
+  await rejectsCode(session.resume(new Uint8Array(), { signal: controller.signal }), "cancelled");
   assert.equal(session.state, "prepared");
 });
 

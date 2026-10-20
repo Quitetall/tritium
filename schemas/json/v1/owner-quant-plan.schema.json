@@ -1,0 +1,1579 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OwnerQuantPlan",
+  "description": "Complete original model request requiring at least one actual owner fit.",
+  "type": "object",
+  "properties": {
+    "architecture": {
+      "description": "Architecture identifier, not loader execution admission.",
+      "type": "string"
+    },
+    "assets": {
+      "description": "Complete sorted original asset inventory.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "levels": {
+      "description": "Complete sorted output level names.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "limits": {
+      "description": "Existing original/output/package logical limits.",
+      "$ref": "#/$defs/QuantLimits"
+    },
+    "max_cache_package_bytes": {
+      "description": "Maximum physical input package per file-backed cache.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_cache_payload_bytes": {
+      "description": "Aggregate logical cache payload, counting intentional window repetitions.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "original_source": {
+      "description": "Preparation identity required of actual consumed original bytes/assets.",
+      "$ref": "#/$defs/OriginalSourceId"
+    },
+    "tensors": {
+      "description": "Complete sorted unique original tensor inventory.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/OwnerQuantTensorPlan"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "architecture",
+    "original_source",
+    "tensors",
+    "assets",
+    "levels",
+    "limits",
+    "max_cache_payload_bytes",
+    "max_cache_package_bytes"
+  ],
+  "$defs": {
+    "AdditiveLayout": {
+      "description": "Semantic layout parameters for an additive tensor.",
+      "type": "object",
+      "properties": {
+        "allocation": {
+          "description": "Plane count allocation mode.",
+          "$ref": "#/$defs/PlaneAllocation"
+        },
+        "basis": {
+          "description": "Input-axis basis.",
+          "$ref": "#/$defs/Basis"
+        },
+        "codec": {
+          "description": "Per-plane codec.",
+          "$ref": "#/$defs/PlaneCodec"
+        },
+        "cols": {
+          "description": "Number of coefficients per row.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "group": {
+          "description": "Scale group width.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "law": {
+          "description": "Scale law.",
+          "$ref": "#/$defs/ScaleLaw"
+        },
+        "max_planes": {
+          "description": "Maximum plane count represented by this tensor.",
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "rows": {
+          "description": "Number of matrix rows.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "tile": {
+          "description": "Canonical tile width. Currently fixed at [`ADDITIVE_TILE_SIZE`].",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "transport": {
+          "description": "Outer entropy transport.",
+          "$ref": "#/$defs/Transport"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "rows",
+        "cols",
+        "tile",
+        "group",
+        "max_planes",
+        "allocation",
+        "codec",
+        "law",
+        "basis",
+        "transport"
+      ]
+    },
+    "Basis": {
+      "description": "Input-axis transform associated with an additive tensor.",
+      "oneOf": [
+        {
+          "description": "No transform.",
+          "type": "string",
+          "const": "Identity"
+        },
+        {
+          "description": "Normalized, self-inverse Walsh–Hadamard transform.",
+          "type": "object",
+          "properties": {
+            "Hadamard": {
+              "type": "object",
+              "properties": {
+                "block": {
+                  "description": "Power-of-two transform block width.",
+                  "type": "integer",
+                  "format": "uint32",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "block"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Hadamard"
+          ]
+        },
+        {
+          "description": "Deterministic signed Walsh–Hadamard transform.",
+          "type": "object",
+          "properties": {
+            "SignedRht": {
+              "type": "object",
+              "properties": {
+                "block": {
+                  "description": "Power-of-two transform block width.",
+                  "type": "integer",
+                  "format": "uint32",
+                  "minimum": 0
+                },
+                "domain": {
+                  "description": "Stable domain identifier for sign derivation.",
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "seed": {
+                  "description": "Seed used to derive signs.",
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "block",
+                "seed",
+                "domain"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "SignedRht"
+          ]
+        }
+      ]
+    },
+    "BlobId": {
+      "description": "Content identity for stored tensor or asset bytes.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "CalibratedFitPlan": {
+      "description": "Expected immutable cache context and numerical request for a calibrated fit.",
+      "type": "object",
+      "properties": {
+        "cache": {
+          "description": "Expected complete actual cache binding; model truth requires engine admission.",
+          "$ref": "#/$defs/CalibrationCacheBinding"
+        },
+        "damping": {
+          "description": "Existing absolute row-metric damping after Fisher scaling.",
+          "type": "number",
+          "format": "double"
+        },
+        "direct": {
+          "description": "Existing original-row controller profile, outputs and logical limits.",
+          "$ref": "#/$defs/DirectFitPlan"
+        },
+        "max_numeric_bytes": {
+          "description": "Logical reducer budget, not caller buffers, fitter workspace or total RSS.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "partition": {
+          "description": "Explicit input statistics partition, independent of weight scale groups.",
+          "$ref": "#/$defs/CalibrationPartition"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "direct",
+        "cache",
+        "partition",
+        "damping",
+        "max_numeric_bytes"
+      ]
+    },
+    "CalibrationCacheBinding": {
+      "description": "Immutable finalized cache context, not a registered/audited observation.",
+      "type": "object",
+      "properties": {
+        "objective": {
+          "description": "BLAKE3 of exact supplied objective/teacher/recovery recipe bytes.\nByte identity does not independently establish that this recipe was executed.",
+          "$ref": "#/$defs/BlobId"
+        },
+        "payload_bytes": {
+          "description": "Actual retained payload bytes, excluding metadata/capacity overhead and full RSS.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "request": {
+          "description": "Context actually used, including declared logical limits.",
+          "$ref": "#/$defs/CalibrationCacheRequest"
+        },
+        "samples": {
+          "description": "Observed sample count, including masked samples.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "source": {
+          "description": "Actual finalized cache/token identities; model identity remains declared until engine admission.",
+          "$ref": "#/$defs/CalibrationSource"
+        },
+        "tokenizer": {
+          "description": "BLAKE3 of actual supplied tokenizer bytes, not a name.",
+          "$ref": "#/$defs/BlobId"
+        },
+        "windows": {
+          "description": "Declared context-window count, not the number of reduction chunks.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "request",
+        "source",
+        "tokenizer",
+        "objective",
+        "samples",
+        "windows",
+        "payload_bytes"
+      ]
+    },
+    "CalibrationCacheLimits": {
+      "description": "Logical retained cache bounds, separate from reducer workspace or process RSS.",
+      "type": "object",
+      "properties": {
+        "max_payload_bytes": {
+          "description": "Exact retained scalar/token/mask and recipe bytes; excludes metadata/capacity overhead.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_samples": {
+          "description": "Maximum observed samples, including masked samples.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_windows": {
+          "description": "Maximum declared model-context windows, not reduction replay chunks.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max_payload_bytes",
+        "max_samples",
+        "max_windows"
+      ]
+    },
+    "CalibrationCacheRequest": {
+      "description": "Context for collecting one tensor's actual original-basis paired cache.",
+      "type": "object",
+      "properties": {
+        "consumer": {
+          "description": "Actual operation/explicit approximation producing the inputs.",
+          "$ref": "#/$defs/CalibrationConsumer"
+        },
+        "limits": {
+          "description": "Logical cache admission, not numerical reduction admission.",
+          "$ref": "#/$defs/CalibrationCacheLimits"
+        },
+        "model": {
+          "description": "Declared original identity; the engine must verify actual byte equality.",
+          "$ref": "#/$defs/OriginalSourceId"
+        },
+        "output": {
+          "description": "Required actual gradient encoding; absent is explicitly input-only.",
+          "$ref": "#/$defs/CalibrationOutput"
+        },
+        "sample_start": {
+          "description": "First canonical sample ordinal, retained across replay/shards.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "tensor": {
+          "description": "Exact original interpretation, not fitted weights.",
+          "$ref": "#/$defs/QuantSourceTensor"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "tensor",
+        "model",
+        "consumer",
+        "output",
+        "sample_start",
+        "limits"
+      ]
+    },
+    "CalibrationConsumer": {
+      "description": "Consumer whose original-source values are being calibrated.",
+      "oneOf": [
+        {
+          "description": "Raw original-input activations of a linear projection.",
+          "type": "string",
+          "const": "Matmul"
+        },
+        {
+          "description": "Gather with the explicitly declared hidden-space identity approximation.\nRequires indexed output factors; does not materialize vocabulary one-hots.",
+          "type": "string",
+          "const": "GatherIdentity"
+        }
+      ]
+    },
+    "CalibrationOutput": {
+      "description": "Declared output factor encoding; no gradients are inferred from activations.",
+      "oneOf": [
+        {
+          "description": "Input Gram only, without a Fisher claim.",
+          "type": "string",
+          "const": "None"
+        },
+        {
+          "description": "One dense output-gradient vector per sample.",
+          "type": "string",
+          "const": "DenseFisher"
+        },
+        {
+          "description": "One named output-row factor per sample, zeros in other rows.",
+          "type": "string",
+          "const": "IndexedFisher"
+        }
+      ]
+    },
+    "CalibrationPartition": {
+      "description": "Input statistics partition, independent of scale groups and basis blocks.",
+      "oneOf": [
+        {
+          "description": "Full original-input covariance, including cross-group correlations.",
+          "type": "string",
+          "const": "Full"
+        },
+        {
+          "description": "Explicit block-diagonal approximation; final group may be ragged.",
+          "type": "object",
+          "properties": {
+            "Groups": {
+              "type": "object",
+              "properties": {
+                "columns": {
+                  "description": "Positive block width, not a weight-format admission constraint.",
+                  "type": "integer",
+                  "format": "uint32",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "columns"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Groups"
+          ]
+        }
+      ]
+    },
+    "CalibrationSource": {
+      "description": "Declared identities of the already finalized calibration source/cache.\nThe collector binds them; cache/source producers must independently verify them.",
+      "type": "object",
+      "properties": {
+        "cache": {
+          "description": "Finalized activation/gradient cache manifest and content identity.",
+          "$ref": "#/$defs/FitInputDigest"
+        },
+        "model": {
+          "description": "Original source content identity, not a fitted model/package identity.",
+          "$ref": "#/$defs/FitInputDigest"
+        },
+        "tokens": {
+          "description": "Ordered token stream and tokenizer provenance identity.",
+          "$ref": "#/$defs/FitInputDigest"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "model",
+        "cache",
+        "tokens"
+      ]
+    },
+    "DirectFitLevel": {
+      "description": "One requested direct fit; plane counts need not be sorted or nested.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Unique nonempty level name within this request.",
+          "type": "string"
+        },
+        "planes": {
+          "description": "Positive plane count bounded by the layout and its admitted law.",
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "planes"
+      ]
+    },
+    "DirectFitLimits": {
+      "description": "Pre-allocation shape limits for one direct-level request.\n\nThese bound specified logical element counts, not total process RSS, solver\ntemporary storage, Rayon overhead, or complete production memory admission.",
+      "type": "object",
+      "properties": {
+        "max_metric_entries": {
+          "description": "Maximum dense input-Gram count (`cols * cols`), even when implicit identity is used.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_output_trits": {
+          "description": "Maximum sum of retained trits over all directly fitted levels.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_weights": {
+          "description": "Maximum source scalar count (`rows * cols`).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max_weights",
+        "max_metric_entries",
+        "max_output_trits"
+      ]
+    },
+    "DirectFitMetric": {
+      "description": "Original metric supplied to the controller, before any basis transform.",
+      "oneOf": [
+        {
+          "description": "Explicit plan invocation without an input Gram.",
+          "type": "string",
+          "const": "Identity"
+        },
+        {
+          "description": "Exact row-major f64 Gram bits; not original calibration data identity.",
+          "type": "object",
+          "properties": {
+            "InputGramF64": {
+              "type": "object",
+              "properties": {
+                "content": {
+                  "description": "Candidate `tritium.quantize.input-gram-f64.v1` digest.",
+                  "$ref": "#/$defs/FitInputDigest"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "content"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "InputGramF64"
+          ]
+        }
+      ]
+    },
+    "DirectFitPlan": {
+      "description": "Typed per-tensor direct-level fit request, not the complete model QuantPlan.\n\nThe layout is the highest permitted plane count. Each returned level has\nits own exact plane count as `max_planes`, and is fitted from the same\noriginal source rather than from a prefix or another level's reconstruction.",
+      "type": "object",
+      "properties": {
+        "layout": {
+          "description": "Declared geometry, law, basis, packing codec and transport.",
+          "$ref": "#/$defs/AdditiveLayout"
+        },
+        "levels": {
+          "description": "Ordered direct levels to produce.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DirectFitLevel"
+          }
+        },
+        "limits": {
+          "description": "Required explicit shape limits, checked before numerical allocations.",
+          "$ref": "#/$defs/DirectFitLimits"
+        },
+        "profile": {
+          "description": "Selected real numerical implementation.",
+          "$ref": "#/$defs/DirectFitProfile"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "layout",
+        "profile",
+        "levels",
+        "limits"
+      ]
+    },
+    "DirectFitProfile": {
+      "description": "Exact numerical profile, not an interchangeable precision or SOTA claim.",
+      "oneOf": [
+        {
+          "description": "Tied one-third F16 ladder with the shipping activation-aware arithmetic.",
+          "type": "object",
+          "properties": {
+            "ActivationAwareLadder": {
+              "$ref": "#/$defs/LadderFitOptions"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ActivationAwareLadder"
+          ]
+        },
+        {
+          "description": "Free F16/F32 planes fitted independently per group with the existing joint solver.",
+          "type": "object",
+          "properties": {
+            "JointIndependentGroups": {
+              "$ref": "#/$defs/JointGroupFitOptions"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "JointIndependentGroups"
+          ]
+        },
+        {
+          "description": "Joint f32-input group fitter with validated full-Gram sequential feedback.",
+          "type": "object",
+          "properties": {
+            "JointFeedbackGroups": {
+              "$ref": "#/$defs/JointFeedbackFitOptions"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "JointFeedbackGroups"
+          ]
+        }
+      ]
+    },
+    "FitInputDigest": {
+      "description": "Exact original fitting input bits under a named candidate digest domain.\nNot a stored blob, package, HF identity or calibration dataset identity.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "JointFeedbackFitOptions": {
+      "description": "Joint row-group fitting with full input-axis sequential residual propagation.",
+      "type": "object",
+      "properties": {
+        "damp": {
+          "description": "Full-Gram feedback damping relative to the mean diagonal; finite and nonnegative.",
+          "type": "number",
+          "format": "double"
+        },
+        "decay": {
+          "description": "Finite residual propagation fraction in `0..=1`.",
+          "type": "number",
+          "format": "double"
+        },
+        "decay_ramp": {
+          "description": "Ramp from one to the configured fraction along the input axis.",
+          "type": "boolean"
+        },
+        "fitter": {
+          "description": "Existing f32-input joint solver configuration; no f64 solver is implied.",
+          "$ref": "#/$defs/JointGroupFitOptions"
+        },
+        "precision": {
+          "description": "Working feedback arithmetic, independent of stored scale precision.",
+          "$ref": "#/$defs/WorkPrecision"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "fitter",
+        "damp",
+        "precision",
+        "decay",
+        "decay_ramp"
+      ]
+    },
+    "JointGroupFitOptions": {
+      "description": "Existing joint fitter applied independently to each row-local scale group.\n\nThis profile does not propagate cross-group residual feedback, implement K-FAC\noutput curvature, or claim to be the full SALT campaign solver.",
+      "type": "object",
+      "properties": {
+        "em_restarts": {
+          "description": "Positive deterministic output-aware restart count.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_iterations": {
+          "description": "Positive maximum alternating scale/assignment iterations.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "modulated_relay": {
+          "description": "Enable the existing modulated-relay initialization basin.",
+          "type": "boolean"
+        },
+        "ridge": {
+          "description": "Finite positive scale-solve ridge.",
+          "type": "number",
+          "format": "double"
+        },
+        "ridge_condition_limit": {
+          "description": "Finite ridge condition-number limit greater than one.",
+          "type": "number",
+          "format": "double"
+        },
+        "softened_relay": {
+          "description": "Enable the existing softened-relay initialization basin.",
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max_iterations",
+        "ridge",
+        "em_restarts",
+        "ridge_condition_limit",
+        "softened_relay",
+        "modulated_relay"
+      ]
+    },
+    "LadderFitOptions": {
+      "description": "Shipping f32 working weights with f64 metric/feedback/search arithmetic.",
+      "type": "object",
+      "properties": {
+        "damp": {
+          "description": "Finite, nonnegative damping relative to the mean input-Gram diagonal.",
+          "type": "number",
+          "format": "double"
+        },
+        "decay": {
+          "description": "Finite feedback fraction in `0..=1`; one is plain GPTQ.",
+          "type": "number",
+          "format": "double"
+        },
+        "decay_ramp": {
+          "description": "Ramp feedback from one to the configured fraction along the input axis.",
+          "type": "boolean"
+        },
+        "grid": {
+          "description": "Quarter-octave anchor grid candidates per group; zero retains the legacy single guess.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "scale_refit": {
+          "description": "Scale refit placement.",
+          "$ref": "#/$defs/LadderScaleRefit"
+        },
+        "search_sweeps": {
+          "description": "Number of optional coordinate-search sweeps.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "grid",
+        "damp",
+        "search_sweeps",
+        "scale_refit",
+        "decay",
+        "decay_ramp"
+      ]
+    },
+    "LadderScaleRefit": {
+      "description": "Placement of the ladder scale refit, without changing its numerical policy.",
+      "oneOf": [
+        {
+          "description": "Do not refit ladder scales.",
+          "type": "string",
+          "const": "None"
+        },
+        {
+          "description": "Refit during the post-feedback coordinate search.",
+          "type": "string",
+          "const": "PostPass"
+        },
+        {
+          "description": "Refit completed groups before propagating to the remaining columns.",
+          "type": "string",
+          "const": "InLoop"
+        }
+      ]
+    },
+    "OriginalSourceId": {
+      "description": "Candidate identity of original named tensor/asset content, not fitted content or provenance.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "OwnerContextBinding": {
+      "description": "Actual context-byte binding.",
+      "type": "object",
+      "properties": {
+        "content": {
+          "description": "Exact logical-value byte digest.",
+          "$ref": "#/$defs/BlobId"
+        },
+        "meta": {
+          "description": "Original context interpretation.",
+          "$ref": "#/$defs/OwnerContextMeta"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "meta",
+        "content"
+      ]
+    },
+    "OwnerContextDtype": {
+      "description": "Context scalar interpretation; payload bytes are contiguous logical values.",
+      "oneOf": [
+        {
+          "description": "IEEE binary16.",
+          "type": "string",
+          "const": "F16"
+        },
+        {
+          "description": "Brain float16.",
+          "type": "string",
+          "const": "Bf16"
+        },
+        {
+          "description": "IEEE binary32.",
+          "type": "string",
+          "const": "F32"
+        },
+        {
+          "description": "IEEE binary64.",
+          "type": "string",
+          "const": "F64"
+        },
+        {
+          "description": "Signed 8-bit integer.",
+          "type": "string",
+          "const": "I8"
+        },
+        {
+          "description": "Signed 16-bit integer.",
+          "type": "string",
+          "const": "I16"
+        },
+        {
+          "description": "Signed 32-bit integer.",
+          "type": "string",
+          "const": "I32"
+        },
+        {
+          "description": "Signed 64-bit integer.",
+          "type": "string",
+          "const": "I64"
+        },
+        {
+          "description": "Unsigned 8-bit integer.",
+          "type": "string",
+          "const": "U8"
+        },
+        {
+          "description": "Boolean bytes, exactly 0/1.",
+          "type": "string",
+          "const": "Bool"
+        },
+        {
+          "description": "Complex pair of binary32 components.",
+          "type": "string",
+          "const": "C64"
+        },
+        {
+          "description": "Complex pair of binary64 components.",
+          "type": "string",
+          "const": "C128"
+        }
+      ]
+    },
+    "OwnerContextMeta": {
+      "description": "Declared logical tensor context, not proof that a callback used it.",
+      "type": "object",
+      "properties": {
+        "conjugated": {
+          "description": "Original conjugate-view flag; stored values are resolved.",
+          "type": "boolean"
+        },
+        "dtype": {
+          "description": "Exact original scalar dtype.",
+          "$ref": "#/$defs/OwnerContextDtype"
+        },
+        "name": {
+          "description": "Unique nonempty context key.",
+          "type": "string"
+        },
+        "negated": {
+          "description": "Original negative-view flag; stored values are resolved.",
+          "type": "boolean"
+        },
+        "shape": {
+          "description": "Original logical dimensions; scalar rank zero is allowed.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "dtype",
+        "shape",
+        "conjugated",
+        "negated"
+      ]
+    },
+    "OwnerInvocationBinding": {
+      "description": "Actual invocation input/adjoint binding.",
+      "type": "object",
+      "properties": {
+        "adjoint": {
+          "description": "Exact f32 output-adjoint byte digest.",
+          "$ref": "#/$defs/BlobId"
+        },
+        "input": {
+          "description": "Exact f32 input or i64 index byte digest.",
+          "$ref": "#/$defs/BlobId"
+        },
+        "meta": {
+          "description": "Declared invocation interpretation.",
+          "$ref": "#/$defs/OwnerInvocationMeta"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "meta",
+        "input",
+        "adjoint"
+      ]
+    },
+    "OwnerInvocationMeta": {
+      "description": "One declared actual invocation; bytes/coverage are verified separately.",
+      "type": "object",
+      "properties": {
+        "ordinal": {
+          "description": "Global operator-entry ordinal, not renumbered per owner.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "paths": {
+          "description": "Sorted unique alias paths of one actual module; root path may be empty.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "role": {
+          "description": "Actual ordinary operation.",
+          "$ref": "#/$defs/OwnerScoreRole"
+        },
+        "samples": {
+          "description": "Positive flattened invocation sample count.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ordinal",
+        "paths",
+        "role",
+        "samples"
+      ]
+    },
+    "OwnerQuantAction": {
+      "description": "Explicit fit class in a model containing scalar-window owner calibration.",
+      "oneOf": [
+        {
+          "description": "Exact original floating-point preservation.",
+          "type": "string",
+          "const": "KeepDense"
+        },
+        {
+          "description": "Existing explicitly uncalibrated original-row fit.",
+          "type": "object",
+          "properties": {
+            "Fit": {
+              "type": "object",
+              "properties": {
+                "metric": {
+                  "description": "Explicit Identity or exact raw-Gram context.",
+                  "$ref": "#/$defs/DirectFitMetric"
+                },
+                "plan": {
+                  "description": "Actual common controller request.",
+                  "$ref": "#/$defs/DirectFitPlan"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "plan",
+                "metric"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Fit"
+          ]
+        },
+        {
+          "description": "Existing actual K-FAC/input-only cache request.",
+          "type": "object",
+          "properties": {
+            "CalibratedFit": {
+              "type": "object",
+              "properties": {
+                "plan": {
+                  "description": "Actual legacy calibrated context, never an owner-score substitute.",
+                  "$ref": "#/$defs/CalibratedFitPlan"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "plan"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "CalibratedFit"
+          ]
+        },
+        {
+          "description": "Actual ordered scalar-window owner cache request.",
+          "type": "object",
+          "properties": {
+            "OwnerFit": {
+              "type": "object",
+              "properties": {
+                "plan": {
+                  "description": "Complete immutable window bindings and numerical request.",
+                  "$ref": "#/$defs/OwnerScoreFitPlan"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "plan"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "OwnerFit"
+          ]
+        }
+      ]
+    },
+    "OwnerQuantTensorPlan": {
+      "description": "One canonical original tensor and its actual conversion operation.",
+      "type": "object",
+      "properties": {
+        "action": {
+          "description": "Explicit preservation or actual fit class.",
+          "$ref": "#/$defs/OwnerQuantAction"
+        },
+        "source": {
+          "description": "Exact original interpretation, before widening or fitting.",
+          "$ref": "#/$defs/QuantSourceTensor"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "action"
+      ]
+    },
+    "OwnerScoreCacheBinding": {
+      "description": "Actual immutable identity/counts; recomputed by the reader.",
+      "type": "object",
+      "properties": {
+        "cache": {
+          "description": "Derived actual content identity.",
+          "$ref": "#/$defs/OwnerScoreCacheId"
+        },
+        "content": {
+          "description": "Complete logical content preimage.",
+          "$ref": "#/$defs/OwnerScoreCacheContent"
+        },
+        "context_bytes": {
+          "description": "Derived context bytes.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "payload_bytes": {
+          "description": "Derived total payload bytes.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "samples": {
+          "description": "Derived sum of invocation samples.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "content",
+        "cache",
+        "payload_bytes",
+        "context_bytes",
+        "samples"
+      ]
+    },
+    "OwnerScoreCacheContent": {
+      "description": "Logical identity preimage; excludes physical package layout and ceilings.",
+      "type": "object",
+      "properties": {
+        "context": {
+          "description": "Sorted exact context descriptors and content.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/OwnerContextBinding"
+          }
+        },
+        "estimator": {
+          "description": "Explicit scalar-window unit; no Fisher/GGN fallback.",
+          "$ref": "#/$defs/OwnerScoreEstimator"
+        },
+        "invocations": {
+          "description": "Ordered exact invocation descriptors and numerical content.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/OwnerInvocationBinding"
+          }
+        },
+        "objective": {
+          "description": "Actual declared objective bytes, not independent execution proof.",
+          "$ref": "#/$defs/BlobId"
+        },
+        "source": {
+          "description": "Original complete source, not fitted model/package identity.",
+          "$ref": "#/$defs/OriginalSourceId"
+        },
+        "tensor": {
+          "description": "Exact original matrix interpretation.",
+          "$ref": "#/$defs/QuantSourceTensor"
+        },
+        "tokenizer": {
+          "description": "Actual tokenizer bytes.",
+          "$ref": "#/$defs/BlobId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "tensor",
+        "estimator",
+        "tokenizer",
+        "objective",
+        "context",
+        "invocations"
+      ]
+    },
+    "OwnerScoreCacheId": {
+      "description": "Candidate identity of one scalar-window owner snapshot, not a fit or qualification.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "OwnerScoreEstimator": {
+      "description": "Estimator unit; no Fisher/GGN interpretation is inferred from scalar adjoints.",
+      "oneOf": [
+        {
+          "description": "One declared scalar objective's complete owner-row gradient.",
+          "type": "string",
+          "const": "ScalarWindowGradient"
+        }
+      ]
+    },
+    "OwnerScoreFitPlan": {
+      "description": "Expected actual cache stream and numerical request, not source custody proof.",
+      "type": "object",
+      "properties": {
+        "damping": {
+          "description": "Absolute source-basis row-metric diagonal damping.",
+          "type": "number",
+          "format": "double"
+        },
+        "direct": {
+          "description": "Common original-row fitter and complete independent level requests.",
+          "$ref": "#/$defs/DirectFitPlan"
+        },
+        "limits": {
+          "description": "Logical cache/reducer limits, independent of direct fitter limits.",
+          "$ref": "#/$defs/OwnerScoreMetricLimits"
+        },
+        "max_row_bindings": {
+          "description": "Positive maximum recorded row identities; not event bytes or process RSS.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "windows": {
+          "description": "Ordered complete immutable scalar-loss window bindings.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WeightedOwnerCache"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "direct",
+        "windows",
+        "damping",
+        "limits",
+        "max_row_bindings"
+      ]
+    },
+    "OwnerScoreMetricLimits": {
+      "description": "Logical admission only, excluding source/tapes/metadata/solver/allocator/RSS.",
+      "type": "object",
+      "properties": {
+        "max_payload_bytes": {
+          "description": "Sum of logical cache payload bytes, counting each list position.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_reduction_entries": {
+          "description": "Conservative bound on reducer numerical f64 entries and row output.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_row_bytes": {
+          "description": "Maximum one reconstructed row's f64 output bytes.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_windows": {
+          "description": "Maximum ordered window count, including repeats and zero weights.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max_windows",
+        "max_payload_bytes",
+        "max_row_bytes",
+        "max_reduction_entries"
+      ]
+    },
+    "OwnerScoreRole": {
+      "description": "Ordinary owner operation, in canonical source coordinates.",
+      "oneOf": [
+        {
+          "description": "`z = x W^T`, without omitted source uses.",
+          "type": "string",
+          "const": "Matmul"
+        },
+        {
+          "description": "Ordinary lookup, without padding/frequency/custom backward rules.",
+          "type": "string",
+          "const": "Gather"
+        }
+      ]
+    },
+    "PlaneAllocation": {
+      "description": "Uniform or per-tile plane-count allocation policy.",
+      "oneOf": [
+        {
+          "description": "Every tile uses the tensor's maximum plane count.",
+          "type": "string",
+          "const": "Uniform"
+        },
+        {
+          "description": "Each tile records its own plane count.",
+          "type": "string",
+          "const": "PerTile"
+        }
+      ]
+    },
+    "PlaneCodec": {
+      "description": "Compact code used for each additive ternary plane.",
+      "oneOf": [
+        {
+          "description": "Two-bit ternary packing.",
+          "type": "string",
+          "const": "D2"
+        },
+        {
+          "description": "Base-3 packing of five ternary coefficients per byte.",
+          "type": "string",
+          "const": "B3"
+        },
+        {
+          "description": "Structured sparse 3-of-4 encoding.",
+          "type": "string",
+          "const": "S34"
+        }
+      ]
+    },
+    "PlaneRelation": {
+      "description": "Relationship between scales of successive additive planes.",
+      "oneOf": [
+        {
+          "description": "Every plane has an independently fitted scale.",
+          "type": "string",
+          "const": "Free"
+        },
+        {
+          "description": "Plane `p` has scale `s0 * (num / den)^p`.",
+          "type": "object",
+          "properties": {
+            "Tied": {
+              "type": "object",
+              "properties": {
+                "den": {
+                  "description": "Denominator of the positive scale ratio.",
+                  "type": "integer",
+                  "format": "uint32",
+                  "minimum": 0
+                },
+                "num": {
+                  "description": "Numerator of the positive scale ratio.",
+                  "type": "integer",
+                  "format": "uint32",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "num",
+                "den"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Tied"
+          ]
+        }
+      ]
+    },
+    "QuantLimits": {
+      "description": "Logical byte bounds, not complete memory/RSS or solver admission.",
+      "type": "object",
+      "properties": {
+        "max_asset_bytes": {
+          "description": "Sum of original assets retained in the output.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_package_bytes": {
+          "description": "Complete output package bound, enforced before writer allocation.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_retained_blob_bytes": {
+          "description": "Sum of unique encoded output blob payload bytes.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_source_bytes": {
+          "description": "Sum of actual original tensor payload bytes.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max_source_bytes",
+        "max_asset_bytes",
+        "max_retained_blob_bytes",
+        "max_package_bytes"
+      ]
+    },
+    "QuantSourceTensor": {
+      "description": "Original tensor interpretation, never an adapter-supplied content hash.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Exact logical tensor name.",
+          "type": "string"
+        },
+        "precision": {
+          "description": "Original stored float precision, before widening or fitting.",
+          "$ref": "#/$defs/ScalePrecision"
+        },
+        "shape": {
+          "description": "Positive row-major dimensions in the original source.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "shape",
+        "precision"
+      ]
+    },
+    "ScaleAnchor": {
+      "description": "Grouping axis to which an additive scale is anchored.",
+      "oneOf": [
+        {
+          "description": "One scale per declared group.",
+          "type": "string",
+          "const": "Group"
+        },
+        {
+          "description": "One scale per matrix row.",
+          "type": "string",
+          "const": "Row"
+        },
+        {
+          "description": "One scale for the complete tensor.",
+          "type": "string",
+          "const": "Tensor"
+        },
+        {
+          "description": "One scale per output channel.",
+          "type": "string",
+          "const": "Channel"
+        }
+      ]
+    },
+    "ScaleLaw": {
+      "description": "Scale law represented as orthogonal anchor, relation, and storage precision.",
+      "type": "object",
+      "properties": {
+        "anchor": {
+          "description": "Scale grouping axis.",
+          "$ref": "#/$defs/ScaleAnchor"
+        },
+        "precision": {
+          "description": "Scale storage precision.",
+          "$ref": "#/$defs/ScalePrecision"
+        },
+        "relation": {
+          "description": "Cross-plane scale relationship.",
+          "$ref": "#/$defs/PlaneRelation"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "anchor",
+        "relation",
+        "precision"
+      ]
+    },
+    "ScalePrecision": {
+      "description": "Precision used to store additive plane scales.",
+      "oneOf": [
+        {
+          "description": "IEEE binary16.",
+          "type": "string",
+          "const": "F16"
+        },
+        {
+          "description": "Brain floating-point 16-bit.",
+          "type": "string",
+          "const": "Bf16"
+        },
+        {
+          "description": "IEEE binary32.",
+          "type": "string",
+          "const": "F32"
+        }
+      ]
+    },
+    "Transport": {
+      "description": "Optional entropy transport applied outside the tensor's plane codec.",
+      "oneOf": [
+        {
+          "description": "Store codec bytes directly.",
+          "type": "string",
+          "const": "Raw"
+        },
+        {
+          "description": "Joint Huffman coding with the specified block width.",
+          "type": "object",
+          "properties": {
+            "JointHuffman": {
+              "type": "object",
+              "properties": {
+                "block": {
+                  "description": "Number of symbols grouped into one entropy-coding block.",
+                  "type": "integer",
+                  "format": "uint32",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "block"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "JointHuffman"
+          ]
+        }
+      ]
+    },
+    "WeightedOwnerCache": {
+      "description": "A complete immutable cache interpretation and its scalar-window weight.",
+      "type": "object",
+      "properties": {
+        "binding": {
+          "description": "Expected complete binding, verified against actual cache content at execution.",
+          "$ref": "#/$defs/OwnerScoreCacheBinding"
+        },
+        "weight": {
+          "description": "Nonnegative finite window weight.",
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "binding",
+        "weight"
+      ]
+    },
+    "WorkPrecision": {
+      "description": "Arithmetic of sequential feedback, not the storage precision or memory footprint.",
+      "oneOf": [
+        {
+          "description": "f32 working values/residuals, with f64 metric and correction accumulation.",
+          "type": "string",
+          "const": "F32Accum64"
+        },
+        {
+          "description": "Existing f64 feedback oracle; a selected fitter may still accept f32 inputs.",
+          "type": "string",
+          "const": "F64"
+        }
+      ]
+    }
+  }
+}

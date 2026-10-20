@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TensorUploadPolicy",
+  "description": "Pre-upload policy for a single semantic tensor payload.",
+  "type": "object",
+  "properties": {
+    "max_payload_bytes": {
+      "description": "Maximum owned payload bytes; `None` leaves this per-tensor limit unset.\nThis is not complete physical/model-memory admission.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "native_only": {
+      "description": "Reject dense emulation before any upload takes place.",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "native_only"
+  ]
+}

@@ -13,7 +13,7 @@
 #
 # `build-mode: none` everywhere: the compiled languages here need CUDA/ROCm/Metal toolkits that no
 # hosted runner has, and scanning source without building is the only mode that can run on a free
-# ubuntu-latest lane.
+# ubuntu-24.04 lane.
 name: CodeQL
 
 on:
@@ -36,7 +36,7 @@ concurrency:
 jobs:
   analyze:
     name: analyze (${{ matrix.language }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
       # Scoped to this job only; the workflow default above stays read-only.

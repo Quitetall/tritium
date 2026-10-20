@@ -1,20 +1,39 @@
 //! Campaign-owned execution admission over exact selected Qwen packages.
 
 mod output_binding;
+mod refined_candidate;
 
 pub use output_binding::{
     Qwen36FinalLogitsOutputBindingError, Qwen36FinalLogitsOutputBindingReceipt,
+    Qwen36OutputScopeBindingReceipt,
 };
+use refined_candidate::ChildReplayEvidence;
+pub use refined_candidate::Qwen36RefinedCandidateExecutionReceipt;
 
 use core::{convert::Infallible, fmt};
-use std::{error::Error, path::Path};
-
-use tritium_format::{ModelId, PackageId};
-use tritium_nn::{
-    NnError, Qwen35ExecutionOutputBatch, Qwen35ExecutionVisitError, Qwen35SaltV2LanguageMtpModel,
-    Qwen35UntrustedRuntimeTranscript,
+use std::{
+    error::Error,
+    io::{Read, Seek, Write},
+    path::Path,
 };
-use tritium_quantize::SaltV2Profile;
+
+use tritium_format::{
+    ModelId, PackageId, RuntimeOutputScope,
+    salt_v2_package::{
+        SaltV2PackageReader, SaltV2ScaleUpdateChild, SaltV2ScaleUpdateChildError,
+        write_salt_v2_scale_update_child,
+    },
+};
+use tritium_nn::{
+    NnError, Projection, Qwen35ExecutionOutputBatch, Qwen35ExecutionVisitError,
+    Qwen35SaltV2LanguageMtpModel, Qwen35UntrustedRuntimeTranscript,
+};
+use tritium_quantize::{
+    FixedTritScaleUpdateCandidate, FixedTritScaleUpdateCandidateBuilder,
+    OutputReconstructionActivationSet, OutputReconstructionActivationSource,
+    OutputReconstructionError, OutputReconstructionScaleCandidate, OutputReconstructionScope,
+    OutputReconstructionSpec, SaltV2Profile,
+};
 
 use crate::{ContentId, Qwen36PreservedSafetensorsError};
 
@@ -142,6 +161,47 @@ impl<E: Error + 'static> Error for Qwen36ExecutionReplayError<E> {
         match self {
             Self::Open(error) => Some(error),
             Self::Execute(error) => Some(error),
+        }
+    }
+}
+
+/// Failure while fitting one fixed-trit scale plane from admitted Qwen activations.
+#[derive(Debug)]
+pub enum Qwen36ScaleRefitWindowError {
+    /// The parent package admission changed during the operation.
+    Admission(Qwen36PackageAdmissionError),
+    /// The parent execution or Qwen projection computation was invalid.
+    Runtime(NnError),
+    /// The activation scope or scale-fit observation did not match its contract.
+    Fit(OutputReconstructionError),
+    /// Tensor name did not identify a canonical language-layer projection.
+    InvalidTensorName,
+    /// Spec, parent, or in-progress candidate identities disagree.
+    ProvenanceMismatch,
+}
+
+impl fmt::Display for Qwen36ScaleRefitWindowError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Admission(error) => write!(formatter, "scale refit admission: {error}"),
+            Self::Runtime(error) => write!(formatter, "scale refit Qwen runtime: {error}"),
+            Self::Fit(error) => write!(formatter, "scale refit fit: {error}"),
+            Self::InvalidTensorName => formatter
+                .write_str("scale refit tensor name is not a canonical language projection"),
+            Self::ProvenanceMismatch => {
+                formatter.write_str("scale refit spec, parent, execution, or candidate differs")
+            }
+        }
+    }
+}
+
+impl Error for Qwen36ScaleRefitWindowError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Admission(error) => Some(error),
+            Self::Runtime(error) => Some(error),
+            Self::Fit(error) => Some(error),
+            Self::InvalidTensorName | Self::ProvenanceMismatch => None,
         }
     }
 }
@@ -446,6 +506,27 @@ pub struct Qwen36AdmittedExecutionSession<'admission, 'allocated, 'parent, 'stor
     authority: ExecutionAuthority,
 }
 
+/// Exact inputs for a fresh, campaign-admitted scale-refined child replay.
+#[derive(Debug)]
+pub struct Qwen36RefinedCandidateReplay<'a> {
+    /// Current admitted PTQ parent execution receipt.
+    pub parent_execution: &'a Qwen36AdmittedExecutionReceipt,
+    /// Bundle directory containing the parent manifest and preserved tensors.
+    pub bundle_dir: &'a Path,
+    /// Immutable child SALT package bytes to execute.
+    pub child_package_path: &'a Path,
+    /// Verified parent/update/child package lineage.
+    pub lineage: SaltV2ScaleUpdateChild,
+    /// Frozen output-evaluation specification.
+    pub spec: &'a OutputReconstructionSpec,
+    /// Canonical output-reconstruction receipt bytes selected for this child.
+    pub output_bytes: &'a [u8],
+    /// Content-bound scale candidate matching the child lineage.
+    pub scale_candidate: OutputReconstructionScaleCandidate<'a>,
+    /// Ordered tokens and row masks for all frozen block and final-logit scopes.
+    pub scope_batches: &'a [(&'a [u32], &'a [bool])],
+}
+
 impl fmt::Debug for Qwen36AdmittedExecutionSession<'_, '_, '_, '_, '_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -461,6 +542,651 @@ impl fmt::Debug for Qwen36AdmittedExecutionSession<'_, '_, '_, '_, '_> {
 impl<'admission, 'allocated, 'parent, 'store, 'source>
     Qwen36AdmittedExecutionSession<'admission, 'allocated, 'parent, 'store, 'source>
 {
+    /// Materialize one fitted restart as a strict immutable child of this session's package.
+    ///
+    /// The parent reader must be the strict package instance used by this admitted
+    /// execution session. The returned child lineage binds the exact parent and
+    /// fitted scale update. Callers must stage `output` and publish it atomically
+    /// only after this method succeeds; the writer may contain partial bytes on error.
+    /// Each restart may be materialized for candidate scoring, then the selected
+    /// restart must be resolved from its output receipt with
+    /// [`tritium_quantize::OutputReconstructionReceipt::selected_fitted_scale_update_candidate`].
+    ///
+    /// # Errors
+    /// Rejects changed admission, a different parent execution/package, mismatched
+    /// fit specification or parent identity, invalid package updates, and I/O errors.
+    pub fn materialize_scale_update_candidate_child<R, W>(
+        &self,
+        parent_execution: &Qwen36AdmittedExecutionReceipt,
+        spec: &OutputReconstructionSpec,
+        candidate: &FixedTritScaleUpdateCandidate,
+        parent: &mut SaltV2PackageReader<R>,
+        output: W,
+    ) -> Result<(W, SaltV2ScaleUpdateChild), Qwen36ExecutionVisitError<Infallible>>
+    where
+        R: Read + Seek,
+        W: Read + Write + Seek,
+    {
+        self.admission
+            .verify_current()
+            .map_err(Qwen36ExecutionVisitError::Admission)?;
+        output_binding::validate_execution(&self.authority, parent_execution)
+            .map_err(Qwen36ExecutionVisitError::Runtime)?;
+        if spec.source_model_id() != self.authority.source_model_id
+            || spec.token_stream_digest() != parent_execution.token_stream_digest()
+            || parent_execution.package_id() != self.authority.package_id
+            || parent.package_id() != self.authority.package_id
+        {
+            return Err(Qwen36ExecutionVisitError::Runtime(NnError::Provenance(
+                "scale-update child parent differs from admitted execution".to_owned(),
+            )));
+        }
+        let scale_candidate = candidate.as_scale_candidate(spec).map_err(|error| {
+            Qwen36ExecutionVisitError::Runtime(NnError::InvalidArtifact(format!(
+                "validate scale-update candidate: {error}"
+            )))
+        })?;
+        if scale_candidate.parent_package_digest() != self.authority.package_id.as_bytes() {
+            return Err(Qwen36ExecutionVisitError::Runtime(NnError::Provenance(
+                "scale-update candidate is bound to a different admitted package".to_owned(),
+            )));
+        }
+        let (output, lineage) =
+            write_salt_v2_scale_update_child(parent, output, scale_candidate.updates()).map_err(
+                |error: SaltV2ScaleUpdateChildError| {
+                    Qwen36ExecutionVisitError::Runtime(NnError::InvalidArtifact(format!(
+                        "materialize scale-update child: {error}"
+                    )))
+                },
+            )?;
+        parent.verify_unchanged().map_err(|error| {
+            Qwen36ExecutionVisitError::Runtime(NnError::InvalidArtifact(format!(
+                "verify scale-update parent after child materialization: {error}"
+            )))
+        })?;
+        self.admission
+            .verify_current()
+            .map_err(Qwen36ExecutionVisitError::Admission)?;
+        Ok((output, lineage))
+    }
+
+    /// Observe one frozen output-reconstruction scope in an exact fixed-trit fit.
+    ///
+    /// The activation set is reopened against `spec` for every call, and the
+    /// parent execution, model identity, in-progress builder, and live package
+    /// admission are checked before the dense teacher/current-package outputs
+    /// reach the scale fitter. The builder must already be active on the exact
+    /// named projection's packed parent plane. Call once for each frozen scope
+    /// that contains that projection's layer.
+    ///
+    /// # Errors
+    /// Rejects changed admission, mismatched model/token/spec/parent identities,
+    /// malformed activation sources or scopes, and projection/fit errors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn observe_scale_refit_scope<S: OutputReconstructionActivationSource + ?Sized>(
+        &self,
+        parent_execution: &Qwen36AdmittedExecutionReceipt,
+        spec: &OutputReconstructionSpec,
+        activation_source: &S,
+        scope: OutputReconstructionScope,
+        token_start: u64,
+        token_count: u64,
+        max_decoded_bytes: u64,
+        tensor_name: &str,
+        teacher: &Projection,
+        builder: &mut FixedTritScaleUpdateCandidateBuilder<'_>,
+    ) -> Result<(), Qwen36ScaleRefitWindowError> {
+        self.admission
+            .verify_current()
+            .map_err(Qwen36ScaleRefitWindowError::Admission)?;
+        output_binding::validate_execution(&self.authority, parent_execution)
+            .map_err(Qwen36ScaleRefitWindowError::Runtime)?;
+        if spec.source_model_id() != self.authority.source_model_id
+            || spec.token_stream_digest() != parent_execution.token_stream_digest()
+            || parent_execution.package_id() != self.authority.package_id
+            || !builder.is_bound_to(spec, self.authority.package_id.as_bytes())
+        {
+            return Err(Qwen36ScaleRefitWindowError::ProvenanceMismatch);
+        }
+
+        let layer_index = qwen_language_projection_layer(tensor_name)
+            .ok_or(Qwen36ScaleRefitWindowError::InvalidTensorName)?;
+        let OutputReconstructionScope::Block { start, end } = scope else {
+            return Err(Qwen36ScaleRefitWindowError::Fit(
+                OutputReconstructionError::InvalidActivationWindowScope,
+            ));
+        };
+        if layer_index < start || layer_index >= end {
+            return Err(Qwen36ScaleRefitWindowError::Fit(
+                OutputReconstructionError::InvalidActivationWindowScope,
+            ));
+        }
+
+        let activation_set = OutputReconstructionActivationSet::new(spec, activation_source)
+            .map_err(Qwen36ScaleRefitWindowError::Fit)?;
+        let windows = activation_set
+            .read_window(scope, token_start, token_count, max_decoded_bytes)
+            .map_err(Qwen36ScaleRefitWindowError::Fit)?;
+        let activation_window =
+            windows
+                .layer(layer_index)
+                .ok_or(Qwen36ScaleRefitWindowError::Fit(
+                    OutputReconstructionError::InvalidActivationWindowScope,
+                ))?;
+        let rows = usize::try_from(activation_window.token_count()).map_err(|_| {
+            Qwen36ScaleRefitWindowError::Fit(OutputReconstructionError::InvalidGeometry)
+        })?;
+        let mut fit_error = None;
+        self.model
+            .runner()
+            .visit_named_projection_output_pairs(
+                tensor_name,
+                teacher,
+                activation_window.values(),
+                rows,
+                |teacher_outputs, current_outputs| {
+                    if fit_error.is_none() {
+                        fit_error = builder
+                            .observe_window_from_current_projection(
+                                activation_window,
+                                teacher_outputs,
+                                current_outputs,
+                            )
+                            .err();
+                    }
+                },
+            )
+            .map_err(Qwen36ScaleRefitWindowError::Runtime)?;
+        if let Some(error) = fit_error {
+            return Err(Qwen36ScaleRefitWindowError::Fit(error));
+        }
+        self.admission
+            .verify_current()
+            .map_err(Qwen36ScaleRefitWindowError::Admission)
+    }
+
+    /// Observe every frozen scheduled block window that contains one projection.
+    ///
+    /// Token windows are supplied in increasing, non-overlapping order and must
+    /// match the spec's frozen batch count. Windows are streamed one at a time;
+    /// each admitted scope is reopened and checked by
+    /// [`Self::observe_scale_refit_scope`]. Final-logit scopes are deliberately
+    /// excluded because they are scored by the output-reconstruction receipt,
+    /// not used as layer-local scale-fit observations.
+    ///
+    /// The builder is incremental. If any observation fails, the caller must
+    /// discard it rather than finish or publish a partial candidate.
+    ///
+    /// # Errors
+    /// Rejects malformed batch schedules, absent projection scopes, changed
+    /// admission, mismatched identities, or invalid activation/output data.
+    #[allow(clippy::too_many_arguments)]
+    pub fn observe_scale_refit_scheduled_windows<
+        S: OutputReconstructionActivationSource + ?Sized,
+    >(
+        &self,
+        parent_execution: &Qwen36AdmittedExecutionReceipt,
+        spec: &OutputReconstructionSpec,
+        activation_source: &S,
+        token_windows: &[(u64, u64)],
+        max_decoded_bytes: u64,
+        tensor_name: &str,
+        teacher: &Projection,
+        builder: &mut FixedTritScaleUpdateCandidateBuilder<'_>,
+    ) -> Result<(), Qwen36ScaleRefitWindowError> {
+        if token_windows.len() != usize::try_from(spec.batches_per_scope()).unwrap_or(usize::MAX) {
+            return Err(Qwen36ScaleRefitWindowError::Fit(
+                OutputReconstructionError::InvalidCount,
+            ));
+        }
+        let mut previous_end = None;
+        for &(token_start, token_count) in token_windows {
+            let Some(token_end) = token_start.checked_add(token_count) else {
+                return Err(Qwen36ScaleRefitWindowError::Fit(
+                    OutputReconstructionError::InvalidGeometry,
+                ));
+            };
+            if token_count == 0 || previous_end.is_some_and(|end| token_start < end) {
+                return Err(Qwen36ScaleRefitWindowError::Fit(
+                    OutputReconstructionError::InvalidGeometry,
+                ));
+            }
+            previous_end = Some(token_end);
+        }
+
+        let layer_index = qwen_language_projection_layer(tensor_name)
+            .ok_or(Qwen36ScaleRefitWindowError::InvalidTensorName)?;
+        let mut observed_scope = false;
+        for &scope in spec.scopes() {
+            let OutputReconstructionScope::Block { start, end } = scope else {
+                continue;
+            };
+            if layer_index < start || layer_index >= end {
+                continue;
+            }
+            observed_scope = true;
+            for &(token_start, token_count) in token_windows {
+                self.observe_scale_refit_scope(
+                    parent_execution,
+                    spec,
+                    activation_source,
+                    scope,
+                    token_start,
+                    token_count,
+                    max_decoded_bytes,
+                    tensor_name,
+                    teacher,
+                    builder,
+                )?;
+            }
+        }
+        if !observed_scope {
+            return Err(Qwen36ScaleRefitWindowError::Fit(
+                OutputReconstructionError::InvalidActivationWindowScope,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Fit one deterministic fixed-trit tile-plane candidate from an admitted parent.
+    ///
+    /// This is the bounded primitive used by a B3 window search: it reopens the
+    /// selected packed plane from the exact admitted package, observes every
+    /// frozen block/token window containing the named projection, and returns
+    /// one content-bound scale-update candidate. Callers can evaluate this
+    /// candidate by materializing an immutable child package and replaying it;
+    /// candidates are never applied to the admitted parent in place.
+    ///
+    /// # Errors
+    /// Rejects a different parent/execution, non-projection tensor, missing
+    /// tile-plane target, malformed schedule, or any activation/refit failure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fit_scale_refit_tile_plane_candidate<
+        R: Read + Seek,
+        S: OutputReconstructionActivationSource + ?Sized,
+    >(
+        &self,
+        parent_execution: &Qwen36AdmittedExecutionReceipt,
+        spec: &OutputReconstructionSpec,
+        activation_source: &S,
+        token_windows: &[(u64, u64)],
+        max_decoded_bytes: u64,
+        tensor_name: &str,
+        tile_index: usize,
+        plane_index: usize,
+        initialization_seed: u64,
+        coordinate_sweeps: usize,
+        teacher: &Projection,
+        parent: &mut SaltV2PackageReader<R>,
+    ) -> Result<FixedTritScaleUpdateCandidate, Qwen36ScaleRefitWindowError> {
+        self.fit_scale_refit_candidate(
+            parent_execution,
+            spec,
+            activation_source,
+            token_windows,
+            max_decoded_bytes,
+            &[(tensor_name, tile_index, plane_index, teacher)],
+            initialization_seed,
+            coordinate_sweeps,
+            parent,
+        )
+    }
+
+    /// Fit one deterministic multi-plane B3 candidate from an admitted parent.
+    ///
+    /// `targets` is an ordered set of `(tensor name, tile, plane, teacher)`
+    /// coordinates. The order must match the package's encoded tensor order,
+    /// then tile and plane order. Each target is fitted against all frozen
+    /// scheduled block/token windows containing its projection. The resulting
+    /// candidate commits the complete ordered update set; it can only be
+    /// evaluated by creating and replaying an immutable child package.
+    ///
+    /// The operation retains one active tile-plane fit at a time. On any error,
+    /// no candidate is returned and the caller must discard the attempt.
+    ///
+    /// # Errors
+    /// Rejects malformed target order, a different parent/execution, missing
+    /// tile-plane targets, invalid schedules, or activation/refit failures.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fit_scale_refit_candidate<
+        R: Read + Seek,
+        S: OutputReconstructionActivationSource + ?Sized,
+    >(
+        &self,
+        parent_execution: &Qwen36AdmittedExecutionReceipt,
+        spec: &OutputReconstructionSpec,
+        activation_source: &S,
+        token_windows: &[(u64, u64)],
+        max_decoded_bytes: u64,
+        targets: &[(&str, usize, usize, &Projection)],
+        initialization_seed: u64,
+        coordinate_sweeps: usize,
+        parent: &mut SaltV2PackageReader<R>,
+    ) -> Result<FixedTritScaleUpdateCandidate, Qwen36ScaleRefitWindowError> {
+        self.admission
+            .verify_current()
+            .map_err(Qwen36ScaleRefitWindowError::Admission)?;
+        output_binding::validate_execution(&self.authority, parent_execution)
+            .map_err(Qwen36ScaleRefitWindowError::Runtime)?;
+        if spec.source_model_id() != self.authority.source_model_id
+            || spec.token_stream_digest() != parent_execution.token_stream_digest()
+            || parent_execution.package_id() != self.authority.package_id
+            || parent.package_id() != self.authority.package_id
+        {
+            return Err(Qwen36ScaleRefitWindowError::ProvenanceMismatch);
+        }
+        if targets.is_empty() {
+            return Err(Qwen36ScaleRefitWindowError::Fit(
+                OutputReconstructionError::InvalidCount,
+            ));
+        }
+
+        let codec = parent.codec();
+        let mut resolved_targets = Vec::new();
+        resolved_targets
+            .try_reserve_exact(targets.len())
+            .map_err(|_| {
+                Qwen36ScaleRefitWindowError::Fit(OutputReconstructionError::ReceiptAllocationFailed)
+            })?;
+        let mut previous_target = None;
+        for &(tensor_name, tile_index, plane_index, teacher) in targets {
+            let projection_layer = qwen_language_projection_layer(tensor_name)
+                .ok_or(Qwen36ScaleRefitWindowError::InvalidTensorName)?;
+            if !spec.scopes().iter().any(|scope| {
+                matches!(scope, OutputReconstructionScope::Block { start, end }
+                    if projection_layer >= *start && projection_layer < *end)
+            }) {
+                return Err(Qwen36ScaleRefitWindowError::Fit(
+                    OutputReconstructionError::InvalidActivationWindowScope,
+                ));
+            }
+            let tensor_index = parent
+                .tensor_names_encoded_order()
+                .position(|name| name == tensor_name)
+                .ok_or_else(|| {
+                    Qwen36ScaleRefitWindowError::Runtime(NnError::InvalidArtifact(
+                        "scale-refit tensor is absent from the admitted package".to_owned(),
+                    ))
+                })?;
+            let target = (tensor_index, tile_index, plane_index);
+            if previous_target.is_some_and(|previous| target <= previous) {
+                return Err(Qwen36ScaleRefitWindowError::Fit(
+                    OutputReconstructionError::NonCanonicalScaleUpdateOrder,
+                ));
+            }
+            previous_target = Some(target);
+            let tensor_info = parent.tensor_info(tensor_name).ok_or_else(|| {
+                Qwen36ScaleRefitWindowError::Runtime(NnError::InvalidArtifact(
+                    "scale-refit tensor metadata is absent from the admitted package".to_owned(),
+                ))
+            })?;
+            if tensor_info.dims().len() != 2 {
+                return Err(Qwen36ScaleRefitWindowError::Runtime(
+                    NnError::InvalidArtifact("scale-refit tensor is not a matrix".to_owned()),
+                ));
+            }
+            let output_width = usize::try_from(tensor_info.dims()[0]).map_err(|_| {
+                Qwen36ScaleRefitWindowError::Fit(OutputReconstructionError::InvalidGeometry)
+            })?;
+            resolved_targets.push((
+                tensor_name,
+                tensor_index,
+                tile_index,
+                plane_index,
+                output_width,
+                tensor_info.scale_group_size(),
+                teacher,
+            ));
+        }
+
+        let mut builder = FixedTritScaleUpdateCandidateBuilder::new(
+            spec,
+            parent.package_id().as_bytes(),
+            initialization_seed,
+        );
+        for (
+            tensor_name,
+            tensor_index,
+            tile_index,
+            plane_index,
+            output_width,
+            scale_group_size,
+            teacher,
+        ) in resolved_targets
+        {
+            let mut matched_plane = false;
+            let mut fit_error = None;
+            parent
+                .visit_packed_tensor(tensor_name, |packed_plane| {
+                    if matched_plane
+                        || packed_plane.tile_index() != tile_index
+                        || packed_plane.plane_index() != plane_index
+                    {
+                        return;
+                    }
+                    matched_plane = true;
+                    let result = (|| {
+                        builder
+                            .begin_packed_tile_plane(
+                                tensor_index,
+                                codec,
+                                packed_plane,
+                                output_width,
+                                scale_group_size,
+                                coordinate_sweeps,
+                            )
+                            .map_err(Qwen36ScaleRefitWindowError::Fit)?;
+                        self.observe_scale_refit_scheduled_windows(
+                            parent_execution,
+                            spec,
+                            activation_source,
+                            token_windows,
+                            max_decoded_bytes,
+                            tensor_name,
+                            teacher,
+                            &mut builder,
+                        )?;
+                        builder
+                            .finish_tile_plane()
+                            .map_err(Qwen36ScaleRefitWindowError::Fit)
+                    })();
+                    if let Err(error) = result {
+                        fit_error = Some(error);
+                    }
+                })
+                .map_err(|error| {
+                    Qwen36ScaleRefitWindowError::Runtime(NnError::InvalidArtifact(format!(
+                        "read admitted scale-refit parent plane: {error}"
+                    )))
+                })?;
+            parent.verify_unchanged().map_err(|error| {
+                Qwen36ScaleRefitWindowError::Runtime(NnError::InvalidArtifact(format!(
+                    "verify admitted scale-refit parent: {error}"
+                )))
+            })?;
+            if let Some(error) = fit_error {
+                return Err(error);
+            }
+            if !matched_plane {
+                return Err(Qwen36ScaleRefitWindowError::Fit(
+                    OutputReconstructionError::InvalidGeometry,
+                ));
+            }
+        }
+        self.admission
+            .verify_current()
+            .map_err(Qwen36ScaleRefitWindowError::Admission)?;
+        builder.finish().map_err(Qwen36ScaleRefitWindowError::Fit)
+    }
+
+    /// Freshly replay and admit an immutable scale-refined child of this exact
+    /// campaign package. The supplied scope batches are executed once for final
+    /// logits and again for the frozen output-reconstruction scopes; both passes
+    /// use the same ordered tokens.
+    ///
+    /// A structurally valid output receipt is not enough: this method reloads the
+    /// child package, validates its parent lineage and physical ledgers, replays
+    /// it on the sealed built-in backend, and binds the resulting transcript to
+    /// the selected output receipt and current campaign admission.
+    ///
+    /// # Errors
+    /// Fails closed if the campaign admission changes, the child is not descended
+    /// from this session's exact package, package loading or runtime replay fails,
+    /// or any output/candidate/transcript identity differs.
+    pub fn replay_refined_candidate(
+        &self,
+        replay: Qwen36RefinedCandidateReplay<'_>,
+    ) -> Result<Qwen36RefinedCandidateExecutionReceipt, Qwen36ExecutionVisitError<Infallible>> {
+        self.admission
+            .verify_current()
+            .map_err(Qwen36ExecutionVisitError::Admission)?;
+        output_binding::validate_execution(&self.authority, replay.parent_execution)
+            .map_err(Qwen36ExecutionVisitError::Runtime)?;
+        if replay.lineage.parent_package_id() != self.authority.package_id
+            || replay.scale_candidate.parent_package_digest()
+                != self.authority.package_id.as_bytes()
+            || replay.scale_candidate.spec_id() != replay.spec.spec_id()
+            || replay.spec.source_model_id() != self.authority.source_model_id
+            || replay.spec.token_stream_digest() != replay.parent_execution.token_stream_digest()
+            || replay.scope_batches.is_empty()
+        {
+            return Err(Qwen36ExecutionVisitError::Runtime(NnError::Provenance(
+                "refined candidate does not match this admitted parent and output schedule"
+                    .to_owned(),
+            )));
+        }
+
+        let mut child_authority = self.authority.clone();
+        child_authority.package_id = replay.lineage.child_package_id();
+        let child_model = match child_authority.backend {
+            Qwen36ExecutionBackend::Cpu => {
+                Qwen35SaltV2LanguageMtpModel::load_bundle_scale_update_child(
+                    replay.bundle_dir,
+                    profile_name(child_authority.profile),
+                    replay.child_package_path,
+                    replay.lineage,
+                    Box::new(tritium_cpu::CpuBackend::new()),
+                )
+            }
+            #[cfg(feature = "cuda")]
+            Qwen36ExecutionBackend::Cuda { ordinal } => {
+                let ordinal = usize::try_from(ordinal).map_err(|_| {
+                    Qwen36ExecutionVisitError::Runtime(NnError::Backend(
+                        "CUDA ordinal exceeds usize".to_owned(),
+                    ))
+                })?;
+                let backend = tritium_cuda::CudaBackend::new(ordinal)
+                    .map_err(|error| Qwen36ExecutionVisitError::Runtime(NnError::from(error)))?;
+                Qwen35SaltV2LanguageMtpModel::load_bundle_scale_update_child(
+                    replay.bundle_dir,
+                    profile_name(child_authority.profile),
+                    replay.child_package_path,
+                    replay.lineage,
+                    Box::new(backend),
+                )
+            }
+            #[cfg(not(feature = "cuda"))]
+            Qwen36ExecutionBackend::Cuda { .. } => {
+                return Err(Qwen36ExecutionVisitError::Runtime(NnError::Backend(
+                    "CUDA refined replay requires the cuda feature".to_owned(),
+                )));
+            }
+        }
+        .map_err(Qwen36ExecutionVisitError::Runtime)?;
+
+        self.replay_refined_candidate_with_model(replay, child_model)
+    }
+
+    fn replay_refined_candidate_with_model(
+        &self,
+        replay: Qwen36RefinedCandidateReplay<'_>,
+        child_model: Qwen35SaltV2LanguageMtpModel,
+    ) -> Result<Qwen36RefinedCandidateExecutionReceipt, Qwen36ExecutionVisitError<Infallible>> {
+        self.admission
+            .verify_current()
+            .map_err(Qwen36ExecutionVisitError::Admission)?;
+        output_binding::validate_execution(&self.authority, replay.parent_execution)
+            .map_err(Qwen36ExecutionVisitError::Runtime)?;
+        if replay.lineage.parent_package_id() != self.authority.package_id
+            || replay.scale_candidate.parent_package_digest()
+                != self.authority.package_id.as_bytes()
+            || replay.scale_candidate.spec_id() != replay.spec.spec_id()
+            || replay.spec.source_model_id() != self.authority.source_model_id
+            || replay.spec.token_stream_digest() != replay.parent_execution.token_stream_digest()
+            || replay.scope_batches.is_empty()
+        {
+            return Err(Qwen36ExecutionVisitError::Runtime(NnError::Provenance(
+                "refined candidate does not match this admitted parent and output schedule"
+                    .to_owned(),
+            )));
+        }
+        let mut child_authority = self.authority.clone();
+        child_authority.package_id = replay.lineage.child_package_id();
+        validate_loaded_model(&child_authority, &child_model)
+            .map_err(Qwen36ExecutionVisitError::Runtime)?;
+
+        let scopes = output_runtime_scopes(replay.spec)?;
+        let mut final_batches = Vec::new();
+        final_batches
+            .try_reserve_exact(replay.scope_batches.len())
+            .map_err(|_| {
+                Qwen36ExecutionVisitError::Runtime(NnError::ResourceExhausted(
+                    "allocate refined replay batch references".to_owned(),
+                ))
+            })?;
+        final_batches.extend(replay.scope_batches.iter().map(|(tokens, _)| *tokens));
+        let transcript = child_model
+            .try_visit_untrusted_final_logits(final_batches.iter().copied(), |_| {
+                Ok::<_, Infallible>(())
+            })
+            .map_err(map_execution_error)?;
+        validate_transcript(&child_authority, &transcript)
+            .map_err(Qwen36ExecutionVisitError::Runtime)?;
+        let scope_transcript = child_model
+            .try_visit_untrusted_output_scopes(
+                replay.spec.spec_id(),
+                replay.scale_candidate.candidate_id(),
+                replay.scale_candidate.initialization_seed(),
+                &scopes,
+                replay.scope_batches.iter().copied(),
+            )
+            .map_err(map_execution_error)?;
+
+        self.admission
+            .verify_current()
+            .map_err(Qwen36ExecutionVisitError::Admission)?;
+        Qwen36RefinedCandidateExecutionReceipt::from_child_replay(
+            replay.parent_execution,
+            replay.lineage,
+            ChildReplayEvidence {
+                spec: replay.spec,
+                output_bytes: replay.output_bytes,
+                scale_candidate: replay.scale_candidate,
+                transcript: &transcript,
+                scope_transcript: &scope_transcript,
+                backend: child_authority.backend,
+            },
+        )
+        .map_err(Qwen36ExecutionVisitError::Runtime)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replay_refined_candidate_test_fixture(
+        &self,
+        replay: Qwen36RefinedCandidateReplay<'_>,
+    ) -> Result<Qwen36RefinedCandidateExecutionReceipt, Qwen36ExecutionVisitError<Infallible>> {
+        let child_model =
+            Qwen35SaltV2LanguageMtpModel::load_bundle_scale_update_child_test_fixture(
+                replay.bundle_dir,
+                profile_name(self.authority.profile),
+                replay.child_package_path,
+                replay.lineage,
+                Box::new(tritium_cpu::CpuBackend::new()),
+            )
+            .map_err(Qwen36ExecutionVisitError::Runtime)?;
+        self.replay_refined_candidate_with_model(replay, child_model)
+    }
+
     /// Execute exact token batches and mint campaign-admitted final-logit evidence.
     ///
     /// # Errors
@@ -707,6 +1433,35 @@ struct ExecutionAuthority {
     identity_status: &'static str,
     official_payload_authenticated: bool,
     backend: Qwen36ExecutionBackend,
+}
+
+fn output_runtime_scopes(
+    spec: &OutputReconstructionSpec,
+) -> Result<Vec<RuntimeOutputScope>, Qwen36ExecutionVisitError<Infallible>> {
+    let mut scopes = Vec::new();
+    scopes.try_reserve_exact(spec.scopes().len()).map_err(|_| {
+        Qwen36ExecutionVisitError::Runtime(NnError::ResourceExhausted(
+            "allocate refined output-scope schedule".to_owned(),
+        ))
+    })?;
+    scopes.extend(spec.scopes().iter().map(|scope| match scope {
+        OutputReconstructionScope::Block { start, end } => RuntimeOutputScope::Block {
+            start: *start,
+            end: *end,
+        },
+        OutputReconstructionScope::FinalLogits => RuntimeOutputScope::FinalLogits,
+    }));
+    Ok(scopes)
+}
+
+fn qwen_language_projection_layer(tensor_name: &str) -> Option<u32> {
+    let suffix = tensor_name.strip_prefix("model.language_model.layers.")?;
+    let (index, projection) = suffix.split_once('.')?;
+    if projection.is_empty() {
+        return None;
+    }
+    let parsed = index.parse::<u32>().ok()?;
+    (parsed.to_string() == index).then_some(parsed)
 }
 
 fn execution_authority(
