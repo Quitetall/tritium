@@ -8356,3 +8356,94 @@ fn sparsity_crossover_sweep() {
          L2-resident column."
     );
 }
+
+/// The decode graph's `rmsnorm_quant_i8` (fused RMSNorm + int8 activation quant)
+/// against the host oracle, bit for bit: the canonical 256-slot sum of squares,
+/// `x * inv * w`, absmax scale and round-ties-even quant. Covers both BitNet
+/// widths, a width past the kernel's register-held weight slots (7200 > 14 * 512)
+/// and edge lengths, at the decode graph's 512 threads.
+#[test]
+fn rmsnorm_quant_i8_bit_matches_host() {
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+    use cudarc::nvrtc::Ptx;
+
+    let ctx = match CudaContext::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping rmsnorm_quant_i8 bit-match: no device ({e})");
+            return;
+        }
+    };
+    let stream = ctx.default_stream();
+    let dm = ctx
+        .load_module(Ptx::from_src(DECODE_PTX))
+        .expect("load decode module");
+    let f = dm
+        .load_function(KERNEL_NAME_RMSNORM_QUANT_I8)
+        .expect("rmsnorm_quant_i8");
+    for &n in &[2560usize, 6912, 7200, 17, 1] {
+        let mut s = 0x5EED_1234_ABCD_0001u64 ^ (n as u64).wrapping_mul(0x9E37_79B9);
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 11) as f32 / (1u64 << 53) as f32) * 8.0 - 4.0
+        };
+        let x: Vec<f32> = (0..n).map(|_| next()).collect();
+        let w: Vec<f32> = (0..n).map(|_| next()).collect();
+        let eps = 1e-5f32;
+
+        let mut part = [0.0f32; 256];
+        for (i, &v) in x.iter().enumerate() {
+            part[i % 256] += v * v;
+        }
+        let mut off = 128;
+        while off > 0 {
+            for t in 0..off {
+                part[t] += part[t + off];
+            }
+            off >>= 1;
+        }
+        let inv = 1.0 / (part[0] / n as f32 + eps).sqrt();
+        let y: Vec<f32> = x.iter().zip(&w).map(|(&xi, &wi)| xi * inv * wi).collect();
+        let gamma = y.iter().fold(0.0f32, |g, v| g.max(v.abs()));
+        let scale = 127.0f32 / gamma;
+        let want: Vec<i8> = y
+            .iter()
+            .map(|&v| (v * scale).round_ties_even().clamp(-128.0, 127.0) as i8)
+            .collect();
+        let want_scale = gamma / 127.0;
+
+        let d_x = stream.clone_htod(&x).unwrap();
+        let d_w = stream.clone_htod(&w).unwrap();
+        let mut d_q = stream.alloc_zeros::<i8>(n).unwrap();
+        let mut d_scale = stream.alloc_zeros::<f32>(1).unwrap();
+        let n_i = n as i32;
+        let mut launch = stream.launch_builder(&f);
+        launch
+            .arg(&d_x)
+            .arg(&d_w)
+            .arg(&eps)
+            .arg(&n_i)
+            .arg(&mut d_q)
+            .arg(&mut d_scale);
+        // SAFETY: `rmsnorm_quant_i8(x, w, eps, n, q_out, act_scale)` with buffers
+        // of `n` elements and `n` floats of dynamic shared memory.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (RMSNORM_QUANT_THREADS, 1, 1),
+                    shared_mem_bytes: (n * 4) as u32,
+                })
+                .unwrap();
+        }
+        let got = stream.clone_dtoh(&d_q).unwrap();
+        let got_scale = stream.clone_dtoh(&d_scale).unwrap()[0];
+        assert_eq!(got_scale.to_bits(), want_scale.to_bits(), "n={n}: scale");
+        for (i, (g, h)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(g, h, "n={n} i={i}: q {g} vs {h}");
+        }
+    }
+}
