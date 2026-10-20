@@ -1,0 +1,318 @@
+{
+ "base": [
+  "--fp-steps",
+  "165000",
+  "--fp-lr",
+  "1e-4",
+  "--fp-cache",
+  "/mnt/4tb/tmp/tritium-eat-ladder/fp-cache"
+ ],
+ "arms": {
+  "exact-label-2k": [
+   [],
+   2000
+  ],
+  "exact-teacher-2k": [
+   [
+    "--target",
+    "teacher"
+   ],
+   2000
+  ],
+  "exact-label-8k": [
+   [],
+   8000
+  ],
+  "exact-teacher-8k": [
+   [
+    "--target",
+    "teacher"
+   ],
+   8000
+  ],
+  "exact-label-32k": [
+   [],
+   32000
+  ],
+  "exact-teacher-32k": [
+   [
+    "--target",
+    "teacher"
+   ],
+   32000
+  ],
+  "fused-label-2k": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1"
+   ],
+   2000
+  ],
+  "fused-teacher-2k": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1",
+    "--target",
+    "teacher"
+   ],
+   2000
+  ],
+  "fused-label-8k": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1"
+   ],
+   8000
+  ],
+  "fused-teacher-8k": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1",
+    "--target",
+    "teacher"
+   ],
+   8000
+  ],
+  "fused-label-32k": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1"
+   ],
+   32000
+  ],
+  "fused-teacher-32k": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1",
+    "--target",
+    "teacher"
+   ],
+   32000
+  ],
+  "fused-label-128k": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1"
+   ],
+   128000
+  ],
+  "fused-teacher-128k": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1",
+    "--target",
+    "teacher"
+   ],
+   128000
+  ],
+  "fused-label-512k": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1"
+   ],
+   512000
+  ],
+  "fused-teacher-512k": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1",
+    "--target",
+    "teacher"
+   ],
+   512000
+  ],
+  "exact-teacher-8k-sparse20": [
+   [
+    "--target",
+    "teacher",
+    "--sparse-carry",
+    "20"
+   ],
+   8000
+  ],
+  "fused-teacher-128k-sparse20": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1",
+    "--target",
+    "teacher",
+    "--sparse-carry",
+    "20"
+   ],
+   128000
+  ],
+  "exact-teacher-8k-sparse5": [
+   [
+    "--target",
+    "teacher",
+    "--sparse-carry",
+    "5"
+   ],
+   8000
+  ],
+  "fused-teacher-128k-sparse5": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1",
+    "--target",
+    "teacher",
+    "--sparse-carry",
+    "5"
+   ],
+   128000
+  ],
+  "exact-teacher-8k-fpcarry": [
+   [
+    "--target",
+    "teacher",
+    "--carry-init",
+    "fp"
+   ],
+   8000
+  ],
+  "fused-teacher-128k-fpcarry": [
+   [
+    "--grad",
+    "noise",
+    "--draws",
+    "1",
+    "--target",
+    "teacher",
+    "--carry-init",
+    "fp"
+   ],
+   128000
+  ]
+ },
+ "lr_shift_grid": [
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11
+ ],
+ "selected": {
+  "exact-label-2k": 9,
+  "exact-teacher-2k": 8,
+  "exact-label-8k": 9,
+  "exact-teacher-8k": 9,
+  "exact-label-32k": 10,
+  "exact-teacher-32k": 11,
+  "fused-label-2k": 13,
+  "fused-teacher-2k": 13,
+  "fused-label-8k": 13,
+  "fused-teacher-8k": 14,
+  "fused-label-32k": 14,
+  "fused-teacher-32k": 14,
+  "fused-label-128k": 14,
+  "fused-teacher-128k": 14,
+  "fused-label-512k": 14,
+  "fused-teacher-512k": 13,
+  "exact-teacher-8k-sparse20": 7,
+  "fused-teacher-128k-sparse20": 12,
+  "exact-teacher-8k-sparse5": 7,
+  "fused-teacher-128k-sparse5": 11,
+  "exact-teacher-8k-fpcarry": 11,
+  "fused-teacher-128k-fpcarry": 15
+ },
+ "tune": "seed 101, half the budget, validation 0..999",
+ "eval": "seeds 1-5, validation 1000..4999",
+ "binary_sha256": "fdd2e59aec001d7874421d759f32a913f8cce9ff6311e6fd7e6022e24d19d2ff",
+ "quality": "UNKNOWN",
+ "grid_extension": {
+  "arms": [
+   "exact-teacher-32k",
+   "fused-label-2k",
+   "fused-label-8k",
+   "fused-teacher-8k",
+   "fused-teacher-32k",
+   "fused-label-128k",
+   "fused-teacher-128k",
+   "fused-label-512k",
+   "fused-teacher-512k",
+   "fused-teacher-128k-sparse20",
+   "fused-teacher-128k-sparse5",
+   "exact-teacher-8k-fpcarry",
+   "fused-teacher-128k-fpcarry"
+  ],
+  "extra_shifts": [
+   12,
+   13,
+   14
+  ],
+  "moved": {
+   "fused-label-2k": 13,
+   "fused-label-8k": 13,
+   "fused-teacher-8k": 14,
+   "fused-teacher-32k": 14,
+   "fused-label-128k": 14,
+   "fused-teacher-128k": 14,
+   "fused-label-512k": 14,
+   "fused-teacher-512k": 13,
+   "fused-teacher-128k-sparse20": 12,
+   "fused-teacher-128k-fpcarry": 14
+  },
+  "second_pass": {
+   "arms": [
+    "fused-label-512k",
+    "fused-teacher-128k-fpcarry"
+   ],
+   "extra_shifts": [
+    15,
+    16,
+    17
+   ],
+   "moved": {
+    "fused-teacher-128k-fpcarry": 15
+   },
+   "note": "fused-label-512k stays at 14 (interior after extension); superseded evals kept as eval-*.edge14.json"
+  },
+  "third_pass": {
+   "arms": [
+    "fused-teacher-2k",
+    "fused-label-32k"
+   ],
+   "extra_shifts": [
+    12,
+    13,
+    14,
+    15,
+    16
+   ],
+   "reason": "every other fused arm selected 12-14 after extension; these two had selected shift 4 (interior, single-seed noise) and were never extended, so they were tuned over the same extended grid for parity. Superseded evals kept as eval-*.shift4.json",
+   "moved": {
+    "fused-teacher-2k": 13,
+    "fused-label-32k": 14
+   }
+  }
+ }
+}

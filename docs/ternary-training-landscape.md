@@ -302,6 +302,11 @@ Results so far:
 - `docs/experiments/eat-o/rules-20261016/results.md` (U3, U4, U7, U8);
 - `docs/experiments/eat-o/estimator-20261016/results.md` (G1);
 - `docs/experiments/eat-o/fused-20261016/results.md` (F0–F5 and the training half of G).
+- `docs/experiments/eat-o/deep-20261016/results.md` (width, depth, timing: from-scratch data
+  multiplier ~60–250×, grows with width; fused ≈ backprop per example);
+- `docs/experiments/eat-o/recovery-20261016/results.md` (recovering a ternarized fp model:
+  fused reaches 93.8% from 82.2% in 2k examples and plateaus ~95.3%; a 20% near-boundary
+  sparse carry ties dense backprop recovery).
 
 ### Axis M: capacity, last
 
