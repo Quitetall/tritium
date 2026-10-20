@@ -17,11 +17,12 @@
 // other rows share the batch: prefill and verification are batch-invariant.
 //
 // **K permutation.** An MMA sums its sixteen k-slots in hardware, so which column
-// sits in which slot is free as long as both operands agree. Each thread's four
-// slots per step take consecutive trits of the bytes it decodes: thread `c` of a
-// quad owns byte `c` of every payload word. Words 0-11 make three groups of four
-// words (80 trits, five steps); word 12's sixteen real trits are step 15, four per
-// thread. `salt_v2_mma_split_act` writes activations in that same order.
+// sits in which slot is free as long as both operands agree. Quad thread `c` owns
+// byte `c` of every payload word. Words 0-11 make three groups of four words and
+// five k16 steps each: steps 5G .. 5G + 3 take digits 0-3 of byte c of word
+// 4G + s, step 5G + 4 takes digit 4 of byte c of words 4G .. 4G + 3. That keeps
+// one word's weights live at a time. Word 12's sixteen real trits are step 15,
+// four per thread. `salt_v2_mma_split_act` writes activations in the same order.
 //
 // Requires B3, scale group 128, `k % 256 == 0`, and every fused tensor's row count
 // a multiple of 16; the host checks all four.
@@ -29,15 +30,10 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
-#ifndef MMA16_MIN_BLOCKS
-#define MMA16_MIN_BLOCKS 2
-#endif
-
 namespace salt_mma {
 
 constexpr uint32_t kTile = 256;
 constexpr uint32_t kRankStrideTiles = 256;
-constexpr uint32_t kStepsPerTile = 16;
 // Activation rows one warp multiplies: eight n8 MMA tiles.
 constexpr uint32_t kMaxRows = 64;
 
@@ -174,48 +170,6 @@ __device__ __forceinline__ uint2 byte_entry(const uint2* table, uint32_t word, u
   return table[__byte_perm(word, 0U, select)];
 }
 
-// One row's weights for word group `G` (< 3): entry `5 * i + d` is trit `d` of
-// byte `c` of the group's word `i`, summed over the row's planes with each
-// plane-tile's scale for that trit's 128-group. Trit x scale is exact, and so is
-// the f32 sum over at most three planes of nearby magnitude.
-template <uint32_t G>
-__device__ __forceinline__ void decode_group(float (&w)[20],
-                                             const GroupWords& in,
-                                             uint32_t r,
-                                             uint32_t planes,
-                                             uint32_t c,
-                                             uint32_t select,
-                                             const uint2* table) {
-#pragma unroll
-  for (uint32_t e = 0; e < 20U; ++e) w[e] = 0.0f;
-#pragma unroll
-  for (uint32_t p = 0; p < 3U; ++p) {
-    if (p < planes) {
-      const float2 half_scale = __half22float2(in.s[r][p]);
-      const float lo_scale = 2.0f * half_scale.x;
-      const float hi_scale = 2.0f * half_scale.y;
-#pragma unroll
-      for (uint32_t i = 0; i < 4U; ++i) {
-        const uint2 entry = byte_entry(table, in.w[r][p][i], select);
-#pragma unroll
-        for (uint32_t d = 0; d < 5U; ++d) {
-          // Trit 20 * (4G + i) + 5c + d. Only word 6 (G = 1, i = 2) straddles the
-          // 128 boundary, at 5c + d < 8.
-          float sc;
-          if (G == 0U || (G == 1U && i < 2U)) {
-            sc = lo_scale;
-          } else if (G == 1U && i == 2U) {
-            sc = 5U * c + d < 8U ? lo_scale : hi_scale;
-          } else {
-            sc = hi_scale;
-          }
-          w[5U * i + d] = fmaf(half_trit(entry, d), sc, w[5U * i + d]);
-        }
-      }
-    }
-  }
-}
-
 // Word 12's real trits 240..255: thread `c` takes 240 + 4c .. 240 + 4c + 3.
 __device__ __forceinline__ void decode_tail(float (&w)[20],
                                             const GroupWords& in,
@@ -327,21 +281,6 @@ __device__ __forceinline__ void group_mma(float (&acc)[NT][4],
   }
 }
 
-template <uint32_t G>
-__device__ __forceinline__ void decode_any(float (&w)[20],
-                                           const GroupWords& in,
-                                           uint32_t r,
-                                           uint32_t planes,
-                                           uint32_t c,
-                                           uint32_t select,
-                                           const uint2* table) {
-  if constexpr (G < 3U) {
-    decode_group<G>(w, in, r, planes, c, select, table);
-  } else {
-    decode_tail(w, in, r, planes, c, table);
-  }
-}
-
 // The GEMM body for at most `8 * NT` activation rows. A block of warps shares one
 // K-split (`blockIdx.y` of `gridDim.y`, tiles split evenly by index) and one staged
 // activation tile at a time; each warp owns sixteen fused rows. With one split a
@@ -412,19 +351,15 @@ __device__ __forceinline__ void mma_rows(const __half* __restrict__ act_hi,
     for (uint32_t e = 0; e < 4U; ++e) acc[n][e] = 0.0f;
   }
 
-  if (DOUBLE && tile_begin < tile_end) {
-    stage_tile(buffers, buffers + buffer_halves, act_hi, act_lo, tile_begin, staged_rows, k);
-    cp_async_commit();
-  }
-  GroupWords current;
-  GroupWords next;
-  if (active && tile_begin < tile_end) load_group<0U>(current, words, scale_pairs, rank, planes);
-
   for (uint32_t tile = tile_begin; tile < tile_end; ++tile) {
     const uint32_t which = DOUBLE ? (tile - tile_begin) & 1U : 0U;
     __half* hi = buffers + which * 2U * buffer_halves;
     __half* lo = hi + buffer_halves;
     if (DOUBLE) {
+      if (tile == tile_begin) {
+        stage_tile(buffers, buffers + buffer_halves, act_hi, act_lo, tile_begin, staged_rows, k);
+        cp_async_commit();
+      }
       if (tile + 1U < tile_end) {
         __half* next_hi = buffers + (which ^ 1U) * 2U * buffer_halves;
         stage_tile(next_hi, next_hi + buffer_halves, act_hi, act_lo, tile + 1U, staged_rows, k);
@@ -440,7 +375,6 @@ __device__ __forceinline__ void mma_rows(const __half* __restrict__ act_hi,
     __syncthreads();
 
     if (active) {
-      // Next tile's planes and ranks, for the group-3 prefetch.
       uint32_t next_rank[2];
       uint32_t next_planes[2] = {0U, 0U};
 #pragma unroll
@@ -449,26 +383,112 @@ __device__ __forceinline__ void mma_rows(const __half* __restrict__ act_hi,
         if (tile + 1U < tile_end) {
           next_planes[r] = planes_of(meta, t.allocation_map_bytes, t.terminal_map_value,
                                      rows[r] * tiles_per_row + tile + 1U);
+          // The next tile's plane-tiles into L1 while this one computes.
+          const char* first = reinterpret_cast<const char*>(words + static_cast<size_t>(next_rank[r]) * 13U);
+          const uint32_t bytes = next_planes[r] * 52U;
+          for (uint32_t offset = c * 128U; offset < bytes; offset += 4U * 128U) {
+            asm volatile("prefetch.global.L1 [%0];" ::"l"(first + offset));
+          }
+          asm volatile("prefetch.global.L1 [%0];" ::"l"(first + bytes - 1U));
         }
       }
-      float w0[20];
-      float w1[20];
-      load_group<1U>(next, words, scale_pairs, rank, planes);
-      decode_any<0U>(w0, current, 0U, planes[0], c, select, table);
-      decode_any<0U>(w1, current, 1U, planes[1], c, select, table);
-      group_mma<NT, 5U>(acc, w0, w1, hi, lo, 0U, g, c, n_tiles);
-      load_group<2U>(current, words, scale_pairs, rank, planes);
-      decode_any<1U>(w0, next, 0U, planes[0], c, select, table);
-      decode_any<1U>(w1, next, 1U, planes[1], c, select, table);
-      group_mma<NT, 5U>(acc, w0, w1, hi, lo, 5U, g, c, n_tiles);
-      load_group<3U>(next, words, scale_pairs, rank, planes);
-      decode_any<2U>(w0, current, 0U, planes[0], c, select, table);
-      decode_any<2U>(w1, current, 1U, planes[1], c, select, table);
-      group_mma<NT, 5U>(acc, w0, w1, hi, lo, 10U, g, c, n_tiles);
-      if (tile + 1U < tile_end) load_group<0U>(current, words, scale_pairs, next_rank, next_planes);
-      decode_any<3U>(w0, next, 0U, planes[0], c, select, table);
-      decode_any<3U>(w1, next, 1U, planes[1], c, select, table);
-      group_mma<NT, 1U>(acc, w0, w1, hi, lo, 15U, g, c, n_tiles);
+      // Scales of every plane-tile of the two rows, doubled for the half trits.
+      float2 sc[2][3];
+#pragma unroll
+      for (uint32_t r = 0; r < 2U; ++r) {
+#pragma unroll
+        for (uint32_t p = 0; p < 3U; ++p) {
+          if (p < planes[r]) {
+            const float2 half_scale = __half22float2(scale_pairs[rank[r] + p]);
+            sc[r][p] = make_float2(2.0f * half_scale.x, 2.0f * half_scale.y);
+          }
+        }
+      }
+#pragma unroll
+      for (uint32_t group = 0; group < 3U; ++group) {
+        float part[NT][4];
+#pragma unroll
+        for (uint32_t n = 0; n < NT; ++n) {
+#pragma unroll
+          for (uint32_t e = 0; e < 4U; ++e) part[n][e] = 0.0f;
+        }
+        float w4[2][4];
+#pragma unroll
+        for (uint32_t s = 0; s < 5U; ++s) {
+          float w[2][4];
+          if (s < 4U) {
+            const uint32_t word = 4U * group + s;
+#pragma unroll
+            for (uint32_t r = 0; r < 2U; ++r) {
+#pragma unroll
+              for (uint32_t j = 0; j < 4U; ++j) w[r][j] = 0.0f;
+              w4[r][s] = 0.0f;
+#pragma unroll
+              for (uint32_t p = 0; p < 3U; ++p) {
+                if (p < planes[r]) {
+                  const uint32_t bits = __ldg(words + static_cast<size_t>(rank[r] + p) * 13U + word);
+                  const uint2 entry = byte_entry(table, bits, select);
+#pragma unroll
+                  for (uint32_t d = 0; d < 5U; ++d) {
+                    float scale_d;
+                    if (word < 6U) {
+                      scale_d = sc[r][p].x;
+                    } else if (word == 6U) {
+                      scale_d = 5U * c + d < 8U ? sc[r][p].x : sc[r][p].y;
+                    } else {
+                      scale_d = sc[r][p].y;
+                    }
+                    const float t = half_trit(entry, d);
+                    if (d < 4U) {
+                      w[r][d] = fmaf(t, scale_d, w[r][d]);
+                    } else {
+                      w4[r][s] = fmaf(t, scale_d, w4[r][s]);
+                    }
+                  }
+                }
+              }
+            }
+          } else {
+#pragma unroll
+            for (uint32_t r = 0; r < 2U; ++r) {
+#pragma unroll
+              for (uint32_t j = 0; j < 4U; ++j) w[r][j] = w4[r][j];
+            }
+          }
+          uint32_t a_hi[4];
+          uint32_t a_lo[4];
+          split2(w[0][0], w[0][1], a_hi[0], a_lo[0]);
+          split2(w[1][0], w[1][1], a_hi[1], a_lo[1]);
+          split2(w[0][2], w[0][3], a_hi[2], a_lo[2]);
+          split2(w[1][2], w[1][3], a_hi[3], a_lo[3]);
+          const uint32_t column = (group * 5U + s) * 16U + c * 4U;
+#pragma unroll
+          for (uint32_t n = 0; n < NT; ++n) {
+            if (n >= n_tiles) break;
+            const uint32_t at = (n * 8U + g) * kActStride + column;
+            const uint2 bh = *reinterpret_cast<const uint2*>(hi + at);
+            const uint2 bl = *reinterpret_cast<const uint2*>(lo + at);
+            mma16816(part[n], a_hi, bh.x, bh.y);
+            mma16816(part[n], a_hi, bl.x, bl.y);
+            mma16816(part[n], a_lo, bh.x, bh.y);
+          }
+        }
+#pragma unroll
+        for (uint32_t n = 0; n < NT; ++n) {
+          if (n >= n_tiles) break;
+#pragma unroll
+          for (uint32_t e = 0; e < 4U; ++e) acc[n][e] = __fadd_rn(acc[n][e], part[n][e]);
+        }
+      }
+      {
+        GroupWords current;
+        float w0[20];
+        float w1[20];
+        load_group<3U>(current, words, scale_pairs, rank, planes);
+        decode_tail(w0, current, 0U, planes[0], c, table);
+        decode_tail(w1, current, 1U, planes[1], c, table);
+        group_mma<NT, 1U>(acc, w0, w1, hi, lo, 15U, g, c, n_tiles);
+      }
 #pragma unroll
       for (uint32_t r = 0; r < 2U; ++r) {
         rank[r] = next_rank[r];
@@ -556,9 +576,11 @@ extern "C" __global__ void salt_v2_mma_split_act(const float* __restrict__ activ
     const uint32_t j = within % 4U;
     uint32_t trit;
     if (step < 15U) {
+      // Steps 5G .. 5G + 3 take digits 0-3 of byte c of word 4G + s; step 5G + 4
+      // takes digit 4 of byte c of words 4G .. 4G + 3.
       const uint32_t group = step / 5U;
-      const uint32_t entry = 4U * (step % 5U) + j;
-      trit = 20U * (4U * group + entry / 5U) + 5U * c + entry % 5U;
+      const uint32_t s = step % 5U;
+      trit = s < 4U ? 20U * (4U * group + s) + 5U * c + j : 20U * (4U * group + j) + 5U * c + 4U;
     } else {
       trit = 240U + 4U * c + j;
     }
@@ -570,7 +592,7 @@ extern "C" __global__ void salt_v2_mma_split_act(const float* __restrict__ activ
 }
 
 // Up to 16 activation rows (verification).
-extern "C" __global__ void __launch_bounds__(256, MMA16_MIN_BLOCKS) salt_v2_mma_rows16_f32(const __half* __restrict__ act_hi,
+extern "C" __global__ void __launch_bounds__(256) salt_v2_mma_rows16_f32(const __half* __restrict__ act_hi,
                                                   const __half* __restrict__ act_lo,
                                                   const float* __restrict__ row_scale,
                                                   const salt_mma::Tensor* __restrict__ tensors,
