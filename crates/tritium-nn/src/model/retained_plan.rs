@@ -154,6 +154,27 @@ pub(super) struct Prepared {
 fn invalid(e: impl std::fmt::Display) -> NnError {
     NnError::InvalidArtifact(format!("retained source preparation: {e}"))
 }
+/// Open once, without waiting for a FIFO writer, then inspect that same handle.
+/// A pathname precheck alone would race substitution with a non-regular source.
+/// Regular-file symlinks keep their existing behavior; custody remains external.
+pub(super) fn open_regular_source(path: &Path) -> std::io::Result<(File, std::fs::Metadata)> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "source must be a regular file",
+        ));
+    }
+    Ok((file, metadata))
+}
 pub(super) fn positive(l: Qwen35TritReadLimits) -> Result<(), NnError> {
     if [
         l.max_config_bytes,
@@ -302,11 +323,7 @@ pub fn inspect_trit_file(
     if let Some(execution) = execution {
         execution.validate()?;
     }
-    let file = File::open(path).map_err(invalid)?;
-    let metadata = file.metadata().map_err(invalid)?;
-    if !metadata.is_file() {
-        return Err(invalid("source must be a regular file"));
-    }
+    let (file, metadata) = open_regular_source(path).map_err(invalid)?;
     let mut model = TritModelReader::open(file, receiving).map_err(invalid)?;
     let prepared = prepare(&mut model, level, metadata.len(), limits, execution)?;
     model.verify().map_err(invalid)?;
@@ -417,11 +434,7 @@ fn inspect_streamed_with(
 ) -> Result<StreamedModelLoadPlan, NnError> {
     positive(limits)?;
     execution.validate()?;
-    let file = File::open(path).map_err(invalid)?;
-    let metadata = file.metadata().map_err(invalid)?;
-    if !metadata.is_file() {
-        return Err(invalid("source must be a regular file"));
-    }
+    let (file, metadata) = open_regular_source(path).map_err(invalid)?;
     let mut model = TritModelReader::open(file, receiving).map_err(invalid)?;
     let prepared = prepare(&mut model, level, metadata.len(), limits, Some(execution))?;
     let covered = describe(&model, &prepared)?;

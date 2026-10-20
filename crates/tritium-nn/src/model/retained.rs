@@ -10,7 +10,6 @@ use crate::{
 };
 use std::{
     cell::RefCell,
-    fs::File,
     io::{Cursor, Read, Seek},
     path::Path,
 };
@@ -37,8 +36,8 @@ pub(super) fn load_file(
     context: TensorUploadContext<'_>,
 ) -> Result<LoadedModel, NnError> {
     positive(limits)?;
-    let file = File::open(path).map_err(invalid)?;
-    let source_bytes = file.metadata().map_err(invalid)?.len();
+    let (file, metadata) = super::retained_plan::open_regular_source(path).map_err(invalid)?;
+    let source_bytes = metadata.len();
     let model = TritModelReader::open(file, receiving).map_err(invalid)?;
     load_reader(
         model,

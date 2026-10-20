@@ -91,6 +91,9 @@ ciborium = "0.2.2"
 serde_json_canonicalizer = "=0.3.2"
 getrandom = "0.3.4"
 half = "2"
+# Unix retained-source admission uses safe std OpenOptions with platform flags.
+# Reuse the already locked version; no project-owned raw FFI is introduced.
+libc = "=0.2.189"
 linkme = "0.3"
 opentelemetry = { version = "=0.33.0", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "=0.33.0", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"] }

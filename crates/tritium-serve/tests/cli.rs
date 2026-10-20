@@ -276,6 +276,76 @@ impl Drop for Server {
         let _ = self.0.wait();
     }
 }
+#[cfg(unix)]
+#[test]
+fn actual_typed_binary_refuses_nonregular_sources_without_blocking() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    fn wait(child: &mut Server) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    let root = Scratch::new("nonregular");
+    let fifo = root.0.join("source.pipe");
+    let mut make = Server(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("Unix file-source regression requires mkfifo"),
+    );
+    assert!(wait(&mut make).expect("mkfifo did not exit").success());
+    drop(make);
+    let fifo_alias = root.0.join("pipe-alias");
+    std::os::unix::fs::symlink(&fifo, &fifo_alias).unwrap();
+    let regular = root.0.join("invalid.trit");
+    std::fs::write(&regular, b"not a model").unwrap();
+    let regular_alias = root.0.join("regular-alias.trit");
+    std::os::unix::fs::symlink(&regular, &regular_alias).unwrap();
+    for (source, expected) in [
+        (&fifo, "source must be a regular file"),
+        (&fifo_alias, "source must be a regular file"),
+        (&root.0, "source must be a regular file"),
+        (&regular, "trit package is truncated"),
+        (&regular_alias, "trit package is truncated"),
+    ] {
+        let config_path = root.0.join("load.json");
+        std::fs::write(&config_path, typed_config(source).to_string()).unwrap();
+        let mut child = Server(
+            clean_command()
+                .arg("--typed")
+                .arg(&config_path)
+                .args(["--backend", "cpu", "--host", "127.0.0.1", "--port", "0"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let status = wait(&mut child).unwrap_or_else(|| {
+            panic!(
+                "typed source open blocked instead of rejecting {}",
+                source.display()
+            )
+        });
+        assert!(!status.success());
+        let mut error = String::new();
+        std::io::Read::read_to_string(&mut child.0.stderr.take().unwrap(), &mut error).unwrap();
+        assert!(error.contains(expected), "{source:?}: {error}");
+        assert!(!error.contains("listening"), "{error}");
+        assert!(!error.contains("typed runtime diagnostics"), "{error}");
+    }
+}
 fn http(port: u16, method: &str, path: &str, body: &str) -> std::io::Result<String> {
     use std::io::{Read, Write};
     let mut stream = std::net::TcpStream::connect_timeout(

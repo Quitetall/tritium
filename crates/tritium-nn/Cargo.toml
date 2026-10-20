@@ -43,6 +43,9 @@ tokenizers = { workspace = true, optional = true }
 # Fixed no-import chat renderer: model-provided templates never execute natively.
 wasmi = { version = "=2.0.0", default-features = false, features = ["std", "validate", "portable-dispatch"], optional = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 # Golden vectors pinning the DeltaNet activation kernels, which are duplicated in tritium-onnx
 # purely so the two backends agree (ADR 0039 WS-G). testkit does not depend on tritium-nn, so
