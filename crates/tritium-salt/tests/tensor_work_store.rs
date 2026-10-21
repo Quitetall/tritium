@@ -163,8 +163,22 @@ fn readonly_view_rejects_missing_or_invalid_layout_without_creating_it() {
         TensorWorkReader::open(std::path::Path::new("")),
         Err(TensorWorkError::InvalidPath(_))
     ));
+    // Canonical Windows roots have a verbatim prefix. PathBuf::join normalizes
+    // away `..` for those roots, so build the invalid input without path pushes.
+    let mut traversal = root.as_os_str().to_os_string();
+    traversal.push(std::path::MAIN_SEPARATOR_STR);
+    traversal.push("..");
+    traversal.push(std::path::MAIN_SEPARATOR_STR);
+    traversal.push("escape");
+    let traversal = std::path::PathBuf::from(traversal);
+    assert!(
+        traversal
+            .components()
+            .any(|part| part == std::path::Component::ParentDir),
+        "traversal fixture must retain its ParentDir component"
+    );
     assert!(matches!(
-        TensorWorkReader::open(&root.join("..").join("escape")),
+        TensorWorkReader::open(&traversal),
         Err(TensorWorkError::InvalidPath(_))
     ));
     std::fs::create_dir(&root).unwrap();
