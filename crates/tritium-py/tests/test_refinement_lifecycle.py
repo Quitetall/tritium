@@ -66,6 +66,111 @@ def _datasets():
     )
 
 
+@pytest.mark.parametrize("via_symlink", [False, True])
+def test_refinement_rejects_nested_work_directory_without_changing_parent(tmp_path, via_symlink):
+    teacher, parent = _parent(tmp_path)
+    training, validation = _datasets()
+    destination_parent = parent.artifact_dir
+    if via_symlink:
+        destination_parent = tmp_path / "parent-alias"
+        try:
+            destination_parent.symlink_to(parent.artifact_dir, target_is_directory=True)
+        except OSError:
+            pytest.skip("directory symlinks unavailable")
+
+    with pytest.raises(ValueError):
+        refine(
+            parent,
+            teacher=teacher,
+            training=training,
+            validation=validation,
+            config=RefinementConfig.scale_only(max_steps=1),
+            work_dir=destination_parent / "child",
+        )
+
+    assert load_module_conversion(parent.artifact_dir) == parent
+
+
+def test_refinement_rejects_ancestor_work_directory_without_deleting_parent(tmp_path):
+    fixture_root = tmp_path / ".tmp-refinement-parent"
+    fixture_root.mkdir()
+    teacher, parent = _parent(fixture_root)
+    training, validation = _datasets()
+
+    with pytest.raises((ValueError, OSError)):
+        refine(
+            parent,
+            teacher=teacher,
+            training=training,
+            validation=validation,
+            config=RefinementConfig.scale_only(max_steps=1),
+            work_dir=tmp_path,
+        )
+
+    assert load_module_conversion(parent.artifact_dir) == parent
+
+
+@pytest.mark.parametrize("via_symlink", [False, True])
+def test_refinement_export_rejects_nested_destination_without_changing_source(tmp_path, via_symlink):
+    teacher, parent = _parent(tmp_path)
+    training, validation = _datasets()
+    result = refine(
+        parent,
+        teacher=teacher,
+        training=training,
+        validation=validation,
+        config=RefinementConfig.scale_only(max_steps=1),
+        work_dir=tmp_path / "refined",
+    )
+    destination_parent = result.artifact_dir
+    if via_symlink:
+        destination_parent = tmp_path / "source-alias"
+        try:
+            destination_parent.symlink_to(result.artifact_dir, target_is_directory=True)
+        except OSError:
+            pytest.skip("directory symlinks unavailable")
+
+    with pytest.raises(ValueError):
+        export(result, destination_parent / "copy")
+
+    assert load(result.artifact_dir) == result
+
+
+def test_refinement_rejects_nested_work_directory_for_refined_parent(tmp_path):
+    teacher, parent = _parent(tmp_path)
+    training, validation = _datasets()
+    config = RefinementConfig.scale_only(max_steps=1)
+    result = refine(
+        parent, teacher=teacher, training=training, validation=validation,
+        config=config, work_dir=tmp_path / "refined",
+    )
+
+    with pytest.raises(ValueError):
+        refine(
+            result, teacher=teacher, training=training, validation=validation,
+            config=config, work_dir=result.artifact_dir / "child",
+        )
+
+    assert load(result.artifact_dir) == result
+
+
+def test_refinement_destination_guard_preserves_sibling_resume(tmp_path):
+    teacher, parent = _parent(tmp_path)
+    training, validation = _datasets()
+    config = RefinementConfig.scale_only(max_steps=1)
+    destination = tmp_path / "parent-sibling"
+    result = refine(
+        parent, teacher=teacher, training=training, validation=validation,
+        config=config, work_dir=destination,
+    )
+
+    assert refine(
+        parent, teacher=teacher, training=training, validation=validation,
+        config=config, work_dir=destination,
+    ) == result
+    assert load_module_conversion(parent.artifact_dir) == parent
+
+
 def test_scale_only_refinement_freezes_trits_and_round_trips(tmp_path):
     teacher, parent = _parent(tmp_path)
     training, validation = _datasets()

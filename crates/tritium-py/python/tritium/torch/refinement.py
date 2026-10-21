@@ -972,6 +972,11 @@ def refine(
     if requested.is_symlink():
         raise ValueError("refinement work_dir must not be a symlink")
     directory = requested.resolve()
+    if (
+        directory.is_relative_to(parent.artifact_dir)
+        or parent.artifact_dir.is_relative_to(directory)
+    ):
+        raise ValueError("refinement work_dir must not overlap its parent artifact")
     if (directory / _MANIFEST).exists():
         result = load_refinement(directory)
         expected = (
@@ -1354,6 +1359,8 @@ def export_refinement(
     parent = target.parent.resolve(strict=True)
     if target.exists() or target.is_symlink():
         raise FileExistsError(f"output directory already exists: {target}")
+    if parent.is_relative_to(current.artifact_dir):
+        raise ValueError("refinement export must not be inside its source artifact")
     staging = Path(tempfile.mkdtemp(prefix=".tritium-refine-", dir=parent))
     published = False
     try:
