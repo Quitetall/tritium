@@ -673,6 +673,20 @@ pub trait TernaryBackend: Send + Sync {
             });
         }
 
+        if m == 0 || n == 0 || k == 0 {
+            // There is no nonempty activation/output contraction to quantize.
+            // Still delegate so the backend validates the weight handle and
+            // preserves its scalar empty-dot scaling semantics.
+            return self.mpgemm(MpGemm {
+                act,
+                weights,
+                scales: weight_scales,
+                shape,
+                format,
+                out,
+            });
+        }
+
         // Per-token int8 absmax quant: int8 values kept in f32 (the f32 `mpgemm`
         // consumes them directly), plus the per-token dequant multiplier.
         let mut q = vec![0.0_f32; act_len];

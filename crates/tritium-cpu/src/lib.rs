@@ -993,6 +993,84 @@ mod tests {
 
     // ---- boundary cases ------------------------------------------------------
 
+    fn assert_zero_geometry_matches_reference(shape: GemmShape, fused: bool) {
+        let backend = CpuBackend::new();
+        let trits = vec![Trit::ZERO; shape.n * shape.k];
+        let act = vec![0.0; shape.m * shape.k];
+        let scales: Vec<f32> = (0..shape.n)
+            .map(|index| if index % 2 == 0 { -2.0 } else { 1.5 })
+            .collect();
+        let mut expected = vec![17.0; shape.m * shape.n];
+        tritium_core::reference_mpgemm(&act, &trits, &scales, shape, &mut expected).unwrap();
+        for format in [TernaryFormat::Tq1_0, TernaryFormat::Tq2_0] {
+            let packed = pack(&trits, shape, format);
+            let weights = backend.upload_weights(&packed, shape, format).unwrap();
+            let mut out = vec![17.0; expected.len()];
+            let request = MpGemm {
+                act: &act,
+                weights: weights.as_ref(),
+                scales: &scales,
+                shape,
+                format,
+                out: &mut out,
+            };
+            if fused {
+                backend.mpgemm_with_act_quant(request).unwrap();
+            } else {
+                backend.mpgemm(request).unwrap();
+            }
+            assert_eq!(
+                out.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "{shape:?} {format:?} fused={fused}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_geometry_mpgemm_contraction_matches_reference() {
+        assert_zero_geometry_matches_reference(GemmShape::new(1, 1, 0), false);
+    }
+
+    #[test]
+    fn zero_geometry_fused_contraction_matches_reference() {
+        assert_zero_geometry_matches_reference(GemmShape::new(2, 3, 0), true);
+    }
+
+    #[test]
+    fn zero_geometry_fused_columns_matches_reference() {
+        assert_zero_geometry_matches_reference(GemmShape::new(1, 0, 1), true);
+    }
+
+    #[test]
+    fn zero_geometry_fused_batch_matches_reference() {
+        assert_zero_geometry_matches_reference(GemmShape::new(0, 3, 2), true);
+    }
+
+    #[test]
+    fn zero_geometry_retains_weight_identity_error() {
+        let backend = CpuBackend::new();
+        let weight_shape = GemmShape::new(1, 1, 3);
+        let packed = pack(&[Trit::ZERO; 3], weight_shape, TernaryFormat::Tq2_0);
+        let weights = backend
+            .upload_weights(&packed, weight_shape, TernaryFormat::Tq2_0)
+            .unwrap();
+        let error = backend
+            .mpgemm_with_act_quant(MpGemm {
+                act: &[0.0; 6],
+                weights: weights.as_ref(),
+                scales: &[],
+                shape: GemmShape::new(2, 0, 3),
+                format: TernaryFormat::Tq2_0,
+                out: &mut [],
+            })
+            .unwrap_err();
+        assert!(matches!(error, BackendError::InvalidInput(_)), "{error:?}");
+    }
+
     #[test]
     fn boundary_all_zero_weights_give_zero() {
         let shape = GemmShape::new(4, 3, 256);
