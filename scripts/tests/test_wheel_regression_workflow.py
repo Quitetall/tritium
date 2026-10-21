@@ -38,6 +38,49 @@ class WheelRegressionWorkflowTests(unittest.TestCase):
         paths = workflow.split("  pull_request:\n", 1)[1].split("  workflow_dispatch:", 1)[0]
         self.assertIn('      - "scripts/tests/test_wheel_regression_workflow.py"', paths)
 
+    def test_real_rust_fixture_probe_runs_against_installed_candidate(self):
+        workflow = (ROOT / ".github/workflows/wheels.yml").read_text(encoding="utf-8")
+        job = workflow.split("  torch-functional-smoke:\n", 1)[1].split("\n  tutorial-clean-wheel:", 1)[0]
+        marker = "      - name: test exact-wheel Rust/core/CLI/Python conversion parity\n"
+        self.assertIn(marker, job)
+        step = job.split(marker, 1)[1].split("      - name:", 1)[0]
+        for required in (
+            'TRITIUM_TEST_INSTALLED_WHEEL: "1"',
+            "TRITIUM_TEST_CANDIDATE_WHEEL_DIR: dist",
+            'RAYON_NUM_THREADS: "1"',
+            'CARGO_BUILD_JOBS: "2"',
+            'TRITIUM_NATIVE_TEST_PYTHON="$(python -c',
+            "sys.executable",
+            "timeout 900 cargo test --locked -p tritium-cli --test convert_plan_cli",
+            "python::actual_python_file_conversion_matches_core_and_cli",
+            "-- --ignored --exact --nocapture",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, step)
+        before = job.split(marker, 1)[0]
+        self.assertIn("dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c", before)
+        self.assertIn('toolchain: "1.98.0"', before)
+        self.assertLess(job.index("install exact Tritium wheel without dependency resolution"), job.index(marker))
+        self.assertNotIn("maturin", step)
+
+    def test_fixture_producer_changes_trigger_wheel_probe(self):
+        workflow = (ROOT / ".github/workflows/wheels.yml").read_text(encoding="utf-8")
+        paths = workflow.split("  pull_request:\n", 1)[1].split("  workflow_dispatch:", 1)[0]
+        for path in (
+            "crates/tritium-cli/tests/convert_plan_cli.rs",
+            "crates/tritium-cli/tests/convert_plan_cli/**",
+        ):
+            with self.subTest(path=path):
+                self.assertIn(f'      - "{path}"', paths)
+
+    def test_real_fixture_receiver_uses_isolated_python(self):
+        producer = (ROOT / "crates/tritium-cli/tests/convert_plan_cli/python.rs").read_text(encoding="utf-8")
+        self.assertIn("fn actual_python_file_conversion_matches_core_and_cli()", producer)
+        self.assertIn('            "-I",\n            "-m",\n            "pytest",', producer)
+        for precision in ("F16", "Bf16", "F32"):
+            self.assertIn(f"ScalePrecision::{precision}", producer)
+        self.assertIn('for mode in ["direct", "gram", "calibrated"]', producer)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -95,6 +95,7 @@ fn actual_python_file_conversion_matches_core_and_cli() {
     let python = std::env::var_os("TRITIUM_NATIVE_TEST_PYTHON").unwrap_or_else(|| "python".into());
     let mut child = Command::new(python)
         .args([
+            "-I",
             "-m",
             "pytest",
             "-q",
