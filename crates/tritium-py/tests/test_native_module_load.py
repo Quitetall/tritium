@@ -14,6 +14,88 @@ from tritium.torch import load_native_module
 from test_native_module_source import StateModel, _prepared, _convert, _fit
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("inplace", [False, True])
+def test_meta_shell_loads_native_state_without_materialized_parameters(tmp_path, dtype, inplace):
+    source = _prepared(StateModel(dtype))
+    result = _convert(tmp_path, source)
+    with torch.device("meta"):
+        shell = StateModel(dtype)
+    # Derived/nonpersistent state belongs to the caller, not the artifact.
+    shell.not_persistent = torch.tensor(99, device="cpu")
+    before = tuple(shell.parameters())
+
+    loaded = load_native_module(
+        shell, result, level="full", load_run_id="meta-shell", inplace=inplace,
+    )
+    reference = load_native_module(
+        StateModel(dtype), result, level="full", load_run_id="cpu-shell", inplace=False,
+    )
+
+    assert all(parameter.device.type == "meta" for parameter in before)
+    assert (loaded is shell) == inplace
+    if not inplace:
+        assert all(parameter.device.type == "meta" for parameter in shell.parameters())
+    assert all(parameter.device.type == "cpu" for parameter in loaded.parameters())
+    assert all(buffer.device.type == "cpu" for buffer in loaded.buffers())
+    assert loaded.a.packed_weight is loaded.b.packed_weight
+    assert loaded.a.bias is loaded.b.bias and loaded.mask is loaded.mask_alias
+    inputs = torch.ones(2, 32, dtype=dtype)
+    with torch.no_grad():
+        assert torch.equal(loaded(inputs), reference(inputs))
+
+
+def test_meta_shell_rejects_unmaterialized_nonpersistent_state(tmp_path):
+    result = _convert(tmp_path, _prepared())
+    with torch.device("meta"):
+        shell = StateModel()
+
+    with pytest.raises(ValueError, match="nonpersistent"):
+        load_native_module(
+            shell, result, level="full", load_run_id="meta-derived", inplace=True,
+        )
+
+    assert all(parameter.device.type == "meta" for parameter in shell.parameters())
+    assert shell.a.weight is shell.b.weight
+
+
+def test_meta_hf_shell_preserves_native_logits_and_generation(tmp_path):
+    from transformers import LlamaForCausalLM
+    from tritium.torch import convert_native_module
+    from test_owner_capture import _hf_source
+
+    torch.manual_seed(1703)
+    source = _hf_source(tmp_path)
+    result = convert_native_module(
+        source.prepared, tmp_path / "meta-hf-package", "meta-hf-fit",
+        **json.loads(source.options_json),
+    )
+    config = copy.deepcopy(source.prepared.model.config)
+    with torch.device("meta"):
+        shell = LlamaForCausalLM(copy.deepcopy(config))
+    # Caller-supplied derived state is initialized independently of parameters.
+    original_modules = dict(source.prepared.model.named_modules())
+    for path, module in shell.named_modules():
+        for name in module._non_persistent_buffers_set:
+            original = original_modules[path]._buffers[name]
+            if original is not None:
+                module._buffers[name] = original.detach().cpu().clone()
+    loaded = load_native_module(shell, result, level="full", load_run_id="meta-hf", inplace=False)
+    reference = load_native_module(
+        LlamaForCausalLM(copy.deepcopy(config)), result, level="full",
+        load_run_id="cpu-hf", inplace=False,
+    )
+    assert all(parameter.device.type == "meta" for parameter in shell.parameters())
+    assert loaded.model.embed_tokens.packed_weight is loaded.lm_head.packed_weight
+    tokens = torch.tensor([[1, 2, 3]])
+    with torch.no_grad():
+        assert torch.equal(loaded(tokens).logits, reference(tokens).logits)
+        assert torch.equal(
+            loaded.generate(tokens, max_new_tokens=2, do_sample=False),
+            reference.generate(tokens, max_new_tokens=2, do_sample=False),
+        )
+
+
 def test_fresh_shell_executes_native_and_restores_all_preserved_aliases(tmp_path):
     source = _prepared()
     result = _convert(tmp_path, source)

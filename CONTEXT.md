@@ -51,6 +51,11 @@ A discrete additive-ternary representation intended for loading or inference.
 It does not contain the latent training state needed to resume optimization.
 _Avoid_: QAT checkpoint, dense master
 
+**Model shell**:
+A model structure supplied to receive the stored state of a hard artifact.
+Its tensor shapes, dtypes and aliases are not evidence of source tensor values.
+_Avoid_: original model, dense checkpoint, observed source
+
 **Tensor work record**:
 An immutable, content-bound piece of intermediate conversion work for one tensor.
 It is distinct from a deployable model, a training snapshot and a qualification receipt.

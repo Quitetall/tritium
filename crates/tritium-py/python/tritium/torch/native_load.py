@@ -162,6 +162,8 @@ def load_native_module(model, artifact, *, level, load_run_id, inplace,
     """Validate topology and privately stage native CPU weights plus original state.
 
     Artifact may be an actual NativeModelConversion or an engine output directory.
+    Persistent shell state may be CPU or meta; nonpersistent buffers must already
+    be materialized on CPU. Package access still retains a complete byte image.
     This is inference-only eager CPU execution; it does not imply torch.compile,
     autograd, ordinary state_dict export, device portability or release qualification.
     """
@@ -181,7 +183,7 @@ def load_native_module(model, artifact, *, level, load_run_id, inplace,
     data = _catalog(snapshot)
     config = TernaryConfig.from_dict(data["source_preparation_config"])
     coverage = CoverageReport.from_dict(data["coverage"])
-    observed = _inventory(PreparedModel(model, config, coverage))
+    observed = _inventory(PreparedModel(model, config, coverage), materialized=False)
     expected = [dict(owner=owner, aliases=aliases, dtype=str(tensor.dtype), shape=list(tensor.shape),
                      kind=kind, disposition="fitted" if targeted else "preserved",
                      storage="tensor" if native else "tritium-torch-preserved.safetensors")
@@ -190,8 +192,13 @@ def load_native_module(model, artifact, *, level, load_run_id, inplace,
         raise ValueError("native catalog differs from complete model shell state")
     if _graph_contract(model, observed) != data["graph"]:
         raise ValueError("native graph contract differs from model shell")
-    if any(tensor.device.type != "cpu" for _, _, tensor, _, _, _ in observed):
-        raise ValueError("native model shell must be on CPU")
+    if any(tensor.device.type not in {"cpu", "meta"} for _, _, tensor, _, _, _ in observed):
+        raise ValueError("native model shell state must be on CPU or meta")
+    for module in model.modules():
+        for name, value in module._buffers.items():
+            if (name in module._non_persistent_buffers_set and value is not None
+                    and value.device.type != "cpu"):
+                raise ValueError("native model shell nonpersistent buffers must be materialized on CPU")
     descriptors = {item["name"]: item["storage"] for item in json.loads(snapshot.descriptors())}
     native_entries = {entry["owner"]: entry for entry in expected if entry["storage"] == "tensor"}
     if set(descriptors) != set(native_entries):
