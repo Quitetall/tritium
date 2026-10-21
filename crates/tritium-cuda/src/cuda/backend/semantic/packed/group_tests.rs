@@ -1,5 +1,7 @@
 //! Ordered-group parity, narrow selection, and fixed pre-candidate comparisons.
 use super::*;
+#[path = "head_tests.rs"]
+mod head_tests;
 
 fn source(rows: usize, cols: usize, planes: u8) -> AdditiveTensor {
     let original = fixture(rows, cols, PlaneCodec::B3, planes, false, Basis::Identity);
@@ -72,6 +74,7 @@ fn b3_groups_metadata_selection_keeps_unmeasured_families_unchanged() {
         (10240, 5120, 3),
         (12288, 5120, 1),
         (12288, 5120, 3),
+        (248320, 5120, 3),
     ] {
         let layout = AdditiveLayout {
             rows,
@@ -129,6 +132,26 @@ fn b3_groups_metadata_selection_keeps_unmeasured_families_unchanged() {
     let plan = Plan::from_metadata(AdditiveMetadata::uniform(layout, 1).unwrap()).unwrap();
     assert!(!plan.b3_groups_eligible());
     assert!(plan.ordered_warp_eligible());
+    for (rows, cols, planes) in [
+        (248319, 5120, 3),
+        (248321, 5120, 3),
+        (248320, 5119, 3),
+        (248320, 5121, 3),
+        (248320, 5120, 1),
+        (248320, 5120, 2),
+    ] {
+        let layout = AdditiveLayout {
+            rows,
+            cols,
+            max_planes: planes,
+            ..layout
+        };
+        let plan = Plan::from_metadata(AdditiveMetadata::uniform(layout, planes).unwrap()).unwrap();
+        assert!(
+            !plan.b3_groups_eligible(),
+            "unmeasured head neighbor {rows}/{cols}/P{planes}"
+        );
+    }
 }
 
 #[test]

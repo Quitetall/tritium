@@ -97,6 +97,7 @@ nccl = ["cuda", "cudarc/nccl"]
 # are referenced solely from `#[cfg(feature = "cuda")]` test code. `tritium-cpu`
 # is the reference for the CPU↔CUDA parity gate (ADR 0002 U2).
 [dev-dependencies]
+blake3 = { workspace = true }
 anyhow = { workspace = true }
 tritium-testkit = { workspace = true }
 tritium-evidence = { workspace = true }
