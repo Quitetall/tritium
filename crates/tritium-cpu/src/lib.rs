@@ -375,9 +375,15 @@ impl TernaryBackend for CpuBackend {
 
         let GemmShape { m, n, k } = shape;
         // Validate operand lengths against the shape before any kernel runs.
-        if act.len() != m * k {
+        let act_len = m
+            .checked_mul(k)
+            .ok_or_else(|| BackendError::InvalidInput("M*K element count overflows".to_owned()))?;
+        let out_len = m
+            .checked_mul(n)
+            .ok_or_else(|| BackendError::InvalidInput("M*N element count overflows".to_owned()))?;
+        if act.len() != act_len {
             return Err(BackendError::ShapeMismatch {
-                expected: m * k,
+                expected: act_len,
                 got: act.len(),
             });
         }
@@ -387,9 +393,9 @@ impl TernaryBackend for CpuBackend {
                 got: scales.len(),
             });
         }
-        if out.len() != m * n {
+        if out.len() != out_len {
             return Err(BackendError::ShapeMismatch {
-                expected: m * n,
+                expected: out_len,
                 got: out.len(),
             });
         }
@@ -942,6 +948,47 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, BackendError::ShapeMismatch { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn mpgemm_rejects_activation_count_overflow() {
+        let backend = CpuBackend::new();
+        let shape = GemmShape::new(usize::MAX / 2 + 1, 1, 2);
+        let packed = pack(&[Trit::ZERO; 2], shape, TernaryFormat::Tq2_0);
+        let weights = backend
+            .upload_weights(&packed, shape, TernaryFormat::Tq2_0)
+            .unwrap();
+        let mut out = [7.0];
+        let result = backend.mpgemm(MpGemm {
+            act: &[],
+            weights: weights.as_ref(),
+            scales: &[1.0],
+            shape,
+            format: TernaryFormat::Tq2_0,
+            out: &mut out,
+        });
+        assert!(matches!(result, Err(BackendError::InvalidInput(_))));
+        assert_eq!(out, [7.0]);
+    }
+
+    #[test]
+    fn mpgemm_rejects_output_count_overflow() {
+        let backend = CpuBackend::new();
+        let shape = GemmShape::new(usize::MAX / 2 + 1, 2, 0);
+        let weights = backend
+            .upload_weights(&[], shape, TernaryFormat::Tq2_0)
+            .unwrap();
+        let mut out = [7.0];
+        let result = backend.mpgemm(MpGemm {
+            act: &[],
+            weights: weights.as_ref(),
+            scales: &[1.0; 2],
+            shape,
+            format: TernaryFormat::Tq2_0,
+            out: &mut out,
+        });
+        assert!(matches!(result, Err(BackendError::InvalidInput(_))));
+        assert_eq!(out, [7.0]);
     }
 
     // ---- boundary cases ------------------------------------------------------

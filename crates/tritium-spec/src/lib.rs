@@ -630,6 +630,8 @@ pub trait TernaryBackend: Send + Sync {
     // value the nn copy asserts, so they cannot silently diverge.
     ///
     /// # Errors
+    /// [`BackendError::InvalidInput`] if an activation or output element count
+    /// overflows `usize`.
     /// [`BackendError::ShapeMismatch`] if `act`/`out`/`scales` lengths
     /// disagree with `shape`; otherwise whatever
     /// [`mpgemm`](TernaryBackend::mpgemm) returns.
@@ -646,15 +648,21 @@ pub trait TernaryBackend: Send + Sync {
             out,
         } = p;
         let GemmShape { m, n, k } = shape;
-        if act.len() != m * k {
+        let act_len = m
+            .checked_mul(k)
+            .ok_or_else(|| BackendError::InvalidInput("M*K element count overflows".to_owned()))?;
+        let out_len = m
+            .checked_mul(n)
+            .ok_or_else(|| BackendError::InvalidInput("M*N element count overflows".to_owned()))?;
+        if act.len() != act_len {
             return Err(BackendError::ShapeMismatch {
-                expected: m * k,
+                expected: act_len,
                 got: act.len(),
             });
         }
-        if out.len() != m * n {
+        if out.len() != out_len {
             return Err(BackendError::ShapeMismatch {
-                expected: m * n,
+                expected: out_len,
                 got: out.len(),
             });
         }
@@ -667,7 +675,7 @@ pub trait TernaryBackend: Send + Sync {
 
         // Per-token int8 absmax quant: int8 values kept in f32 (the f32 `mpgemm`
         // consumes them directly), plus the per-token dequant multiplier.
-        let mut q = vec![0.0_f32; m * k];
+        let mut q = vec![0.0_f32; act_len];
         let mut act_scale = vec![0.0_f32; m];
         quantize_act_int8(act, m, k, &mut q, &mut act_scale);
 
@@ -1147,5 +1155,35 @@ mod tests {
             }),
             Err(BackendError::ShapeMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn fused_rejects_activation_count_overflow() {
+        let mut out = [7.0];
+        let result = MockBackend.mpgemm_with_act_quant(MpGemm {
+            act: &[],
+            weights: &MockBuffer { trits: vec![] },
+            scales: &[1.0],
+            shape: GemmShape::new(usize::MAX / 2 + 1, 1, 2),
+            format: TernaryFormat::Tq2_0,
+            out: &mut out,
+        });
+        assert!(matches!(result, Err(BackendError::InvalidInput(_))));
+        assert_eq!(out, [7.0]);
+    }
+
+    #[test]
+    fn fused_rejects_output_count_overflow() {
+        let mut out = [7.0];
+        let result = MockBackend.mpgemm_with_act_quant(MpGemm {
+            act: &[],
+            weights: &MockBuffer { trits: vec![] },
+            scales: &[1.0; 2],
+            shape: GemmShape::new(usize::MAX / 2 + 1, 2, 0),
+            format: TernaryFormat::Tq2_0,
+            out: &mut out,
+        });
+        assert!(matches!(result, Err(BackendError::InvalidInput(_))));
+        assert_eq!(out, [7.0]);
     }
 }
