@@ -94,34 +94,65 @@ def build_inputs(
     invocation_id = _required(invocation_id, "invocation ID")
 
     assets: dict[str, Path] = {}
-    for path in staged.iterdir():
+    sboms: list[Path] = []
+    for path in staged.rglob("*"):
+        if path.is_symlink():
+            raise ReleaseInputsError(
+                f"staged release tree must not contain symlinks: {path}"
+            )
+        if path.is_dir():
+            continue
+        if path.name.endswith(".cdx.json"):
+            sboms.append(path)
+            continue
         if path.suffix not in ARTIFACT_KINDS:
             continue
-        if path.is_symlink() or not path.is_file():
-            raise ReleaseInputsError(f"release artifact must be an ordinary file: {path.name}")
-        assets[path.name] = path
+        if not path.is_file():
+            raise ReleaseInputsError(f"release artifact must be an ordinary file: {path}")
+        relative = path.relative_to(staged).as_posix()
+        if "\\" in relative:
+            raise ReleaseInputsError(
+                f"release artifact path must use portable POSIX separators: {relative!r}"
+            )
+        assets[relative] = path
     if not assets:
         raise ReleaseInputsError("staged directory contains no release artifacts")
 
     artifacts: list[dict[str, str]] = []
     seen_ids: set[str] = set()
     seen_paths: set[str] = set()
-    for sbom in sorted(staged.glob("*.cdx.json"), key=lambda item: item.name):
+    for sbom in sorted(sboms, key=lambda item: item.relative_to(staged).as_posix()):
         artifact_id, filename = _sbom_binding(sbom)
-        if filename not in assets:
+        sbom_relative = sbom.relative_to(staged).as_posix()
+        if "\\" in sbom_relative:
+            raise ReleaseInputsError(
+                f"SBOM path must use portable POSIX separators: {sbom_relative!r}"
+            )
+        colocated = (sbom.parent / filename).relative_to(staged).as_posix()
+        matches = [path for path in assets if PurePosixPath(path).name == filename]
+        if colocated in assets:
+            artifact_path = colocated
+        elif len(matches) == 1:
+            artifact_path = matches[0]
+        elif not matches:
             raise ReleaseInputsError(f"SBOM {sbom.name} names absent artifact {filename!r}")
+        else:
+            raise ReleaseInputsError(
+                f"SBOM {sbom_relative} ambiguously names artifact {filename!r}; "
+                "place the SBOM beside its artifact"
+            )
         if artifact_id in seen_ids:
             raise ReleaseInputsError(f"duplicate artifact ID {artifact_id!r}")
-        if filename in seen_paths:
-            raise ReleaseInputsError(f"duplicate SBOM binding for {filename!r}")
+        if artifact_path in seen_paths:
+            raise ReleaseInputsError(f"duplicate SBOM binding for {artifact_path!r}")
         seen_ids.add(artifact_id)
-        seen_paths.add(filename)
+        seen_paths.add(artifact_path)
         artifacts.append(
             {
                 "id": artifact_id,
-                "kind": ARTIFACT_KINDS[Path(filename).suffix],
-                "path": filename,
-                "sbom": sbom.name,
+                "kind": ARTIFACT_KINDS[Path(artifact_path).suffix],
+                "path": artifact_path,
+                "sbom": sbom_relative,
             }
         )
     if seen_paths != set(assets):
