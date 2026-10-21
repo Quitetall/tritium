@@ -4,7 +4,6 @@ import json
 from types import MethodType
 import torch
 from torch import nn
-from safetensors.torch import load as load_safetensors
 from .. import _tritium
 from .config import TernaryConfig
 from .conversion import PreparedModel
@@ -209,7 +208,11 @@ def load_native_module(model, artifact, *, level, load_run_id, inplace,
               or _PRECISIONS[storage["Dense"]["precision"]] != _DTYPES[entry["dtype"]]):
             raise ValueError("native preserved geometry/precision differs from catalog")
     opaque_entries = {entry["owner"]: entry for entry in expected if entry["storage"] != "tensor"}
-    opaque = load_safetensors(snapshot.asset("tritium-torch-preserved.safetensors")) if opaque_entries else {}
+    opaque = {}
+    if opaque_entries:
+        from safetensors.torch import load as load_safetensors
+
+        opaque = load_safetensors(snapshot.asset("tritium-torch-preserved.safetensors"))
     if set(opaque) != set(opaque_entries):
         raise ValueError("native preserved asset inventory differs from catalog")
     for name, tensor in opaque.items():
