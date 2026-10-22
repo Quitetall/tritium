@@ -8,24 +8,31 @@ use super::{
     RecordedOwnerScoreFitError, fit_calibrated_levels_recorded, fit_direct_levels_recorded,
     fit_owner_score_levels_recorded,
 };
-use std::{borrow::Cow, collections::BTreeMap};
+use std::{
+    borrow::Cow,
+    collections::BTreeMap,
+    io::{Read, Seek},
+};
 use tritium_core::DType;
 use tritium_evidence::{
     CalibratedQuantizationReceiptView, EvidenceError, EvidenceRecorder,
     OwnerQuantizationReceiptView, QuantizationReceiptView, SealedEvidence,
 };
 use tritium_format::trit_model::{
-    TritModelError, decode_dense_f32, encode_model_manifest, read_trit_model,
-    validate_dense_payload,
+    TritModelError, TritModelReadError, TritModelReader, decode_dense_f32, encode_model_manifest,
+    read_trit_model, validate_dense_payload,
 };
-use tritium_format::{TritBlob, TritBlobKind, TritPackageError, write_trit_package_bounded};
+use tritium_format::{
+    TritBlob, TritBlobKind, TritPackageError, TritPackageReadLimits, write_trit_package_bounded,
+};
 use tritium_schema::{
     BlobId, BlobReference, CalibratedQuantPlan, CalibratedQuantizationCompleted,
-    CalibratedQuantizationStarted, DirectFitMetric, ModelId, ModelQuantPlan, NamedAssetDigest,
-    OriginalSourceId, OwnerQuantPlan, OwnerQuantizationCompleted, OwnerQuantizationStarted,
-    PackageId, PlaneCounts, QuantActionRef, QuantOutputLevel, QuantPlan, QuantPlanError,
-    QuantSourceBinding, QuantSourceTensor, QuantizationCompleted, QuantizationStarted,
-    SalienceConversionLimits, ScalePrecision, TensorMeta, TensorStorage,
+    CalibratedQuantizationStarted, DirectFitMetric, ModelId, ModelManifest, ModelQuantPlan,
+    NamedAssetDigest, OriginalSourceId, OwnerQuantPlan, OwnerQuantizationCompleted,
+    OwnerQuantizationStarted, PackageId, PlaneCounts, QuantActionRef, QuantOutputLevel, QuantPlan,
+    QuantPlanError, QuantSourceBinding, QuantSourceTensor, QuantizationCompleted,
+    QuantizationStarted, SalienceConversionLimits, ScalePrecision, SemanticTensorDigest,
+    TensorMeta, TensorStorage,
 };
 
 /// Original byte provider; adapters never supply trusted input digests.
@@ -88,6 +95,8 @@ pub enum QuantEngineError {
     Evidence(EvidenceError),
     /// Existing typed model/payload reader failed.
     Model(TritModelError),
+    /// Existing seekable typed model/source reader failed.
+    ModelRead(TritModelReadError),
     /// Existing physical package writer failed.
     Package(TritPackageError),
     /// Source metadata, missing payload or failed I/O.
@@ -117,6 +126,11 @@ impl From<EvidenceError> for QuantEngineError {
 impl From<TritModelError> for QuantEngineError {
     fn from(e: TritModelError) -> Self {
         Self::Model(e)
+    }
+}
+impl From<TritModelReadError> for QuantEngineError {
+    fn from(error: TritModelReadError) -> Self {
+        Self::ModelRead(error)
     }
 }
 impl From<TritPackageError> for QuantEngineError {
@@ -844,6 +858,34 @@ pub fn verify_package_with_fit_log(
     bound_package(package, log).map(|_| ())
 }
 
+/// Open a seekable typed package and bind it to its complete actual fit log.
+///
+/// Uses the same manifest, inventory, ancestry and fitted-semantic checks as
+/// [`verify_package_with_fit_log`], without a whole-package byte image. Typed
+/// admission and terminal verification recheck complete payload/source identity.
+/// Metadata and log allocations remain separately admitted; this is not a
+/// whole-process memory bound, immutable writer snapshot or quality qualification.
+/// The returned reader retains its source under the existing reader contract.
+///
+/// # Errors
+/// Invalid package/log binding, source mutation, byte limits or actual I/O.
+pub fn open_model_reader_with_fit_log<R: Read + Seek>(
+    source: R,
+    limits: TritPackageReadLimits,
+    log: &tritium_evidence::VerifiedLog,
+) -> Result<TritModelReader<R>, QuantEngineError> {
+    let views = conversion_views(log)?;
+    if views.len() != 1 {
+        return Err(QuantEngineError::Binding(
+            "expected exactly one completed conversion",
+        ));
+    }
+    let mut model = TritModelReader::open(source, limits)?;
+    verify_conversion_model(&model, &views[0])?;
+    model.verify()?;
+    Ok(model)
+}
+
 fn bound_package<'a>(
     package: &'a [u8],
     log: &tritium_evidence::VerifiedLog,
@@ -860,8 +902,43 @@ fn bound_package<'a>(
     Ok(model)
 }
 
+pub(super) trait ConversionModel {
+    fn manifest(&self) -> &ModelManifest;
+    fn tensor_digest(
+        &self,
+        level: &str,
+        name: &str,
+    ) -> Result<SemanticTensorDigest, TritModelError>;
+}
+
+impl ConversionModel for tritium_format::trit_model::TritModel<'_> {
+    fn manifest(&self) -> &ModelManifest {
+        self.manifest()
+    }
+    fn tensor_digest(
+        &self,
+        level: &str,
+        name: &str,
+    ) -> Result<SemanticTensorDigest, TritModelError> {
+        self.tensor_digest(level, name)
+    }
+}
+
+impl<R: Read + Seek> ConversionModel for TritModelReader<R> {
+    fn manifest(&self) -> &ModelManifest {
+        self.manifest()
+    }
+    fn tensor_digest(
+        &self,
+        level: &str,
+        name: &str,
+    ) -> Result<SemanticTensorDigest, TritModelError> {
+        self.tensor_digest(level, name)
+    }
+}
+
 pub(super) fn verify_conversion_model(
-    model: &tritium_format::trit_model::TritModel<'_>,
+    model: &impl ConversionModel,
     view: &ConversionView,
 ) -> Result<(), QuantEngineError> {
     if model.manifest() != view.manifest() {

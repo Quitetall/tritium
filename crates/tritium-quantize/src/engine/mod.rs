@@ -48,7 +48,7 @@ pub use file_source::{
 };
 pub use model::{
     Engine, PublicationWarning, QuantEngineError, QuantizedModel, TensorSink, WeightSource,
-    verify_package_with_fit_log,
+    open_model_reader_with_fit_log, verify_package_with_fit_log,
 };
 pub use model_import::{
     ImportedModelEvidenceView, ImportedSaltV2Model, SaltV2MatrixImportPlan, SaltV2ModelGuardError,

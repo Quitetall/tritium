@@ -6,6 +6,7 @@ use pyo3::{
 };
 use std::{
     collections::BTreeMap,
+    fs::File,
     path::{Path, PathBuf},
 };
 use tritium_evidence::{
@@ -13,11 +14,14 @@ use tritium_evidence::{
     CALIBRATED_QUANTIZATION_STARTED_REGISTRATION, DIRECT_LEVELS_FITTED_REGISTRATION,
     EvidenceRecorder, OWNER_QUANTIZATION_COMPLETED_REGISTRATION,
     OWNER_QUANTIZATION_STARTED_REGISTRATION, OWNER_SCORE_LEVELS_FITTED_REGISTRATION,
-    QUANTIZATION_COMPLETED_REGISTRATION, QUANTIZATION_STARTED_REGISTRATION, verify_jsonl,
+    QUANTIZATION_COMPLETED_REGISTRATION, QUANTIZATION_STARTED_REGISTRATION, VerifiedLog,
+    verify_jsonl,
 };
+use tritium_format::{TritPackageReadLimits, trit_model::TritModelReader};
 use tritium_quantize::engine::{
     DirectoryTensorSink, Engine, FileWeightSource, QuantEngineError, TritOwnerCalibrationSource,
-    file_calibration_source, read_original_file_bounded, verify_package_with_fit_log,
+    file_calibration_source, open_model_reader_with_fit_log, open_original_file,
+    read_original_file_bounded, verify_package_with_fit_log,
 };
 use tritium_schema::{
     CalibratedQuantPlan, ModelQuantPlan, OwnerQuantPlan, QuantPlan, TensorStorage,
@@ -35,6 +39,34 @@ fn paths(input: Option<BTreeMap<String, String>>) -> BTreeMap<String, PathBuf> {
         .into_iter()
         .map(|(name, path)| (name, path.into()))
         .collect()
+}
+
+fn open_bound_model(
+    root: &Path,
+    maximum: u64,
+    evidence_maximum: u64,
+) -> PyResult<(TritModelReader<File>, VerifiedLog, u64)> {
+    if maximum == 0 || evidence_maximum == 0 {
+        return Err(error("package and evidence byte limits must be positive"));
+    }
+    let text = read_original_file_bounded(&root.join("evidence.jsonl"), evidence_maximum)
+        .map_err(error)?;
+    let log = verify_jsonl(std::str::from_utf8(&text).map_err(error)?).map_err(error)?;
+    // Preserve existing package-byte admission for metadata as well. This does
+    // not introduce a hidden lower metadata ceiling or claim a total RSS bound.
+    let metadata_maximum = usize::try_from(maximum).unwrap_or(usize::MAX);
+    let limits = TritPackageReadLimits {
+        max_source_bytes: maximum,
+        max_manifest_bytes: metadata_maximum,
+        max_directory_bytes: metadata_maximum,
+    };
+    let reader = open_model_reader_with_fit_log(
+        open_original_file(&root.join("model.trit")).map_err(error)?,
+        limits,
+        &log,
+    )
+    .map_err(error)?;
+    Ok((reader, log, text.len() as u64))
 }
 
 enum Plan {
@@ -115,12 +147,8 @@ impl NativeModelConversion {
             .into_string()
             .map_err(|_| error("output path is not UTF-8"))?;
         py.detach(|| {
-            let bytes = read_original_file_bounded(&root.join("model.trit"), max_package_bytes)
-                .map_err(error)?;
-            let text = read_original_file_bounded(&root.join("evidence.jsonl"), max_evidence_bytes)
-                .map_err(error)?;
-            let log = verify_jsonl(std::str::from_utf8(&text).map_err(error)?).map_err(error)?;
-            verify_package_with_fit_log(&bytes, &log).map_err(error)?;
+            let (model, log, evidence_bytes) =
+                open_bound_model(&root, max_package_bytes, max_evidence_bytes)?;
             let mut ids = tritium_evidence::QuantizationReceiptView::fold(&log)
                 .map_err(error)?
                 .into_iter()
@@ -141,7 +169,6 @@ impl NativeModelConversion {
             if ids.len() != 1 {
                 return Err(error("exactly one conversion identity required"));
             }
-            let model = tritium_format::trit_model::read_trit_model(&bytes).map_err(error)?;
             let model_ids = model
                 .manifest()
                 .levels
@@ -168,12 +195,25 @@ impl NativeModelConversion {
                 run_id,
                 publication_warnings: Vec::new(),
                 max_package_bytes,
-                evidence_bytes: text.len() as u64,
+                evidence_bytes,
             })
         })
     }
     fn verified_bytes(&self) -> PyResult<Vec<u8>> {
         self.verified_bytes_bounded(self.max_package_bytes)
+    }
+    fn verified_model_bounded(&self, maximum: u64, evidence_maximum: u64) -> PyResult<()> {
+        let (model, log, _) = open_bound_model(
+            Path::new(&self.output_dir),
+            self.max_package_bytes.min(maximum),
+            self.evidence_bytes.min(evidence_maximum),
+        )?;
+        if hex(model.package_id().as_bytes()) != self.package_id
+            || log.root_digest != self.evidence_root
+        {
+            return Err(error("conversion package or evidence identity changed"));
+        }
+        Ok(())
     }
     fn verified_bytes_bounded(&self, maximum: u64) -> PyResult<Vec<u8>> {
         self.verified_contents_bounded(maximum, self.evidence_bytes)
@@ -230,11 +270,10 @@ impl NativeModelConversion {
         max_evidence_bytes: Option<u64>,
     ) -> PyResult<()> {
         py.detach(|| {
-            self.verified_contents_bounded(
+            self.verified_model_bounded(
                 max_package_bytes.unwrap_or(self.max_package_bytes),
                 max_evidence_bytes.unwrap_or(self.evidence_bytes),
             )
-            .map(|_| ())
         })
     }
     /// Export the verified original files without refitting or changing identities.
