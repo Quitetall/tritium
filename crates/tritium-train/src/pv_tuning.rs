@@ -43,9 +43,11 @@ pub use native_scale::{
 };
 pub use native_scale::{
     NativeScaleContribution, NativeScaleJournalError, NativeScaleJournalLimits,
-    NativeScaleJournalSizeLedger, NativeScaleJournalSummary, NativeScaleJournalWriter,
-    NativeScaleRefinementSession, NativeScaleSizeLedger, NativeScaleStageError, NativeScaleStep,
-    VerifiedNativeScaleReplay, replay_native_scale_journal, replay_native_scale_journal_with_state,
+    NativeScaleJournalResume, NativeScaleJournalSizeLedger, NativeScaleJournalSummary,
+    NativeScaleJournalWriter, NativeScaleRefinementSession, NativeScaleResumeTail,
+    NativeScaleSizeLedger, NativeScaleStageError, NativeScaleStep, VerifiedNativeScaleReplay,
+    replay_native_scale_journal, replay_native_scale_journal_with_state,
+    resume_native_scale_journal,
 };
 pub use receipt::PvStepReceipt;
 pub use representation::{PvTernaryPlane, PvTernaryStructure, PvTernaryWeight};

@@ -22,9 +22,10 @@ pub use consumers::NativeScaleContribution;
 #[cfg(feature = "native-cpu")]
 pub use cpu::{NativeCpuScaleError, NativeCpuScaleJournalStageError, NativeCpuScaleSession};
 pub use journal::{
-    NativeScaleJournalError, NativeScaleJournalLimits, NativeScaleJournalSizeLedger,
-    NativeScaleJournalSummary, NativeScaleJournalWriter, VerifiedNativeScaleReplay,
-    replay_native_scale_journal, replay_native_scale_journal_with_state,
+    NativeScaleJournalError, NativeScaleJournalLimits, NativeScaleJournalResume,
+    NativeScaleJournalSizeLedger, NativeScaleJournalSummary, NativeScaleJournalWriter,
+    NativeScaleResumeTail, VerifiedNativeScaleReplay, replay_native_scale_journal,
+    replay_native_scale_journal_with_state, resume_native_scale_journal,
 };
 pub use publication::{
     NATIVE_SCALE_CHECKPOINT_FILE, NATIVE_SCALE_JOURNAL_FILE, NativeScaleChildError,

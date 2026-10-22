@@ -104,6 +104,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         tritium_schema::NativeScaleReplayObserved,
         "native-scale-replay-observed"
     );
+    project!(
+        tritium_schema::NativeScaleResumePoint,
+        "native-scale-resume-point"
+    );
     project!(EvidenceEnvelope<serde_json::Value>, "evidence-envelope");
     project!(LayoutError, "layout-error");
     project!(ModelId, "model-id");

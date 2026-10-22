@@ -26,6 +26,11 @@ A declared computation and update rule over named tensor owners. It is distinct
 from the state used to execute that computation.
 _Avoid_: checkpoint, model weights
 
+**Recorded resume point**:
+A training snapshot bound to the exact recorded update prefix that produced it.
+It is distinct from a hard ternary artifact or permission to erase later work.
+_Avoid_: completed model, truncation authorization
+
 **Owner calibration recipe**:
 An ordered, weighted set of declared scalar objectives and observation limits
 for tensor owners. It is distinct from captured observations and qualification.

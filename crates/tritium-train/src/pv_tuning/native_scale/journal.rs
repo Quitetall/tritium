@@ -1,12 +1,14 @@
 //! Streamed numerical replay, not objective authentication or publication approval.
 use super::*;
 use std::io::{Read, Seek, SeekFrom, Write};
-use tritium_schema::BlobId;
+use tritium_schema::{BlobId, NativeScaleResumePoint};
 
 const MAGIC: [u8; 8] = *b"TNSJ\0\0\0\x01";
 const END: [u8; 8] = *b"TNSJEND1";
 const SCRATCH: usize = 8192;
 const FRAME_DOMAIN: &[u8] = b"tritium.native-scale.journal-frame.v1\0";
+mod resume;
+pub use resume::{NativeScaleJournalResume, NativeScaleResumeTail, resume_native_scale_journal};
 
 /// Logical payload limits; excludes metadata, allocator and external model/stream memory.
 #[derive(Clone, Copy, Debug)]
@@ -286,6 +288,25 @@ impl<W: Write + Seek> NativeScaleJournalWriter<W> {
         self.completed += 1;
         Ok(())
     }
+    /// Snapshot one complete emitted prefix and exact checkpoint without sealing.
+    /// Flush is not fsync; returned observations do not authenticate numerical history.
+    pub fn checkpoint(
+        &mut self,
+        session: &NativeScaleRefinementSession,
+    ) -> Result<(Vec<u8>, NativeScaleResumePoint)> {
+        self.check(session)?;
+        self.flush()?;
+        let checkpoint = session.checkpoint_bytes()?;
+        let point = NativeScaleResumePoint {
+            plan: self.plan,
+            completed_updates: self.completed,
+            journal_prefix: BlobId::from_bytes(*self.hasher.finalize().as_bytes()),
+            journal_prefix_bytes: self.bytes,
+            checkpoint: BlobId::from_bytes(*blake3::hash(&checkpoint).as_bytes()),
+            checkpoint_bytes: checkpoint.len() as u64,
+        };
+        Ok((checkpoint, point))
+    }
     /// Seal only a complete schedule against its actual checkpoint. Caller owns persistence/custody.
     pub fn finish(
         mut self,
@@ -462,52 +483,8 @@ pub fn replay_native_scale_journal_with_state<R: Read + Seek>(
         hash: blake3::Hasher::new(),
         bytes: 0,
     };
-    if input.array::<8>()? != MAGIC
-        || input.array::<32>()? != *admission.plan_id.as_bytes()
-        || input.array::<32>()? != admission.parent
-        || input.u64()? != plan.training.len() as u64
-        || input.u64()? != plan.owners.len() as u64
-    {
-        return Err(invalid("native journal header differs"));
-    }
-    for weight in &parents {
-        if input.u64()? != weight.scales().len() as u64 {
-            return Err(invalid("native journal owner scale count differs"));
-        }
-    }
-    let mut session = NativeScaleRefinementSession::new(plan, parents)?;
-    let counts: Vec<_> = session.weights().map(|w| w.scales().len()).collect();
-    let mut gradients = reserved(counts.len())?;
-    for &count in &counts {
-        gradients.push(zeroed(count)?);
-    }
-    for ordinal in 0..session.plan.training.len() {
-        let encoded_ordinal = input.array::<8>()?;
-        let window = input.array::<32>()?;
-        if u64::from_le_bytes(encoded_ordinal) != ordinal as u64
-            || window != session.plan.training[ordinal].content
-        {
-            return Err(invalid("native journal window/order differs"));
-        }
-        let mut frame = blake3::Hasher::new();
-        frame.update(FRAME_DOMAIN);
-        frame.update(&encoded_ordinal);
-        frame.update(&window);
-        for owner in &mut gradients {
-            for chunk in owner.chunks_mut(SCRATCH / 4) {
-                let bytes = &mut scratch[..chunk.len() * 4];
-                input.read(bytes)?;
-                frame.update(bytes);
-                for (value, encoded) in chunk.iter_mut().zip(bytes.as_chunks::<4>().0) {
-                    *value = f32::from_le_bytes(*encoded);
-                }
-            }
-        }
-        if input.array::<32>()? != *frame.finalize().as_bytes() {
-            return Err(invalid("native journal frame checksum differs"));
-        }
-        session.step(&gradients.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
-    }
+    let updates = plan.training.len();
+    let session = replay_frames(&mut input, &admission, plan, parents, updates, &mut scratch)?;
     if input.array::<8>()? != END
         || input.u64()? != session.completed_updates
         || input.u64()? != expected_checkpoint.len() as u64
@@ -540,4 +517,64 @@ pub fn replay_native_scale_journal_with_state<R: Read + Seek>(
         },
     };
     Ok((session, observation))
+}
+
+fn replay_frames<R: Read>(
+    input: &mut Reader<R>,
+    admission: &Admission,
+    plan: NativeRefinementPlan,
+    parents: Vec<AdditiveTensor>,
+    updates: usize,
+    scratch: &mut [u8; SCRATCH],
+) -> Result<NativeScaleRefinementSession> {
+    if updates > plan.training.len() {
+        return Err(invalid("native replay cursor exceeds schedule"));
+    }
+    if input.array::<8>()? != MAGIC
+        || input.array::<32>()? != *admission.plan_id.as_bytes()
+        || input.array::<32>()? != admission.parent
+        || input.u64()? != plan.training.len() as u64
+        || input.u64()? != plan.owners.len() as u64
+    {
+        return Err(invalid("native journal header differs"));
+    }
+    for weight in &parents {
+        if input.u64()? != weight.scales().len() as u64 {
+            return Err(invalid("native journal owner scale count differs"));
+        }
+    }
+    let mut session = NativeScaleRefinementSession::new(plan, parents)?;
+    let counts: Vec<_> = session.weights().map(|w| w.scales().len()).collect();
+    let mut gradients = reserved(counts.len())?;
+    for &count in &counts {
+        gradients.push(zeroed(count)?);
+    }
+    for ordinal in 0..updates {
+        let encoded_ordinal = input.array::<8>()?;
+        let window = input.array::<32>()?;
+        if u64::from_le_bytes(encoded_ordinal) != ordinal as u64
+            || window != session.plan.training[ordinal].content
+        {
+            return Err(invalid("native journal window/order differs"));
+        }
+        let mut frame = blake3::Hasher::new();
+        frame.update(FRAME_DOMAIN);
+        frame.update(&encoded_ordinal);
+        frame.update(&window);
+        for owner in &mut gradients {
+            for chunk in owner.chunks_mut(SCRATCH / 4) {
+                let bytes = &mut scratch[..chunk.len() * 4];
+                input.read(bytes)?;
+                frame.update(bytes);
+                for (value, encoded) in chunk.iter_mut().zip(bytes.as_chunks::<4>().0) {
+                    *value = f32::from_le_bytes(*encoded);
+                }
+            }
+        }
+        if input.array::<32>()? != *frame.finalize().as_bytes() {
+            return Err(invalid("native journal frame checksum differs"));
+        }
+        session.step(&gradients.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
+    }
+    Ok(session)
 }

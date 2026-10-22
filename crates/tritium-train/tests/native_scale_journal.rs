@@ -14,6 +14,9 @@ use tritium_train::pv_tuning::{
     replay_native_scale_journal as replay,
 };
 
+#[path = "native_scale_journal/continuation.rs"]
+mod continuation;
+
 fn plan(owners: usize) -> NativeRefinementPlan {
     NativeRefinementPlan {
         parent: NativeRefinementParent {
@@ -803,6 +806,7 @@ fn real_file_journal_reopens_with_multichunk_owner_gradients() {
         .open(root.join("journal.tnsj"))
         .unwrap();
     let mut writer = Writer::new(file, &session, limits()).unwrap();
+    let mut saved = None;
     for i in 0..4 {
         let g = gradients(&session, i);
         session
@@ -811,6 +815,9 @@ fn real_file_journal_reopens_with_multichunk_owner_gradients() {
                 &mut writer,
             )
             .unwrap();
+        if i == 1 {
+            saved = Some(writer.checkpoint(&session).unwrap());
+        }
     }
     let (file, summary) = writer.finish(&session).unwrap();
     file.sync_all().unwrap();
@@ -843,8 +850,8 @@ fn real_file_journal_reopens_with_multichunk_owner_gradients() {
         read_bytes: read_bytes.clone(),
     };
     let verified = replay(
-        request,
-        vec![parent],
+        request.clone(),
+        vec![parent.clone()],
         source,
         summary.journal(),
         &checkpoint,
@@ -854,6 +861,59 @@ fn real_file_journal_reopens_with_multichunk_owner_gradients() {
     verified.verify_session(&session).unwrap();
     assert_eq!(maximum.get(), 8192);
     assert_eq!(read_bytes.get(), summary.bytes() * 2);
+    let (checkpoint, point) = saved.unwrap();
+    maximum.set(0);
+    read_bytes.set(0);
+    let source = Observed {
+        file: File::open(root.join("journal.tnsj")).unwrap(),
+        maximum: maximum.clone(),
+        read_bytes: read_bytes.clone(),
+    };
+    use tritium_train::pv_tuning::{
+        NativeScaleJournalResume, NativeScaleResumeTail, resume_native_scale_journal,
+    };
+    let output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .read(true)
+        .open(root.join("continued.tnsj"))
+        .unwrap();
+    let (mut continued, mut writer) = resume_native_scale_journal(
+        NativeScaleJournalResume {
+            plan: request,
+            parents: vec![parent],
+            source,
+            point: &point,
+            checkpoint: &checkpoint,
+            tail: NativeScaleResumeTail::CheckpointPrefix,
+        },
+        output,
+        limits(),
+    )
+    .unwrap();
+    assert_eq!(maximum.get(), 8192);
+    assert_eq!(read_bytes.get(), point.journal_prefix_bytes * 3);
+    for i in 2..4 {
+        let g = gradients(&continued, i);
+        continued
+            .step_recorded(
+                &g.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+                &mut writer,
+            )
+            .unwrap();
+    }
+    let (file, continued_summary) = writer.finish(&continued).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    assert_eq!(continued_summary, summary);
+    assert_eq!(
+        fs::read(root.join("continued.tnsj")).unwrap(),
+        fs::read(root.join("journal.tnsj")).unwrap()
+    );
+    assert_eq!(
+        continued.checkpoint_bytes().unwrap(),
+        session.checkpoint_bytes().unwrap()
+    );
     println!(
         "NATIVE_SCALE_FILE_JOURNAL bytes={} maximum_read={}",
         summary.bytes(),

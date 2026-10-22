@@ -201,6 +201,82 @@ fn packed_steps_record_actual_scale_adjoints_and_replay_current_state() {
 }
 
 #[test]
+fn replayed_prefix_rebinds_original_packed_roots_without_changing_old_graphs() {
+    use std::io::Cursor;
+    use tritium_train::pv_tuning::{
+        NativeScaleJournalLimits, NativeScaleJournalResume, NativeScaleJournalWriter,
+        NativeScaleResumeTail, resume_native_scale_journal,
+    };
+    let parents = vec![tensor()];
+    let request = plan(1);
+    let limits = NativeScaleJournalLimits {
+        max_journal_bytes: 100_000,
+        max_working_bytes: 100_000,
+    };
+    let budget = TensorPayloadBudget::new(120);
+    let mut bound = Bound::bind(
+        Session::new(request.clone(), parents.clone()).unwrap(),
+        roots(&parents),
+        budget.clone(),
+    )
+    .unwrap();
+    let original = Arc::clone(bound.handles().next().unwrap().1);
+    let before = outputs(&*original, &[0.25, -0.5, 0.125, 1.0], &[0, 2]);
+    let mut journal =
+        NativeScaleJournalWriter::new(Cursor::new(Vec::new()), bound.session(), limits).unwrap();
+    for _ in 0..2 {
+        bound.step_recorded(&[&[0.25; 3]], &mut journal).unwrap();
+    }
+    let (checkpoint, point) = journal.checkpoint(bound.session()).unwrap();
+    let middle = Arc::clone(bound.handles().next().unwrap().1);
+    let middle_outputs = outputs(&*middle, &[0.25, -0.5, 0.125, 1.0], &[0, 2]);
+    for _ in 2..4 {
+        bound.step_recorded(&[&[0.25; 3]], &mut journal).unwrap();
+    }
+    let (source, expected) = journal.finish(bound.session()).unwrap();
+    let (state, mut journal) = resume_native_scale_journal(
+        NativeScaleJournalResume {
+            plan: request,
+            parents: parents.clone(),
+            source: Cursor::new(source.get_ref()),
+            point: &point,
+            checkpoint: &checkpoint,
+            tail: NativeScaleResumeTail::CheckpointPrefix,
+        },
+        Cursor::new(Vec::new()),
+        limits,
+    )
+    .unwrap();
+    let mut resumed = Bound::bind(state, roots(&parents), budget.clone()).unwrap();
+    assert_eq!(bytes(&resumed), checkpoint);
+    assert_eq!(
+        outputs(
+            &**resumed.handles().next().unwrap().1,
+            &[0.25, -0.5, 0.125, 1.0],
+            &[0, 2]
+        ),
+        middle_outputs
+    );
+    for _ in 2..4 {
+        resumed.step_recorded(&[&[0.25; 3]], &mut journal).unwrap();
+    }
+    let (output, summary) = journal.finish(resumed.session()).unwrap();
+    assert_eq!(output.into_inner(), source.into_inner());
+    assert_eq!(summary, expected);
+    assert_eq!(bytes(&resumed), bytes(&bound));
+    assert_eq!(
+        outputs(&*original, &[0.25, -0.5, 0.125, 1.0], &[0, 2]),
+        before
+    );
+    assert_eq!(
+        outputs(&*middle, &[0.25, -0.5, 0.125, 1.0], &[0, 2]),
+        middle_outputs
+    );
+    drop((original, middle, bound, resumed));
+    assert_eq!(budget.used_bytes(), 0);
+}
+
+#[test]
 fn recorded_late_snapshot_failure_writes_nothing_and_can_retry_on_same_state() {
     use std::cell::RefCell;
     use std::io::{Cursor, Seek, SeekFrom, Write};

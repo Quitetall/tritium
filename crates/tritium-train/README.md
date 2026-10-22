@@ -100,10 +100,22 @@ together. A snapshot failure leaves the journal unchanged; a journal failure
 drops all staged snapshots and preserves old handles/state. Finish/replay uses
 the read-only `binding.session()` and the original parents.
 
-This v1 profile does not append/resume partial journals, record Python steps,
-publish children, authenticate backward execution or clear any
-independent quality/performance/release gate. Existing unrecorded TNSR resume and
-all prior numerical/inference profiles are unchanged.
+`journal.checkpoint(&session)` flushes and returns TNSR bytes with a schema-owned
+`NativeScaleResumePoint` binding the exact emitted prefix, plan and cursor. Keep
+both independently; this observation is neither numerical proof nor fsync.
+`resume_native_scale_journal(request, empty_new_output, limits)` checks the prefix,
+replays it from the actual original parents and requires an exact checkpoint
+match before copying that prefix into the new stream and returning state/writer.
+It never appends to, truncates or writes the recovery source. `ExactPrefix`
+requires no trailing bytes; explicitly selecting `CheckpointPrefix` branches at
+the saved boundary while leaving a later complete/partial tail untouched and
+unvalidated. Failed output I/O can leave an unusable caller-owned destination;
+the caller owns cleanup and exclusive source custody. Replay/copy use bounded
+8192-byte chunks and the existing complete-journal/replay working limits.
+The existing TNSJ v1/TNSR bytes are unchanged. Durable resume-bundle publication
+and Python recorded continuation remain separate work. These interfaces do not
+authenticate backward/objective/data origin or clear independent quality,
+performance or release gates. Existing unrecorded TNSR resume is unchanged.
 
 ## Immutable native scale children (Rust)
 

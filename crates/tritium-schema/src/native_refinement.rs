@@ -435,6 +435,29 @@ pub struct NativeScaleReplayObserved {
     pub completed_updates: u64,
 }
 
+/// Emitted checkpoint/prefix observations; numerical replay and persistence are external.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
+pub struct NativeScaleResumePoint {
+    /// Exact frozen native request identity.
+    pub plan: NativeRefinementPlanId,
+    /// Number of complete ordered gradient frames before this boundary.
+    pub completed_updates: u64,
+    /// BLAKE3 of exactly the admitted raw journal prefix, not the final stream.
+    pub journal_prefix: BlobId,
+    /// Exact header plus complete frame bytes; excludes the final trailer.
+    pub journal_prefix_bytes: u64,
+    /// BLAKE3 of the exact saved TNSR checkpoint.
+    pub checkpoint: BlobId,
+    /// Exact saved TNSR length.
+    pub checkpoint_bytes: u64,
+}
+
 /// Structural native request error; unavailable execution is a separate result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
