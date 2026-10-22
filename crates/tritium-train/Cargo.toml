@@ -31,6 +31,7 @@ tritium-testkit = { workspace = true }
 # leaves each element's k-accumulation order untouched, so results are bit-identical to the serial
 # loop (verified by the tape gradchecks + the ModelRunner conformance gate). Not in the wasm build.
 rayon = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tritium-cpu = { workspace = true }
@@ -39,7 +40,6 @@ tritium-runtime = { workspace = true }
 # ADR 0007. Workspace-pinned; already used by tritium-core/-cpu/-nn/-format/-quantize.
 proptest = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 
 [build-dependencies]
 tritium-build-info = { workspace = true }

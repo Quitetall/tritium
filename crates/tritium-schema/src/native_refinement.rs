@@ -458,6 +458,21 @@ pub struct NativeScaleResumePoint {
     pub checkpoint_bytes: u64,
 }
 
+/// Frozen recovery inputs and emitted observations, not numerical qualification.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
+pub struct NativeScaleResumeManifest {
+    /// Exact full native request, including the explicitly selected parent level.
+    pub plan: NativeRefinementPlan,
+    /// Untrusted emitted prefix/checkpoint binding, replay required on recovery.
+    pub point: NativeScaleResumePoint,
+}
+
 /// Structural native request error; unavailable execution is a separate result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]

@@ -112,10 +112,34 @@ the saved boundary while leaving a later complete/partial tail untouched and
 unvalidated. Failed output I/O can leave an unusable caller-owned destination;
 the caller owns cleanup and exclusive source custody. Replay/copy use bounded
 8192-byte chunks and the existing complete-journal/replay working limits.
-The existing TNSJ v1/TNSR bytes are unchanged. Durable resume-bundle publication
-and Python recorded continuation remain separate work. These interfaces do not
+The existing TNSJ v1/TNSR bytes are unchanged. Python recorded continuation
+remains separate work. These interfaces do not
 authenticate backward/objective/data origin or clear independent quality,
 performance or release gates. Existing unrecorded TNSR resume is unchanged.
+
+`stage_native_scale_resume_bundle(session, journal, empty_output, limits)` emits
+and reopens a self-contained TNSB v1 recovery file: frozen plan, emitted resume
+point, complete checkpoint and exact journal prefix. No prefix-sized Vec or
+extraction file is retained. `publish_native_scale_resume_bundle` uses the same
+stager in a new directory, fsyncs the pending file and commits `resume.tnsb` with
+a no-clobber hard link. It cleans only owned precommit files; postcommit cleanup
+or directory/parent-sync caveats are warnings. Retain the returned full BlobId
+separately and use `NativeScaleResumeBundleReader::open(file, id, limits)` after
+restart. Byte consistency is not numerical or quality qualification.
+
+`bundle.resume(original_parents, empty_new_journal, journal_limits)` rechecks
+the actual bundle and invokes strict common continuation through a bounded view
+of its prefix. Original recording work need not survive, but original parent
+tensors are still required. Saving restores the live journal append cursor;
+destination-only failures permit retry if restoration succeeds, while source
+read/hash/position uncertainty poisons that writer. Bundle limits admit exact
+file/serialized manifest/checkpoint bytes and M+C+8192 logical working payload;
+session/model, metadata heap, allocator, page cache, caller streams and RSS are
+excluded. Generic staging flush is not fsync; no power-loss/security clearance
+is inferred from the filesystem publisher.
+Each explicit save copies the entire selected prefix; it is not an incremental
+or compressed checkpoint. Set a disk ceiling and retention policy deliberately;
+this module neither schedules saves nor deletes older recovery bundles.
 
 ## Immutable native scale children (Rust)
 

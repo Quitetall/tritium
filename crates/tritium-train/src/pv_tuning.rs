@@ -16,6 +16,11 @@ mod continuous;
 mod error;
 mod identity;
 mod native_scale;
+pub use native_scale::{
+    NativeScaleResumeBundleError, NativeScaleResumeBundleLimits, NativeScaleResumeBundleReader,
+    PublishedNativeScaleResumeBundle, publish_native_scale_resume_bundle,
+    stage_native_scale_resume_bundle,
+};
 mod projection;
 mod receipt;
 mod representation;

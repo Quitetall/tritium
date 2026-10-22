@@ -15,6 +15,11 @@ mod consumers;
 mod cpu;
 mod identity;
 mod journal;
+pub use journal::{
+    NativeScaleResumeBundleError, NativeScaleResumeBundleLimits, NativeScaleResumeBundleReader,
+    PublishedNativeScaleResumeBundle, publish_native_scale_resume_bundle,
+    stage_native_scale_resume_bundle,
+};
 mod publication;
 mod transaction;
 mod verification;

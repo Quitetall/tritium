@@ -7,6 +7,12 @@ const MAGIC: [u8; 8] = *b"TNSJ\0\0\0\x01";
 const END: [u8; 8] = *b"TNSJEND1";
 const SCRATCH: usize = 8192;
 const FRAME_DOMAIN: &[u8] = b"tritium.native-scale.journal-frame.v1\0";
+mod bundle;
+pub use bundle::{
+    NativeScaleResumeBundleError, NativeScaleResumeBundleLimits, NativeScaleResumeBundleReader,
+    PublishedNativeScaleResumeBundle, publish_native_scale_resume_bundle,
+    stage_native_scale_resume_bundle,
+};
 mod resume;
 pub use resume::{NativeScaleJournalResume, NativeScaleResumeTail, resume_native_scale_journal};
 
@@ -296,6 +302,14 @@ impl<W: Write + Seek> NativeScaleJournalWriter<W> {
     ) -> Result<(Vec<u8>, NativeScaleResumePoint)> {
         self.check(session)?;
         self.flush()?;
+        self.snapshot_unflushed(session)
+    }
+    // Private preparation only. No public observation may escape before a successful flush.
+    fn snapshot_unflushed(
+        &self,
+        session: &NativeScaleRefinementSession,
+    ) -> Result<(Vec<u8>, NativeScaleResumePoint)> {
+        self.check(session)?;
         let checkpoint = session.checkpoint_bytes()?;
         let point = NativeScaleResumePoint {
             plan: self.plan,

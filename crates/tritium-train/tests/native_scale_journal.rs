@@ -14,6 +14,8 @@ use tritium_train::pv_tuning::{
     replay_native_scale_journal as replay,
 };
 
+#[path = "native_scale_journal/bundle.rs"]
+mod bundle;
 #[path = "native_scale_journal/continuation.rs"]
 mod continuation;
 

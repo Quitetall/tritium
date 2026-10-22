@@ -31,6 +31,11 @@ A training snapshot bound to the exact recorded update prefix that produced it.
 It is distinct from a hard ternary artifact or permission to erase later work.
 _Avoid_: completed model, truncation authorization
 
+**Recorded resume bundle**:
+A self-contained recorded resume point and its recovery history. It is training
+recovery input, not a refined child or qualification receipt.
+_Avoid_: deployable model, qualified checkpoint
+
 **Owner calibration recipe**:
 An ordered, weighted set of declared scalar objectives and observation limits
 for tensor owners. It is distinct from captured observations and qualification.
