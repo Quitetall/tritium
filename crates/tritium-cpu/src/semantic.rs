@@ -215,6 +215,19 @@ impl CpuTensor {
         }
     }
 
+    pub(crate) fn additive_input_vjp(
+        tensor: &dyn DeviceBuffer,
+        output_gradients: &[f32],
+        batch: usize,
+        row_workspace: &mut [f32],
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        match Self::checked(tensor)? {
+            Self::Additive(tensor) => tensor.input_vjp(output_gradients, batch, row_workspace, out),
+            Self::Dense { .. } => Err(BackendError::UnsupportedTensor),
+        }
+    }
+
     pub(crate) fn embed(
         tensor: &dyn DeviceBuffer,
         ids: &[usize],

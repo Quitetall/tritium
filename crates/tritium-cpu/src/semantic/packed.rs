@@ -472,32 +472,77 @@ impl PackedAdditive {
             return Err(invalid("gather shape or row out of range"));
         }
         for (&row, output) in ids.iter().zip(out.chunks_exact_mut(cols)) {
-            output.fill(0.0);
-            for plane in 0..self.planes {
-                if let Allocation::PerTile { index, .. } = &self.allocation {
-                    for tile in index
-                        .as_index()
-                        .tiles_in_row(plane, row)
-                        .expect("checked row/plane")
-                    {
-                        for (offset, value) in output[tile.columns()].iter_mut().enumerate() {
-                            let scale = if self.layout.law.anchor == ScaleAnchor::Tensor {
-                                plane
-                            } else {
-                                tile.scale_offset() + offset / usize::from(self.layout.group)
-                            };
-                            *value += f32::from(self.trit(plane, tile.trit_offset() + offset))
-                                * self.stored_scale(plane, scale);
-                        }
-                    }
-                } else {
-                    for (col, value) in output.iter_mut().enumerate() {
-                        *value += f32::from(self.trit(plane, row * cols + col))
-                            * self.scale(plane, row, col);
+            self.decode_stored_row(row, output);
+            apply_inverse_basis(output, self.layout.basis).map_err(invalid)?;
+        }
+        Ok(())
+    }
+
+    // Row/length have already been checked by the public operation. Keep this
+    // exact stored-basis reconstruction shared by gather and the input adjoint.
+    fn decode_stored_row(&self, row: usize, output: &mut [f32]) {
+        let cols = self.layout.cols as usize;
+        output.fill(0.0);
+        for plane in 0..self.planes {
+            if let Allocation::PerTile { index, .. } = &self.allocation {
+                for tile in index
+                    .as_index()
+                    .tiles_in_row(plane, row)
+                    .expect("checked row/plane")
+                {
+                    for (offset, value) in output[tile.columns()].iter_mut().enumerate() {
+                        let scale = if self.layout.law.anchor == ScaleAnchor::Tensor {
+                            plane
+                        } else {
+                            tile.scale_offset() + offset / usize::from(self.layout.group)
+                        };
+                        *value += f32::from(self.trit(plane, tile.trit_offset() + offset))
+                            * self.stored_scale(plane, scale);
                     }
                 }
+            } else {
+                for (col, value) in output.iter_mut().enumerate() {
+                    *value +=
+                        f32::from(self.trit(plane, row * cols + col)) * self.scale(plane, row, col);
+                }
             }
-            apply_inverse_basis(output, self.layout.basis).map_err(invalid)?;
+        }
+    }
+
+    pub(super) fn input_vjp(
+        &self,
+        output_gradients: &[f32],
+        batch: usize,
+        row_workspace: &mut [f32],
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        let rows = self.layout.rows as usize;
+        let cols = self.layout.cols as usize;
+        let gradients = batch
+            .checked_mul(rows)
+            .ok_or_else(|| invalid("gradient size overflow"))?;
+        let inputs = batch
+            .checked_mul(cols)
+            .ok_or_else(|| invalid("input size overflow"))?;
+        if output_gradients.len() != gradients || row_workspace.len() != cols || out.len() != inputs
+        {
+            return Err(invalid("input adjoint shape mismatch"));
+        }
+        if batch == 0 {
+            return Ok(());
+        }
+        out.fill(0.0);
+        for row in 0..rows {
+            self.decode_stored_row(row, row_workspace);
+            for (batch_row, input_gradient) in out.chunks_exact_mut(cols).enumerate() {
+                let gradient = output_gradients[batch_row * rows + row];
+                for (value, &coefficient) in input_gradient.iter_mut().zip(row_workspace.iter()) {
+                    *value += gradient * coefficient;
+                }
+            }
+        }
+        for input_gradient in out.chunks_exact_mut(cols) {
+            apply_inverse_basis(input_gradient, self.layout.basis).map_err(invalid)?;
         }
         Ok(())
     }

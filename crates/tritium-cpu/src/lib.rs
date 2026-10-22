@@ -47,6 +47,9 @@
 //! include owned packed coefficients and stored-precision scales, not container bytes.
 //! The ISA flags above describe legacy packed kernel availability, not SIMD
 //! acceleration for these semantic operations; the packed arithmetic is scalar.
+//! [`CpuBackend::additive_matmul_input_vjp`] supplies the shared-reference input
+//! adjoint for additive handles with caller-owned row workspace. It is scalar,
+//! CPU-only and distinct from complete backend training or owner refinement.
 //
 // `linkme`'s `distributed_slice` expands to a static with a custom
 // `#[link_section]`, and the AVX2 kernel needs hand-written `unsafe` for its
@@ -184,6 +187,31 @@ impl CpuBackend {
     #[must_use]
     pub fn new() -> Self {
         CpuBackend
+    }
+
+    /// Original-coordinate input adjoint for an uploaded CPU additive matrix.
+    ///
+    /// Matches [`tritium_core::reference_ternary_matmul_input_vjp`] using packed
+    /// symbols/scales directly. `output_gradients` has `batch * rows` elements,
+    /// `row_workspace` exactly `cols`, and `out` exactly `batch * cols`. Both
+    /// products and all lengths are checked before mutation. Zero batch leaves
+    /// the still-required row workspace untouched. No internal heap scratch or
+    /// dense matrix is allocated; finite-value policy remains the caller's.
+    /// This CPU-only input adjoint is not a weight/scale/code update or a claim
+    /// of complete backend training support. Existing inference caps are unchanged.
+    ///
+    /// # Errors
+    /// [`BackendError::InvalidInput`] for foreign/legacy handles, shape mismatch
+    /// or dimension overflow; [`BackendError::UnsupportedTensor`] for dense handles.
+    pub fn additive_matmul_input_vjp(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        output_gradients: &[f32],
+        batch: usize,
+        row_workspace: &mut [f32],
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        semantic::CpuTensor::additive_input_vjp(tensor, output_gradients, batch, row_workspace, out)
     }
 
     /// Unpack the `[N, K]` packed weights in `buf` to a flat `Vec<Trit>` (one
