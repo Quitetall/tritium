@@ -211,6 +211,23 @@ pub(crate) struct NativeModelRefinement {
     limits: ReadLimits,
 }
 impl NativeModelRefinement {
+    pub(crate) fn root(&self) -> &Path {
+        Path::new(&self.output_dir)
+    }
+    pub(crate) fn refinement_parent_view(
+        &self,
+        level: &str,
+    ) -> PyResult<(
+        TritModelReader<File>,
+        tritium_evidence::NativeRefinementParentView,
+    )> {
+        let (mut model, _, view) = self.verified(self.limits)?;
+        let parent = tritium_evidence::NativeRefinementParentView::from_refined_record(
+            &mut model, level, &view,
+        )
+        .map_err(error)?;
+        Ok((model, parent))
+    }
     pub(crate) fn add_warning(&mut self, message: String) {
         self.publication_warnings.push(message);
     }
@@ -292,6 +309,42 @@ impl NativeModelRefinement {
 
 #[pymethods]
 impl NativeModelRefinement {
+    /// Actual immediate refined parent tuple, not transitive lineage qualification.
+    fn native_refinement_parent(&self, py: Python<'_>, level: &str) -> PyResult<String> {
+        py.detach(|| {
+            serde_json::to_string(self.refinement_parent_view(level)?.1.binding()).map_err(error)
+        })
+    }
+    #[pyo3(signature=(plan_json,matrices,*,max_snapshot_bytes,max_parent_bytes,checkpoint=None,recorded_resume=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn begin_scale_training(
+        &self,
+        py: Python<'_>,
+        plan_json: &str,
+        matrices: Vec<(String, Py<crate::model_level::NativePackedMatrix>)>,
+        max_snapshot_bytes: u64,
+        max_parent_bytes: u64,
+        checkpoint: Option<&Bound<'_, PyBytes>>,
+        recorded_resume: Option<(
+            PyRef<'_, crate::native_scale::NativeScaleResumeBundle>,
+            String,
+        )>,
+    ) -> PyResult<crate::native_scale::NativeScaleTraining> {
+        crate::native_scale::begin(
+            py,
+            self.clone().into(),
+            matrices,
+            crate::native_scale::BeginOptions {
+                plan_json,
+                max_snapshot_bytes,
+                max_parent_bytes,
+                checkpoint: checkpoint.map(|b| b.as_bytes()),
+                recorded_resume: recorded_resume
+                    .as_ref()
+                    .map(|(bundle, text)| (&**bundle, text.as_str())),
+            },
+        )
+    }
     // Operational cleanup is not an alteration of immutable child evidence.
     fn _with_cleanup_warning(&self, message: &str) -> Self {
         let mut result = self.clone();
@@ -359,13 +412,14 @@ impl NativeModelRefinement {
     fn verify_with_parent(
         &self,
         py: Python<'_>,
-        parent: &crate::model_conversion::NativeModelConversion,
+        parent: &Bound<'_, PyAny>,
         max_parent_bytes: u64,
         max_replay_working_bytes: u64,
     ) -> PyResult<String> {
         if max_parent_bytes == 0 || max_replay_working_bytes == 0 {
             return Err(error("native parent/replay limits must be positive"));
         }
+        let parent = crate::native_parent::NativeTrainingParent::extract(parent)?;
         py.detach(||{
             let(mut child,log,view)=self.verified(self.limits)?;
             let(mut reader,parent_view)=parent.refinement_parent_view(&view.started().plan.parent.level)?;
@@ -375,6 +429,7 @@ impl NativeModelRefinement {
                 NativeScaleParentReadLimits{max_working_bytes:max_parent_bytes,extra_payload_bytes:0},NativeScaleJournalLimits{max_journal_bytes:self.limits.journal,max_working_bytes:max_replay_working_bytes}).map_err(error)?;
             self.verified(self.limits)?;
             Ok(serde_json::json!({"scope":"parent-backed-numerical-replay","package_id":hex(verified.package().as_bytes()),"journal_id":hex(verified.replay().summary().journal().as_bytes()),
+                "lineage_scope":"immediate-parent-only","parent_admission":parent.admission(),
                 "objective_authenticated":false,"quality_qualified":false}).to_string())
         })
     }

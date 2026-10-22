@@ -392,6 +392,7 @@ jobs:
           crates/tritium-py/tests/test_native_refinement.py
           crates/tritium-py/tests/test_native_resume.py
           crates/tritium-py/tests/test_native_refine.py
+          crates/tritium-py/tests/test_native_chaining.py
           crates/tritium-py/tests/test_native_module_calibration.py
           crates/tritium-py/tests/test_native_calibration_selection.py
           crates/tritium-py/tests/test_owner_row_score.py

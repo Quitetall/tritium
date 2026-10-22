@@ -17,6 +17,9 @@ use tritium_quantize::engine::{
 use tritium_schema::*;
 use tritium_train::pv_tuning::*;
 
+#[path = "native_scale_publication/chaining.rs"]
+mod chaining;
+
 #[derive(Clone, Debug)]
 struct Shared {
     bytes: Rc<RefCell<Vec<u8>>>,

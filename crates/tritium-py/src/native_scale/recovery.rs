@@ -242,7 +242,7 @@ impl ResumeRecording {
         bundle: &NativeScaleResumeBundle,
         text: &str,
         plan: &NativeRefinementPlan,
-        parent: &NativeModelConversion,
+        parent: &NativeTrainingParent,
     ) -> PyResult<Self> {
         if text.len() > 16384 {
             return Err(error("native resume recording request exceeds byte limit"));

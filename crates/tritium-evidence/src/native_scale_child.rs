@@ -89,6 +89,7 @@ impl NativeScaleChildReceiptView {
 pub struct NativeScaleChildRecordView {
     recovery: NativeRecoveryRecord,
     replay: NativeScaleReplayObserved,
+    package: tritium_format::PackageId,
 }
 impl NativeScaleChildRecordView {
     /// Recorded plan/execution, not authenticated objective execution.
@@ -198,7 +199,30 @@ impl NativeScaleChildRecordView {
         child
             .verify()
             .map_err(|_| invalid("standalone child source changed"))?;
-        Ok(Self { recovery, replay })
+        Ok(Self {
+            recovery,
+            replay,
+            package: child.package_id(),
+        })
+    }
+    /// Reverify exactly the model container originally observed by this record.
+    /// This does not read checkpoint/journal companions or establish numerical history.
+    pub fn verify_child<R: Read + Seek>(
+        &self,
+        child: &mut TritModelReader<R>,
+    ) -> Result<(), EvidenceError> {
+        if child.package_id() != self.package {
+            return Err(invalid(
+                "standalone native child package differs from admitted record",
+            ));
+        }
+        child
+            .validate_complete_payload_inventory()
+            .map_err(|_| invalid("standalone native child inventory changed"))?;
+        child
+            .verify()
+            .map_err(|_| invalid("standalone native child bytes changed"))?;
+        Ok(())
     }
 }
 

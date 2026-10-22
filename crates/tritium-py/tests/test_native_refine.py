@@ -206,7 +206,7 @@ def test_final_teacher_digest_detects_data_write_that_bypasses_version_counter(t
     parent.verify();saved[0].verify()
 
 
-def test_config_and_output_refusals_are_early_and_native_children_are_not_legacy(tmp_path):
+def test_config_and_output_refusals_require_exact_actual_parent(tmp_path):
     teacher,parent,training,validation,work=fixture(tmp_path);cfg=configuration(parent,training,validation)
     output=tmp_path/"exists";output.mkdir();(output/"sentinel").write_text("keep")
     with pytest.raises(FileExistsError):refine(parent,teacher=teacher,training=training,validation=validation,config=cfg,work_dir=work,output_dir=output)
@@ -216,7 +216,7 @@ def test_config_and_output_refusals_are_early_and_native_children_are_not_legacy
     request=cfg.plan;request["objective"]=[0]*32
     with pytest.raises(ValueError,match="objective"):Config(request,level="full",run_id="run",machine="cpu",training_limits=training_limits(),publication_limits=publish_limits(),data_limits=data_limits())
     result=refine(parent,teacher=teacher,training=training,validation=validation,config=cfg,work_dir=work,output_dir=tmp_path/"child")
-    with pytest.raises(TypeError,match="chaining"):
+    with pytest.raises(ValueError,match="parent level differs"):
         refine(result,teacher=teacher,training=training,validation=validation,config=cfg,work_dir=work,output_dir=tmp_path/"grandchild")
 
 

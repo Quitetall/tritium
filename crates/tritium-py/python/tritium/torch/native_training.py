@@ -358,8 +358,8 @@ def native_scale_training(model, artifact, *, level, plan=None, load_run_id,
     training window per step; pass its content identity to step(). Limits are
     logical, not complete Torch graph/process memory. Source shell is untouched.
     """
-    if not isinstance(artifact, _tritium.NativeModelConversion):
-        raise TypeError("native scale training requires NativeModelConversion")
+    if not isinstance(artifact, (_tritium.NativeModelConversion, _tritium.NativeModelRefinement)):
+        raise TypeError("native scale training requires NativeModelConversion or NativeModelRefinement")
     if not isinstance(level, str) or not level or not isinstance(load_run_id, str) or not load_run_id:
         raise ValueError("explicit level and load run required")
     for limit in (max_snapshot_bytes, max_parent_bytes, max_saved_input_bytes):

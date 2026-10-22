@@ -41,6 +41,7 @@ mod model_conversion;
 mod model_level;
 mod model_refinement;
 mod module_package;
+mod native_parent;
 mod native_scale;
 #[cfg(feature = "onnx")]
 mod onnx;

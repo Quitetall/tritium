@@ -297,8 +297,8 @@ def refine_native(parent, *, teacher, training, validation, config, work_dir, ou
     """Run source-consistent KD and observed retention; return an unqualified child."""
     if not isinstance(config, NativeRefinementConfig) or not isinstance(teacher, torch.nn.Module):
         raise TypeError("native refine requires NativeRefinementConfig and a dense teacher")
-    if not isinstance(parent, _tritium.NativeModelConversion):
-        raise TypeError("native refined-parent chaining is not admitted")
+    if not isinstance(parent, (_tritium.NativeModelConversion, _tritium.NativeModelRefinement)):
+        raise TypeError("native refinement requires an actual native conversion or refined parent")
     if resume is not None and not isinstance(resume, _tritium.NativeScaleResumeBundle):
         raise TypeError("native refinement resume requires NativeScaleResumeBundle")
     if on_checkpoint is not None and (not callable(on_checkpoint) or not config.checkpoint_steps):

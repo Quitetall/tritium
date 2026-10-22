@@ -326,7 +326,7 @@ impl NativeModelConversion {
     ) -> PyResult<crate::native_scale::NativeScaleTraining> {
         crate::native_scale::begin(
             py,
-            self,
+            self.clone().into(),
             matrices,
             crate::native_scale::BeginOptions {
                 plan_json,

@@ -1,7 +1,7 @@
 //! Explicit native scale training/recording bridge over common Rust publication.
 use crate::{
-    model_conversion::NativeModelConversion,
     model_level::NativePackedMatrix,
+    native_parent::NativeTrainingParent,
     torch_native::{checked_product, cpu_f32, export_array_f64, tensor_shape},
 };
 use dlpark::legacy::Dlpack;
@@ -219,7 +219,7 @@ pub(crate) fn embed_vjp(
 pub(crate) struct NativeScaleTraining {
     state: Mutex<TrainingState>,
     specs: Vec<NativePackedMatrix>,
-    parent: NativeModelConversion,
+    parent: NativeTrainingParent,
 }
 impl NativeScaleTraining {
     fn lock(&self) -> PyResult<std::sync::MutexGuard<'_, TrainingState>> {
@@ -239,7 +239,7 @@ pub(crate) struct BeginOptions<'a> {
 
 pub(crate) fn begin(
     py: Python<'_>,
-    result: &NativeModelConversion,
+    result: NativeTrainingParent,
     matrices: Vec<(String, Py<NativePackedMatrix>)>,
     options: BeginOptions<'_>,
 ) -> PyResult<NativeScaleTraining> {
@@ -279,7 +279,7 @@ pub(crate) fn begin(
         .collect();
     let (driver, recording) = py.detach(|| {
         let resumed = recorded_resume
-            .map(|(bundle, text)| recovery::ResumeRecording::new(bundle, text, &plan, result))
+            .map(|(bundle, text)| recovery::ResumeRecording::new(bundle, text, &plan, &result))
             .transpose()?;
         let (mut reader, parent) = result.refinement_parent_view(&plan.parent.level)?;
         if parent.binding() != &plan.parent {
@@ -318,7 +318,7 @@ pub(crate) fn begin(
             publication_ordinal: 0,
         }),
         specs,
-        parent: result.clone(),
+        parent: result,
     })
 }
 

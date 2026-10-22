@@ -77,7 +77,8 @@ its exact parent tuple with `artifact.native_refinement_parent(level)` and suppl
 a complete Rust `NativeRefinementPlan` mapping or JSON: selected canonical owners,
 `ScaleOnly` recipe, declared objective/teacher identities, ordered training and
 validation windows, child level, and resource limits. The artifact must be an
-actual `NativeModelConversion`; the factory revalidates its package/evidence.
+actual `NativeModelConversion` or distinct `NativeModelRefinement`; the factory
+revalidates the immediate parent's package/evidence and required companions.
 
 ```python
 from tritium.torch import native_scale_training
@@ -251,8 +252,35 @@ but no child. Older checkpoints are never pruned automatically. Postcommit train
 cleanup caveats are operational `publication_warnings`, not altered evidence or a
 false failed commit. Return type remains the unqualified `NativeModelRefinement`;
 legacy `RefinementConfig` and its artifact/profile gates stay unchanged. Native
-refined-parent chaining, code/PV, objective/data attestation and accelerator/
+code/PV, objective/data attestation and accelerator/
 distributed/physical/quality/release qualification remain open.
+
+### Refining an existing native child
+
+A `NativeModelRefinement` can supply actual hard starting values to another run
+without being relabeled a PTQ conversion. Obtain its exact immediate tuple with
+`child.native_refinement_parent(selected_level)`, build a new explicit plan, and
+pass it to `native_scale_training` or public `refine`. The same level label may
+appear in distinct packages; exact PackageId/model/source/evidence bindings, not
+labels alone, identify the parent. New rounds start at cursor0 with fresh moments;
+the previous TNSR is not silently imported as the new optimizer state. Use a saved
+bundle only to resume the same new-round plan and immediate parent.
+
+The parent descriptor admits actual model/strict log/checkpoint/journal bytes.
+Source-catalog assets and original-source observation are inherited unchanged;
+KD still uses the original dense teacher, while observed retention compares the
+actual immediate parent's values. Old models need not remain merely to infer or
+start another round, but audits of their earlier edges require those actual
+parents separately. Each published child remains complete, immutable and distinct.
+
+`child.verify_with_parent(immediate_parent, ...)` accepts either descriptor kind
+and verifies that immediate numerical edge. Its JSON scope remains
+`parent-backed-numerical-replay` and now explicitly reports
+`lineage_scope="immediate-parent-only"` and the parent's unqualified admission kind.
+It does not verify the entire chain or upgrade quality/objective flags. A new
+successful edge never retroactively authenticates older history. Existing
+completed-PTQ admission still rejects refined packages; standalone loading/export
+preserve their distinct type, original logs and companions.
 
 `NativeModelRefinement.open(directory)` independently checks actual typed child,
 original log and exact checkpoint/journal identities without requiring the parent

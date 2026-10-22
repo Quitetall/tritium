@@ -145,6 +145,28 @@ impl NativeRefinementParentView {
             view.reference.clone(),
         )
     }
+    /// Admit the exact immediate refined model from a standalone record-consistent view.
+    /// Companion bytes require separate admission. Earlier ancestry/numerical history
+    /// is not verified or retroactively authenticated by this constructor.
+    pub fn from_refined_record<R: Read + Seek>(
+        reader: &mut TritModelReader<R>,
+        level: &str,
+        view: &crate::NativeScaleChildRecordView,
+    ) -> Result<Self, EvidenceError> {
+        view.verify_child(reader)?;
+        if level != view.started().plan.child_level {
+            return Err(invalid("immediate refined parent level differs"));
+        }
+        Ok(Self {
+            binding: binding(
+                reader,
+                level,
+                view.started().plan.parent.source,
+                view.reference().clone(),
+            )?,
+            manifest_digest: manifest_digest(reader.manifest())?,
+        })
+    }
     /// Bind original import observations to actual complete imported bytes.
     /// This does not authenticate legacy/official source claims or reseal logs.
     pub fn from_import<R: Read + Seek>(

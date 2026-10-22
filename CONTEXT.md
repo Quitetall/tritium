@@ -77,6 +77,11 @@ A complete immutable hard artifact descended from one explicitly selected parent
 level through a declared recovery run. Its ancestry is distinct from quality qualification.
 _Avoid_: direct PTQ fit, overwritten parent, multilevel refinement
 
+**Immediate refinement parent**:
+The exact hard artifact and selected level supplying the current run's starting
+values. Its admission does not verify earlier refinement edges.
+_Avoid_: original source, verified entire ancestry
+
 **Model shell**:
 A model structure supplied to receive the stored state of a hard artifact.
 Its tensor shapes, dtypes and aliases are not evidence of source tensor values.
