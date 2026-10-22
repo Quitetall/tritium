@@ -10,6 +10,77 @@ use tritium_format::{
 
 const CHUNK: usize = 64 * 1024;
 
+#[test]
+fn complete_package_visits_preserve_exact_bytes_and_original_visitor_errors() {
+    let bytes = fixture(CHUNK + 1);
+    let mut reader = TritPackageReader::open(Source::new(bytes.clone()), limits(&bytes)).unwrap();
+    for _ in 0..2 {
+        let mut actual = Vec::new();
+        reader
+            .visit_package(|chunk| {
+                assert!(chunk.len() <= CHUNK);
+                actual.extend_from_slice(chunk);
+                Ok::<_, u8>(())
+            })
+            .unwrap();
+        assert_eq!(actual, bytes);
+    }
+    assert!(matches!(
+        reader.visit_package(|_| Err(83u8)),
+        Err(TritBlobVisitError::Visitor(83))
+    ));
+    reader.verify().unwrap();
+}
+
+#[test]
+fn complete_package_visit_rejects_changes_behind_the_visited_cursor_and_length_changes() {
+    let bytes = fixture(CHUNK + 1);
+    for change in 0..3 {
+        let source = Source::new(bytes.clone());
+        let mutable = source.bytes.clone();
+        let mut reader = TritPackageReader::open(source, limits(&bytes)).unwrap();
+        let mut changed = false;
+        let result = reader.visit_package(|_| {
+            if !changed {
+                changed = true;
+                match change {
+                    0 => mutable.borrow_mut()[256] ^= 1,
+                    1 => mutable.borrow_mut().push(0),
+                    _ => {
+                        mutable.borrow_mut().pop();
+                    }
+                }
+            }
+            Ok::<_, u8>(())
+        });
+        assert!(result.is_err());
+        if change == 0 {
+            assert!(matches!(
+                result,
+                Err(TritBlobVisitError::Source(
+                    TritPackageReadError::SourceChanged
+                ))
+            ));
+        }
+    }
+}
+
+#[test]
+fn complete_package_visit_preserves_actual_retained_source_io_failures() {
+    let bytes = fixture(CHUNK + 1);
+    let source = Source::new(bytes.clone());
+    let fail = source.fail_read.clone();
+    let mut reader = TritPackageReader::open(source, limits(&bytes)).unwrap();
+    fail.set(true);
+    match reader.visit_package(|_| Ok::<_, u8>(())) {
+        Err(TritBlobVisitError::Source(TritPackageReadError::Io { source, .. })) => {
+            assert_eq!(source.kind(), io::ErrorKind::Other);
+            assert_eq!(source.to_string(), "injected read");
+        }
+        other => panic!("original source failure lost: {other:?}"),
+    }
+}
+
 fn fixture(size: usize) -> Vec<u8> {
     let payload: Vec<_> = (0..size).map(|i| (i % 251) as u8).collect();
     write_trit_package(

@@ -220,6 +220,31 @@ impl<R: Read + Seek> TritPackageReader<R> {
         Ok(())
     }
 
+    /// Visit exact original package bytes in at most64KiB chunks.
+    ///
+    /// Checks the identity of bytes actually visited and verifies the retained
+    /// source again before success. Visitor effects are not transactional: keep
+    /// them private until success. Immutable source custody remains required;
+    /// this does not create an atomic external-writer snapshot.
+    /// # Errors
+    /// Changed source/length, actual I/O or unchanged visitor failure.
+    pub fn visit_package<E>(
+        &mut self,
+        mut visitor: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), TritBlobVisitError<E>> {
+        check_length(&mut self.source, self.length)?;
+        let mut hash = PackageHasher::new();
+        visit_range(&mut self.source, 0..self.length, |chunk| {
+            hash.update(chunk);
+            visitor(chunk)
+        })?;
+        if hash.finalize() != self.id {
+            return Err(TritPackageReadError::SourceChanged.into());
+        }
+        self.verify()?;
+        Ok(())
+    }
+
     /// Stream one admitted blob through at most64KiB chunks and recheck its ID.
     ///
     /// Only a directory index is accepted; a caller cannot forge source ranges.

@@ -11,6 +11,8 @@ mod republish;
 mod seek_admission;
 #[path = "model_engine/spool_publish.rs"]
 mod spool_publish;
+#[path = "model_engine/stream_export.rs"]
+mod stream_export;
 use std::{collections::BTreeMap, io::Cursor};
 use tritium_evidence::{
     DIRECT_LEVELS_FITTED_REGISTRATION, EvidenceRecorder, QUANTIZATION_COMPLETED_REGISTRATION,

@@ -19,8 +19,8 @@ use tritium_evidence::{
     OwnerQuantizationReceiptView, QuantizationReceiptView, SealedEvidence,
 };
 use tritium_format::trit_model::{
-    TritModelError, TritModelReadError, TritModelReader, decode_dense_f32, encode_model_manifest,
-    read_trit_model, validate_dense_payload,
+    TritModelError, TritModelReadError, TritModelReader, TritModelVisitError, decode_dense_f32,
+    encode_model_manifest, read_trit_model, validate_dense_payload,
 };
 use tritium_format::{
     TritBlob, TritBlobKind, TritPackageError, TritPackageReadLimits, write_trit_package_bounded,
@@ -97,6 +97,8 @@ pub enum QuantEngineError {
     Model(TritModelError),
     /// Existing seekable typed model/source reader failed.
     ModelRead(TritModelReadError),
+    /// Original typed model/source visitor or destination write failure.
+    ModelVisit(TritModelVisitError<std::io::Error>),
     /// Existing physical package writer failed.
     Package(TritPackageError),
     /// Source metadata, missing payload or failed I/O.

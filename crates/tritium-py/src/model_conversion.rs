@@ -199,10 +199,11 @@ impl NativeModelConversion {
             })
         })
     }
-    fn verified_bytes(&self) -> PyResult<Vec<u8>> {
-        self.verified_bytes_bounded(self.max_package_bytes)
-    }
-    fn verified_model_bounded(&self, maximum: u64, evidence_maximum: u64) -> PyResult<()> {
+    fn verified_model_bounded(
+        &self,
+        maximum: u64,
+        evidence_maximum: u64,
+    ) -> PyResult<TritModelReader<File>> {
         let (model, log, _) = open_bound_model(
             Path::new(&self.output_dir),
             self.max_package_bytes.min(maximum),
@@ -213,11 +214,7 @@ impl NativeModelConversion {
         {
             return Err(error("conversion package or evidence identity changed"));
         }
-        Ok(())
-    }
-    fn verified_bytes_bounded(&self, maximum: u64) -> PyResult<Vec<u8>> {
-        self.verified_contents_bounded(maximum, self.evidence_bytes)
-            .map(|(bytes, _)| bytes)
+        Ok(model)
     }
     fn verified_contents_bounded(
         &self,
@@ -274,10 +271,11 @@ impl NativeModelConversion {
                 max_package_bytes.unwrap_or(self.max_package_bytes),
                 max_evidence_bytes.unwrap_or(self.evidence_bytes),
             )
+            .map(|_| ())
         })
     }
     /// Export the verified original files without refitting or changing identities.
-    /// Whole-package buffering is bounded, not a full-process RSS guarantee.
+    /// Uses checked bounded package chunks, not a full-process RSS guarantee.
     #[pyo3(signature=(output_dir, *, max_package_bytes=None, max_evidence_bytes=None))]
     fn export(
         &self,
@@ -299,12 +297,36 @@ impl NativeModelConversion {
             .unwrap_or(self.max_package_bytes)
             .min(self.max_package_bytes);
         py.detach(|| {
-            let (bytes, text) = self.verified_contents_bounded(
-                maximum,
-                max_evidence_bytes.unwrap_or(self.evidence_bytes),
-            )?;
+            let evidence_maximum = max_evidence_bytes
+                .unwrap_or(self.evidence_bytes)
+                .min(self.evidence_bytes);
+            if maximum == 0 || evidence_maximum == 0 {
+                return Err(error("package and evidence byte limits must be positive"));
+            }
+            let root = Path::new(&self.output_dir);
+            let text = read_original_file_bounded(&root.join("evidence.jsonl"), evidence_maximum)
+                .map_err(error)?;
+            let text = std::str::from_utf8(&text).map_err(error)?;
+            if verify_jsonl(text).map_err(error)?.root_digest != self.evidence_root {
+                return Err(error("conversion package or evidence identity changed"));
+            }
+            let expected = tritium_format::PackageId::from_digest(
+                *blake3::Hash::from_hex(&self.package_id)
+                    .map_err(error)?
+                    .as_bytes(),
+            );
+            let metadata_maximum = usize::try_from(maximum).unwrap_or(usize::MAX);
             let warnings = DirectoryTensorSink::new(&output_dir)
-                .publish_verified_model(&bytes, std::str::from_utf8(&text).map_err(error)?)
+                .publish_verified_model_reader(
+                    open_original_file(&root.join("model.trit")).map_err(error)?,
+                    TritPackageReadLimits {
+                        max_source_bytes: maximum,
+                        max_manifest_bytes: metadata_maximum,
+                        max_directory_bytes: metadata_maximum,
+                    },
+                    expected,
+                    text,
+                )
                 .map_err(|failure| match failure {
                     QuantEngineError::DestinationExists => {
                         PyFileExistsError::new_err("output directory already exists")
@@ -377,13 +399,22 @@ impl NativeModelConversion {
             return Err(error("max_bytes must be positive"));
         }
         let payload = py.detach(|| {
-            let bytes = self.verified_bytes()?;
-            let model = tritium_format::trit_model::read_trit_model(&bytes).map_err(error)?;
-            let payload = model.asset(name).map_err(error)?;
-            if payload.len() > max_bytes {
+            let mut model =
+                self.verified_model_bounded(self.max_package_bytes, self.evidence_bytes)?;
+            let length = model.asset_byte_len(name).map_err(error)?;
+            if length > max_bytes as u64 {
                 return Err(error("asset exceeds byte limit"));
             }
-            Ok::<_, PyErr>(payload.to_vec())
+            let mut payload = Vec::new();
+            payload.try_reserve_exact(length as usize).map_err(error)?;
+            model
+                .visit_asset(name, |chunk| {
+                    payload.extend_from_slice(chunk);
+                    Ok::<_, std::convert::Infallible>(())
+                })
+                .map_err(error)?;
+            model.verify().map_err(error)?;
+            Ok::<_, PyErr>(payload)
         })?;
         Ok(PyBytes::new(py, &payload))
     }
@@ -400,18 +431,28 @@ impl NativeModelConversion {
             return Err(error("max_bytes must be positive"));
         }
         let (precision, shape, payload) = py.detach(|| {
-            let bytes = self.verified_bytes()?;
-            let model = tritium_format::trit_model::read_trit_model(&bytes).map_err(error)?;
-            let (meta, payload) = model.tensor(level, name).map_err(error)?;
-            if payload.len() > max_bytes {
+            let mut model =
+                self.verified_model_bounded(self.max_package_bytes, self.evidence_bytes)?;
+            let length = model.tensor_byte_len(level, name).map_err(error)?;
+            if length > max_bytes as u64 {
                 return Err(error("preserved tensor exceeds byte limit"));
             }
-            match &meta.storage {
+            let (precision, shape) = match &model.tensor_meta(level, name).map_err(error)?.storage {
                 TensorStorage::Dense { precision, shape } => {
-                    Ok((format!("{precision:?}"), shape.clone(), payload.to_vec()))
+                    (format!("{precision:?}"), shape.clone())
                 }
-                _ => Err(error("requested tensor is not dense-preserved")),
-            }
+                _ => return Err(error("requested tensor is not dense-preserved")),
+            };
+            let mut payload = Vec::new();
+            payload.try_reserve_exact(length as usize).map_err(error)?;
+            model
+                .visit_tensor(level, name, |chunk| {
+                    payload.extend_from_slice(chunk);
+                    Ok::<_, std::convert::Infallible>(())
+                })
+                .map_err(error)?;
+            model.verify().map_err(error)?;
+            Ok((precision, shape, payload))
         })?;
         Ok((precision, shape, PyBytes::new(py, &payload)))
     }

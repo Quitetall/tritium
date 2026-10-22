@@ -135,6 +135,47 @@ impl DirectoryTensorSink {
         })
     }
 
+    /// Republish exact retained-source bytes without a complete package buffer.
+    ///
+    /// Admits the canonical original log, complete typed source binding and the
+    /// expected exact PackageId before creating output. Copies checked bounded
+    /// chunks into the common owned pending file, admits that file through the
+    /// same checker and verifies the retained source before no-clobber commit.
+    /// No recorder seal, rewritten log, refit or distribution approval is made.
+    /// Caller owns immutable source and parent-directory custody; this is not an
+    /// atomic external-writer snapshot, process-RSS or power-loss/security gate.
+    /// # Errors
+    /// Invalid binding/identity, changed source, byte limits, original source or
+    /// destination I/O, existing output or other pre-commit publication failure.
+    pub fn publish_verified_model_reader<R: Read + Seek>(
+        &mut self,
+        source: R,
+        limits: TritPackageReadLimits,
+        expected: tritium_format::PackageId,
+        original_jsonl: &str,
+    ) -> Result<Vec<PublicationWarning>, QuantEngineError> {
+        let log = tritium_evidence::verify_jsonl(original_jsonl)?;
+        let mut model = super::open_model_reader_with_fit_log(source, limits, &log)?;
+        if model.package_id() != expected {
+            return Err(QuantEngineError::Binding("export package identity changed"));
+        }
+        self.publish_with_emitter(original_jsonl, true, |file| {
+            model
+                .visit_package(|chunk| file.write_all(chunk))
+                .map_err(QuantEngineError::ModelVisit)?;
+            let staged = super::open_model_reader_with_fit_log(file, limits, &log)?;
+            if staged.package_id() != expected {
+                return Err(QuantEngineError::Binding("staged export identity changed"));
+            }
+            model.verify()?;
+            Ok(())
+        })
+        .map(|(_, warnings)| warnings)
+        .map_err(|error| match error {
+            WriteFailure::Emitter(error) | WriteFailure::Publication(error) => error,
+        })
+    }
+
     /// Validate bounded spool output before the existing sync/no-clobber commit.
     ///
     /// Uses the same publisher as ordinary/recorded-stage writers and the format

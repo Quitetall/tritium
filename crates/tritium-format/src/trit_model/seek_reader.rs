@@ -250,6 +250,20 @@ impl<R: Read + Seek> TritModelReader<R> {
     pub fn verify(&mut self) -> Result<(), TritModelReadError> {
         self.package.verify().map_err(Into::into)
     }
+
+    /// Visit exact original package bytes, not a reconstructed model encoding.
+    ///
+    /// Delegates bounded chunks, visited-byte identity, source-length and final
+    /// source verification to the package reader. Keep visitor effects private
+    /// until success; this is not an atomic snapshot or quality qualification.
+    /// # Errors
+    /// Changed source/length, actual I/O or unchanged visitor failure.
+    pub fn visit_package<E>(
+        &mut self,
+        visitor: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), TritModelVisitError<E>> {
+        self.package.visit_package(visitor).map_err(Into::into)
+    }
 }
 
 struct Cache {
