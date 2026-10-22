@@ -79,9 +79,36 @@ pub fn stage_trit_model_from_spool<S: Read + Seek, R: Read + Write + Seek, E>(
     blobs: &[TritSpoolBlob],
     spool: &mut S,
     limits: TritPackageReadLimits,
-    mut destination: R,
+    destination: R,
     source_guard: impl FnOnce() -> Result<(), E>,
 ) -> Result<TritModelReader<R>, TritModelStageError<E>> {
+    stage_trit_model_from_spool_with_admission(manifest, blobs, spool, limits, destination, |_| {
+        source_guard()
+    })
+    .map(|(reader, ())| reader)
+}
+
+/// Same checked staging, allowing owned metadata/result extraction before terminal verification.
+/// The callback also owns original source admission; it executes once after full
+/// typed staging and before final output verification. No publication is implied.
+/// Callback results must be owned, not borrowed from the private reader.
+/// ```compile_fail
+/// use std::io::Cursor;
+/// use tritium_format::{TritSpoolBlob,TritPackageReadLimits};
+/// use tritium_format::trit_model::stage_trit_model_from_spool_with_admission;
+/// use tritium_schema::ModelManifest;
+/// fn escape(m:&ModelManifest,b:&[TritSpoolBlob],s:&mut Cursor<Vec<u8>>,l:TritPackageReadLimits) {
+///     let _=stage_trit_model_from_spool_with_admission(m,b,s,l,Cursor::new(Vec::new()),|r|Ok::<_,()>(r.manifest()));
+/// }
+/// ```
+pub fn stage_trit_model_from_spool_with_admission<S: Read + Seek, R: Read + Write + Seek, E, T>(
+    manifest: &ModelManifest,
+    blobs: &[TritSpoolBlob],
+    spool: &mut S,
+    limits: TritPackageReadLimits,
+    mut destination: R,
+    admit: impl FnOnce(&mut TritModelReader<R>) -> Result<T, E>,
+) -> Result<(TritModelReader<R>, T), TritModelStageError<E>> {
     let metadata = encode_model_manifest(manifest).map_err(TritModelStageError::Model)?;
     if destination
         .seek(SeekFrom::End(0))
@@ -115,7 +142,7 @@ pub fn stage_trit_model_from_spool<S: Read + Seek, R: Read + Write + Seek, E>(
     if actual != expected {
         return Err(TritModelStageError::IdentityMismatch { expected, actual });
     }
-    source_guard().map_err(TritModelStageError::Guard)?;
+    let value = admit(&mut reader).map_err(TritModelStageError::Guard)?;
     reader.verify().map_err(TritModelStageError::Read)?;
-    Ok(reader)
+    Ok((reader, value))
 }

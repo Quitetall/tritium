@@ -870,6 +870,14 @@ fn wire_bytes_follow_the_declared_little_endian_frames_not_only_roundtrip() {
     let mut expected = b"TNSJ\0\0\0\x01".to_vec();
     expected.extend_from_slice(session.plan_id().as_bytes());
     expected.extend_from_slice(&checkpoint[37..69]); // Existing TNSR exact-parent fingerprint.
+    assert_eq!(
+        checkpoint[37..69]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+        "18c9547a924a4f5b41c3164a635e7d1ae3778c10d045579f48830ca8c3fbc6d5",
+        "frozen TNSR v1 parent binding from 40f609c4 must not change"
+    );
     expected.extend_from_slice(&4u64.to_le_bytes());
     expected.extend_from_slice(&1u64.to_le_bytes());
     expected.extend_from_slice(&(scales as u64).to_le_bytes());

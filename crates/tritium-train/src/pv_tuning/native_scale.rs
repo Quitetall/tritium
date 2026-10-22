@@ -15,6 +15,7 @@ mod consumers;
 mod cpu;
 mod identity;
 mod journal;
+mod publication;
 mod transaction;
 pub use consumers::NativeScaleContribution;
 #[cfg(feature = "native-cpu")]
@@ -23,6 +24,12 @@ pub use journal::{
     NativeScaleJournalError, NativeScaleJournalLimits, NativeScaleJournalSizeLedger,
     NativeScaleJournalSummary, NativeScaleJournalWriter, VerifiedNativeScaleReplay,
     replay_native_scale_journal,
+};
+pub use publication::{
+    NATIVE_SCALE_CHECKPOINT_FILE, NATIVE_SCALE_JOURNAL_FILE, NativeScaleChildError,
+    NativeScaleChildGuardError, NativeScaleChildLimits, NativeScaleChildSizeLedger,
+    NativeScaleChildSource, PublishedNativeScaleChild, inspect_native_scale_child,
+    publish_native_scale_child,
 };
 pub use transaction::{NativeScaleStageError, NativeScaleStep};
 
@@ -266,53 +273,9 @@ fn admit(
     }
     let plan_id = native_refinement_plan_id(plan)
         .map_err(|e| PvTuningError::invalid_config(e.to_string()))?;
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"tritium.native-scale.parent.v1\0");
-    hasher.update(plan_id.as_bytes());
+    let mut hasher = parent_hasher(plan_id);
     for weight in parents {
-        // Reuse canonical plane codecs with fixed 20-trit (LCM of 4 and 5)
-        // chunks: no encoded model-size temporary and no S34 padding shortcut.
-        let codec = match weight.layout().codec {
-            PlaneCodec::D2 => SaltV2Codec::D2,
-            PlaneCodec::B3 => SaltV2Codec::B3,
-            PlaneCodec::S34 => SaltV2Codec::S34,
-            _ => {
-                return Err(PvTuningError::invalid_weight(
-                    "unsupported native plane codec",
-                ));
-            }
-        };
-        let view = weight.view();
-        for plane in 0..view.plane_count() {
-            for trits in view
-                .plane_trits(plane)
-                .map_err(|e| PvTuningError::invalid_weight(format!("{e:?}")))?
-                .chunks(20)
-            {
-                let len = codec
-                    .ledger(trits.len())
-                    .map_err(|e| PvTuningError::invalid_weight(e.to_string()))?
-                    .physical_bytes;
-                codec
-                    .pack_into(trits, &mut [0; 5][..len])
-                    .map_err(|e| PvTuningError::invalid_weight(e.to_string()))?;
-            }
-        }
-        identity::hash_layout(&mut hasher, weight.layout())?;
-        hasher.update(&[weight.plane_count()]);
-        frame(&mut hasher, weight.tile_counts().unwrap_or_default());
-        hasher.update(&(weight.trits().len() as u64).to_le_bytes());
-        for chunk in weight.trits().chunks(256) {
-            let mut bytes = [0; 256];
-            for (byte, trit) in bytes.iter_mut().zip(chunk) {
-                *byte = trit.get() as u8;
-            }
-            hasher.update(&bytes[..chunk.len()]);
-        }
-        hasher.update(&(weight.scales().len() as u64).to_le_bytes());
-        for scale in weight.scales() {
-            hasher.update(&scale.to_bits().to_le_bytes());
-        }
+        hash_parent_tensor(&mut hasher, weight)?;
     }
     Ok(Admission {
         plan_id,
@@ -326,6 +289,62 @@ fn admit(
             weight_decay: optimizer.weight_decay,
         },
     })
+}
+
+fn parent_hasher(plan_id: NativeRefinementPlanId) -> blake3::Hasher {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"tritium.native-scale.parent.v1\0");
+    hasher.update(plan_id.as_bytes());
+    hasher
+}
+fn hash_parent_tensor(
+    hasher: &mut blake3::Hasher,
+    weight: &AdditiveTensor,
+) -> Result<(), PvTuningError> {
+    // Reuse canonical plane codecs with fixed 20-trit (LCM of 4 and 5)
+    // chunks: no encoded model-size temporary and no S34 padding shortcut.
+    let codec = match weight.layout().codec {
+        PlaneCodec::D2 => SaltV2Codec::D2,
+        PlaneCodec::B3 => SaltV2Codec::B3,
+        PlaneCodec::S34 => SaltV2Codec::S34,
+        _ => {
+            return Err(PvTuningError::invalid_weight(
+                "unsupported native plane codec",
+            ));
+        }
+    };
+    let view = weight.view();
+    for plane in 0..view.plane_count() {
+        for trits in view
+            .plane_trits(plane)
+            .map_err(|e| PvTuningError::invalid_weight(format!("{e:?}")))?
+            .chunks(20)
+        {
+            let len = codec
+                .ledger(trits.len())
+                .map_err(|e| PvTuningError::invalid_weight(e.to_string()))?
+                .physical_bytes;
+            codec
+                .pack_into(trits, &mut [0; 5][..len])
+                .map_err(|e| PvTuningError::invalid_weight(e.to_string()))?;
+        }
+    }
+    identity::hash_layout(hasher, weight.layout())?;
+    hasher.update(&[weight.plane_count()]);
+    frame(hasher, weight.tile_counts().unwrap_or_default());
+    hasher.update(&(weight.trits().len() as u64).to_le_bytes());
+    for chunk in weight.trits().chunks(256) {
+        let mut bytes = [0; 256];
+        for (byte, trit) in bytes.iter_mut().zip(chunk) {
+            *byte = trit.get() as u8;
+        }
+        hasher.update(&bytes[..chunk.len()]);
+    }
+    hasher.update(&(weight.scales().len() as u64).to_le_bytes());
+    for scale in weight.scales() {
+        hasher.update(&scale.to_bits().to_le_bytes());
+    }
+    Ok(())
 }
 
 fn size_ledger(parents: &[AdditiveTensor]) -> Result<NativeScaleSizeLedger, PvTuningError> {

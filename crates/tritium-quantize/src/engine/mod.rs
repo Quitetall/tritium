@@ -6,6 +6,8 @@
 
 mod activation_aware;
 mod cache_scalar;
+mod companions;
+pub use companions::{TritModelCompanion, TritModelCompanions, TritModelSpool};
 mod calibrated_fit;
 mod calibration;
 mod calibration_cache;

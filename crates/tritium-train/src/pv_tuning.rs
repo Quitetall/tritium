@@ -27,6 +27,12 @@ mod wire;
 pub use blockwise::PvBlockwiseCursor;
 pub use config::{PvTuningConfig, PvTuningConfigBuilder};
 pub use error::PvTuningError;
+pub use native_scale::{
+    NATIVE_SCALE_CHECKPOINT_FILE, NATIVE_SCALE_JOURNAL_FILE, NativeScaleChildError,
+    NativeScaleChildGuardError, NativeScaleChildLimits, NativeScaleChildSizeLedger,
+    NativeScaleChildSource, PublishedNativeScaleChild, inspect_native_scale_child,
+    publish_native_scale_child,
+};
 #[cfg(feature = "native-cpu")]
 pub use native_scale::{
     NativeCpuScaleError, NativeCpuScaleJournalStageError, NativeCpuScaleSession,

@@ -221,6 +221,46 @@ fn bad_metadata_ranges_and_digests_leave_destination_untouched() {
 }
 
 #[test]
+fn exact_layout_inspection_matches_actual_deduplication_and_ignores_source_offsets() {
+    use tritium_format::inspect_trit_spool_layout;
+    for length in [0, 1, 23, 255, 256, 65536] {
+        let data = vec![19; length];
+        let other = vec![23; length];
+        let blobs = [
+            TritBlob {
+                kind: TritBlobKind::AdditiveTensor,
+                bytes: &data,
+            },
+            TritBlob {
+                kind: TritBlobKind::Asset("same.bin".into()),
+                bytes: &data,
+            },
+            TritBlob {
+                kind: TritBlobKind::Asset("other.bin".into()),
+                bytes: &other,
+            },
+        ];
+        let (_, mut entries) = stage(&blobs);
+        let actual = write_trit_package(MANIFEST, &blobs).unwrap();
+        let size = inspect_trit_spool_layout(MANIFEST, &entries).unwrap();
+        assert_eq!(size.package_bytes, actual.len() as u64);
+        assert_eq!(size.manifest_bytes, MANIFEST.len() as u64);
+        assert_eq!(
+            size.directory_bytes,
+            u64::from_le_bytes(actual[40..48].try_into().unwrap())
+        );
+        for entry in &mut entries {
+            entry.offset = u64::MAX;
+        }
+        assert_eq!(
+            inspect_trit_spool_layout(MANIFEST, &entries).unwrap(),
+            size,
+            "inspection is metadata layout, not source-range verification"
+        );
+    }
+}
+
+#[test]
 fn source_errors_are_distinct_and_preflight_does_not_write() {
     let (cursor, entries) = stage(&[TritBlob {
         kind: TritBlobKind::AdditiveTensor,

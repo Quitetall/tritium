@@ -75,6 +75,31 @@ pub struct TritSpoolBlob {
     pub length: u64,
 }
 
+/// Exact canonical layout from known blob identities/lengths, not source-byte proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TritSpoolLayoutSize {
+    /// Complete canonical container length including alignment and deduplication.
+    pub package_bytes: u64,
+    /// Exact supplied canonical manifest bytes.
+    pub manifest_bytes: u64,
+    /// Exact owning encoder's deduplicated typed directory bytes.
+    pub directory_bytes: u64,
+}
+
+/// Inspect the owning spool encoder's exact metadata layout without source/output I/O.
+/// Actual payload identities/ranges/collisions remain checked by the writer.
+pub fn inspect_trit_spool_layout(
+    manifest_cbor: &[u8],
+    blobs: &[TritSpoolBlob],
+) -> Result<TritSpoolLayoutSize, TritPackageError> {
+    let plan = prepare_spool_layout(manifest_cbor, blobs, usize::MAX)?;
+    Ok(TritSpoolLayoutSize {
+        package_bytes: plan.size as u64,
+        manifest_bytes: plan.manifest.len() as u64,
+        directory_bytes: plan.directory.len() as u64,
+    })
+}
+
 /// Indexed package entry for one blob kind.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TritBlobInfo {
@@ -367,16 +392,7 @@ pub fn write_trit_package_from_spool(
     max_bytes: usize,
     destination: &mut impl std::io::Write,
 ) -> Result<PackageId, TritPackageWriteError> {
-    let entries = blob_metadata(manifest_cbor, blobs.len(), |index| {
-        let blob = &blobs[index];
-        Ok(BlobMetadata {
-            id: blob.id,
-            kind: blob.kind.clone(),
-            length: as_usize(blob.length)?,
-        })
-    })
-    .map_err(TritPackageWriteError::Package)?;
-    let plan = prepare_layout(manifest_cbor, &entries, max_bytes)
+    let plan = prepare_spool_layout(manifest_cbor, blobs, max_bytes)
         .map_err(TritPackageWriteError::Package)?;
     let source_len = source
         .seek(std::io::SeekFrom::End(0))
@@ -412,6 +428,22 @@ pub fn write_trit_package_from_spool(
         },
     )?;
     Ok(hash.finalize())
+}
+
+fn prepare_spool_layout<'a>(
+    manifest_cbor: &'a [u8],
+    blobs: &[TritSpoolBlob],
+    max_bytes: usize,
+) -> Result<PackageWritePlan<'a>, TritPackageError> {
+    let entries = blob_metadata(manifest_cbor, blobs.len(), |index| {
+        let blob = &blobs[index];
+        Ok(BlobMetadata {
+            id: blob.id,
+            kind: blob.kind.clone(),
+            length: as_usize(blob.length)?,
+        })
+    })?;
+    prepare_layout(manifest_cbor, &entries, max_bytes)
 }
 
 fn seek_spool(source: &mut impl std::io::Seek, offset: u64) -> Result<(), TritPackageWriteError> {

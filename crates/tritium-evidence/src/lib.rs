@@ -22,6 +22,7 @@ pub use model_load::{MODEL_LOADED_REGISTRATION, ModelLoadReceiptView};
 
 mod model_import;
 mod native_refinement;
+mod native_scale_child;
 pub use model_import::{
     LEGACY_MODEL_IMPORT_BOUND_PREPARED_REGISTRATION, LEGACY_MODEL_IMPORT_PREPARED_REGISTRATION,
     LegacyModelImportBoundView, LegacyModelImportView,
@@ -30,6 +31,9 @@ pub use native_refinement::{
     NATIVE_REFINEMENT_CHECKPOINTED_REGISTRATION, NATIVE_REFINEMENT_COMPLETED_REGISTRATION,
     NATIVE_REFINEMENT_STARTED_REGISTRATION, NativeRefinementParentView,
     NativeRefinementReceiptView, native_refinement_plan_id, native_refinement_state_id,
+};
+pub use native_scale_child::{
+    NATIVE_SCALE_REPLAY_OBSERVED_REGISTRATION, NativeScaleChildReceiptView,
 };
 
 mod direct_fit;

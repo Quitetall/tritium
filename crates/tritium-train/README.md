@@ -104,3 +104,39 @@ This v1 profile does not append/resume partial journals, record Python steps,
 publish children, authenticate backward execution or clear any
 independent quality/performance/release gate. Existing unrecorded TNSR resume and
 all prior numerical/inference profiles are unchanged.
+
+## Immutable native scale children (Rust)
+
+`pv_tuning::publish_native_scale_child` consumes a completed common session, its
+actual `VerifiedNativeScaleReplay`, the original evidence-bound retained parent
+reader and actual journal, explicit validation observations, an empty private
+spool, declared limits, a new directory sink and a fresh registered recorder.
+Register native start/checkpoint/completion plus
+`NATIVE_SCALE_REPLAY_OBSERVED_REGISTRATION`. The producer records its compiled
+source identity and CPU-reference profile; machine/validation values remain
+caller observations, not independently authenticated quality or hardware proof.
+
+The producer rechecks current state and actual original parent coefficients/scales
+without retaining a second decoded model. It publishes exactly one schema1.1
+Refined level, preserving unselected tensor bytes/storage and every original
+asset. Selected tensors keep their layout/law/basis/allocation/codes and actual
+stored scale precision. Selected encoding currently requires Raw transport.
+`inspect_native_scale_child` forecasts logical spool/companion/builder payload,
+not authenticity, complete container bytes or process RSS.
+
+The common publisher writes `model.trit`, `evidence.jsonl`, `checkpoint.tnsr` and
+`gradients.tnsj`. Companion lengths/identities and the original parent guard must
+pass before the no-clobber model commit marker. Failed private spool tails belong
+to the caller; failed publication cleans only owned files. Post-commit cleanup/
+directory-sync caveats are explicit warnings. Training journals/checkpoints are
+not deployment compression evidence and may require substantial disk space.
+
+`NativeScaleChildReceiptView` folds original records against an admitted parent
+and requested plan and verifies actual typed child bytes. It is record consistency,
+not numerical replay or a quality/release capability. An unchanged child may keep
+its semantic ModelId; package/provenance remain distinct. Standalone typed reopen
+does not yet provide Python/HF shell loading: preserved catalogs still describe
+the explicit parent level and need the separate refined-result loader. No old
+completed-conversion gate is broadened. Python recording/public refine/export/load,
+objective/data authentication, native code/PV and independent physical/model/
+security/release gates remain open.

@@ -202,7 +202,12 @@ impl NativeRefinementParentView {
             manifest_digest: manifest_digest(manifest)?,
         })
     }
-    fn verify<R: Read + Seek>(&self, reader: &mut TritModelReader<R>) -> Result<(), EvidenceError> {
+    /// Reverify the exact original package, selected level and metadata binding.
+    /// This does not authenticate official source or numerical/quality claims.
+    pub fn verify<R: Read + Seek>(
+        &self,
+        reader: &mut TritModelReader<R>,
+    ) -> Result<(), EvidenceError> {
         reader
             .verify()
             .map_err(|_| invalid("parent source changed"))?;

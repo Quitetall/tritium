@@ -1,4 +1,5 @@
 //! No-overwrite destinations for a checked package and actual sealed fit log.
+use super::companions::{TritModelCompanions, TritModelSpool, copy_companion, verify_companion};
 use super::{PublicationWarning, QuantEngineError, TensorSink};
 use std::{
     fs::{self, File, OpenOptions},
@@ -7,7 +8,7 @@ use std::{
 };
 use tritium_evidence::SealedEvidence;
 use tritium_format::trit_model::{
-    TritModelReader, TritModelStageError, stage_trit_model_from_spool,
+    TritModelReader, TritModelStageError, stage_trit_model_from_spool_with_admission,
 };
 use tritium_format::{TritPackageReadLimits, TritSpoolBlob};
 use tritium_schema::ModelManifest;
@@ -201,10 +202,80 @@ impl DirectoryTensorSink {
         source_guard: impl FnOnce() -> Result<(), E>,
     ) -> Result<(TritModelReader<File>, Vec<PublicationWarning>), TritModelPublicationError<E>>
     {
-        self.publish_with_emitter(evidence.jsonl(), true, |file| {
+        self.publish_spooled_model_with_companions(
+            TritModelSpool {
+                manifest,
+                blobs,
+                source: spool,
+                limits,
+            },
+            evidence,
+            TritModelCompanions {
+                files: Vec::new(),
+                max_bytes: 0,
+            },
+            |_| source_guard(),
+        )
+        .map(|(model, (), warnings)| (model, warnings))
+    }
+
+    /// Stage a complete typed model and bounded hashed companions in one commit.
+    /// Companions are copied/synced before staging; retained handles are rechecked
+    /// after the source guard and before the no-clobber model hard link. Caller
+    /// owns exclusive source/directory custody; not adversarial-writer, RSS,
+    /// power-loss/security, lineage or distribution qualification.
+    pub fn publish_spooled_model_with_companions<S: Read + Seek, E, T>(
+        &mut self,
+        staging: TritModelSpool<'_, S>,
+        evidence: &SealedEvidence,
+        companions: TritModelCompanions<'_>,
+        admit: impl FnOnce(&mut TritModelReader<File>) -> Result<T, E>,
+    ) -> Result<(TritModelReader<File>, T, Vec<PublicationWarning>), TritModelPublicationError<E>>
+    {
+        {
+            use tritium_format::trit_model::{TritModelError, encode_model_manifest};
+            use tritium_format::{TritPackageError, inspect_trit_spool_layout};
+            let metadata = encode_model_manifest(staging.manifest).map_err(|error| {
+                TritModelPublicationError::Staging(TritModelStageError::Model(error))
+            })?;
+            let size = inspect_trit_spool_layout(&metadata, staging.blobs).map_err(|error| {
+                TritModelPublicationError::Staging(TritModelStageError::Model(
+                    TritModelError::Package(error),
+                ))
+            })?;
+            if size.package_bytes > staging.limits.max_source_bytes {
+                return Err(TritModelPublicationError::Staging(
+                    TritModelStageError::Model(TritModelError::Package(
+                        TritPackageError::PackageLimitExceeded {
+                            requested: usize::try_from(size.package_bytes).unwrap_or(usize::MAX),
+                            limit: usize::try_from(staging.limits.max_source_bytes)
+                                .unwrap_or(usize::MAX),
+                        },
+                    )),
+                ));
+            }
+            if size.manifest_bytes > staging.limits.max_manifest_bytes as u64
+                || size.directory_bytes > staging.limits.max_directory_bytes as u64
+            {
+                return Err(TritModelPublicationError::Staging(
+                    TritModelStageError::Model(TritModelError::Package(
+                        TritPackageError::MetadataLimitExceeded,
+                    )),
+                ));
+            }
+        }
+        self.publish_with_companions(evidence.jsonl(), true, companions, |file| {
             let destination = file.try_clone().map_err(TritModelStageError::Destination)?;
-            stage_trit_model_from_spool(manifest, blobs, spool, limits, destination, source_guard)
+            stage_trit_model_from_spool_with_admission(
+                staging.manifest,
+                staging.blobs,
+                staging.source,
+                staging.limits,
+                destination,
+                admit,
+            )
         })
+        .map(|((model, value), warnings)| (model, value, warnings))
         .map_err(|error| match error {
             WriteFailure::Emitter(error) => TritModelPublicationError::Staging(error),
             WriteFailure::Publication(error) => TritModelPublicationError::Publication(error),
@@ -217,6 +288,29 @@ impl DirectoryTensorSink {
         readable: bool,
         emit: impl FnOnce(&mut File) -> Result<R, E>,
     ) -> Result<(R, Vec<PublicationWarning>), WriteFailure<E>> {
+        self.publish_with_companions(
+            original_jsonl,
+            readable,
+            TritModelCompanions {
+                files: Vec::new(),
+                max_bytes: 0,
+            },
+            emit,
+        )
+    }
+
+    fn publish_with_companions<R, E>(
+        &mut self,
+        original_jsonl: &str,
+        readable: bool,
+        mut companions: TritModelCompanions<'_>,
+        emit: impl FnOnce(&mut File) -> Result<R, E>,
+    ) -> Result<(R, Vec<PublicationWarning>), WriteFailure<E>> {
+        companions.validate().map_err(WriteFailure::Publication)?;
+        let mut owned_companions = Vec::new();
+        owned_companions
+            .try_reserve_exact(companions.files.len())
+            .map_err(|_| WriteFailure::Publication(QuantEngineError::Allocation))?;
         fs::create_dir(&self.directory).map_err(|e| {
             WriteFailure::Publication(if e.kind() == std::io::ErrorKind::AlreadyExists {
                 QuantEngineError::DestinationExists
@@ -234,6 +328,18 @@ impl DirectoryTensorSink {
             owned_log = true;
             file.write_all(original_jsonl.as_bytes())?;
             file.sync_all()?;
+            for companion in &mut companions.files {
+                let path = self.directory.join(companion.name);
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)?;
+                owned_companions.push((path, file, companion.bytes, companion.content));
+                let file = &mut owned_companions.last_mut().expect("just inserted").1;
+                copy_companion(companion.source, file, companion.bytes, companion.content)
+                    .map_err(WriteFailure::Publication)?;
+            }
             let mut file = OpenOptions::new()
                 .read(readable)
                 .write(true)
@@ -242,6 +348,9 @@ impl DirectoryTensorSink {
             owned_pending = true;
             let value = emit(&mut file).map_err(WriteFailure::Emitter)?;
             file.sync_all()?;
+            for (_, companion, bytes, content) in &mut owned_companions {
+                verify_companion(companion, *bytes, *content).map_err(WriteFailure::Publication)?;
+            }
             fs::hard_link(&pending, &model)?;
             Ok::<R, WriteFailure<E>>(value)
         })();
@@ -253,6 +362,10 @@ impl DirectoryTensorSink {
                 }
                 if owned_log {
                     let _ = fs::remove_file(&log);
+                }
+                for (path, file, _, _) in owned_companions {
+                    drop(file);
+                    let _ = fs::remove_file(path);
                 }
                 // Never recursively remove unexpected/foreign files injected here.
                 let _ = fs::remove_dir(&self.directory);

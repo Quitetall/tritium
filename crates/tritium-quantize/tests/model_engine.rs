@@ -1,6 +1,8 @@
 //! Actual raw source -> shared fitter -> sealed log -> checked package -> sinks.
 #[path = "model_engine/calibrated.rs"]
 mod calibrated;
+#[path = "model_engine/companions.rs"]
+mod companions;
 #[path = "model_engine/observed.rs"]
 mod observed;
 #[path = "model_engine/owner.rs"]

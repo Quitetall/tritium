@@ -176,9 +176,10 @@ pub use trit_package::{
     EncodedSizeBounds, TRIT_BLOB_ALIGNMENT, TRIT_HEADER_BYTES, TRIT_MAGIC, TRIT_PACKAGE_MAJOR,
     TritBlob, TritBlobInfo, TritBlobKind, TritBlobSize, TritBlobVisitError, TritPackage,
     TritPackageError, TritPackageReadError, TritPackageReadLimits, TritPackageReader,
-    TritPackageSizeBounds, TritPackageWriteError, TritSpoolBlob, read_trit_package,
-    read_trit_package_with_manifest_limit, trit_package_size_bounds, write_trit_package,
-    write_trit_package_bounded, write_trit_package_from_spool, write_trit_package_to,
+    TritPackageSizeBounds, TritPackageWriteError, TritSpoolBlob, TritSpoolLayoutSize,
+    inspect_trit_spool_layout, read_trit_package, read_trit_package_with_manifest_limit,
+    trit_package_size_bounds, write_trit_package, write_trit_package_bounded,
+    write_trit_package_from_spool, write_trit_package_to,
 };
 
 /// Weights per quantization block (ggml `QK_K`).

@@ -412,6 +412,29 @@ pub struct NativeRefinementCompleted {
     pub validation: Vec<NativeRefinementValidation>,
 }
 
+/// Recorded numerical replay inputs/output, not objective execution or acceptance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
+pub struct NativeScaleReplayObserved {
+    /// Exact frozen native request identity.
+    pub plan: NativeRefinementPlanId,
+    /// Complete gradient journal BlobId, including its trailer checksum.
+    pub journal: BlobId,
+    /// Exact complete journal bytes.
+    pub journal_bytes: u64,
+    /// Exact replayed TNSR BlobId.
+    pub checkpoint: BlobId,
+    /// Exact replayed TNSR length.
+    pub checkpoint_bytes: u64,
+    /// Complete declared update cursor.
+    pub completed_updates: u64,
+}
+
 /// Structural native request error; unavailable execution is a separate result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
