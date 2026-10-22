@@ -35,6 +35,7 @@ from .module_artifacts import (
 from .projection import TernaryPlane, expand_plane_scales
 from .ptq import _hash_value, _invoke_model, _source_model_digest
 from .refinement_core import RefinedWeight, refine_weight_diagonal
+from .native_refinement import NativeRefinementConfig, refine_native
 
 Pathish = Union[str, os.PathLike[str]]
 _MANIFEST = "refinement.json"
@@ -930,16 +931,26 @@ def load_refinement(artifact_dir: Pathish) -> RefinementResult:
 
 
 def refine(
-    parent: Union[ModuleQuantizationResult, RefinementResult],
+    parent: Union[ModuleQuantizationResult, RefinementResult, _tritium.NativeModelConversion],
     *,
     teacher: nn.Module,
     training: Iterable[Any],
     validation: Iterable[Any],
-    config: RefinementConfig,
+    config: Union[RefinementConfig, NativeRefinementConfig],
     work_dir: Pathish,
-) -> RefinementResult:
+    output_dir=None,
+    resume=None,
+    checkpoint_dir=None,
+    on_checkpoint=None,
+) -> Union[RefinementResult, _tritium.NativeModelRefinement]:
     """Refine a hard PTQ child while preserving explicit ancestry and claims."""
 
+    if isinstance(parent, (_tritium.NativeModelConversion, _tritium.NativeModelRefinement)):
+        return refine_native(parent, teacher=teacher, training=training, validation=validation,
+                             config=config, work_dir=work_dir, output_dir=output_dir, resume=resume,
+                             checkpoint_dir=checkpoint_dir, on_checkpoint=on_checkpoint)
+    if any(value is not None for value in (output_dir, resume, checkpoint_dir, on_checkpoint)):
+        raise TypeError("native-only refinement arguments cannot be used with legacy artifacts")
     if not isinstance(teacher, nn.Module):
         raise TypeError("refine teacher must be a torch.nn.Module")
     if not isinstance(config, RefinementConfig):

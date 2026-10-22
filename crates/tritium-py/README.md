@@ -190,6 +190,70 @@ crash/security qualification or arbitrary-PyTorch checkpoint support is inferred
 The bundle checkpoint is included in decoded-parent working admission on resume;
 Torch/packed handles, replay state and caller-owned buffers retain separate scopes.
 
+### Public native refinement
+
+`tritium.torch.refine(native_parent, teacher=original_dense_cpu_model, ..., config=...)`
+uses a distinct `NativeRefinementConfig`. It never translates the native package
+through legacy plane dictionaries or another optimizer. Specify the exact parent
+level/native plan, new output and existing external work root. The source teacher's
+persistent-state digest must match the immutable native Torch catalog; declare
+`plan["teacher_source"] = plan["parent"]["source"]`. Official source authentication,
+arbitrary Python forward-code attestation and independent quality remain separate.
+
+```python
+from tritium.torch import NativeRefinementConfig, refine
+
+plan["objective"] = NativeRefinementConfig.objective_id(temperature=1.0)
+for request, batch in zip(plan["training"], training_batches):
+    request["content"] = NativeRefinementConfig.window_id(batch, limits=data_limits)
+for request, batch in zip(plan["validation"], validation_batches):
+    request["content"] = NativeRefinementConfig.window_id(batch, limits=data_limits)
+config = NativeRefinementConfig(
+    plan, level="full", run_id="native-kd-1", machine="local-cpu",
+    training_limits=training_limits, publication_limits=publication_limits,
+    data_limits=data_limits,
+)
+child = refine(parent, teacher=original_dense_cpu_model,
+               training=iter(training_batches), validation=iter(validation_batches),
+               config=config, work_dir=existing_work_root, output_dir=new_child_directory)
+```
+
+Exact positive `training_limits` keys: `max_snapshot_bytes`, `max_parent_bytes`,
+`max_saved_input_bytes`, `max_package_bytes`, `max_payload_bytes`,
+`max_workspace_bytes`, `max_output_bytes`, `max_evidence_bytes`. Publication keys
+are the ten recorded-publication keys above. Data keys: `max_window_bytes`,
+`max_validation_bytes`, `max_nodes`, `max_depth` (at most64), `max_loss_bytes`.
+They bound logical data/copies and a 32-byte-per-logit loss-work forecast, not
+framework/autograd/metadata heap, allocator, page cache or total process memory.
+
+The built-in versioned objective uses f32 log-target KL with positive temperature
+for multiple logits, scalar/one-logit MSE otherwise. Matching binary attention
+masks and integer labels!=-100 exclude padded/ignored positions; empty support,
+nonfinite output or mismatched geometry refuses. Window IDs use domain-separated,
+typed length-framed hashing with bounded raw tensor traversal. Only ordinary CPU
+tensor/scalar/container values are admitted. A protected copy of one training
+window is held at a time; only bounded validation windows are retained. Streams
+must match the full frozen schedule exactly; no cycling, missing or trailing data.
+
+The actual terminal candidate must not regress against the original parent on
+the same weighted validation snapshots before publication. No silent earlier-step
+fallback rewrites the plan. Teacher modes are restored and original artifacts are
+never overwritten; mutation checks refuse changes rather than repairing arbitrary
+user code. `resume=saved_bundle` replays the exact plan and skips old training
+computation while checking the complete supplied stream. Original-parent inference
+provides the predecessor baseline on resume, not a throwaway optimizer.
+
+Optional `checkpoint_steps=(...)` with explicit `checkpoint_limits` enables only
+those cursors. Supply a durable existing `checkpoint_dir` outside work/parent/output
+and optionally `on_checkpoint(saved_descriptor)`. Each new step directory is
+no-clobber and copies the whole prefix; callback failure leaves that saved bundle
+but no child. Older checkpoints are never pruned automatically. Postcommit trainer
+cleanup caveats are operational `publication_warnings`, not altered evidence or a
+false failed commit. Return type remains the unqualified `NativeModelRefinement`;
+legacy `RefinementConfig` and its artifact/profile gates stay unchanged. Native
+refined-parent chaining, code/PV, objective/data attestation and accelerator/
+distributed/physical/quality/release qualification remain open.
+
 `NativeModelRefinement.open(directory)` independently checks actual typed child,
 original log and exact checkpoint/journal identities without requiring the parent
 for inference. Its admission is `record-consistent-unqualified`; it does not prove

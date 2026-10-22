@@ -292,6 +292,15 @@ impl NativeModelRefinement {
 
 #[pymethods]
 impl NativeModelRefinement {
+    // Operational cleanup is not an alteration of immutable child evidence.
+    fn _with_cleanup_warning(&self, message: &str) -> Self {
+        let mut result = self.clone();
+        result.add_warning(format!(
+            "NativeRunCleanup: {}",
+            message.chars().take(1024).collect::<String>()
+        ));
+        result
+    }
     #[getter]
     fn admission(&self) -> &'static str {
         "record-consistent-unqualified"
