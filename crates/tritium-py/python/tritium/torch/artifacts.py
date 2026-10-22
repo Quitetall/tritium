@@ -593,7 +593,7 @@ def export(
         return result.export(os.fspath(output_dir), max_package_bytes=max_package_bytes,
                              max_evidence_bytes=max_evidence_bytes)
     if max_package_bytes is not None or max_evidence_bytes is not None:
-        raise TypeError("native export limits require a native model result")
+        raise TypeError("native export limits require a NativeModelConversion or NativeModelRefinement")
     from .qat import QatHardResult
 
     if isinstance(result, QatHardResult):
