@@ -24,3 +24,19 @@ These scalar CPU operations do not update scales/codes, enable mutable Python
 autograd or qualify a complete training backend. Existing upload payloads,
 inference capabilities and forward results are unchanged. Process memory,
 performance and model-quality acceptance require their separate release gates.
+
+## Exact scale snapshots
+
+`snapshot_additive_scales(&parent_arc, scales, &budget)` creates a new immutable
+handle without copying packed coefficients or compact indices. Scales must be
+exactly representable in the declared precision. Old handles retain their old
+values; chained snapshots share the original root, not obsolete scale overlays.
+Forward, gather, input adjoints and scale adjoints accept the returned handle.
+
+The budget reserves only the new stored-scale bytes before allocation, retaining
+the parent's original admission lease if one exists. It does not authenticate
+parent admission or coordinate independent ledgers. `CpuScaleSnapshotBytes`
+separates shared-root bytes (including original scales), newly owned scale bytes
+and reachable total. `len_bytes()` reports the reachable total; summing snapshots
+double-counts shared roots and is not unique residency or physical memory.
+These snapshots do not publish models or enable Python training by themselves.

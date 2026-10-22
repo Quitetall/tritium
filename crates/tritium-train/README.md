@@ -41,3 +41,10 @@ This API does not admit package custody, authenticate graph/objective/data or th
 complete consumer inventory, implement native alternating-PV, provide packed
 Python scale autograd, emit publication evidence or create a refined child. Public
 native refinement stays unavailable until those integrations and replay exist.
+
+CPU packed scale snapshots can consume the session's updated exact scales while
+preserving old forward/backward versions and sharing packed codes. The local
+closed-loop fixture combines actual packed Matmul/Embed cotangents, the common
+step, immutable snapshots and exact restart. The session still owns decoded
+reference state: this does not establish production packed/out-of-core training,
+an authenticated model objective or public native refinement.

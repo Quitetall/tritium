@@ -3,7 +3,7 @@ use super::{
     apply_basis,
 };
 use crate::{PerTileIndex, Trit};
-use tritium_schema::{AdditiveLayout, PlaneRelation, ScaleAnchor};
+use tritium_schema::{AdditiveLayout, PlaneRelation, ScaleAnchor, ScalePrecision};
 
 /// Checked scale-adjoint geometry shared by decoded and packed readers.
 ///
@@ -47,6 +47,26 @@ impl<'a> AdditiveScaleVjpPlan<'a> {
             ScaleAllocation::Uniform(plan) => plan.scale_count(),
             ScaleAllocation::PerTile(index) => index.scale_count(),
         }
+    }
+
+    /// Declared storage precision; this getter does not narrow any value.
+    #[must_use]
+    pub fn scale_precision(&self) -> ScalePrecision {
+        self.layout().law.precision
+    }
+
+    /// Check scale length, finite nonnegative values and derived tied scales.
+    ///
+    /// Does not enforce exact storage precision or reject negative zero; those
+    /// canonical storage rules belong to the format layer. No payload is read.
+    pub fn validate_scales(&self, scales: &[f32]) -> Result<(), AdditiveError> {
+        if scales.len() != self.stored_scale_count() {
+            return Err(AdditiveError::ScaleCountMismatch {
+                expected: self.stored_scale_count(),
+                got: scales.len(),
+            });
+        }
+        super::validate_scales(self.layout(), self.plane_count(), scales)
     }
 
     /// Accumulate a matmul scale VJP through an admitted coefficient reader.

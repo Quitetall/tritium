@@ -1,7 +1,10 @@
 //! Owned, validated additive-ternary tensors.
 
 use half::{bf16, f16};
-use tritium_core::{AdditiveError, AdditiveView, OwnedPerTileIndex, PerTilePlan, Trit};
+use tritium_core::{
+    AdditiveError, AdditiveScaleVjpPlan, AdditiveView, OwnedPerTileIndex, PerTilePlan, Trit,
+    UniformPlan,
+};
 use tritium_schema::{AdditiveLayout, PlaneCodec, PlaneRelation, ScaleAnchor, ScalePrecision};
 
 use crate::salt_v2::{
@@ -144,13 +147,33 @@ impl AdditiveTensor {
     ///
     /// Used by capability queries and before reservations in [`Self::from_view`].
     pub fn validate_view(view: AdditiveView<'_>) -> Result<(), AdditiveTensorError> {
-        for (index, scale) in view.scales().iter().copied().enumerate() {
+        Self::validate_precision(view.layout().law.precision, view.scales())
+    }
+
+    /// Validate replacement scales using sealed geometry, without reading trits.
+    ///
+    /// Checks length, finite/nonnegative values, tied derived scales, negative
+    /// zero and exact declared precision. Neither allocates nor silently narrows.
+    pub fn validate_scale_replacement(
+        plan: &AdditiveScaleVjpPlan<'_>,
+        scales: &[f32],
+    ) -> Result<(), AdditiveTensorError> {
+        plan.validate_scales(scales)
+            .map_err(AdditiveTensorError::InvalidView)?;
+        Self::validate_precision(plan.scale_precision(), scales)
+    }
+
+    fn validate_precision(
+        precision: ScalePrecision,
+        scales: &[f32],
+    ) -> Result<(), AdditiveTensorError> {
+        for (index, scale) in scales.iter().copied().enumerate() {
             if scale.to_bits() & 0x8000_0000 != 0 {
                 return Err(AdditiveTensorError::InvalidView(
                     AdditiveError::InvalidScale,
                 ));
             }
-            let roundtrip = match view.layout().law.precision {
+            let roundtrip = match precision {
                 ScalePrecision::F16 => f16::from_f32(scale).to_f32(),
                 ScalePrecision::Bf16 => bf16::from_f32(scale).to_f32(),
                 ScalePrecision::F32 => scale,
@@ -291,13 +314,15 @@ impl AdditiveTensor {
     /// This also checks derived tied-plane scales and exact storage precision.
     /// No coefficient/index buffers are copied. Failure leaves the tensor unchanged.
     pub fn validate_scales(&self, scales: &[f32]) -> Result<(), AdditiveTensorError> {
-        let view = if let Some(index) = &self.per_tile {
-            AdditiveView::new_per_tile(index.as_index(), &self.trits, scales)
+        let plan = if let Some(index) = &self.per_tile {
+            AdditiveScaleVjpPlan::from_per_tile(index.as_index())
         } else {
-            AdditiveView::new(self.layout, self.plane_count, &self.trits, scales)
-        }
-        .map_err(AdditiveTensorError::InvalidView)?;
-        Self::validate_view(view)
+            AdditiveScaleVjpPlan::from_uniform(
+                UniformPlan::new(self.layout, self.plane_count)
+                    .map_err(AdditiveTensorError::InvalidView)?,
+            )
+        };
+        Self::validate_scale_replacement(&plan, scales)
     }
 
     /// Replace actual stored scales transactionally, preserving all other state.

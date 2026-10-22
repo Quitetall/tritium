@@ -804,3 +804,160 @@ fn actual_tied_matmul_embedding_loss_decreases_and_resumes_exactly() {
     assert_eq!(actual.weights().next().unwrap().trits(), parent.trits());
     eprintln!("NATIVE_TIED_FIXTURE_LOSS initial={initial} final={final_loss}");
 }
+
+// Closed-loop common recovery + actual packed execution. The common session
+// still owns decoded oracle state; this is not production packed/out-of-core QAT.
+fn packed_outputs(
+    handle: &dyn tritium_spec::DeviceBuffer,
+    x: &[f32],
+    ids: &[usize],
+) -> (Vec<f32>, Vec<f32>) {
+    use tritium_spec::TernaryBackend;
+    let cpu = tritium_cpu::CpuBackend::new();
+    let mut y = vec![0.0; x.len() / 4 * 3];
+    cpu.matmul(tritium_spec::TensorMatmul {
+        act: x,
+        tensor: handle,
+        batch: x.len() / 4,
+        transformed_act: &mut vec![0.0; x.len()],
+        out: &mut y,
+    })
+    .unwrap();
+    let mut e = vec![0.0; ids.len() * 4];
+    cpu.embed_rows(handle, ids, &mut e).unwrap();
+    (y, e)
+}
+fn packed_recovery_step(
+    state: &mut Session,
+    current: &std::sync::Arc<dyn tritium_spec::DeviceBuffer>,
+    x: &[f32],
+    ids: &[usize],
+    target: &(Vec<f32>, Vec<f32>),
+    budget: &tritium_runtime::TensorPayloadBudget,
+) -> std::sync::Arc<dyn tritium_spec::DeviceBuffer> {
+    let (y, e) = packed_outputs(&**current, x, ids);
+    let dy: Vec<_> = y
+        .iter()
+        .zip(&target.0)
+        .map(|(&y, &t)| 2.0 * (y - t))
+        .collect();
+    let de: Vec<_> = e
+        .iter()
+        .zip(&target.1)
+        .map(|(&y, &t)| 2.0 * (y - t))
+        .collect();
+    let cpu = tritium_cpu::CpuBackend::new();
+    let mut gradient = vec![0.0; cpu.additive_stored_scale_count(&**current).unwrap()];
+    let mut row = [0.0; 4];
+    cpu.accumulate_additive_matmul_scale_vjp(
+        &**current,
+        x,
+        &dy,
+        x.len() / 4,
+        &mut row,
+        &mut gradient,
+    )
+    .unwrap();
+    cpu.accumulate_additive_embed_scale_vjp(&**current, ids, &de, &mut row, &mut gradient)
+        .unwrap();
+    let gradient: Vec<_> = gradient.iter().map(|&v| v as f32).collect();
+    state.step(&[&gradient]).unwrap();
+    cpu.snapshot_additive_scales(current, state.weights().next().unwrap().scales(), budget)
+        .unwrap()
+        .0
+}
+
+#[test]
+fn common_scale_recovery_uses_actual_packed_snapshots_with_exact_restart_and_old_graph_isolation() {
+    use std::sync::Arc;
+    use tritium_spec::{DeviceBuffer, TensorView, TernaryBackend};
+    let layout = AdditiveLayout {
+        rows: 3,
+        cols: 4,
+        max_planes: 1,
+        basis: Basis::SignedRht {
+            block: 4,
+            seed: 19,
+            domain: 7,
+        },
+        ..simple().layout()
+    };
+    let parent = AdditiveTensor::new(
+        layout,
+        1,
+        [Trit::POS, Trit::ZERO, Trit::NEG, Trit::POS].repeat(3),
+        vec![0.5; 3],
+    )
+    .unwrap();
+    let mut teacher = parent.clone();
+    teacher.replace_scales(vec![0.8, 0.65, 0.9]).unwrap();
+    let x = consumer_values(8);
+    let ids = [2, 0, 2];
+    let target = fixture_outputs(&teacher, &x, &ids);
+    let root: Arc<dyn DeviceBuffer> = Arc::from(
+        tritium_cpu::CpuBackend::new()
+            .upload_tensor(TensorView::Additive(parent.view()))
+            .unwrap(),
+    );
+    let mut current = Arc::clone(&root);
+    let budget = tritium_runtime::TensorPayloadBudget::new(36);
+    let fork_budget = tritium_runtime::TensorPayloadBudget::new(24);
+    let mut p = plan(1);
+    if let NativeRecoveryRecipe::ScaleOnly { optimizer } = &mut p.recipe {
+        optimizer.lr = 0.02;
+        optimizer.weight_decay = 0.0;
+    }
+    let mut state = Session::new(p.clone(), vec![parent.clone()]).unwrap();
+    let mut resumed: Option<(Session, Arc<dyn DeviceBuffer>)> = None;
+    let mut old_graph = None;
+    let loss = |out: &(Vec<f32>, Vec<f32>)| {
+        out.0
+            .iter()
+            .chain(&out.1)
+            .zip(target.0.iter().chain(&target.1))
+            .map(|(&y, &t)| f64::from(y - t).powi(2))
+            .sum::<f64>()
+    };
+    let initial = loss(&packed_outputs(&*current, &x, &ids));
+    for window in 0..4 {
+        current = packed_recovery_step(&mut state, &current, &x, &ids, &target, &budget);
+        if let Some((fork, handle)) = &mut resumed {
+            *handle = packed_recovery_step(fork, handle, &x, &ids, &target, &fork_budget);
+            assert_eq!(checkpoint(fork), checkpoint(&state));
+            assert_eq!(
+                packed_outputs(&**handle, &x, &ids),
+                packed_outputs(&*current, &x, &ids)
+            );
+        }
+        if window == 0 {
+            old_graph = Some((Arc::clone(&current), packed_outputs(&*current, &x, &ids)));
+        }
+        if window == 1 {
+            let fork =
+                Session::resume(p.clone(), vec![parent.clone()], &checkpoint(&state)).unwrap();
+            let handle = tritium_cpu::CpuBackend::new()
+                .snapshot_additive_scales(
+                    &root,
+                    fork.weights().next().unwrap().scales(),
+                    &fork_budget,
+                )
+                .unwrap()
+                .0;
+            resumed = Some((fork, handle));
+        }
+    }
+    let final_loss = loss(&packed_outputs(&*current, &x, &ids));
+    assert!(final_loss < initial);
+    let (old, expected) = old_graph.unwrap();
+    assert_eq!(packed_outputs(&*old, &x, &ids), expected);
+    assert_eq!(
+        packed_outputs(&*root, &x, &ids),
+        fixture_outputs(&parent, &x, &ids)
+    );
+    eprintln!("PACKED_SNAPSHOT_RECOVERY_LOSS initial={initial} final={final_loss}");
+    drop(old);
+    drop(current);
+    drop(resumed);
+    assert_eq!(budget.used_bytes(), 0);
+    assert_eq!(fork_budget.used_bytes(), 0);
+}

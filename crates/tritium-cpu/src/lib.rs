@@ -99,6 +99,7 @@ mod simd;
 /// Exact, allocation-accounted SALT V2 CPU semantic reference.
 pub mod salt_v2;
 mod semantic;
+pub use semantic::CpuScaleSnapshotBytes;
 
 /// Owned host-memory buffer of packed weight bytes.
 ///
@@ -190,6 +191,36 @@ impl CpuBackend {
     #[must_use]
     pub fn new() -> Self {
         CpuBackend
+    }
+
+    /// Create an immutable exact-scale version sharing an original packed root.
+    ///
+    /// Requires an owning Arc so the source handle and any original admission
+    /// lease survive old/new graphs. Snapshots of snapshots flatten to the
+    /// original root, retaining no obsolete overlay. Codes/geometry are not copied.
+    /// Scales must already be finite, nonnegative (not negative zero) and exactly
+    /// representable in their declared precision; no silent narrowing occurs.
+    ///
+    /// Validates before reserving/allocating new stored-scale bytes from `budget`.
+    /// This charges only the new scale buffer and retains, but does not create or
+    /// authenticate, parent admission. Independent budgets do not coordinate.
+    /// Returned byte fields distinguish shared root (including original scales),
+    /// owned scale bytes and reachable sum. `len_bytes()` reports the reachable
+    /// sum, not the incremental charge; summing snapshots double-counts roots.
+    /// Metadata/allocator capacity/RSS are excluded. No format/model identity,
+    /// optimizer action, complete refinement or Python training is produced.
+    ///
+    /// # Errors
+    /// Rejects dense/foreign/legacy or misreported handles, invalid scale values,
+    /// size overflow, allocation failure and insufficient budget without changing
+    /// the source or leaking a new reservation.
+    pub fn snapshot_additive_scales(
+        &self,
+        parent: &std::sync::Arc<dyn DeviceBuffer>,
+        scales: &[f32],
+        budget: &tritium_runtime::TensorPayloadBudget,
+    ) -> Result<(std::sync::Arc<dyn DeviceBuffer>, CpuScaleSnapshotBytes), BackendError> {
+        semantic::CpuTensor::snapshot_scales(parent, scales, budget)
     }
 
     /// Original-coordinate input adjoint for an uploaded CPU additive matrix.

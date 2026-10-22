@@ -22,6 +22,14 @@ pub(crate) struct PackedAdditive {
     packed: Vec<u8>,
 }
 
+/// Borrowed execution over immutable codes with one exact scale version.
+pub(super) struct PackedScaleView<'a> {
+    tensor: &'a PackedAdditive,
+    layout: AdditiveLayout,
+    planes: usize,
+    scales: &'a [u8],
+}
+
 #[derive(Debug)]
 enum Allocation {
     Uniform {
@@ -319,6 +327,63 @@ impl PackedAdditive {
         }
     }
 
+    pub(super) fn with_scales<'a>(&'a self, scales: &'a [u8]) -> PackedScaleView<'a> {
+        debug_assert_eq!(scales.len(), self.packed.len() - self.scale_offset);
+        PackedScaleView {
+            tensor: self,
+            layout: self.layout,
+            planes: self.planes,
+            scales,
+        }
+    }
+
+    pub(super) fn view(&self) -> PackedScaleView<'_> {
+        self.with_scales(&self.packed[self.scale_offset..])
+    }
+    pub(super) fn matmul(&self, p: TensorMatmul<'_>) -> Result<(), BackendError> {
+        self.view().matmul(p)
+    }
+    pub(super) fn embed(&self, ids: &[usize], out: &mut [f32]) -> Result<(), BackendError> {
+        self.view().embed(ids, out)
+    }
+
+    pub(super) fn validate_scale_replacement(&self, scales: &[f32]) -> Result<usize, BackendError> {
+        tritium_format::AdditiveTensor::validate_scale_replacement(&self.scale_vjp_plan()?, scales)
+            .map_err(invalid)?;
+        scales
+            .len()
+            .checked_mul(Self::scale_width(self.layout)?)
+            .ok_or_else(|| invalid("scale snapshot byte overflow"))
+    }
+
+    // Caller has validated exact values and reserved this new buffer's payload.
+    pub(super) fn encode_scales(
+        &self,
+        scales: &[f32],
+        bytes: usize,
+    ) -> Result<Vec<u8>, BackendError> {
+        let mut out = Vec::new();
+        out.try_reserve_exact(bytes)
+            .map_err(|_| BackendError::OutOfMemory { requested: bytes })?;
+        for &scale in scales {
+            match self.layout.law.precision {
+                ScalePrecision::F16 => {
+                    out.extend_from_slice(&f16::from_f32(scale).to_bits().to_le_bytes())
+                }
+                ScalePrecision::F32 => out.extend_from_slice(&scale.to_bits().to_le_bytes()),
+                _ => return Err(BackendError::UnsupportedTensor),
+            }
+        }
+        debug_assert_eq!(out.len(), bytes);
+        Ok(out)
+    }
+}
+
+impl PackedScaleView<'_> {
+    fn trit(&self, plane: usize, coefficient: usize) -> i8 {
+        self.tensor.trit(plane, coefficient)
+    }
+
     fn scale(&self, plane: usize, row: usize, col: usize) -> f32 {
         let unit = match self.layout.law.anchor {
             ScaleAnchor::Group => {
@@ -328,11 +393,11 @@ impl PackedAdditive {
             ScaleAnchor::Tensor => 0,
             _ => unreachable!("upload accepts only currently admitted anchors"),
         };
-        let Allocation::Uniform { scale_units, .. } = self.allocation else {
+        let Allocation::Uniform { scale_units, .. } = &self.tensor.allocation else {
             unreachable!("uniform scale geometry only")
         };
         let index = if matches!(self.layout.law.relation, PlaneRelation::Free) {
-            plane * scale_units + unit
+            plane * *scale_units + unit
         } else {
             unit
         };
@@ -340,7 +405,7 @@ impl PackedAdditive {
     }
 
     fn stored_scale(&self, plane: usize, index: usize) -> f32 {
-        let scales = &self.packed[self.scale_offset..];
+        let scales = self.scales;
         let base = match self.layout.law.precision {
             ScalePrecision::F16 => f16::from_bits(u16::from_le_bytes(
                 scales[index * 2..index * 2 + 2]
@@ -370,7 +435,7 @@ impl PackedAdditive {
     }
 
     fn dot(&self, row: usize, act: &[f32]) -> f32 {
-        if let Allocation::PerTile { index, .. } = &self.allocation {
+        if let Allocation::PerTile { index, .. } = &self.tensor.allocation {
             let group = usize::from(self.layout.group);
             let tensor_anchor = self.layout.law.anchor == ScaleAnchor::Tensor;
             let mut sum = 0.0;
@@ -487,7 +552,7 @@ impl PackedAdditive {
         let cols = self.layout.cols as usize;
         output.fill(0.0);
         for plane in 0..self.planes {
-            if let Allocation::PerTile { index, .. } = &self.allocation {
+            if let Allocation::PerTile { index, .. } = &self.tensor.allocation {
                 for tile in index
                     .as_index()
                     .tiles_in_row(plane, row)
@@ -549,7 +614,9 @@ impl PackedAdditive {
         }
         Ok(())
     }
+}
 
+impl PackedAdditive {
     pub(super) fn scale_vjp_plan(&self) -> Result<AdditiveScaleVjpPlan<'_>, BackendError> {
         match &self.allocation {
             Allocation::Uniform { .. } => UniformPlan::new(self.layout, self.planes as u8)

@@ -27,6 +27,8 @@ tritium-testkit = { workspace = true }
 rayon = { workspace = true }
 
 [dev-dependencies]
+tritium-cpu = { workspace = true }
+tritium-runtime = { workspace = true }
 # Property-based gates for LoRA (frozen-base zero-grad, merge correctness, rank edges) —
 # ADR 0007. Workspace-pinned; already used by tritium-core/-cpu/-nn/-format/-quantize.
 proptest = { workspace = true }
