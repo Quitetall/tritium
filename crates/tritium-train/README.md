@@ -38,8 +38,9 @@ and process RSS. A valid checkpoint is not proof of gradient/objective execution
 
 The package-byte limit belongs to the future publisher, not this numerical state.
 This API does not admit package custody, authenticate graph/objective/data or the
-complete consumer inventory, implement native alternating-PV, provide packed
-Python scale autograd, emit publication evidence or create a refined child. Public
+complete consumer inventory, implement native alternating-PV, emit publication
+evidence or create a refined child. The separate `tritium.torch.native_scale_training`
+adapter supplies eager CPU scale autograd; see `tritium-py/README.md`. Public
 native refinement stays unavailable until those integrations and replay exist.
 
 CPU packed scale snapshots can consume the session's updated exact scales while
@@ -65,3 +66,41 @@ new resources and preserves old handles/checkpoints. Actual packed consumer
 adjoints share the reference reducer. Budget for initial versions and simultaneous
 old/new versions; retained old graph Arcs retain their scale payload admission.
 The adapter still owns decoded reference state, not production packed-memory QAT.
+
+## Recorded numerical replay
+
+`pv_tuning::NativeScaleJournalWriter::new(stream, &session, limits)` starts an
+optional journal over an empty caller-owned `Write + Seek` stream and a zero-step
+session. Use `session.step_recorded(gradients, &mut journal)` for every declared
+window. It uses the same optimizer/atomic commit path as `step`: write and flush
+the exact admitted unweighted f32 scale gradients before committing state. Numeric
+refusal writes nothing; write/flush failure or unwind preserves state and poisons
+the writer. An incomplete/poisoned writer cannot finish. Generic flush does not
+promise fsync or power-loss durability.
+
+`journal.finish(&session)` returns the stream and exact journal/checkpoint byte
+observations. Retain the journal BlobId outside the mutable stream. Then call
+`replay_native_scale_journal(plan, original_parents, stream, journal_id,
+expected_checkpoint, limits)`. It checks complete input identity before creating
+optimizer state, replays every ordered frame through the common optimizer and
+requires bit-identical checkpoint bytes, including moments. The returned
+`VerifiedNativeScaleReplay` can recheck the current session; it is numerical
+reproduction, not proof of the supplied gradients' model/objective/data origin.
+
+`session.journal_size_ledger()` forecasts exact journal bytes and logical
+writer/replay buffers without stream I/O. Journal limits separately cap exact
+stream bytes and logical working payload.
+The writer needs one serialized checkpoint plus fixed 8192-byte I/O scratch;
+replay also admits reference state, update workspace and one f32 gradient window.
+Streams, metadata, supplied expected-checkpoint bytes, allocator capacity and
+external models/graphs are excluded. No whole journal is retained by the module.
+With `native-cpu`, `NativeCpuScaleSession::step_recorded()` stages every next
+snapshot before writing the journal, then commits common state and handles
+together. A snapshot failure leaves the journal unchanged; a journal failure
+drops all staged snapshots and preserves old handles/state. Finish/replay uses
+the read-only `binding.session()` and the original parents.
+
+This v1 profile does not append/resume partial journals, record Python steps,
+publish children, authenticate backward execution or clear any
+independent quality/performance/release gate. Existing unrecorded TNSR resume and
+all prior numerical/inference profiles are unchanged.

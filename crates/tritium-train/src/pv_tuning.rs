@@ -28,10 +28,14 @@ pub use blockwise::PvBlockwiseCursor;
 pub use config::{PvTuningConfig, PvTuningConfigBuilder};
 pub use error::PvTuningError;
 #[cfg(feature = "native-cpu")]
-pub use native_scale::{NativeCpuScaleError, NativeCpuScaleSession};
 pub use native_scale::{
-    NativeScaleContribution, NativeScaleRefinementSession, NativeScaleSizeLedger,
-    NativeScaleStageError, NativeScaleStep,
+    NativeCpuScaleError, NativeCpuScaleJournalStageError, NativeCpuScaleSession,
+};
+pub use native_scale::{
+    NativeScaleContribution, NativeScaleJournalError, NativeScaleJournalLimits,
+    NativeScaleJournalSizeLedger, NativeScaleJournalSummary, NativeScaleJournalWriter,
+    NativeScaleRefinementSession, NativeScaleSizeLedger, NativeScaleStageError, NativeScaleStep,
+    VerifiedNativeScaleReplay, replay_native_scale_journal,
 };
 pub use receipt::PvStepReceipt;
 pub use representation::{PvTernaryPlane, PvTernaryStructure, PvTernaryWeight};

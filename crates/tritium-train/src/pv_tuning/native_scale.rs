@@ -14,10 +14,16 @@ mod consumers;
 #[cfg(feature = "native-cpu")]
 mod cpu;
 mod identity;
+mod journal;
 mod transaction;
 pub use consumers::NativeScaleContribution;
 #[cfg(feature = "native-cpu")]
-pub use cpu::{NativeCpuScaleError, NativeCpuScaleSession};
+pub use cpu::{NativeCpuScaleError, NativeCpuScaleJournalStageError, NativeCpuScaleSession};
+pub use journal::{
+    NativeScaleJournalError, NativeScaleJournalLimits, NativeScaleJournalSizeLedger,
+    NativeScaleJournalSummary, NativeScaleJournalWriter, VerifiedNativeScaleReplay,
+    replay_native_scale_journal,
+};
 pub use transaction::{NativeScaleStageError, NativeScaleStep};
 
 struct ScaleCandidate {

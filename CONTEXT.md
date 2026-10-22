@@ -56,6 +56,12 @@ A discrete additive-ternary representation intended for loading or inference.
 It does not contain the latent training state needed to resume optimization.
 _Avoid_: QAT checkpoint, dense master
 
+**Recovery replay**:
+Re-execution of a ternary training recipe from its original training payload,
+reproducing the same training snapshot. It is distinct from authenticating the
+objective inputs or qualifying the hard ternary artifact.
+_Avoid_: execution attestation, qualification
+
 **Refined child**:
 A complete immutable hard artifact descended from one explicitly selected parent
 level through a declared recovery run. Its ancestry is distinct from quality qualification.

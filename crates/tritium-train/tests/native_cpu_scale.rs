@@ -116,6 +116,235 @@ fn outputs(handle: &dyn DeviceBuffer, x: &[f32], ids: &[usize]) -> (Vec<f32>, Ve
 }
 
 #[test]
+fn packed_steps_record_actual_scale_adjoints_and_replay_current_state() {
+    use std::io::Cursor;
+    use tritium_train::pv_tuning::{
+        NativeScaleJournalLimits, NativeScaleJournalWriter, replay_native_scale_journal,
+    };
+    let parents = vec![tensor()];
+    let request = plan(1);
+    let budget = TensorPayloadBudget::new(48);
+    let mut bound = Bound::bind(
+        Session::new(request.clone(), parents.clone()).unwrap(),
+        roots(&parents),
+        budget.clone(),
+    )
+    .unwrap();
+    let old = Arc::clone(bound.handles().next().unwrap().1);
+    let initial = outputs(&*old, &[0.25, -0.5, 0.125, 1.0], &[0, 2]);
+    let limits = NativeScaleJournalLimits {
+        max_journal_bytes: 100_000,
+        max_working_bytes: 100_000,
+    };
+    let mut journal =
+        NativeScaleJournalWriter::new(Cursor::new(Vec::new()), bound.session(), limits).unwrap();
+    for _ in 0..4 {
+        let mut gradients = vec![0.0; 3];
+        let mut row = [0.0; 4];
+        // Gradient of 0.5*sum(embedding**2); all-ones cotangents cancel in this basis.
+        let mut cotangents = [0.0; 12];
+        CpuBackend::new()
+            .embed_rows(
+                &**bound.handles().next().unwrap().1,
+                &[0, 1, 2],
+                &mut cotangents,
+            )
+            .unwrap();
+        CpuBackend::new()
+            .accumulate_additive_embed_scale_vjp(
+                &**bound.handles().next().unwrap().1,
+                &[0, 1, 2],
+                &cotangents,
+                &mut row,
+                &mut gradients,
+            )
+            .unwrap();
+        let gradients: Vec<_> = gradients.iter().map(|&v| v as f32).collect();
+        assert!(
+            gradients.iter().any(|&g| g != 0.0),
+            "fixture must exercise a nonzero scale update: {gradients:?}"
+        );
+        bound.step_recorded(&[&gradients], &mut journal).unwrap();
+        assert!(
+            CpuBackend::new()
+                .additive_equals_view(
+                    &**bound.handles().next().unwrap().1,
+                    bound.session().weights().next().unwrap().view()
+                )
+                .unwrap()
+        );
+    }
+    let (source, summary) = journal.finish(bound.session()).unwrap();
+    let checkpoint = bytes(&bound);
+    let verified = replay_native_scale_journal(
+        request,
+        parents,
+        source,
+        summary.journal(),
+        &checkpoint,
+        limits,
+    )
+    .unwrap();
+    verified.verify_session(bound.session()).unwrap();
+    assert_eq!(outputs(&*old, &[0.25, -0.5, 0.125, 1.0], &[0, 2]), initial);
+    assert_ne!(
+        outputs(
+            &**bound.handles().next().unwrap().1,
+            &[0.25, -0.5, 0.125, 1.0],
+            &[0, 2]
+        ),
+        initial
+    );
+    drop(old);
+    drop(bound);
+    assert_eq!(budget.used_bytes(), 0);
+}
+
+#[test]
+fn recorded_late_snapshot_failure_writes_nothing_and_can_retry_on_same_state() {
+    use std::cell::RefCell;
+    use std::io::{Cursor, Seek, SeekFrom, Write};
+    use std::rc::Rc;
+    use tritium_train::pv_tuning::{
+        NativeCpuScaleJournalStageError, NativeScaleJournalLimits, NativeScaleJournalWriter,
+    };
+    #[derive(Clone)]
+    struct Observed(Rc<RefCell<Cursor<Vec<u8>>>>);
+    impl Write for Observed {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().write(b)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Seek for Observed {
+        fn seek(&mut self, s: SeekFrom) -> std::io::Result<u64> {
+            self.0.borrow_mut().seek(s)
+        }
+    }
+    let parents = vec![tensor(), tensor()];
+    let budget = TensorPayloadBudget::new(36);
+    let request = plan(2);
+    let mut bound = Bound::bind(
+        Session::new(request.clone(), parents.clone()).unwrap(),
+        roots(&parents),
+        budget.clone(),
+    )
+    .unwrap();
+    let old: Vec<_> = bound.handles().map(|(_, h)| Arc::clone(h)).collect();
+    let before = bytes(&bound);
+    let io = Observed(Rc::new(RefCell::new(Cursor::new(Vec::new()))));
+    let limits = NativeScaleJournalLimits {
+        max_journal_bytes: 100_000,
+        max_working_bytes: 100_000,
+    };
+    let mut journal = NativeScaleJournalWriter::new(io.clone(), bound.session(), limits).unwrap();
+    let header = io.0.borrow().get_ref().clone();
+    assert!(matches!(
+        bound.step_recorded(&[&[0.25; 3], &[0.25; 3]], &mut journal),
+        Err(NativeScaleStageError::Stage(
+            NativeCpuScaleJournalStageError::Snapshot(_)
+        ))
+    ));
+    assert_eq!(bytes(&bound), before);
+    assert_eq!(*io.0.borrow().get_ref(), header);
+    assert_eq!(budget.used_bytes(), 24);
+    for ((_, current), old) in bound.handles().zip(&old) {
+        assert!(Arc::ptr_eq(current, old));
+    }
+    let mut retry = Bound::bind(
+        Session::new(request, parents.clone()).unwrap(),
+        roots(&parents),
+        TensorPayloadBudget::new(1000),
+    )
+    .unwrap();
+    for _ in 0..4 {
+        retry
+            .step_recorded(&[&[0.25; 3], &[0.25; 3]], &mut journal)
+            .unwrap();
+    }
+    journal.finish(retry.session()).unwrap();
+}
+
+#[test]
+fn recorded_io_failure_drops_all_proposed_handles_and_preserves_state() {
+    use std::cell::Cell;
+    use std::io::{Cursor, Seek, SeekFrom, Write};
+    use std::rc::Rc;
+    use tritium_train::pv_tuning::{
+        NativeCpuScaleJournalStageError, NativeScaleJournalLimits, NativeScaleJournalWriter,
+    };
+    #[derive(Debug)]
+    struct Failing {
+        data: Cursor<Vec<u8>>,
+        fail: Rc<Cell<bool>>,
+    }
+    impl Write for Failing {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if self.fail.get() {
+                return Err(std::io::Error::other("original journal I/O error"));
+            }
+            self.data.write(b)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Seek for Failing {
+        fn seek(&mut self, s: SeekFrom) -> std::io::Result<u64> {
+            self.data.seek(s)
+        }
+    }
+    let parents = vec![tensor(), tensor()];
+    let budget = TensorPayloadBudget::new(1000);
+    let mut bound = Bound::bind(
+        Session::new(plan(2), parents.clone()).unwrap(),
+        roots(&parents),
+        budget.clone(),
+    )
+    .unwrap();
+    let old: Vec<_> = bound.handles().map(|(_, h)| Arc::clone(h)).collect();
+    let before = bytes(&bound);
+    let fail = Rc::new(Cell::new(false));
+    let mut journal = NativeScaleJournalWriter::new(
+        Failing {
+            data: Cursor::new(Vec::new()),
+            fail: fail.clone(),
+        },
+        bound.session(),
+        NativeScaleJournalLimits {
+            max_journal_bytes: 100_000,
+            max_working_bytes: 100_000,
+        },
+    )
+    .unwrap();
+    fail.set(true);
+    assert!(matches!(
+        bound.step_recorded(&[&[0.25; 3], &[0.25; 3]], &mut journal),
+        Err(NativeScaleStageError::Stage(
+            NativeCpuScaleJournalStageError::Journal(_)
+        ))
+    ));
+    assert_eq!(bytes(&bound), before);
+    assert_eq!(budget.used_bytes(), 24);
+    for ((_, current), old) in bound.handles().zip(&old) {
+        assert!(Arc::ptr_eq(current, old));
+    }
+    fail.set(false);
+    assert!(
+        journal
+            .finish(bound.session())
+            .unwrap_err()
+            .to_string()
+            .contains("poisoned")
+    );
+    drop(old);
+    drop(bound);
+    assert_eq!(budget.used_bytes(), 0);
+}
+
+#[test]
 fn late_owner_budget_failure_preserves_all_state_handles_and_reservations() {
     let parents = vec![tensor(), tensor()];
     let state = Session::new(plan(2), parents.clone()).unwrap();

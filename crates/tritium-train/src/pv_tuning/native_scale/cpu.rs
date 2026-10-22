@@ -1,7 +1,9 @@
 //! Opt-in owned numerical CPU binding; not model/source or release admission.
 use super::{
-    NativeScaleContribution, NativeScaleRefinementSession, NativeScaleStageError, reserved,
+    NativeScaleContribution, NativeScaleJournalError, NativeScaleJournalWriter,
+    NativeScaleRefinementSession, NativeScaleStageError, NativeScaleStep, reserved,
 };
+use std::io::{Seek, Write};
 use std::sync::Arc;
 use tritium_cpu::CpuBackend;
 use tritium_runtime::TensorPayloadBudget;
@@ -9,6 +11,32 @@ use tritium_spec::{BackendError, DeviceBuffer};
 
 /// Numeric binding/preflight/update or packed snapshot/gradient staging failure.
 pub type NativeCpuScaleError = NativeScaleStageError<BackendError>;
+
+/// Preserve the original snapshot or journal failure before atomic commit.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum NativeCpuScaleJournalStageError {
+    /// Packed snapshot/budget staging failed; journal was not advanced.
+    Snapshot(BackendError),
+    /// Journal staging failed; all new snapshots are dropped.
+    Journal(NativeScaleJournalError),
+}
+impl std::fmt::Display for NativeCpuScaleJournalStageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Snapshot(error) => error.fmt(f),
+            Self::Journal(error) => error.fmt(f),
+        }
+    }
+}
+impl std::error::Error for NativeCpuScaleJournalStageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Snapshot(error) => Some(error),
+            Self::Journal(error) => Some(error),
+        }
+    }
+}
 
 /// Common scale state and a complete immutable CPU handle set committed together.
 ///
@@ -93,15 +121,39 @@ impl NativeCpuScaleSession {
         let handles = &self.handles;
         let budget = &self.budget;
         let (changed, staged) = self.session.step_staged(gradients, |candidate| {
-            let mut staged = handle_storage(handles.len())?;
-            for ((_, scales), parent) in candidate.owners().zip(handles) {
-                staged.push(
-                    CpuBackend::new()
-                        .snapshot_additive_scales(parent, scales, budget)?
-                        .0,
-                );
-            }
-            Ok::<_, BackendError>(staged)
+            stage_handles(handles, budget, &candidate)
+        })?;
+        self.handles = staged;
+        Ok(changed)
+    }
+
+    /// Stage all packed handles, then write/flush the admitted gradients before
+    /// committing state and handles together. Snapshot failure writes no journal
+    /// bytes; journal failure releases every new snapshot and preserves old state.
+    pub fn step_recorded<W: Write + Seek>(
+        &mut self,
+        gradients: &[&[f32]],
+        journal: &mut NativeScaleJournalWriter<W>,
+    ) -> Result<usize, NativeScaleStageError<NativeCpuScaleJournalStageError>> {
+        journal.check(&self.session).map_err(|e| {
+            NativeScaleStageError::Stage(NativeCpuScaleJournalStageError::Journal(e))
+        })?;
+        let ordinal = self.session.completed_updates;
+        let window = self
+            .session
+            .plan
+            .training
+            .get(ordinal as usize)
+            .map(|w| w.content);
+        let handles = &self.handles;
+        let budget = &self.budget;
+        let (changed, staged) = self.session.step_staged(gradients, |candidate| {
+            let staged = stage_handles(handles, budget, &candidate)
+                .map_err(NativeCpuScaleJournalStageError::Snapshot)?;
+            journal
+                .append(ordinal, window.expect("admitted schedule"), gradients)
+                .map_err(NativeCpuScaleJournalStageError::Journal)?;
+            Ok::<_, NativeCpuScaleJournalStageError>(staged)
         })?;
         self.handles = staged;
         Ok(changed)
@@ -150,6 +202,22 @@ impl NativeCpuScaleSession {
         borrowed.extend(gradients.iter().map(Vec::as_slice));
         self.step(&borrowed)
     }
+}
+
+fn stage_handles(
+    handles: &[Arc<dyn DeviceBuffer>],
+    budget: &TensorPayloadBudget,
+    candidate: &NativeScaleStep<'_>,
+) -> Result<Vec<Arc<dyn DeviceBuffer>>, BackendError> {
+    let mut staged = handle_storage(handles.len())?;
+    for ((_, scales), parent) in candidate.owners().zip(handles) {
+        staged.push(
+            CpuBackend::new()
+                .snapshot_additive_scales(parent, scales, budget)?
+                .0,
+        );
+    }
+    Ok(staged)
 }
 
 fn stage_error(message: &str) -> NativeCpuScaleError {
