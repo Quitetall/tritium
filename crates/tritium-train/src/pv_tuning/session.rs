@@ -1,5 +1,6 @@
 use crate::optim::Optimizer;
 
+use super::continuous::check_optimizer_moments;
 use super::projection::project_units;
 use super::selection::selected_units;
 use super::{PvStepReceipt, PvTernaryWeight, PvTuningConfig, PvTuningError, PvTuningSession};
@@ -100,6 +101,7 @@ impl PvTuningSession {
                 "code optimizer produced a non-finite proposal",
             ));
         }
+        check_optimizer_moments(&self.code_state, "code")?;
 
         let units = selected_units(
             self.weight.structure,
