@@ -229,7 +229,7 @@ impl DirectoryTensorSink {
         staging: TritModelSpool<'_, S>,
         evidence: &SealedEvidence,
         companions: TritModelCompanions<'_>,
-        admit: impl FnOnce(&mut TritModelReader<File>) -> Result<T, E>,
+        admit: impl FnOnce(&TritModelReader<File>) -> Result<T, E>,
     ) -> Result<(TritModelReader<File>, T, Vec<PublicationWarning>), TritModelPublicationError<E>>
     {
         {

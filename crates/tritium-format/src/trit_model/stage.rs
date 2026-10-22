@@ -91,7 +91,8 @@ pub fn stage_trit_model_from_spool<S: Read + Seek, R: Read + Write + Seek, E>(
 /// Same checked staging, allowing owned metadata/result extraction before terminal verification.
 /// The callback also owns original source admission; it executes once after full
 /// typed staging and before final output verification. No publication is implied.
-/// Callback results must be owned, not borrowed from the private reader.
+/// Admission is read-only: it cannot replace the retained reader. Callback
+/// results must be owned, not borrowed from that reader.
 /// ```compile_fail
 /// use std::io::Cursor;
 /// use tritium_format::{TritSpoolBlob,TritPackageReadLimits};
@@ -101,13 +102,23 @@ pub fn stage_trit_model_from_spool<S: Read + Seek, R: Read + Write + Seek, E>(
 ///     let _=stage_trit_model_from_spool_with_admission(m,b,s,l,Cursor::new(Vec::new()),|r|Ok::<_,()>(r.manifest()));
 /// }
 /// ```
+/// Admission cannot replace the retained reader with another valid package:
+/// ```compile_fail
+/// use std::io::Cursor;
+/// use tritium_format::{TritSpoolBlob,TritPackageReadLimits};
+/// use tritium_format::trit_model::{TritModelReader,stage_trit_model_from_spool_with_admission};
+/// use tritium_schema::ModelManifest;
+/// fn replace(m:&ModelManifest,b:&[TritSpoolBlob],s:&mut Cursor<Vec<u8>>,l:TritPackageReadLimits,other:TritModelReader<Cursor<Vec<u8>>>) {
+///     let _=stage_trit_model_from_spool_with_admission(m,b,s,l,Cursor::new(Vec::new()),|reader|{*reader=other;Ok::<_,()>(())});
+/// }
+/// ```
 pub fn stage_trit_model_from_spool_with_admission<S: Read + Seek, R: Read + Write + Seek, E, T>(
     manifest: &ModelManifest,
     blobs: &[TritSpoolBlob],
     spool: &mut S,
     limits: TritPackageReadLimits,
     mut destination: R,
-    admit: impl FnOnce(&mut TritModelReader<R>) -> Result<T, E>,
+    admit: impl FnOnce(&TritModelReader<R>) -> Result<T, E>,
 ) -> Result<(TritModelReader<R>, T), TritModelStageError<E>> {
     let metadata = encode_model_manifest(manifest).map_err(TritModelStageError::Model)?;
     if destination
@@ -142,7 +153,11 @@ pub fn stage_trit_model_from_spool_with_admission<S: Read + Seek, R: Read + Writ
     if actual != expected {
         return Err(TritModelStageError::IdentityMismatch { expected, actual });
     }
-    let value = admit(&mut reader).map_err(TritModelStageError::Guard)?;
+    let value = admit(&reader).map_err(TritModelStageError::Guard)?;
+    let actual = reader.package_id();
+    if actual != expected {
+        return Err(TritModelStageError::IdentityMismatch { expected, actual });
+    }
     reader.verify().map_err(TritModelStageError::Read)?;
     Ok((reader, value))
 }

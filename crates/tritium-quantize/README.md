@@ -13,8 +13,8 @@ have explicit portable leaf names, lengths and BlobIds; no companion-sized buffe
 is retained. Exact container/manifest/directory caps are checked through the
 owning encoder's layout inspector before creating publication files.
 
-The admission callback sees the private typed reader and returns owned metadata
-before terminal verification and commit. Retained companion handles are hashed
+The admission callback sees the private typed reader read-only and returns owned
+metadata before terminal verification and commit. Retained companion handles are hashed
 again after that callback. Source errors or pre-commit failure remove only owned
 files; unexpected files are preserved. Generic companion bytes are not interpreted
 as training checkpoints by this module. Source/directory custody, power-loss,
