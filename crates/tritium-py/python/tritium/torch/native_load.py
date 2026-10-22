@@ -229,7 +229,8 @@ def load_native_module(model, artifact, *, level, load_run_id, inplace,
                        max_evidence_bytes=None, input_gradients=False):
     """Validate topology and privately stage native CPU weights plus original state.
 
-    Artifact may be an actual NativeModelConversion or an engine output directory.
+    Artifact may be an actual native conversion/refinement result or an engine
+    output directory. Refined admission stays record-consistent and unqualified.
     Persistent shell state may be CPU or meta; nonpersistent buffers must already
     be materialized on CPU. Package access still retains a complete byte image.
     Defaults to inference-only eager CPU execution. Explicit input_gradients=True
@@ -247,7 +248,7 @@ def load_native_module(model, artifact, *, level, load_run_id, inplace,
     if max_evidence_bytes is not None and (type(max_evidence_bytes) is not int or max_evidence_bytes <= 0):
         raise ValueError("native evidence byte limit must be a positive integer")
     evidence_options = {} if max_evidence_bytes is None else dict(max_evidence_bytes=max_evidence_bytes)
-    result = artifact if isinstance(artifact, _tritium.NativeModelConversion) else _tritium.NativeModelConversion.open(
+    result = artifact if isinstance(artifact, (_tritium.NativeModelConversion, _tritium.NativeModelRefinement)) else _tritium._open_native_model(
         str(artifact), max_package_bytes=max_package_bytes, **evidence_options)
     snapshot = result.open_level(level, load_run_id, max_payload_bytes=max_payload_bytes,
                                  max_workspace_bytes=max_workspace_bytes, max_output_bytes=max_output_bytes,

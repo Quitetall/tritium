@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from types import MethodType
 import weakref
+import tempfile
+from pathlib import Path
 import torch
 from .. import _tritium
 from .native_load import (NativeTernaryWeight, NativeTernaryLinear, NativeTernaryEmbedding, _compact, _check_input_autograd,
@@ -126,6 +128,7 @@ class NativeScaleTrainer:
         self._saved = _SavedBudget(max_saved_input_bytes)
         self.active = True
         self._failed = False
+        self._recording_work = None
         self._base_apply = model._apply
         self._topology = tuple((name, id(module), type(module)) for name, module in model.named_modules(remove_duplicate=False))
         self._state = tuple((module, kind, name, tensor, tensor._version) for module in model.modules()
@@ -271,6 +274,31 @@ class NativeScaleTrainer:
     def checkpoint(self):
         return bytes(self._backend.checkpoint())
 
+    def publish(self, output_dir, run_id, *, machine, validation, limits):
+        """Publish an unqualified child through Rust replay and common no-clobber commit.
+
+        Requires recording configured at factory creation. The live shell stays
+        unpublished; load the returned NativeModelRefinement for frozen inference.
+        Validation values are observations, not authenticated objective execution.
+        """
+        self._validate()
+        if self._failed:
+            raise RuntimeError("native backward failed; call zero_grad before reuse")
+        if self._recording_work is None:
+            raise RuntimeError("native publication requires recorded training")
+        fields = {"max_spool_bytes", "max_working_bytes", "max_evidence_bytes", "max_companion_bytes",
+                  "max_package_bytes", "max_manifest_bytes", "max_directory_bytes", "max_parent_bytes",
+                  "max_replay_working_bytes", "max_journal_bytes"}
+        if (not isinstance(limits, dict) or set(limits) != fields
+                or any(type(n) is not int or n <= 0 for n in limits.values())):
+            raise ValueError("native publication requires exact positive limit fields")
+        if not isinstance(run_id, str) or not run_id or not isinstance(machine, str) or not machine:
+            raise ValueError("native publication requires explicit run and machine")
+        if not isinstance(validation, (list, tuple)):
+            raise TypeError("bounded validation observations required")
+        return self._backend.publish(str(Path(output_dir).resolve()), run_id, machine,
+                                     json.dumps(validation, allow_nan=False), json.dumps(limits, allow_nan=False))
+
     def close(self):
         if not self.active:
             return self.model
@@ -286,12 +314,25 @@ class NativeScaleTrainer:
         self._cache.clear()
         self.active = False
         object.__setattr__(self.model, "_apply", self._base_apply)
+        self._cleanup_recording()
         return self.model
+
+    def _cleanup_recording(self):
+        self._backend.close_recording()
+        if self._recording_work is not None:
+            self._recording_work.cleanup()
+            self._recording_work = None
+
+    def __del__(self):
+        try:
+            self._cleanup_recording()
+        except BaseException:
+            pass
 
 
 def native_scale_training(model, artifact, *, level, plan, load_run_id,
                           max_snapshot_bytes, max_parent_bytes, max_saved_input_bytes,
-                          checkpoint=None, **load_limits):
+                          checkpoint=None, recording=None, **load_limits):
     """Create a private native eager CPU scale trainer, never a refined artifact.
 
     plan is the complete Rust NativeRefinementPlan mapping/JSON; obtain its exact
@@ -313,6 +354,19 @@ def native_scale_training(model, artifact, *, level, plan, load_run_id,
         raise ValueError("native training explicit parent level differs")
     if set(load_limits) - {"max_package_bytes", "max_payload_bytes", "max_workspace_bytes", "max_output_bytes", "max_evidence_bytes"}:
         raise TypeError("unknown native training load limit")
+    record_options = None
+    if recording is not None:
+        fields = {"work_dir", "max_journal_bytes", "max_working_bytes"}
+        if (not isinstance(recording, dict) or set(recording) != fields
+                or any(type(recording[name]) is not int or recording[name] <= 0 for name in fields - {"work_dir"})):
+            raise ValueError("native recording requires work_dir and positive journal/work limits")
+        if checkpoint is not None:
+            raise ValueError("recorded training requires zero origin; partial journal continuation unavailable")
+        work = Path(recording["work_dir"]).resolve(strict=True)
+        parent = Path(artifact.output_dir).resolve(strict=True)
+        if not work.is_dir() or work == parent or parent in work.parents:
+            raise ValueError("recording work must be an existing directory outside parent artifact")
+        record_options = (work, recording["max_journal_bytes"], recording["max_working_bytes"])
     private = load_native_module(model, artifact, level=level, load_run_id=load_run_id,
                                  inplace=False, input_gradients=True, **load_limits)
     # Derived buffers belong to this private shell too; do not mutate the caller's
@@ -332,7 +386,17 @@ def native_scale_training(model, artifact, *, level, plan, load_run_id,
     backend = artifact.begin_scale_training(text, [(name, selected[name].handle) for name in data["owners"]],
                                            max_snapshot_bytes=max_snapshot_bytes, max_parent_bytes=max_parent_bytes,
                                            checkpoint=checkpoint)
-    return NativeScaleTrainer(private, backend, data, selected, max_saved_input_bytes)
+    trainer = NativeScaleTrainer(private, backend, data, selected, max_saved_input_bytes)
+    if record_options is not None:
+        work, journal_bytes, working_bytes = record_options
+        temporary = tempfile.TemporaryDirectory(prefix="tritium-native-recording-", dir=work)
+        trainer._recording_work = temporary
+        try:
+            backend.start_recording(str(Path(temporary.name) / "gradients.tnsj"), journal_bytes, working_bytes)
+        except BaseException:
+            trainer._cleanup_recording()
+            raise
+    return trainer
 
 
 def _pairs(items):

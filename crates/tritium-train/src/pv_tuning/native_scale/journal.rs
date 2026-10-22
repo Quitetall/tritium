@@ -403,11 +403,32 @@ impl<R: Read> Reader<R> {
 pub fn replay_native_scale_journal<R: Read + Seek>(
     plan: NativeRefinementPlan,
     parents: Vec<AdditiveTensor>,
-    mut source: R,
+    source: R,
     expected_journal: BlobId,
     expected_checkpoint: &[u8],
     limits: NativeScaleJournalLimits,
 ) -> Result<VerifiedNativeScaleReplay> {
+    replay_native_scale_journal_with_state(
+        plan,
+        parents,
+        source,
+        expected_journal,
+        expected_checkpoint,
+        limits,
+    )
+    .map(|(_, observation)| observation)
+}
+
+/// Same exact replayer, retaining its final common state for encoded-child binding.
+/// Consumes original parents once; does not clone coefficients or alter the recipe.
+pub fn replay_native_scale_journal_with_state<R: Read + Seek>(
+    plan: NativeRefinementPlan,
+    parents: Vec<AdditiveTensor>,
+    mut source: R,
+    expected_journal: BlobId,
+    expected_checkpoint: &[u8],
+    limits: NativeScaleJournalLimits,
+) -> Result<(NativeScaleRefinementSession, VerifiedNativeScaleReplay)> {
     let admission = admit(&plan, &parents)?;
     let scales = parents
         .iter()
@@ -507,7 +528,7 @@ pub fn replay_native_scale_journal<R: Read + Seek>(
     {
         return Err(invalid("native replay exact checkpoint differs"));
     }
-    Ok(VerifiedNativeScaleReplay {
+    let observation = VerifiedNativeScaleReplay {
         parent: session.parent,
         summary: NativeScaleJournalSummary {
             journal: expected_journal,
@@ -517,5 +538,6 @@ pub fn replay_native_scale_journal<R: Read + Seek>(
             checkpoint_bytes: expected_checkpoint.len() as u64,
             updates: session.completed_updates,
         },
-    })
+    };
+    Ok((session, observation))
 }

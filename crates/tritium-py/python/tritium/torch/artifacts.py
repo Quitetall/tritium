@@ -396,7 +396,8 @@ def load(
     Loading re-parses and hashes every package through the native seek-backed
     reader. Without ``device`` it returns artifact evidence. With ``device`` it
     additionally materializes the selected packed Qwen language runtime.
-    A typed NativeModelConversion is verified directly. Explicit model, level,
+    A typed NativeModelConversion or unqualified NativeModelRefinement is verified
+    at its declared admission scope. Explicit model, level,
     load_run_id and inplace select the native packed CPU shell loader instead.
     Explicit input_gradients=True enables input-only native CPU autograd with
     immutable weights; it is not native refinement or parameter training.
@@ -407,7 +408,7 @@ def load(
         raise TypeError("native input gradients require a model shell")
     if format not in {None, "trit"}:
         raise ValueError("explicit native format must be 'trit'")
-    native = isinstance(artifact, _tritium.NativeModelConversion)
+    native = isinstance(artifact, (_tritium.NativeModelConversion, _tritium.NativeModelRefinement))
     if native or format == "trit" or model is not None or level is not None or load_run_id is not None or inplace is not None:
         if device is not None or profile != "compact-v1":
             raise TypeError("native load does not accept legacy device/profile selection")
@@ -424,7 +425,7 @@ def load(
             requested = Path(artifact)
             if requested.is_symlink() or not requested.is_dir():
                 raise ValueError("native artifact must be an ordinary directory")
-            result = _tritium.NativeModelConversion.open(os.fspath(requested), **limits)
+            result = _tritium._open_native_model(os.fspath(requested), **limits)
         if model is None:
             return result
         if not isinstance(level, str) or not level or not isinstance(load_run_id, str) or not load_run_id:
@@ -588,11 +589,11 @@ def export(
 ) -> Union[ExportReceipt, "QatHardArtifact", "RefinementResult", "_tritium.NativeModelConversion"]:
     """Publish a typed PTQ or QAT-hard result without changing its claim."""
 
-    if isinstance(result, _tritium.NativeModelConversion):
+    if isinstance(result, (_tritium.NativeModelConversion, _tritium.NativeModelRefinement)):
         return result.export(os.fspath(output_dir), max_package_bytes=max_package_bytes,
                              max_evidence_bytes=max_evidence_bytes)
     if max_package_bytes is not None or max_evidence_bytes is not None:
-        raise TypeError("native export limits require a NativeModelConversion")
+        raise TypeError("native export limits require a native model result")
     from .qat import QatHardResult
 
     if isinstance(result, QatHardResult):

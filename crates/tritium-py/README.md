@@ -115,8 +115,45 @@ production packed/out-of-core training memory. Callback/data identities are
 declarations, not authenticated replay or quality evidence. Closing exposes the
 current private inference shell marked unpublished. It does **not** publish a
 complete immutable child package, modify the parent, refine every quality level,
-or make native `refine`/artifact export available. Code/PV updates and independent
-quality/performance/release gates remain separate work.
+or run native public `refine` orchestration. The opt-in recorded publication path
+below is separate. Code/PV updates and independent quality/performance/release
+gates remain separate work.
+
+To publish a child, configure `recording={"work_dir": existing_work_dir,
+"max_journal_bytes": journal_cap, "max_working_bytes": recording_cap}` when
+creating the trainer. This requires a zero-origin run: appending partial journals
+is not admitted; unrecorded TNSR checkpoint/resume stays unchanged. Rust admits
+exact stream/work bytes and writes the actual f32 gradients before atomic state
+commit. Journal I/O failure never silently becomes an unrecorded update.
+
+After all declared steps, call `trainer.publish(output_dir, run_id, machine=...,
+validation=[...], limits=...)`. Validation entries use the existing Rust content,
+parent_loss and child_loss fields. The exact positive limit keys are:
+`max_spool_bytes`, `max_working_bytes`, `max_evidence_bytes`,
+`max_companion_bytes`, `max_package_bytes`, `max_manifest_bytes`,
+`max_directory_bytes`, `max_parent_bytes`, `max_replay_working_bytes`,
+`max_journal_bytes`. Replay/reference buffers, current trainer state and Torch
+graphs have separate scope; these ceilings are not total RSS. The stream can be
+large: use its forecast/explicit limits, not deployment compression estimates.
+
+The publisher reopens the actual original parent, replays the complete journal,
+and uses the shared immutable writer. It returns `tritium.NativeModelRefinement`,
+not a `NativeModelConversion`. The private shell stays unpublished. Load the
+frozen result with `tritium.torch.load(result, model=fresh_shell,
+level=child_level, load_run_id=..., inplace=False)`; exact native directory loading
+and `export(result, new_directory)` also preserve this distinct result type.
+`trainer.close()` closes/removes only its owned temporary recording work; the
+published checkpoint/journal remain in the child directory.
+
+`NativeModelRefinement.open(directory)` independently checks actual typed child,
+original log and exact checkpoint/journal identities without requiring the parent
+for inference. Its admission is `record-consistent-unqualified`; it does not prove
+original parent state, backward/objective origin or quality. The v2 catalog stays
+unchanged and loads against the child's actual level/storage. `verify()` repeats
+that same scope. `verify_with_parent(parent_conversion, max_parent_bytes=...,
+max_replay_working_bytes=...)` separately checks original ancestry, actual common
+numerical replay and encoded deployed owner bytes, not only checkpoint IDs. Even
+that observation is not objective authentication or release qualification.
 
 The opt-in calibrated lifecycle is separate from the legacy diagonal `calibrate`:
 `prepare_native_module(prepared, actions=..., levels=..., limits=..., work_dir=...,

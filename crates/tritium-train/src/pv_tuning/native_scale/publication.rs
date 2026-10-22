@@ -578,7 +578,7 @@ pub fn publish_native_scale_child<R: Read + Seek, J: Read + Seek, S: Read + Writ
     })
 }
 
-fn read_tensor<R: Read + Seek>(
+pub(super) fn read_tensor<R: Read + Seek>(
     parent: &mut TritModelReader<R>,
     level: &str,
     name: &str,

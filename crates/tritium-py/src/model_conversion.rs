@@ -137,6 +137,16 @@ impl NativeModelConversion {
         TritModelReader<File>,
         tritium_schema::NativeRefinementParent,
     )> {
+        let (model, parent) = self.refinement_parent_view(level)?;
+        Ok((model, parent.binding().clone()))
+    }
+    pub(crate) fn refinement_parent_view(
+        &self,
+        level: &str,
+    ) -> PyResult<(
+        TritModelReader<File>,
+        tritium_evidence::NativeRefinementParentView,
+    )> {
         use tritium_evidence::NativeRefinementParentView;
         let (mut model, log, _) = open_bound_model(
             Path::new(&self.output_dir),
@@ -171,10 +181,13 @@ impl NativeModelConversion {
         if parents.len() != 1 {
             return Err(error("exactly one native refinement parent required"));
         }
-        Ok((model, parents.remove(0).binding().clone()))
+        Ok((model, parents.remove(0)))
+    }
+    pub(crate) fn root(&self) -> &Path {
+        Path::new(&self.output_dir)
     }
     /// Reopen an engine package/log without trusting caller identity fields.
-    fn open_inner(
+    pub(crate) fn open_inner(
         py: Python<'_>,
         output_dir: String,
         max_package_bytes: u64,

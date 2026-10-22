@@ -1,4 +1,4 @@
-//! Explicit numerical native scale training bridge; not child publication.
+//! Explicit native scale training/recording bridge over common Rust publication.
 use crate::{
     model_conversion::NativeModelConversion,
     model_level::NativePackedMatrix,
@@ -10,11 +10,101 @@ use pyo3::{
     prelude::*,
     types::{PyAny, PyBytes},
 };
-use std::sync::Mutex;
+use std::{
+    fs::{File, OpenOptions},
+    ops::{Deref, DerefMut},
+    path::PathBuf,
+    sync::Mutex,
+};
 use tritium_runtime::TensorPayloadBudget;
-use tritium_schema::{NativeRefinementPlan, PlaneCounts, TensorStorage};
-use tritium_spec::AdditiveMetadata;
-use tritium_train::pv_tuning::{NativeCpuScaleSession, NativeScaleRefinementSession};
+use tritium_schema::NativeRefinementPlan;
+use tritium_train::pv_tuning::{
+    NativeCpuScaleSession, NativeScaleChildLimits, NativeScaleChildSource,
+    NativeScaleJournalLimits, NativeScaleJournalSummary, NativeScaleJournalWriter,
+    NativeScaleParentReadLimits, NativeScaleRefinementSession, decode_native_scale_parents,
+    publish_native_scale_child, replay_native_scale_journal,
+};
+
+enum Recording {
+    Off,
+    Writing {
+        writer: Box<NativeScaleJournalWriter<File>>,
+        directory: PathBuf,
+    },
+    Sealed {
+        file: File,
+        summary: NativeScaleJournalSummary,
+        directory: PathBuf,
+    },
+    Failed,
+}
+struct TrainingState {
+    driver: NativeCpuScaleSession,
+    recording: Recording,
+    publication_ordinal: u64,
+}
+impl Deref for TrainingState {
+    type Target = NativeCpuScaleSession;
+    fn deref(&self) -> &Self::Target {
+        &self.driver
+    }
+}
+impl DerefMut for TrainingState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.driver
+    }
+}
+impl TrainingState {
+    fn update(&mut self, g: &[&[f32]]) -> PyResult<usize> {
+        match &mut self.recording {
+            Recording::Off => self.driver.step(g).map_err(error),
+            Recording::Writing { writer, .. } => {
+                self.driver.step_recorded(g, writer).map_err(error)
+            }
+            Recording::Sealed { .. } => Err(error("native recording is sealed")),
+            Recording::Failed => Err(error("native recording is failed or closed")),
+        }
+    }
+    fn seal(&mut self) -> PyResult<()> {
+        if self.driver.session().completed_updates()
+            != self.driver.session().plan().training.len() as u64
+        {
+            return Err(error("native recording schedule incomplete"));
+        }
+        if matches!(self.recording, Recording::Writing { .. }) {
+            let Recording::Writing { writer, directory } =
+                std::mem::replace(&mut self.recording, Recording::Failed)
+            else {
+                unreachable!()
+            };
+            let (file, summary) = (*writer).finish(self.driver.session()).map_err(error)?;
+            self.recording = Recording::Sealed {
+                file,
+                summary,
+                directory,
+            };
+        }
+        if !matches!(self.recording, Recording::Sealed { .. }) {
+            return Err(error("complete native recording required"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicationLimits {
+    max_spool_bytes: u64,
+    max_working_bytes: u64,
+    max_evidence_bytes: u64,
+    max_companion_bytes: u64,
+    max_package_bytes: u64,
+    max_manifest_bytes: usize,
+    max_directory_bytes: usize,
+    max_parent_bytes: u64,
+    max_replay_working_bytes: u64,
+    max_journal_bytes: u64,
+}
 
 fn error(value: impl std::fmt::Display) -> PyErr {
     PyValueError::new_err(value.to_string())
@@ -125,11 +215,12 @@ pub(crate) fn embed_vjp(
 
 #[pyclass(frozen, module = "tritium._tritium", skip_from_py_object)]
 pub(crate) struct NativeScaleTraining {
-    state: Mutex<NativeCpuScaleSession>,
+    state: Mutex<TrainingState>,
     specs: Vec<NativePackedMatrix>,
+    parent: NativeModelConversion,
 }
 impl NativeScaleTraining {
-    fn lock(&self) -> PyResult<std::sync::MutexGuard<'_, NativeCpuScaleSession>> {
+    fn lock(&self) -> PyResult<std::sync::MutexGuard<'_, TrainingState>> {
         self.state
             .lock()
             .map_err(|_| error("native training state lock poisoned"))
@@ -168,82 +259,20 @@ pub(crate) fn begin(
         .zip(specs.iter().map(NativePackedMatrix::shared_tensor))
         .collect();
     let driver = py.detach(|| {
-        let (mut reader, parent) = result.refinement_parent(&plan.parent.level)?;
-        if parent != plan.parent {
+        let (mut reader, parent) = result.refinement_parent_view(&plan.parent.level)?;
+        if parent.binding() != &plan.parent {
             return Err(error("native training parent tuple differs"));
         }
-        plan.validate_parent(reader.manifest(), &parent)
-            .map_err(|e| error(format!("{e:?}")))?;
-        let mut retained = 0u64;
-        let mut largest = 0u64;
-        for name in &plan.owners {
-            let meta = reader
-                .tensor_meta(&plan.parent.level, name)
-                .map_err(error)?;
-            let TensorStorage::Additive { layout, planes } = &meta.storage else {
-                return Err(error("native training owner is not additive"));
-            };
-            let m = match planes {
-                PlaneCounts::Uniform(p) => AdditiveMetadata::uniform(*layout, *p),
-                PlaneCounts::PerTile(c) => AdditiveMetadata::per_tile(*layout, c),
-                _ => return Err(error("unsupported plane allocation")),
-            }
-            .map_err(error)?;
-            let mut bytes = m.auxiliary_bytes().map_err(error)? as u64;
-            for p in 0..m.plane_count() {
-                bytes = bytes
-                    .checked_add(m.plane_trit_count(p).map_err(error)? as u64)
-                    .ok_or_else(|| error("native state size overflow"))?;
-            }
-            bytes = bytes
-                .checked_add(
-                    (m.scale_count() as u64)
-                        .checked_mul(12)
-                        .ok_or_else(|| error("native state size overflow"))?,
-                )
-                .ok_or_else(|| error("native state size overflow"))?;
-            retained = retained
-                .checked_add(bytes)
-                .ok_or_else(|| error("native state size overflow"))?;
-            largest = largest.max(
-                reader
-                    .tensor_byte_len(&plan.parent.level, name)
-                    .map_err(error)?,
-            );
-        }
-        if retained > plan.limits.max_state_bytes
-            || retained
-                .checked_add(largest)
-                .is_none_or(|n| n > max_parent_bytes)
-        {
-            return Err(error("native decoded parent/state exceeds byte limit"));
-        }
-        let mut parents = Vec::new();
-        for name in &plan.owners {
-            let meta = reader
-                .tensor_meta(&plan.parent.level, name)
-                .map_err(error)?
-                .clone();
-            let len = usize::try_from(
-                reader
-                    .tensor_byte_len(&plan.parent.level, name)
-                    .map_err(error)?,
-            )
-            .map_err(error)?;
-            let mut bytes = Vec::new();
-            bytes.try_reserve_exact(len).map_err(error)?;
-            reader
-                .visit_tensor(&plan.parent.level, name, |chunk| {
-                    bytes.extend_from_slice(chunk);
-                    Ok::<_, PyErr>(())
-                })
-                .map_err(error)?;
-            parents.push(
-                tritium_format::trit_model::decode_additive_payload(&meta, &bytes)
-                    .map_err(error)?,
-            );
-        }
-        reader.verify().map_err(error)?;
+        let parents = decode_native_scale_parents(
+            &mut reader,
+            &parent,
+            &plan,
+            NativeScaleParentReadLimits {
+                max_working_bytes: max_parent_bytes,
+                extra_payload_bytes: 0,
+            },
+        )
+        .map_err(error)?;
         let state = if let Some(bytes) = checkpoint {
             NativeScaleRefinementSession::resume(plan, parents, bytes)
         } else {
@@ -254,13 +283,255 @@ pub(crate) fn begin(
             .map_err(error)
     })?;
     Ok(NativeScaleTraining {
-        state: Mutex::new(driver),
+        state: Mutex::new(TrainingState {
+            driver,
+            recording: Recording::Off,
+            publication_ordinal: 0,
+        }),
         specs,
+        parent: result.clone(),
     })
 }
 
 #[pymethods]
 impl NativeScaleTraining {
+    fn start_recording(
+        &self,
+        py: Python<'_>,
+        path: String,
+        max_journal_bytes: u64,
+        max_working_bytes: u64,
+    ) -> PyResult<()> {
+        py.detach(|| {
+            let mut state = self.lock()?;
+            if !matches!(state.recording, Recording::Off)
+                || state.session().completed_updates() != 0
+            {
+                return Err(error(
+                    "native recording requires a fresh zero-origin session",
+                ));
+            }
+            let ledger = state.session().journal_size_ledger().map_err(error)?;
+            if max_journal_bytes == 0
+                || max_working_bytes == 0
+                || ledger.journal_bytes > max_journal_bytes
+                || ledger.writer_working_bytes > max_working_bytes
+            {
+                return Err(error("native journal byte limit exceeded"));
+            }
+            let path = crate::model_refinement::path(&path)?;
+            let directory = path
+                .parent()
+                .ok_or_else(|| error("journal parent absent"))?
+                .canonicalize()
+                .map_err(error)?;
+            if directory.starts_with(self.parent.root().canonicalize().map_err(error)?) {
+                return Err(error("journal work cannot overlap parent artifact"));
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(error)?;
+            // Creation/header failure must never turn selected recording into unrecorded updates.
+            state.recording = Recording::Failed;
+            let writer = NativeScaleJournalWriter::new(
+                file,
+                state.session(),
+                NativeScaleJournalLimits {
+                    max_journal_bytes,
+                    max_working_bytes,
+                },
+            )
+            .map_err(error)?;
+            state.recording = Recording::Writing {
+                writer: Box::new(writer),
+                directory,
+            };
+            Ok(())
+        })
+    }
+    fn close_recording(&self) -> PyResult<()> {
+        self.lock()?.recording = Recording::Failed;
+        Ok(())
+    }
+    fn publish(
+        &self,
+        py: Python<'_>,
+        output_dir: String,
+        run_id: String,
+        machine: String,
+        validation_json: &str,
+        limits_json: &str,
+    ) -> PyResult<crate::model_refinement::NativeModelRefinement> {
+        if validation_json.len() > 16 * 1024 * 1024 || limits_json.len() > 16384 {
+            return Err(error("native publication request exceeds byte limit"));
+        }
+        let validation: Vec<tritium_schema::NativeRefinementValidation> =
+            serde_json::from_str(validation_json).map_err(error)?;
+        let limits: PublicationLimits = serde_json::from_str(limits_json).map_err(error)?;
+        if [
+            limits.max_spool_bytes,
+            limits.max_working_bytes,
+            limits.max_evidence_bytes,
+            limits.max_companion_bytes,
+            limits.max_package_bytes,
+            limits.max_parent_bytes,
+            limits.max_replay_working_bytes,
+            limits.max_journal_bytes,
+        ]
+        .contains(&0)
+            || limits.max_manifest_bytes == 0
+            || limits.max_directory_bytes == 0
+        {
+            return Err(error("native publication byte limits must be positive"));
+        }
+        let output = crate::model_refinement::path(&output_dir)?;
+        let leaf = output
+            .file_name()
+            .ok_or_else(|| error("child output basename absent"))?
+            .to_owned();
+        let output = output
+            .parent()
+            .ok_or_else(|| error("child output parent absent"))?
+            .canonicalize()
+            .map_err(error)?
+            .join(leaf);
+        let output_text = output
+            .to_str()
+            .ok_or_else(|| error("child output path is not UTF-8"))?
+            .to_owned();
+        py.detach(|| {
+            let mut state = self.lock()?;
+            let checkpoint_bytes = state.session().size_ledger().checkpoint_bytes;
+            if checkpoint_bytes > limits.max_parent_bytes
+                || checkpoint_bytes > limits.max_working_bytes
+            {
+                return Err(error("native checkpoint exceeds publication working limit"));
+            }
+            let predicted = state.session().journal_size_ledger().map_err(error)?;
+            if checkpoint_bytes
+                .checked_add(predicted.journal_bytes)
+                .is_none_or(|n| n > limits.max_companion_bytes)
+            {
+                return Err(error("native companions exceed publication byte limit"));
+            }
+            state.seal()?;
+            let forecast = state.session().journal_size_ledger().map_err(error)?;
+            if forecast.journal_bytes > limits.max_journal_bytes
+                || forecast.replay_working_bytes > limits.max_replay_working_bytes
+            {
+                return Err(error("native journal/replay byte limit exceeded"));
+            }
+            let ordinal = state.publication_ordinal;
+            state.publication_ordinal = ordinal
+                .checked_add(1)
+                .ok_or_else(|| error("native publication ordinal exhausted"))?;
+            let Recording::Sealed {
+                file,
+                summary,
+                directory,
+            } = &state.recording
+            else {
+                unreachable!()
+            };
+            if output.starts_with(directory)
+                || output.starts_with(self.parent.root().canonicalize().map_err(error)?)
+            {
+                return Err(error("child output cannot overlap parent or journal work"));
+            }
+            let mut journal = file.try_clone().map_err(error)?;
+            let summary = summary.clone();
+            let plan = state.session().plan();
+            let checkpoint = state.session().checkpoint_bytes().map_err(error)?;
+            let (mut parent, parent_view) =
+                self.parent.refinement_parent_view(&plan.parent.level)?;
+            let parents = decode_native_scale_parents(
+                &mut parent,
+                &parent_view,
+                plan,
+                NativeScaleParentReadLimits {
+                    max_working_bytes: limits.max_parent_bytes,
+                    extra_payload_bytes: checkpoint.len() as u64,
+                },
+            )
+            .map_err(error)?;
+            let replay = replay_native_scale_journal(
+                plan.clone(),
+                parents,
+                &mut journal,
+                summary.journal(),
+                &checkpoint,
+                NativeScaleJournalLimits {
+                    max_journal_bytes: limits.max_journal_bytes,
+                    max_working_bytes: limits.max_replay_working_bytes,
+                },
+            )
+            .map_err(error)?;
+            let evidence = tritium_evidence::EvidenceRecorder::new(
+                run_id,
+                [
+                    tritium_evidence::NATIVE_REFINEMENT_STARTED_REGISTRATION,
+                    tritium_evidence::NATIVE_REFINEMENT_CHECKPOINTED_REGISTRATION,
+                    tritium_evidence::NATIVE_REFINEMENT_COMPLETED_REGISTRATION,
+                    tritium_evidence::NATIVE_SCALE_REPLAY_OBSERVED_REGISTRATION,
+                ],
+            )
+            .map_err(error)?;
+            // Spool belongs to the already-owned recording work directory, never output/source.
+            let spool_path = directory.join(format!("publication-{ordinal}.spool"));
+            let mut spool = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&spool_path)
+                .map_err(error)?;
+            let receiving = tritium_format::TritPackageReadLimits {
+                max_source_bytes: limits.max_package_bytes,
+                max_manifest_bytes: limits.max_manifest_bytes,
+                max_directory_bytes: limits.max_directory_bytes,
+            };
+            let result = publish_native_scale_child(
+                state.session(),
+                NativeScaleChildSource {
+                    parent: &mut parent,
+                    parent_evidence: &parent_view,
+                    replay: &replay,
+                    journal: &mut journal,
+                    machine: &machine,
+                    validation: &validation,
+                },
+                &mut spool,
+                &mut tritium_quantize::engine::DirectoryTensorSink::new(&output),
+                NativeScaleChildLimits {
+                    max_spool_bytes: limits.max_spool_bytes,
+                    max_working_bytes: limits.max_working_bytes,
+                    max_evidence_bytes: limits.max_evidence_bytes,
+                    max_companion_bytes: limits.max_companion_bytes,
+                    receiving,
+                },
+                evidence,
+            );
+            drop(spool);
+            let cleanup = std::fs::remove_file(&spool_path);
+            let child = result.map_err(error)?;
+            let mut result = crate::model_refinement::NativeModelRefinement::from_published(
+                output_text,
+                child,
+                crate::model_refinement::ReadLimits {
+                    package: limits.max_package_bytes,
+                    evidence: limits.max_evidence_bytes,
+                    checkpoint: plan.limits.max_checkpoint_bytes,
+                    journal: limits.max_journal_bytes,
+                },
+            );
+            if let Err(cause) = cleanup {
+                result.add_warning(format!("SpoolCleanup: {cause}"));
+            }
+            Ok(result)
+        })
+    }
     #[getter]
     fn completed_updates(&self) -> PyResult<u64> {
         Ok(self.lock()?.session().completed_updates())
@@ -388,9 +659,7 @@ impl NativeScaleTraining {
             if state.session().completed_updates() != revision {
                 return Err(error("stale native training revision"));
             }
-            state
-                .step(&values.iter().map(Vec::as_slice).collect::<Vec<_>>())
-                .map_err(error)
+            state.update(&values.iter().map(Vec::as_slice).collect::<Vec<_>>())
         })
     }
     fn checkpoint<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {

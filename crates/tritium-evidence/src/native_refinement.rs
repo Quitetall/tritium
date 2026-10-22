@@ -275,93 +275,16 @@ impl NativeRefinementReceiptView {
         requested
             .validate_parent(reader.manifest(), parent.binding())
             .map_err(|_| invalid("requested parent/inventory mismatch"))?;
-        let id = native_refinement_plan_id(requested)?;
-        let native: Vec<_> = log
-            .events
-            .iter()
-            .filter(|e| e.schema.starts_with("tritium.refine.native_"))
-            .collect();
-        if native.is_empty() {
-            return Ok(Vec::new());
-        }
-        let first = native[0];
-        if first.schema != NativeRefinementStarted::SCHEMA_ID
-            || first.seq != 0
-            || first.parent.is_some()
-        {
-            return Err(invalid("native run must start at a root"));
-        }
-        let started: NativeRefinementStarted = decode(first)?;
-        started
-            .execution
-            .validate()
-            .map_err(|_| invalid("invalid execution scope"))?;
-        if &started.plan != requested {
-            return Err(invalid("recorded request differs from frozen request"));
-        }
-        if log.events.iter().any(|e| {
-            (e.parent.is_none() && e.span != first.span)
-                || (e.span == first.span && !e.schema.starts_with("tritium.refine.native_"))
-        }) {
-            return Err(invalid("foreign lifecycle in native root"));
-        }
-        let mut last: Option<NativeRefinementCheckpointed> = None;
-        let mut completed = None;
-        for event in native.into_iter().skip(1) {
-            if event.span != first.span || event.parent.is_some() || completed.is_some() {
-                return Err(invalid(
-                    "multiple/nonroot/after-completion native lifecycle",
-                ));
-            }
-            if event.schema == NativeRefinementCheckpointed::SCHEMA_ID {
-                let state: NativeRefinementCheckpointed = decode(event)?;
-                if state.plan != id
-                    || state.state
-                        != native_refinement_state_id(
-                            state.plan,
-                            state.completed_updates,
-                            state.checkpoint,
-                        )
-                    || state.completed_updates == 0
-                    || state.completed_updates > requested.training.len() as u64
-                    || state.checkpoint_bytes == 0
-                    || state.checkpoint_bytes > requested.limits.max_checkpoint_bytes
-                    || state.state_payload_bytes == 0
-                    || state.state_payload_bytes > requested.limits.max_state_bytes
-                    || state
-                        .owners
-                        .iter()
-                        .map(|o| &o.name)
-                        .ne(requested.owners.iter())
-                    || last.as_ref().is_some_and(|old| {
-                        state.completed_updates <= old.completed_updates
-                            || state.checkpoint == old.checkpoint
-                            || state.state == old.state
-                    })
-                {
-                    return Err(invalid("invalid/incomplete/nonadvancing checkpoint"));
-                }
-                last = Some(state);
-            } else if event.schema == NativeRefinementCompleted::SCHEMA_ID {
-                let output: NativeRefinementCompleted = decode(event)?;
-                let state = last
-                    .as_ref()
-                    .ok_or_else(|| invalid("completion without checkpoint"))?;
-                if output.plan != id
-                    || output.checkpoint != state.checkpoint
-                    || state.completed_updates != requested.training.len() as u64
-                {
-                    return Err(invalid("completion before final checkpoint"));
-                }
-                completed = Some(output);
-            } else {
-                return Err(invalid("unknown or repeated native lifecycle event"));
-            }
-        }
-        let Some(completed) = completed else {
+        let Some(NativeRecoveryRecord {
+            started,
+            checkpoint,
+            completed,
+            reference,
+            plan: id,
+        }) = fold_native_recovery(log, requested)?
+        else {
             return Ok(Vec::new());
         };
-        let checkpoint = last.ok_or_else(|| invalid("missing final checkpoint"))?;
         let level = reader
             .manifest()
             .levels
@@ -406,11 +329,6 @@ impl NativeRefinementReceiptView {
             child.blob.id = observed.content;
             child.blob.shard = None;
         }
-        let reference = EvidenceReference {
-            run: first.run.clone(),
-            span: first.span.clone(),
-            root: decode_hex(&log.root_digest)?,
-        };
         let mut assets = reader.manifest().assets.clone();
         for asset in &mut assets {
             asset.blob.shard = None;
@@ -444,6 +362,124 @@ impl NativeRefinementReceiptView {
             manifest,
         }])
     }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeRecoveryRecord {
+    pub started: NativeRefinementStarted,
+    pub checkpoint: NativeRefinementCheckpointed,
+    pub completed: NativeRefinementCompleted,
+    pub reference: EvidenceReference,
+    pub plan: NativeRefinementPlanId,
+}
+/// Strict lifecycle only; parent bytes and output interpretations remain separate.
+pub(crate) fn fold_native_recovery(
+    log: &VerifiedLog,
+    requested: &NativeRefinementPlan,
+) -> Result<Option<NativeRecoveryRecord>, EvidenceError> {
+    verify_log(log)?;
+    requested
+        .validate()
+        .map_err(|_| invalid("invalid native request"))?;
+    let id = native_refinement_plan_id(requested)?;
+    let native: Vec<_> = log
+        .events
+        .iter()
+        .filter(|e| e.schema.starts_with("tritium.refine.native_"))
+        .collect();
+    if native.is_empty() {
+        return Ok(None);
+    }
+    let first = native[0];
+    if first.schema != NativeRefinementStarted::SCHEMA_ID
+        || first.seq != 0
+        || first.parent.is_some()
+    {
+        return Err(invalid("native run must start at a root"));
+    }
+    let started: NativeRefinementStarted = decode(first)?;
+    started
+        .execution
+        .validate()
+        .map_err(|_| invalid("invalid execution scope"))?;
+    if &started.plan != requested {
+        return Err(invalid("recorded request differs from frozen request"));
+    }
+    if log.events.iter().any(|e| {
+        (e.parent.is_none() && e.span != first.span)
+            || (e.span == first.span && !e.schema.starts_with("tritium.refine.native_"))
+    }) {
+        return Err(invalid("foreign lifecycle in native root"));
+    }
+    let mut last: Option<NativeRefinementCheckpointed> = None;
+    let mut completed = None;
+    for event in native.into_iter().skip(1) {
+        if event.span != first.span || event.parent.is_some() || completed.is_some() {
+            return Err(invalid(
+                "multiple/nonroot/after-completion native lifecycle",
+            ));
+        }
+        if event.schema == NativeRefinementCheckpointed::SCHEMA_ID {
+            let state: NativeRefinementCheckpointed = decode(event)?;
+            if state.plan != id
+                || state.state
+                    != native_refinement_state_id(
+                        state.plan,
+                        state.completed_updates,
+                        state.checkpoint,
+                    )
+                || state.completed_updates == 0
+                || state.completed_updates > requested.training.len() as u64
+                || state.checkpoint_bytes == 0
+                || state.checkpoint_bytes > requested.limits.max_checkpoint_bytes
+                || state.state_payload_bytes == 0
+                || state.state_payload_bytes > requested.limits.max_state_bytes
+                || state
+                    .owners
+                    .iter()
+                    .map(|o| &o.name)
+                    .ne(requested.owners.iter())
+                || last.as_ref().is_some_and(|old| {
+                    state.completed_updates <= old.completed_updates
+                        || state.checkpoint == old.checkpoint
+                        || state.state == old.state
+                })
+            {
+                return Err(invalid("invalid/incomplete/nonadvancing checkpoint"));
+            }
+            last = Some(state);
+        } else if event.schema == NativeRefinementCompleted::SCHEMA_ID {
+            let output: NativeRefinementCompleted = decode(event)?;
+            let state = last
+                .as_ref()
+                .ok_or_else(|| invalid("completion without checkpoint"))?;
+            if output.plan != id
+                || output.checkpoint != state.checkpoint
+                || state.completed_updates != requested.training.len() as u64
+            {
+                return Err(invalid("completion before final checkpoint"));
+            }
+            completed = Some(output);
+        } else {
+            return Err(invalid("unknown or repeated native lifecycle event"));
+        }
+    }
+    let Some(completed) = completed else {
+        return Ok(None);
+    };
+    let checkpoint = last.ok_or_else(|| invalid("missing final checkpoint"))?;
+    let reference = EvidenceReference {
+        run: first.run.clone(),
+        span: first.span.clone(),
+        root: decode_hex(&log.root_digest)?,
+    };
+    Ok(Some(NativeRecoveryRecord {
+        started,
+        checkpoint,
+        completed,
+        reference,
+        plan: id,
+    }))
 }
 
 fn binding<R: Read + Seek>(

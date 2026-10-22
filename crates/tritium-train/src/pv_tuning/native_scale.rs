@@ -17,13 +17,14 @@ mod identity;
 mod journal;
 mod publication;
 mod transaction;
+mod verification;
 pub use consumers::NativeScaleContribution;
 #[cfg(feature = "native-cpu")]
 pub use cpu::{NativeCpuScaleError, NativeCpuScaleJournalStageError, NativeCpuScaleSession};
 pub use journal::{
     NativeScaleJournalError, NativeScaleJournalLimits, NativeScaleJournalSizeLedger,
     NativeScaleJournalSummary, NativeScaleJournalWriter, VerifiedNativeScaleReplay,
-    replay_native_scale_journal,
+    replay_native_scale_journal, replay_native_scale_journal_with_state,
 };
 pub use publication::{
     NATIVE_SCALE_CHECKPOINT_FILE, NATIVE_SCALE_JOURNAL_FILE, NativeScaleChildError,
@@ -32,6 +33,10 @@ pub use publication::{
     publish_native_scale_child,
 };
 pub use transaction::{NativeScaleStageError, NativeScaleStep};
+pub use verification::{
+    NativeScaleChildVerification, NativeScaleParentReadLimits, VerifiedNativeScaleChild,
+    decode_native_scale_parents, verify_native_scale_child,
+};
 
 struct ScaleCandidate {
     values: Vec<f32>,

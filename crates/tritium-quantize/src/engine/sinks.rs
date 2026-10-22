@@ -232,6 +232,27 @@ impl DirectoryTensorSink {
         admit: impl FnOnce(&TritModelReader<File>) -> Result<T, E>,
     ) -> Result<(TritModelReader<File>, T, Vec<PublicationWarning>), TritModelPublicationError<E>>
     {
+        self.publish_original_spooled_model_with_companions(
+            staging,
+            evidence.jsonl(),
+            companions,
+            admit,
+        )
+    }
+
+    /// Copy original verified log bytes without manufacturing a new recorder seal.
+    /// Caller admission must bind actual typed contents/companions to that original
+    /// lineage; generic log verification alone is not model/replay qualification.
+    pub fn publish_original_spooled_model_with_companions<S: Read + Seek, E, T>(
+        &mut self,
+        staging: TritModelSpool<'_, S>,
+        original_jsonl: &str,
+        companions: TritModelCompanions<'_>,
+        admit: impl FnOnce(&TritModelReader<File>) -> Result<T, E>,
+    ) -> Result<(TritModelReader<File>, T, Vec<PublicationWarning>), TritModelPublicationError<E>>
+    {
+        tritium_evidence::verify_jsonl(original_jsonl)
+            .map_err(|e| TritModelPublicationError::Publication(QuantEngineError::Evidence(e)))?;
         {
             use tritium_format::trit_model::{TritModelError, encode_model_manifest};
             use tritium_format::{TritPackageError, inspect_trit_spool_layout};
@@ -264,7 +285,7 @@ impl DirectoryTensorSink {
                 ));
             }
         }
-        self.publish_with_companions(evidence.jsonl(), true, companions, |file| {
+        self.publish_with_companions(original_jsonl, true, companions, |file| {
             let destination = file.try_clone().map_err(TritModelStageError::Destination)?;
             stage_trit_model_from_spool_with_admission(
                 staging.manifest,

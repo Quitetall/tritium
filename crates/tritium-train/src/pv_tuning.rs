@@ -23,6 +23,10 @@ mod selection;
 mod session;
 mod size;
 mod wire;
+pub use native_scale::{
+    NativeScaleChildVerification, NativeScaleParentReadLimits, VerifiedNativeScaleChild,
+    decode_native_scale_parents, verify_native_scale_child,
+};
 
 pub use blockwise::PvBlockwiseCursor;
 pub use config::{PvTuningConfig, PvTuningConfigBuilder};
@@ -41,7 +45,7 @@ pub use native_scale::{
     NativeScaleContribution, NativeScaleJournalError, NativeScaleJournalLimits,
     NativeScaleJournalSizeLedger, NativeScaleJournalSummary, NativeScaleJournalWriter,
     NativeScaleRefinementSession, NativeScaleSizeLedger, NativeScaleStageError, NativeScaleStep,
-    VerifiedNativeScaleReplay, replay_native_scale_journal,
+    VerifiedNativeScaleReplay, replay_native_scale_journal, replay_native_scale_journal_with_state,
 };
 pub use receipt::PvStepReceipt;
 pub use representation::{PvTernaryPlane, PvTernaryStructure, PvTernaryWeight};

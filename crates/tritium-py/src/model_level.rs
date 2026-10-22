@@ -243,6 +243,19 @@ pub(crate) fn open(
         max_directory_bytes: 64 * 1024 * 1024,
     };
     let reader = TritModelReader::open(Cursor::new(bytes), limits).map_err(error)?;
+    open_reader(reader, level, run, payload, workspace, max_output_bytes)
+}
+pub(crate) fn open_reader(
+    reader: TritModelReader<Cursor<Vec<u8>>>,
+    level: String,
+    run: String,
+    payload: u64,
+    workspace: u64,
+    max_output_bytes: usize,
+) -> PyResult<NativeModelLevel> {
+    if max_output_bytes == 0 {
+        return Err(error("max_output_bytes must be positive"));
+    }
     reader.model_id(&level).map_err(error)?;
     let recorder = EvidenceRecorder::new(run, [TENSOR_UPLOADED_REGISTRATION]).map_err(error)?;
     Ok(NativeModelLevel {

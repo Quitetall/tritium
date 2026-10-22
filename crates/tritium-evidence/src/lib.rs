@@ -34,6 +34,7 @@ pub use native_refinement::{
 };
 pub use native_scale_child::{
     NATIVE_SCALE_REPLAY_OBSERVED_REGISTRATION, NativeScaleChildReceiptView,
+    NativeScaleChildRecordView,
 };
 
 mod direct_fit;

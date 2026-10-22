@@ -12,6 +12,7 @@
       "KroneckerSharedForwardGroup",
       "KroneckerStateError",
       "NativeModelConversion",
+      "NativeModelRefinement",
       "Qwen36KroneckerCaptureReceipt",
       "Qwen36KroneckerCaptureSession",
       "Qwen36KroneckerCaptureTask",
@@ -48,7 +49,7 @@
       "ternary_matmul"
     ]
   },
-  "report_id": "sha256:7ac118e65654124a24fb3f38afd8d6d202fa54da68eae6e76ad3d0d0bc3e1382",
+  "report_id": "sha256:e333202de80dc1410e034e60d0360e7b6e5899d8748a1945f013f6e8991cceed",
   "rust": {
     "frozen_crates": [
       "tritium-core",

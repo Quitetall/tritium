@@ -1255,3 +1255,154 @@ fn synthetic_imported_raw_profiles_preserve_all_four_laws_codecs_bases_and_alloc
     assert_eq!(cases, 216);
     println!("NATIVE_CHILD_SYNTHETIC_RAW_PROFILES={cases}");
 }
+
+#[test]
+fn numerical_verifier_rejects_record_consistent_forged_encoded_owner_state() {
+    use tritium_format::trit_model::encode_model_manifest;
+    use tritium_format::{TritBlob, TritBlobKind, write_trit_package};
+    let root = Scratch::new("numeric-binding");
+    let mut f = Fixture::new(
+        ScalePrecision::F32,
+        Basis::Identity,
+        PlaneCodec::B3,
+        "full",
+        false,
+    );
+    let mut child = publish(
+        &mut f,
+        &root.0.join("child"),
+        &mut Cursor::new(Vec::new()),
+        limits(),
+        recorder("original"),
+    )
+    .unwrap();
+    let accepted = verify_native_scale_child(
+        NativeScaleChildVerification {
+            parent: &mut f.parent,
+            parent_evidence: &f.view,
+            child: &mut child.model,
+            log: child.evidence.log(),
+            plan: &f.plan,
+            journal: &mut Cursor::new(&f.journal),
+            checkpoint: &f.checkpoint,
+        },
+        NativeScaleParentReadLimits {
+            max_working_bytes: 2_000_000,
+            extra_payload_bytes: 0,
+        },
+        journal_limits(),
+    )
+    .unwrap();
+    assert_eq!(accepted.package(), child.model.package_id());
+    let (other, _, _, _) = trained(&f.plan, &f.parents, 0.125);
+    let changed = other.weights().next().unwrap().encode_payload().unwrap();
+    let changed_id = BlobId::from_bytes(*blake3::hash(&changed).as_bytes());
+    assert_ne!(
+        changed_id,
+        child
+            .model
+            .tensor_meta("refined", "weight")
+            .unwrap()
+            .blob
+            .id
+    );
+    let mut fake_log = recorder("forged-but-record-consistent");
+    for event in &child.evidence.log().events {
+        match event.schema.as_str() {
+            "tritium.refine.native_started" => {
+                let value: NativeRefinementStarted =
+                    serde_json::from_value(event.payload.clone()).unwrap();
+                fake_log
+                    .emit(&event.span, event.parent.as_deref(), event.t, &value)
+                    .unwrap();
+            }
+            "tritium.refine.scale_replay_observed" => {
+                let value: NativeScaleReplayObserved =
+                    serde_json::from_value(event.payload.clone()).unwrap();
+                fake_log
+                    .emit(&event.span, event.parent.as_deref(), event.t, &value)
+                    .unwrap();
+            }
+            "tritium.refine.native_checkpointed" => {
+                let mut value: NativeRefinementCheckpointed =
+                    serde_json::from_value(event.payload.clone()).unwrap();
+                value.owners[0].content = changed_id;
+                fake_log
+                    .emit(&event.span, event.parent.as_deref(), event.t, &value)
+                    .unwrap();
+            }
+            "tritium.refine.native_completed" => {
+                let mut value: NativeRefinementCompleted =
+                    serde_json::from_value(event.payload.clone()).unwrap();
+                value
+                    .tensors
+                    .iter_mut()
+                    .find(|t| t.name == "weight")
+                    .unwrap()
+                    .content = changed_id;
+                fake_log
+                    .emit(&event.span, event.parent.as_deref(), event.t, &value)
+                    .unwrap();
+            }
+            _ => panic!("unexpected event"),
+        }
+    }
+    let fake_log = fake_log.seal().unwrap();
+    let view = NativeScaleChildReceiptView::fold(fake_log.log(), &mut f.parent, &f.view, &f.plan)
+        .unwrap()
+        .remove(0);
+    let mut payloads = Vec::new();
+    for meta in &view.manifest().levels[0].tensors {
+        let data = if meta.name == "weight" {
+            changed.clone()
+        } else {
+            tensor_bytes(&mut child.model, "refined", &meta.name)
+        };
+        let kind = match &meta.storage {
+            TensorStorage::Additive { .. } => TritBlobKind::AdditiveTensor,
+            TensorStorage::Dense { precision, .. } => TritBlobKind::DenseTensor(match precision {
+                ScalePrecision::F32 => tritium_core::DType::F32,
+                ScalePrecision::Bf16 => tritium_core::DType::BF16,
+                _ => tritium_core::DType::F16,
+            }),
+            _ => panic!("unsupported"),
+        };
+        payloads.push((kind, data));
+    }
+    for asset in &view.manifest().assets {
+        payloads.push((
+            TritBlobKind::Asset(asset.name.clone()),
+            asset_bytes(&mut child.model, &asset.name),
+        ));
+    }
+    let blobs: Vec<_> = payloads
+        .iter()
+        .map(|(kind, bytes)| TritBlob {
+            kind: kind.clone(),
+            bytes,
+        })
+        .collect();
+    let bytes =
+        write_trit_package(&encode_model_manifest(view.manifest()).unwrap(), &blobs).unwrap();
+    let mut fake = TritModelReader::open(Cursor::new(bytes), receiving()).unwrap();
+    NativeScaleChildRecordView::from_child(fake_log.log(), &mut fake).unwrap();
+    view.verify_child(&mut fake).unwrap();
+    let error = verify_native_scale_child(
+        NativeScaleChildVerification {
+            parent: &mut f.parent,
+            parent_evidence: &f.view,
+            child: &mut fake,
+            log: fake_log.log(),
+            plan: &f.plan,
+            journal: &mut Cursor::new(&f.journal),
+            checkpoint: &f.checkpoint,
+        },
+        NativeScaleParentReadLimits {
+            max_working_bytes: 2_000_000,
+            extra_payload_bytes: 0,
+        },
+        journal_limits(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("replayed owner state"));
+}
