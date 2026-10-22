@@ -191,6 +191,21 @@ def test_postcommit_cleanup_is_warning_and_precommit_error_is_not_masked(tmp_pat
     assert list(work.iterdir())==[]
 
 
+def test_final_teacher_digest_detects_data_write_that_bypasses_version_counter(tmp_path):
+    teacher,parent,training,validation,work=fixture(tmp_path)
+    cfg=configuration(parent,training,validation,steps=(0,));root=tmp_path/"checkpoints";root.mkdir()
+    version=teacher.a.weight._version;saved=[];original=(tmp_path/"output/model.trit").read_bytes()
+    def mutate(bundle):
+        saved.append(bundle);teacher.a.weight.data.add_(0.001)
+        assert teacher.a.weight._version==version
+    with pytest.raises(ValueError,match="teacher bytes changed"):
+        refine(parent,teacher=teacher,training=training,validation=validation,config=cfg,work_dir=work,
+               output_dir=tmp_path/"child",checkpoint_dir=root,on_checkpoint=mutate)
+    assert not (tmp_path/"child").exists() and list(work.iterdir())==[]
+    assert (tmp_path/"output/model.trit").read_bytes()==original
+    parent.verify();saved[0].verify()
+
+
 def test_config_and_output_refusals_are_early_and_native_children_are_not_legacy(tmp_path):
     teacher,parent,training,validation,work=fixture(tmp_path);cfg=configuration(parent,training,validation)
     output=tmp_path/"exists";output.mkdir();(output/"sentinel").write_text("keep")
