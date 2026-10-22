@@ -432,3 +432,78 @@ fn concurrent_snapshot_creation_cannot_overcommit_incremental_budget() {
     assert_eq!(budget.used_bytes(), 0);
     assert_eq!(Arc::strong_count(&root), 1);
 }
+
+struct SwitchingRoot {
+    first: Arc<dyn DeviceBuffer>,
+    second: Arc<dyn DeviceBuffer>,
+    select: Arc<std::sync::atomic::AtomicBool>,
+}
+impl DeviceBuffer for SwitchingRoot {
+    fn len_bytes(&self) -> usize {
+        self.first.len_bytes()
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        if self.select.load(std::sync::atomic::Ordering::Acquire) {
+            self.second.as_any()
+        } else {
+            self.first.as_any()
+        }
+    }
+}
+#[test]
+fn snapshot_refuses_a_wrapper_that_switches_its_backend_root() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let cpu = CpuBackend::new();
+    let source = tensor(3, PlaneCodec::D2, Basis::Identity, 0, 128, 1);
+    let changed = AdditiveTensor::new(
+        source.layout(),
+        1,
+        vec![Trit::NEG; source.trits().len()],
+        source.scales().to_vec(),
+    )
+    .unwrap();
+    let first: Arc<dyn DeviceBuffer> = Arc::from(
+        cpu.upload_tensor(TensorView::Additive(source.view()))
+            .unwrap(),
+    );
+    let second: Arc<dyn DeviceBuffer> = Arc::from(
+        cpu.upload_tensor(TensorView::Additive(changed.view()))
+            .unwrap(),
+    );
+    assert_eq!(first.len_bytes(), second.len_bytes());
+    let select = Arc::new(AtomicBool::new(false));
+    let parent: Arc<dyn DeviceBuffer> = Arc::new(SwitchingRoot {
+        first,
+        second,
+        select: select.clone(),
+    });
+    let budget = TensorPayloadBudget::new(8);
+    let (snapshot, _) = cpu
+        .snapshot_additive_scales(&parent, &[0.75], &budget)
+        .unwrap();
+    select.store(true, Ordering::Release);
+    let mut row = vec![17.0; 260];
+    let mut out = [19.0; 3];
+    assert!(
+        cpu.matmul(TensorMatmul {
+            act: &[0.25; 260],
+            tensor: &*snapshot,
+            batch: 1,
+            transformed_act: &mut row,
+            out: &mut out
+        })
+        .is_err(),
+        "snapshot silently switched coefficients"
+    );
+    assert!(row.iter().all(|&v| v == 17.0));
+    assert_eq!(out, [19.0; 3]);
+    assert!(
+        cpu.snapshot_additive_scales(&snapshot, &[0.25], &budget)
+            .is_err()
+    );
+    assert_eq!(budget.used_bytes(), 4);
+    select.store(false, Ordering::Release);
+    let mut expected = source;
+    expected.replace_scales(vec![0.75]).unwrap();
+    check(&*snapshot, expected.view());
+}

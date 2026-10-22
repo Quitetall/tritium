@@ -139,4 +139,39 @@ fn scale_updates_do_not_copy_codes_or_allocate_dense_or_code_optimizer_state() {
         observations[0], observations[1],
         "one-scale update allocation must not scale with coefficient count"
     );
+    // The allocator counter is process-global: keep both probes in one harness
+    // test, so parallel tests cannot charge one another's setup allocations.
+    #[cfg(feature = "native-cpu")]
+    atomic_bound_step_does_not_clone_coefficient_state();
+}
+
+#[cfg(feature = "native-cpu")]
+fn atomic_bound_step_does_not_clone_coefficient_state() {
+    use std::sync::Arc;
+    use tritium_spec::{DeviceBuffer, TensorView, TernaryBackend};
+    use tritium_train::pv_tuning::NativeCpuScaleSession;
+    let mut observations = Vec::new();
+    for elements in [1024, 1_048_576] {
+        let state = session(elements);
+        let cpu = tritium_cpu::CpuBackend::new();
+        let root: Arc<dyn DeviceBuffer> = Arc::from(
+            cpu.upload_tensor(TensorView::Additive(state.weights().next().unwrap().view()))
+                .unwrap(),
+        );
+        let budget = tritium_runtime::TensorPayloadBudget::new(8);
+        let mut bound =
+            NativeCpuScaleSession::bind(state, vec![("weight".into(), root)], budget.clone())
+                .unwrap();
+        let (result, bytes) = measured(|| bound.step(&[&[0.25]]));
+        assert_eq!(result.unwrap(), 1);
+        assert!(
+            bytes < 4096,
+            "atomic step requested {bytes} bytes for {elements} coefficients"
+        );
+        eprintln!("ATOMIC_BOUND_STEP_ALLOC elements={elements} bytes={bytes}");
+        observations.push(bytes);
+        drop(bound);
+        assert_eq!(budget.used_bytes(), 0);
+    }
+    assert_eq!(observations[0], observations[1]);
 }

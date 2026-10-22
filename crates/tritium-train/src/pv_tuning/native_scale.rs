@@ -11,8 +11,24 @@ use crate::optim::{AdamState, AdamW, Optimizer};
 
 mod checkpoint;
 mod consumers;
+#[cfg(feature = "native-cpu")]
+mod cpu;
 mod identity;
+mod transaction;
 pub use consumers::NativeScaleContribution;
+#[cfg(feature = "native-cpu")]
+pub use cpu::{NativeCpuScaleError, NativeCpuScaleSession};
+pub use transaction::{NativeScaleStageError, NativeScaleStep};
+
+struct ScaleCandidate {
+    values: Vec<f32>,
+    state: AdamState,
+}
+struct PreparedScaleStep {
+    next: u64,
+    changed: usize,
+    candidates: Vec<ScaleCandidate>,
+}
 
 /// Logical selected-owner buffers; not graph memory, allocator capacity or RSS.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,6 +147,14 @@ impl NativeScaleRefinementSession {
     /// not logical dense-weight gradients; owner/basis/scale adjoints belong to
     /// the caller. All owners, moments and the cursor commit together or not at all.
     pub fn step(&mut self, gradients: &[&[f32]]) -> Result<usize, PvTuningError> {
+        match self.step_staged(gradients, |_| Ok::<_, std::convert::Infallible>(())) {
+            Ok((changed, ())) => Ok(changed),
+            Err(NativeScaleStageError::Update(error)) => Err(error),
+            Err(NativeScaleStageError::Stage(never)) => match never {},
+        }
+    }
+
+    fn prepare_step(&self, gradients: &[&[f32]]) -> Result<PreparedScaleStep, PvTuningError> {
         let window = self
             .plan
             .training
@@ -184,9 +208,19 @@ impl NativeScaleRefinementSession {
                 .zip(owner.weight.scales())
                 .filter(|(a, b)| a.to_bits() != b.to_bits())
                 .count();
-            candidates.push((values, state));
+            candidates.push(ScaleCandidate { values, state });
         }
-        for (owner, (values, state)) in self.owners.iter_mut().zip(candidates) {
+        Ok(PreparedScaleStep {
+            next,
+            changed,
+            candidates,
+        })
+    }
+
+    fn commit_step(&mut self, prepared: PreparedScaleStep) {
+        for (owner, ScaleCandidate { values, state }) in
+            self.owners.iter_mut().zip(prepared.candidates)
+        {
             // The exact candidate has already passed validation; no allocation or
             // externally fallible operation remains in this commit phase.
             owner
@@ -195,8 +229,7 @@ impl NativeScaleRefinementSession {
                 .expect("prevalidated native scales");
             owner.state = state;
         }
-        self.completed_updates = next;
-        Ok(changed)
+        self.completed_updates = prepared.next;
     }
 }
 

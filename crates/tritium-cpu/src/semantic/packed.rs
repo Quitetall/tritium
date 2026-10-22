@@ -380,6 +380,40 @@ impl PackedAdditive {
 }
 
 impl PackedScaleView<'_> {
+    pub(super) fn equals_view(&self, view: AdditiveView<'_>) -> Result<bool, BackendError> {
+        tritium_format::AdditiveTensor::validate_view(view).map_err(invalid)?;
+        if self.layout != view.layout() || self.planes != view.plane_count() {
+            return Ok(false);
+        }
+        let counts = match &self.tensor.allocation {
+            Allocation::Uniform { .. } => None,
+            Allocation::PerTile { index, .. } => Some(index.tile_counts()),
+        };
+        if counts != view.tile_counts() {
+            return Ok(false);
+        }
+        if view.scales().len() != self.tensor.scale_vjp_plan()?.stored_scale_count() {
+            return Ok(false);
+        }
+        for (index, &value) in view.scales().iter().enumerate() {
+            if self.stored_scale(0, index).to_bits() != value.to_bits() {
+                return Ok(false);
+            }
+        }
+        for plane in 0..self.planes {
+            let offset = match &self.tensor.allocation {
+                Allocation::Uniform { .. } => 0,
+                Allocation::PerTile { starts, .. } => starts[plane].trit,
+            };
+            for (index, value) in view.plane_trits(plane).map_err(invalid)?.iter().enumerate() {
+                if self.tensor.trit(plane, offset + index) != value.get() {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     fn trit(&self, plane: usize, coefficient: usize) -> i8 {
         self.tensor.trit(plane, coefficient)
     }

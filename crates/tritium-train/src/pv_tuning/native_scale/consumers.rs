@@ -1,5 +1,5 @@
-use super::{NativeScaleRefinementSession, PvTuningError, reserved, zeroed};
-use tritium_core::{accumulate_embed_scale_vjp, accumulate_ternary_matmul_scale_vjp};
+use super::{NativeScaleRefinementSession, NativeScaleStageError, PvTuningError, reserved, zeroed};
+use tritium_core::{AdditiveView, accumulate_embed_scale_vjp, accumulate_ternary_matmul_scale_vjp};
 
 /// One explicit native consumer contribution to a selected owner's scale gradient.
 ///
@@ -44,11 +44,60 @@ impl NativeScaleRefinementSession {
         &mut self,
         contributions: &[&[NativeScaleContribution<'_>]],
     ) -> Result<usize, PvTuningError> {
+        let gradients = self
+            .consumer_gradients(contributions, |_, view, contribution, scratch, out| {
+                match contribution {
+                    NativeScaleContribution::Matmul {
+                        activations,
+                        output_gradients,
+                        batch,
+                    } => accumulate_ternary_matmul_scale_vjp(
+                        activations,
+                        &view.bind_matmul(),
+                        output_gradients,
+                        batch,
+                        scratch,
+                        out,
+                    ),
+                    NativeScaleContribution::Embed {
+                        ids,
+                        output_gradients,
+                    } => accumulate_embed_scale_vjp(
+                        &view.bind_gather(),
+                        ids,
+                        output_gradients,
+                        scratch,
+                        out,
+                    ),
+                }
+                .map_err(|e| {
+                    PvTuningError::step(format!("native scale adjoint rejected consumer: {e:?}"))
+                })
+            })
+            .map_err(|e| match e {
+                NativeScaleStageError::Update(e) | NativeScaleStageError::Stage(e) => e,
+            })?;
+        let mut borrowed = reserved(gradients.len())?;
+        borrowed.extend(gradients.iter().map(Vec::as_slice));
+        self.step(&borrowed)
+    }
+
+    pub(super) fn consumer_gradients<E>(
+        &self,
+        contributions: &[&[NativeScaleContribution<'_>]],
+        mut consume: impl FnMut(
+            usize,
+            AdditiveView<'_>,
+            NativeScaleContribution<'_>,
+            &mut [f32],
+            &mut [f64],
+        ) -> Result<(), E>,
+    ) -> Result<Vec<Vec<f32>>, NativeScaleStageError<E>> {
         if self.completed_updates >= self.plan.training.len() as u64 {
-            return Err(PvTuningError::step("native training schedule is exhausted"));
+            return Err(PvTuningError::step("native training schedule is exhausted").into());
         }
         if contributions.len() != self.owners.len() {
-            return Err(PvTuningError::step("native consumer owner count mismatch"));
+            return Err(PvTuningError::step("native consumer owner count mismatch").into());
         }
         let mut total = 0u64;
         let mut max_scales = 0usize;
@@ -73,7 +122,8 @@ impl NativeScaleRefinementSession {
             return Err(PvTuningError::step(format!(
                 "native consumer workspace requires {peak} bytes, limit is {}",
                 self.plan.limits.max_workspace_bytes
-            )));
+            ))
+            .into());
         }
         for (owner, uses) in self.owners.iter().zip(contributions) {
             for contribution in *uses {
@@ -87,39 +137,14 @@ impl NativeScaleRefinementSession {
         let mut accumulated = reserved(max_scales)?;
         accumulated.resize(max_scales, 0.0f64);
         let mut gradients = reserved(self.owners.len())?;
-        for (owner, uses) in self.owners.iter().zip(contributions) {
+        for (index, (owner, uses)) in self.owners.iter().zip(contributions).enumerate() {
             let view = owner.weight.view();
             let out = &mut accumulated[..view.scales().len()];
             out.fill(0.0);
             let scratch = &mut row[..view.layout().cols as usize];
             for contribution in *uses {
-                match contribution {
-                    NativeScaleContribution::Matmul {
-                        activations,
-                        output_gradients,
-                        batch,
-                    } => accumulate_ternary_matmul_scale_vjp(
-                        activations,
-                        &view.bind_matmul(),
-                        output_gradients,
-                        *batch,
-                        scratch,
-                        out,
-                    ),
-                    NativeScaleContribution::Embed {
-                        ids,
-                        output_gradients,
-                    } => accumulate_embed_scale_vjp(
-                        &view.bind_gather(),
-                        ids,
-                        output_gradients,
-                        scratch,
-                        out,
-                    ),
-                }
-                .map_err(|e| {
-                    PvTuningError::step(format!("native scale adjoint rejected consumer: {e:?}"))
-                })?;
+                consume(index, view, *contribution, scratch, out)
+                    .map_err(NativeScaleStageError::Stage)?;
             }
             let mut values = reserved(out.len())?;
             for &value in out.iter() {
@@ -127,7 +152,8 @@ impl NativeScaleRefinementSession {
                 if !value.is_finite() {
                     return Err(PvTuningError::step(
                         "native accumulated scale gradient overflowed f32",
-                    ));
+                    )
+                    .into());
                 }
                 values.push(value);
             }
@@ -135,9 +161,7 @@ impl NativeScaleRefinementSession {
         }
         drop(row);
         drop(accumulated);
-        let mut borrowed = reserved(gradients.len())?;
-        borrowed.extend(gradients.iter().map(Vec::as_slice));
-        self.step(&borrowed)
+        Ok(gradients)
     }
 }
 

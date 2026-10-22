@@ -48,3 +48,20 @@ closed-loop fixture combines actual packed Matmul/Embed cotangents, the common
 step, immutable snapshots and exact restart. The session still owns decoded
 reference state: this does not establish production packed/out-of-core training,
 an authenticated model objective or public native refinement.
+
+`step_staged()` computes checked candidates, borrows their exact named scales to
+one resource stager, and commits scales/moments/cursor only if staging succeeds.
+Staging error or unwind preserves the old common state. Callbacks must keep
+resources private; arbitrary external effects are not rolled back or admitted by
+the numeric workspace ledger. Direct steps use the same candidate/commit path.
+
+With `--features native-cpu`, `pv_tuning::NativeCpuScaleSession` owns both common
+state and the complete named packed handle set. Binding pins current-state scales
+over supplied code roots and verifies actual geometry/codes/scale bits. This
+supports resume over original roots but does not authenticate original scale
+lineage or model/source provenance. Every step privately stages all next handles,
+then commits state and replaces the complete set; a late budget failure drops all
+new resources and preserves old handles/checkpoints. Actual packed consumer
+adjoints share the reference reducer. Budget for initial versions and simultaneous
+old/new versions; retained old graph Arcs retain their scale payload admission.
+The adapter still owns decoded reference state, not production packed-memory QAT.

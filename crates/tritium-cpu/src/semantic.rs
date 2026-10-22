@@ -237,6 +237,23 @@ impl CpuTensor {
             .stored_scale_count())
     }
 
+    pub(crate) fn additive_equals_view(
+        tensor: &dyn DeviceBuffer,
+        view: tritium_core::AdditiveView<'_>,
+    ) -> Result<bool, BackendError> {
+        let selected = Self::checked(tensor)?;
+        if tensor.len_bytes() != selected.len_bytes() {
+            return Err(BackendError::InvalidInput(
+                "CPU handle payload bytes differ from backend storage".into(),
+            ));
+        }
+        match selected {
+            Self::Additive(tensor) => tensor.view().equals_view(view),
+            Self::ScaleSnapshot(snapshot) => snapshot.view()?.equals_view(view),
+            Self::Dense { .. } => Err(BackendError::UnsupportedTensor),
+        }
+    }
+
     pub(crate) fn additive_matmul_scale_vjp(
         tensor: &dyn DeviceBuffer,
         activations: &[f32],

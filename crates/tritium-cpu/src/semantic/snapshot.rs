@@ -22,6 +22,8 @@ pub(crate) struct ScaleSnapshot {
     // Free the scale payload and root before releasing this payload reservation.
     scales: Vec<u8>,
     root: Arc<dyn DeviceBuffer>,
+    // Process-local comparison only; never dereferenced or persisted as identity.
+    root_identity: usize,
     bytes: CpuScaleSnapshotBytes,
     _reservation: TensorStorageReservation,
 }
@@ -35,9 +37,13 @@ impl fmt::Debug for ScaleSnapshot {
 impl ScaleSnapshot {
     pub(super) fn base(&self) -> Result<&PackedAdditive, BackendError> {
         match CpuTensor::checked(&*self.root)? {
-            CpuTensor::Additive(tensor) => Ok(tensor),
+            CpuTensor::Additive(tensor)
+                if std::ptr::from_ref(tensor).addr() == self.root_identity =>
+            {
+                Ok(tensor)
+            }
             _ => Err(BackendError::InvalidInput(
-                "CPU scale snapshot has no original additive root".into(),
+                "CPU scale snapshot original backend root changed".into(),
             )),
         }
     }
@@ -86,6 +92,7 @@ impl CpuTensor {
         let result: Arc<dyn DeviceBuffer> = Arc::new(Self::ScaleSnapshot(ScaleSnapshot {
             scales,
             root: Arc::clone(root),
+            root_identity: std::ptr::from_ref(base).addr(),
             bytes,
             _reservation: reserved,
         }));

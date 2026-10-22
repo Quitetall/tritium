@@ -961,3 +961,83 @@ fn common_scale_recovery_uses_actual_packed_snapshots_with_exact_restart_and_old
     assert_eq!(budget.used_bytes(), 0);
     assert_eq!(fork_budget.used_bytes(), 0);
 }
+
+#[test]
+fn staged_scale_error_rolls_back_and_success_matches_direct_step_bits() {
+    use tritium_train::pv_tuning::NativeScaleStageError;
+    let parents = vec![simple(), simple()];
+    let mut actual = Session::new(plan(2), parents.clone()).unwrap();
+    let mut direct = Session::new(plan(2), parents).unwrap();
+    let before = checkpoint(&actual);
+    let n = actual.weights().next().unwrap().scales().len();
+    let g = vec![0.25; n];
+    let expected_plan = actual.plan_id();
+    let error = actual
+        .step_staged(&[&g, &g], |candidate| {
+            assert_eq!(candidate.plan_id(), expected_plan);
+            assert_eq!(candidate.proposed_update(), 1);
+            assert_eq!(
+                candidate.owners().map(|(name, _)| name).collect::<Vec<_>>(),
+                vec!["owner-0000", "owner-0001"]
+            );
+            assert!(candidate.owners().all(|(_, scales)| {
+                scales
+                    .iter()
+                    .any(|v| v.to_bits() != f32::from_bits(0x3f00_0001).to_bits())
+            }));
+            Err::<(), _>("original staging error")
+        })
+        .unwrap_err();
+    assert_eq!(
+        error,
+        NativeScaleStageError::Stage("original staging error")
+    );
+    assert_eq!(checkpoint(&actual), before);
+    let (changed, staged) = actual
+        .step_staged(&[&g, &g], |candidate| {
+            Ok::<_, String>(
+                candidate
+                    .owners()
+                    .map(|(_, scales)| scales.to_vec())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .unwrap();
+    assert_eq!(changed, direct.step(&[&g, &g]).unwrap());
+    assert_eq!(checkpoint(&actual), checkpoint(&direct));
+    assert_eq!(
+        actual
+            .weights()
+            .map(|w| w.scales().to_vec())
+            .collect::<Vec<_>>(),
+        staged
+    );
+}
+
+#[test]
+fn stage_unwind_and_preflight_errors_preserve_the_last_good_state() {
+    let mut actual = Session::new(plan(1), vec![simple()]).unwrap();
+    let before = checkpoint(&actual);
+    let n = actual.weights().next().unwrap().scales().len();
+    let gradient = vec![0.25; n];
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        actual.step_staged(&[&gradient], |_| -> Result<(), String> {
+            panic!("injected staging unwind")
+        })
+    }));
+    assert!(result.is_err());
+    assert_eq!(checkpoint(&actual), before);
+    let called = std::cell::Cell::new(false);
+    for bad in [f32::NAN, 1e20] {
+        assert!(
+            actual
+                .step_staged(&[&vec![bad; n]], |_| {
+                    called.set(true);
+                    Ok::<_, String>(())
+                })
+                .is_err()
+        );
+        assert!(!called.get());
+        assert_eq!(checkpoint(&actual), before);
+    }
+}

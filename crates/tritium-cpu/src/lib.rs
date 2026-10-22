@@ -261,6 +261,23 @@ impl CpuBackend {
         semantic::CpuTensor::additive_scale_count(tensor)
     }
 
+    /// Compare actual immutable packed state with an exact decoded view.
+    ///
+    /// Checks layout/codec/basis/counts, stored scale bits and every coefficient
+    /// without allocating a decoded master. Linear in coefficient count; intended
+    /// for initial binding, not every optimizer step. This is numeric equality,
+    /// not package/source/model authentication or a qualification receipt.
+    /// # Errors
+    /// Invalid views/foreign/legacy/changed or misreported handles are refused;
+    /// dense handles return UnsupportedTensor.
+    pub fn additive_equals_view(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        view: tritium_core::AdditiveView<'_>,
+    ) -> Result<bool, BackendError> {
+        semantic::CpuTensor::additive_equals_view(tensor, view)
+    }
+
     /// Accumulate packed matmul cotangents into actual stored-scale gradients.
     ///
     /// Matches [`tritium_core::accumulate_ternary_matmul_scale_vjp`] through its

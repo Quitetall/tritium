@@ -11,10 +11,16 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = []
+native-cpu = ["dep:tritium-cpu", "dep:tritium-runtime"]
+
 [dependencies]
 blake3 = { workspace = true }
 half = { workspace = true }
 tritium-core = { workspace = true }
+tritium-cpu = { workspace = true, optional = true }
+tritium-runtime = { workspace = true, optional = true }
 tritium-format = { workspace = true }
 tritium-schema = { workspace = true, features = ["serde"] }
 tritium-evidence = { workspace = true }

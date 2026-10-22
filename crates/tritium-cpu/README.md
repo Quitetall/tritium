@@ -40,3 +40,10 @@ separates shared-root bytes (including original scales), newly owned scale bytes
 and reachable total. `len_bytes()` reports the reachable total; summing snapshots
 double-counts shared roots and is not unique residency or physical memory.
 These snapshots do not publish models or enable Python training by themselves.
+
+Snapshots pin the actual backend root as well as its owning handle. Wrappers that
+change the object exposed through `as_any()` are rejected before lookup/output
+mutation. The process-local address guard is not persisted or a model identity.
+`additive_equals_view` checks actual layout/counts, code values and stored scale
+bits without allocating a decoded master; use this linear-time comparison for
+binding, not each optimizer step. It is not source/model authentication.
