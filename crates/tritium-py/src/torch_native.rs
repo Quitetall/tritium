@@ -190,6 +190,20 @@ pub(crate) fn export_array(
     Ok(dlpack.into_pyobject(py)?.unbind())
 }
 
+pub(crate) fn export_array_f64(
+    py: Python<'_>,
+    shape: &[usize],
+    values: Vec<f64>,
+    label: &str,
+) -> PyResult<Py<PyAny>> {
+    let array = ArrayD::from_shape_vec(IxDyn(shape), values)
+        .map_err(|e| PyRuntimeError::new_err(format!("cannot shape {label}: {e}")))?;
+    let dlpack: Dlpack = Builder::from(Box::new(array))
+        .try_build()
+        .map_err(|e| PyRuntimeError::new_err(format!("cannot export {label}: {e}")))?;
+    Ok(dlpack.into_pyobject(py)?.unbind())
+}
+
 fn strict_ste_mask_words(master: &[f32], scales: &[f32], n: usize, k: usize) -> PyResult<Vec<u64>> {
     let elements = n
         .checked_mul(k)

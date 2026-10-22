@@ -92,6 +92,7 @@ from .ptq import (
 )
 from .native_source import convert_native_module
 from .native_load import load_native_module
+from .native_training import NativeScaleTrainer, native_scale_training
 from .native_calibration import (NativeModulePreparation, NativeModuleCalibration,
     prepare_native_module, calibrate_native_module, convert_calibrated_native_module)
 from .owner_conversion import convert_owner_native_module
@@ -140,6 +141,8 @@ from .refinement import (
 )
 
 __all__ = [
+    "NativeScaleTrainer",
+    "native_scale_training",
     "AbsMeanSTE",
     "ActivationCalibrationReceipt",
     "ActivationRecord",

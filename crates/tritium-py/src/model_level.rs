@@ -6,7 +6,10 @@ use pyo3::{
     prelude::*,
     types::{PyAny, PyBytes},
 };
-use std::{io::Cursor, sync::Mutex};
+use std::{
+    io::Cursor,
+    sync::{Arc, Mutex},
+};
 use tritium_evidence::{EvidenceRecorder, TENSOR_UPLOADED_REGISTRATION};
 use tritium_format::{TritPackageReadLimits, trit_model::TritModelReader};
 use tritium_runtime::{
@@ -35,7 +38,7 @@ fn zeros(count: usize, maximum: usize) -> PyResult<Vec<f32>> {
 /// Native-only immutable packed CPU matrix. No latent/dense master is retained.
 #[pyclass(frozen, module = "tritium._tritium", skip_from_py_object)]
 pub(crate) struct NativePackedMatrix {
-    tensor: Box<dyn DeviceBuffer>,
+    tensor: Arc<dyn DeviceBuffer>,
     #[pyo3(get)]
     rows: usize,
     #[pyo3(get)]
@@ -47,8 +50,48 @@ pub(crate) struct NativePackedMatrix {
     #[pyo3(get)]
     max_output_bytes: usize,
 }
+impl NativePackedMatrix {
+    pub(crate) fn shared_tensor(&self) -> Arc<dyn DeviceBuffer> {
+        Arc::clone(&self.tensor)
+    }
+    pub(crate) fn with_tensor(&self, tensor: Arc<dyn DeviceBuffer>) -> Self {
+        Self {
+            payload_bytes: tensor.len_bytes(),
+            tensor,
+            rows: self.rows,
+            columns: self.columns,
+            storage_json: self.storage_json.clone(),
+            max_output_bytes: self.max_output_bytes,
+        }
+    }
+    pub(crate) fn dimensions(&self) -> (usize, usize, usize) {
+        (self.rows, self.columns, self.max_output_bytes)
+    }
+}
 #[pymethods]
 impl NativePackedMatrix {
+    #[getter]
+    fn scale_count(&self) -> PyResult<usize> {
+        tritium_cpu::CpuBackend::new()
+            .additive_stored_scale_count(&*self.tensor)
+            .map_err(error)
+    }
+    fn scale_vjp(
+        &self,
+        py: Python<'_>,
+        input: &Bound<'_, PyAny>,
+        gradient: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        crate::native_scale::matmul_vjp(self, py, input, gradient)
+    }
+    fn embedding_scale_vjp(
+        &self,
+        py: Python<'_>,
+        indices: &Bound<'_, PyAny>,
+        gradient: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        crate::native_scale::embed_vjp(self, py, indices, gradient)
+    }
     /// Float32 CPU DLPack input/output; basis and scale law stay in the backend.
     fn matmul(&self, py: Python<'_>, input: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let input: Dlpack = input.extract()?;
@@ -357,7 +400,7 @@ impl NativeModelLevel {
                 .checked_add(1)
                 .ok_or_else(|| error("upload ordinal overflow"))?;
             Ok(NativePackedMatrix {
-                tensor,
+                tensor: Arc::from(tensor),
                 rows,
                 columns,
                 payload_bytes,

@@ -41,7 +41,7 @@ tritium-format = { workspace = true }
 tritium-evidence = { workspace = true }
 tritium-onnx = { workspace = true, optional = true, features = ["qwen-package", "onnx"] }
 # The autograd tape ops (ternary Conv1d, FSQ, STE) exposed to PyTorch via `src/ops.rs` (ADR 0030).
-tritium-train = { workspace = true }
+tritium-train = { workspace = true, features = ["native-cpu"] }
 # Production SALT V2 evidence and resumable Qwen master-campaign orchestration.
 tritium-quantize = { workspace = true }
 tritium-salt = { workspace = true }

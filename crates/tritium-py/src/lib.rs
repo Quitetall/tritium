@@ -40,6 +40,7 @@ mod model_calibration;
 mod model_conversion;
 mod model_level;
 mod module_package;
+mod native_scale;
 #[cfg(feature = "onnx")]
 mod onnx;
 mod ops;
@@ -403,6 +404,11 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<model_conversion::NativeModelConversion>()?;
     m.add_class::<model_level::NativeModelLevel>()?;
     m.add_class::<model_level::NativePackedMatrix>()?;
+    m.add_class::<native_scale::NativeScaleTraining>()?;
+    m.add_function(wrap_pyfunction!(
+        native_scale::_validate_native_scale_plan,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(model_conversion::convert_model_plan, m)?)?;
     m.add_function(wrap_pyfunction!(
         model_conversion::convert_owner_model_plan,

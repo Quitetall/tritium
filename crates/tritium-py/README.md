@@ -56,7 +56,9 @@ The loader checks state topology, selected consumer options and normalized HF
 configuration before privately staging any changes. The version-1 preservation
 catalog is not executable and is never silently upgraded.
 
-This initial adapter is eager CPU inference only. Autograd, accelerator placement,
+The default adapter is eager CPU inference only. Explicit `input_gradients=True`
+admits input-only eager autograd without training packed weights. The separate
+scale-training path below does not change that default. Accelerator placement,
 `torch.compile`, ordinary `state_dict`/`save_pretrained` export and arbitrary model
 architectures are not supported or inferred. Save/reopen the native package, not
 an incomplete framework checkpoint. Root dtype moves keep packed scale precision
@@ -65,6 +67,56 @@ whole-model topology guarantee. Payload/workspace/output limits bound declared
 native allocations, not aggregate RSS: the initial receiver retains one admitted
 whole package byte image. Its sealed upload observations are not a model-quality,
 physical-memory, performance or full-release qualification receipt.
+
+### Explicit native scale training
+
+`tritium.torch.native_scale_training` admits first-order CPU eager scale updates
+through actual packed Linear/Embedding backward kernels and the common Rust
+atomic optimizer. Each run selects **one explicit parent quality level**. Obtain
+its exact parent tuple with `artifact.native_refinement_parent(level)` and supply
+a complete Rust `NativeRefinementPlan` mapping or JSON: selected canonical owners,
+`ScaleOnly` recipe, declared objective/teacher identities, ordered training and
+validation windows, child level, and resource limits. The artifact must be an
+actual `NativeModelConversion`; the factory revalidates its package/evidence.
+
+```python
+from tritium.torch import native_scale_training
+
+trainer = native_scale_training(
+    fresh_shell, artifact, level="full", plan=refinement_plan,
+    load_run_id="scale-load-1", max_snapshot_bytes=snapshot_limit,
+    max_parent_bytes=parent_limit, max_saved_input_bytes=saved_input_limit,
+)
+trainer.zero_grad()
+loss = objective(trainer.model, training_window)
+loss.backward()
+trainer.step(refinement_plan["training"][0]["content"])
+checkpoint = trainer.checkpoint()
+unpublished_model = trainer.close()
+```
+
+The private shell leaves caller state untouched. Tied consumers share one f64
+gradient-transport leaf; Rust owns deployed scales, moments and atomic updates.
+Do not use `torch.optim` on these leaves. Pass `checkpoint=...` to resume the exact
+same plan; changing parent level or plan rejects. `trainer.plan` is detached
+metadata, not a way to change the frozen update schedule or owner order.
+
+F16/BF16/F32 activations are supported; higher-order scale gradients, autocast,
+concurrent backward/step, compile/vmap and accelerator/distributed training are
+not admitted. Stale graphs and externally modified preserved state/owner leaves
+reject. A failed backward requires `zero_grad()` before reuse. Each update needs
+the next declared window identity and at least one owner gradient; unused owners
+receive zero gradients. A rejected update retains Rust state and gradients.
+
+Limits cover declared native state, transfer/workspace, snapshots and conservative
+graph-lifetime saved inputs, not allocator capacity or total Torch/process RSS.
+The common optimizer still retains decoded ternary reference parents; this is not
+production packed/out-of-core training memory. Callback/data identities are
+declarations, not authenticated replay or quality evidence. Closing exposes the
+current private inference shell marked unpublished. It does **not** publish a
+complete immutable child package, modify the parent, refine every quality level,
+or make native `refine`/artifact export available. Code/PV updates and independent
+quality/performance/release gates remain separate work.
 
 The opt-in calibrated lifecycle is separate from the legacy diagonal `calibrate`:
 `prepare_native_module(prepared, actions=..., levels=..., limits=..., work_dir=...,

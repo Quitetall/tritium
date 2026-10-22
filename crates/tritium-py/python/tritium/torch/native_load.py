@@ -106,6 +106,12 @@ class NativeTernaryWeight(nn.Module):
         return self
 
     def matmul(self, value):
+        training = getattr(self, "_native_training", None)
+        if training is not None:
+            trainer = training[0]()
+            if trainer is None:
+                raise RuntimeError("native training context is closed")
+            return trainer.matmul(training[1], value)
         if value.device.type != "cpu" or not value.dtype.is_floating_point:
             raise ValueError("native packed matmul requires CPU floating activations")
         if torch.is_grad_enabled() and value.requires_grad:
@@ -114,7 +120,13 @@ class NativeTernaryWeight(nn.Module):
             return _NativeMatmul.apply(value, self.handle)
         return _matmul_output(value, self.handle)
 
-    def gather(self, indices, dtype):
+    def gather(self, indices, dtype, padding=None):
+        training = getattr(self, "_native_training", None)
+        if training is not None:
+            trainer = training[0]()
+            if trainer is None:
+                raise RuntimeError("native training context is closed")
+            return trainer.gather(training[1], indices, dtype, padding)
         if indices.device.type != "cpu" or indices.dtype not in {torch.int32, torch.int64}:
             raise ValueError("native packed gather requires CPU integer indices")
         if indices.numel() * (self.in_features * 4 + 8) > self.handle.max_output_bytes:
@@ -154,7 +166,7 @@ class NativeTernaryEmbedding(nn.Module):
         return super()._apply(fn, recurse)
 
     def forward(self, indices):
-        return self.packed_weight.gather(indices, self.output_dtype)
+        return self.packed_weight.gather(indices, self.output_dtype, self.padding_idx)
 
 
 def _catalog(snapshot):
@@ -293,6 +305,7 @@ def load_native_module(model, artifact, *, level, load_run_id, inplace,
     for entry in expected:
         if entry["disposition"] != "fitted": continue
         weight = NativeTernaryWeight(snapshot.packed_tensor(entry["owner"]), input_gradients=input_gradients)
+        weight._native_owner = entry["owner"]
         by_module = {}
         owner = True
         for alias in entry["aliases"]:

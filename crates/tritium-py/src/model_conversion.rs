@@ -130,6 +130,49 @@ pub(crate) struct NativeModelConversion {
     evidence_bytes: u64,
 }
 impl NativeModelConversion {
+    pub(crate) fn refinement_parent(
+        &self,
+        level: &str,
+    ) -> PyResult<(
+        TritModelReader<File>,
+        tritium_schema::NativeRefinementParent,
+    )> {
+        use tritium_evidence::NativeRefinementParentView;
+        let (mut model, log, _) = open_bound_model(
+            Path::new(&self.output_dir),
+            self.max_package_bytes,
+            self.evidence_bytes,
+        )?;
+        if hex(model.package_id().as_bytes()) != self.package_id
+            || log.root_digest != self.evidence_root
+        {
+            return Err(error("conversion package or evidence identity changed"));
+        }
+        let mut parents = Vec::new();
+        for view in tritium_evidence::QuantizationReceiptView::fold(&log).map_err(error)? {
+            parents.push(
+                NativeRefinementParentView::from_quantization(&mut model, level, &view)
+                    .map_err(error)?,
+            );
+        }
+        for view in
+            tritium_evidence::CalibratedQuantizationReceiptView::fold(&log).map_err(error)?
+        {
+            parents.push(
+                NativeRefinementParentView::from_calibrated(&mut model, level, &view)
+                    .map_err(error)?,
+            );
+        }
+        for view in tritium_evidence::OwnerQuantizationReceiptView::fold(&log).map_err(error)? {
+            parents.push(
+                NativeRefinementParentView::from_owner(&mut model, level, &view).map_err(error)?,
+            );
+        }
+        if parents.len() != 1 {
+            return Err(error("exactly one native refinement parent required"));
+        }
+        Ok((model, parents.remove(0).binding().clone()))
+    }
     /// Reopen an engine package/log without trusting caller identity fields.
     fn open_inner(
         py: Python<'_>,
@@ -248,6 +291,31 @@ impl NativeModelConversion {
 }
 #[pymethods]
 impl NativeModelConversion {
+    /// Actual original parent tuple for an explicit native scale request.
+    fn native_refinement_parent(&self, py: Python<'_>, level: &str) -> PyResult<String> {
+        py.detach(|| serde_json::to_string(&self.refinement_parent(level)?.1).map_err(error))
+    }
+
+    #[pyo3(signature=(plan_json, matrices, *, max_snapshot_bytes, max_parent_bytes, checkpoint=None))]
+    fn begin_scale_training(
+        &self,
+        py: Python<'_>,
+        plan_json: &str,
+        matrices: Vec<(String, Py<crate::model_level::NativePackedMatrix>)>,
+        max_snapshot_bytes: u64,
+        max_parent_bytes: u64,
+        checkpoint: Option<&Bound<'_, PyBytes>>,
+    ) -> PyResult<crate::native_scale::NativeScaleTraining> {
+        crate::native_scale::begin(
+            py,
+            self,
+            plan_json,
+            matrices,
+            max_snapshot_bytes,
+            max_parent_bytes,
+            checkpoint.map(|b| b.as_bytes()),
+        )
+    }
     #[staticmethod]
     #[pyo3(signature=(output_dir, *, max_package_bytes=8_589_934_592, max_evidence_bytes=16_777_216))]
     fn open(
