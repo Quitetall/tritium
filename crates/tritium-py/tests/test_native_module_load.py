@@ -251,6 +251,161 @@ def test_logical_output_bounds_precede_activation_normalization(tmp_path, monkey
         weight.matmul(torch.ones(1, 32, requires_grad=True))
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("basis", ["Identity", {"Hadamard": {"block": 32}},
+                                  {"SignedRht": {"block": 32, "seed": 13, "domain": 29}}])
+@pytest.mark.parametrize("codec", ["D2", "B3"])
+@pytest.mark.parametrize("precision", ["F16", "F32"])
+def test_native_input_autograd_matches_first_and_second_derivatives(tmp_path, dtype, basis, codec, precision):
+    torch.manual_seed(1712)
+    action = _fit()
+    action["Fit"]["plan"]["layout"].update(basis=basis, codec=codec)
+    action["Fit"]["plan"]["layout"]["law"]["precision"] = precision
+    result = _convert(tmp_path, _prepared(), actions={"a.weight": action})
+    loaded = load_native_module(StateModel(), result, level="full", load_run_id="input-grad", inplace=False,
+                                input_gradients=True)
+    weight = loaded.a.packed_weight
+    assert weight is loaded.b.packed_weight
+    dense = torch.utils.dlpack.from_dlpack(weight.handle.gather(torch.arange(weight.out_features)))
+    value = torch.linspace(-0.5, 0.5, 64, dtype=dtype).reshape(2, 32).requires_grad_().unsqueeze(0).transpose(0, 1)
+    reference = value.detach().clone().requires_grad_()
+    actual = weight.matmul(value)
+    expected = torch.nn.functional.linear(reference.float(), dense).to(dtype=dtype)
+    tolerance = 3e-5 if dtype == torch.float32 else 4 * torch.finfo(dtype).eps
+    torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
+    first = torch.autograd.grad(actual.square().sum(), value, create_graph=True)[0]
+    first_reference = torch.autograd.grad(expected.square().sum(), reference, create_graph=True)[0]
+    torch.testing.assert_close(first, first_reference, atol=tolerance, rtol=tolerance)
+    second = torch.autograd.grad(first.sum(), value)[0]
+    second_reference = torch.autograd.grad(first_reference.sum(), reference)[0]
+    torch.testing.assert_close(second, second_reference, atol=tolerance, rtol=tolerance)
+    assert first.dtype == second.dtype == dtype
+    assert all(not parameter.requires_grad and parameter.grad is None for parameter in loaded.parameters())
+    result.verify()
+
+
+def test_native_input_autograd_public_load_and_repeated_owner_model(tmp_path):
+    from tritium.torch import load
+    result = _convert(tmp_path, _prepared())
+    loaded = load(result, model=StateModel(), level="full", load_run_id="public-input-grad", inplace=False,
+                  input_gradients=True)
+    dense = torch.utils.dlpack.from_dlpack(loaded.a.packed_weight.handle.gather(torch.arange(1)))
+    value = torch.randn(2, 32, requires_grad=True)
+    reference = value.detach().clone().requires_grad_()
+    normalized = torch.nn.functional.layer_norm(reference, (32,), loaded.norm.weight, loaded.norm.bias, loaded.norm.eps)
+    expected = 2 * torch.nn.functional.linear(normalized, dense, loaded.a.bias)
+    actual = loaded(value)
+    actual_gradient = torch.autograd.grad(actual.square().sum(), value)[0]
+    expected_gradient = torch.autograd.grad(expected.square().sum(), reference)[0]
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(actual_gradient, expected_gradient, atol=2e-5, rtol=2e-5)
+    default = load_native_module(StateModel(), result, level="full", load_run_id="default-input-grad", inplace=False)
+    with pytest.raises(RuntimeError, match="inference-only"):
+        default(value)
+    with torch.no_grad():
+        assert torch.equal(default(value), loaded(value))
+
+
+def test_native_input_autograd_retains_forward_handle_without_saved_tensors(tmp_path):
+    result = _convert(tmp_path, _prepared())
+    loaded = load_native_module(StateModel(), result, level="full", load_run_id="lifetime-input-grad", inplace=False,
+                                input_gradients=True)
+    weight = loaded.a.packed_weight
+    dense = torch.utils.dlpack.from_dlpack(weight.handle.gather(torch.arange(1)))
+    value = torch.randn(2, 32, requires_grad=True)
+    saved = []
+    with torch.autograd.graph.saved_tensors_hooks(lambda tensor: saved.append(tensor) or tensor, lambda tensor: tensor):
+        output = weight.matmul(value)
+    assert saved == []
+    # A mutable module lookup during backward would now fail. The graph must
+    # retain its actual immutable forward handle, not its model/source package.
+    weight.handle = None
+    del weight, loaded, result
+    gc.collect()
+    output.sum().backward()
+    torch.testing.assert_close(value.grad, dense.expand(2, 32), atol=2e-6, rtol=2e-6)
+
+
+def test_native_input_autograd_bounds_precede_copy_and_low_level_validation(tmp_path, monkeypatch):
+    from tritium.torch import native_load
+    result = _convert(tmp_path, _prepared())
+    session = result.open_level("full", "small-input-grad", max_output_bytes=200)
+    handle = session.packed_tensor("a.weight")
+    weight = native_load.NativeTernaryWeight(handle, input_gradients=True)
+    def no_copy(value): raise AssertionError("known backward bound must reject before copying")
+    monkeypatch.setattr(native_load, "_compact", no_copy)
+    with pytest.raises(ValueError, match="byte limit"):
+        weight.matmul(torch.ones(1, 32, requires_grad=True))
+    with pytest.raises(ValueError, match="byte limit"):
+        handle.input_vjp(torch.ones(1, 1))
+    with pytest.raises(ValueError): handle.input_vjp(torch.ones(1, 2))
+    with pytest.raises(ValueError): handle.input_vjp(torch.ones(1, 1, dtype=torch.float16))
+    with pytest.raises(ValueError): handle.input_vjp(torch.ones(()))
+
+
+def test_native_input_autograd_empty_dtype_and_option_admission(tmp_path):
+    from tritium.torch import load
+    result = _convert(tmp_path, _prepared())
+    loaded = load_native_module(StateModel(), result, level="full", load_run_id="empty-input-grad", inplace=False,
+                                input_gradients=True)
+    empty = torch.empty(0, 32, requires_grad=True)
+    loaded.a.packed_weight.matmul(empty).sum().backward()
+    assert empty.grad.shape == empty.shape
+    with pytest.raises(ValueError, match="float32"):
+        loaded.a.packed_weight.matmul(torch.ones(1, 32, dtype=torch.float64, requires_grad=True))
+    for invalid in (None, 0, 1, "true"):
+        with pytest.raises(TypeError, match="bool"):
+            load_native_module(StateModel(), "missing", level="full", load_run_id="bad-input-grad", inplace=False,
+                               input_gradients=invalid)
+    with pytest.raises(TypeError, match="model shell"):
+        load(result, input_gradients=True)
+    with pytest.raises(TypeError, match="model shell"):
+        load("missing", input_gradients=False)
+
+
+def test_native_input_autograd_rejects_unqualified_autocast(tmp_path):
+    result = _convert(tmp_path, _prepared())
+    loaded = load_native_module(StateModel(), result, level="full", load_run_id="amp-input-grad", inplace=False,
+                                input_gradients=True)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        with pytest.raises(RuntimeError, match="autocast"):
+            loaded.a.packed_weight.matmul(torch.ones(1, 32, requires_grad=True))
+
+
+def test_native_input_autograd_tiny_hf_loss_matches_logical_dense_oracle(tmp_path):
+    from transformers import LlamaForCausalLM
+    from tritium.torch import convert_native_module
+    from test_owner_capture import _hf_source
+
+    torch.manual_seed(1713)
+    source = _hf_source(tmp_path)
+    result = convert_native_module(source.prepared, tmp_path / "hf-input-grad", "hf-input-grad-fit",
+                                   **json.loads(source.options_json))
+    config = copy.deepcopy(source.prepared.model.config)
+    loaded = load_native_module(LlamaForCausalLM(config), result, level="full", load_run_id="hf-input-grad-load",
+                                inplace=False, input_gradients=True)
+    # Dense reconstruction is only this tiny test's oracle, never the adapter.
+    reference = copy.deepcopy(source.prepared.model).eval().requires_grad_(False)
+    reference_modules = dict(reference.named_modules(remove_duplicate=False))
+    for path, module in loaded.named_modules(remove_duplicate=False):
+        if not hasattr(module, "packed_weight"): continue
+        handle = module.packed_weight.handle
+        dense = torch.utils.dlpack.from_dlpack(handle.gather(torch.arange(handle.rows)))
+        with torch.no_grad(): reference_modules[path].weight.copy_(dense)
+    value = torch.randn(1, 3, 32, requires_grad=True)
+    value_reference = value.detach().clone().requires_grad_()
+    labels = torch.tensor([[1, 2, 3]])
+    actual = loaded(inputs_embeds=value, labels=labels, use_cache=False).loss
+    expected = reference(inputs_embeds=value_reference, labels=labels, use_cache=False).loss
+    gradient = torch.autograd.grad(actual, value)[0]
+    expected_gradient = torch.autograd.grad(expected, value_reference)[0]
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(gradient, expected_gradient, atol=2e-5, rtol=2e-5)
+    assert loaded.model.embed_tokens.packed_weight is loaded.lm_head.packed_weight
+    assert all(parameter.grad is None for parameter in loaded.parameters())
+    result.verify()
+
+
 @pytest.mark.parametrize("file", ["model.trit", "evidence.jsonl"])
 def test_corrupt_package_reopen_fails_without_mutating_shell(tmp_path, file):
     result = _convert(tmp_path, _prepared())

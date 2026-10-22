@@ -91,6 +91,40 @@ impl NativePackedMatrix {
             .ok_or_else(|| error("input rank is zero"))? = self.rows;
         export_array(py, &shape, output, "native matrix output")
     }
+    /// Float32 CPU input adjoint; no dense or decoded-trit master is created.
+    fn input_vjp(&self, py: Python<'_>, gradient: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let input: Dlpack = gradient.extract()?;
+        let mut shape = tensor_shape(&input, "output gradient")?;
+        if shape.last() != Some(&self.rows) {
+            return Err(error("native output gradient width differs"));
+        }
+        let batch = checked_product(&shape[..shape.len() - 1], "batch")?;
+        let values = cpu_f32(&input, "output gradient")?;
+        let count = batch
+            .checked_mul(self.columns)
+            .ok_or_else(|| error("input adjoint shape overflow"))?;
+        if count
+            .checked_add(self.columns)
+            .and_then(|n| n.checked_mul(4))
+            .is_none_or(|n| n > self.max_output_bytes)
+        {
+            return Err(error(
+                "native input adjoint output/scratch exceeds byte limit",
+            ));
+        }
+        let output = py.detach(|| {
+            let mut output = zeros(count, self.max_output_bytes)?;
+            let mut row = zeros(self.columns, self.max_output_bytes)?;
+            tritium_cpu::CpuBackend::new()
+                .additive_matmul_input_vjp(&*self.tensor, values, batch, &mut row, &mut output)
+                .map_err(error)?;
+            Ok::<_, PyErr>(output)
+        })?;
+        *shape
+            .last_mut()
+            .ok_or_else(|| error("output gradient rank is zero"))? = self.columns;
+        export_array(py, &shape, output, "native input adjoint")
+    }
     /// Int64 CPU DLPack indices; only requested embedding rows are materialized.
     fn gather(&self, py: Python<'_>, indices: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let input: Dlpack = indices.extract()?;

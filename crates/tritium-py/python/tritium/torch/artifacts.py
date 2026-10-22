@@ -389,6 +389,7 @@ def load(
     format: Optional[str] = None,
     max_package_bytes: Optional[int] = None,
     max_evidence_bytes: Optional[int] = None,
+    input_gradients: Optional[bool] = None,
 ) -> Union[QuantizationResult, "RefinementResult", Any]:
     """Strictly reopen a two-profile Tritium PTQ bundle.
 
@@ -397,7 +398,13 @@ def load(
     additionally materializes the selected packed Qwen language runtime.
     A typed NativeModelConversion is verified directly. Explicit model, level,
     load_run_id and inplace select the native packed CPU shell loader instead.
+    Explicit input_gradients=True enables input-only native CPU autograd with
+    immutable weights; it is not native refinement or parameter training.
     """
+    if input_gradients is not None and type(input_gradients) is not bool:
+        raise TypeError("input_gradients must be bool")
+    if input_gradients is not None and model is None:
+        raise TypeError("native input gradients require a model shell")
     if format not in {None, "trit"}:
         raise ValueError("explicit native format must be 'trit'")
     native = isinstance(artifact, _tritium.NativeModelConversion)
@@ -424,7 +431,8 @@ def load(
             raise TypeError("native execution requires level and load_run_id")
         from .native_load import load_native_module
 
-        return load_native_module(model, result, level=level, load_run_id=load_run_id, inplace=inplace, **limits)
+        return load_native_module(model, result, level=level, load_run_id=load_run_id, inplace=inplace,
+                                  input_gradients=False if input_gradients is None else input_gradients, **limits)
     if max_package_bytes is not None or max_evidence_bytes is not None:
         raise TypeError("native byte limits require explicit native load selection")
     requested = Path(artifact)
