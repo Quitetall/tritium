@@ -24,6 +24,8 @@ use tritium_train::pv_tuning::{
     NativeScaleParentReadLimits, NativeScaleRefinementSession, decode_native_scale_parents,
     publish_native_scale_child, replay_native_scale_journal,
 };
+mod recovery;
+pub(crate) use recovery::NativeScaleResumeBundle;
 
 enum Recording {
     Off,
@@ -227,15 +229,32 @@ impl NativeScaleTraining {
     }
 }
 
+pub(crate) struct BeginOptions<'a> {
+    pub plan_json: &'a str,
+    pub max_snapshot_bytes: u64,
+    pub max_parent_bytes: u64,
+    pub checkpoint: Option<&'a [u8]>,
+    pub recorded_resume: Option<(&'a NativeScaleResumeBundle, &'a str)>,
+}
+
 pub(crate) fn begin(
     py: Python<'_>,
     result: &NativeModelConversion,
-    plan_json: &str,
     matrices: Vec<(String, Py<NativePackedMatrix>)>,
-    max_snapshot_bytes: u64,
-    max_parent_bytes: u64,
-    checkpoint: Option<&[u8]>,
+    options: BeginOptions<'_>,
 ) -> PyResult<NativeScaleTraining> {
+    let BeginOptions {
+        plan_json,
+        max_snapshot_bytes,
+        max_parent_bytes,
+        checkpoint,
+        recorded_resume,
+    } = options;
+    if checkpoint.is_some() && recorded_resume.is_some() {
+        return Err(error(
+            "checkpoint and recorded resume are mutually exclusive",
+        ));
+    }
     if plan_json.len() > 16 * 1024 * 1024 || max_parent_bytes == 0 || max_snapshot_bytes == 0 {
         return Err(error("native training plan/byte limits invalid"));
     }
@@ -258,7 +277,10 @@ pub(crate) fn begin(
         .cloned()
         .zip(specs.iter().map(NativePackedMatrix::shared_tensor))
         .collect();
-    let driver = py.detach(|| {
+    let (driver, recording) = py.detach(|| {
+        let resumed = recorded_resume
+            .map(|(bundle, text)| recovery::ResumeRecording::new(bundle, text, &plan, result))
+            .transpose()?;
         let (mut reader, parent) = result.refinement_parent_view(&plan.parent.level)?;
         if parent.binding() != &plan.parent {
             return Err(error("native training parent tuple differs"));
@@ -269,23 +291,30 @@ pub(crate) fn begin(
             &plan,
             NativeScaleParentReadLimits {
                 max_working_bytes: max_parent_bytes,
-                extra_payload_bytes: 0,
+                extra_payload_bytes: resumed
+                    .as_ref()
+                    .map_or(0, recovery::ResumeRecording::checkpoint_bytes),
             },
         )
         .map_err(error)?;
+        if let Some(resumed) = resumed {
+            return resumed.bind(parents, roots, TensorPayloadBudget::new(max_snapshot_bytes));
+        }
         let state = if let Some(bytes) = checkpoint {
             NativeScaleRefinementSession::resume(plan, parents, bytes)
         } else {
             NativeScaleRefinementSession::new(plan, parents)
         }
         .map_err(error)?;
-        NativeCpuScaleSession::bind(state, roots, TensorPayloadBudget::new(max_snapshot_bytes))
-            .map_err(error)
+        let driver =
+            NativeCpuScaleSession::bind(state, roots, TensorPayloadBudget::new(max_snapshot_bytes))
+                .map_err(error)?;
+        Ok((driver, Recording::Off))
     })?;
     Ok(NativeScaleTraining {
         state: Mutex::new(TrainingState {
             driver,
-            recording: Recording::Off,
+            recording,
             publication_ordinal: 0,
         }),
         specs,
@@ -295,6 +324,14 @@ pub(crate) fn begin(
 
 #[pymethods]
 impl NativeScaleTraining {
+    fn save_resume(
+        &self,
+        py: Python<'_>,
+        output_dir: &str,
+        limits_json: &str,
+    ) -> PyResult<NativeScaleResumeBundle> {
+        recovery::save(self, py, output_dir, limits_json)
+    }
     fn start_recording(
         &self,
         py: Python<'_>,

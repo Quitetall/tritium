@@ -309,7 +309,8 @@ impl NativeModelConversion {
         py.detach(|| serde_json::to_string(&self.refinement_parent(level)?.1).map_err(error))
     }
 
-    #[pyo3(signature=(plan_json, matrices, *, max_snapshot_bytes, max_parent_bytes, checkpoint=None))]
+    #[pyo3(signature=(plan_json, matrices, *, max_snapshot_bytes, max_parent_bytes, checkpoint=None, recorded_resume=None))]
+    #[allow(clippy::too_many_arguments)]
     fn begin_scale_training(
         &self,
         py: Python<'_>,
@@ -318,15 +319,24 @@ impl NativeModelConversion {
         max_snapshot_bytes: u64,
         max_parent_bytes: u64,
         checkpoint: Option<&Bound<'_, PyBytes>>,
+        recorded_resume: Option<(
+            PyRef<'_, crate::native_scale::NativeScaleResumeBundle>,
+            String,
+        )>,
     ) -> PyResult<crate::native_scale::NativeScaleTraining> {
         crate::native_scale::begin(
             py,
             self,
-            plan_json,
             matrices,
-            max_snapshot_bytes,
-            max_parent_bytes,
-            checkpoint.map(|b| b.as_bytes()),
+            crate::native_scale::BeginOptions {
+                plan_json,
+                max_snapshot_bytes,
+                max_parent_bytes,
+                checkpoint: checkpoint.map(|b| b.as_bytes()),
+                recorded_resume: recorded_resume
+                    .as_ref()
+                    .map(|(bundle, text)| (&**bundle, text.as_str())),
+            },
         )
     }
     #[staticmethod]

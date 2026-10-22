@@ -33,7 +33,7 @@ pub(crate) fn path(value: &str) -> PyResult<PathBuf> {
     }
     Ok(std::env::current_dir().map_err(error)?.join(value))
 }
-fn new_output(value: &str) -> PyResult<PathBuf> {
+pub(crate) fn new_output(value: &str) -> PyResult<PathBuf> {
     let output = path(value)?;
     let leaf = output
         .file_name()

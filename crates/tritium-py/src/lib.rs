@@ -406,6 +406,7 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<model_level::NativeModelLevel>()?;
     m.add_class::<model_level::NativePackedMatrix>()?;
     m.add_class::<native_scale::NativeScaleTraining>()?;
+    m.add_class::<native_scale::NativeScaleResumeBundle>()?;
     m.add_class::<model_refinement::NativeModelRefinement>()?;
     m.add_function(wrap_pyfunction!(model_refinement::_open_native_model, m)?)?;
     m.add_function(wrap_pyfunction!(

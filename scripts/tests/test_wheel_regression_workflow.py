@@ -11,6 +11,7 @@ TESTS = (
     "test_native_module_load.py",
     "test_native_scale_training.py",
     "test_native_refinement.py",
+    "test_native_resume.py",
     "test_native_module_calibration.py",
     "test_native_calibration_selection.py",
     "test_owner_row_score.py",

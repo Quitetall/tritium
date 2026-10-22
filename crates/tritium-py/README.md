@@ -121,8 +121,9 @@ gates remain separate work.
 
 To publish a child, configure `recording={"work_dir": existing_work_dir,
 "max_journal_bytes": journal_cap, "max_working_bytes": recording_cap}` when
-creating the trainer. This requires a zero-origin run: appending partial journals
-is not admitted; unrecorded TNSR checkpoint/resume stays unchanged. Rust admits
+creating the trainer. A fresh run requires zero origin; recorded recovery uses
+the explicit bundle path below, never in-place journal appending. Unrecorded
+TNSR checkpoint/resume stays unchanged. Rust admits
 exact stream/work bytes and writes the actual f32 gradients before atomic state
 commit. Journal I/O failure never silently becomes an unrecorded update.
 
@@ -144,6 +145,50 @@ level=child_level, load_run_id=..., inplace=False)`; exact native directory load
 and `export(result, new_directory)` also preserve this distinct result type.
 `trainer.close()` closes/removes only its owned temporary recording work; the
 published checkpoint/journal remain in the child directory.
+
+### Recorded save and restart
+
+```python
+from tritium import NativeScaleResumeBundle
+
+bundle_limits = dict(max_bundle_bytes=bundle_cap, max_manifest_bytes=metadata_cap,
+                     max_checkpoint_bytes=checkpoint_cap, max_working_bytes=working_cap)
+saved = trainer.save_resume(new_saved_directory, limits=bundle_limits)
+saved_id = saved.bundle_id  # Retain this independently of the mutable file.
+trainer.close()  # Its unique temporary journal work can now disappear.
+
+saved = NativeScaleResumeBundle.open(new_saved_directory, bundle_id=saved_id, **bundle_limits)
+trainer = native_scale_training(
+    fresh_shell, original_parent, level="full", resume=saved,  # Plan is derived from the bundle.
+    load_run_id="recovered-load", max_snapshot_bytes=snapshot_limit,
+    max_parent_bytes=parent_limit, max_saved_input_bytes=saved_input_limit,
+    recording=dict(work_dir=existing_work_dir, max_journal_bytes=journal_cap,
+                   max_working_bytes=replay_cap),
+)
+```
+
+The frozen descriptor exposes `completed_updates`, `plan_json`, `bundle_bytes`,
+`warnings`, `verify()` and `admission="byte-consistent-unqualified"`. It is not an
+inference artifact or numerical/quality approval. Rust reopens actual saved bytes,
+checks the exact parent/request, decodes parents once, replays the saved history
+and requires a byte-identical checkpoint before continuing in a new owned journal.
+An explicit plan must match; checkpoint and bundle resume are mutually exclusive.
+Only completed Rust scale/moment/cursor/history state is saved. Pending gradients,
+autograd graphs, RNG, data-loader state and arbitrary nonpersistent Python buffers
+are not saved; recompute pending windows and supply identical remaining inputs
+for exact continuation. Objective/data/teacher authentication remains separate.
+
+Save outside both the original parent and the trainer's owned temporary work.
+New resume work cannot be under the parent or saved bundle. Bundle close/destruction
+does not delete its durable directory; trainer close deletes only its own journal
+work. Failed restoration never silently downgrades to unrecorded training. After
+completion, the unchanged `publish` path replays the whole actual journal and
+publishes an unqualified immutable child. Sealed/closed/failed writers cannot save.
+Every explicit save copies the whole prefix under the supplied disk/working byte
+ceilings. No automatic cadence, pruning, compressed storage, total RSS guarantee,
+crash/security qualification or arbitrary-PyTorch checkpoint support is inferred.
+The bundle checkpoint is included in decoded-parent working admission on resume;
+Torch/packed handles, replay state and caller-owned buffers retain separate scopes.
 
 `NativeModelRefinement.open(directory)` independently checks actual typed child,
 original log and exact checkpoint/journal identities without requiring the parent

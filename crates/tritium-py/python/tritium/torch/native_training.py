@@ -1,4 +1,4 @@
-"""Explicit first-order eager CPU scale training; no refined artifact publication."""
+"""Explicit eager CPU scale training, recorded recovery and unqualified publication."""
 from __future__ import annotations
 import json
 from types import MethodType
@@ -118,7 +118,8 @@ class NativeScaleTrainer:
     Use model/loss.backward(), zero_grad(), then step(window_identity). Gradient
     leaves are private f64 transport buffers, not torch.optim Parameters. Rust
     owns deployed scale values and updates. No concurrent backward/step, autocast,
-    higher-order/compile/vmap, code training or refined artifact export is admitted.
+    higher-order/compile/vmap or code training is admitted. Recorded publication
+    and recovery use the common Rust writers/readers with explicit admission.
     """
     def __init__(self, model, backend, plan, weights, max_saved_input_bytes):
         self.model, self._backend = model, backend
@@ -274,6 +275,23 @@ class NativeScaleTrainer:
     def checkpoint(self):
         return bytes(self._backend.checkpoint())
 
+    def save_resume(self, output_dir, *, limits):
+        """Save committed state/history outside owned work; pending gradients/RNG are not saved.
+
+        Each explicit save copies the whole prefix. Retain the returned bundle_id
+        separately. This is unqualified recovery input, not a deployable child.
+        """
+        self._validate()
+        if self._failed:
+            raise RuntimeError("native backward failed; call zero_grad before reuse")
+        if self._recording_work is None:
+            raise RuntimeError("native resume save requires recorded training")
+        fields = {"max_bundle_bytes", "max_manifest_bytes", "max_checkpoint_bytes", "max_working_bytes"}
+        if (not isinstance(limits, dict) or set(limits) != fields
+                or any(type(n) is not int or n <= 0 for n in limits.values())):
+            raise ValueError("native resume requires exact positive bundle limit fields")
+        return self._backend.save_resume(str(Path(output_dir).resolve()), json.dumps(limits, allow_nan=False))
+
     def publish(self, output_dir, run_id, *, machine, validation, limits):
         """Publish an unqualified child through Rust replay and common no-clobber commit.
 
@@ -330,9 +348,9 @@ class NativeScaleTrainer:
             pass
 
 
-def native_scale_training(model, artifact, *, level, plan, load_run_id,
+def native_scale_training(model, artifact, *, level, plan=None, load_run_id,
                           max_snapshot_bytes, max_parent_bytes, max_saved_input_bytes,
-                          checkpoint=None, recording=None, **load_limits):
+                          checkpoint=None, recording=None, resume=None, **load_limits):
     """Create a private native eager CPU scale trainer, never a refined artifact.
 
     plan is the complete Rust NativeRefinementPlan mapping/JSON; obtain its exact
@@ -347,6 +365,17 @@ def native_scale_training(model, artifact, *, level, plan, load_run_id,
     for limit in (max_snapshot_bytes, max_parent_bytes, max_saved_input_bytes):
         if type(limit) is not int or limit <= 0:
             raise ValueError("native training byte limits must be positive integers")
+    if resume is not None:
+        if not isinstance(resume, _tritium.NativeScaleResumeBundle):
+            raise TypeError("recorded resume requires NativeScaleResumeBundle")
+        if checkpoint is not None:
+            raise ValueError("checkpoint and recorded resume are mutually exclusive")
+        if recording is None:
+            raise ValueError("recorded resume requires a fresh recording work directory")
+        if plan is None:
+            plan = resume.plan_json
+    if plan is None:
+        raise ValueError("native training requires an explicit plan or recorded resume bundle")
     data = json.loads(plan, object_pairs_hook=_pairs) if isinstance(plan, str) else json.loads(json.dumps(plan))
     text = json.dumps(data, allow_nan=False)
     _tritium._validate_native_scale_plan(text)
@@ -361,11 +390,15 @@ def native_scale_training(model, artifact, *, level, plan, load_run_id,
                 or any(type(recording[name]) is not int or recording[name] <= 0 for name in fields - {"work_dir"})):
             raise ValueError("native recording requires work_dir and positive journal/work limits")
         if checkpoint is not None:
-            raise ValueError("recorded training requires zero origin; partial journal continuation unavailable")
+            raise ValueError("recorded training requires zero origin; use a recorded resume bundle instead of checkpoint")
         work = Path(recording["work_dir"]).resolve(strict=True)
         parent = Path(artifact.output_dir).resolve(strict=True)
         if not work.is_dir() or work == parent or parent in work.parents:
             raise ValueError("recording work must be an existing directory outside parent artifact")
+        if resume is not None:
+            saved = Path(resume.output_dir).resolve(strict=True)
+            if work == saved or saved in work.parents:
+                raise ValueError("resume work cannot overlap saved bundle")
         record_options = (work, recording["max_journal_bytes"], recording["max_working_bytes"])
     private = load_native_module(model, artifact, level=level, load_run_id=load_run_id,
                                  inplace=False, input_gradients=True, **load_limits)
@@ -383,19 +416,29 @@ def native_scale_training(model, artifact, *, level, plan, load_run_id,
     if any(owner not in weights for owner in data["owners"]):
         raise ValueError("native selected owner differs from loaded graph")
     selected = {name: weights[name] for name in data["owners"]}
-    backend = artifact.begin_scale_training(text, [(name, selected[name].handle) for name in data["owners"]],
-                                           max_snapshot_bytes=max_snapshot_bytes, max_parent_bytes=max_parent_bytes,
-                                           checkpoint=checkpoint)
-    trainer = NativeScaleTrainer(private, backend, data, selected, max_saved_input_bytes)
-    if record_options is not None:
-        work, journal_bytes, working_bytes = record_options
-        temporary = tempfile.TemporaryDirectory(prefix="tritium-native-recording-", dir=work)
-        trainer._recording_work = temporary
-        try:
+    temporary, backend = None, None
+    try:
+        resumed = None
+        if record_options is not None:
+            work, journal_bytes, working_bytes = record_options
+            temporary = tempfile.TemporaryDirectory(prefix="tritium-native-recording-", dir=work)
+            journal_path = str(Path(temporary.name) / "gradients.tnsj")
+            if resume is not None:
+                resumed = (resume, json.dumps(dict(path=journal_path, max_journal_bytes=journal_bytes,
+                                                   max_working_bytes=working_bytes), allow_nan=False))
+        backend = artifact.begin_scale_training(text, [(name, selected[name].handle) for name in data["owners"]],
+                                               max_snapshot_bytes=max_snapshot_bytes, max_parent_bytes=max_parent_bytes,
+                                               checkpoint=checkpoint, recorded_resume=resumed)
+        if temporary is not None and resume is None:
             backend.start_recording(str(Path(temporary.name) / "gradients.tnsj"), journal_bytes, working_bytes)
-        except BaseException:
-            trainer._cleanup_recording()
-            raise
+        trainer = NativeScaleTrainer(private, backend, data, selected, max_saved_input_bytes)
+        trainer._recording_work = temporary
+    except BaseException:
+        if backend is not None:
+            backend.close_recording()
+        if temporary is not None:
+            temporary.cleanup()
+        raise
     return trainer
 
 
