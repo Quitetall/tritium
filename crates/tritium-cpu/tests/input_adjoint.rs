@@ -360,6 +360,57 @@ fn admitted_stream_handle_preserves_payload_lease_and_upload_evidence() {
     cpu.additive_matmul_input_vjp(&*handle, &dy, 1, &mut vec![0.0; cols], &mut actual)
         .unwrap();
     assert_eq!(actual, expected);
+    let count = cpu.additive_stored_scale_count(&*handle).unwrap();
+    assert_eq!(count, view.scales().len());
+    let x = vec![0.125; cols];
+    let ids = [0, rows - 1, 0];
+    let de = vec![0.25; ids.len() * cols];
+    let mut actual_scales = vec![0.25; count];
+    let mut expected_scales = actual_scales.clone();
+    tritium_core::accumulate_ternary_matmul_scale_vjp(
+        &x,
+        &view.bind_matmul(),
+        &dy,
+        1,
+        &mut vec![0.0; cols],
+        &mut expected_scales,
+    )
+    .unwrap();
+    cpu.accumulate_additive_matmul_scale_vjp(
+        &*handle,
+        &x,
+        &dy,
+        1,
+        &mut vec![0.0; cols],
+        &mut actual_scales,
+    )
+    .unwrap();
+    tritium_core::accumulate_embed_scale_vjp(
+        &view.bind_gather(),
+        &ids,
+        &de,
+        &mut vec![0.0; cols],
+        &mut expected_scales,
+    )
+    .unwrap();
+    cpu.accumulate_additive_embed_scale_vjp(
+        &*handle,
+        &ids,
+        &de,
+        &mut vec![0.0; cols],
+        &mut actual_scales,
+    )
+    .unwrap();
+    assert_eq!(
+        actual_scales
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        expected_scales
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>()
+    );
     assert_eq!(payload.used_bytes(), caps.payload_bytes);
     assert_eq!(recorder.to_jsonl().unwrap(), before);
     verify_jsonl_with_registry(&before, [TENSOR_UPLOADED_REGISTRATION]).unwrap();

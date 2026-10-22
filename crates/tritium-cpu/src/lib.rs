@@ -50,6 +50,9 @@
 //! [`CpuBackend::additive_matmul_input_vjp`] supplies the shared-reference input
 //! adjoint for additive handles with caller-owned row workspace. It is scalar,
 //! CPU-only and distinct from complete backend training or owner refinement.
+//! Packed stored-scale adjoints share the core geometry/gradient loop through
+//! [`CpuBackend::accumulate_additive_matmul_scale_vjp`] and
+//! [`CpuBackend::accumulate_additive_embed_scale_vjp`], without expanding weights.
 //
 // `linkme`'s `distributed_slice` expands to a static with a custom
 // `#[link_section]`, and the AVX2 kernel needs hand-written `unsafe` for its
@@ -212,6 +215,79 @@ impl CpuBackend {
         out: &mut [f32],
     ) -> Result<(), BackendError> {
         semantic::CpuTensor::additive_input_vjp(tensor, output_gradients, batch, row_workspace, out)
+    }
+
+    /// Actual stored-scale count of an admitted CPU additive handle.
+    ///
+    /// Metadata only, excluding derived tied scales; no payload decoding or
+    /// allocation. This is not a complete backend-training capability report.
+    /// # Errors
+    /// Foreign/legacy handles return InvalidInput; dense returns UnsupportedTensor.
+    pub fn additive_stored_scale_count(
+        &self,
+        tensor: &dyn DeviceBuffer,
+    ) -> Result<usize, BackendError> {
+        semantic::CpuTensor::additive_scale_count(tensor)
+    }
+
+    /// Accumulate packed matmul cotangents into actual stored-scale gradients.
+    ///
+    /// Matches [`tritium_core::accumulate_ternary_matmul_scale_vjp`] through its
+    /// shared checked plan, reading canonical symbols directly from this handle.
+    /// Inputs have batch*cols and batch*rows elements, row workspace exactly cols,
+    /// and f64 output exactly the stored-scale count. Adds in shared reference
+    /// order. No heap, dense or decoded-trit scratch; empty batch leaves buffers
+    /// untouched. Finite/overflow policy belongs to the caller. The immutable
+    /// handle may be shared with callers using independent buffers. No scale
+    /// update, code STE or full training/other-backend qualification is implied.
+    /// # Errors
+    /// InvalidInput for foreign/legacy handles, shapes or overflow;
+    /// UnsupportedTensor for dense handles. Refusal precedes buffer mutation.
+    pub fn accumulate_additive_matmul_scale_vjp(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        activations: &[f32],
+        output_gradients: &[f32],
+        batch: usize,
+        row_workspace: &mut [f32],
+        out: &mut [f64],
+    ) -> Result<(), BackendError> {
+        semantic::CpuTensor::additive_matmul_scale_vjp(
+            tensor,
+            activations,
+            output_gradients,
+            batch,
+            row_workspace,
+            out,
+        )
+    }
+
+    /// Accumulate packed embedding cotangents into actual stored-scale gradients.
+    ///
+    /// Matches [`tritium_core::accumulate_embed_scale_vjp`]: ids retain occurrence
+    /// order (including duplicates), cotangents are ids.len()*cols, workspace cols,
+    /// f64 output the stored-scale count. Uses forward basis on cotangents and
+    /// directly reads admitted packed symbols without allocation or mutation of
+    /// the handle. Every shape/index is checked before output/workspace mutation;
+    /// empty ids leave buffers untouched. Finite/overflow policy is the caller's.
+    /// # Errors
+    /// Same handle/shape refusals as the packed matmul scale adjoint, including
+    /// out-of-range ids. Existing inference capability reports remain unchanged.
+    pub fn accumulate_additive_embed_scale_vjp(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        ids: &[usize],
+        output_gradients: &[f32],
+        row_workspace: &mut [f32],
+        out: &mut [f64],
+    ) -> Result<(), BackendError> {
+        semantic::CpuTensor::additive_embed_scale_vjp(
+            tensor,
+            ids,
+            output_gradients,
+            row_workspace,
+            out,
+        )
     }
 
     /// Unpack the `[N, K]` packed weights in `buf` to a flat `Vec<Trit>` (one

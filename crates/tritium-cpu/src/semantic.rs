@@ -222,8 +222,45 @@ impl CpuTensor {
         row_workspace: &mut [f32],
         out: &mut [f32],
     ) -> Result<(), BackendError> {
+        Self::checked_additive(tensor)?.input_vjp(output_gradients, batch, row_workspace, out)
+    }
+
+    pub(crate) fn additive_scale_count(tensor: &dyn DeviceBuffer) -> Result<usize, BackendError> {
+        Ok(Self::checked_additive(tensor)?
+            .scale_vjp_plan()?
+            .stored_scale_count())
+    }
+
+    pub(crate) fn additive_matmul_scale_vjp(
+        tensor: &dyn DeviceBuffer,
+        activations: &[f32],
+        output_gradients: &[f32],
+        batch: usize,
+        row_workspace: &mut [f32],
+        out: &mut [f64],
+    ) -> Result<(), BackendError> {
+        Self::checked_additive(tensor)?.matmul_scale_vjp(
+            activations,
+            output_gradients,
+            batch,
+            row_workspace,
+            out,
+        )
+    }
+
+    pub(crate) fn additive_embed_scale_vjp(
+        tensor: &dyn DeviceBuffer,
+        ids: &[usize],
+        output_gradients: &[f32],
+        row_workspace: &mut [f32],
+        out: &mut [f64],
+    ) -> Result<(), BackendError> {
+        Self::checked_additive(tensor)?.embed_scale_vjp(ids, output_gradients, row_workspace, out)
+    }
+
+    fn checked_additive(tensor: &dyn DeviceBuffer) -> Result<&PackedAdditive, BackendError> {
         match Self::checked(tensor)? {
-            Self::Additive(tensor) => tensor.input_vjp(output_gradients, batch, row_workspace, out),
+            Self::Additive(tensor) => Ok(tensor),
             Self::Dense { .. } => Err(BackendError::UnsupportedTensor),
         }
     }

@@ -1,5 +1,169 @@
-use super::{AdditiveError, AdditiveView, BasisBound, Gather, Matmul, apply_basis};
-use tritium_schema::{PlaneRelation, ScaleAnchor};
+use super::{
+    AdditiveError, AdditiveView, Allocation, BasisBound, Gather, Matmul, RowTiles, UniformPlan,
+    apply_basis,
+};
+use crate::{PerTileIndex, Trit};
+use tritium_schema::{AdditiveLayout, PlaneRelation, ScaleAnchor};
+
+/// Checked scale-adjoint geometry shared by decoded and packed readers.
+///
+/// Owns no coefficients/scales and authenticates no payload. A reader must return
+/// the admitted Trit at `(plane, absolute plane-major coefficient offset)`; the
+/// offset includes all previous planes, including compact allocation. Only
+/// present coefficients are visited, after full shape/index preflight. Reader
+/// side effects/panics are not transactional. No allocation is performed here.
+#[derive(Clone, Copy, Debug)]
+pub struct AdditiveScaleVjpPlan<'a> {
+    allocation: ScaleAllocation<'a>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ScaleAllocation<'a> {
+    Uniform(UniformPlan),
+    PerTile(PerTileIndex<'a>),
+}
+
+impl<'a> AdditiveScaleVjpPlan<'a> {
+    /// Reuse checked uniform geometry without copying or revalidating payloads.
+    #[must_use]
+    pub const fn from_uniform(plan: UniformPlan) -> Self {
+        Self {
+            allocation: ScaleAllocation::Uniform(plan),
+        }
+    }
+
+    /// Borrow the existing checked compact index; all-pruned geometry is valid.
+    #[must_use]
+    pub const fn from_per_tile(index: PerTileIndex<'a>) -> Self {
+        Self {
+            allocation: ScaleAllocation::PerTile(index),
+        }
+    }
+
+    /// Number of actual stored scales, excluding derived tied-plane scales.
+    #[must_use]
+    pub const fn stored_scale_count(&self) -> usize {
+        match self.allocation {
+            ScaleAllocation::Uniform(plan) => plan.scale_count(),
+            ScaleAllocation::PerTile(index) => index.scale_count(),
+        }
+    }
+
+    /// Accumulate a matmul scale VJP through an admitted coefficient reader.
+    ///
+    /// Uses the exact semantics, shape/preflight, accumulation order, caller
+    /// buffers and finite-value policy of [`accumulate_ternary_matmul_scale_vjp`].
+    pub fn matmul(
+        &self,
+        activations: &[f32],
+        output_gradients: &[f32],
+        batch: usize,
+        row_workspace: &mut [f32],
+        out: &mut [f64],
+        mut read: impl FnMut(usize, usize) -> Trit,
+    ) -> Result<(), AdditiveError> {
+        let rows = usize::try_from(self.layout().rows).map_err(|_| AdditiveError::SizeOverflow)?;
+        let cols = usize::try_from(self.layout().cols).map_err(|_| AdditiveError::SizeOverflow)?;
+        let inputs = batch.checked_mul(cols).ok_or(AdditiveError::SizeOverflow)?;
+        let outputs = batch.checked_mul(rows).ok_or(AdditiveError::SizeOverflow)?;
+        if activations.len() != inputs
+            || output_gradients.len() != outputs
+            || row_workspace.len() != cols
+            || out.len() != self.stored_scale_count()
+        {
+            return Err(AdditiveError::MatmulShape);
+        }
+        for (activation, dy) in activations
+            .chunks_exact(cols)
+            .zip(output_gradients.chunks_exact(rows))
+        {
+            row_workspace.copy_from_slice(activation);
+            apply_basis(row_workspace, self.layout().basis)?;
+            for (row, &gradient) in dy.iter().enumerate() {
+                accumulate_row(
+                    self,
+                    row,
+                    row_workspace,
+                    f64::from(gradient),
+                    out,
+                    &mut read,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Accumulate an embedding scale VJP through an admitted coefficient reader.
+    ///
+    /// Uses [`accumulate_embed_scale_vjp`]'s original-coordinate cotangents,
+    /// duplicate-index order and preflight, without allocating or reading scales.
+    pub fn embed(
+        &self,
+        ids: &[usize],
+        output_gradients: &[f32],
+        row_workspace: &mut [f32],
+        out: &mut [f64],
+        mut read: impl FnMut(usize, usize) -> Trit,
+    ) -> Result<(), AdditiveError> {
+        let rows = usize::try_from(self.layout().rows).map_err(|_| AdditiveError::SizeOverflow)?;
+        let cols = usize::try_from(self.layout().cols).map_err(|_| AdditiveError::SizeOverflow)?;
+        let outputs = ids
+            .len()
+            .checked_mul(cols)
+            .ok_or(AdditiveError::SizeOverflow)?;
+        if output_gradients.len() != outputs
+            || row_workspace.len() != cols
+            || out.len() != self.stored_scale_count()
+        {
+            return Err(AdditiveError::MatmulShape);
+        }
+        if ids.iter().any(|&row| row >= rows) {
+            return Err(AdditiveError::RowOutOfRange);
+        }
+        for (&row, dy) in ids.iter().zip(output_gradients.chunks_exact(cols)) {
+            row_workspace.copy_from_slice(dy);
+            apply_basis(row_workspace, self.layout().basis)?;
+            accumulate_row(self, row, row_workspace, 1.0, out, &mut read);
+        }
+        Ok(())
+    }
+
+    fn layout(&self) -> AdditiveLayout {
+        match self.allocation {
+            ScaleAllocation::Uniform(plan) => plan.layout,
+            ScaleAllocation::PerTile(index) => index.layout,
+        }
+    }
+    fn plane_count(&self) -> usize {
+        match self.allocation {
+            ScaleAllocation::Uniform(plan) => plan.plane_count(),
+            ScaleAllocation::PerTile(index) => index.plane_count(),
+        }
+    }
+    fn row_tiles(&self, plane: usize, row: usize) -> RowTiles<'a> {
+        match self.allocation {
+            ScaleAllocation::Uniform(plan) => RowTiles::Uniform(plan.row_tiles(plane, row)),
+            ScaleAllocation::PerTile(index) => RowTiles::PerTile(index.row_tiles(plane, row)),
+        }
+    }
+}
+
+fn for_view<'a>(view: &AdditiveView<'a>) -> AdditiveScaleVjpPlan<'a> {
+    match view.allocation {
+        Allocation::Uniform {
+            layout,
+            planes,
+            scale_units,
+        } => AdditiveScaleVjpPlan::from_uniform(UniformPlan {
+            layout,
+            planes,
+            scale_units,
+            trit_count: view.trits.len(),
+            scale_count: view.scales.len(),
+        }),
+        Allocation::PerTile(index) => AdditiveScaleVjpPlan::from_per_tile(index),
+    }
+}
 
 /// Accumulate the matmul's continuous **stored-scale** vector-Jacobian product.
 ///
@@ -31,28 +195,14 @@ pub fn accumulate_ternary_matmul_scale_vjp(
     out: &mut [f64],
 ) -> Result<(), AdditiveError> {
     let weights = &weights.tensor;
-    let rows = usize::try_from(weights.layout().rows).map_err(|_| AdditiveError::SizeOverflow)?;
-    let cols = usize::try_from(weights.layout().cols).map_err(|_| AdditiveError::SizeOverflow)?;
-    let inputs = batch.checked_mul(cols).ok_or(AdditiveError::SizeOverflow)?;
-    let outputs = batch.checked_mul(rows).ok_or(AdditiveError::SizeOverflow)?;
-    if activations.len() != inputs
-        || output_gradients.len() != outputs
-        || row_workspace.len() != cols
-        || out.len() != weights.scales().len()
-    {
-        return Err(AdditiveError::MatmulShape);
-    }
-    for (activation, dy) in activations
-        .chunks_exact(cols)
-        .zip(output_gradients.chunks_exact(rows))
-    {
-        row_workspace.copy_from_slice(activation);
-        apply_basis(row_workspace, weights.layout().basis)?;
-        for (row, &gradient) in dy.iter().enumerate() {
-            accumulate_row(weights, row, row_workspace, f64::from(gradient), out);
-        }
-    }
-    Ok(())
+    for_view(weights).matmul(
+        activations,
+        output_gradients,
+        batch,
+        row_workspace,
+        out,
+        |_, index| weights.trits[index],
+    )
 }
 
 /// Accumulate embedding/gather output cotangents into the actual stored scales.
@@ -80,35 +230,18 @@ pub fn accumulate_embed_scale_vjp(
     out: &mut [f64],
 ) -> Result<(), AdditiveError> {
     let weights = &weights.tensor;
-    let rows = usize::try_from(weights.layout().rows).map_err(|_| AdditiveError::SizeOverflow)?;
-    let cols = usize::try_from(weights.layout().cols).map_err(|_| AdditiveError::SizeOverflow)?;
-    let outputs = ids
-        .len()
-        .checked_mul(cols)
-        .ok_or(AdditiveError::SizeOverflow)?;
-    if output_gradients.len() != outputs
-        || row_workspace.len() != cols
-        || out.len() != weights.scales().len()
-    {
-        return Err(AdditiveError::MatmulShape);
-    }
-    if ids.iter().any(|&row| row >= rows) {
-        return Err(AdditiveError::RowOutOfRange);
-    }
-    for (&row, dy) in ids.iter().zip(output_gradients.chunks_exact(cols)) {
-        row_workspace.copy_from_slice(dy);
-        apply_basis(row_workspace, weights.layout().basis)?;
-        accumulate_row(weights, row, row_workspace, 1.0, out);
-    }
-    Ok(())
+    for_view(weights).embed(ids, output_gradients, row_workspace, out, |_, index| {
+        weights.trits[index]
+    })
 }
 
 fn accumulate_row(
-    weights: &AdditiveView<'_>,
+    weights: &AdditiveScaleVjpPlan<'_>,
     row: usize,
     values: &[f32],
     dy: f64,
     out: &mut [f64],
+    read: &mut impl FnMut(usize, usize) -> Trit,
 ) {
     let layout = weights.layout();
     let group = usize::from(layout.group);
@@ -116,7 +249,7 @@ fn accumulate_row(
     for plane in 0..weights.plane_count() {
         for tile in weights.row_tiles(plane, row) {
             for offset in 0..tile.len {
-                let trit = weights.trits[tile.trit + offset];
+                let trit = read(plane, tile.trit + offset);
                 if !trit.is_zero() {
                     let scale = tile.scale
                         + if layout.law.anchor == ScaleAnchor::Group {

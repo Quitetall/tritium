@@ -125,6 +125,45 @@ fn packed_input_adjoint_allocates_no_decoded_master_or_hidden_scratch() {
                 eprintln!(
                     "PACKED_INPUT_ADJOINT_HEAP rows={rows} compact={compact} codec={codec:?} bytes={bytes}"
                 );
+                let (count, bytes) =
+                    measured(|| CpuBackend::new().additive_stored_scale_count(&*handle));
+                let count = count.unwrap();
+                assert_eq!(bytes, 0);
+                let mut scale_gradients = vec![0.25; count];
+                let x = vec![0.125; 520];
+                let (result, bytes) = measured(|| {
+                    CpuBackend::new().accumulate_additive_matmul_scale_vjp(
+                        &*handle,
+                        &x,
+                        &gradients,
+                        2,
+                        &mut scratch,
+                        &mut scale_gradients,
+                    )
+                });
+                assert_eq!(result, Ok(()));
+                assert_eq!(bytes, 0);
+                eprintln!(
+                    "PACKED_MATMUL_SCALE_HEAP rows={rows} compact={compact} codec={codec:?} bytes={bytes}"
+                );
+                let ids = [rows as usize - 1, 0, rows as usize - 1];
+                let de = vec![0.25; 780];
+                let (result, bytes) = measured(|| {
+                    CpuBackend::new().accumulate_additive_embed_scale_vjp(
+                        &*handle,
+                        &ids,
+                        &de,
+                        &mut scratch,
+                        &mut scale_gradients,
+                    )
+                });
+                assert_eq!(result, Ok(()));
+                assert_eq!(bytes, 0);
+                assert_eq!(handle.len_bytes(), before);
+                assert!(scale_gradients.iter().all(|v| v.is_finite()));
+                eprintln!(
+                    "PACKED_EMBED_SCALE_HEAP rows={rows} compact={compact} codec={codec:?} bytes={bytes}"
+                );
             }
         }
     }

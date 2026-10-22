@@ -3,7 +3,10 @@
 
 use half::f16;
 use rayon::prelude::*;
-use tritium_core::{AdditiveView, OwnedPerTileIndex, apply_basis, apply_inverse_basis};
+use tritium_core::{
+    AdditiveScaleVjpPlan, AdditiveView, OwnedPerTileIndex, Trit, UniformPlan, apply_basis,
+    apply_inverse_basis,
+};
 use tritium_format::salt_v2::SaltV2Codec;
 use tritium_schema::{AdditiveLayout, PlaneCodec, PlaneRelation, ScaleAnchor, ScalePrecision};
 use tritium_spec::{
@@ -545,6 +548,63 @@ impl PackedAdditive {
             apply_inverse_basis(input_gradient, self.layout.basis).map_err(invalid)?;
         }
         Ok(())
+    }
+
+    pub(super) fn scale_vjp_plan(&self) -> Result<AdditiveScaleVjpPlan<'_>, BackendError> {
+        match &self.allocation {
+            Allocation::Uniform { .. } => UniformPlan::new(self.layout, self.planes as u8)
+                .map(AdditiveScaleVjpPlan::from_uniform)
+                .map_err(invalid),
+            Allocation::PerTile { index, .. } => {
+                Ok(AdditiveScaleVjpPlan::from_per_tile(index.as_index()))
+            }
+        }
+    }
+
+    // Shared plans use absolute plane-major offsets. The pre-existing uniform
+    // byte reader instead takes an offset local to the selected packed plane.
+    fn scale_vjp_trit(&self, plane: usize, absolute: usize) -> Trit {
+        let coefficient = match &self.allocation {
+            Allocation::Uniform { .. } => {
+                absolute - plane * self.layout.rows as usize * self.layout.cols as usize
+            }
+            Allocation::PerTile { .. } => absolute,
+        };
+        Trit::from_i8(self.trit(plane, coefficient)).expect("admitted canonical ternary symbol")
+    }
+
+    pub(super) fn matmul_scale_vjp(
+        &self,
+        activations: &[f32],
+        output_gradients: &[f32],
+        batch: usize,
+        row_workspace: &mut [f32],
+        out: &mut [f64],
+    ) -> Result<(), BackendError> {
+        self.scale_vjp_plan()?
+            .matmul(
+                activations,
+                output_gradients,
+                batch,
+                row_workspace,
+                out,
+                |plane, index| self.scale_vjp_trit(plane, index),
+            )
+            .map_err(invalid)
+    }
+
+    pub(super) fn embed_scale_vjp(
+        &self,
+        ids: &[usize],
+        output_gradients: &[f32],
+        row_workspace: &mut [f32],
+        out: &mut [f64],
+    ) -> Result<(), BackendError> {
+        self.scale_vjp_plan()?
+            .embed(ids, output_gradients, row_workspace, out, |plane, index| {
+                self.scale_vjp_trit(plane, index)
+            })
+            .map_err(invalid)
     }
 }
 

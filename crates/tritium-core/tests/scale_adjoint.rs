@@ -1,8 +1,8 @@
 //! CPU semantic fixtures, not packed/hardware/model-quality qualification.
 use tritium_core::{
-    AdditiveError, AdditiveView, OwnedPerTileIndex, PerTilePlan, Trit, UniformPlan,
-    accumulate_embed_scale_vjp, accumulate_ternary_matmul_scale_vjp, apply_inverse_basis,
-    reference_embed, reference_ternary_matmul,
+    AdditiveError, AdditiveScaleVjpPlan, AdditiveView, OwnedPerTileIndex, PerTilePlan, Trit,
+    UniformPlan, accumulate_embed_scale_vjp, accumulate_ternary_matmul_scale_vjp,
+    apply_inverse_basis, reference_embed, reference_ternary_matmul,
 };
 use tritium_schema::{
     ADMITTED_LAWS, AdditiveLayout, Basis, PlaneAllocation, PlaneCodec, Transport,
@@ -131,6 +131,17 @@ fn check(f: &Fixture, batch: usize) {
         assert!(gm.iter().all(|&v| v == 0.25));
     }
     accumulate_embed_scale_vjp(&view.bind_gather(), &ids, &de, &mut workspace, &mut ge).unwrap();
+    if std::env::var_os("TRITIUM_SCALE_ADJOINT_CAPTURE").is_some() {
+        println!(
+            "SCALE_BITS batch={batch} layout={:?} planes={} counts={:?} matmul={:?} embed={:?} row={:?}",
+            f.layout,
+            view.plane_count(),
+            view.tile_counts(),
+            gm.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            ge.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            workspace.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+    }
     if batch == 0 {
         assert!(workspace.iter().all(|&v| v == 91.0));
         assert!(ge.iter().all(|&v| v == 0.25));
@@ -437,4 +448,97 @@ fn shapes_overflow_and_late_invalid_index_reject_before_any_mutation() {
     );
     assert_eq!(row, [17.0; 4]);
     assert!(out.iter().all(|&v| v == 19.0));
+}
+
+#[test]
+fn checked_plan_offsets_are_absolute_and_failed_preflight_never_calls_reader() {
+    for (law, admitted) in ADMITTED_LAWS.iter().enumerate() {
+        for mode in 0..3 {
+            let f = Fixture::new(
+                law,
+                Basis::SignedRht {
+                    block: 4,
+                    seed: 19,
+                    domain: 7,
+                },
+                128,
+                260,
+                admitted.max_planes,
+                mode,
+            );
+            let plan = if let Some(index) = &f.index {
+                AdditiveScaleVjpPlan::from_per_tile(index.as_index())
+            } else {
+                AdditiveScaleVjpPlan::from_uniform(UniformPlan::new(f.layout, f.planes).unwrap())
+            };
+            assert_eq!(plan.stored_scale_count(), f.scales.len());
+            let mut starts = vec![0];
+            for plane in 0..f.view(&f.scales).plane_count() {
+                let n = if let Some(index) = &f.index {
+                    PerTilePlan::new(f.layout, index.tile_counts())
+                        .unwrap()
+                        .plane_trit_count(plane)
+                        .unwrap()
+                } else {
+                    780
+                };
+                starts.push(starts.last().unwrap() + n);
+            }
+            let calls = std::cell::Cell::new(0);
+            let mut actual = vec![0.25; f.scales.len()];
+            let mut expected = actual.clone();
+            let x = values(520);
+            let dy = values(6);
+            let mut row = vec![0.0; 260];
+            plan.matmul(&x, &dy, 2, &mut row, &mut actual, |plane, index| {
+                assert!(index >= starts[plane] && index < starts[plane + 1]);
+                calls.set(calls.get() + 1);
+                f.trits[index]
+            })
+            .unwrap();
+            accumulate_ternary_matmul_scale_vjp(
+                &x,
+                &f.view(&f.scales).bind_matmul(),
+                &dy,
+                2,
+                &mut row,
+                &mut expected,
+            )
+            .unwrap();
+            assert_eq!(calls.get(), 2 * f.trits.len());
+            assert_eq!(actual, expected);
+            let mut row = vec![17.0; 260];
+            let mut out = vec![19.0; f.scales.len()];
+            assert!(
+                plan.matmul(&[], &[], usize::MAX, &mut row, &mut out, |_, _| panic!(
+                    "reader called before overflow refusal"
+                ))
+                .is_err()
+            );
+            assert!(
+                plan.embed(&[0, 3], &[0.25; 520], &mut row, &mut out, |_, _| panic!(
+                    "reader called before index refusal"
+                ))
+                .is_err()
+            );
+            assert!(
+                plan.matmul(&[], &[], 0, &mut row[..259], &mut out, |_, _| panic!(
+                    "reader called before shape refusal"
+                ))
+                .is_err()
+            );
+            assert!(row.iter().all(|&v| v == 17.0));
+            assert!(out.iter().all(|&v| v == 19.0));
+            plan.matmul(&[], &[], 0, &mut row, &mut out, |_, _| {
+                panic!("reader called for empty batch")
+            })
+            .unwrap();
+            plan.embed(&[], &[], &mut row, &mut out, |_, _| {
+                panic!("reader called for empty ids")
+            })
+            .unwrap();
+            assert!(row.iter().all(|&v| v == 17.0));
+            assert!(out.iter().all(|&v| v == 19.0));
+        }
+    }
 }

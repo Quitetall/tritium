@@ -12,7 +12,9 @@ use crate::per_tile::{ActiveTile, ActiveTiles};
 use crate::{PerTileIndex, Trit};
 
 mod scale_adjoint;
-pub use scale_adjoint::{accumulate_embed_scale_vjp, accumulate_ternary_matmul_scale_vjp};
+pub use scale_adjoint::{
+    AdditiveScaleVjpPlan, accumulate_embed_scale_vjp, accumulate_ternary_matmul_scale_vjp,
+};
 
 /// Consumer marker: rotate activations before additive matrix multiplication.
 #[derive(Clone, Copy, Debug)]
