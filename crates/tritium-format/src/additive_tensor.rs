@@ -286,6 +286,30 @@ impl AdditiveTensor {
         &self.scales
     }
 
+    /// Validate replacement stored scales without changing coefficients or geometry.
+    ///
+    /// This also checks derived tied-plane scales and exact storage precision.
+    /// No coefficient/index buffers are copied. Failure leaves the tensor unchanged.
+    pub fn validate_scales(&self, scales: &[f32]) -> Result<(), AdditiveTensorError> {
+        let view = if let Some(index) = &self.per_tile {
+            AdditiveView::new_per_tile(index.as_index(), &self.trits, scales)
+        } else {
+            AdditiveView::new(self.layout, self.plane_count, &self.trits, scales)
+        }
+        .map_err(AdditiveTensorError::InvalidView)?;
+        Self::validate_view(view)
+    }
+
+    /// Replace actual stored scales transactionally, preserving all other state.
+    ///
+    /// Accepts only finite nonnegative values exactly representable by the
+    /// declared precision. It never silently narrows a scale or changes a law.
+    pub fn replace_scales(&mut self, scales: Vec<f32>) -> Result<(), AdditiveTensorError> {
+        self.validate_scales(&scales)?;
+        self.scales = scales;
+        Ok(())
+    }
+
     /// Borrow row-major compact counts, or `None` for uniform allocation.
     #[must_use]
     pub fn tile_counts(&self) -> Option<&[u8]> {

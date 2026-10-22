@@ -5121,8 +5121,10 @@ dependencies = [
  "serde_json",
  "tritium-build-info",
  "tritium-core",
+ "tritium-evidence",
  "tritium-format",
  "tritium-quantize",
+ "tritium-schema",
  "tritium-spec",
  "tritium-testkit",
 ]

@@ -16,6 +16,8 @@ blake3 = { workspace = true }
 half = { workspace = true }
 tritium-core = { workspace = true }
 tritium-format = { workspace = true }
+tritium-schema = { workspace = true, features = ["serde"] }
+tritium-evidence = { workspace = true }
 tritium-quantize = { workspace = true }
 tritium-spec = { workspace = true }
 tritium-testkit = { workspace = true }
