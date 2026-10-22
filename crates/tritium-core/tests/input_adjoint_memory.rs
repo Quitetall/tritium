@@ -1,7 +1,10 @@
 //! Heap requests during the reference call only, not a physical-memory bound.
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tritium_core::{AdditiveView, Trit, UniformPlan, reference_ternary_matmul_input_vjp};
+use tritium_core::{
+    AdditiveView, Trit, UniformPlan, accumulate_embed_scale_vjp,
+    accumulate_ternary_matmul_scale_vjp, reference_ternary_matmul_input_vjp,
+};
 use tritium_schema::{
     ADMITTED_LAWS, AdditiveLayout, Basis, PlaneAllocation, PlaneCodec, Transport,
 };
@@ -82,5 +85,39 @@ fn input_adjoint_uses_only_caller_buffers_at_small_and_large_shapes() {
         assert_eq!(bytes, 0);
         assert!(output.iter().all(|v| v.is_finite()));
         eprintln!("INPUT_ADJOINT_HEAP_REQUESTS rows={rows} cols=256 batch=2 bytes={bytes}");
+
+        let raw = AdditiveView::new(layout, 3, &trits, &scales).unwrap();
+        let activations = vec![0.125; 512];
+        let mut scale_gradients = vec![0.0; scales.len()];
+        let (result, bytes) = measured(|| {
+            accumulate_ternary_matmul_scale_vjp(
+                &activations,
+                &raw.bind_matmul(),
+                &gradients,
+                2,
+                &mut scratch,
+                &mut scale_gradients,
+            )
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(bytes, 0);
+        eprintln!("MATMUL_SCALE_ADJOINT_HEAP_REQUESTS rows={rows} cols=256 batch=2 bytes={bytes}");
+        let ids = [rows as usize - 1, 0, rows as usize - 1];
+        let embedding_gradients = vec![0.25; 768];
+        let (result, bytes) = measured(|| {
+            accumulate_embed_scale_vjp(
+                &raw.bind_gather(),
+                &ids,
+                &embedding_gradients,
+                &mut scratch,
+                &mut scale_gradients,
+            )
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(bytes, 0);
+        assert!(scale_gradients.iter().all(|v| v.is_finite()));
+        eprintln!(
+            "EMBED_SCALE_ADJOINT_HEAP_REQUESTS rows={rows} cols=256 occurrences=3 bytes={bytes}"
+        );
     }
 }

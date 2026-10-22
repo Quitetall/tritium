@@ -1,10 +1,15 @@
 //! Small CPU numerical/checkpoint fixtures, not model-quality or release evidence.
 use half::f16;
-use tritium_core::{PerTilePlan, Trit, UniformPlan};
+use tritium_core::{
+    PerTilePlan, Trit, UniformPlan, accumulate_embed_scale_vjp,
+    accumulate_ternary_matmul_scale_vjp, reference_embed, reference_ternary_matmul,
+};
 use tritium_format::AdditiveTensor;
 use tritium_schema::*;
 use tritium_train::optim::{AdamW, Optimizer};
-use tritium_train::pv_tuning::NativeScaleRefinementSession as Session;
+use tritium_train::pv_tuning::{
+    NativeScaleContribution as Use, NativeScaleRefinementSession as Session,
+};
 
 fn plan(owners: usize) -> NativeRefinementPlan {
     NativeRefinementPlan {
@@ -506,4 +511,296 @@ fn large_u64_rotation_seed_and_domain_bits_are_not_rounded_in_parent_binding() {
         .unwrap();
         assert!(Session::resume(plan(1), vec![other], &bytes).is_err());
     }
+}
+
+fn consumer_values(n: usize) -> Vec<f32> {
+    (0..n).map(|i| (i % 7) as f32 * 0.125 - 0.375).collect()
+}
+
+#[test]
+fn tied_repeated_consumers_match_direct_scale_step_and_resume_across_profiles() {
+    let mut cases = 0;
+    for law in 0..ADMITTED_LAWS.len() {
+        for codec in [PlaneCodec::D2, PlaneCodec::B3, PlaneCodec::S34] {
+            for basis in [
+                Basis::Identity,
+                Basis::Hadamard { block: 128 },
+                Basis::SignedRht {
+                    block: 128,
+                    seed: 19,
+                    domain: 7,
+                },
+            ] {
+                for mode in 0..3 {
+                    let parent = tensor(law, codec, basis, mode, Transport::Raw);
+                    let cols = parent.layout().cols as usize;
+                    let x = consumer_values(2 * cols);
+                    let dy = consumer_values(6);
+                    let ids = [2, 0, 2];
+                    let de = consumer_values(3 * cols);
+                    let uses = [
+                        Use::Matmul {
+                            activations: &x,
+                            output_gradients: &dy,
+                            batch: 2,
+                        },
+                        Use::Embed {
+                            ids: &ids,
+                            output_gradients: &de,
+                        },
+                        Use::Matmul {
+                            activations: &x[..cols],
+                            output_gradients: &dy[..3],
+                            batch: 1,
+                        },
+                    ];
+                    let view = parent.view();
+                    let mut g = vec![0.0; parent.scales().len()];
+                    let mut row = vec![0.0; cols];
+                    accumulate_ternary_matmul_scale_vjp(
+                        &x,
+                        &view.bind_matmul(),
+                        &dy,
+                        2,
+                        &mut row,
+                        &mut g,
+                    )
+                    .unwrap();
+                    accumulate_embed_scale_vjp(&view.bind_gather(), &ids, &de, &mut row, &mut g)
+                        .unwrap();
+                    accumulate_ternary_matmul_scale_vjp(
+                        &x[..cols],
+                        &view.bind_matmul(),
+                        &dy[..3],
+                        1,
+                        &mut row,
+                        &mut g,
+                    )
+                    .unwrap();
+                    let g: Vec<f32> = g.iter().map(|&v| v as f32).collect();
+                    let mut actual = Session::new(plan(1), vec![parent.clone()]).unwrap();
+                    let mut direct = Session::new(plan(1), vec![parent.clone()]).unwrap();
+                    let mut resumed: Option<Session> = None;
+                    for window in 0..4 {
+                        actual.step_from_consumers(&[&uses]).unwrap();
+                        direct.step(&[&g]).unwrap();
+                        assert_eq!(checkpoint(&actual), checkpoint(&direct));
+                        if let Some(state) = &mut resumed {
+                            state.step_from_consumers(&[&uses]).unwrap();
+                            assert_eq!(checkpoint(state), checkpoint(&actual));
+                        }
+                        if window == 1 {
+                            resumed = Some(
+                                Session::resume(
+                                    plan(1),
+                                    vec![parent.clone()],
+                                    &checkpoint(&actual),
+                                )
+                                .unwrap(),
+                            );
+                        }
+                    }
+                    assert!(actual.step_from_consumers(&[&uses]).is_err());
+                    cases += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 108);
+}
+
+#[test]
+fn consumer_workspace_bound_is_exact_and_empty_uses_mean_zero_gradient_not_skip() {
+    let parents = vec![
+        simple(),
+        tensor(3, PlaneCodec::D2, Basis::Identity, 0, Transport::Raw),
+    ];
+    let total: usize = parents.iter().map(|w| w.scales().len()).sum();
+    let max = parents.iter().map(|w| w.scales().len()).max().unwrap();
+    let required = (4 * total + 8 * max + 4 * 260).max(20 * total) as u64;
+    let mut p = plan(2);
+    p.limits.max_workspace_bytes = required - 1;
+    let mut insufficient = Session::new(p, parents.clone()).unwrap();
+    let good = checkpoint(&insufficient);
+    assert!(insufficient.step_from_consumers(&[&[], &[]]).is_err());
+    assert_eq!(checkpoint(&insufficient), good);
+    let mut p = plan(2);
+    p.limits.max_workspace_bytes = required;
+    let mut actual = Session::new(p.clone(), parents.clone()).unwrap();
+    let mut direct = Session::new(p, parents.clone()).unwrap();
+    actual.step_from_consumers(&[&[], &[]]).unwrap();
+    let zero: Vec<_> = parents
+        .iter()
+        .map(|w| vec![0.0; w.scales().len()])
+        .collect();
+    direct
+        .step(&zero.iter().map(Vec::as_slice).collect::<Vec<_>>())
+        .unwrap();
+    assert_eq!(checkpoint(&actual), checkpoint(&direct));
+    assert_ne!(
+        actual.weights().next().unwrap().scales(),
+        parents[0].scales()
+    );
+}
+
+#[test]
+fn invalid_or_overflowing_consumer_contributions_preserve_all_owner_state() {
+    let parents = vec![simple(), simple()];
+    let mut actual = Session::new(plan(2), parents).unwrap();
+    step(&mut actual, 0.125);
+    let good = checkpoint(&actual);
+    let x = vec![0.125; 260];
+    let dy = [0.25; 3];
+    let valid = [Use::Matmul {
+        activations: &x,
+        output_gradients: &dy,
+        batch: 1,
+    }];
+    let invalid = [Use::Embed {
+        ids: &[0, 3],
+        output_gradients: &[0.0; 520],
+    }];
+    assert!(actual.step_from_consumers(&[&valid, &invalid]).is_err());
+    assert_eq!(checkpoint(&actual), good);
+    let invalid = [Use::Matmul {
+        activations: &[],
+        output_gradients: &[],
+        batch: usize::MAX,
+    }];
+    assert!(actual.step_from_consumers(&[&valid, &invalid]).is_err());
+    assert_eq!(checkpoint(&actual), good);
+    assert!(actual.step_from_consumers(&[&valid]).is_err());
+    let mut nonfinite = x.clone();
+    nonfinite[259] = f32::NAN;
+    let invalid = [Use::Matmul {
+        activations: &nonfinite,
+        output_gradients: &dy,
+        batch: 1,
+    }];
+    assert!(actual.step_from_consumers(&[&valid, &invalid]).is_err());
+    assert_eq!(checkpoint(&actual), good);
+    let invalid = [Use::Matmul {
+        activations: &x,
+        output_gradients: &[f32::INFINITY; 3],
+        batch: 1,
+    }];
+    assert!(actual.step_from_consumers(&[&valid, &invalid]).is_err());
+    assert_eq!(checkpoint(&actual), good);
+    let mut huge = vec![0.0; 260];
+    huge[2] = f32::MAX;
+    let invalid = [Use::Matmul {
+        activations: &huge,
+        output_gradients: &[f32::MAX; 3],
+        batch: 1,
+    }];
+    assert!(actual.step_from_consumers(&[&valid, &invalid]).is_err());
+    assert_eq!(checkpoint(&actual), good);
+}
+
+fn fixture_outputs(weight: &AdditiveTensor, x: &[f32], ids: &[usize]) -> (Vec<f32>, Vec<f32>) {
+    let cols = weight.layout().cols as usize;
+    let batch = x.len() / cols;
+    let mut y = vec![0.0; batch * weight.layout().rows as usize];
+    reference_ternary_matmul(
+        x,
+        &weight.view().bind_matmul(),
+        batch,
+        &mut vec![0.0; x.len()],
+        &mut y,
+    )
+    .unwrap();
+    let mut e = vec![0.0; ids.len() * cols];
+    reference_embed(&weight.view().bind_gather(), ids, &mut e).unwrap();
+    (y, e)
+}
+fn fixture_loss_and_cotangents(
+    weight: &AdditiveTensor,
+    x: &[f32],
+    ids: &[usize],
+    target: &(Vec<f32>, Vec<f32>),
+) -> (f64, Vec<f32>, Vec<f32>) {
+    let (y, e) = fixture_outputs(weight, x, ids);
+    let mut loss = 0.0;
+    let mut gradients = |values: &[f32], target: &[f32]| {
+        values
+            .iter()
+            .zip(target)
+            .map(|(&v, &t)| {
+                let residual = v - t;
+                loss += f64::from(residual).powi(2);
+                2.0 * residual
+            })
+            .collect::<Vec<_>>()
+    };
+    let dy = gradients(&y, &target.0);
+    let de = gradients(&e, &target.1);
+    (loss, dy, de)
+}
+
+#[test]
+fn actual_tied_matmul_embedding_loss_decreases_and_resumes_exactly() {
+    let layout = AdditiveLayout {
+        rows: 3,
+        cols: 4,
+        max_planes: 1,
+        basis: Basis::SignedRht {
+            block: 4,
+            seed: 19,
+            domain: 7,
+        },
+        ..simple().layout()
+    };
+    let parent = AdditiveTensor::new(
+        layout,
+        1,
+        [Trit::POS, Trit::ZERO, Trit::NEG, Trit::POS].repeat(3),
+        vec![0.5; 3],
+    )
+    .unwrap();
+    let mut teacher = parent.clone();
+    teacher.replace_scales(vec![0.8, 0.65, 0.9]).unwrap();
+    let x = consumer_values(8);
+    let ids = [2, 0, 2];
+    let target = fixture_outputs(&teacher, &x, &ids);
+    let mut p = plan(1);
+    if let NativeRecoveryRecipe::ScaleOnly { optimizer } = &mut p.recipe {
+        optimizer.lr = 0.02;
+        optimizer.weight_decay = 0.0;
+    }
+    let mut actual = Session::new(p.clone(), vec![parent.clone()]).unwrap();
+    let initial = fixture_loss_and_cotangents(&parent, &x, &ids, &target).0;
+    let mut resumed: Option<Session> = None;
+    for window in 0..4 {
+        let (_, dy, de) =
+            fixture_loss_and_cotangents(actual.weights().next().unwrap(), &x, &ids, &target);
+        let uses = [
+            Use::Matmul {
+                activations: &x,
+                output_gradients: &dy,
+                batch: 2,
+            },
+            Use::Embed {
+                ids: &ids,
+                output_gradients: &de,
+            },
+        ];
+        actual.step_from_consumers(&[&uses]).unwrap();
+        if let Some(state) = &mut resumed {
+            state.step_from_consumers(&[&uses]).unwrap();
+            assert_eq!(checkpoint(state), checkpoint(&actual));
+        }
+        if window == 1 {
+            resumed = Some(
+                Session::resume(p.clone(), vec![parent.clone()], &checkpoint(&actual)).unwrap(),
+            );
+        }
+    }
+    let final_loss =
+        fixture_loss_and_cotangents(actual.weights().next().unwrap(), &x, &ids, &target).0;
+    assert!(
+        final_loss < initial,
+        "fixture loss: {initial} -> {final_loss}"
+    );
+    assert_eq!(actual.weights().next().unwrap().trits(), parent.trits());
+    eprintln!("NATIVE_TIED_FIXTURE_LOSS initial={initial} final={final_loss}");
 }

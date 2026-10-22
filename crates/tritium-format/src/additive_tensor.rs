@@ -319,13 +319,13 @@ impl AdditiveTensor {
     /// Create a zero-copy semantic view over this owned tensor.
     #[must_use]
     pub fn view(&self) -> AdditiveView<'_> {
-        // Constructor established all invariants and fields are immutable.
+        // Constructors and checked scale replacement preserve all invariants.
         let view = if let Some(index) = &self.per_tile {
             AdditiveView::new_per_tile(index.as_index(), &self.trits, &self.scales)
         } else {
             AdditiveView::new(self.layout, self.plane_count, &self.trits, &self.scales)
         };
-        view.expect("AdditiveTensor invariants are immutable after construction")
+        view.expect("AdditiveTensor invariants are maintained by checked mutations")
     }
 }
 

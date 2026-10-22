@@ -10,7 +10,9 @@ use super::{PvTuningError, continuous::check_optimizer_moments};
 use crate::optim::{AdamState, AdamW, Optimizer};
 
 mod checkpoint;
+mod consumers;
 mod identity;
+pub use consumers::NativeScaleContribution;
 
 /// Logical selected-owner buffers; not graph memory, allocator capacity or RSS.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

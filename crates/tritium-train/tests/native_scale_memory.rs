@@ -110,6 +110,20 @@ fn scale_updates_do_not_copy_codes_or_allocate_dense_or_code_optimizer_state() {
             elements as u64 + 12
         );
         assert_eq!(state.size_ledger().update_workspace_bytes, 16);
+        let before = state.checkpoint_bytes().unwrap();
+        let (rejected, bytes) = measured(|| state.step_from_consumers(&[&[]]));
+        assert!(
+            rejected
+                .unwrap_err()
+                .to_string()
+                .contains("consumer workspace requires")
+        );
+        assert!(
+            bytes < 1024,
+            "preflight must not allocate its rejected basis row"
+        );
+        assert_eq!(state.checkpoint_bytes().unwrap(), before);
+        eprintln!("NATIVE_CONSUMER_PREFLIGHT elements={elements} allocated_request_bytes={bytes}");
         let address = state.weights().next().unwrap().trits().as_ptr();
         let (result, bytes) = measured(|| state.step(&[&[0.25]]));
         assert_eq!(result.unwrap(), 1);

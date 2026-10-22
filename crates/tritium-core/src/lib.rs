@@ -37,9 +37,9 @@ mod trit;
 
 pub use additive::{
     AdditiveError, AdditiveView, BasisBound, Gather, Matmul, UniformPlan, UniformTiles,
-    apply_basis, apply_basis_f64, apply_inverse_basis, fast_hadamard, fast_hadamard_f64,
-    group_is_rotatable, reference_embed, reference_ternary_matmul,
-    reference_ternary_matmul_input_vjp,
+    accumulate_embed_scale_vjp, accumulate_ternary_matmul_scale_vjp, apply_basis, apply_basis_f64,
+    apply_inverse_basis, fast_hadamard, fast_hadamard_f64, group_is_rotatable, reference_embed,
+    reference_ternary_matmul, reference_ternary_matmul_input_vjp,
 };
 pub use dense::{DenseError, DenseView};
 pub use dtype::{DType, TernaryFormat};
