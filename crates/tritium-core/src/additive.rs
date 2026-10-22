@@ -860,6 +860,66 @@ pub fn reference_ternary_matmul(
     Ok(())
 }
 
+/// Input vector-Jacobian product of the shared additive matmul operator.
+///
+/// For stored weights `A = W B^T`, forward computes `A B x`; this returns
+/// `B^T A^T dy` in the original input coordinates. In particular, signed RHT
+/// requires the inverse basis, not a second application of its forward basis.
+/// This is a linear-operator adjoint, not a scale/code gradient or an STE.
+///
+/// `output_gradients` has `batch * rows` values, `out` has `batch * cols`, and
+/// `row_workspace` has exactly `cols`. All products/lengths are checked before
+/// mutation. Zero batch still requires that row workspace but leaves it untouched.
+/// Output rows accumulate in ascending order using f32 multiply/add; each stored
+/// row is decoded once through the existing scale/allocation interpretation.
+/// Only caller-owned memory is used; no dense matrix or heap scratch is allocated.
+/// The view already contains decoded trits: this is not a packed backend kernel.
+/// As with forward reference math, finite-value/overflow policy is the caller's.
+///
+/// ```compile_fail
+/// use tritium_core::{AdditiveView, reference_ternary_matmul_input_vjp};
+/// fn wrong_consumer(view: AdditiveView<'_>) {
+///     reference_ternary_matmul_input_vjp(&[1.0], &view.bind_gather(), 1,
+///         &mut [0.0; 4], &mut [0.0; 4]).unwrap();
+/// }
+/// ```
+pub fn reference_ternary_matmul_input_vjp(
+    output_gradients: &[f32],
+    weights: &BasisBound<AdditiveView<'_>, Matmul>,
+    batch: usize,
+    row_workspace: &mut [f32],
+    out: &mut [f32],
+) -> Result<(), AdditiveError> {
+    let weights = &weights.tensor;
+    let rows = usize::try_from(weights.layout().rows).map_err(|_| AdditiveError::SizeOverflow)?;
+    let cols = usize::try_from(weights.layout().cols).map_err(|_| AdditiveError::SizeOverflow)?;
+    let gradient_count = batch.checked_mul(rows).ok_or(AdditiveError::SizeOverflow)?;
+    let input_count = batch.checked_mul(cols).ok_or(AdditiveError::SizeOverflow)?;
+    if output_gradients.len() != gradient_count
+        || row_workspace.len() != cols
+        || out.len() != input_count
+    {
+        return Err(AdditiveError::MatmulShape);
+    }
+    if batch == 0 {
+        return Ok(());
+    }
+    out.fill(0.0);
+    for row in 0..rows {
+        weights.dequant_row_into(row, row_workspace)?;
+        for (batch_row, input_gradient) in out.chunks_exact_mut(cols).enumerate() {
+            let gradient = output_gradients[batch_row * rows + row];
+            for (value, &coefficient) in input_gradient.iter_mut().zip(row_workspace.iter()) {
+                *value += gradient * coefficient;
+            }
+        }
+    }
+    for input_gradient in out.chunks_exact_mut(cols) {
+        apply_inverse_basis(input_gradient, weights.layout().basis)?;
+    }
+    Ok(())
+}
+
 fn validate_basis_blocks(len: usize, block: u32) -> Result<usize, AdditiveError> {
     if !block.is_power_of_two() {
         return Err(AdditiveError::InvalidLayout(LayoutError::InvalidBasisBlock));

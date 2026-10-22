@@ -41,6 +41,11 @@ The initial tensor state supplied to a training recipe. It is not a trained
 artifact or evidence that the recipe has executed.
 _Avoid_: trained model, qualification
 
+**Basis-restored input adjoint**:
+The loss contribution to a matmul consumer's input in its original coordinates,
+after undoing the stored tensor basis. It is distinct from a scale or code update.
+_Avoid_: ternary weight gradient, hard-code refinement
+
 **Training snapshot**:
 The parameter and optimizer state associated with one completed training step.
 It is distinct from a hard ternary export.
