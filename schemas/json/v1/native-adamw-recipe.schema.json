@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NativeAdamWRecipe",
+  "description": "Typed native AdamW settings; equations belong to the common training engine.",
+  "type": "object",
+  "properties": {
+    "beta1": {
+      "description": "First-moment decay in [0,1), excluding negative zero.",
+      "type": "number",
+      "format": "float"
+    },
+    "beta2": {
+      "description": "Second-moment decay in [0,1), excluding negative zero.",
+      "type": "number",
+      "format": "float"
+    },
+    "eps": {
+      "description": "Finite positive epsilon outside the square root.",
+      "type": "number",
+      "format": "float"
+    },
+    "lr": {
+      "description": "Finite positive learning rate.",
+      "type": "number",
+      "format": "float"
+    },
+    "weight_decay": {
+      "description": "Finite nonnegative decoupled decay with lr*decay <=1.",
+      "type": "number",
+      "format": "float"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "lr",
+    "beta1",
+    "beta2",
+    "eps",
+    "weight_decay"
+  ]
+}

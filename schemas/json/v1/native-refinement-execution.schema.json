@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NativeRefinementExecution",
+  "description": "Recorded actual execution scope, not independently authenticated hardware.",
+  "type": "object",
+  "properties": {
+    "backend": {
+      "description": "Actual backend identifier.",
+      "type": "string"
+    },
+    "device": {
+      "description": "Actual machine/device observation.",
+      "type": "string"
+    },
+    "source_revision": {
+      "description": "Actual producing source revision identity.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "backend",
+    "device",
+    "source_revision"
+  ]
+}

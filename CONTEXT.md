@@ -56,6 +56,11 @@ A discrete additive-ternary representation intended for loading or inference.
 It does not contain the latent training state needed to resume optimization.
 _Avoid_: QAT checkpoint, dense master
 
+**Refined child**:
+A complete immutable hard artifact descended from one explicitly selected parent
+level through a declared recovery run. Its ancestry is distinct from quality qualification.
+_Avoid_: direct PTQ fit, overwritten parent, multilevel refinement
+
 **Model shell**:
 A model structure supplied to receive the stored state of a hard artifact.
 Its tensor shapes, dtypes and aliases are not evidence of source tensor values.

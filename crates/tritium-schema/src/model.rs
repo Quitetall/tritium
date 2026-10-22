@@ -3,7 +3,7 @@
 use crate::{
     AdditiveLayout, BlobId, LayoutError, PackageId, PlaneAllocation, ScalePrecision, SchemaId,
 };
-use alloc::{string::String, vec::Vec};
+use alloc::{boxed::Box, string::String, vec::Vec};
 
 /// Stored-byte blob reference, local unless a declared shard is selected.
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
@@ -120,6 +120,11 @@ pub enum LevelFit {
     },
     /// Imported weights without a direct-fit or exact-prefix claim.
     Imported,
+    /// Schema1.1 single-level recovery ancestry; not a Direct PTQ claim.
+    Refined {
+        /// Parent/request/original recovery evidence bindings.
+        ancestry: Box<crate::NativeRefinementAncestry>,
+    },
 }
 
 /// One complete model level; identical blob references may be shared across levels.
@@ -278,6 +283,8 @@ pub enum ModelManifestError {
     LevelShapeMismatch,
     /// Legacy identity points to an absent level.
     MissingLegacyLevel,
+    /// Refined ancestry/profile violates the explicit schema1.1 single-level contract.
+    InvalidRefinement,
 }
 
 impl core::fmt::Display for ModelManifestError {
@@ -295,8 +302,18 @@ impl ModelManifest {
     /// Returns a typed structural error; success is not model-load qualification.
     pub fn validate(&self) -> Result<(), ModelManifestError> {
         use ModelManifestError as E;
-        if self.schema != (SchemaId { major: 1, minor: 0 }) {
+        if self.schema.major != 1 || self.schema.minor > 1 {
             return Err(E::UnsupportedVersion(self.schema));
+        }
+        let refined = self
+            .levels
+            .iter()
+            .any(|level| matches!(level.fit, LevelFit::Refined { .. }));
+        if (self.schema.minor == 0 && refined)
+            || (self.schema.minor == 1
+                && (!refined || self.levels.len() != 1 || !self.legacy_ids.is_empty()))
+        {
+            return Err(E::InvalidRefinement);
         }
         name(&self.architecture, false)?;
         sorted(self.assets.iter().map(|x| x.name.as_str()), "assets")?;
@@ -338,6 +355,9 @@ impl ModelManifest {
         }
         for level in &self.levels {
             name(&level.name, false)?;
+            if let LevelFit::Refined { ancestry } = &level.fit {
+                ancestry.validate().map_err(|_| E::InvalidRefinement)?;
+            }
             sorted(level.tensors.iter().map(|t| t.name.as_str()), "tensors")?;
             if level.tensors.is_empty() || level.tensors.len() > 1_000_000 {
                 return Err(E::InvalidCount);

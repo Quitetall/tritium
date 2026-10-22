@@ -82,6 +82,11 @@ mod owner_quant_plan;
 pub use owner_quant_plan::*;
 
 #[cfg(feature = "alloc")]
+mod native_refinement;
+#[cfg(feature = "alloc")]
+pub use native_refinement::*;
+
+#[cfg(feature = "alloc")]
 mod calibration_capture;
 #[cfg(feature = "alloc")]
 pub use calibration_capture::*;
@@ -495,6 +500,14 @@ digest_id!(
 );
 digest_id!(PackageId, "Content identity for a Tritium package.");
 digest_id!(BlobId, "Content identity for stored tensor or asset bytes.");
+digest_id!(
+    NativeRefinementPlanId,
+    "Native recovery request identity in its own versioned domain, not a legacy PV recipe hash."
+);
+digest_id!(
+    NativeRefinementStateId,
+    "Scoped native checkpoint-content binding including request/cursor, not a model ID or legacy checkpoint digest."
+);
 digest_id!(
     OriginalSourceId,
     "Candidate identity of original named tensor/asset content, not fitted content or provenance."

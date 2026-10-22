@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NativeRefinementTensorOutput",
+  "description": "Compact output binding; exact storage interpretation is inherited from parent.",
+  "type": "object",
+  "properties": {
+    "content": {
+      "description": "Exact canonical stored-byte identity, not a semantic model ID.",
+      "$ref": "#/$defs/BlobId"
+    },
+    "name": {
+      "description": "Canonical tensor owner name.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "content"
+  ],
+  "$defs": {
+    "BlobId": {
+      "description": "Content identity for stored tensor or asset bytes.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    }
+  }
+}

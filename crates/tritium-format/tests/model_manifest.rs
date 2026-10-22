@@ -1095,6 +1095,13 @@ fn invalid_shape_version_inventory_and_required_assets_fail_structurally() {
     }
     let mut manifest = original.clone();
     manifest.schema.minor = 1;
+    // Minor1 is the explicit single-refined-level profile, not permission to
+    // reinterpret old Direct/Imported metadata under a new version.
+    assert_eq!(
+        manifest.validate(),
+        Err(ModelManifestError::InvalidRefinement)
+    );
+    manifest.schema.minor = 2;
     assert!(matches!(
         manifest.validate(),
         Err(ModelManifestError::UnsupportedVersion(_))

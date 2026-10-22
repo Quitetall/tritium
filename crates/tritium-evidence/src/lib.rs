@@ -21,9 +21,15 @@ mod model_load;
 pub use model_load::{MODEL_LOADED_REGISTRATION, ModelLoadReceiptView};
 
 mod model_import;
+mod native_refinement;
 pub use model_import::{
     LEGACY_MODEL_IMPORT_BOUND_PREPARED_REGISTRATION, LEGACY_MODEL_IMPORT_PREPARED_REGISTRATION,
     LegacyModelImportBoundView, LegacyModelImportView,
+};
+pub use native_refinement::{
+    NATIVE_REFINEMENT_CHECKPOINTED_REGISTRATION, NATIVE_REFINEMENT_COMPLETED_REGISTRATION,
+    NATIVE_REFINEMENT_STARTED_REGISTRATION, NativeRefinementParentView,
+    NativeRefinementReceiptView, native_refinement_plan_id, native_refinement_state_id,
 };
 
 mod direct_fit;
