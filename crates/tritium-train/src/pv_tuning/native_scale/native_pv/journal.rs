@@ -21,6 +21,11 @@ pub use paged::{
     NativePvPagedReplayError, NativePvPagedReplayLimits, NativePvPagedUpdate,
     replay_native_pv_paged_journal, resume_native_pv_paged_journal,
 };
+pub use paged::{
+    NativePvPagedResumeBundleError, NativePvPagedResumeBundleLimits,
+    NativePvPagedResumeBundleReader, PublishedNativePvPagedResumeBundle,
+    publish_native_pv_paged_resume_bundle, stage_native_pv_paged_resume_bundle,
+};
 pub use resume::{NativePvJournalResume, NativePvResumeTail, resume_native_pv_journal};
 
 /// Logical payload limits; excludes metadata, allocator and external model/stream memory.

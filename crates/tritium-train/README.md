@@ -296,5 +296,21 @@ checkpoint stream for each cursor and retire obsolete owned named files (or use
 anonymous streams); dropping a generic file handle does not delete its path.
 `NativePvPagedReplayLimits` separates full-schedule journal and 16384-byte extra
 I/O scratch caps from owner/source limits. These are logical payload bounds, not
-RSS/VRAM qualification. Paged bundles and deployed-child verification/publication
-remain separate work.
+RSS/VRAM qualification. Deployed-child verification/publication remains separate
+work.
+
+`stage_native_pv_paged_resume_bundle` and
+`publish_native_pv_paged_resume_bundle` reuse the standard TNPB transport and
+new-directory fsync/no-clobber publication. They stream actual checkpoint bytes
+without a checkpoint `Vec`, recheck state and live-prefix bytes after output
+effects, and preserve poisoning/restoration on source uncertainty or unwind.
+`NativePvPagedResumeBundleReader` retains only decoded metadata and source regions;
+its `resume` invokes actual-original-owner numerical replay through independent
+checkpoint/prefix views, then rechecks the whole bundle and reconstructed state.
+No extraction files or original-source writes. A byte-consistent bundle is still
+untrusted recovery input, not numerical or quality proof.
+`NativePvPagedResumeBundleLimits` separately caps checkpoint/bundle bytes and
+encoded manifest plus8192bytes transport scratch; resident bundle limits keep
+their checkpoint-inclusive meaning. Numerical replay, source, decoded metadata,
+allocator/stream/OS-cache and physical-memory budgets remain separate. Budget disk
+and retire only obsolete owned private workspaces after retained recovery succeeds.

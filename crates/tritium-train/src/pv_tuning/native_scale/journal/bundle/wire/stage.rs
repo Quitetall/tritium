@@ -4,7 +4,7 @@ use super::*;
 pub(super) struct Prepared {
     pub(super) manifest: Manifest,
     metadata: Vec<u8>,
-    checkpoint: Vec<u8>,
+    checkpoint: Option<Vec<u8>>,
     total: u64,
 }
 struct Count {
@@ -28,18 +28,18 @@ pub(super) fn prepare(
     journal: &mut impl Live,
     limits: NativeScaleResumeBundleLimits,
 ) -> Result<Prepared> {
-    journal.check()?;
     let c = journal.checkpoint_bytes();
     // Admit checkpoint allocation and scratch before snapshot flush/serialization.
     if limits.max_checkpoint_bytes < c
         || limits.max_manifest_bytes == 0
         || limits.max_bundle_bytes == 0
-        || add(c, SCRATCH as u64)? > limits.max_working_bytes
+        || add(if journal.streamed() { 0 } else { c }, SCRATCH as u64)? > limits.max_working_bytes
     {
         return Err(NativeScaleResumeBundleError::Limit(
             "native resume bundle byte limit exceeded",
         ));
     }
+    journal.check()?;
     let (checkpoint, manifest) = journal.snapshot()?;
     let mut count = Count {
         bytes: 0,
@@ -53,6 +53,7 @@ pub(super) fn prepare(
         count.bytes,
         c,
         manifest.point().journal_prefix_bytes,
+        journal.streamed(),
     )?;
     journal.flush()?;
     let mut metadata = bytes(count.bytes)?;
@@ -129,6 +130,23 @@ fn prefix<O: Write>(journal: &mut impl Live, point: Point, output: &mut Output<O
     restored
 }
 
+// Reuse the exact bounded prefix traversal/restoration/poisoning after output
+// effects. Hashing transferred bytes alone misses a source changed just after
+// its final read. No second format or full-prefix buffer is introduced.
+pub(super) fn verify_prefix(journal: &mut impl Live, point: Point) -> Result<()> {
+    journal.check()?;
+    prefix(
+        journal,
+        point,
+        &mut Output {
+            source: io::sink(),
+            hash: blake3::Hasher::new(),
+            bytes: 0,
+        },
+    )?;
+    journal.check()
+}
+
 fn write<O: Read + Write + Seek>(
     prepared: &Prepared,
     journal: &mut impl Live,
@@ -143,10 +161,14 @@ fn write<O: Read + Write + Seek>(
     };
     out.write(&prepared.manifest.kind().magic())?;
     out.write(&(prepared.metadata.len() as u64).to_le_bytes())?;
-    out.write(&(prepared.checkpoint.len() as u64).to_le_bytes())?;
+    out.write(&prepared.manifest.point().checkpoint_bytes.to_le_bytes())?;
     out.write(&prepared.manifest.point().journal_prefix_bytes.to_le_bytes())?;
     out.write(&prepared.metadata)?;
-    out.write(&prepared.checkpoint)?;
+    journal.write_checkpoint(
+        prepared.checkpoint.as_deref(),
+        &prepared.manifest.point(),
+        |b| out.write(b),
+    )?;
     prefix(journal, prepared.manifest.point(), &mut out)?;
     let body = out.hash.finalize();
     out.write(body.as_bytes())?;
@@ -155,6 +177,7 @@ fn write<O: Read + Write + Seek>(
     }
     out.source.flush()?;
     seek(&mut out.source, SeekFrom::End(0), prepared.total)?;
+    verify_prefix(journal, prepared.manifest.point())?;
     Ok((
         out.source,
         BlobId::from_bytes(*out.hash.finalize().as_bytes()),
@@ -168,10 +191,17 @@ pub(super) fn stage<O: Read + Write + Seek>(
     limits: NativeScaleResumeBundleLimits,
 ) -> Result<ReaderCore<O>> {
     let kind = prepared.manifest.kind();
+    let point = prepared.manifest.point();
     let (output, id) = write(&prepared, journal, output)?;
     // Do not retain two encoded metadata/checkpoint copies while reopening.
     drop(prepared);
-    ReaderCore::open(output, id, limits, kind)
+    let opened = if journal.streamed() {
+        ReaderCore::open_streamed(output, id, limits, kind)
+    } else {
+        ReaderCore::open(output, id, limits, kind)
+    };
+    verify_prefix(journal, point)?;
+    opened
 }
 
 /// Stage, flush and reopen a self-contained recovery file in an empty owned stream.

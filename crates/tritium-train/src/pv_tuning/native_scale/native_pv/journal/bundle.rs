@@ -17,16 +17,16 @@ struct PvLive<'a, W> {
 }
 impl<W: Read + Write + Seek> wire::Live for PvLive<'_, W> {
     type Stream = W;
-    fn check(&self) -> BundleResult<()> {
+    fn check(&mut self) -> BundleResult<()> {
         Ok(self.journal.check(self.session)?)
     }
     fn checkpoint_bytes(&self) -> u64 {
         self.session.size_ledger().checkpoint_bytes
     }
-    fn snapshot(&self) -> BundleResult<(Vec<u8>, wire::Manifest)> {
+    fn snapshot(&mut self) -> BundleResult<(Option<Vec<u8>>, wire::Manifest)> {
         let (checkpoint, point) = self.journal.snapshot_unflushed(self.session)?;
         Ok((
-            checkpoint,
+            Some(checkpoint),
             wire::Manifest::Pv(NativePvResumeManifest {
                 plan: self.session.plan().clone(),
                 point,

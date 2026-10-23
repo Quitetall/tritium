@@ -2,7 +2,13 @@
 use super::super::checkpoint::WireError;
 use super::super::paged::{NativePvPagedError, NativePvPagedSession, PagedJournalState};
 use super::*;
+mod bundle;
 mod replay;
+pub use bundle::{
+    NativePvPagedResumeBundleError, NativePvPagedResumeBundleLimits,
+    NativePvPagedResumeBundleReader, PublishedNativePvPagedResumeBundle,
+    publish_native_pv_paged_resume_bundle, stage_native_pv_paged_resume_bundle,
+};
 pub use replay::{
     NativePvPagedJournalReplay, NativePvPagedJournalResume, NativePvPagedReplayError,
     NativePvPagedReplayLimits, replay_native_pv_paged_journal, resume_native_pv_paged_journal,
@@ -150,14 +156,17 @@ impl<W: Write + Seek> NativePvPagedJournalWriter<W> {
         if verify(session)? != state {
             return Err(invalid("paged checkpoint changed during snapshot"));
         }
-        Ok(NativePvResumePoint {
+        Ok(self.point(state))
+    }
+    fn point(&self, state: PagedJournalState) -> NativePvResumePoint {
+        NativePvResumePoint {
             plan: state.plan,
             completed_updates: state.completed,
             journal_prefix: BlobId::from_bytes(*self.inner.hasher.finalize().as_bytes()),
             journal_prefix_bytes: self.inner.bytes,
             checkpoint: state.checkpoint,
             checkpoint_bytes: state.checkpoint_bytes,
-        })
+        }
     }
     /// Seal the complete standard journal against freshly rechecked paged state.
     pub fn finish<R: Read + Seek>(

@@ -47,6 +47,11 @@ pub use native_scale::{
     NativePvPagedRecordingSizeLedger, NativePvPagedUpdate,
 };
 pub use native_scale::{
+    NativePvPagedResumeBundleError, NativePvPagedResumeBundleLimits,
+    NativePvPagedResumeBundleReader, PublishedNativePvPagedResumeBundle,
+    publish_native_pv_paged_resume_bundle, stage_native_pv_paged_resume_bundle,
+};
+pub use native_scale::{
     NativeRefinementOwnerReadLimits, NativeRefinementOwnerSource, NativeRefinementOwnerSourceError,
 };
 pub use native_scale::{

@@ -1,6 +1,10 @@
 //! Actual recorded PTQ package through scoped source and paged numerical state.
 use super::*;
 use std::cell::Cell;
+use tritium_train::pv_tuning::{
+    NativePvPagedResumeBundleLimits, NativePvResumeBundleLimits,
+    stage_native_pv_paged_resume_bundle, stage_native_pv_resume_bundle,
+};
 fn read_limits() -> NativeRefinementOwnerReadLimits {
     NativeRefinementOwnerReadLimits {
         max_working_bytes: 1_000_000,
@@ -162,6 +166,33 @@ fn original_ptq_packages_feed_complete_paged_recovery_and_standard_replay_withou
                         )
                         .unwrap();
                     }
+                    let bundle_cap = NativePvPagedResumeBundleLimits {
+                        max_bundle_bytes: 1_000_000,
+                        max_manifest_bytes: 100_000,
+                        max_checkpoint_bytes: 1_000_000,
+                        max_working_bytes: 108192,
+                    };
+                    let bundle = stage_native_pv_paged_resume_bundle(
+                        &mut paged,
+                        &mut paged_journal,
+                        Cursor::new(Vec::new()),
+                        bundle_cap,
+                    )
+                    .unwrap();
+                    let resident_bundle = stage_native_pv_resume_bundle(
+                        &reference,
+                        &mut journal,
+                        Cursor::new(Vec::new()),
+                        NativePvResumeBundleLimits {
+                            max_bundle_bytes: 1_000_000,
+                            max_manifest_bytes: 100_000,
+                            max_checkpoint_bytes: 1_000_000,
+                            max_working_bytes: 1_000_000,
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(bundle.id(), resident_bundle.id());
+                    assert_eq!(bundle.bytes(), resident_bundle.bytes());
                     let final_point = paged_journal.checkpoint(&mut paged).unwrap();
                     let (actual, actual_summary) = paged_journal.finish(&mut paged).unwrap();
                     let (journal, summary) = journal.finish(&reference).unwrap();
@@ -174,6 +205,26 @@ fn original_ptq_packages_feed_complete_paged_recovery_and_standard_replay_withou
                         paging: paged_limits(),
                     };
                     let mut expected = Cursor::new(checkpoint.clone());
+                    let (mut bundled, bundled_writer) = NativeRefinementOwnerSource::with(
+                        &mut f.parent,
+                        &f.view,
+                        &plan,
+                        read_limits(),
+                        |source| {
+                            bundle.resume(
+                                Cursor::new(Vec::new()),
+                                |i, n| source.load(i, n),
+                                |_| Ok(Cursor::new(Vec::new())),
+                                replay_cap,
+                            )
+                        },
+                    )
+                    .unwrap();
+                    let (bundled_journal, bundled_summary) =
+                        bundled_writer.finish(&mut bundled).unwrap();
+                    assert_eq!(bundled_journal.get_ref(), journal.get_ref());
+                    assert_eq!(bundled_summary, summary);
+                    assert_eq!(bundled.into_checkpoint().into_inner(), checkpoint);
                     let (mut checked, proof) = NativeRefinementOwnerSource::with(
                         &mut f.parent,
                         &f.view,

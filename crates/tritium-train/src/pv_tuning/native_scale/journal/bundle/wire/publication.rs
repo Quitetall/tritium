@@ -39,6 +39,7 @@ pub(in crate::pv_tuning::native_scale) fn publish(
         let mut bundle = stage::stage(prepared, journal, file, limits)?;
         bundle.source.sync_all()?;
         bundle.verify_unchanged()?;
+        stage::verify_prefix(journal, bundle.manifest.point())?;
         fs::hard_link(&pending, &destination)?;
         Ok(bundle)
     })();

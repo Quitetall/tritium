@@ -35,13 +35,13 @@ pub(in crate::pv_tuning::native_scale) enum Manifest {
     Scale(NativeScaleResumeManifest),
     Pv(NativePvResumeManifest),
 }
-struct Point {
-    plan: NativeRefinementPlanId,
-    completed_updates: u64,
-    journal_prefix: BlobId,
-    journal_prefix_bytes: u64,
-    checkpoint: BlobId,
-    checkpoint_bytes: u64,
+pub(in crate::pv_tuning::native_scale) struct Point {
+    pub plan: NativeRefinementPlanId,
+    pub completed_updates: u64,
+    pub journal_prefix: BlobId,
+    pub journal_prefix_bytes: u64,
+    pub checkpoint: BlobId,
+    pub checkpoint_bytes: u64,
 }
 impl Manifest {
     fn parse(kind: Kind, bytes: &[u8]) -> Result<Self> {
@@ -103,9 +103,26 @@ impl Manifest {
 // shared transport controls prefix poisoning/restoration, never numerical replay.
 pub(in crate::pv_tuning::native_scale) trait Live {
     type Stream: Read + Write + Seek;
-    fn check(&self) -> Result<()>;
+    fn check(&mut self) -> Result<()>;
     fn checkpoint_bytes(&self) -> u64;
-    fn snapshot(&self) -> Result<(Vec<u8>, Manifest)>;
+    fn snapshot(&mut self) -> Result<(Option<Vec<u8>>, Manifest)>;
+    fn streamed(&self) -> bool {
+        false
+    }
+    fn write_checkpoint(
+        &mut self,
+        checkpoint: Option<&[u8]>,
+        _point: &Point,
+        mut write: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        for chunk in checkpoint
+            .ok_or_else(|| invalid("native resume checkpoint missing"))?
+            .chunks(SCRATCH)
+        {
+            write(chunk)?;
+        }
+        Ok(())
+    }
     fn flush(&mut self) -> Result<()>;
     fn stream(&mut self) -> (&mut Self::Stream, &mut bool);
 }
@@ -194,7 +211,7 @@ fn add(a: u64, b: u64) -> Result<u64> {
         "native resume bundle size overflow",
     ))
 }
-fn admit(l: NativeScaleResumeBundleLimits, m: u64, c: u64, p: u64) -> Result<u64> {
+fn admit(l: NativeScaleResumeBundleLimits, m: u64, c: u64, p: u64, streamed: bool) -> Result<u64> {
     let total = add(add(add(64, m)?, c)?, p)?;
     if m == 0
         || c == 0
@@ -206,7 +223,7 @@ fn admit(l: NativeScaleResumeBundleLimits, m: u64, c: u64, p: u64) -> Result<u64
         || m > l.max_manifest_bytes as u64
         || c > l.max_checkpoint_bytes
         || total > l.max_bundle_bytes
-        || add(add(m, c)?, SCRATCH as u64)? > l.max_working_bytes
+        || add(add(m, if streamed { 0 } else { c })?, SCRATCH as u64)? > l.max_working_bytes
     {
         return Err(NativeScaleResumeBundleError::Limit(
             "native resume bundle byte limit exceeded",
@@ -230,7 +247,11 @@ fn bytes(n: u64) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn verify_raw<R: Read + Seek>(s: &mut R, total: u64, expected: BlobId) -> Result<()> {
+pub(in crate::pv_tuning::native_scale) fn verify_raw<R: Read + Seek>(
+    s: &mut R,
+    total: u64,
+    expected: BlobId,
+) -> Result<()> {
     seek(s, SeekFrom::End(0), total)?;
     seek(s, SeekFrom::Start(0), 0)?;
     let mut hash = blake3::Hasher::new();
@@ -260,7 +281,8 @@ fn verify_raw<R: Read + Seek>(s: &mut R, total: u64, expected: BlobId) -> Result
 pub(in crate::pv_tuning::native_scale) struct ReaderCore<R> {
     source: R,
     manifest: Manifest,
-    checkpoint: Vec<u8>,
+    checkpoint: Option<Vec<u8>>,
+    checkpoint_offset: u64,
     prefix_offset: u64,
     total: u64,
     id: BlobId,
@@ -268,10 +290,27 @@ pub(in crate::pv_tuning::native_scale) struct ReaderCore<R> {
 impl<R: Read + Seek> ReaderCore<R> {
     /// Admit exact complete bytes before bounded JSON/checkpoint allocation.
     pub(in crate::pv_tuning::native_scale) fn open(
+        source: R,
+        expected: BlobId,
+        limits: NativeScaleResumeBundleLimits,
+        kind: Kind,
+    ) -> Result<Self> {
+        Self::open_mode(source, expected, limits, kind, false)
+    }
+    pub(in crate::pv_tuning::native_scale) fn open_streamed(
+        source: R,
+        expected: BlobId,
+        limits: NativeScaleResumeBundleLimits,
+        kind: Kind,
+    ) -> Result<Self> {
+        Self::open_mode(source, expected, limits, kind, true)
+    }
+    fn open_mode(
         mut source: R,
         expected: BlobId,
         limits: NativeScaleResumeBundleLimits,
         kind: Kind,
+        streamed: bool,
     ) -> Result<Self> {
         // Limits on the header itself are checked before touching a caller stream.
         if limits.max_bundle_bytes < 64
@@ -292,7 +331,7 @@ impl<R: Read + Seek> ReaderCore<R> {
         let m = u64::from_le_bytes(header[8..16].try_into().expect("fixed header"));
         let c = u64::from_le_bytes(header[16..24].try_into().expect("fixed header"));
         let p = u64::from_le_bytes(header[24..32].try_into().expect("fixed header"));
-        let total = admit(limits, m, c, p)?;
+        let total = admit(limits, m, c, p, streamed)?;
         verify_raw(&mut source, total, expected)?;
         seek(&mut source, SeekFrom::Start(0), 0)?;
         let mut input = Reader {
@@ -320,16 +359,29 @@ impl<R: Read + Seek> ReaderCore<R> {
         {
             return Err(invalid("native resume bundle manifest binding differs"));
         }
-        let mut checkpoint = bytes(c)?;
-        for chunk in checkpoint.chunks_mut(SCRATCH) {
-            input.read(chunk)?;
+        let checkpoint_offset = input.bytes;
+        let mut scratch = [0; SCRATCH];
+        let mut checkpoint = if streamed { None } else { Some(bytes(c)?) };
+        let mut checkpoint_hash = blake3::Hasher::new();
+        if let Some(data) = checkpoint.as_mut() {
+            for chunk in data.chunks_mut(SCRATCH) {
+                input.read(chunk)?;
+                checkpoint_hash.update(chunk);
+            }
+        } else {
+            let mut left = c;
+            while left > 0 {
+                let n = left.min(SCRATCH as u64) as usize;
+                input.read(&mut scratch[..n])?;
+                checkpoint_hash.update(&scratch[..n]);
+                left -= n as u64;
+            }
         }
-        if blake3::hash(&checkpoint).as_bytes() != point.checkpoint.as_bytes() {
+        if checkpoint_hash.finalize().as_bytes() != point.checkpoint.as_bytes() {
             return Err(invalid("native resume bundle checkpoint differs"));
         }
         let prefix_offset = input.bytes;
         let mut hash = blake3::Hasher::new();
-        let mut scratch = [0; SCRATCH];
         let mut left = p;
         while left > 0 {
             let n = left.min(SCRATCH as u64) as usize;
@@ -350,6 +402,7 @@ impl<R: Read + Seek> ReaderCore<R> {
             source: input.source,
             manifest,
             checkpoint,
+            checkpoint_offset,
             prefix_offset,
             total,
             id: expected,
@@ -385,7 +438,48 @@ impl<R: Read + Seek> ReaderCore<R> {
             ..
         } = self;
         let source = Prefix::new(source, prefix_offset, manifest.point().journal_prefix_bytes)?;
-        Ok((source, manifest, checkpoint))
+        Ok((
+            source,
+            manifest,
+            checkpoint.ok_or_else(|| invalid("resident checkpoint missing"))?,
+        ))
+    }
+    pub(in crate::pv_tuning::native_scale) fn into_streamed_parts(
+        mut self,
+    ) -> Result<StreamedParts<R>> {
+        if self.checkpoint.is_some() {
+            return Err(invalid("streamed checkpoint expected"));
+        }
+        self.verify_unchanged()?;
+        Ok(StreamedParts {
+            source: self.source,
+            manifest: self.manifest,
+            checkpoint_offset: self.checkpoint_offset,
+            prefix_offset: self.prefix_offset,
+            total: self.total,
+            id: self.id,
+        })
+    }
+}
+
+pub(in crate::pv_tuning::native_scale) struct StreamedParts<R> {
+    pub source: R,
+    pub manifest: Manifest,
+    pub checkpoint_offset: u64,
+    pub prefix_offset: u64,
+    pub total: u64,
+    pub id: BlobId,
+}
+
+pub(in crate::pv_tuning::native_scale) struct Shared<'a, R>(pub &'a std::cell::RefCell<R>);
+impl<R: Read> Read for Shared<'_, R> {
+    fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+        self.0.borrow_mut().read(b)
+    }
+}
+impl<R: Seek> Seek for Shared<'_, R> {
+    fn seek(&mut self, s: SeekFrom) -> io::Result<u64> {
+        self.0.borrow_mut().seek(s)
     }
 }
 
@@ -396,7 +490,11 @@ pub(in crate::pv_tuning::native_scale) struct Prefix<R> {
     position: u64,
 }
 impl<R: Seek> Prefix<R> {
-    fn new(mut source: R, start: u64, len: u64) -> Result<Self> {
+    pub(in crate::pv_tuning::native_scale) fn new(
+        mut source: R,
+        start: u64,
+        len: u64,
+    ) -> Result<Self> {
         seek(&mut source, SeekFrom::Start(start), start)?;
         Ok(Self {
             source,
@@ -406,11 +504,20 @@ impl<R: Seek> Prefix<R> {
         })
     }
 }
-impl<R: Read> Read for Prefix<R> {
+impl<R: Read + Seek> Read for Prefix<R> {
     fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
         let n = (self.len - self.position).min(b.len() as u64) as usize;
         if n == 0 {
             return Ok(0);
+        }
+        // Checkpoint/prefix regions may share one source: every read restores
+        // its own absolute cursor rather than trusting the other region's seek.
+        let absolute = self
+            .start
+            .checked_add(self.position)
+            .ok_or_else(|| io::Error::other("native resume prefix seek overflow"))?;
+        if self.source.seek(SeekFrom::Start(absolute))? != absolute {
+            return Err(io::Error::other("native resume prefix seek differs"));
         }
         let n = self.source.read(&mut b[..n])?;
         self.position += n as u64;

@@ -35,6 +35,11 @@ pub use native_pv::{
     NativePvPagedJournalWriter, NativePvPagedRecordingError, NativePvPagedRecordingLimits,
     NativePvPagedRecordingSizeLedger, NativePvPagedUpdate,
 };
+pub use native_pv::{
+    NativePvPagedResumeBundleError, NativePvPagedResumeBundleLimits,
+    NativePvPagedResumeBundleReader, PublishedNativePvPagedResumeBundle,
+    publish_native_pv_paged_resume_bundle, stage_native_pv_paged_resume_bundle,
+};
 mod consumers;
 #[cfg(feature = "native-cpu")]
 mod cpu;

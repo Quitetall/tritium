@@ -23,6 +23,8 @@ use tritium_train::pv_tuning::{
     replay_native_pv_journal_with_state, replay_native_pv_paged_journal,
     resume_native_pv_paged_journal,
 };
+#[path = "native_pv_paged/bundle.rs"]
+mod bundle;
 #[path = "native_pv_paged/recording.rs"]
 mod recording;
 #[path = "native_pv_paged/replay.rs"]

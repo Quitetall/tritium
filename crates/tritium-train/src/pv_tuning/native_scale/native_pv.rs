@@ -28,6 +28,11 @@ pub use journal::{
     replay_native_pv_journal, replay_native_pv_journal_with_state, replay_native_pv_paged_journal,
     resume_native_pv_journal, resume_native_pv_paged_journal, stage_native_pv_resume_bundle,
 };
+pub use journal::{
+    NativePvPagedResumeBundleError, NativePvPagedResumeBundleLimits,
+    NativePvPagedResumeBundleReader, PublishedNativePvPagedResumeBundle,
+    publish_native_pv_paged_resume_bundle, stage_native_pv_paged_resume_bundle,
+};
 
 /// Logical buffer lengths; excludes metadata, allocator slack and external graphs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

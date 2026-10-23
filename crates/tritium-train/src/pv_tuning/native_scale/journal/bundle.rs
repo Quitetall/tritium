@@ -20,16 +20,16 @@ struct ScaleLive<'a, W> {
 }
 impl<W: Read + Write + Seek> wire::Live for ScaleLive<'_, W> {
     type Stream = W;
-    fn check(&self) -> Result<()> {
+    fn check(&mut self) -> Result<()> {
         Ok(self.journal.check(self.session)?)
     }
     fn checkpoint_bytes(&self) -> u64 {
         self.session.size_ledger().checkpoint_bytes
     }
-    fn snapshot(&self) -> Result<(Vec<u8>, wire::Manifest)> {
+    fn snapshot(&mut self) -> Result<(Option<Vec<u8>>, wire::Manifest)> {
         let (checkpoint, point) = self.journal.snapshot_unflushed(self.session)?;
         Ok((
-            checkpoint,
+            Some(checkpoint),
             wire::Manifest::Scale(NativeScaleResumeManifest {
                 plan: self.session.plan().clone(),
                 point,

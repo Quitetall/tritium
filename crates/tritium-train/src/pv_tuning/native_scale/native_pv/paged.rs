@@ -325,6 +325,9 @@ impl<R: Read + Seek> NativePvPagedSession<R> {
     pub(super) fn journal_channels(&self) -> &[(u64, u64)] {
         &self.channels
     }
+    pub(super) fn journal_checkpoint(&mut self) -> &mut R {
+        &mut self.checkpoint
+    }
     pub(super) fn verify_journal_source(&mut self) -> Result<(), WireError> {
         if checkpoint::inspect(&mut self.checkpoint, self.observed.bytes)? != self.observed {
             return Err(invalid("native PV paging committed checkpoint drift").into());
