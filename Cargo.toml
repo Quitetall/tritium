@@ -149,7 +149,9 @@ anyhow = "1"
 # multi-GB (50GB+ sharded) model fully into RAM — pages fault in per touched tensor.
 memmap2 = "0.9"
 # serve (OpenAI HTTP/SSE server; all behind tritium-serve's `serve` feature)
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "macros", "signal", "time", "sync"] }
+# RUSTSEC-2026-0386: require the patched AsyncFd I/O-safety release for
+# downstream registry consumers too, not only this workspace's lockfile.
+tokio = { version = "1.53.3", default-features = false, features = ["rt-multi-thread", "net", "macros", "signal", "time", "sync"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 async-stream = "0.3"
 futures-core = "0.3"
