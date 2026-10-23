@@ -16,8 +16,10 @@ pub use bundle::{
     PublishedNativePvResumeBundle, publish_native_pv_resume_bundle, stage_native_pv_resume_bundle,
 };
 pub use paged::{
-    NativePvPagedJournalWriter, NativePvPagedRecordingError, NativePvPagedRecordingLimits,
-    NativePvPagedRecordingSizeLedger, NativePvPagedUpdate,
+    NativePvPagedJournalReplay, NativePvPagedJournalResume, NativePvPagedJournalWriter,
+    NativePvPagedRecordingError, NativePvPagedRecordingLimits, NativePvPagedRecordingSizeLedger,
+    NativePvPagedReplayError, NativePvPagedReplayLimits, NativePvPagedUpdate,
+    replay_native_pv_paged_journal, resume_native_pv_paged_journal,
 };
 pub use resume::{NativePvJournalResume, NativePvResumeTail, resume_native_pv_journal};
 
@@ -586,21 +588,17 @@ fn replay_frames<R: Read>(
     if updates > admission.plan.training.len() {
         return Err(invalid("native replay cursor exceeds schedule"));
     }
-    if input.array::<8>()? != MAGIC
-        || input.array::<32>()? != *admission.plan_id.as_bytes()
-        || input.array::<32>()? != admission.parent
-        || input.u64()? != admission.plan.training.len() as u64
-        || input.u64()? != admission.plan.owners.len() as u64
-    {
-        return Err(invalid("native journal header differs"));
-    }
+    let mut channels = reserved(parents.len())?;
     for weight in &parents {
-        if input.u64()? != weight.scales().len() as u64
-            || input.u64()? != active_count(weight)? as u64
-        {
-            return Err(invalid("native journal owner gradient counts differ"));
-        }
+        channels.push((weight.scales().len() as u64, active_count(weight)? as u64));
     }
+    replay_header(
+        input,
+        admission.plan_id,
+        admission.parent,
+        admission.plan.training.len() as u64,
+        &channels,
+    )?;
     let mut session = admission.with_parents(parents)?;
     let mut scale_gradients = reserved(session.owners.len())?;
     let mut weight_gradients = reserved(session.owners.len())?;
@@ -609,20 +607,13 @@ fn replay_frames<R: Read>(
         weight_gradients.push(zeroed(active_count(weight)?)?);
     }
     for ordinal in 0..updates {
-        let encoded_ordinal = input.array::<8>()?;
-        let window = input.array::<32>()?;
-        if u64::from_le_bytes(encoded_ordinal) != ordinal as u64
-            || window != session.plan.training[ordinal].content
-        {
-            return Err(invalid("native journal window/order differs"));
-        }
-        let mut frame = blake3::Hasher::new();
-        frame.update(FRAME_DOMAIN);
-        frame.update(&encoded_ordinal);
-        frame.update(&window);
+        let mut frame = replay_frame_header(
+            input,
+            ordinal as u64,
+            session.plan.training[ordinal].content,
+        )?;
         for (scale, weight) in scale_gradients.iter_mut().zip(&mut weight_gradients) {
-            stream::decode(scale, scratch, &mut frame, |bytes| input.read(bytes))?;
-            stream::decode(weight, scratch, &mut frame, |bytes| input.read(bytes))?;
+            replay_owner(input, scale, weight, scratch, &mut frame)?;
         }
         if input.array::<32>()? != *frame.finalize().as_bytes() {
             return Err(invalid("native journal frame checksum differs"));
@@ -639,4 +630,53 @@ fn replay_frames<R: Read>(
         )?;
     }
     Ok(session)
+}
+
+fn replay_header<R: Read>(
+    input: &mut Reader<R>,
+    plan: NativeRefinementPlanId,
+    parent: [u8; 32],
+    updates: u64,
+    channels: &[(u64, u64)],
+) -> Result<()> {
+    if input.array::<8>()? != MAGIC
+        || input.array::<32>()? != *plan.as_bytes()
+        || input.array::<32>()? != parent
+        || input.u64()? != updates
+        || input.u64()? != channels.len() as u64
+    {
+        return Err(invalid("native journal header differs"));
+    }
+    for &(scale, weight) in channels {
+        if input.u64()? != scale || input.u64()? != weight {
+            return Err(invalid("native journal owner gradient counts differ"));
+        }
+    }
+    Ok(())
+}
+fn replay_frame_header<R: Read>(
+    input: &mut Reader<R>,
+    ordinal: u64,
+    expected: [u8; 32],
+) -> Result<blake3::Hasher> {
+    let encoded = input.array::<8>()?;
+    let window = input.array::<32>()?;
+    if u64::from_le_bytes(encoded) != ordinal || window != expected {
+        return Err(invalid("native journal window/order differs"));
+    }
+    let mut frame = blake3::Hasher::new();
+    frame.update(FRAME_DOMAIN);
+    frame.update(&encoded);
+    frame.update(&window);
+    Ok(frame)
+}
+fn replay_owner<R: Read>(
+    input: &mut Reader<R>,
+    scales: &mut [f32],
+    weights: &mut [f32],
+    scratch: &mut [u8; SCRATCH],
+    frame: &mut blake3::Hasher,
+) -> Result<()> {
+    stream::decode(scales, scratch, frame, |bytes| input.read(bytes))?;
+    stream::decode(weights, scratch, frame, |bytes| input.read(bytes))
 }

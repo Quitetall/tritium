@@ -28,6 +28,10 @@ pub use native_pv::{
     NativePvPagedError, NativePvPagedLimits, NativePvPagedSession, NativePvPagedSizeLedger,
 };
 pub use native_pv::{
+    NativePvPagedJournalReplay, NativePvPagedJournalResume, NativePvPagedReplayError,
+    NativePvPagedReplayLimits, replay_native_pv_paged_journal, resume_native_pv_paged_journal,
+};
+pub use native_pv::{
     NativePvPagedJournalWriter, NativePvPagedRecordingError, NativePvPagedRecordingLimits,
     NativePvPagedRecordingSizeLedger, NativePvPagedUpdate,
 };

@@ -19,12 +19,14 @@ pub use verification::{NativePvChildVerification, VerifiedNativePvChild, verify_
 mod journal;
 pub use journal::{
     NativePvJournalError, NativePvJournalLimits, NativePvJournalResume, NativePvJournalSizeLedger,
-    NativePvJournalSummary, NativePvJournalWriter, NativePvPagedJournalWriter,
-    NativePvPagedRecordingError, NativePvPagedRecordingLimits, NativePvPagedRecordingSizeLedger,
-    NativePvPagedUpdate, NativePvResumeBundleError, NativePvResumeBundleLimits,
-    NativePvResumeBundleReader, NativePvResumeTail, PublishedNativePvResumeBundle,
-    VerifiedNativePvReplay, publish_native_pv_resume_bundle, replay_native_pv_journal,
-    replay_native_pv_journal_with_state, resume_native_pv_journal, stage_native_pv_resume_bundle,
+    NativePvJournalSummary, NativePvJournalWriter, NativePvPagedJournalReplay,
+    NativePvPagedJournalResume, NativePvPagedJournalWriter, NativePvPagedRecordingError,
+    NativePvPagedRecordingLimits, NativePvPagedRecordingSizeLedger, NativePvPagedReplayError,
+    NativePvPagedReplayLimits, NativePvPagedUpdate, NativePvResumeBundleError,
+    NativePvResumeBundleLimits, NativePvResumeBundleReader, NativePvResumeTail,
+    PublishedNativePvResumeBundle, VerifiedNativePvReplay, publish_native_pv_resume_bundle,
+    replay_native_pv_journal, replay_native_pv_journal_with_state, replay_native_pv_paged_journal,
+    resume_native_pv_journal, resume_native_pv_paged_journal, stage_native_pv_resume_bundle,
 };
 
 /// Logical buffer lengths; excludes metadata, allocator slack and external graphs.

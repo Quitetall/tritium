@@ -29,7 +29,7 @@ pub struct NativePvJournalResume<'a, R> {
     pub tail: NativePvResumeTail,
 }
 
-fn source_length(length: u64, prefix: u64, tail: NativePvResumeTail) -> Result<()> {
+pub(super) fn source_length(length: u64, prefix: u64, tail: NativePvResumeTail) -> Result<()> {
     if length < prefix || (tail == NativePvResumeTail::ExactPrefix && length != prefix) {
         return Err(invalid("native resume source length/tail differs"));
     }

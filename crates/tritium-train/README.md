@@ -259,8 +259,7 @@ limits and all checkpoint/journal/publication gates are unchanged.
 state. Its header, raw unweighted frames, footer, resume points and summaries are
 byte-identical to resident recording. It starts only at zero origin, binds its
 cursor to the exact checkpoint identity, and snapshots/finishes without a full
-checkpoint `Vec`. A resume point is not numerical replay; bounded paged prefix
-recovery and child verification/publication are still separate work.
+checkpoint `Vec`. A resume point is not numerical replay.
 
 Call `stage_recorded((empty_checkpoint, empty_frame), parents, gradients, stage,
 limits)` inside `NativeRefinementOwnerSource::with`, then call the opaque update's
@@ -282,3 +281,20 @@ Keep outputs private, budget disk, retain recovery evidence and retire obsolete
 owned spools only after their replacement is safely retained. Generic flush and
 recorded byte consistency do not grant fsync durability, objective/data/teacher
 authentication, numerical replay, model quality, GPU support or release approval.
+
+`replay_native_pv_paged_journal` numerically reconstructs a complete journal from
+original owners, returning the existing `VerifiedNativePvReplay` only after exact
+target checkpoint equality. `resume_native_pv_paged_journal` reconstructs a saved
+prefix, copies it into an empty new journal and returns a bound continuing writer;
+it never modifies the recovery source or grants a complete-schedule proof for a
+partial prefix. `ExactPrefix` rejects tails; `CheckpointPrefix` preserves the
+unparsed suffix. Both validate caps, source identities, original-owner geometry
+and canonical journal structure before creating optimizer workspace, then decode
+one owner's adjoints at a time through the shared parser/update. Actual traversal,
+transfer, target and reconstructed bytes are rechecked. Supply a new private
+checkpoint stream for each cursor and retire obsolete owned named files (or use
+anonymous streams); dropping a generic file handle does not delete its path.
+`NativePvPagedReplayLimits` separates full-schedule journal and 16384-byte extra
+I/O scratch caps from owner/source limits. These are logical payload bounds, not
+RSS/VRAM qualification. Paged bundles and deployed-child verification/publication
+remain separate work.

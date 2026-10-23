@@ -39,6 +39,10 @@ pub use native_scale::{
     NativePvPagedError, NativePvPagedLimits, NativePvPagedSession, NativePvPagedSizeLedger,
 };
 pub use native_scale::{
+    NativePvPagedJournalReplay, NativePvPagedJournalResume, NativePvPagedReplayError,
+    NativePvPagedReplayLimits, replay_native_pv_paged_journal, resume_native_pv_paged_journal,
+};
+pub use native_scale::{
     NativePvPagedJournalWriter, NativePvPagedRecordingError, NativePvPagedRecordingLimits,
     NativePvPagedRecordingSizeLedger, NativePvPagedUpdate,
 };

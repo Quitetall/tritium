@@ -15,14 +15,18 @@ use tritium_core::{PerTilePlan, Trit, UniformPlan};
 use tritium_format::AdditiveTensor;
 use tritium_schema::*;
 use tritium_train::pv_tuning::{
-    NativePvJournalLimits, NativePvJournalWriter, NativePvPagedError,
-    NativePvPagedJournalWriter as PagedWriter, NativePvPagedLimits as Limits,
-    NativePvPagedRecordingError as RecordingError, NativePvPagedRecordingLimits as RecordingLimits,
-    NativePvPagedSession as Paged, NativePvRefinementSession as Resident,
-    replay_native_pv_journal_with_state,
+    NativePvJournalLimits, NativePvJournalWriter, NativePvPagedError, NativePvPagedJournalReplay,
+    NativePvPagedJournalResume, NativePvPagedJournalWriter as PagedWriter,
+    NativePvPagedLimits as Limits, NativePvPagedRecordingError as RecordingError,
+    NativePvPagedRecordingLimits as RecordingLimits, NativePvPagedReplayLimits,
+    NativePvPagedSession as Paged, NativePvRefinementSession as Resident, NativePvResumeTail,
+    replay_native_pv_journal_with_state, replay_native_pv_paged_journal,
+    resume_native_pv_paged_journal,
 };
 #[path = "native_pv_paged/recording.rs"]
 mod recording;
+#[path = "native_pv_paged/replay.rs"]
+mod replay;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 struct Allocator;

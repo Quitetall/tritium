@@ -162,11 +162,67 @@ fn original_ptq_packages_feed_complete_paged_recovery_and_standard_replay_withou
                         )
                         .unwrap();
                     }
+                    let final_point = paged_journal.checkpoint(&mut paged).unwrap();
                     let (actual, actual_summary) = paged_journal.finish(&mut paged).unwrap();
                     let (journal, summary) = journal.finish(&reference).unwrap();
                     assert_eq!(actual.get_ref(), journal.get_ref());
                     assert_eq!(actual_summary, summary);
                     let checkpoint = paged.into_checkpoint().into_inner();
+                    let replay_cap = NativePvPagedReplayLimits {
+                        max_journal_bytes: 1_000_000,
+                        max_working_bytes: 16384,
+                        paging: paged_limits(),
+                    };
+                    let mut expected = Cursor::new(checkpoint.clone());
+                    let (mut checked, proof) = NativeRefinementOwnerSource::with(
+                        &mut f.parent,
+                        &f.view,
+                        &plan,
+                        read_limits(),
+                        |source| {
+                            replay_native_pv_paged_journal(
+                                NativePvPagedJournalReplay {
+                                    plan: plan.clone(),
+                                    source: actual.clone(),
+                                    expected_journal: actual_summary.journal(),
+                                    checkpoint: &mut expected,
+                                },
+                                |i, n| source.load(i, n),
+                                |_| Ok(Cursor::new(Vec::new())),
+                                replay_cap,
+                            )
+                        },
+                    )
+                    .unwrap();
+                    proof.verify_paged(&mut checked).unwrap();
+                    assert_eq!(proof.summary(), &actual_summary);
+                    assert_eq!(checked.into_checkpoint().into_inner(), checkpoint);
+                    let (mut recovered, writer) = NativeRefinementOwnerSource::with(
+                        &mut f.parent,
+                        &f.view,
+                        &plan,
+                        read_limits(),
+                        |source| {
+                            resume_native_pv_paged_journal(
+                                NativePvPagedJournalResume {
+                                    plan: plan.clone(),
+                                    source: actual,
+                                    point: &final_point,
+                                    checkpoint: &mut expected,
+                                    tail: NativePvResumeTail::CheckpointPrefix,
+                                },
+                                Cursor::new(Vec::new()),
+                                |i, n| source.load(i, n),
+                                |_| Ok(Cursor::new(Vec::new())),
+                                replay_cap,
+                            )
+                        },
+                    )
+                    .unwrap();
+                    let (recovered_journal, recovered_summary) =
+                        writer.finish(&mut recovered).unwrap();
+                    assert_eq!(recovered_journal.get_ref(), journal.get_ref());
+                    assert_eq!(recovered_summary, summary);
                     let replay = replay_native_pv_journal(
                         plan,
                         originals,

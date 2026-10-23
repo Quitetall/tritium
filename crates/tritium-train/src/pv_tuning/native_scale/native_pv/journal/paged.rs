@@ -2,6 +2,11 @@
 use super::super::checkpoint::WireError;
 use super::super::paged::{NativePvPagedError, NativePvPagedSession, PagedJournalState};
 use super::*;
+mod replay;
+pub use replay::{
+    NativePvPagedJournalReplay, NativePvPagedJournalResume, NativePvPagedReplayError,
+    NativePvPagedReplayLimits, replay_native_pv_paged_journal, resume_native_pv_paged_journal,
+};
 
 /// Independent journal/frame disk caps and recording-only scratch ceiling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,12 +32,17 @@ pub struct NativePvPagedRecordingSizeLedger {
 fn recording_sizes<R: Read + Seek>(
     session: &NativePvPagedSession<R>,
 ) -> Result<NativePvPagedRecordingSizeLedger> {
-    let gradients = session
-        .journal_channels()
+    channel_sizes(session.plan(), session.journal_channels())
+}
+fn channel_sizes(
+    plan: &NativeRefinementPlan,
+    channels: &[(u64, u64)],
+) -> Result<NativePvPagedRecordingSizeLedger> {
+    let gradients = channels
         .iter()
         .try_fold(0, |n, &(s, w)| sum(n, sum(s, w)?))?;
     Ok(NativePvPagedRecordingSizeLedger {
-        journal_bytes: journal_bytes(session.plan(), gradients)?,
+        journal_bytes: journal_bytes(plan, gradients)?,
         frame_bytes: sum(72, product(4, gradients)?)?,
         working_bytes: 2 * SCRATCH as u64,
     })

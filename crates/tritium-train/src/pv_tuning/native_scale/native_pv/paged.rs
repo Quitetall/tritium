@@ -107,7 +107,7 @@ impl<R> std::fmt::Debug for NativePvPagedSession<R> {
 fn invalid(text: &str) -> PvTuningError {
     PvTuningError::checkpoint(text)
 }
-fn empty_ledger() -> NativePvPagedSizeLedger {
+pub(super) fn empty_ledger() -> NativePvPagedSizeLedger {
     NativePvPagedSizeLedger {
         logical: NativePvSizeLedger {
             state_payload_bytes: 0,
@@ -117,7 +117,7 @@ fn empty_ledger() -> NativePvPagedSizeLedger {
         max_owner_payload_bytes: 0,
     }
 }
-fn account(
+pub(super) fn account(
     plan: &NativeRefinementPlan,
     limits: NativePvPagedLimits,
     fraction: f32,
