@@ -85,3 +85,56 @@ fn legacy_projection_session_vectors() {
         }
     }
 }
+
+#[test]
+fn blockwise_nonfinite_legacy_proposal_preserves_no_candidate_semantics() {
+    for sparse in [false, true] {
+        let parent = PvTernaryWeight::new(
+            1,
+            4,
+            4,
+            if sparse {
+                PvTernaryStructure::S34
+            } else {
+                PvTernaryStructure::Dense
+            },
+            vec![PvTernaryPlane::new(
+                if sparse { vec![0, 1, 1, 1] } else { vec![1; 4] },
+                vec![f16::ONE],
+            )],
+        )
+        .unwrap();
+        let adam = |lr| AdamW {
+            lr,
+            beta1: 0.0,
+            beta2: 0.0,
+            eps: 1e-8,
+            weight_decay: 0.0,
+        };
+        let config = PvTuningConfig::builder(
+            adam(0.001),
+            AdamW {
+                eps: f32::MIN_POSITIVE,
+                ..adam(f32::MAX)
+            },
+        )
+        .max_code_change_fraction(1.0)
+        .build()
+        .unwrap();
+        let mut session = PvTuningSession::new(parent.clone(), config).unwrap();
+        session.begin_blockwise_step(1, 4).unwrap();
+        session.apply_gradient_block(0, &[1e-30; 4]).unwrap();
+        // Legacy blockwise proposal arithmetic can overflow although its stored
+        // moments remain finite. It historically found no improving candidate,
+        // rather than panicking or changing checkpoint/optimizer semantics.
+        let receipt = session.finish_blockwise_step().unwrap();
+        assert_eq!(receipt.changed_code_units(), 0);
+        assert!(receipt.v_surrogate_before().is_infinite());
+        assert!(receipt.v_surrogate_after().is_infinite());
+        assert_eq!(
+            session.weight().planes()[0].trits(),
+            parent.planes()[0].trits()
+        );
+        assert_eq!(session.completed_step(), 1);
+    }
+}

@@ -91,6 +91,14 @@ where
 // legacy adapter widens one unit only, preserving its original f32 arithmetic
 // and outer selection/trust accounting. No dense owner conversion is involved.
 fn best_candidate(weight: &PvTernaryWeight, unit: usize, target: &[f32]) -> Option<CodeCandidate> {
+    // Legacy blockwise arithmetic may produce an infinite/NaN proposal from
+    // finite stored moments. Its old loss comparisons selected no candidate
+    // in that case. Keep that compatibility here; native callers still receive
+    // the common projector's explicit NonFinite error. Do not turn a legacy
+    // no-candidate case into an expect panic or silently change its optimizer.
+    if target.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
     use tritium_core::{AdditiveView, Trit, project_additive_code_unit};
     use tritium_schema::{
         ADMITTED_LAWS, AdditiveLayout, Basis, PlaneAllocation, PlaneCodec, Transport,
