@@ -135,7 +135,11 @@ source decoding and packed payloads have separate limits. This is not within-own
 paging, GPU training or a physical RSS/VRAM measurement. Python/Torch callers can
 explicitly select `native_pv_paged_training` with `NativePvPagedTrainingLimits`
 and a new private workspace for recorded updates, streamed resume bundles and
-child publication. The default resident controllers and high-level refinement
+child publication. Optional `NativePvPagedGradientLimits` capture uses scalar
+autograd tokens and a bounded private adjoint spool instead of all-owner Torch
+gradient leaves. One owner VJP, activations, packed models and disk/I/O costs
+still remain; this is not whole-model memory qualification. The default resident
+controllers and high-level refinement
 facade retain their existing semantics. See [training](docs/book/src/training.md)
 for the storage/graph limits; model qualification remains open.
 

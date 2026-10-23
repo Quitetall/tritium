@@ -16,6 +16,7 @@ use tritium_cpu::CpuBackend;
 use tritium_runtime::TensorPayloadBudget;
 use tritium_schema::NativeRefinementPlan;
 use tritium_train::pv_tuning::*;
+mod gradients;
 mod publication;
 mod recovery;
 pub(crate) use recovery::NativePvPagedResumeBundle;
@@ -26,6 +27,49 @@ fn strict_u64(value: &Bound<'_, PyAny>) -> PyResult<u64> {
         ));
     }
     value.extract()
+}
+
+/// Private on-disk adjoints, one owner contribution plus bounded I/O scratch.
+#[derive(Clone, Copy)]
+#[pyclass(frozen, module = "tritium._tritium", skip_from_py_object)]
+pub(crate) struct NativePvPagedGradientLimits {
+    #[pyo3(get)]
+    pub max_spool_bytes: u64,
+    #[pyo3(get)]
+    pub max_owner_working_bytes: u64,
+    #[pyo3(get)]
+    pub max_contributions: u64,
+}
+#[pymethods]
+impl NativePvPagedGradientLimits {
+    #[new]
+    #[pyo3(signature=(*,max_spool_bytes,max_owner_working_bytes,max_contributions))]
+    fn new(
+        #[pyo3(from_py_with=strict_u64)] max_spool_bytes: u64,
+        #[pyo3(from_py_with=strict_u64)] max_owner_working_bytes: u64,
+        #[pyo3(from_py_with=strict_u64)] max_contributions: u64,
+    ) -> PyResult<Self> {
+        let v = Self {
+            max_spool_bytes,
+            max_owner_working_bytes,
+            max_contributions,
+        };
+        v.check()?;
+        Ok(v)
+    }
+}
+impl NativePvPagedGradientLimits {
+    fn check(self) -> PyResult<()> {
+        if self.max_spool_bytes < 8
+            || self.max_owner_working_bytes < gradients::HEADROOM
+            || self.max_contributions == 0
+        {
+            return Err(error(
+                "capture limits require spool>=8, owner working>=16384 and positive contributions",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Disjoint logical caps; excludes caller Torch buffers, metadata, OS and RSS.
@@ -142,6 +186,8 @@ struct Runtime {
     driver: NativeCpuPvPagedSession<Checkpoint>,
     recording: Recording,
     specs: Vec<NativePackedMatrix>,
+    capture_layout: Option<gradients::Layout>,
+    pending: Option<gradients::Window<Checkpoint>>,
 }
 /// Single-controller eager CPU training with seek-backed optimizer state.
 #[pyclass(frozen, module = "tritium._tritium", skip_from_py_object)]
@@ -152,6 +198,7 @@ pub(crate) struct NativePvPagedTraining {
     directory: PathBuf,
     parent: NativeTrainingParent,
     limits: NativePvPagedTrainingLimits,
+    capture_limits: Option<NativePvPagedGradientLimits>,
 }
 impl NativePvPagedTraining {
     fn lock(&self) -> PyResult<std::sync::MutexGuard<'_, Option<Runtime>>> {
@@ -162,10 +209,79 @@ impl NativePvPagedTraining {
     fn runtime(v: &mut Option<Runtime>) -> PyResult<&mut Runtime> {
         v.as_mut().ok_or_else(|| error("paged training is closed"))
     }
+    fn pending<'a>(&self, s: &'a mut Runtime) -> PyResult<&'a mut gradients::Window<Checkpoint>> {
+        let caps = self
+            .capture_limits
+            .ok_or_else(|| error("gradient capture is not enabled"))?;
+        self.workspace.check().map_err(error)?;
+        if s.pending.is_none() {
+            let layout = s.capture_layout.as_ref().expect("capture layout").clone();
+            let file = self
+                .workspace
+                .create_blob(layout.bytes, 8192)
+                .map_err(error)?;
+            s.pending =
+                Some(gradients::Window::new(file, layout, caps.max_contributions).map_err(error)?);
+        }
+        Ok(s.pending.as_mut().expect("admitted pending gradients"))
+    }
+    fn update(
+        &self,
+        s: &mut Runtime,
+        revision: u64,
+        window: &[u8],
+        mut gradient: impl FnMut(
+            usize,
+            &tritium_format::AdditiveTensor,
+        ) -> PyResult<(Vec<f32>, Vec<f32>)>,
+    ) -> PyResult<(usize, usize)> {
+        let plan = s.driver.session().plan().clone();
+        if s.driver.session().completed_updates() != revision {
+            return Err(error("stale paged training revision"));
+        }
+        if plan
+            .training
+            .get(revision as usize)
+            .is_none_or(|w| window != w.content)
+        {
+            return Err(error("paged training window differs or schedule exhausted"));
+        }
+        let Recording::Writing(journal) = &mut s.recording else {
+            return Err(error("paged recording is sealed or failed"));
+        };
+        let ledger = s.driver.session().recording_size_ledger().map_err(error)?;
+        let checkpoint = self
+            .workspace
+            .create_blob(
+                s.driver.session().size_ledger().logical.checkpoint_bytes,
+                8192,
+            )
+            .map_err(error)?;
+        let frame = self
+            .workspace
+            .create_blob(ledger.frame_bytes, 8192)
+            .map_err(error)?;
+        let ready = source(&self.parent, &plan, self.limits, |parents| {
+            s.driver
+                .stage_recorded(
+                    (checkpoint, frame),
+                    |i, n| parents.load(i, n).map_err(error),
+                    |i, _, _, w| gradient(i, w),
+                    self.limits.recording(),
+                )
+                .map_err(error)
+        })?;
+        let (next, stats) = ready.commit(&mut s.driver, journal).map_err(error)?;
+        s.driver = next;
+        Ok((
+            stats.changed_scales,
+            stats.owners.iter().map(|o| o.changed_units).sum(),
+        ))
+    }
 }
 
 #[pyfunction]
-#[pyo3(signature=(parent,plan_json,matrices,workspace_dir,*,limits,max_snapshot_bytes,resume=None))]
+#[pyo3(signature=(parent,plan_json,matrices,workspace_dir,*,limits,max_snapshot_bytes,resume=None,gradient_capture=None))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn _begin_paged_pv_training(
     py: Python<'_>,
@@ -176,11 +292,16 @@ pub(crate) fn _begin_paged_pv_training(
     limits: PyRef<'_, NativePvPagedTrainingLimits>,
     max_snapshot_bytes: u64,
     resume: Option<PyRef<'_, NativePvPagedResumeBundle>>,
+    gradient_capture: Option<PyRef<'_, NativePvPagedGradientLimits>>,
 ) -> PyResult<NativePvPagedTraining> {
     let parent = NativeTrainingParent::extract(parent)?;
     let plan = parse(plan_json)?;
     let limits = *limits;
     limits.check()?;
+    let capture_limits = gradient_capture.as_deref().copied();
+    if let Some(l) = capture_limits {
+        l.check()?;
+    }
     if max_snapshot_bytes == 0 || matrices.iter().map(|x| &x.0).ne(plan.owners.iter()) {
         return Err(error("paged training owner inventory/snapshot cap differs"));
     }
@@ -279,16 +400,42 @@ pub(crate) fn _begin_paged_pv_training(
         let driver = source(&parent, &plan, limits, |s| {
             NativeCpuPvPagedSession::bind(state, roots, budget, |i, n| s.load(i, n)).map_err(error)
         })?;
+        let capture_layout = if let Some(caps) = capture_limits {
+            let cpu = CpuBackend::new();
+            let counts = driver
+                .handles()
+                .map(|(_, h)| {
+                    let s = cpu.additive_stored_scale_count(&**h).map_err(error)?;
+                    let w = cpu.additive_present_weight_count(&**h).map_err(error)?;
+                    if s.checked_add(w)
+                        .and_then(|n| (n as u64).checked_mul(4))
+                        .is_none_or(|n| n > limits.max_gradient_working_bytes)
+                    {
+                        return Err(error("capture step gradient working cap exceeded"));
+                    }
+                    Ok((s, w))
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            Some(
+                gradients::Layout::new(&counts, caps.max_spool_bytes, caps.max_owner_working_bytes)
+                    .map_err(error)?,
+            )
+        } else {
+            None
+        };
         Ok(NativePvPagedTraining {
             state: Mutex::new(Some(Runtime {
                 driver,
                 recording: Recording::Writing(Box::new(journal)),
                 specs,
+                capture_layout,
+                pending: None,
             })),
             workspace,
             directory,
             parent,
             limits,
+            capture_limits,
         })
     })
 }
@@ -309,8 +456,15 @@ impl NativePvPagedTraining {
             r.warnings
                 .push("RuntimeCleanup: training lock poisoned; no state admission".into());
         }
+        let lock = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pending = lock.as_ref().and_then(|s| s.pending.as_ref());
         serde_json::json!({"storage":"owner-paged","reserved_bytes":r.reserved_bytes,"files":r.files,
             "peak_reserved_bytes":r.peak_reserved_bytes,"peak_files":r.peak_files,"cleaned":r.cleaned,"cleanup_warnings":r.warnings,
+            "gradient_capture_enabled":self.capture_limits.is_some(),"pending_gradient_bytes":pending.map_or(0,|p|p.bytes()),
+            "pending_contributions":pending.map_or(0,|p|p.contributions),"pending_gradient_poisoned":pending.is_some_and(|p|p.poisoned),
             "quality_qualified":false,"physical_memory_qualified":false}).to_string()
     }
     fn frame(
@@ -350,6 +504,15 @@ impl NativePvPagedTraining {
                     return Err(error("paged gradient leaf exceeds output cap"));
                 }
                 // Values are private transport only; forward uses immutable packed h.
+                if self.capture_limits.is_some() && matrix.dimensions().2 < 8 {
+                    return Err(error("capture scalar token exceeds output cap"));
+                }
+                let count = if self.capture_limits.is_some() {
+                    self.pending(s)?;
+                    1
+                } else {
+                    count
+                };
                 Some(crate::native_scale::zeros(count)?)
             } else {
                 None
@@ -368,6 +531,11 @@ impl NativePvPagedTraining {
         window: Vec<u8>,
         gradients: Vec<Option<Dlpack>>,
     ) -> PyResult<(usize, usize)> {
+        if self.capture_limits.is_some() {
+            return Err(error(
+                "capture mode requires step_captured, not caller gradients",
+            ));
+        }
         let values = gradients
             .iter()
             .map(|g| {
@@ -417,52 +585,128 @@ impl NativePvPagedTraining {
                     return Err(error("paged gradient shape/working cap exceeded"));
                 }
             }
-            let Recording::Writing(journal) = &mut s.recording else {
-                return Err(error("paged recording is sealed or failed"));
-            };
-            let ledger = s.driver.session().recording_size_ledger().map_err(error)?;
-            let checkpoint = self
-                .workspace
-                .create_blob(
-                    s.driver.session().size_ledger().logical.checkpoint_bytes,
-                    8192,
-                )
-                .map_err(error)?;
-            let frame = self
-                .workspace
-                .create_blob(ledger.frame_bytes, 8192)
-                .map_err(error)?;
-            let ready = source(&self.parent, &plan, self.limits, |parents| {
-                s.driver
-                    .stage_recorded(
-                        (checkpoint, frame),
-                        |i, n| parents.load(i, n).map_err(error),
-                        |i, _, _, w| {
-                            let split = w.scales().len();
-                            let count = super::count(w)?;
-                            let mut scales = Vec::new();
-                            let mut weights = Vec::new();
-                            scales.try_reserve_exact(split).map_err(error)?;
-                            weights.try_reserve_exact(count - split).map_err(error)?;
-                            if let Some(v) = values[i] {
-                                scales.extend(v[..split].iter().map(|&x| x as f32));
-                                weights.extend(v[split..].iter().map(|&x| x as f32));
-                            } else {
-                                scales.resize(split, 0.);
-                                weights.resize(count - split, 0.);
-                            }
-                            Ok((scales, weights))
-                        },
-                        self.limits.recording(),
-                    )
-                    .map_err(error)
-            })?;
-            let (next, stats) = ready.commit(&mut s.driver, journal).map_err(error)?;
-            s.driver = next;
-            Ok((
-                stats.changed_scales,
-                stats.owners.iter().map(|o| o.changed_units).sum(),
-            ))
+            self.update(s, revision, &window, |i, w| {
+                let split = w.scales().len();
+                let count = super::count(w)?;
+                let mut scales = Vec::new();
+                let mut weights = Vec::new();
+                scales.try_reserve_exact(split).map_err(error)?;
+                weights.try_reserve_exact(count - split).map_err(error)?;
+                if let Some(v) = values[i] {
+                    scales.extend(v[..split].iter().map(|&x| x as f32));
+                    weights.extend(v[split..].iter().map(|&x| x as f32));
+                } else {
+                    scales.resize(split, 0.);
+                    weights.resize(count - split, 0.);
+                }
+                Ok((scales, weights))
+            })
+        })
+    }
+    fn admit_capture(&self, owner: &str, revision: u64) -> PyResult<()> {
+        let mut lock = self.lock()?;
+        let s = Self::runtime(&mut lock)?;
+        if s.driver.session().completed_updates() != revision {
+            return Err(error("stale capture revision"));
+        }
+        if revision >= s.driver.session().plan().training.len() as u64
+            || !matches!(s.recording, Recording::Writing(_))
+        {
+            return Err(error("capture schedule exhausted or recording sealed"));
+        }
+        let i = s
+            .driver
+            .session()
+            .plan()
+            .owners
+            .iter()
+            .position(|n| n == owner)
+            .ok_or_else(|| error("capture owner absent"))?;
+        self.pending(s)?.admit(i).map_err(error)
+    }
+    fn capture_gradient(
+        &self,
+        py: Python<'_>,
+        owner: &str,
+        revision: u64,
+        values: Dlpack,
+    ) -> PyResult<()> {
+        let shape = tensor_shape(&values, "captured gradient")?;
+        let values = values.cpu_data_slice::<f64>().map_err(error)?;
+        if shape != [values.len()] {
+            return Err(error("capture gradient must be a vector"));
+        }
+        py.detach(|| {
+            self.admit_capture(owner, revision)?;
+            let mut lock = self.lock()?;
+            let s = Self::runtime(&mut lock)?;
+            // Recheck after admission; direct callers cannot cross a committed step.
+            if s.driver.session().completed_updates() != revision {
+                return Err(error("stale capture revision"));
+            }
+            let i = s
+                .driver
+                .session()
+                .plan()
+                .owners
+                .iter()
+                .position(|n| n == owner)
+                .ok_or_else(|| error("capture owner absent"))?;
+            self.pending(s)?.capture(i, values).map_err(error)
+        })
+    }
+    fn poison_capture(&self) {
+        if let Ok(mut lock) = self.state.lock()
+            && let Some(s) = lock.as_mut()
+            && let Some(p) = s.pending.as_mut()
+        {
+            p.poisoned = true;
+        }
+    }
+    fn clear_capture(&self) -> PyResult<()> {
+        let mut lock = self.lock()?;
+        let s = Self::runtime(&mut lock)?;
+        if self.capture_limits.is_none() {
+            return Err(error("gradient capture is not enabled"));
+        }
+        drop(s.pending.take());
+        // Admit fresh storage before exposing the next backward window.
+        self.pending(s)?;
+        Ok(())
+    }
+    fn step_captured(
+        &self,
+        py: Python<'_>,
+        revision: u64,
+        window: Vec<u8>,
+    ) -> PyResult<(usize, usize)> {
+        if self.capture_limits.is_none() {
+            return Err(error("gradient capture is not enabled"));
+        }
+        py.detach(|| {
+            let mut lock = self.lock()?;
+            let s = Self::runtime(&mut lock)?;
+            let mut pending = s
+                .pending
+                .take()
+                .ok_or_else(|| error("no captured gradients"))?;
+            if pending.poisoned || pending.contributions == 0 {
+                s.pending = Some(pending);
+                return Err(error(
+                    "captured window empty or poisoned; zero_grad required",
+                ));
+            }
+            let result = self.update(s, revision, &window, |i, w| {
+                let scales = w.scales().len();
+                let count = super::count(w)?;
+                pending.gradients(i, scales, count - scales).map_err(error)
+            });
+            // Only committed state consumes observations. Uncertain spool reads
+            // remain poisoned; source-only refusal preserves valid pending data.
+            if result.is_err() {
+                s.pending = Some(pending);
+            }
+            result
         })
     }
     fn checkpoint(&self) -> PyResult<()> {

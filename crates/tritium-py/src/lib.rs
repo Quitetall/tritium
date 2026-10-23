@@ -413,6 +413,7 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<native_pv::NativePvTraining>()?;
     m.add_class::<native_pv::paged::NativePvPagedTraining>()?;
     m.add_class::<native_pv::paged::NativePvPagedTrainingLimits>()?;
+    m.add_class::<native_pv::paged::NativePvPagedGradientLimits>()?;
     m.add_class::<native_pv::paged::NativePvPagedResumeBundle>()?;
     m.add_function(wrap_pyfunction!(
         native_pv::paged::_begin_paged_pv_training,

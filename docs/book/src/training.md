@@ -114,6 +114,56 @@ physical RSS/VRAM, source authenticity and objective/data/teacher attestation ar
 not established by this interface. Within-owner/GPU state and real-model
 quality/performance qualification remain open.
 
+### Bounded pending-gradient capture
+
+Pass an explicit `gradient_capture=NativePvPagedGradientLimits(...)` to the paged
+factory to avoid full-size f64 leaf values and accumulated Torch `.grad` tensors
+across all selected owners. This mode uses one scalar private autograd token per
+active owner; actual packed Matmul/Embed adjoints are written to a single private
+pending gradient window. Resident and ordinary paged modes are unchanged.
+
+```python
+from tritium import NativePvPagedGradientLimits
+
+capture = NativePvPagedGradientLimits(
+    max_spool_bytes=1_000_000,
+    max_owner_working_bytes=1_000_000,
+    max_contributions=128,
+)
+# Include gradient_capture=capture in native_pv_paged_training(...).
+```
+
+These are small-fixture caps, not Qwen sizing. The logical spool extent is
+`8 + 8*sum(S+A)` bytes, where each owner has `S` stored scales and `A` present
+weight adjoints. Largest-owner working admission is `16384 + 8*max(S+A)` for
+one VJP contribution plus bounded I/O, separately from source/numerical/packed/
+saved-input caps and the step's f32 transfer limit. Every callback, including
+repeated/tied and empty contributions, consumes the contribution counter. The
+spool also consumes the existing aggregate anonymous-workspace budget/file cap.
+Sparse-file initialization avoids a whole-window zero buffer, not the eventual
+disk/OS-cache cost of writing observations.
+
+Call `zero_grad()` before each declared objective window. It retires previous
+pending observations and admits a fresh spool. First-order custom backward
+callbacks are serialized, sum in f64 in execution order and narrow once per
+owner before the common recorded updater applies window weight. Every supported
+callback execution contributes; these observations do not attest the objective.
+The scalar tokens are transport only: no `torch.optim`, external leaf edits or
+concurrent caller mutation is supported. Input-gradient and alias/version guards
+remain active. Failed backward poisons pending work; clear with `zero_grad()`.
+
+Only successful recorded `step()` consumes pending observations. Source-only
+refusal leaves committed state unchanged and retains valid pending work; uncertain
+spool reads require clearing it. Resume bundles omit pending observations and
+contain only committed checkpoint/history, just as ordinary mode omits pending
+Torch gradients. Child publication still performs actual-parent numerical replay
+through the common publisher. TNPJ, TNPB and artifact formats do not change.
+
+This removes one all-owner retention source, not every memory bottleneck. A full
+owner VJP and numerical owner, caller activations, packed current/old graphs,
+teacher state, raw checkpoints/journals/spools and their I/O remain. Physical
+memory, GPU/within-owner/compact-state and model-quality gates are still open.
+
 ## LoRA on a frozen ternary base
 
 LoRA adapters train on top of a **frozen** ternary base. The contract, proptested:

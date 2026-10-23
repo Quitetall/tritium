@@ -69,6 +69,9 @@ pub(crate) struct Report {
     pub warnings: Vec<String>,
 }
 impl Workspace {
+    pub(crate) fn check(&self) -> io::Result<()> {
+        self.0.lock().map_err(poison)?.check()
+    }
     pub(crate) fn report(&self) -> Report {
         let s = self
             .0

@@ -64,6 +64,11 @@ committed training snapshot. It is distinct from an individual tensor version or
 permission to replace a live graph before its recorded update commits.
 _Avoid_: trained model, qualified checkpoint, partial owner update
 
+**Pending gradient window**:
+Uncommitted owner adjoints associated with one current training revision. It is
+distinct from a committed training snapshot or authenticated objective execution.
+_Avoid_: trained checkpoint, recovery bundle, qualification receipt
+
 **Owner calibration recipe**:
 An ordered, weighted set of declared scalar objectives and observation limits
 for tensor owners. It is distinct from captured observations and qualification.
