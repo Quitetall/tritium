@@ -17,6 +17,10 @@ mod error;
 mod identity;
 mod native_scale;
 pub use native_scale::{
+    NativePvCandidate, NativePvOwnerStep, NativePvRefinementSession, NativePvSizeLedger,
+    NativePvStageError, NativePvStepStats,
+};
+pub use native_scale::{
     NativeScaleResumeBundleError, NativeScaleResumeBundleLimits, NativeScaleResumeBundleReader,
     PublishedNativeScaleResumeBundle, publish_native_scale_resume_bundle,
     stage_native_scale_resume_bundle,

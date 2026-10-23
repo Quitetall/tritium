@@ -335,6 +335,39 @@ impl AdditiveTensor {
         Ok(())
     }
 
+    /// Replace coefficients transactionally, preserving scales and geometry.
+    ///
+    /// Checks exact compact/uniform length and complete canonical per-plane
+    /// codec structure with fixed stack buffers, not encoded model allocation.
+    /// In particular S34 must retain exactly one zero in each four-trit block.
+    /// Errors leave all tensor state unchanged. This is not package admission.
+    pub fn replace_trits(&mut self, trits: Vec<Trit>) -> Result<(), AdditiveTensorError> {
+        let view = if let Some(index) = &self.per_tile {
+            AdditiveView::new_per_tile(index.as_index(), &trits, &self.scales)
+        } else {
+            AdditiveView::new(self.layout, self.plane_count, &trits, &self.scales)
+        }
+        .map_err(AdditiveTensorError::InvalidView)?;
+        let codec = salt_codec(self.layout.codec)?;
+        for plane in 0..view.plane_count() {
+            for chunk in view
+                .plane_trits(plane)
+                .map_err(AdditiveTensorError::InvalidView)?
+                .chunks(20)
+            {
+                let bytes = codec
+                    .ledger(chunk.len())
+                    .map_err(AdditiveTensorError::Codec)?
+                    .physical_bytes;
+                codec
+                    .pack_into(chunk, &mut [0; 5][..bytes])
+                    .map_err(AdditiveTensorError::Codec)?;
+            }
+        }
+        self.trits = trits;
+        Ok(())
+    }
+
     /// Borrow row-major compact counts, or `None` for uniform allocation.
     #[must_use]
     pub fn tile_counts(&self) -> Option<&[u8]> {

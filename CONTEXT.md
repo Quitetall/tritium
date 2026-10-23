@@ -11,6 +11,11 @@ A jointly projected set of additive ternary coefficients for one logical weight,
 or one four-weight sparse 3:4 block, across its present planes.
 _Avoid_: optimizer step, scale group, tensor owner
 
+**Present weight coordinate**:
+A stored-basis logical weight position whose tile retains a base ternary plane,
+even when its coefficient is zero. It is distinct from an individual plane coefficient.
+_Avoid_: nonzero weight, dense slot, trit index
+
 **Source-bound chat prompt**:
 A conversation rendered using the template and token vocabulary belonging to
 the loaded model source. It is distinct from an architecture-based approximation.

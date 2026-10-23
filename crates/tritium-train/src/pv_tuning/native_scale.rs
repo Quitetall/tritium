@@ -10,6 +10,11 @@ use super::{PvTuningError, continuous::check_optimizer_moments};
 use crate::optim::{AdamState, AdamW, Optimizer};
 
 mod checkpoint;
+mod native_pv;
+pub use native_pv::{
+    NativePvCandidate, NativePvOwnerStep, NativePvRefinementSession, NativePvSizeLedger,
+    NativePvStageError, NativePvStepStats,
+};
 mod consumers;
 #[cfg(feature = "native-cpu")]
 mod cpu;
@@ -197,42 +202,16 @@ impl NativeScaleRefinementSession {
         let mut candidates = reserved(self.owners.len())?;
         let mut changed = 0;
         for (owner, gradient) in self.owners.iter().zip(gradients) {
-            let mut weighted = reserved(gradient.len())?;
-            for &value in gradient.iter() {
-                let value = (f64::from(value) * window.weight) as f32;
-                if !value.is_finite() {
-                    return Err(PvTuningError::step(
-                        "weighted native scale gradient overflowed f32",
-                    ));
-                }
-                weighted.push(value);
-            }
-            let mut values = copied(owner.weight.scales())?;
-            let mut state = AdamState {
-                m: copied(&owner.state.m)?,
-                v: copied(&owner.state.v)?,
-            };
-            self.optimizer
-                .step(next, &mut values, &weighted, &mut state);
-            check_optimizer_moments(&state, "native scale")?;
-            check_corrected_moments(self.optimizer, next, &state).map_err(PvTuningError::step)?;
-            for value in &mut values {
-                if !value.is_finite() {
-                    return Err(PvTuningError::step(
-                        "native optimizer produced a non-finite scale",
-                    ));
-                }
-                *value = round_scale(value.max(0.0), owner.weight.layout().law.precision)?;
-            }
-            owner.weight.validate_scales(&values).map_err(|e| {
-                PvTuningError::step(format!("native scale update is invalid: {e:?}"))
-            })?;
-            changed += values
-                .iter()
-                .zip(owner.weight.scales())
-                .filter(|(a, b)| a.to_bits() != b.to_bits())
-                .count();
-            candidates.push(ScaleCandidate { values, state });
+            let candidate = prepare_scale_candidate(
+                &owner.weight,
+                &owner.state,
+                self.optimizer,
+                next,
+                window.weight,
+                gradient,
+            )?;
+            changed += candidate.0;
+            candidates.push(candidate.1);
         }
         Ok(PreparedScaleStep {
             next,
@@ -459,4 +438,50 @@ fn check_corrected_moments(
         return Err("native bias-corrected optimizer moment became non-finite");
     }
     Ok(())
+}
+
+// One native continuous law for scale-only and alternating P/V sessions.
+fn prepare_scale_candidate(
+    weight: &AdditiveTensor,
+    state: &AdamState,
+    optimizer: AdamW,
+    next: u64,
+    window_weight: f64,
+    gradient: &[f32],
+) -> Result<(usize, ScaleCandidate), PvTuningError> {
+    let mut weighted = reserved(gradient.len())?;
+    for &value in gradient.iter() {
+        let value = (f64::from(value) * window_weight) as f32;
+        if !value.is_finite() {
+            return Err(PvTuningError::step(
+                "weighted native scale gradient overflowed f32",
+            ));
+        }
+        weighted.push(value);
+    }
+    let mut values = copied(weight.scales())?;
+    let mut state = AdamState {
+        m: copied(&state.m)?,
+        v: copied(&state.v)?,
+    };
+    optimizer.step(next, &mut values, &weighted, &mut state);
+    check_optimizer_moments(&state, "native scale")?;
+    check_corrected_moments(optimizer, next, &state).map_err(PvTuningError::step)?;
+    for value in &mut values {
+        if !value.is_finite() {
+            return Err(PvTuningError::step(
+                "native optimizer produced a non-finite scale",
+            ));
+        }
+        *value = round_scale(value.max(0.0), weight.layout().law.precision)?;
+    }
+    weight
+        .validate_scales(&values)
+        .map_err(|e| PvTuningError::step(format!("native scale update is invalid: {e:?}")))?;
+    let changed = values
+        .iter()
+        .zip(weight.scales())
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    Ok((changed, ScaleCandidate { values, state }))
 }
