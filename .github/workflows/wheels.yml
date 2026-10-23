@@ -391,6 +391,7 @@ jobs:
           crates/tritium-py/tests/test_native_module_load.py
           crates/tritium-py/tests/test_native_scale_training.py
           crates/tritium-py/tests/test_native_pv_training.py
+          crates/tritium-py/tests/test_native_pv_paged_verify.py
           crates/tritium-py/tests/test_native_pv_resume.py
           crates/tritium-py/tests/test_native_refinement.py
           crates/tritium-py/tests/test_native_resume.py

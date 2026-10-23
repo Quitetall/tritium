@@ -56,6 +56,9 @@ ort = { workspace = true, optional = true }
 pyo3 = { workspace = true, features = ["abi3-py39"] }
 dlpark = { workspace = true }
 ndarray = { workspace = true }
+# Reuse already-locked anonymous workspace files and directory-handle identity.
+tempfile = "=3.27.0"
+same-file = "=1.0.6"
 
 [build-dependencies]
 tritium-build-info = { workspace = true }

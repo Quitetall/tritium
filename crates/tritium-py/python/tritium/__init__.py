@@ -8,6 +8,7 @@ PyTorch is installed — the :mod:`tritium.torch` research facade, :mod:`tritium
 from ._tritium import (
     NativeModelConversion,
     NativeModelRefinement,
+    NativePvPagedVerificationLimits,
     NativeScaleResumeBundle,
     NativePvResumeBundle,
     convert_model_plan,
@@ -49,6 +50,7 @@ from . import onnx, portable, salt
 __all__ = [
     "NativeModelConversion",
     "NativeModelRefinement",
+    "NativePvPagedVerificationLimits",
     "NativeScaleResumeBundle",
     "NativePvResumeBundle",
     "convert_model_plan",

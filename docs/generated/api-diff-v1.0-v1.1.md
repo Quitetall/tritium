@@ -1,6 +1,6 @@
 # Generated v1.0 to v1.1 API diff
 
-Report identity: `sha256:31c371b56dc08bf8f28cd581050ddc49d647bbc429ca7a4be0796be9bf747beb`
+Report identity: `sha256:131ded26685578ae1cd68f10749c44bb153c5c272d7ca3050ee7f3b51fc53849`
 
 This is a structural source report for candidate `1.1.0-rc.2`
 against `v1.0.0`. It is not a package-install or runtime receipt.
@@ -29,6 +29,7 @@ Added in v1.1:
 - `KroneckerStateError`
 - `NativeModelConversion`
 - `NativeModelRefinement`
+- `NativePvPagedVerificationLimits`
 - `NativePvResumeBundle`
 - `NativeScaleResumeBundle`
 - `Qwen36KroneckerCaptureReceipt`

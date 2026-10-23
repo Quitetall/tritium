@@ -390,6 +390,39 @@ max_replay_working_bytes=...)` separately checks original ancestry, actual commo
 numerical replay and encoded deployed owner bytes, not only checkpoint IDs. Even
 that observation is not objective authentication or release qualification.
 
+For an `alternating-pv` child, `verify_paged_with_parent` audits the same immediate
+numerical edge with file-backed owner-paged replay rather than a full checkpoint
+buffer/all-parent cache. The resident method and its budget meanings are unchanged:
+
+```python
+from tritium import NativePvPagedVerificationLimits
+
+limits = NativePvPagedVerificationLimits(
+    max_owner_read_bytes=owner_decode_budget,
+    max_owner_resident_bytes=numerical_owner_budget,
+    max_encoded_owner_bytes=encoded_owner_budget,
+    max_workspace_bytes=checkpoint_workspace_budget,
+)
+audit_json = child.verify_paged_with_parent(parent, new_workspace_directory, limits=limits)
+```
+
+The workspace must not exist or overlap either source artifact. Its anonymous
+checkpoint files retire on close; current+next full checkpoint lengths are
+reserved before file creation, so budget at least twice the expected checkpoint
+bytes for a nonempty schedule. Actual free space, metadata, caller buffers and
+OS/allocator overhead are separate. Source-owner, numerical-owner, encoded-owner
+and fixed16KiB replay scratch budgets are distinct logical limits, not total RAM/
+VRAM measurements. Root ordinary-file/identity/companion checks remain in force.
+`ScaleOnly` refuses instead of silently using the resident method.
+
+The JSON keeps `scope="parent-backed-numerical-replay"` and immediate-parent-only
+lineage, adding `storage="owner-paged"`, logical workspace peaks and cleanup
+observations. Qualification flags remain false. Cleanup never recursively removes
+a directory or unexpected files; caveats are reported, and caller-exclusive
+filesystem custody is required. This is verification, not a persistent training
+restart or quality/public-release approval. Native P/V training/recovery/runtime
+controllers still use their existing resident implementation.
+
 The opt-in calibrated lifecycle is separate from the legacy diagonal `calibrate`:
 `prepare_native_module(prepared, actions=..., levels=..., limits=..., work_dir=...,
 asset_paths=...)` observes the complete original source without fitting.

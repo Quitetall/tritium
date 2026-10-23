@@ -414,6 +414,7 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(native_pv::_validate_native_pv_plan, m)?)?;
     m.add_class::<native_scale::NativeScaleResumeBundle>()?;
     m.add_class::<model_refinement::NativeModelRefinement>()?;
+    m.add_class::<model_refinement::NativePvPagedVerificationLimits>()?;
     m.add_function(wrap_pyfunction!(model_refinement::_open_native_model, m)?)?;
     m.add_function(wrap_pyfunction!(
         native_scale::_validate_native_scale_plan,

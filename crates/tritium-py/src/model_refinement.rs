@@ -26,6 +26,9 @@ use tritium_train::pv_tuning::{
 
 mod record;
 use record::Record;
+mod paged;
+mod workspace;
+pub(crate) use paged::NativePvPagedVerificationLimits;
 
 fn error(v: impl std::fmt::Display) -> PyErr {
     PyValueError::new_err(v.to_string())
@@ -473,6 +476,20 @@ impl NativeModelRefinement {
             self.verified(self.limits)?;
             Ok(serde_json::json!({"scope":"parent-backed-numerical-replay","package_id":hex(package.as_bytes()),"journal_id":hex(journal_id.as_bytes()),"lineage_scope":"immediate-parent-only","parent_admission":parent.admission(),"objective_authenticated":false,"quality_qualified":false}).to_string())
         })
+    }
+    /// Audit a P/V artifact using owner-paged state and a new disposable workspace.
+    /// Limits are logical payload scopes, not physical memory or quality approval.
+    #[pyo3(signature=(parent,workspace_dir,*,limits))]
+    fn verify_paged_with_parent(
+        &self,
+        py: Python<'_>,
+        parent: &Bound<'_, PyAny>,
+        workspace_dir: PathBuf,
+        limits: PyRef<'_, NativePvPagedVerificationLimits>,
+    ) -> PyResult<String> {
+        let parent = crate::native_parent::NativeTrainingParent::extract(parent)?;
+        let limits = *limits;
+        py.detach(|| paged::verify(self, parent, workspace_dir, limits))
     }
     #[pyo3(signature=(output_dir,*,max_package_bytes=None,max_evidence_bytes=None))]
     fn export(
