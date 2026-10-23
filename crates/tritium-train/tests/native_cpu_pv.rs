@@ -19,6 +19,8 @@ use tritium_train::pv_tuning::{
 };
 #[path = "common/native_pv_consumer.rs"]
 mod fixture;
+#[path = "native_cpu_pv/paged.rs"]
+mod paged;
 use fixture::{active, manual, plan, tensor, values};
 fn limits() -> Limits {
     Limits {

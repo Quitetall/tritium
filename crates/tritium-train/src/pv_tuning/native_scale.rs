@@ -13,6 +13,11 @@ mod checkpoint;
 mod native_pv;
 #[cfg(feature = "native-cpu")]
 pub use native_pv::{NativeCpuPvError, NativeCpuPvJournalStageError, NativeCpuPvSession};
+#[cfg(feature = "native-cpu")]
+pub use native_pv::{
+    NativeCpuPvPagedError, NativeCpuPvPagedSession, NativeCpuPvPagedStepLimits,
+    NativeCpuPvPagedUpdate,
+};
 pub use native_pv::{
     NativePvCandidate, NativePvOwnerStep, NativePvRefinementSession, NativePvResumeBundleError,
     NativePvResumeBundleLimits, NativePvResumeBundleReader, NativePvSizeLedger, NativePvStageError,

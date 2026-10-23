@@ -14,6 +14,11 @@ mod consumers;
 mod cpu;
 #[cfg(feature = "native-cpu")]
 pub use cpu::{NativeCpuPvError, NativeCpuPvJournalStageError, NativeCpuPvSession};
+#[cfg(feature = "native-cpu")]
+pub use cpu::{
+    NativeCpuPvPagedError, NativeCpuPvPagedSession, NativeCpuPvPagedStepLimits,
+    NativeCpuPvPagedUpdate,
+};
 mod publication;
 mod verification;
 pub use publication::{

@@ -38,7 +38,7 @@ fn replaying() -> NativePvPagedReplayLimits {
         paging: paging(),
     }
 }
-fn original(
+pub(super) fn original(
     files: &Files,
 ) -> (
     TritModelReader<File>,

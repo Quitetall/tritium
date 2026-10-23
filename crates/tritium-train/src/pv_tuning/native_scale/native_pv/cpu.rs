@@ -11,6 +11,11 @@ use tritium_cpu::CpuBackend;
 use tritium_format::AdditiveTensor;
 use tritium_runtime::TensorPayloadBudget;
 use tritium_spec::{BackendError, DeviceBuffer};
+mod paged;
+pub use paged::{
+    NativeCpuPvPagedError, NativeCpuPvPagedSession, NativeCpuPvPagedStepLimits,
+    NativeCpuPvPagedUpdate,
+};
 
 /// Common numerical rejection versus the original packed/backend failure.
 pub type NativeCpuPvError = NativePvStageError<BackendError>;
@@ -204,56 +209,52 @@ impl NativeCpuPvSession {
         self.session.consumer_gradients(
             contributions,
             |index, _, contribution, row, scales, weights| {
-                let cpu = CpuBackend::new();
-                let handle = &*self.handles[index];
-                match contribution {
-                    NativePvContribution::Matmul {
-                        activations,
-                        output_gradients,
-                        batch,
-                    } => {
-                        cpu.accumulate_additive_matmul_scale_vjp(
-                            handle,
-                            activations,
-                            output_gradients,
-                            batch,
-                            row,
-                            scales,
-                        )?;
-                        cpu.accumulate_additive_matmul_weight_vjp(
-                            handle,
-                            activations,
-                            output_gradients,
-                            batch,
-                            row,
-                            weights,
-                        )
-                    }
-                    NativePvContribution::Embed {
-                        ids,
-                        output_gradients,
-                    } => {
-                        cpu.accumulate_additive_embed_scale_vjp(
-                            handle,
-                            ids,
-                            output_gradients,
-                            row,
-                            scales,
-                        )?;
-                        cpu.accumulate_additive_embed_weight_vjp(
-                            handle,
-                            ids,
-                            output_gradients,
-                            row,
-                            weights,
-                        )
-                    }
-                }
+                consume(&*self.handles[index], contribution, row, scales, weights)
             },
         )
     }
 }
 
+fn consume(
+    handle: &dyn DeviceBuffer,
+    c: NativePvContribution<'_>,
+    row: &mut [f32],
+    scales: &mut [f64],
+    weights: &mut [f64],
+) -> Result<(), BackendError> {
+    let cpu = CpuBackend::new();
+    match c {
+        NativePvContribution::Matmul {
+            activations,
+            output_gradients,
+            batch,
+        } => {
+            cpu.accumulate_additive_matmul_scale_vjp(
+                handle,
+                activations,
+                output_gradients,
+                batch,
+                row,
+                scales,
+            )?;
+            cpu.accumulate_additive_matmul_weight_vjp(
+                handle,
+                activations,
+                output_gradients,
+                batch,
+                row,
+                weights,
+            )
+        }
+        NativePvContribution::Embed {
+            ids,
+            output_gradients,
+        } => {
+            cpu.accumulate_additive_embed_scale_vjp(handle, ids, output_gradients, row, scales)?;
+            cpu.accumulate_additive_embed_weight_vjp(handle, ids, output_gradients, row, weights)
+        }
+    }
+}
 fn snapshots<'a>(
     parents: impl ExactSizeIterator<Item = &'a Arc<dyn DeviceBuffer>>,
     weights: impl ExactSizeIterator<Item = &'a AdditiveTensor>,

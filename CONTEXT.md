@@ -58,6 +58,12 @@ awaiting admission into the current recorded history. It is distinct from a
 committed resume point, a refined child or qualification evidence.
 _Avoid_: completed training, published checkpoint, verified model
 
+**Packed training cohort**:
+The complete named set of immutable packed owner versions corresponding to one
+committed training snapshot. It is distinct from an individual tensor version or
+permission to replace a live graph before its recorded update commits.
+_Avoid_: trained model, qualified checkpoint, partial owner update
+
 **Owner calibration recipe**:
 An ordered, weighted set of declared scalar objectives and observation limits
 for tensor owners. It is distinct from captured observations and qualification.

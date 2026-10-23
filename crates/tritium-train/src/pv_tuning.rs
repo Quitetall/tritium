@@ -93,6 +93,11 @@ pub use native_scale::{
     NativeCpuPvError, NativeCpuPvJournalStageError, NativeCpuPvSession, NativeCpuScaleError,
     NativeCpuScaleJournalStageError, NativeCpuScaleSession,
 };
+#[cfg(feature = "native-cpu")]
+pub use native_scale::{
+    NativeCpuPvPagedError, NativeCpuPvPagedSession, NativeCpuPvPagedStepLimits,
+    NativeCpuPvPagedUpdate,
+};
 pub use native_scale::{
     NativeScaleContribution, NativeScaleJournalError, NativeScaleJournalLimits,
     NativeScaleJournalResume, NativeScaleJournalSizeLedger, NativeScaleJournalSummary,

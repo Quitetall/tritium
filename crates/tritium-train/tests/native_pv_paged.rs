@@ -31,6 +31,8 @@ mod publication;
 mod recording;
 #[path = "native_pv_paged/replay.rs"]
 mod replay;
+#[path = "native_pv_paged/runtime.rs"]
+mod runtime;
 #[path = "native_pv_paged/visit.rs"]
 mod visit;
 

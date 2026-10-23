@@ -138,17 +138,7 @@ pub(super) fn reduce<'a, E>(
     if contributions.len() != plan.owners.len() {
         return Err(PvTuningError::step("native consumer owner count mismatch").into());
     }
-    let combined = |view: AdditiveView<'_>| -> Result<usize, PvTuningError> {
-        let weights = if include_weights && view.plane_count() != 0 {
-            view.plane_trits(0).map_err(|_| workspace_overflow())?.len()
-        } else {
-            0
-        };
-        view.scales()
-            .len()
-            .checked_add(weights)
-            .ok_or_else(workspace_overflow)
-    };
+    let combined = |view| owner_count(view, include_weights);
     let mut total = 0u64;
     let mut max_gradients = 0usize;
     let mut max_cols = 0usize;
@@ -196,29 +186,91 @@ pub(super) fn reduce<'a, E>(
     for (index, uses) in contributions.iter().enumerate() {
         let view = view_at(index);
         let out = &mut accumulated[..combined(view)?];
-        out.fill(0.0);
-        let (scales, weights) = out.split_at_mut(view.scales().len());
         let scratch = &mut row[..view.layout().cols as usize];
-        for contribution in *uses {
-            consume(index, view, *contribution, scratch, scales, weights)
-                .map_err(NativeScaleStageError::Stage)?;
-        }
-        let mut values = reserved(out.len())?;
-        for &value in out.iter() {
-            let value = value as f32;
-            if !value.is_finite() {
-                return Err(PvTuningError::step(if include_weights {
-                    "native accumulated gradient overflowed f32"
-                } else {
-                    "native accumulated scale gradient overflowed f32"
-                })
-                .into());
-            }
-            values.push(value);
-        }
-        gradients.push(values);
+        accumulate_owner(view, uses, scratch, out, |view, c, row, s, w| {
+            consume(index, view, c, row, s, w)
+        })?;
+        gradients.push(narrow(out, include_weights)?);
     }
     Ok(gradients)
+}
+
+fn owner_count(view: AdditiveView<'_>, weights: bool) -> Result<usize, PvTuningError> {
+    let active = if weights && view.plane_count() != 0 {
+        view.plane_trits(0).map_err(|_| workspace_overflow())?.len()
+    } else {
+        0
+    };
+    view.scales()
+        .len()
+        .checked_add(active)
+        .ok_or_else(workspace_overflow)
+}
+fn narrow(values: &[f64], weights: bool) -> Result<Vec<f32>, PvTuningError> {
+    let mut result = reserved(values.len())?;
+    for &v in values {
+        let v = v as f32;
+        if !v.is_finite() {
+            return Err(PvTuningError::step(if weights {
+                "native accumulated gradient overflowed f32"
+            } else {
+                "native accumulated scale gradient overflowed f32"
+            }));
+        }
+        result.push(v);
+    }
+    Ok(result)
+}
+fn accumulate_owner<'a, 'b, E>(
+    view: AdditiveView<'a>,
+    uses: &[NativeScaleContribution<'b>],
+    row: &mut [f32],
+    out: &mut [f64],
+    mut consume: impl FnMut(
+        AdditiveView<'a>,
+        NativeScaleContribution<'b>,
+        &mut [f32],
+        &mut [f64],
+        &mut [f64],
+    ) -> Result<(), E>,
+) -> Result<(), NativeScaleStageError<E>> {
+    out.fill(0.0);
+    let (scales, weights) = out.split_at_mut(view.scales().len());
+    for &c in uses {
+        consume(view, c, row, scales, weights).map_err(NativeScaleStageError::Stage)?;
+    }
+    Ok(())
+}
+/// Same reducer with only one owner's accumulation and split f32 outputs alive.
+pub(in crate::pv_tuning::native_scale) fn reduce_pv_owner<'a, 'b, E>(
+    view: AdditiveView<'a>,
+    uses: &[NativePvContribution<'b>],
+    max_working_bytes: u64,
+    consume: impl FnMut(
+        AdditiveView<'a>,
+        NativePvContribution<'b>,
+        &mut [f32],
+        &mut [f64],
+        &mut [f64],
+    ) -> Result<(), E>,
+) -> Result<(Vec<f32>, Vec<f32>), NativeScaleStageError<E>> {
+    let count = owner_count(view, true)?;
+    let required = (count as u64)
+        .checked_mul(12)
+        .and_then(|n| n.checked_add(view.layout().cols.checked_mul(4)?))
+        .ok_or_else(workspace_overflow)?;
+    if max_working_bytes == 0 || required > max_working_bytes {
+        return Err(PvTuningError::step("native paged consumer working cap exceeded").into());
+    }
+    for c in uses {
+        c.validate(view.layout().rows as usize, view.layout().cols as usize)?;
+    }
+    let mut row = zeroed(view.layout().cols as usize)?;
+    let mut out = reserved(count)?;
+    out.resize(count, 0.0f64);
+    accumulate_owner(view, uses, &mut row, &mut out, consume)?;
+    let (s, w) = out.split_at(view.scales().len());
+    Ok((narrow(s, true)?, narrow(w, true)?))
 }
 
 impl NativeScaleContribution<'_> {
