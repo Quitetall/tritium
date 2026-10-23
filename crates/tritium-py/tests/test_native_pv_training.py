@@ -128,7 +128,11 @@ def test_record_publish_standalone_export_and_pv_parent_chaining(tmp_path):
 def test_tied_embedding_padding_and_head_share_dual_gradient_leaf(tmp_path):
     from test_owner_capture import _source, TiedModel
     source = _source(tmp_path); parent = convert_native_module(source.prepared, tmp_path/"parent", "pv-tied", **json.loads(source.options_json))
-    trainer = start(TiedModel(), parent, plan(parent, "embed.weight")); weight = trainer.model.embed.packed_weight
+    request = plan(parent, "embed.weight")
+    # This embedding starts at unit-normal scale, unlike nn.Linear's ~0.1 scale.
+    # Choose a declared code step that crosses its discrete projection threshold.
+    request["recipe"]["AlternatingPv"]["code_optimizer"]["lr"] = 1.0
+    trainer = start(TiedModel(), parent, request); weight = trainer.model.embed.packed_weight
     weight.gather(torch.tensor(0), torch.float32, padding=0).sum().backward()
     leaf = trainer._cache["embed.weight"][2]; assert torch.count_nonzero(leaf.grad) == 0
     trainer.zero_grad(); first, second = trainer.model(torch.tensor([0, 1, 0])); (first.square().mean()+second.square().mean()).backward()
