@@ -233,8 +233,8 @@ TNPV stores decoded trits and f32 moments, not a compact inference package. An
 update needs both complete old and new checkpoints, in addition to parent
 artifacts and any journal. Set a disk ceiling and delete only obsolete owned
 snapshots after their replacement is safely retained. Generic flush does not
-provide fsync durability or immutable filesystem publication. Paged journal
-recording, complete runtime/Python wiring, within-owner moment paging,
+provide fsync durability or immutable filesystem publication. Paged numerical
+prefix recovery/publication, complete runtime/Python wiring, within-owner moment paging,
 GPU execution and independent model/physical/release qualification remain open.
 
 `NativeRefinementOwnerSource::with` supplies a first-party original-package loader
@@ -252,3 +252,33 @@ owner plus codec/carry and64KiB source window, with explicit overlapping caller
 payload. It does not include arbitrary consumer storage, model metadata, caller
 stream buffers, allocator slack or OS caches. Existing resident parent-decoder
 limits and all checkpoint/journal/publication gates are unchanged.
+
+## Recorded paged updates
+
+`NativePvPagedJournalWriter` adapts the existing TNPJ encoder/writer to seek-backed
+state. Its header, raw unweighted frames, footer, resume points and summaries are
+byte-identical to resident recording. It starts only at zero origin, binds its
+cursor to the exact checkpoint identity, and snapshots/finishes without a full
+checkpoint `Vec`. A resume point is not numerical replay; bounded paged prefix
+recovery and child verification/publication are still separate work.
+
+Call `stage_recorded((empty_checkpoint, empty_frame), parents, gradients, stage,
+limits)` inside `NativeRefinementOwnerSource::with`, then call the opaque update's
+`commit(&mut old_session, &mut journal)` only after that scope succeeds. The frame
+is private until all owners, next-checkpoint bytes and source checks pass.
+Commit rechecks old/next/frame identities and live output position, hashes actual
+transferred bytes, flushes, rechecks checkpoints, and returns the complete next
+session/resources. Switch to that returned session for the next step; the old
+session remains the unchanged recovery snapshot. Pre-append refusal leaves live
+history untouched. Failure/unwind during append poisons the writer and exposes
+no next state; partial tails and private spool files remain caller owned.
+
+`recording_size_ledger` forecasts exact complete-journal and one-frame disk bytes
+plus 16384 bytes of recording-only scratch. `NativePvPagedRecordingLimits` admits
+those separately from numerical/source/resource/stream/metadata budgets. Use
+file-backed streams for out-of-core execution. Full raw-gradient journals and
+old/new TNPV files can be large: owner paging does not reduce their disk bytes.
+Keep outputs private, budget disk, retain recovery evidence and retire obsolete
+owned spools only after their replacement is safely retained. Generic flush and
+recorded byte consistency do not grant fsync durability, objective/data/teacher
+authentication, numerical replay, model quality, GPU support or release approval.

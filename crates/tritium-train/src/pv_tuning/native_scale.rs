@@ -27,6 +27,10 @@ pub use native_pv::{
 pub use native_pv::{
     NativePvPagedError, NativePvPagedLimits, NativePvPagedSession, NativePvPagedSizeLedger,
 };
+pub use native_pv::{
+    NativePvPagedJournalWriter, NativePvPagedRecordingError, NativePvPagedRecordingLimits,
+    NativePvPagedRecordingSizeLedger, NativePvPagedUpdate,
+};
 mod consumers;
 #[cfg(feature = "native-cpu")]
 mod cpu;

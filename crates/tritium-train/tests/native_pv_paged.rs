@@ -16,9 +16,13 @@ use tritium_format::AdditiveTensor;
 use tritium_schema::*;
 use tritium_train::pv_tuning::{
     NativePvJournalLimits, NativePvJournalWriter, NativePvPagedError,
-    NativePvPagedLimits as Limits, NativePvPagedSession as Paged,
-    NativePvRefinementSession as Resident, replay_native_pv_journal_with_state,
+    NativePvPagedJournalWriter as PagedWriter, NativePvPagedLimits as Limits,
+    NativePvPagedRecordingError as RecordingError, NativePvPagedRecordingLimits as RecordingLimits,
+    NativePvPagedSession as Paged, NativePvRefinementSession as Resident,
+    replay_native_pv_journal_with_state,
 };
+#[path = "native_pv_paged/recording.rs"]
+mod recording;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 struct Allocator;

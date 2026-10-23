@@ -2,6 +2,16 @@
 use super::*;
 use checkpoint::{HashRead, HashWrite, Header, Inspection, WireError};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use tritium_schema::BlobId;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PagedJournalState {
+    pub(super) plan: NativeRefinementPlanId,
+    pub(super) parent: [u8; 32],
+    pub(super) completed: u64,
+    pub(super) checkpoint: BlobId,
+    pub(super) checkpoint_bytes: u64,
+}
 
 /// Extra residency limit; original plan caps still cover aggregate logical state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,6 +93,7 @@ pub struct NativePvPagedSession<R> {
     observed: Inspection,
     ledger: NativePvPagedSizeLedger,
     limits: NativePvPagedLimits,
+    channels: Vec<(u64, u64)>,
 }
 impl<R> std::fmt::Debug for NativePvPagedSession<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -173,6 +184,7 @@ impl<R: Read + Seek> NativePvPagedSession<R> {
         empty_output(&mut destination)?;
         destination.write_all(&[0; 85])?;
         let mut ledger = empty_ledger();
+        let mut channels = reserved(plan.owners.len())?;
         let mut parent_hash = NativePvRefinementSession::parent_hasher(id);
         let suffix = {
             let mut writer = HashWrite {
@@ -182,6 +194,7 @@ impl<R: Read + Seek> NativePvPagedSession<R> {
             for (i, name) in plan.owners.iter().enumerate() {
                 let weight = parents(i, name).map_err(NativePvPagedError::Provider)?;
                 account(&plan, limits, updater.fraction, &weight, &mut ledger)?;
+                channels.push((weight.scales().len() as u64, active_count(&weight)? as u64));
                 hash_parent_tensor(&mut parent_hash, &weight)?;
                 checkpoint::write_owner::<8192>(&mut writer, &initial_owner(weight)?)?;
             }
@@ -208,6 +221,7 @@ impl<R: Read + Seek> NativePvPagedSession<R> {
             observed,
             ledger,
             limits,
+            channels,
         })
     }
 
@@ -230,6 +244,7 @@ impl<R: Read + Seek> NativePvPagedSession<R> {
         }
         source.rewind()?;
         let mut ledger = empty_ledger();
+        let mut channels = reserved(plan.owners.len())?;
         let mut parent_hash = NativePvRefinementSession::parent_hasher(id);
         let traversed = {
             let mut reader = HashRead {
@@ -242,6 +257,7 @@ impl<R: Read + Seek> NativePvPagedSession<R> {
             for (i, name) in plan.owners.iter().enumerate() {
                 let weight = parents(i, name).map_err(NativePvPagedError::Provider)?;
                 account(&plan, limits, updater.fraction, &weight, &mut ledger)?;
+                channels.push((weight.scales().len() as u64, active_count(&weight)? as u64));
                 hash_parent_tensor(&mut parent_hash, &weight)?;
                 let _owner = checkpoint::read_owner::<8192>(
                     &mut reader,
@@ -268,6 +284,7 @@ impl<R: Read + Seek> NativePvPagedSession<R> {
             observed,
             ledger,
             limits,
+            channels,
         })
     }
 
@@ -294,6 +311,25 @@ impl<R: Read + Seek> NativePvPagedSession<R> {
     /// Release the underlying checkpoint; its seek position is unspecified.
     pub fn into_checkpoint(self) -> R {
         self.checkpoint
+    }
+
+    pub(super) fn journal_state(&self) -> PagedJournalState {
+        PagedJournalState {
+            plan: self.observed.header.plan,
+            parent: self.observed.header.parent,
+            completed: self.completed_updates(),
+            checkpoint: BlobId::from_bytes(self.observed.digest),
+            checkpoint_bytes: self.observed.bytes,
+        }
+    }
+    pub(super) fn journal_channels(&self) -> &[(u64, u64)] {
+        &self.channels
+    }
+    pub(super) fn verify_journal_source(&mut self) -> Result<(), WireError> {
+        if checkpoint::inspect(&mut self.checkpoint, self.observed.bytes)? != self.observed {
+            return Err(invalid("native PV paging committed checkpoint drift").into());
+        }
+        Ok(())
     }
 
     /// Stage a complete next checkpoint and one owned resource per owner.
@@ -403,6 +439,7 @@ impl<R: Read + Seek> NativePvPagedSession<R> {
                 observed,
                 ledger,
                 limits: self.limits,
+                channels: copied(&self.channels)?,
             },
             stats,
             resources,

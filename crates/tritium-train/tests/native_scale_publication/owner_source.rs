@@ -12,6 +12,13 @@ fn paged_limits() -> NativePvPagedLimits {
         max_resident_payload_bytes: 1_000_000,
     }
 }
+fn recording_limits() -> NativePvPagedRecordingLimits {
+    NativePvPagedRecordingLimits {
+        max_journal_bytes: 1_000_000,
+        max_frame_bytes: 1_000_000,
+        max_working_bytes: 16384,
+    }
+}
 fn request(f: &Fixture) -> NativeRefinementPlan {
     let mut plan = f.plan.clone();
     plan.owners = vec!["frozen.weight".into(), "weight".into()];
@@ -97,6 +104,12 @@ fn original_ptq_packages_feed_complete_paged_recovery_and_standard_replay_withou
                         },
                     )
                     .unwrap();
+                    let mut paged_journal = NativePvPagedJournalWriter::new(
+                        Cursor::new(Vec::new()),
+                        &mut paged,
+                        recording_limits(),
+                    )
+                    .unwrap();
                     for step in 0..4 {
                         let g: Vec<_> = reference
                             .weights()
@@ -110,21 +123,24 @@ fn original_ptq_packages_feed_complete_paged_recovery_and_standard_replay_withou
                                 &mut journal,
                             )
                             .unwrap();
-                        let (next, stats, resources) = NativeRefinementOwnerSource::with(
+                        let ready = NativeRefinementOwnerSource::with(
                             &mut f.parent,
                             &f.view,
                             &plan,
                             read_limits(),
                             |source| {
-                                paged.step_staged(
-                                    Cursor::new(Vec::new()),
+                                paged.stage_recorded(
+                                    (Cursor::new(Vec::new()), Cursor::new(Vec::new())),
                                     |i, name| source.load(i, name),
                                     |i, _, w| Ok(gradients(w, i + step)),
                                     |_, _, _| Ok(()),
+                                    recording_limits(),
                                 )
                             },
                         )
                         .unwrap();
+                        let (next, stats, resources) =
+                            ready.commit(&mut paged, &mut paged_journal).unwrap();
                         assert_eq!(stats, expected);
                         assert_eq!(resources.len(), 2);
                         assert_eq!(paged.completed_updates(), step as u64);
@@ -146,7 +162,10 @@ fn original_ptq_packages_feed_complete_paged_recovery_and_standard_replay_withou
                         )
                         .unwrap();
                     }
+                    let (actual, actual_summary) = paged_journal.finish(&mut paged).unwrap();
                     let (journal, summary) = journal.finish(&reference).unwrap();
+                    assert_eq!(actual.get_ref(), journal.get_ref());
+                    assert_eq!(actual_summary, summary);
                     let checkpoint = paged.into_checkpoint().into_inner();
                     let replay = replay_native_pv_journal(
                         plan,
@@ -171,6 +190,61 @@ fn original_ptq_packages_feed_complete_paged_recovery_and_standard_replay_withou
 }
 
 struct Dropped(Rc<Cell<usize>>);
+
+#[test]
+fn terminal_parent_refusal_drops_recorded_candidate_without_advancing_live_journal() {
+    let mut f = Fixture::new(
+        ScalePrecision::F32,
+        Basis::Identity,
+        PlaneCodec::B3,
+        "compact",
+        false,
+    );
+    let plan = request(&f);
+    let mut current =
+        NativeRefinementOwnerSource::with(&mut f.parent, &f.view, &plan, read_limits(), |source| {
+            NativePvPagedSession::initialize(
+                plan.clone(),
+                paged_limits(),
+                |i, n| source.load(i, n),
+                Cursor::new(Vec::new()),
+            )
+        })
+        .unwrap();
+    let mut writer =
+        NativePvPagedJournalWriter::new(Cursor::new(Vec::new()), &mut current, recording_limits())
+            .unwrap();
+    let before = writer.checkpoint(&mut current).unwrap();
+    let bytes = f.bytes.clone();
+    let drops = Rc::new(Cell::new(0));
+    let result =
+        NativeRefinementOwnerSource::with(&mut f.parent, &f.view, &plan, read_limits(), |source| {
+            let ready = current.stage_recorded(
+                (Cursor::new(Vec::new()), Cursor::new(Vec::new())),
+                |i, n| source.load(i, n),
+                |i, _, w| Ok(gradients(w, i)),
+                |_, _, _| Ok(Dropped(drops.clone())),
+                recording_limits(),
+            )?;
+            let last = bytes.borrow().len() - 1;
+            bytes.borrow_mut()[last] ^= 1;
+            Ok::<_, NativePvPagedRecordingError<NativePvChildError>>(ready)
+        });
+    assert!(matches!(
+        result,
+        Err(NativeRefinementOwnerSourceError::Source(_))
+    ));
+    assert_eq!(drops.get(), 2);
+    f.bytes.borrow_mut().copy_from_slice(&f.original);
+    assert_eq!(current.completed_updates(), 0);
+    assert_eq!(writer.checkpoint(&mut current).unwrap(), before);
+    let live = writer.into_inner().into_inner();
+    assert_eq!(live.len() as u64, before.journal_prefix_bytes);
+    assert_eq!(
+        blake3::hash(&live).as_bytes(),
+        before.journal_prefix.as_bytes()
+    );
+}
 
 #[test]
 fn nested_scope_swap_cannot_redirect_terminal_verification() {

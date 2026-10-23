@@ -52,6 +52,12 @@ and materializes one tensor owner at a time. It is distinct from within-owner
 paging, a resident-memory measurement, or a qualified trained model.
 _Avoid_: GPU training, memory-mapped model, completed refinement
 
+**Staged recorded update**:
+A private candidate training snapshot and its exact gradient observations,
+awaiting admission into the current recorded history. It is distinct from a
+committed resume point, a refined child or qualification evidence.
+_Avoid_: completed training, published checkpoint, verified model
+
 **Owner calibration recipe**:
 An ordered, weighted set of declared scalar objectives and observation limits
 for tensor owners. It is distinct from captured observations and qualification.

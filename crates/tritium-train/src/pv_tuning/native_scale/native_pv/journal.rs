@@ -9,10 +9,15 @@ use crate::pv_tuning::journal_io as stream;
 const SCRATCH: usize = stream::SCRATCH;
 const FRAME_DOMAIN: &[u8] = b"tritium.native-pv.journal-frame.v1\0";
 mod bundle;
+mod paged;
 mod resume;
 pub use bundle::{
     NativePvResumeBundleError, NativePvResumeBundleLimits, NativePvResumeBundleReader,
     PublishedNativePvResumeBundle, publish_native_pv_resume_bundle, stage_native_pv_resume_bundle,
+};
+pub use paged::{
+    NativePvPagedJournalWriter, NativePvPagedRecordingError, NativePvPagedRecordingLimits,
+    NativePvPagedRecordingSizeLedger, NativePvPagedUpdate,
 };
 pub use resume::{NativePvJournalResume, NativePvResumeTail, resume_native_pv_journal};
 
@@ -103,10 +108,7 @@ fn sizes(
     ledger: NativePvSizeLedger,
     gradients: u64,
 ) -> Result<NativePvJournalSizeLedger> {
-    let bytes = sum(
-        sum(176, product(16, plan.owners.len() as u64)?)?,
-        product(plan.training.len() as u64, sum(72, product(4, gradients)?)?)?,
-    )?;
+    let bytes = journal_bytes(plan, gradients)?;
     let working = sum(
         sum(
             sum(ledger.state_payload_bytes, ledger.update_workspace_bytes)?,
@@ -119,6 +121,34 @@ fn sizes(
         writer_working_bytes: sum(ledger.checkpoint_bytes, SCRATCH as u64)?,
         replay_working_bytes: working,
     })
+}
+fn journal_bytes(plan: &NativeRefinementPlan, gradients: u64) -> Result<u64> {
+    sum(
+        sum(176, product(16, plan.owners.len() as u64)?)?,
+        product(plan.training.len() as u64, sum(72, product(4, gradients)?)?)?,
+    )
+}
+fn frame_header(
+    ordinal: u64,
+    window: [u8; 32],
+    frame: &mut blake3::Hasher,
+    mut write: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    frame.update(FRAME_DOMAIN);
+    for bytes in [&ordinal.to_le_bytes()[..], &window[..]] {
+        write(bytes)?;
+        frame.update(bytes);
+    }
+    Ok(())
+}
+fn frame_owner(
+    scales: &[f32],
+    weights: &[f32],
+    frame: &mut blake3::Hasher,
+    mut write: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    stream::encode(scales, frame, &mut write)?;
+    stream::encode(weights, frame, write)
 }
 fn admit_limits(limits: NativePvJournalLimits, bytes: u64, working: u64) -> Result<()> {
     if limits.max_journal_bytes == 0
@@ -200,7 +230,7 @@ pub struct NativePvJournalWriter<W> {
 impl<W: Write + Seek> NativePvJournalWriter<W> {
     /// Admit exact logical bytes before writing. Destination must be empty and session at zero.
     pub fn new(
-        mut output: W,
+        output: W,
         session: &NativePvRefinementSession,
         limits: NativePvJournalLimits,
     ) -> Result<Self> {
@@ -210,6 +240,27 @@ impl<W: Write + Seek> NativePvJournalWriter<W> {
         if session.completed != 0 {
             return Err(invalid("native journal requires a zero-origin session"));
         }
+        let mut channels = reserved(session.owners.len())?;
+        for weight in session.weights() {
+            channels.push((weight.scales().len() as u64, active_count(weight)? as u64));
+        }
+        Self::start(
+            output,
+            session.plan_id,
+            session.parent,
+            session.plan.training.len() as u64,
+            &channels,
+            bytes,
+        )
+    }
+    fn start(
+        mut output: W,
+        plan: NativeRefinementPlanId,
+        parent: [u8; 32],
+        updates: u64,
+        channels: &[(u64, u64)],
+        bytes: u64,
+    ) -> Result<Self> {
         if output.seek(SeekFrom::End(0))? != 0 {
             return Err(invalid("native journal destination is not empty"));
         }
@@ -219,21 +270,21 @@ impl<W: Write + Seek> NativePvJournalWriter<W> {
         let mut writer = Self {
             output,
             hasher: blake3::Hasher::new(),
-            plan: session.plan_id,
-            parent: session.parent,
+            plan,
+            parent,
             completed: 0,
             bytes: 0,
             expected_bytes: bytes,
             poisoned: false,
         };
         writer.write(&MAGIC)?;
-        writer.write(session.plan_id.as_bytes())?;
-        writer.write(&session.parent)?;
-        writer.write(&(session.plan.training.len() as u64).to_le_bytes())?;
-        writer.write(&(session.owners.len() as u64).to_le_bytes())?;
-        for weight in session.weights() {
-            writer.write(&(weight.scales().len() as u64).to_le_bytes())?;
-            writer.write(&(active_count(weight)? as u64).to_le_bytes())?;
+        writer.write(plan.as_bytes())?;
+        writer.write(&parent)?;
+        writer.write(&updates.to_le_bytes())?;
+        writer.write(&(channels.len() as u64).to_le_bytes())?;
+        for &(scales, weights) in channels {
+            writer.write(&scales.to_le_bytes())?;
+            writer.write(&weights.to_le_bytes())?;
         }
         Ok(writer)
     }
@@ -271,14 +322,9 @@ impl<W: Write + Seek> NativePvJournalWriter<W> {
         weights: &[&[f32]],
     ) -> Result<()> {
         let mut frame = blake3::Hasher::new();
-        frame.update(FRAME_DOMAIN);
-        for bytes in [&ordinal.to_le_bytes()[..], &window[..]] {
-            self.write(bytes)?;
-            frame.update(bytes);
-        }
+        frame_header(ordinal, window, &mut frame, |bytes| self.write(bytes))?;
         for (scale, weight) in scales.iter().zip(weights) {
-            stream::encode(scale, &mut frame, |bytes| self.write(bytes))?;
-            stream::encode(weight, &mut frame, |bytes| self.write(bytes))?;
+            frame_owner(scale, weight, &mut frame, |bytes| self.write(bytes))?;
         }
         self.write(frame.finalize().as_bytes())?;
         self.flush()?;
@@ -314,7 +360,7 @@ impl<W: Write + Seek> NativePvJournalWriter<W> {
     }
     /// Seal only a complete schedule against its actual checkpoint. Caller owns persistence/custody.
     pub fn finish(
-        mut self,
+        self,
         session: &NativePvRefinementSession,
     ) -> Result<(W, NativePvJournalSummary)> {
         self.check(session)?;
@@ -323,9 +369,24 @@ impl<W: Write + Seek> NativePvJournalWriter<W> {
         }
         let checkpoint = session.checkpoint_bytes()?;
         let checkpoint_id = BlobId::from_bytes(*blake3::hash(&checkpoint).as_bytes());
+        self.finish_observed(
+            session.plan.training.len() as u64,
+            checkpoint.len() as u64,
+            checkpoint_id,
+        )
+    }
+    fn finish_observed(
+        mut self,
+        updates: u64,
+        checkpoint_bytes: u64,
+        checkpoint_id: BlobId,
+    ) -> Result<(W, NativePvJournalSummary)> {
+        if self.completed != updates {
+            return Err(invalid("native journal schedule incomplete"));
+        }
         self.write(&END)?;
         self.write(&self.completed.to_le_bytes())?;
-        self.write(&(checkpoint.len() as u64).to_le_bytes())?;
+        self.write(&checkpoint_bytes.to_le_bytes())?;
         self.write(checkpoint_id.as_bytes())?;
         let checksum = *self.hasher.finalize().as_bytes();
         self.write(&checksum)?;
@@ -338,7 +399,7 @@ impl<W: Write + Seek> NativePvJournalWriter<W> {
             bytes: self.bytes,
             plan: self.plan,
             checkpoint: checkpoint_id,
-            checkpoint_bytes: checkpoint.len() as u64,
+            checkpoint_bytes,
             updates: self.completed,
         };
         Ok((self.output, summary))
