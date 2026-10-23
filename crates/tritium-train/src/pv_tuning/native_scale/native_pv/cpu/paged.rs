@@ -7,6 +7,7 @@ use super::super::{
 use super::*;
 use std::io::Read;
 use tritium_schema::NativePvResumePoint;
+mod observation;
 
 /// Original paged/provider, packed/backend or journal refusal.
 #[derive(Debug)]

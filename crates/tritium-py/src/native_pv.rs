@@ -24,6 +24,7 @@ use tritium_train::pv_tuning::{
     NativePvRefinementSession, decode_native_pv_parents, publish_native_pv_child,
     replay_native_pv_journal,
 };
+pub(crate) mod paged;
 mod recovery;
 pub(crate) use recovery::NativePvResumeBundle;
 

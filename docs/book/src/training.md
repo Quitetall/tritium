@@ -33,6 +33,84 @@ uninterrupted run, and the checkpoint round-trip is a golden test. The
 no-NaN/Inf-over-≥1k-steps and same-seed⇒same-loss-curve properties are the
 mixed-precision conformance gate.
 
+## Owner-paged native CPU P/V training
+
+`tritium.torch.native_pv_paged_training` is a distinct first-order eager controller
+over an actual `NativeModelConversion` or `NativeModelRefinement` parent. Select
+one explicit parent level and a complete `NativeRefinementPlan`; obtain its exact
+parent tuple with `parent.native_refinement_parent(level)`. It shares the packed
+CPU kernels, optimizer, TNPJ journal, TNPB resume transport and immutable child
+publisher with the resident path. It does not retain all decoded optimizer
+owners or materialize checkpoint bytes. The ordinary resident factories and
+high-level teacher/data `refine` facade are unchanged.
+
+Small-fixture example (these caps are **not** Qwen sizing):
+
+```python
+from tritium import NativePvPagedTrainingLimits
+from tritium.torch import native_pv_paged_training
+
+caps = NativePvPagedTrainingLimits(
+    max_owner_read_bytes=1_000_000,
+    max_owner_resident_bytes=1_000_000,
+    max_gradient_working_bytes=1_000_000,
+    max_workspace_bytes=16_000_000,
+    max_journal_bytes=2_000_000,
+    max_frame_bytes=2_000_000,
+    max_recording_working_bytes=16_384,
+)
+trainer = native_pv_paged_training(
+    shell, parent, level="full", plan=plan, load_run_id="paged-load",
+    workspace_dir="/path/to/new/private-work", limits=caps,
+    max_snapshot_bytes=1_000_000, max_saved_input_bytes=10_000_000,
+)
+trainer.zero_grad()
+loss = objective(trainer.model, batch)
+loss.backward()
+trainer.step(plan["training"][0]["content"])
+print(trainer.workspace_report)  # logical reservations, not physical memory
+```
+
+The workspace must be new and outside parent, resume and output artifacts.
+Anonymous current/next checkpoints, gradient frame, journal, replay and publication
+spools share aggregate byte admission and at most six live files. Initial and
+replayed checkpoints reserve the plan's checkpoint ceiling; subsequent updates
+reserve exact checkpoint lengths. Journal and publication spools reserve their
+declared ceilings. Allocation may refuse even when actual written files are
+smaller. Budget real filesystem free space and I/O separately.
+
+Use `save_resume(output_dir, limits=...)` with the same four positive bundle
+fields as resident recovery (`max_bundle_bytes`, `max_manifest_bytes`,
+`max_checkpoint_bytes`, `max_working_bytes`). The result is a
+`NativePvPagedResumeBundle`, not a trained model or replay/quality approval.
+Pass it as `resume=` to a fresh paged factory/workspace, omitting `plan` to use
+its frozen request. Actual original-parent numerical replay precedes continuation;
+pending gradients, Torch RNG and the external data iterator are not saved.
+`checkpoint()` intentionally refuses rather than allocating a full byte buffer.
+
+After completing every declared window, `publish` numerically replays and emits
+an ordinary unqualified `NativeModelRefinement`. Its `limits` mapping has exactly
+`max_spool_bytes`, `max_working_bytes`, `max_evidence_bytes`,
+`max_companion_bytes`, `max_package_bytes`, `max_manifest_bytes` and
+`max_directory_bytes`. Source-owner and replay/journal caps remain the frozen
+controller limits. Publication working bytes cover one encoded owner plus fixed
+publisher I/O, not a checkpoint buffer. Reload the child for frozen inference.
+
+Call `close()` when finished. It preserves complete current packed weights on
+the private shell, drops file leases and removes only the same empty owned
+workspace. Unexpected files/replacement directories are preserved with warnings;
+there is no recursive cleanup. Old graph handles remain immutable and budgeted.
+No concurrent backward/step, higher-order gradients, autocast, compile, vmap,
+dtype/device mutation or `torch.optim` updates are admitted. Private f64 leaves
+transport gradients; they are not latent weight values.
+
+One complete numerical owner, current/old packed models and caller Torch
+leaves/gradients still need memory. Source, numerical, gradient-transfer, recorded
+scratch, packed and saved-input caps are separate; metadata, allocator/OS caches,
+physical RSS/VRAM, source authenticity and objective/data/teacher attestation are
+not established by this interface. Within-owner/GPU state and real-model
+quality/performance qualification remain open.
+
 ## LoRA on a frozen ternary base
 
 LoRA adapters train on top of a **frozen** ternary base. The contract, proptested:

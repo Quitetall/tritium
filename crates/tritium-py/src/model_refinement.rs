@@ -27,7 +27,7 @@ use tritium_train::pv_tuning::{
 mod record;
 use record::Record;
 mod paged;
-mod workspace;
+use crate::native_workspace as workspace;
 pub(crate) use paged::NativePvPagedVerificationLimits;
 
 fn error(v: impl std::fmt::Display) -> PyErr {
@@ -262,6 +262,26 @@ impl NativeModelRefinement {
     pub(crate) fn from_published_pv(
         output_dir: String,
         child: PublishedNativePvChild,
+        limits: ReadLimits,
+    ) -> Self {
+        let plan = &child.receipt.refinement().started().plan;
+        Self {
+            output_dir,
+            source_id: hex(plan.parent.source.as_bytes()),
+            package_id: hex(child.model.package_id().as_bytes()),
+            model_ids: BTreeMap::from([(plan.child_level.clone(), hex(child.model_id.as_bytes()))]),
+            evidence_root: child.evidence.log().root_digest.clone(),
+            run_id: child.evidence.run().into(),
+            parent_level: plan.parent.level.clone(),
+            parent_package_id: hex(plan.parent.package.as_bytes()),
+            recovery_recipe: "alternating-pv".into(),
+            publication_warnings: child.warnings.iter().map(|w| format!("{w:?}")).collect(),
+            limits,
+        }
+    }
+    pub(crate) fn from_published_paged_pv(
+        output_dir: String,
+        child: tritium_train::pv_tuning::PublishedNativePvPagedChild,
         limits: ReadLimits,
     ) -> Self {
         let plan = &child.receipt.refinement().started().plan;

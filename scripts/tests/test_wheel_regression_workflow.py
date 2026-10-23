@@ -12,6 +12,7 @@ TESTS = (
     "test_native_scale_training.py",
     "test_native_pv_training.py",
     "test_native_pv_paged_verify.py",
+    "test_native_pv_paged_training.py",
     "test_native_pv_resume.py",
     "test_native_refinement.py",
     "test_native_resume.py",

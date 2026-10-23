@@ -45,6 +45,7 @@ mod native_parent;
 mod native_publication;
 mod native_pv;
 mod native_scale;
+mod native_workspace;
 #[cfg(feature = "onnx")]
 mod onnx;
 mod ops;
@@ -410,6 +411,13 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<model_level::NativePackedMatrix>()?;
     m.add_class::<native_scale::NativeScaleTraining>()?;
     m.add_class::<native_pv::NativePvTraining>()?;
+    m.add_class::<native_pv::paged::NativePvPagedTraining>()?;
+    m.add_class::<native_pv::paged::NativePvPagedTrainingLimits>()?;
+    m.add_class::<native_pv::paged::NativePvPagedResumeBundle>()?;
+    m.add_function(wrap_pyfunction!(
+        native_pv::paged::_begin_paged_pv_training,
+        m
+    )?)?;
     m.add_class::<native_pv::NativePvResumeBundle>()?;
     m.add_function(wrap_pyfunction!(native_pv::_validate_native_pv_plan, m)?)?;
     m.add_class::<native_scale::NativeScaleResumeBundle>()?;

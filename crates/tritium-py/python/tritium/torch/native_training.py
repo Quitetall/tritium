@@ -365,9 +365,56 @@ class NativePvTrainer(NativeScaleTrainer):
     _pv = True
 
 
+class NativePvPagedTrainer(NativePvTrainer):
+    """Recorded CPU P/V training with owner-paged optimizer state.
+
+    Checkpoint bytes are intentionally unavailable: use save_resume(). Packed
+    models and caller Torch leaves/gradients remain resident. Logical workspace
+    reservations are not physical RAM/disk qualification.
+    """
+    @property
+    def workspace_report(self):
+        return json.loads(self._backend.workspace_report)
+
+    def close(self):
+        model = super().close()
+        self._original_handles.clear()
+        return model
+
+    def _cleanup_recording(self):
+        if getattr(self, "_recording_work", None) is None:
+            return
+        report = json.loads(self._backend.close_recording())
+        self._recording_work = None
+        if report["cleanup_warnings"]:
+            import warnings
+            warnings.warn("; ".join(report["cleanup_warnings"]), RuntimeWarning, stacklevel=2)
+
+    def publish(self, output_dir, run_id, *, machine, validation, limits):
+        """Replay and publish an unqualified child without a checkpoint byte buffer.
+
+        Source-owner and replay/journal caps are the frozen controller limits.
+        Publication scratch covers one encoded owner plus fixed publisher I/O.
+        """
+        self._validate()
+        if self._failed:
+            raise RuntimeError("native backward failed; call zero_grad before reuse")
+        fields = {"max_spool_bytes", "max_working_bytes", "max_evidence_bytes", "max_companion_bytes",
+                  "max_package_bytes", "max_manifest_bytes", "max_directory_bytes"}
+        if (not isinstance(limits, dict) or set(limits) != fields
+                or any(type(n) is not int or n <= 0 for n in limits.values())):
+            raise ValueError("paged publication requires exact positive limit fields")
+        if not isinstance(run_id, str) or not run_id or not isinstance(machine, str) or not machine:
+            raise ValueError("paged publication requires explicit run and machine")
+        if not isinstance(validation, (list, tuple)):
+            raise TypeError("bounded validation observations required")
+        return self._backend.publish(str(Path(output_dir).resolve()), run_id, machine,
+                                     json.dumps(validation, allow_nan=False), json.dumps(limits, allow_nan=False))
+
+
 def _native_training(_pv, /, model, artifact, *, level, plan=None, load_run_id,
                           max_snapshot_bytes, max_parent_bytes, max_saved_input_bytes,
-                          checkpoint=None, recording=None, resume=None, **load_limits):
+                          checkpoint=None, recording=None, resume=None, _paging=None, **load_limits):
     """Create a private native eager CPU scale trainer, never a refined artifact.
 
     plan is the complete Rust NativeRefinementPlan mapping/JSON; obtain its exact
@@ -379,16 +426,18 @@ def _native_training(_pv, /, model, artifact, *, level, plan=None, load_run_id,
         raise TypeError("native scale training requires NativeModelConversion or NativeModelRefinement")
     if not isinstance(level, str) or not level or not isinstance(load_run_id, str) or not load_run_id:
         raise ValueError("explicit level and load run required")
-    for limit in (max_snapshot_bytes, max_parent_bytes, max_saved_input_bytes):
+    caps = (max_snapshot_bytes, max_saved_input_bytes) if _paging is not None else (max_snapshot_bytes, max_parent_bytes, max_saved_input_bytes)
+    for limit in caps:
         if type(limit) is not int or limit <= 0:
             raise ValueError("native training byte limits must be positive integers")
     if resume is not None:
-        expected_bundle = _tritium.NativePvResumeBundle if _pv else _tritium.NativeScaleResumeBundle
+        expected_bundle = (_tritium.NativePvPagedResumeBundle if _paging is not None else
+                           _tritium.NativePvResumeBundle if _pv else _tritium.NativeScaleResumeBundle)
         if not isinstance(resume, expected_bundle):
             raise TypeError(f"recorded resume requires {expected_bundle.__name__}")
         if checkpoint is not None:
             raise ValueError("checkpoint and recorded resume are mutually exclusive")
-        if recording is None:
+        if recording is None and _paging is None:
             raise ValueError("recorded resume requires a fresh recording work directory")
         if plan is None:
             plan = resume.plan_json
@@ -445,16 +494,22 @@ def _native_training(_pv, /, model, artifact, *, level, plan=None, load_run_id,
             if resume is not None:
                 resumed = (resume, json.dumps(dict(path=journal_path, max_journal_bytes=journal_bytes,
                                                    max_working_bytes=working_bytes), allow_nan=False))
-        arguments = dict(max_snapshot_bytes=max_snapshot_bytes, max_parent_bytes=max_parent_bytes, checkpoint=checkpoint)
-        arguments["recorded_resume"] = resumed
-        begin = artifact.begin_pv_training if _pv else artifact.begin_scale_training
-        backend = begin(text, [(name, selected[name].handle) for name in data["owners"]], **arguments)
-        if temporary is not None and resume is None:
+        matrices = [(name, selected[name].handle) for name in data["owners"]]
+        if _paging is not None:
+            workspace, paging_limits = _paging
+            backend = _tritium._begin_paged_pv_training(artifact, text, matrices, workspace,
+                         limits=paging_limits, max_snapshot_bytes=max_snapshot_bytes, resume=resume)
+        else:
+            arguments = dict(max_snapshot_bytes=max_snapshot_bytes, max_parent_bytes=max_parent_bytes, checkpoint=checkpoint)
+            arguments["recorded_resume"] = resumed
+            begin = artifact.begin_pv_training if _pv else artifact.begin_scale_training
+            backend = begin(text, matrices, **arguments)
+        if _paging is None and temporary is not None and resume is None:
             name = "gradients.tnpj" if _pv else "gradients.tnsj"
             backend.start_recording(str(Path(temporary.name) / name), journal_bytes, working_bytes)
-        trainer_type = NativePvTrainer if _pv else NativeScaleTrainer
+        trainer_type = NativePvPagedTrainer if _paging is not None else NativePvTrainer if _pv else NativeScaleTrainer
         trainer = trainer_type(private, backend, data, selected, max_saved_input_bytes)
-        trainer._recording_work = temporary
+        trainer._recording_work = True if _paging is not None else temporary
     except BaseException:
         if backend is not None:
             backend.close_recording()
@@ -490,6 +545,26 @@ def native_pv_training(model, artifact, *, level, plan=None, load_run_id,
                             recording=recording, resume=resume, **load_limits)
 
 
+def native_pv_paged_training(model, artifact, *, level, plan=None, load_run_id, workspace_dir, limits,
+                             max_snapshot_bytes, max_saved_input_bytes, resume=None, **load_limits):
+    """Distinct owner-paged, always-recorded CPU P/V controller.
+
+    workspace_dir must be new and outside parent/resume artifacts. Anonymous
+    current/next checkpoints, frame, journal and publication/replay spools share
+    an aggregate workspace cap and at most six live files. Initial/replayed
+    checkpoint reservations use the plan's checkpoint ceiling; later updates
+    use exact checkpoint lengths. Actual disk space is a separate requirement.
+    Only a NativePvPagedResumeBundle admits recorded restart; no raw bytes or
+    silent resident fallback. Other load limits retain their original meanings.
+    """
+    if not isinstance(limits, _tritium.NativePvPagedTrainingLimits):
+        raise TypeError("NativePvPagedTrainingLimits required")
+    return _native_training(True, model, artifact, level=level, plan=plan, load_run_id=load_run_id,
+               max_snapshot_bytes=max_snapshot_bytes, max_parent_bytes=None,
+               max_saved_input_bytes=max_saved_input_bytes, resume=resume,
+               _paging=(str(Path(workspace_dir).resolve()), limits), **load_limits)
+
+
 def _pairs(items):
     result = {}
     for key, value in items:
@@ -499,4 +574,5 @@ def _pairs(items):
     return result
 
 
-__all__ = ["NativeScaleTrainer", "native_scale_training", "NativePvTrainer", "native_pv_training"]
+__all__ = ["NativeScaleTrainer", "native_scale_training", "NativePvTrainer", "native_pv_training",
+           "NativePvPagedTrainer", "native_pv_paged_training"]

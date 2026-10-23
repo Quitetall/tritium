@@ -132,9 +132,12 @@ packed-payload budget.
 
 Numerical owner scratch, consumer reduction, recorded disk/scratch, original
 source decoding and packed payloads have separate limits. This is not within-owner
-paging, GPU training or a physical RSS/VRAM measurement. Python/Torch live training
-still uses the resident controller; its artifact verifier has a separate paged
-path. Live Python recovery/publication wiring and model qualification remain open.
+paging, GPU training or a physical RSS/VRAM measurement. Python/Torch callers can
+explicitly select `native_pv_paged_training` with `NativePvPagedTrainingLimits`
+and a new private workspace for recorded updates, streamed resume bundles and
+child publication. The default resident controllers and high-level refinement
+facade retain their existing semantics. See [training](docs/book/src/training.md)
+for the storage/graph limits; model qualification remains open.
 
 ## Native inference from source
 

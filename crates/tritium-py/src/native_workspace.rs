@@ -1,4 +1,4 @@
-//! Disposable bounded anonymous checkpoint storage, never recursive cleanup.
+//! Shared bounded anonymous work storage, never recursive cleanup.
 use same_file::Handle;
 #[derive(Debug)]
 struct Initialization {
@@ -21,11 +21,10 @@ impl std::error::Error for Initialization {
     }
 }
 use std::{
-    cell::RefCell,
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom, Write},
     path::PathBuf,
-    rc::Rc,
+    sync::{Arc, Mutex},
 };
 
 struct State {
@@ -35,6 +34,7 @@ struct State {
     max: u64,
     live: u64,
     files: u64,
+    max_files: u64,
     peak: u64,
     peak_files: u64,
     next: u64,
@@ -59,15 +59,29 @@ impl State {
         Ok(())
     }
 }
-pub(super) struct Workspace(Rc<RefCell<State>>);
-pub(super) struct Report {
+pub(crate) struct Workspace(Arc<Mutex<State>>);
+pub(crate) struct Report {
+    pub reserved_bytes: u64,
+    pub files: u64,
     pub cleaned: bool,
     pub peak_reserved_bytes: u64,
     pub peak_files: u64,
     pub warnings: Vec<String>,
 }
 impl Workspace {
-    pub(super) fn new(root: PathBuf, bytes: u64, max: u64, updates: u64) -> io::Result<Self> {
+    pub(crate) fn report(&self) -> Report {
+        let s = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut r = report(&s);
+        if self.0.is_poisoned() {
+            r.warnings
+                .push("WorkspaceCleanup: lock poisoned; custody/accounting unqualified".into());
+        }
+        r
+    }
+    pub(crate) fn new(root: PathBuf, bytes: u64, max: u64, updates: u64) -> io::Result<Self> {
         let required = bytes
             .checked_mul(if updates == 0 { 1 } else { 2 })
             .ok_or_else(|| io::Error::other("paged verification workspace byte overflow"))?;
@@ -76,6 +90,16 @@ impl Workspace {
                 "paged verification workspace byte cap exceeded",
             ));
         }
+        Self::initialize(root, bytes, max, 2)
+    }
+    /// Private generalized storage seam; callers preflight role-specific extents.
+    pub(crate) fn storage(root: PathBuf, max: u64, max_files: u64) -> io::Result<Self> {
+        if max == 0 || max_files == 0 {
+            return Err(io::Error::other("paged workspace limits must be positive"));
+        }
+        Self::initialize(root, 0, max, max_files)
+    }
+    fn initialize(root: PathBuf, bytes: u64, max: u64, max_files: u64) -> io::Result<Self> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
@@ -90,13 +114,14 @@ impl Workspace {
                 return Err(io::Error::new(e.kind(), Initialization { source: e, root }));
             }
         };
-        Ok(Self(Rc::new(RefCell::new(State {
+        Ok(Self(Arc::new(Mutex::new(State {
             root,
             identity: Some(identity),
             bytes,
             max,
             live: 0,
             files: 0,
+            max_files,
             peak: 0,
             peak_files: 0,
             next: 0,
@@ -105,20 +130,32 @@ impl Workspace {
             warnings: Vec::new(),
         }))))
     }
-    pub(super) fn create(&mut self, ordinal: u64) -> io::Result<Checkpoint> {
-        let mut s = self.0.borrow_mut();
+    pub(crate) fn create(&mut self, ordinal: u64) -> io::Result<Checkpoint> {
+        let bytes = self.0.lock().map_err(poison)?.bytes;
+        self.allocate(Some(ordinal), bytes, 8192)
+    }
+    pub(crate) fn create_blob(&self, bytes: u64, io_bytes: usize) -> io::Result<Checkpoint> {
+        self.allocate(None, bytes, io_bytes)
+    }
+    fn allocate(
+        &self,
+        ordinal: Option<u64>,
+        bytes: u64,
+        io_bytes: usize,
+    ) -> io::Result<Checkpoint> {
+        let mut s = self.0.lock().map_err(poison)?;
         s.check()?;
-        if ordinal != s.next {
+        if ordinal.is_some_and(|i| i != s.next) {
             return Err(io::Error::other(
                 "paged verification workspace ordinal differs",
             ));
         }
         let live = s
             .live
-            .checked_add(s.bytes)
+            .checked_add(bytes)
             .filter(|n| *n <= s.max)
             .ok_or_else(|| io::Error::other("paged verification workspace byte cap exceeded"))?;
-        if s.files >= 2 {
+        if bytes == 0 || io_bytes == 0 || s.files >= s.max_files {
             return Err(io::Error::other(
                 "paged verification workspace file cap exceeded",
             ));
@@ -137,14 +174,21 @@ impl Workspace {
         s.next = next;
         Ok(Checkpoint {
             file: Some(file),
-            bytes: s.bytes,
+            bytes,
+            io_bytes,
             state: self.0.clone(),
         })
     }
-    pub(super) fn finish(&mut self) -> Report {
-        let mut s = self.0.borrow_mut();
+    pub(crate) fn finish(&self) -> Report {
+        let mut s = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !s.finished {
-            if s.files != 0 {
+            if self.0.is_poisoned() {
+                s.warnings
+                    .push("WorkspaceCleanup: lock poisoned; directory preserved".into());
+            } else if s.files != 0 {
                 s.warnings
                     .push("workspace has live checkpoint leases".into());
             } else if let Err(e) = s.check() {
@@ -160,12 +204,17 @@ impl Workspace {
             }
             s.finished = true;
         }
-        Report {
-            cleaned: s.cleaned,
-            peak_reserved_bytes: s.peak,
-            peak_files: s.peak_files,
-            warnings: s.warnings.clone(),
-        }
+        report(&s)
+    }
+}
+fn report(s: &State) -> Report {
+    Report {
+        reserved_bytes: s.live,
+        files: s.files,
+        cleaned: s.cleaned,
+        peak_reserved_bytes: s.peak,
+        peak_files: s.peak_files,
+        warnings: s.warnings.clone(),
     }
 }
 impl Drop for Workspace {
@@ -173,14 +222,18 @@ impl Drop for Workspace {
         let _ = self.finish();
     }
 }
-pub(super) struct Checkpoint {
+fn poison<T>(_: std::sync::PoisonError<T>) -> io::Error {
+    io::Error::other("paged workspace lock poisoned")
+}
+pub(crate) struct Checkpoint {
     file: Option<File>,
     bytes: u64,
-    state: Rc<RefCell<State>>,
+    io_bytes: usize,
+    state: Arc<Mutex<State>>,
 }
 impl Read for Checkpoint {
     fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
-        if b.len() > 8192 {
+        if b.len() > self.io_bytes {
             return Err(io::Error::other("paged checkpoint I/O window exceeded"));
         }
         self.file.as_mut().expect("live checkpoint").read(b)
@@ -193,7 +246,7 @@ impl Seek for Checkpoint {
 }
 impl Write for Checkpoint {
     fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-        if b.len() > 8192 {
+        if b.len() > self.io_bytes {
             return Err(io::Error::other("paged checkpoint I/O window exceeded"));
         }
         let file = self.file.as_mut().expect("live checkpoint");
@@ -213,9 +266,12 @@ impl Write for Checkpoint {
 impl Drop for Checkpoint {
     fn drop(&mut self) {
         drop(self.file.take());
-        let mut s = self.state.borrow_mut();
-        s.live -= self.bytes;
-        s.files -= 1;
+        let mut s = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        s.live = s.live.saturating_sub(self.bytes);
+        s.files = s.files.saturating_sub(1);
     }
 }
 
@@ -260,7 +316,7 @@ mod tests {
         assert!(Workspace::new(p.clone(), 256, 512, 1).is_err());
         assert_eq!(fs::read(p.join("foreign")).unwrap(), b"keep");
         let p = root.path().join("owned");
-        let mut w = Workspace::new(p.clone(), 256, 512, 1).unwrap();
+        let w = Workspace::new(p.clone(), 256, 512, 1).unwrap();
         fs::write(p.join("foreign"), b"keep").unwrap();
         let r = w.finish();
         assert!(!r.cleaned);
@@ -291,5 +347,55 @@ mod tests {
         assert!(!w.finish().cleaned);
         assert!(p.exists());
         assert!(moved.exists());
+    }
+    #[test]
+    fn role_extents_io_quota_and_cross_thread_retirement_share_one_account() {
+        let root = root();
+        let path = root.path().join("roles");
+        let w = Workspace::storage(path.clone(), 300, 2).unwrap();
+        let a = w.create_blob(100, 8).unwrap();
+        let mut b = w.create_blob(200, 16).unwrap();
+        assert!(w.create_blob(1, 8).is_err());
+        assert_eq!((w.report().reserved_bytes, w.report().files), (300, 2));
+        assert!(b.write_all(&[0; 17]).is_err());
+        std::thread::spawn(move || {
+            let mut a = a;
+            a.write_all(&[1; 8]).unwrap();
+            a.seek(SeekFrom::Start(99)).unwrap();
+            assert!(a.write_all(&[0; 2]).is_err());
+        })
+        .join()
+        .unwrap();
+        assert_eq!((w.report().reserved_bytes, w.report().files), (200, 1));
+        let c = w.create_blob(100, 1).unwrap();
+        assert!(w.create_blob(1, 1).is_err());
+        drop(b);
+        drop(c);
+        let r = w.finish();
+        assert!(r.cleaned);
+        assert_eq!(r.peak_reserved_bytes, 300);
+        assert_eq!(r.peak_files, 2);
+        assert!(!path.exists());
+    }
+    #[test]
+    fn poisoned_storage_refuses_admission_and_preserves_owned_directory() {
+        let root = root();
+        let path = root.path().join("poison");
+        let w = Workspace::storage(path.clone(), 100, 1).unwrap();
+        let a = w.create_blob(100, 8).unwrap();
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _guard = w.0.lock().unwrap();
+                panic!("injected storage poison");
+            })
+            .is_err()
+        );
+        assert!(w.create_blob(1, 1).is_err());
+        drop(a);
+        let r = w.finish();
+        assert!(!r.cleaned);
+        assert_eq!(r.files, 0);
+        assert!(r.warnings.iter().any(|s| s.contains("poisoned")));
+        assert!(path.exists());
     }
 }
