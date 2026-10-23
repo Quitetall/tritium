@@ -277,15 +277,30 @@ pub(super) fn verify_encoded_state<P: Read + Seek, C: Read + Seek>(
                 "native child encoded verification exceeds byte limit",
             ));
         }
-        let bytes = weight.encode_payload()?;
-        let meta = child.tensor_meta(&state.plan().child_level, name)?;
-        if bytes.len() as u64 != child.tensor_byte_len(&state.plan().child_level, name)?
-            || blake3::hash(&bytes).as_bytes() != meta.blob.id.as_bytes()
-        {
-            return Err(Error::Binding(
-                "native child bytes differ from replayed owner state",
-            ));
-        }
+        verify_encoded_owner(weight, child, &state.plan().child_level, name, length)?;
+    }
+    Ok(())
+}
+pub(super) fn verify_encoded_owner<C: Read + Seek>(
+    weight: &AdditiveTensor,
+    child: &mut TritModelReader<C>,
+    level: &str,
+    name: &str,
+    expected_bytes: u64,
+) -> Result<(), Error> {
+    // Geometry and storage are parent-bound; numerical updates cannot change
+    // their encoded length. Callers admit this length before owner allocation.
+    let meta = child.tensor_meta(level, name)?;
+    if child.tensor_byte_len(level, name)? != expected_bytes {
+        return Err(Error::Binding("native child encoded owner length differs"));
+    }
+    let bytes = weight.encode_payload()?;
+    if bytes.len() as u64 != expected_bytes
+        || blake3::hash(&bytes).as_bytes() != meta.blob.id.as_bytes()
+    {
+        return Err(Error::Binding(
+            "native child bytes differ from replayed owner state",
+        ));
     }
     Ok(())
 }

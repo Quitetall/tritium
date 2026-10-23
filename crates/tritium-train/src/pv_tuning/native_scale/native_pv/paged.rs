@@ -3,6 +3,8 @@ use super::*;
 use checkpoint::{HashRead, HashWrite, Header, Inspection, WireError};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use tritium_schema::BlobId;
+mod visit;
+use visit::Traversal;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PagedJournalState {
@@ -231,7 +233,7 @@ impl<R: Read + Seek> NativePvPagedSession<R> {
     pub fn reopen<E>(
         plan: NativeRefinementPlan,
         limits: NativePvPagedLimits,
-        mut parents: impl FnMut(usize, &str) -> Result<AdditiveTensor, E>,
+        parents: impl FnMut(usize, &str) -> Result<AdditiveTensor, E>,
         mut source: R,
     ) -> Result<Self, NativePvPagedError<E>> {
         let (updater, id) = configuration(&plan, limits)?;
@@ -242,41 +244,13 @@ impl<R: Read + Seek> NativePvPagedSession<R> {
         {
             return Err(invalid("native PV paging plan/cursor/owner mismatch").into());
         }
-        source.rewind()?;
-        let mut ledger = empty_ledger();
-        let mut channels = reserved(plan.owners.len())?;
-        let mut parent_hash = NativePvRefinementSession::parent_hasher(id);
-        let traversed = {
-            let mut reader = HashRead {
-                source: &mut source,
-                hash: blake3::Hasher::new(),
-            };
-            if checkpoint::read_header(&mut reader)? != observed.header {
-                return Err(invalid("native PV paging header drift").into());
-            }
-            for (i, name) in plan.owners.iter().enumerate() {
-                let weight = parents(i, name).map_err(NativePvPagedError::Provider)?;
-                account(&plan, limits, updater.fraction, &weight, &mut ledger)?;
-                channels.push((weight.scales().len() as u64, active_count(&weight)? as u64));
-                hash_parent_tensor(&mut parent_hash, &weight)?;
-                let _owner = checkpoint::read_owner::<8192>(
-                    &mut reader,
-                    weight,
-                    observed.header.completed,
-                    updater,
-                )?;
-            }
-            *reader.hash.finalize().as_bytes()
-        };
-        if traversed != observed.body
-            || *parent_hash.finalize().as_bytes() != observed.header.parent
-            || ledger.logical.checkpoint_bytes != observed.bytes
-        {
-            return Err(invalid("native PV paging parent/body/length mismatch").into());
+        let (ledger, channels, _) = Traversal {
+            plan: &plan,
+            limits,
+            updater,
+            observed,
         }
-        if checkpoint::inspect(&mut source, observed.bytes)? != observed {
-            return Err(invalid("native PV paging checkpoint changed during reopen").into());
-        }
+        .run(&mut source, parents, |_, _, _| Ok(()))?;
         Ok(Self {
             checkpoint: source,
             plan,

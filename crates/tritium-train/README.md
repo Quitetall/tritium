@@ -296,7 +296,7 @@ checkpoint stream for each cursor and retire obsolete owned named files (or use
 anonymous streams); dropping a generic file handle does not delete its path.
 `NativePvPagedReplayLimits` separates full-schedule journal and 16384-byte extra
 I/O scratch caps from owner/source limits. These are logical payload bounds, not
-RSS/VRAM qualification. Deployed-child verification/publication remains separate
+RSS/VRAM qualification. Owner-paged deployed-child publication remains separate
 work.
 
 `stage_native_pv_paged_resume_bundle` and
@@ -314,3 +314,23 @@ encoded manifest plus8192bytes transport scratch; resident bundle limits keep
 their checkpoint-inclusive meaning. Numerical replay, source, decoded metadata,
 allocator/stream/OS-cache and physical-memory budgets remain separate. Budget disk
 and retire only obsolete owned private workspaces after retained recovery succeeds.
+
+`NativePvPagedSession::visit_weights` reuses strict reopen traversal to expose one
+validated current owner at a time. Staged callback results return only after the
+complete original-parent fingerprint, ledger, actual traversed body and terminal
+checkpoint checks; failures/unwind drop them without advancing numerical state.
+Arbitrary returned resources and callback side effects have separate budgets and
+must remain private until success. Visiting alone is not numerical replay.
+
+`verify_native_pv_paged_child` numerically replays actual original-package owners,
+visits reconstructed weights and checks each deployed owner through the same
+canonical encoder used by resident verification. It consumes a seek-backed
+expected checkpoint, not a full byte slice or all-owner decoded cache. Only exact
+receipt/replay/encoded-owner equality plus fresh retained source/workspace checks
+return the existing `VerifiedNativePvChild`. Its limits separately cap original
+owner loading, paged numerical replay and one additional encoded-owner allocation;
+one complete owner state plus encoded owner must still fit. This is not
+within-owner paging, source authenticity, objective/data/teacher authentication,
+quality, physical-memory or release qualification. Factory checkpoint files remain
+caller-owned and should be retired or anonymous. Streamed publication/companions,
+Python/runtime integration and within-owner/GPU state remain follow-up work.

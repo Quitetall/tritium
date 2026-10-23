@@ -16,6 +16,10 @@ mod cpu;
 pub use cpu::{NativeCpuPvError, NativeCpuPvJournalStageError, NativeCpuPvSession};
 mod verification;
 pub use verification::{NativePvChildVerification, VerifiedNativePvChild, verify_native_pv_child};
+pub use verification::{
+    NativePvPagedChildVerification, NativePvPagedChildVerificationError,
+    NativePvPagedChildVerificationLimits, verify_native_pv_paged_child,
+};
 mod journal;
 pub use journal::{
     NativePvJournalError, NativePvJournalLimits, NativePvJournalResume, NativePvJournalSizeLedger,

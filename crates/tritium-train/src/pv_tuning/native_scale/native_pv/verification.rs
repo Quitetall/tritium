@@ -7,6 +7,11 @@ use super::*;
 use std::io::{Read, Seek};
 use tritium_evidence::{NativePvChildReceiptView, NativeRefinementParentView, VerifiedLog};
 use tritium_format::trit_model::TritModelReader;
+mod paged;
+pub use paged::{
+    NativePvPagedChildVerification, NativePvPagedChildVerificationError,
+    NativePvPagedChildVerificationLimits, verify_native_pv_paged_child,
+};
 fn add(a: u64, b: u64) -> Result<u64, Error> {
     a.checked_add(b)
         .ok_or(Error::Limit("native PV verifier size overflow"))

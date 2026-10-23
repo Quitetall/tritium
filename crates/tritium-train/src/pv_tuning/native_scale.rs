@@ -25,6 +25,10 @@ pub use native_pv::{
     replay_native_pv_journal, replay_native_pv_journal_with_state, resume_native_pv_journal,
 };
 pub use native_pv::{
+    NativePvPagedChildVerification, NativePvPagedChildVerificationError,
+    NativePvPagedChildVerificationLimits, verify_native_pv_paged_child,
+};
+pub use native_pv::{
     NativePvPagedError, NativePvPagedLimits, NativePvPagedSession, NativePvPagedSizeLedger,
 };
 pub use native_pv::{

@@ -29,6 +29,8 @@ mod bundle;
 mod recording;
 #[path = "native_pv_paged/replay.rs"]
 mod replay;
+#[path = "native_pv_paged/visit.rs"]
+mod visit;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 struct Allocator;
@@ -245,6 +247,14 @@ fn all_profiles_match_resident_checkpoints_statistics_and_every_reopen_cursor() 
                         Paged::reopen(p.clone(), limits(), parents(&weights), Cursor::new(bytes))
                             .unwrap();
                     assert_eq!(paged.completed_updates(), cursor);
+                    let owners = paged
+                        .visit_weights(parents(&weights), |i, name, current| {
+                            assert_eq!(name, p.owners[i]);
+                            assert_eq!(current, resident.weights().nth(i).unwrap());
+                            Ok(())
+                        })
+                        .unwrap();
+                    assert_eq!(owners.len(), weights.len());
                     if cursor == 4 {
                         break;
                     }

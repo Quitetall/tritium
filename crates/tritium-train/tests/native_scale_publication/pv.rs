@@ -84,6 +84,31 @@ fn journal_limits() -> NativePvJournalLimits {
         max_working_bytes: 1_000_000,
     }
 }
+fn paged_verify_limits() -> NativePvPagedChildVerificationLimits {
+    NativePvPagedChildVerificationLimits {
+        owners: NativeRefinementOwnerReadLimits {
+            max_working_bytes: 2_000_000,
+            extra_payload_bytes: 0,
+        },
+        replay: NativePvPagedReplayLimits {
+            max_journal_bytes: 2_000_000,
+            max_working_bytes: 16384,
+            paging: NativePvPagedLimits {
+                max_resident_payload_bytes: 2_000_000,
+            },
+        },
+        max_encoded_owner_bytes: 1_000_000,
+    }
+}
+fn paged_verify<P: Read + Seek, C: Read + Seek, J: Read + Seek, K: Read + Seek>(
+    source: NativePvPagedChildVerification<'_, P, C, J, K>,
+) -> Result<VerifiedNativePvChild, NativePvPagedChildVerificationError<&'static str>> {
+    verify_native_pv_paged_child(source, paged_verify_limits(), |_| {
+        Ok::<_, &str>(Cursor::new(Vec::new()))
+    })
+}
+#[path = "pv_paged.rs"]
+mod paged;
 fn recorder(run: &str) -> EvidenceRecorder {
     EvidenceRecorder::new(
         run,
@@ -216,6 +241,32 @@ fn actual_ptq_parent_recorded_recovery_and_complete_single_level_child_reopen() 
                     let mut child =
                         publish(&mut f, &out, &mut spool, limits(), recorder("native-child"))
                             .unwrap();
+                    let proof = verify_native_pv_paged_child(
+                        NativePvPagedChildVerification {
+                            parent: &mut f.parent,
+                            parent_evidence: &f.view,
+                            child: &mut child.model,
+                            log: child.evidence.log(),
+                            plan: &f.plan,
+                            journal: &mut fs::File::open(out.join(NATIVE_PV_JOURNAL_FILE)).unwrap(),
+                            checkpoint: &mut fs::File::open(out.join(NATIVE_PV_CHECKPOINT_FILE))
+                                .unwrap(),
+                        },
+                        paged_verify_limits(),
+                        |i| {
+                            fs::OpenOptions::new()
+                                .read(true)
+                                .write(true)
+                                .create_new(true)
+                                .open(out.join(format!("verify-{i}.tnpv")))
+                        },
+                    )
+                    .unwrap();
+                    for i in 0..=f.plan.training.len() {
+                        fs::remove_file(out.join(format!("verify-{i}.tnpv"))).unwrap();
+                    }
+                    assert_eq!(proof.package(), child.model.package_id());
+                    assert_eq!(proof.replay().summary(), f.replay.summary());
                     assert_eq!(child.model.manifest().levels.len(), 1);
                     assert_eq!(
                         child.model.manifest().schema,
@@ -994,7 +1045,7 @@ fn synthetic_imported_raw_profiles_preserve_all_four_laws_codecs_bases_and_alloc
                                 parent: &mut parent,
                                 parent_evidence: &view,
                                 replay: &replay,
-                                journal: &mut Cursor::new(journal),
+                                journal: &mut Cursor::new(&journal),
                                 machine: "synthetic-import",
                                 validation: &validation(),
                             },
@@ -1004,6 +1055,18 @@ fn synthetic_imported_raw_profiles_preserve_all_four_laws_codecs_bases_and_alloc
                             recorder("imported-child"),
                         )
                         .unwrap();
+                        let proof = paged_verify(NativePvPagedChildVerification {
+                            parent: &mut parent,
+                            parent_evidence: &view,
+                            child: &mut child.model,
+                            log: child.evidence.log(),
+                            plan: &plan,
+                            journal: &mut Cursor::new(&journal),
+                            checkpoint: &mut Cursor::new(&checkpoint),
+                        })
+                        .unwrap();
+                        assert_eq!(proof.replay().summary(), replay.summary());
+                        assert_eq!(proof.package(), child.model.package_id());
                         let raw = tensor_bytes(&mut child.model, "refined", "weight");
                         let actual = decode_additive_payload(
                             child.model.tensor_meta("refined", "weight").unwrap(),
@@ -1064,6 +1127,18 @@ fn numerical_verifier_rejects_record_consistent_forged_encoded_owner_state() {
     )
     .unwrap();
     assert_eq!(accepted.package(), child.model.package_id());
+    let paged = paged_verify(NativePvPagedChildVerification {
+        parent: &mut f.parent,
+        parent_evidence: &f.view,
+        child: &mut child.model,
+        log: child.evidence.log(),
+        plan: &f.plan,
+        journal: &mut Cursor::new(&f.journal),
+        checkpoint: &mut Cursor::new(&f.checkpoint),
+    })
+    .unwrap();
+    assert_eq!(paged.package(), accepted.package());
+    assert_eq!(paged.replay().summary(), accepted.replay().summary());
     let (other, _, _, _) = trained(&f.plan, &f.parents, 0.125);
     let changed = other.weights().next().unwrap().encode_payload().unwrap();
     let changed_id = BlobId::from_bytes(*blake3::hash(&changed).as_bytes());
@@ -1173,6 +1248,17 @@ fn numerical_verifier_rejects_record_consistent_forged_encoded_owner_state() {
         },
         journal_limits(),
     )
+    .unwrap_err();
+    assert!(error.to_string().contains("replayed owner state"));
+    let error = paged_verify(NativePvPagedChildVerification {
+        parent: &mut f.parent,
+        parent_evidence: &f.view,
+        child: &mut fake,
+        log: fake_log.log(),
+        plan: &f.plan,
+        journal: &mut Cursor::new(&f.journal),
+        checkpoint: &mut Cursor::new(&f.checkpoint),
+    })
     .unwrap_err();
     assert!(error.to_string().contains("replayed owner state"));
 }
@@ -1338,6 +1424,17 @@ fn pv_children_supply_explicit_immediate_parents_to_pv_and_scale_rounds() {
     )
     .unwrap();
     let mut scale = plan.clone();
+    let paged = paged_verify(NativePvPagedChildVerification {
+        parent: &mut child.model,
+        parent_evidence: &parent,
+        child: &mut next.model,
+        log: next.evidence.log(),
+        plan: &plan,
+        journal: &mut Cursor::new(&journal),
+        checkpoint: &mut Cursor::new(&checkpoint),
+    })
+    .unwrap();
+    assert_eq!(paged.replay().summary(), replay.summary());
     scale.child_level = "scale-again".into();
     let NativeRecoveryRecipe::AlternatingPv {
         continuous_optimizer,
