@@ -5,7 +5,8 @@ use tritium_schema::{BlobId, NativeScaleResumePoint};
 
 const MAGIC: [u8; 8] = *b"TNSJ\0\0\0\x01";
 const END: [u8; 8] = *b"TNSJEND1";
-const SCRATCH: usize = 8192;
+use crate::pv_tuning::journal_io as stream;
+const SCRATCH: usize = stream::SCRATCH;
 const FRAME_DOMAIN: &[u8] = b"tritium.native-scale.journal-frame.v1\0";
 mod bundle;
 pub use bundle::{
@@ -75,6 +76,15 @@ impl From<std::io::Error> for NativeScaleJournalError {
 impl From<PvTuningError> for NativeScaleJournalError {
     fn from(error: PvTuningError) -> Self {
         Self::Update(error)
+    }
+}
+impl From<stream::Error> for NativeScaleJournalError {
+    fn from(error: stream::Error) -> Self {
+        match error {
+            stream::Error::Limit(message) => Self::Limit(message),
+            stream::Error::Io(error) => Self::Io(error),
+            stream::Error::Poisoned => invalid("native journal writer is poisoned"),
+        }
     }
 }
 type Result<T> = std::result::Result<T, NativeScaleJournalError>;
@@ -227,32 +237,18 @@ impl<W: Write + Seek> NativeScaleJournalWriter<W> {
         Ok(writer)
     }
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        if self.poisoned {
-            return Err(invalid("native journal writer is poisoned"));
-        }
-        let next = sum(self.bytes, bytes.len() as u64)?;
-        if next > self.expected_bytes {
-            return Err(NativeScaleJournalError::Limit(
-                "native journal emitted bytes exceed limit",
-            ));
-        }
-        // Stay poisoned on an unwinding custom stream, not just an I/O Result.
-        self.poisoned = true;
-        if let Err(error) = self.output.write_all(bytes) {
-            return Err(error.into());
-        }
-        self.hasher.update(bytes);
-        self.bytes = next;
-        self.poisoned = false;
-        Ok(())
+        stream::write(
+            &mut self.output,
+            &mut self.hasher,
+            &mut self.bytes,
+            self.expected_bytes,
+            &mut self.poisoned,
+            bytes,
+        )
+        .map_err(Into::into)
     }
     fn flush(&mut self) -> Result<()> {
-        self.poisoned = true;
-        if let Err(error) = self.output.flush() {
-            return Err(error.into());
-        }
-        self.poisoned = false;
-        Ok(())
+        stream::flush(&mut self.output, &mut self.poisoned).map_err(Into::into)
     }
     pub(super) fn check(&self, session: &NativeScaleRefinementSession) -> Result<()> {
         if self.poisoned {
@@ -278,16 +274,8 @@ impl<W: Write + Seek> NativeScaleJournalWriter<W> {
             self.write(bytes)?;
             frame.update(bytes);
         }
-        let mut scratch = [0; SCRATCH];
         for gradient in gradients {
-            for chunk in gradient.chunks(SCRATCH / 4) {
-                for (bytes, value) in scratch.as_chunks_mut::<4>().0.iter_mut().zip(chunk) {
-                    bytes.copy_from_slice(&value.to_le_bytes());
-                }
-                let bytes = &scratch[..chunk.len() * 4];
-                self.write(bytes)?;
-                frame.update(bytes);
-            }
+            stream::encode(gradient, &mut frame, |bytes| self.write(bytes))?;
         }
         self.write(frame.finalize().as_bytes())?;
         self.flush()?;
@@ -417,10 +405,7 @@ struct Reader<R> {
 }
 impl<R: Read> Reader<R> {
     fn read(&mut self, bytes: &mut [u8]) -> Result<()> {
-        self.source.read_exact(bytes)?;
-        self.hash.update(bytes);
-        self.bytes = sum(self.bytes, bytes.len() as u64)?;
-        Ok(())
+        stream::read(&mut self.source, &mut self.hash, &mut self.bytes, bytes).map_err(Into::into)
     }
     fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
         let mut bytes = [0; N];
@@ -478,15 +463,8 @@ pub fn replay_native_scale_journal_with_state<R: Read + Seek>(
         return Err(invalid("native journal source length/seek differs"));
     }
     let mut scratch = [0; SCRATCH];
-    let mut remaining = bytes;
-    let mut hash = blake3::Hasher::new();
-    while remaining > 0 {
-        let count = usize::try_from(remaining.min(SCRATCH as u64)).expect("bounded chunk");
-        source.read_exact(&mut scratch[..count])?;
-        hash.update(&scratch[..count]);
-        remaining -= count as u64;
-    }
-    if hash.finalize().as_bytes() != expected_journal.as_bytes() {
+    let hash = stream::hash_exact(&mut source, bytes, &mut scratch)?;
+    if &hash != expected_journal.as_bytes() {
         return Err(invalid("native journal source identity differs"));
     }
     if source.seek(SeekFrom::Start(0))? != 0 {
@@ -576,14 +554,7 @@ fn replay_frames<R: Read>(
         frame.update(&encoded_ordinal);
         frame.update(&window);
         for owner in &mut gradients {
-            for chunk in owner.chunks_mut(SCRATCH / 4) {
-                let bytes = &mut scratch[..chunk.len() * 4];
-                input.read(bytes)?;
-                frame.update(bytes);
-                for (value, encoded) in chunk.iter_mut().zip(bytes.as_chunks::<4>().0) {
-                    *value = f32::from_le_bytes(*encoded);
-                }
-            }
+            stream::decode(owner, scratch, &mut frame, |bytes| input.read(bytes))?;
         }
         if input.array::<32>()? != *frame.finalize().as_bytes() {
             return Err(invalid("native journal frame checksum differs"));

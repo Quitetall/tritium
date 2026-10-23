@@ -15,6 +15,11 @@ pub use native_pv::{
     NativePvCandidate, NativePvOwnerStep, NativePvRefinementSession, NativePvSizeLedger,
     NativePvStageError, NativePvStepStats,
 };
+pub use native_pv::{
+    NativePvJournalError, NativePvJournalLimits, NativePvJournalResume, NativePvJournalSizeLedger,
+    NativePvJournalSummary, NativePvJournalWriter, NativePvResumeTail, VerifiedNativePvReplay,
+    replay_native_pv_journal, replay_native_pv_journal_with_state, resume_native_pv_journal,
+};
 mod consumers;
 #[cfg(feature = "native-cpu")]
 mod cpu;

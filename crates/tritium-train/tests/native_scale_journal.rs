@@ -19,6 +19,57 @@ mod bundle;
 #[path = "native_scale_journal/continuation.rs"]
 mod continuation;
 
+#[test]
+fn shared_streaming_refactor_keeps_frozen_scale_vectors() {
+    let expected = [
+        (
+            1624,
+            "5f6ce8b9d00b37437cb0c9cb10b99fe0db484a98e7c6c2197ead0e820e9bd61a",
+            "a4b83954c54a7a8165f9e5f0a43df3d708d21085d010e5c90d4bb8734d3e7543",
+        ),
+        (
+            2784,
+            "ba27b176a321b87015d372d90bf57950cad2fc833031d7cdf0918d79fe698ac5",
+            "2a92c3607ad14f67441a0644c714b06ee637a09c8c132f971807647a8aab5580",
+        ),
+        (
+            536,
+            "b1ba06354fc45067744ec8d8c23396b94b0f84c6b6c43bcb544a50d9a635c739",
+            "b13e2c6bdf2e79b173c36c0b465323301c6b6c5a4dbbbec1333fdddc800f057f",
+        ),
+    ];
+    for (i, parents) in [
+        vec![simple()],
+        vec![simple(), simple()],
+        vec![tensor(
+            2,
+            PlaneCodec::S34,
+            Basis::SignedRht {
+                block: 128,
+                seed: 91,
+                domain: 3,
+            },
+            1,
+            Transport::JointHuffman { block: 128 },
+            128,
+        )],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (_, session, bytes, summary) = run(parents);
+        assert_eq!(bytes.len(), expected[i].0);
+        assert_eq!(blake3::hash(&bytes).to_hex().as_str(), expected[i].1);
+        assert_eq!(summary.journal(), digest(&bytes));
+        assert_eq!(
+            blake3::hash(&session.checkpoint_bytes().unwrap())
+                .to_hex()
+                .as_str(),
+            expected[i].2
+        );
+    }
+}
+
 fn plan(owners: usize) -> NativeRefinementPlan {
     NativeRefinementPlan {
         parent: NativeRefinementParent {

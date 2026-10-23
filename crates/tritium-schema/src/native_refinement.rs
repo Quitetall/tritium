@@ -473,6 +473,29 @@ pub struct NativeScaleResumeManifest {
     pub point: NativeScaleResumePoint,
 }
 
+/// Emitted P/V TNPV checkpoint and TNPJ prefix observations, not replay or durability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
+pub struct NativePvResumePoint {
+    /// Exact frozen AlternatingPv request identity.
+    pub plan: NativeRefinementPlanId,
+    /// Number of complete ordered P/V gradient frames.
+    pub completed_updates: u64,
+    /// BLAKE3 of the exact admitted TNPJ prefix, excluding any trailer/suffix.
+    pub journal_prefix: BlobId,
+    /// Exact header and complete frame byte count.
+    pub journal_prefix_bytes: u64,
+    /// BLAKE3 of the exact saved TNPV checkpoint.
+    pub checkpoint: BlobId,
+    /// Exact saved TNPV length.
+    pub checkpoint_bytes: u64,
+}
+
 /// Structural native request error; unavailable execution is a separate result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]

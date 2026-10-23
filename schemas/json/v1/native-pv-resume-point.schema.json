@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NativePvResumePoint",
+  "description": "Emitted P/V TNPV checkpoint and TNPJ prefix observations, not replay or durability.",
+  "type": "object",
+  "properties": {
+    "checkpoint": {
+      "description": "BLAKE3 of the exact saved TNPV checkpoint.",
+      "$ref": "#/$defs/BlobId"
+    },
+    "checkpoint_bytes": {
+      "description": "Exact saved TNPV length.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "completed_updates": {
+      "description": "Number of complete ordered P/V gradient frames.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "journal_prefix": {
+      "description": "BLAKE3 of the exact admitted TNPJ prefix, excluding any trailer/suffix.",
+      "$ref": "#/$defs/BlobId"
+    },
+    "journal_prefix_bytes": {
+      "description": "Exact header and complete frame byte count.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "plan": {
+      "description": "Exact frozen AlternatingPv request identity.",
+      "$ref": "#/$defs/NativeRefinementPlanId"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "plan",
+    "completed_updates",
+    "journal_prefix",
+    "journal_prefix_bytes",
+    "checkpoint",
+    "checkpoint_bytes"
+  ],
+  "$defs": {
+    "BlobId": {
+      "description": "Content identity for stored tensor or asset bytes.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "NativeRefinementPlanId": {
+      "description": "Native recovery request identity in its own versioned domain, not a legacy PV recipe hash.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    }
+  }
+}

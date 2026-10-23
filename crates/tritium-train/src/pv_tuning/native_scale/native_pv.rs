@@ -4,6 +4,12 @@ use tritium_core::project_additive_code_unit;
 use tritium_schema::NativeAdamWRecipe;
 
 mod checkpoint;
+mod journal;
+pub use journal::{
+    NativePvJournalError, NativePvJournalLimits, NativePvJournalResume, NativePvJournalSizeLedger,
+    NativePvJournalSummary, NativePvJournalWriter, NativePvResumeTail, VerifiedNativePvReplay,
+    replay_native_pv_journal, replay_native_pv_journal_with_state, resume_native_pv_journal,
+};
 
 /// Logical buffer lengths; excludes metadata, allocator slack and external graphs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -150,11 +156,13 @@ impl NativePvRefinementSession {
         plan: NativeRefinementPlan,
         parents: Vec<AdditiveTensor>,
     ) -> Result<Self, PvTuningError> {
-        let mut session = admit(plan, &parents)?;
+        admit(plan, &parents)?.with_parents(parents)
+    }
+    fn with_parents(mut self, parents: Vec<AdditiveTensor>) -> Result<Self, PvTuningError> {
         for weight in parents {
             let scales = weight.scales().len();
             let active = active_count(&weight)?;
-            session.owners.push(PvOwner {
+            self.owners.push(PvOwner {
                 weight,
                 scale: AdamState {
                     m: zeroed(scales)?,
@@ -166,7 +174,7 @@ impl NativePvRefinementSession {
                 },
             });
         }
-        Ok(session)
+        Ok(self)
     }
     /// Frozen plan including the explicitly selected parent level.
     #[must_use]

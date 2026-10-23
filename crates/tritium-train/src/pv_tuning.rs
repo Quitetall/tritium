@@ -15,10 +15,16 @@ mod config;
 mod continuous;
 mod error;
 mod identity;
+mod journal_io;
 mod native_scale;
 pub use native_scale::{
     NativePvCandidate, NativePvOwnerStep, NativePvRefinementSession, NativePvSizeLedger,
     NativePvStageError, NativePvStepStats,
+};
+pub use native_scale::{
+    NativePvJournalError, NativePvJournalLimits, NativePvJournalResume, NativePvJournalSizeLedger,
+    NativePvJournalSummary, NativePvJournalWriter, NativePvResumeTail, VerifiedNativePvReplay,
+    replay_native_pv_journal, replay_native_pv_journal_with_state, resume_native_pv_journal,
 };
 pub use native_scale::{
     NativeScaleResumeBundleError, NativeScaleResumeBundleLimits, NativeScaleResumeBundleReader,
