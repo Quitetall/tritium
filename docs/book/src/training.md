@@ -99,7 +99,10 @@ publisher I/O, not a checkpoint buffer. Reload the child for frozen inference.
 Call `close()` when finished. It preserves complete current packed weights on
 the private shell, drops file leases and removes only the same empty owned
 workspace. Unexpected files/replacement directories are preserved with warnings;
-there is no recursive cleanup. Old graph handles remain immutable and budgeted.
+there is no recursive cleanup. If caller graph/state validation refuses close,
+the original error remains primary, owned resources still retire and the invalid
+graph stays closed rather than becoming an admitted inference model. Old graph
+handles remain immutable and budgeted.
 No concurrent backward/step, higher-order gradients, autocast, compile, vmap,
 dtype/device mutation or `torch.optim` updates are admitted. Private f64 leaves
 transport gradients; they are not latent weight values.

@@ -230,7 +230,12 @@ def test_shared_torch_graph_guards_and_owned_work_retirement(tmp_path, failure):
     else:
         with torch.no_grad(): b.model.a.bias.add_(1)
         with pytest.raises(RuntimeError, match="preserved state"): b.step([10]*32)
-    b._cleanup_recording(); assert not work.exists() and b.workspace_report["cleaned"]
+    if failure == "preserved-state":
+        with pytest.raises(RuntimeError, match="preserved state"): b.close()
+    else:
+        b.close()
+    assert not b.active and not b._original_handles
+    assert not work.exists() and b.workspace_report["cleaned"] and b.workspace_report["files"] == 0
 
 
 def test_tiny_hf_multiowner_paged_backward_publish_reload_and_generation(tmp_path):

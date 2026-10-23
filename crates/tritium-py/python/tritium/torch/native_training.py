@@ -377,7 +377,20 @@ class NativePvPagedTrainer(NativePvTrainer):
         return json.loads(self._backend.workspace_report)
 
     def close(self):
-        model = super().close()
+        try:
+            model = super().close()
+        except BaseException as failure:
+            # Invalid caller state is never admitted, but close must still retire
+            # our disk/graph ownership. Preserve the original refusal as primary.
+            try:
+                self._cleanup_recording()
+            except BaseException as cleanup:
+                raise failure from cleanup
+            finally:
+                self.active = False
+                self._cache.clear()
+                self._original_handles.clear()
+            raise
         self._original_handles.clear()
         return model
 

@@ -304,7 +304,11 @@ impl NativePvPagedTraining {
     }
     #[getter]
     fn workspace_report(&self) -> String {
-        let r = self.workspace.report();
+        let mut r = self.workspace.report();
+        if self.state.is_poisoned() {
+            r.warnings
+                .push("RuntimeCleanup: training lock poisoned; no state admission".into());
+        }
         serde_json::json!({"storage":"owner-paged","reserved_bytes":r.reserved_bytes,"files":r.files,
             "peak_reserved_bytes":r.peak_reserved_bytes,"peak_files":r.peak_files,"cleaned":r.cleaned,"cleanup_warnings":r.warnings,
             "quality_qualified":false,"physical_memory_qualified":false}).to_string()
@@ -494,7 +498,14 @@ impl NativePvPagedTraining {
         )
     }
     fn close_recording(&self) -> PyResult<String> {
-        drop(self.lock()?.take());
+        // Retirement does not admit or inspect poisoned numerical state. Always
+        // release owned files; ordinary operations still refuse a poisoned lock.
+        drop(
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
         let _ = self.workspace.finish();
         Ok(self.workspace_report())
     }
