@@ -8,7 +8,12 @@ const END: [u8; 8] = *b"TNPJEND1";
 use crate::pv_tuning::journal_io as stream;
 const SCRATCH: usize = stream::SCRATCH;
 const FRAME_DOMAIN: &[u8] = b"tritium.native-pv.journal-frame.v1\0";
+mod bundle;
 mod resume;
+pub use bundle::{
+    NativePvResumeBundleError, NativePvResumeBundleLimits, NativePvResumeBundleReader,
+    PublishedNativePvResumeBundle, publish_native_pv_resume_bundle, stage_native_pv_resume_bundle,
+};
 pub use resume::{NativePvJournalResume, NativePvResumeTail, resume_native_pv_journal};
 
 /// Logical payload limits; excludes metadata, allocator and external model/stream memory.

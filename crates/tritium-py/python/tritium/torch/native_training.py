@@ -364,9 +364,6 @@ class NativePvTrainer(NativeScaleTrainer):
     """
     _pv = True
 
-    def save_resume(self, output_dir, *, limits):
-        raise NotImplementedError("durable native P/V resume bundles are not implemented")
-
 
 def _native_training(_pv, /, model, artifact, *, level, plan=None, load_run_id,
                           max_snapshot_bytes, max_parent_bytes, max_saved_input_bytes,
@@ -386,10 +383,9 @@ def _native_training(_pv, /, model, artifact, *, level, plan=None, load_run_id,
         if type(limit) is not int or limit <= 0:
             raise ValueError("native training byte limits must be positive integers")
     if resume is not None:
-        if _pv:
-            raise NotImplementedError("durable native P/V resume bundles are not implemented")
-        if not isinstance(resume, _tritium.NativeScaleResumeBundle):
-            raise TypeError("recorded resume requires NativeScaleResumeBundle")
+        expected_bundle = _tritium.NativePvResumeBundle if _pv else _tritium.NativeScaleResumeBundle
+        if not isinstance(resume, expected_bundle):
+            raise TypeError(f"recorded resume requires {expected_bundle.__name__}")
         if checkpoint is not None:
             raise ValueError("checkpoint and recorded resume are mutually exclusive")
         if recording is None:
@@ -445,13 +441,12 @@ def _native_training(_pv, /, model, artifact, *, level, plan=None, load_run_id,
         if record_options is not None:
             work, journal_bytes, working_bytes = record_options
             temporary = tempfile.TemporaryDirectory(prefix="tritium-native-recording-", dir=work)
-            journal_path = str(Path(temporary.name) / "gradients.tnsj")
+            journal_path = str(Path(temporary.name) / ("gradients.tnpj" if _pv else "gradients.tnsj"))
             if resume is not None:
                 resumed = (resume, json.dumps(dict(path=journal_path, max_journal_bytes=journal_bytes,
                                                    max_working_bytes=working_bytes), allow_nan=False))
         arguments = dict(max_snapshot_bytes=max_snapshot_bytes, max_parent_bytes=max_parent_bytes, checkpoint=checkpoint)
-        if not _pv:
-            arguments["recorded_resume"] = resumed
+        arguments["recorded_resume"] = resumed
         begin = artifact.begin_pv_training if _pv else artifact.begin_scale_training
         backend = begin(text, [(name, selected[name].handle) for name in data["owners"]], **arguments)
         if temporary is not None and resume is None:
@@ -479,19 +474,20 @@ def native_scale_training(model, artifact, *, level, plan=None, load_run_id,
                             recording=recording, resume=resume, **load_limits)
 
 
-def native_pv_training(model, artifact, *, level, plan, load_run_id,
+def native_pv_training(model, artifact, *, level, plan=None, load_run_id,
                        max_snapshot_bytes, max_parent_bytes, max_saved_input_bytes,
-                       checkpoint=None, recording=None, **load_limits):
+                       checkpoint=None, recording=None, resume=None, **load_limits):
     """Explicit first-order CPU AlternatingPv training and unqualified publication.
 
     Raw checkpoint restart is unrecorded and may require two complete packed
-    payload sets during admission. Durable bundle resume and high-level refine's
-    P/V path are not enabled. No torch.optim or latent dense weight master.
+    payload sets during admission. Recorded recovery requires an actual
+    NativePvResumeBundle and fresh work. High-level refine's P/V path remains
+    unavailable. No torch.optim or latent dense weight master.
     """
     return _native_training(True, model, artifact, level=level, plan=plan, load_run_id=load_run_id,
                             max_snapshot_bytes=max_snapshot_bytes, max_parent_bytes=max_parent_bytes,
                             max_saved_input_bytes=max_saved_input_bytes, checkpoint=checkpoint,
-                            recording=recording, **load_limits)
+                            recording=recording, resume=resume, **load_limits)
 
 
 def _pairs(items):

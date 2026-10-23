@@ -519,6 +519,21 @@ pub struct NativePvResumePoint {
     pub checkpoint_bytes: u64,
 }
 
+/// Frozen native P/V recovery inputs, not numerical or quality qualification.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
+pub struct NativePvResumeManifest {
+    /// Exact full AlternatingPv request, including explicit parent level.
+    pub plan: NativeRefinementPlan,
+    /// Untrusted emitted TNPJ prefix/TNPV binding; actual-parent replay required.
+    pub point: NativePvResumePoint,
+}
+
 /// Structural native request error; unavailable execution is a separate result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]

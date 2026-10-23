@@ -120,6 +120,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         tritium_schema::NativePvResumePoint,
         "native-pv-resume-point"
     );
+    project!(
+        tritium_schema::NativePvResumeManifest,
+        "native-pv-resume-manifest"
+    );
     project!(EvidenceEnvelope<serde_json::Value>, "evidence-envelope");
     project!(LayoutError, "layout-error");
     project!(ModelId, "model-id");

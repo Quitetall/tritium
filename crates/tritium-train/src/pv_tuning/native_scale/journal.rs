@@ -8,7 +8,7 @@ const END: [u8; 8] = *b"TNSJEND1";
 use crate::pv_tuning::journal_io as stream;
 const SCRATCH: usize = stream::SCRATCH;
 const FRAME_DOMAIN: &[u8] = b"tritium.native-scale.journal-frame.v1\0";
-mod bundle;
+pub(in crate::pv_tuning::native_scale) mod bundle;
 pub use bundle::{
     NativeScaleResumeBundleError, NativeScaleResumeBundleLimits, NativeScaleResumeBundleReader,
     PublishedNativeScaleResumeBundle, publish_native_scale_resume_bundle,

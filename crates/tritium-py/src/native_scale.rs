@@ -24,7 +24,7 @@ use tritium_train::pv_tuning::{
     NativeScaleParentReadLimits, NativeScaleRefinementSession, decode_native_scale_parents,
     publish_native_scale_child, replay_native_scale_journal,
 };
-mod recovery;
+pub(crate) mod recovery;
 pub(crate) use recovery::NativeScaleResumeBundle;
 
 enum Recording {

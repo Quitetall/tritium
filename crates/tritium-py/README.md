@@ -182,10 +182,10 @@ logical caps are not full Torch/process memory admission.
 Unrecorded `checkpoint=trainer.checkpoint()` restarts the exact TNPV state,
 including changed codes and moments. Materializing current hard handles for a
 restart can require two packed payload sets within `max_snapshot_bytes` before
-temporary roots drop. Recorded runs must start at zero; raw checkpoints cannot
-stand in for authenticated journal history. P/V durable `save_resume` bundles
-and high-level `refine` teacher/data orchestration are not enabled yet; a scale
-resume bundle is never accepted as P/V recovery.
+temporary roots drop. Fresh recorded runs must start at zero; raw checkpoints
+cannot stand in for replayed journal history. Durable P/V recovery uses the
+distinct bundle below; a scale bundle is never accepted as P/V recovery.
+High-level `refine` teacher/data orchestration for P/V is not enabled yet.
 
 After the complete declared recorded schedule, `trainer.publish` uses the same
 publication limit keys above, replays the actual TNPJ journal against the original
@@ -197,6 +197,45 @@ objective/data/teacher authentication or independent model-quality approval.
 Closing removes only owned temporary recording work and leaves the private shell
 marked unpublished. Native reference state and code moments are still retained;
 this is not a production GPU/out-of-core or flagship-model memory claim.
+
+### Recorded P/V save and restart
+
+```python
+from tritium import NativePvResumeBundle
+
+saved = trainer.save_resume(new_saved_directory, limits=bundle_limits)
+saved_id = saved.bundle_id
+trainer.close()  # Only its owned temporary recording work is removed.
+saved = NativePvResumeBundle.open(new_saved_directory, bundle_id=saved_id, **bundle_limits)
+trainer = native_pv_training(
+    fresh_shell, original_parent, level="full", resume=saved,
+    load_run_id="pv-recovered-load", max_snapshot_bytes=snapshot_limit,
+    max_parent_bytes=parent_limit, max_saved_input_bytes=saved_input_limit,
+    recording=dict(work_dir=existing_work_dir, max_journal_bytes=journal_cap,
+                   max_working_bytes=replay_cap),
+)
+```
+
+`bundle_limits` has exact positive `max_bundle_bytes`, `max_manifest_bytes`,
+`max_checkpoint_bytes`, and `max_working_bytes` fields. Each explicit save creates
+one new `resume.tnpb` file with the exact plan, TNPV checkpoint and complete TNPJ
+prefix; it copies the whole prefix, not an incremental checkpoint. Keep the
+bundle ID separately. No automatic cadence or old-bundle deletion occurs.
+
+The frozen descriptor reports `admission="byte-consistent-unqualified"`, never
+numerical or quality approval. Recovery rechecks saved bytes, replays original
+parents through the existing P/V engine, matches both moment sets and changed
+codes, then continues in a new owned journal. Current packed roots need explicit
+snapshot admission. Saving captures committed Rust state/history, not pending
+gradients/graphs, RNG/data-loader or arbitrary Python state. Recompute pending
+windows; exact continuation requires matching future inputs/backward results.
+
+Save/recovery outputs cannot overlap the original parent, old work or saved
+bundle. Existing paths are not overwritten. Closed, failed or sealed recording
+is not silently reopened. `NativeScaleResumeBundle`/`resume.tnsb` remain separate
+and retain their original bytes and numerical profile. P/V recovery does not
+authenticate objective/data/teacher, qualify physical durability, or open the
+high-level P/V teacher/data facade.
 
 ### Recorded scale save and restart
 

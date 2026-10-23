@@ -14,8 +14,10 @@ mod native_pv;
 #[cfg(feature = "native-cpu")]
 pub use native_pv::{NativeCpuPvError, NativeCpuPvJournalStageError, NativeCpuPvSession};
 pub use native_pv::{
-    NativePvCandidate, NativePvOwnerStep, NativePvRefinementSession, NativePvSizeLedger,
-    NativePvStageError, NativePvStepStats,
+    NativePvCandidate, NativePvOwnerStep, NativePvRefinementSession, NativePvResumeBundleError,
+    NativePvResumeBundleLimits, NativePvResumeBundleReader, NativePvSizeLedger, NativePvStageError,
+    NativePvStepStats, PublishedNativePvResumeBundle, publish_native_pv_resume_bundle,
+    stage_native_pv_resume_bundle,
 };
 pub use native_pv::{
     NativePvJournalError, NativePvJournalLimits, NativePvJournalResume, NativePvJournalSizeLedger,

@@ -11,14 +11,14 @@ use tritium_train::pv_tuning::{
 
 #[derive(Clone, Copy, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReadLimits {
-    max_bundle_bytes: u64,
-    max_manifest_bytes: usize,
-    max_checkpoint_bytes: u64,
-    max_working_bytes: u64,
+pub(crate) struct ReadLimits {
+    pub(crate) max_bundle_bytes: u64,
+    pub(crate) max_manifest_bytes: usize,
+    pub(crate) max_checkpoint_bytes: u64,
+    pub(crate) max_working_bytes: u64,
 }
 impl ReadLimits {
-    fn common(self) -> PyResult<BundleLimits> {
+    pub(crate) fn common(self) -> PyResult<BundleLimits> {
         if self.max_bundle_bytes == 0
             || self.max_manifest_bytes == 0
             || self.max_checkpoint_bytes == 0
@@ -74,7 +74,7 @@ impl NativeScaleResumeBundle {
         Ok(reader)
     }
 }
-fn blob(value: &str) -> PyResult<BlobId> {
+pub(crate) fn blob(value: &str) -> PyResult<BlobId> {
     if value.len() != 64
         || !value
             .bytes()

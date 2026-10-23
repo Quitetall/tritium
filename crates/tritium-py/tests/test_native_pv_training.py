@@ -154,7 +154,7 @@ def test_stale_higher_order_budget_nonfinite_and_profile_refusals(tmp_path):
     leaf.grad[0] = float("inf")
     with pytest.raises(ValueError, match="non-finite"): trainer.step([11]*32)
     assert trainer.checkpoint() == before
-    with pytest.raises(NotImplementedError, match="not implemented"): trainer.save_resume(tmp_path/"bundle", limits={})
+    with pytest.raises(RuntimeError, match="recorded"): trainer.save_resume(tmp_path/"bundle", limits={})
     trainer.close()
     with pytest.raises(ValueError, match="AlternatingPv"): start(StateModel(), parent, scale_plan(parent))
     with pytest.raises(ValueError, match="ScaleOnly"):

@@ -410,6 +410,7 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<model_level::NativePackedMatrix>()?;
     m.add_class::<native_scale::NativeScaleTraining>()?;
     m.add_class::<native_pv::NativePvTraining>()?;
+    m.add_class::<native_pv::NativePvResumeBundle>()?;
     m.add_function(wrap_pyfunction!(native_pv::_validate_native_pv_plan, m)?)?;
     m.add_class::<native_scale::NativeScaleResumeBundle>()?;
     m.add_class::<model_refinement::NativeModelRefinement>()?;

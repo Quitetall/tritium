@@ -24,6 +24,8 @@ use tritium_train::pv_tuning::{
     NativePvRefinementSession, decode_native_pv_parents, publish_native_pv_child,
     replay_native_pv_journal,
 };
+mod recovery;
+pub(crate) use recovery::NativePvResumeBundle;
 
 fn error(v: impl std::fmt::Display) -> PyErr {
     PyValueError::new_err(v.to_string())
@@ -147,6 +149,7 @@ pub(crate) struct BeginOptions<'a> {
     pub max_snapshot_bytes: u64,
     pub max_parent_bytes: u64,
     pub checkpoint: Option<&'a [u8]>,
+    pub recorded_resume: Option<(&'a NativePvResumeBundle, &'a str)>,
 }
 pub(crate) fn begin(
     py: Python<'_>,
@@ -159,7 +162,13 @@ pub(crate) fn begin(
         max_snapshot_bytes,
         max_parent_bytes,
         checkpoint,
+        recorded_resume,
     } = options;
+    if checkpoint.is_some() && recorded_resume.is_some() {
+        return Err(error(
+            "checkpoint and recorded resume are mutually exclusive",
+        ));
+    }
     let plan = parse(plan_json)?;
     if max_snapshot_bytes == 0 || max_parent_bytes == 0 {
         return Err(error("native training byte limits invalid"));
@@ -180,7 +189,10 @@ pub(crate) fn begin(
         .cloned()
         .zip(specs.iter().map(NativePackedMatrix::shared_tensor))
         .collect();
-    let driver = py.detach(|| {
+    let (driver, recording) = py.detach(|| {
+        let resumed = recorded_resume
+            .map(|(bundle, text)| recovery::ResumeRecording::new(bundle, text, &plan, &parent))
+            .transpose()?;
         let (mut reader, view) = parent.refinement_parent_view(&plan.parent.level)?;
         if view.binding() != &plan.parent {
             return Err(error("native training parent tuple differs"));
@@ -191,10 +203,16 @@ pub(crate) fn begin(
             &plan,
             NativePvParentReadLimits {
                 max_working_bytes: max_parent_bytes,
-                extra_payload_bytes: checkpoint.map_or(0, |b| b.len() as u64),
+                extra_payload_bytes: resumed.as_ref().map_or(
+                    checkpoint.map_or(0, |b| b.len() as u64),
+                    recovery::ResumeRecording::checkpoint_bytes,
+                ),
             },
         )
         .map_err(error)?;
+        if let Some(resumed) = resumed {
+            return resumed.bind(parents, roots, TensorPayloadBudget::new(max_snapshot_bytes));
+        }
         let state = if let Some(bytes) = checkpoint {
             NativePvRefinementSession::resume(plan, parents, bytes)
         } else {
@@ -202,27 +220,13 @@ pub(crate) fn begin(
         }
         .map_err(error)?;
         let budget = TensorPayloadBudget::new(max_snapshot_bytes);
-        let roots = if checkpoint.is_some() {
-            let mut current = Vec::new();
-            current.try_reserve_exact(roots.len()).map_err(error)?;
-            for ((name, root), w) in roots.into_iter().zip(state.weights()) {
-                current.push((
-                    name,
-                    tritium_cpu::CpuBackend::new()
-                        .snapshot_additive_weights(&root, w.view(), &budget)
-                        .map_err(error)?,
-                ));
-            }
-            current
-        } else {
-            roots
-        };
-        NativeCpuPvSession::bind(state, roots, budget).map_err(error)
+        let driver = bind_current(state, roots, budget, checkpoint.is_some())?;
+        Ok((driver, Recording::Off))
     })?;
     Ok(NativePvTraining {
         state: Mutex::new(State {
             driver,
-            recording: Recording::Off,
+            recording,
             publication_ordinal: 0,
         }),
         specs,
@@ -230,8 +234,40 @@ pub(crate) fn begin(
     })
 }
 
+fn bind_current(
+    state: NativePvRefinementSession,
+    roots: Vec<(String, std::sync::Arc<dyn tritium_spec::DeviceBuffer>)>,
+    budget: TensorPayloadBudget,
+    refresh: bool,
+) -> PyResult<NativeCpuPvSession> {
+    let roots = if refresh {
+        let mut current = Vec::new();
+        current.try_reserve_exact(roots.len()).map_err(error)?;
+        for ((name, root), w) in roots.into_iter().zip(state.weights()) {
+            current.push((
+                name,
+                tritium_cpu::CpuBackend::new()
+                    .snapshot_additive_weights(&root, w.view(), &budget)
+                    .map_err(error)?,
+            ));
+        }
+        current
+    } else {
+        roots
+    };
+    NativeCpuPvSession::bind(state, roots, budget).map_err(error)
+}
+
 #[pymethods]
 impl NativePvTraining {
+    fn save_resume(
+        &self,
+        py: Python<'_>,
+        output_dir: &str,
+        limits_json: &str,
+    ) -> PyResult<NativePvResumeBundle> {
+        recovery::save(self, py, output_dir, limits_json)
+    }
     #[getter]
     fn completed_updates(&self) -> PyResult<u64> {
         Ok(self.lock()?.driver.session().completed_updates())

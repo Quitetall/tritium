@@ -13,6 +13,8 @@ use tritium_train::pv_tuning::{
     NativePvRefinementSession as Session, NativePvResumeTail as Tail, NativePvStageError,
     replay_native_pv_journal_with_state as replay, resume_native_pv_journal as resume,
 };
+#[path = "native_pv_journal/bundle.rs"]
+mod bundle;
 fn plan(owners: usize) -> NativeRefinementPlan {
     NativeRefinementPlan {
         parent: NativeRefinementParent {

@@ -326,7 +326,7 @@ impl NativeModelRefinement {
 
 #[pymethods]
 impl NativeModelRefinement {
-    #[pyo3(signature=(plan_json,matrices,*,max_snapshot_bytes,max_parent_bytes,checkpoint=None))]
+    #[pyo3(signature=(plan_json,matrices,*,max_snapshot_bytes,max_parent_bytes,checkpoint=None,recorded_resume=None))]
     #[allow(clippy::too_many_arguments)]
     fn begin_pv_training(
         &self,
@@ -336,6 +336,7 @@ impl NativeModelRefinement {
         max_snapshot_bytes: u64,
         max_parent_bytes: u64,
         checkpoint: Option<&Bound<'_, PyBytes>>,
+        recorded_resume: Option<(PyRef<'_, crate::native_pv::NativePvResumeBundle>, String)>,
     ) -> PyResult<crate::native_pv::NativePvTraining> {
         crate::native_pv::begin(
             py,
@@ -346,6 +347,9 @@ impl NativeModelRefinement {
                 max_snapshot_bytes,
                 max_parent_bytes,
                 checkpoint: checkpoint.map(|b| b.as_bytes()),
+                recorded_resume: recorded_resume
+                    .as_ref()
+                    .map(|(bundle, text)| (&**bundle, text.as_str())),
             },
         )
     }

@@ -2,7 +2,7 @@
 use super::*;
 
 pub(super) struct Prepared {
-    manifest: NativeScaleResumeManifest,
+    pub(super) manifest: Manifest,
     metadata: Vec<u8>,
     checkpoint: Vec<u8>,
     total: u64,
@@ -24,13 +24,12 @@ impl Write for Count {
         Ok(())
     }
 }
-pub(super) fn prepare<W: Write + Seek>(
-    journal: &mut NativeScaleJournalWriter<W>,
-    session: &NativeScaleRefinementSession,
+pub(super) fn prepare(
+    journal: &mut impl Live,
     limits: NativeScaleResumeBundleLimits,
 ) -> Result<Prepared> {
-    journal.check(session)?;
-    let c = session.size_ledger().checkpoint_bytes;
+    journal.check()?;
+    let c = journal.checkpoint_bytes();
     // Admit checkpoint allocation and scratch before snapshot flush/serialization.
     if limits.max_checkpoint_bytes < c
         || limits.max_manifest_bytes == 0
@@ -41,23 +40,24 @@ pub(super) fn prepare<W: Write + Seek>(
             "native resume bundle byte limit exceeded",
         ));
     }
-    let (checkpoint, point) = journal.snapshot_unflushed(session)?;
-    let manifest = NativeScaleResumeManifest {
-        plan: session.plan().clone(),
-        point,
-    };
+    let (checkpoint, manifest) = journal.snapshot()?;
     let mut count = Count {
         bytes: 0,
         max: limits.max_manifest_bytes as u64,
     };
-    serde_json::to_writer(&mut count, &manifest).map_err(|_| {
+    manifest.write(&mut count).map_err(|_| {
         NativeScaleResumeBundleError::Limit("native resume manifest byte limit exceeded")
     })?;
-    let total = admit(limits, count.bytes, c, manifest.point.journal_prefix_bytes)?;
+    let total = admit(
+        limits,
+        count.bytes,
+        c,
+        manifest.point().journal_prefix_bytes,
+    )?;
     journal.flush()?;
     let mut metadata = bytes(count.bytes)?;
     let mut encoded = io::Cursor::new(metadata.as_mut_slice());
-    serde_json::to_writer(&mut encoded, &manifest)?;
+    manifest.write(&mut encoded)?;
     if encoded.position() != count.bytes {
         return Err(invalid("native resume manifest size changed"));
     }
@@ -85,20 +85,17 @@ impl<W: Write> Output<W> {
     }
 }
 
-fn prefix<W: Read + Write + Seek, O: Write>(
-    journal: &mut NativeScaleJournalWriter<W>,
-    point: &tritium_schema::NativeScaleResumePoint,
-    output: &mut Output<O>,
-) -> Result<()> {
+fn prefix<O: Write>(journal: &mut impl Live, point: Point, output: &mut Output<O>) -> Result<()> {
     let append = point.journal_prefix_bytes;
-    journal.poisoned = true;
-    let position = journal.output.stream_position()?;
+    let (source, poisoned) = journal.stream();
+    *poisoned = true;
+    let position = source.stream_position()?;
     if position != append {
         return Err(invalid("native resume journal append position differs"));
     }
     let mut source_ok = true;
     let result = (|| {
-        if let Err(error) = seek(&mut journal.output, SeekFrom::Start(0), 0) {
+        if let Err(error) = seek(source, SeekFrom::Start(0), 0) {
             source_ok = false;
             return Err(error);
         }
@@ -107,7 +104,7 @@ fn prefix<W: Read + Write + Seek, O: Write>(
         let mut left = append;
         while left > 0 {
             let n = left.min(SCRATCH as u64) as usize;
-            if let Err(error) = journal.output.read_exact(&mut scratch[..n]) {
+            if let Err(error) = source.read_exact(&mut scratch[..n]) {
                 source_ok = false;
                 return Err(error.into());
             }
@@ -120,21 +117,21 @@ fn prefix<W: Read + Write + Seek, O: Write>(
             return Err(invalid("native resume journal prefix changed"));
         }
         // Journal is live and must still end at the selected complete cursor.
-        if let Err(error) = seek(&mut journal.output, SeekFrom::End(0), append) {
+        if let Err(error) = seek(source, SeekFrom::End(0), append) {
             source_ok = false;
             return Err(error);
         }
         Ok(())
     })();
-    let restored = seek(&mut journal.output, SeekFrom::Start(append), append);
-    journal.poisoned = !(source_ok && restored.is_ok());
+    let restored = seek(source, SeekFrom::Start(append), append);
+    *poisoned = !(source_ok && restored.is_ok());
     result?;
     restored
 }
 
-fn write<W: Read + Write + Seek, O: Read + Write + Seek>(
+fn write<O: Read + Write + Seek>(
     prepared: &Prepared,
-    journal: &mut NativeScaleJournalWriter<W>,
+    journal: &mut impl Live,
     mut output: O,
 ) -> Result<(O, BlobId)> {
     seek(&mut output, SeekFrom::End(0), 0)?;
@@ -144,13 +141,13 @@ fn write<W: Read + Write + Seek, O: Read + Write + Seek>(
         hash: blake3::Hasher::new(),
         bytes: 0,
     };
-    out.write(&MAGIC)?;
+    out.write(&prepared.manifest.kind().magic())?;
     out.write(&(prepared.metadata.len() as u64).to_le_bytes())?;
     out.write(&(prepared.checkpoint.len() as u64).to_le_bytes())?;
-    out.write(&prepared.manifest.point.journal_prefix_bytes.to_le_bytes())?;
+    out.write(&prepared.manifest.point().journal_prefix_bytes.to_le_bytes())?;
     out.write(&prepared.metadata)?;
     out.write(&prepared.checkpoint)?;
-    prefix(journal, &prepared.manifest.point, &mut out)?;
+    prefix(journal, prepared.manifest.point(), &mut out)?;
     let body = out.hash.finalize();
     out.write(body.as_bytes())?;
     if out.bytes != prepared.total {
@@ -164,16 +161,17 @@ fn write<W: Read + Write + Seek, O: Read + Write + Seek>(
     ))
 }
 
-pub(super) fn stage<W: Read + Write + Seek, O: Read + Write + Seek>(
+pub(super) fn stage<O: Read + Write + Seek>(
     prepared: Prepared,
-    journal: &mut NativeScaleJournalWriter<W>,
+    journal: &mut impl Live,
     output: O,
     limits: NativeScaleResumeBundleLimits,
-) -> Result<NativeScaleResumeBundleReader<O>> {
+) -> Result<ReaderCore<O>> {
+    let kind = prepared.manifest.kind();
     let (output, id) = write(&prepared, journal, output)?;
     // Do not retain two encoded metadata/checkpoint copies while reopening.
     drop(prepared);
-    NativeScaleResumeBundleReader::open(output, id, limits)
+    ReaderCore::open(output, id, limits, kind)
 }
 
 /// Stage, flush and reopen a self-contained recovery file in an empty owned stream.
@@ -181,12 +179,11 @@ pub(super) fn stage<W: Read + Write + Seek, O: Read + Write + Seek>(
 /// A destination-only failure permits retry if the journal cursor was restored;
 /// source read/hash/position uncertainty poisons the live writer.
 /// An unwinding stream during prefix copying also leaves it poisoned.
-pub fn stage_native_scale_resume_bundle<W: Read + Write + Seek, O: Read + Write + Seek>(
-    session: &NativeScaleRefinementSession,
-    journal: &mut NativeScaleJournalWriter<W>,
+pub(in crate::pv_tuning::native_scale) fn stage_bundle<O: Read + Write + Seek>(
+    journal: &mut impl Live,
     output: O,
     limits: NativeScaleResumeBundleLimits,
-) -> Result<NativeScaleResumeBundleReader<O>> {
-    let prepared = prepare(journal, session, limits)?;
+) -> Result<ReaderCore<O>> {
+    let prepared = prepare(journal, limits)?;
     stage(prepared, journal, output, limits)
 }

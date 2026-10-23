@@ -21,8 +21,10 @@ pub use native_scale::{
     NATIVE_PV_CHECKPOINT_FILE, NATIVE_PV_JOURNAL_FILE, NativeChildPublicationError,
     NativePvChildError, NativePvChildGuardError, NativePvChildLimits, NativePvChildSizeLedger,
     NativePvChildSource, NativePvChildVerification, NativePvParentReadLimits,
-    PublishedNativePvChild, VerifiedNativePvChild, decode_native_pv_parents,
-    inspect_native_pv_child, publish_native_pv_child, verify_native_pv_child,
+    NativePvResumeBundleError, NativePvResumeBundleLimits, NativePvResumeBundleReader,
+    PublishedNativePvChild, PublishedNativePvResumeBundle, VerifiedNativePvChild,
+    decode_native_pv_parents, inspect_native_pv_child, publish_native_pv_child,
+    publish_native_pv_resume_bundle, stage_native_pv_resume_bundle, verify_native_pv_child,
 };
 pub use native_scale::{
     NativePvCandidate, NativePvContribution, NativePvOwnerStep, NativePvRefinementSession,

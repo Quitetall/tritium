@@ -8,9 +8,9 @@ use tritium_quantize::engine::PublicationWarning;
 
 /// Committed recovery inputs with explicit post-commit cleanup/sync caveats.
 #[derive(Debug)]
-pub struct PublishedNativeScaleResumeBundle {
+pub(in crate::pv_tuning::native_scale) struct Published {
     /// Retained byte-consistent inputs, not numerical or quality qualification.
-    pub bundle: NativeScaleResumeBundleReader<File>,
+    pub bundle: ReaderCore<File>,
     /// No post-commit cleanup or directory-sync failure is reported as failed commit.
     pub warnings: Vec<PublicationWarning>,
 }
@@ -18,16 +18,16 @@ pub struct PublishedNativeScaleResumeBundle {
 /// Publish `resume.tnsb` in a new directory without replacing any existing path.
 /// Fsync precedes the hard-link commit. Caller owns parent directory/source
 /// custody and aggregate disk/memory admission. Not power-loss/security qualification.
-pub fn publish_native_scale_resume_bundle<W: Read + Write + Seek>(
-    session: &NativeScaleRefinementSession,
-    journal: &mut NativeScaleJournalWriter<W>,
+pub(in crate::pv_tuning::native_scale) fn publish(
+    journal: &mut impl Live,
     directory: &Path,
     limits: NativeScaleResumeBundleLimits,
-) -> Result<PublishedNativeScaleResumeBundle> {
-    let prepared = stage::prepare(journal, session, limits)?;
+) -> Result<Published> {
+    let prepared = stage::prepare(journal, limits)?;
+    let suffix = prepared.manifest.kind().suffix();
     fs::create_dir(directory)?;
-    let pending = directory.join(".pending.tnsb");
-    let destination = directory.join("resume.tnsb");
+    let pending = directory.join(format!(".pending.{suffix}"));
+    let destination = directory.join(format!("resume.{suffix}"));
     let mut owned = false;
     let result = (|| {
         let file = OpenOptions::new()
@@ -66,5 +66,5 @@ pub fn publish_native_scale_resume_bundle<W: Read + Write + Seek>(
     {
         warnings.push(PublicationWarning::DirectorySync);
     }
-    Ok(PublishedNativeScaleResumeBundle { bundle, warnings })
+    Ok(Published { bundle, warnings })
 }
