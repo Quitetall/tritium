@@ -170,4 +170,49 @@ fn pruned_coordinates_have_no_dense_moments_and_caps_reject_before_payload_alloc
     assert!(bytes < 4096, "consumer cap rejection allocated {bytes}");
     assert_eq!(state.checkpoint_bytes().unwrap(), before);
     eprintln!("NATIVE_PV_CONSUMER_CAP logical_coordinates=1048576 allocated_requests={bytes}");
+
+    let active = 1usize << 20;
+    let mut p = plan(1);
+    p.limits.max_state_bytes = 64_000_000;
+    p.limits.max_workspace_bytes = 64_000_000;
+    p.limits.max_checkpoint_bytes = 64_000_000;
+    let NativeRecoveryRecipe::AlternatingPv {
+        max_code_change_fraction,
+        ..
+    } = &mut p.recipe
+    else {
+        unreachable!()
+    };
+    *max_code_change_fraction = 0.03125;
+    let mut state = Session::new(p.clone(), vec![parent(4096, false)]).unwrap();
+    let gradient = vec![0.125; active];
+    let (result, bytes) = measured(|| state.step(&[&[0.0]], &[&gradient]));
+    assert_eq!(result.unwrap().owners[0].selected_units, active / 32);
+    let required = state.size_ledger().update_workspace_bytes;
+    eprintln!(
+        "NATIVE_PV_SELECTED logical_coordinates={active} selected={} step_allocated_requests={bytes} workspace_payload={required}",
+        active / 32
+    );
+    assert!(bytes < 16 * active, "bounded proposal allocated {bytes}");
+    let expected = 2 * active as u64
+        + 20
+        + 12 * active as u64
+        + (active / 32 * std::mem::size_of::<(usize, usize, f64)>()) as u64
+        + 4 * 256;
+    assert_eq!(required, expected);
+    // This cap was below the previous full-buffer/full-ranking requirement.
+    p.limits.max_workspace_bytes = required;
+    let mut exact = Session::new(p.clone(), vec![parent(4096, false)]).unwrap();
+    assert_eq!(
+        exact.step(&[&[0.0]], &[&gradient]).unwrap().owners[0].selected_units,
+        active / 32
+    );
+    p.limits.max_workspace_bytes -= 1;
+    let weight = parent(4096, false);
+    let (result, rejected_bytes) = measured(|| Session::new(p, vec![weight]));
+    assert!(result.is_err());
+    assert!(
+        rejected_bytes < 65536,
+        "short cap allocated {rejected_bytes}"
+    );
 }

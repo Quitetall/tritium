@@ -41,7 +41,8 @@ This API does not admit package custody, authenticate graph/objective/data or th
 complete consumer inventory, implement native alternating-PV, emit publication
 evidence or create a refined child. The separate `tritium.torch.native_scale_training`
 adapter supplies eager CPU scale autograd; see `tritium-py/README.md`. Public
-native refinement stays unavailable until those integrations and replay exist.
+native teacher/data refinement is exposed through `tritium.torch.refine` with
+distinct scale-only and alternating-P/V plans; see `tritium-py/README.md`.
 
 CPU packed scale snapshots can consume the session's updated exact scales while
 preserving old forward/backward versions and sharing packed codes. The local
@@ -173,6 +174,31 @@ not numerical replay or a quality/release capability. An unchanged child may kee
 its semantic ModelId; package/provenance remain distinct. Standalone typed reopen
 does not yet provide Python/HF shell loading: preserved catalogs still describe
 the explicit parent level and need the separate refined-result loader. No old
-completed-conversion gate is broadened. Python recording/public refine/export/load,
-objective/data authentication, native code/PV and independent physical/model/
-security/release gates remain open.
+completed-conversion gate is broadened. Python recording/public refine/export/load
+and native alternating-P/V integration are available separately; objective/data
+authentication and independent physical/model/security/release gates remain open.
+
+## Native alternating P/V recovery (CPU reference)
+
+`pv_tuning::NativePvRefinementSession` consumes an actual `AlternatingPv` plan,
+separate stored-scale and present stored-weight adjoints, and immutable original
+parents. It shares AdamW and the native code projector; it is not scale-only
+training relabeled as P/V. All owners, moments, hard codes and the cursor commit
+atomically. Recorded journals and durable recovery bundles preserve exact replay;
+the optional `NativeCpuPvSession` stages every next packed snapshot before journal
+append/flush and commit. See `tritium-py/README.md` for eager teacher/data training
+and immutable child publication through `tritium.torch.refine`.
+
+The code proposal reuses one transient present-weight buffer, maps window-weighted
+gradients inside the shared optimizer, and decodes one row again for movement
+ranking. A bounded heap retains exactly `K=ceil(fraction*U)` units; projection
+still visits them in descending movement order with logical-index ties. No
+coordinate moments are skipped, and no dense weight master persists. Logical
+per-owner update workspace is `2T+I+20S+12A+sizeof(rank)*K+4C`: decoded coefficient
+bytes T, auxiliary bytes I, stored scale count S, present weight count A,
+code-unit count U and column count C. The session sums this conservative bound
+over all owners; consumer and journal limits derive from the same ledger.
+Persistent state remains `T+I+12S+8A`. Checkpoint/journal formats and recipes are
+unchanged. These are payload bounds, excluding metadata, allocator slack, caller
+gradients, external graphs and separately admitted packed versions—not process
+RSS, VRAM, production GPU/paged fitting or model-quality qualification.

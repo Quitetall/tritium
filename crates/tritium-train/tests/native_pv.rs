@@ -152,6 +152,90 @@ fn reseal(bytes: &mut [u8]) {
     bytes[n..].copy_from_slice(hash.as_bytes());
 }
 
+/// Captured before the bounded proposal implementation. Includes complete hard
+/// state/moments/cursors and every numerical statistic, not just final trits.
+#[test]
+fn full_sort_pv_checkpoint_and_statistics_golden() {
+    let mut hash = blake3::Hasher::new();
+    let mut cases = 0u64;
+    for law in 0..ADMITTED_LAWS.len() {
+        for codec in [PlaneCodec::D2, PlaneCodec::B3, PlaneCodec::S34] {
+            for basis in [
+                Basis::Identity,
+                Basis::Hadamard { block: 128 },
+                Basis::SignedRht {
+                    block: 128,
+                    seed: u64::MAX,
+                    domain: 9,
+                },
+            ] {
+                for mode in 0..3 {
+                    for fraction in [0.0001, 0.03125, 0.5, 1.0] {
+                        for trust in [None, Some(f32::MIN_POSITIVE), Some(0.9)] {
+                            let parent = tensor_group(law, codec, basis, mode, Transport::Raw, 128);
+                            let mut p = plan(1);
+                            let NativeRecoveryRecipe::AlternatingPv {
+                                max_code_change_fraction,
+                                max_relative_code_change,
+                                ..
+                            } = &mut p.recipe
+                            else {
+                                unreachable!()
+                            };
+                            *max_code_change_fraction = fraction;
+                            *max_relative_code_change = trust;
+                            let mut session = Session::new(p, vec![parent]).unwrap();
+                            for step in 0..4 {
+                                let weight = session.weights().next().unwrap();
+                                let scale: Vec<_> = (0..weight.scales().len())
+                                    .map(|i| ((i + step) % 5) as f32 * 0.125 - 0.25)
+                                    .collect();
+                                // The final zero window and repeated gradient magnitudes
+                                // cover decay/momentum ranking and deterministic ties.
+                                let grad: Vec<_> = (0..active(weight))
+                                    .map(|i| {
+                                        if step == 3 {
+                                            0.0
+                                        } else {
+                                            ((i + step) % 7) as f32 * 0.125 - 0.375
+                                        }
+                                    })
+                                    .collect();
+                                let stats = session.step(&[&scale], &[&grad]).unwrap();
+                                hash.update(&session.checkpoint_bytes().unwrap());
+                                hash.update(&stats.completed_updates.to_le_bytes());
+                                hash.update(&(stats.changed_scales as u64).to_le_bytes());
+                                for owner in stats.owners {
+                                    for value in [
+                                        owner.selected_units,
+                                        owner.changed_units,
+                                        owner.trust_limited_units,
+                                    ] {
+                                        hash.update(&(value as u64).to_le_bytes());
+                                    }
+                                    for value in [
+                                        owner.surrogate_before,
+                                        owner.surrogate_after,
+                                        owner.relative_change,
+                                    ] {
+                                        hash.update(&value.to_bits().to_le_bytes());
+                                    }
+                                }
+                            }
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 1296);
+    assert_eq!(
+        hash.finalize().to_hex().as_str(),
+        "76874d54fa5648b0ebdb69c309d03e9cc84e9ebd380e747662d157516c0b5648"
+    );
+}
+
 #[test]
 fn exact_resume_and_real_code_updates_across_native_profiles() {
     let mut cases = 0;

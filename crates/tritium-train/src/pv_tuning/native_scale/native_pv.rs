@@ -1,5 +1,6 @@
 //! Numerical alternating P/V; not source admission, replay, or publication.
 use super::*;
+use std::{cmp::Ordering, collections::BinaryHeap};
 use tritium_core::project_additive_code_unit;
 use tritium_schema::NativeAdamWRecipe;
 
@@ -158,6 +159,32 @@ struct Rank {
     unit: usize,
     offset: usize,
     magnitude: f64,
+}
+
+// Better entries compare smaller, so the heap root is the worst retained unit.
+// The logical-unit tie break is the same one used by the original full sort.
+impl Ord for Rank {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .magnitude
+            .total_cmp(&self.magnitude)
+            .then(self.unit.cmp(&other.unit))
+    }
+}
+impl PartialOrd for Rank {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for Rank {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for Rank {}
+
+fn selected_count(units: usize, fraction: f32) -> usize {
+    ((units as f64 * f64::from(fraction)).ceil() as usize).min(units)
 }
 
 impl NativePvRefinementSession {
@@ -340,7 +367,7 @@ impl NativePvRefinementSession {
             });
         }
         let width = unit_width(&owner.weight);
-        let mut decoded = reserved(active)?;
+        let mut proposal = reserved(active)?;
         let cols = owner.weight.layout().cols as usize;
         let mut row = zeroed(cols)?;
         for r in 0..owner.weight.layout().rows as usize {
@@ -351,22 +378,19 @@ impl NativePvRefinementSession {
                 .map_err(|e| PvTuningError::step(format!("native PV decode: {e:?}")))?;
             for tile in 0..cols.div_ceil(256) {
                 if present(&owner.weight, r, tile) {
-                    decoded.extend_from_slice(&row[tile * 256..((tile + 1) * 256).min(cols)]);
+                    proposal.extend_from_slice(&row[tile * 256..((tile + 1) * 256).min(cols)]);
                 }
             }
         }
-        debug_assert_eq!(decoded.len(), active);
-        drop(row);
-        if decoded.iter().any(|value| !value.is_finite()) {
+        debug_assert_eq!(proposal.len(), active);
+        if proposal.iter().any(|value| !value.is_finite()) {
             return Err(PvTuningError::step("native PV decoded weight overflowed"));
         }
-        let norm = decoded
+        let norm = proposal
             .iter()
             .map(|&v| f64::from(v).powi(2))
             .sum::<f64>()
             .max(f64::from(f32::EPSILON));
-        let mut proposal = copied(&decoded)?;
-        let mut weighted = reserved(active)?;
         for &value in gradient {
             let value = (f64::from(value) * window_weight) as f32;
             if !value.is_finite() {
@@ -374,39 +398,54 @@ impl NativePvRefinementSession {
                     "native PV weighted gradient overflowed",
                 ));
             }
-            weighted.push(value);
         }
         self.code_optimizer
-            .step(step, &mut proposal, &weighted, &mut owner.code);
-        drop(weighted);
+            .step_mapped(step, &mut proposal, gradient, &mut owner.code, |value| {
+                (f64::from(value) * window_weight) as f32
+            });
         check_optimizer_moments(&owner.code, "native PV code")?;
         check_corrected_moments(self.code_optimizer, step, &owner.code)
             .map_err(PvTuningError::step)?;
         if proposal.iter().any(|value| !value.is_finite()) {
             return Err(PvTuningError::step("native PV proposal overflowed"));
         }
-        let mut ranked = reserved(active / width)?;
-        visit_units(&owner.weight, |unit, offset| {
-            let magnitude = decoded[offset..offset + width]
-                .iter()
-                .zip(&proposal[offset..offset + width])
-                .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
-                .sum();
-            ranked.push(Rank {
-                unit,
-                offset,
-                magnitude,
-            });
-        });
-        ranked.sort_unstable_by(|a, b| {
-            b.magnitude
-                .total_cmp(&a.magnitude)
-                .then(a.unit.cmp(&b.unit))
-        });
-        drop(decoded);
-        let keep =
-            ((ranked.len() as f64 * f64::from(self.fraction)).ceil() as usize).min(ranked.len());
-        ranked.truncate(keep);
+        let keep = selected_count(active / width, self.fraction);
+        let mut ranked = BinaryHeap::from(reserved(keep)?);
+        let mut offset = 0;
+        for r in 0..owner.weight.layout().rows as usize {
+            owner
+                .weight
+                .view()
+                .dequant_row_into(r, &mut row)
+                .map_err(|e| PvTuningError::step(format!("native PV decode: {e:?}")))?;
+            for tile in 0..cols.div_ceil(256) {
+                if !present(&owner.weight, r, tile) {
+                    continue;
+                }
+                for col in (tile * 256..((tile + 1) * 256).min(cols)).step_by(width) {
+                    let rank = Rank {
+                        unit: (r * cols + col) / width,
+                        offset,
+                        magnitude: row[col..col + width]
+                            .iter()
+                            .zip(&proposal[offset..offset + width])
+                            .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+                            .sum(),
+                    };
+                    if ranked.len() < keep {
+                        ranked.push(rank);
+                    } else if let Some(mut worst) = ranked.peek_mut()
+                        && rank < *worst
+                    {
+                        *worst = rank;
+                    }
+                    offset += width;
+                }
+            }
+        }
+        debug_assert_eq!(offset, active);
+        drop(row);
+        let ranked = ranked.into_sorted_vec();
         let limit = self.trust.map(|ratio| f64::from(ratio).powi(2) * norm);
         let mut accepted = 0.0;
         let mut stats = NativePvOwnerStep {
@@ -470,22 +509,6 @@ fn present(weight: &AdditiveTensor, row: usize, tile: usize) -> bool {
         .tile_counts()
         .is_none_or(|counts| counts[row * (weight.layout().cols as usize).div_ceil(256) + tile] > 0)
 }
-fn visit_units(weight: &AdditiveTensor, mut visit: impl FnMut(usize, usize)) {
-    let cols = weight.layout().cols as usize;
-    let width = unit_width(weight);
-    let mut offset = 0;
-    for row in 0..weight.layout().rows as usize {
-        for tile in 0..cols.div_ceil(256) {
-            if present(weight, row, tile) {
-                for col in (tile * 256..((tile + 1) * 256).min(cols)).step_by(width) {
-                    visit((row * cols + col) / width, offset);
-                    offset += width;
-                }
-            }
-        }
-    }
-}
-
 fn admit(
     plan: NativeRefinementPlan,
     parents: &[AdditiveTensor],
@@ -536,9 +559,12 @@ fn admit(
                 .checked_mul(2)?
                 .checked_add(i)?
                 .checked_add(s.checked_mul(20)?)?
-                .checked_add(a.checked_mul(20)?)?
+                .checked_add(a.checked_mul(12)?)?
                 .checked_add(
-                    (a / unit_width(weight) as u64)
+                    (selected_count(
+                        (a / unit_width(weight) as u64).try_into().ok()?,
+                        max_code_change_fraction,
+                    ) as u64)
                         .checked_mul(std::mem::size_of::<Rank>() as u64)?,
                 )?
                 .checked_add(c.checked_mul(4)?)?;
