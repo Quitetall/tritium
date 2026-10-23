@@ -105,6 +105,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         "native-scale-replay-observed"
     );
     project!(
+        tritium_schema::NativePvReplayObserved,
+        "native-pv-replay-observed"
+    );
+    project!(
         tritium_schema::NativeScaleResumePoint,
         "native-scale-resume-point"
     );

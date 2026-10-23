@@ -1,8 +1,13 @@
 //! Replayed immutable scale children; no objective or release qualification.
+use crate::pv_tuning::{NativePvJournalError, NativePvRefinementSession, VerifiedNativePvReplay};
+use tritium_evidence::NativePvChildReceiptView;
+mod profile;
 use super::{
     NativeScaleJournalError, NativeScaleRefinementSession, VerifiedNativeScaleReplay,
     hash_parent_tensor, parent_hasher,
 };
+use profile::Receipt;
+pub(super) use profile::{Profile, State};
 use std::{
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
@@ -137,6 +142,8 @@ pub enum NativeScaleChildError {
     Update(super::PvTuningError),
     /// Actual numerical replay/current-state failure.
     Replay(NativeScaleJournalError),
+    /// Actual P/V replay/current-state failure, never a scale-only observation.
+    PvReplay(NativePvJournalError),
     /// Original evidence/parent/lifecycle failure.
     Evidence(EvidenceError),
     /// Original typed stage, source guard or no-clobber publication failure.
@@ -154,6 +161,7 @@ impl std::fmt::Display for NativeScaleChildError {
             Self::Tensor(e) => write!(f, "native child tensor codec: {e:?}"),
             Self::Update(e) => e.fmt(f),
             Self::Replay(e) => e.fmt(f),
+            Self::PvReplay(e) => e.fmt(f),
             Self::Evidence(e) => e.fmt(f),
             Self::Publication(e) => e.fmt(f),
         }
@@ -168,6 +176,7 @@ impl std::error::Error for NativeScaleChildError {
             Self::Visit(e) => Some(e),
             Self::Update(e) => Some(e),
             Self::Replay(e) => Some(e),
+            Self::PvReplay(e) => Some(e),
             Self::Evidence(e) => Some(e),
             Self::Publication(e) => Some(e),
             _ => None,
@@ -190,6 +199,7 @@ from_error!(TritModelVisitError<io::Error>, Visit);
 from_error!(AdditiveTensorError, Tensor);
 from_error!(super::PvTuningError, Update);
 from_error!(NativeScaleJournalError, Replay);
+from_error!(NativePvJournalError, PvReplay);
 from_error!(EvidenceError, Evidence);
 from_error!(
     TritModelPublicationError<NativeScaleChildGuardError>,
@@ -233,11 +243,27 @@ pub fn inspect_native_scale_child<R: Read + Seek>(
     parent: &TritModelReader<R>,
     replay: &VerifiedNativeScaleReplay,
 ) -> Result<NativeScaleChildSizeLedger> {
+    inspect_child(State::Scale(session, replay), parent)
+}
+fn inspect_child<R: Read + Seek>(
+    state: State<'_>,
+    parent: &TritModelReader<R>,
+) -> Result<NativeScaleChildSizeLedger> {
+    let plan = state.plan();
+    if !matches!(
+        (state.kind(), &plan.recipe),
+        (Profile::Scale, NativeRecoveryRecipe::ScaleOnly { .. })
+            | (Profile::Pv, NativeRecoveryRecipe::AlternatingPv { .. })
+    ) {
+        return Err(NativeScaleChildError::Binding(
+            "native child numerical profile differs",
+        ));
+    }
     let level = parent
         .manifest()
         .levels
         .iter()
-        .find(|l| l.name == session.plan.parent.level)
+        .find(|l| l.name == plan.parent.level)
         .ok_or(NativeScaleChildError::Binding(
             "native child parent level absent",
         ))?;
@@ -250,7 +276,7 @@ pub fn inspect_native_scale_child<R: Read + Seek>(
     for asset in &parent.manifest().assets {
         spool = add(spool, parent.asset_byte_len(&asset.name)?)?;
     }
-    for (name, weight) in session.plan.owners.iter().zip(session.weights()) {
+    for (name, weight) in plan.owners.iter().zip(state.weights()) {
         let meta = parent.tensor_meta(&level.name, name)?;
         let TensorStorage::Additive { layout, planes } = &meta.storage else {
             return Err(NativeScaleChildError::Binding(
@@ -280,8 +306,8 @@ pub fn inspect_native_scale_child<R: Read + Seek>(
     }
     Ok(NativeScaleChildSizeLedger {
         spool_payload_bytes: spool,
-        companion_payload_bytes: add(session.ledger.checkpoint_bytes, replay.summary().bytes())?,
-        working_payload_bytes: add(session.ledger.checkpoint_bytes, largest)?,
+        companion_payload_bytes: add(state.footprint().1, state.binding().bytes)?,
+        working_payload_bytes: add(state.footprint().1, largest)?,
     })
 }
 
@@ -294,9 +320,59 @@ pub fn publish_native_scale_child<R: Read + Seek, J: Read + Seek, S: Read + Writ
     spool: &mut S,
     destination: &mut DirectoryTensorSink,
     limits: NativeScaleChildLimits,
-    mut recorder: EvidenceRecorder,
+    recorder: EvidenceRecorder,
 ) -> Result<PublishedNativeScaleChild> {
-    let sizes = inspect_native_scale_child(session, source.parent, source.replay)?;
+    let out = publish_child(
+        State::Scale(session, source.replay),
+        Source {
+            parent: source.parent,
+            parent_evidence: source.parent_evidence,
+            journal: source.journal,
+            machine: source.machine,
+            validation: source.validation,
+        },
+        spool,
+        destination,
+        limits,
+        recorder,
+    )?;
+    let Receipt::Scale(receipt) = out.receipt else {
+        unreachable!("scale profile returns scale receipt")
+    };
+    Ok(PublishedNativeScaleChild {
+        model: out.model,
+        evidence: out.evidence,
+        receipt,
+        model_id: out.model_id,
+        warnings: out.warnings,
+        sizes: out.sizes,
+    })
+}
+struct Source<'a, R, J> {
+    parent: &'a mut TritModelReader<R>,
+    parent_evidence: &'a NativeRefinementParentView,
+    journal: &'a mut J,
+    machine: &'a str,
+    validation: &'a [NativeRefinementValidation],
+}
+struct Published {
+    model: TritModelReader<File>,
+    evidence: SealedEvidence,
+    receipt: Receipt,
+    model_id: ModelId,
+    warnings: Vec<PublicationWarning>,
+    sizes: NativeScaleChildSizeLedger,
+}
+fn publish_child<R: Read + Seek, J: Read + Seek, S: Read + Write + Seek>(
+    state: State<'_>,
+    source: Source<'_, R, J>,
+    spool: &mut S,
+    destination: &mut DirectoryTensorSink,
+    limits: NativeScaleChildLimits,
+    mut recorder: EvidenceRecorder,
+) -> Result<Published> {
+    let plan = state.plan();
+    let sizes = inspect_child(state, source.parent)?;
     if limits.max_evidence_bytes == 0
         || limits.max_working_bytes == 0
         || limits.max_spool_bytes == 0
@@ -308,17 +384,15 @@ pub fn publish_native_scale_child<R: Read + Seek, J: Read + Seek, S: Read + Writ
             "native child payload byte limit exceeded",
         ));
     }
-    if session.completed_updates != session.plan.training.len() as u64 {
+    if state.completed() != plan.training.len() as u64 {
         return Err(NativeScaleChildError::Binding(
             "native child schedule incomplete",
         ));
     }
-    session
-        .plan
-        .validate_parent(source.parent.manifest(), source.parent_evidence.binding())
+    plan.validate_parent(source.parent.manifest(), source.parent_evidence.binding())
         .map_err(|_| NativeScaleChildError::Binding("native child parent/request mismatch"))?;
     let execution = NativeRefinementExecution {
-        backend: "native-scale-cpu-reference-v1".into(),
+        backend: state.backend().into(),
         device: format!(
             "cpu:{}:{}:{}",
             std::env::consts::ARCH,
@@ -331,11 +405,11 @@ pub fn publish_native_scale_child<R: Read + Seek, J: Read + Seek, S: Read + Writ
         .validate()
         .map_err(|_| NativeScaleChildError::Binding("native child execution label invalid"))?;
     if source.machine.is_empty()
-        || source.validation.len() != session.plan.validation.len()
+        || source.validation.len() != plan.validation.len()
         || source
             .validation
             .iter()
-            .zip(&session.plan.validation)
+            .zip(&plan.validation)
             .any(|(a, b)| {
                 a.content != b.content || !a.parent_loss.is_finite() || !a.child_loss.is_finite()
             })
@@ -352,8 +426,8 @@ pub fn publish_native_scale_child<R: Read + Seek, J: Read + Seek, S: Read + Writ
     recorder.check_emit::<NativeRefinementStarted>("refinement", None, 0)?;
     recorder.check_emit::<NativeRefinementCheckpointed>("refinement", None, 2)?;
     recorder.check_emit::<NativeRefinementCompleted>("refinement", None, 3)?;
-    recorder.check_emit::<NativeScaleReplayObserved>("numerical-replay", Some("refinement"), 1)?;
-    source.replay.verify_session(session)?;
+    state.check_emit(&recorder)?;
+    state.verify()?;
     source.parent_evidence.verify(source.parent)?;
     if spool.seek(SeekFrom::End(0))? != 0 || spool.seek(SeekFrom::Start(0))? != 0 {
         return Err(NativeScaleChildError::Binding(
@@ -361,23 +435,19 @@ pub fn publish_native_scale_child<R: Read + Seek, J: Read + Seek, S: Read + Writ
         ));
     }
     // Bind the actual original decoded parents one at a time, without a duplicate model.
-    let mut fingerprint = parent_hasher(session.plan_id);
-    for name in &session.plan.owners {
-        let bytes = read_tensor(source.parent, &session.plan.parent.level, name)?;
-        let decoded = decode_additive_payload(
-            source
-                .parent
-                .tensor_meta(&session.plan.parent.level, name)?,
-            &bytes,
-        )?;
+    let mut fingerprint = state.parent_hasher();
+    for name in &plan.owners {
+        let bytes = read_tensor(source.parent, &plan.parent.level, name)?;
+        let decoded =
+            decode_additive_payload(source.parent.tensor_meta(&plan.parent.level, name)?, &bytes)?;
         hash_parent_tensor(&mut fingerprint, &decoded)?;
     }
-    if fingerprint.finalize().as_bytes() != &session.parent {
+    if fingerprint.finalize().as_bytes() != &state.parent() {
         return Err(NativeScaleChildError::Binding(
             "native child actual original parent state differs",
         ));
     }
-    let checkpoint = session.checkpoint_bytes()?;
+    let checkpoint = state.checkpoint()?;
     let checkpoint_id = blob(&checkpoint);
     let mut blobs = Vec::new();
     let mut selected = Vec::new();
@@ -386,7 +456,7 @@ pub fn publish_native_scale_child<R: Read + Seek, J: Read + Seek, S: Read + Writ
         .manifest()
         .levels
         .iter()
-        .position(|l| l.name == session.plan.parent.level)
+        .position(|l| l.name == plan.parent.level)
         .expect("admitted level");
     let tensor_count = source.parent.manifest().levels[level_index].tensors.len();
     let mut outputs = Vec::new();
@@ -395,12 +465,10 @@ pub fn publish_native_scale_child<R: Read + Seek, J: Read + Seek, S: Read + Writ
             let meta = &source.parent.manifest().levels[level_index].tensors[tensor_index];
             (meta.name.clone(), meta.blob.id, kind(&meta.storage)?)
         };
-        let length = source
-            .parent
-            .tensor_byte_len(&session.plan.parent.level, &name)?;
+        let length = source.parent.tensor_byte_len(&plan.parent.level, &name)?;
         let offset = spool.seek(SeekFrom::End(0))?;
-        let content = if let Ok(index) = session.plan.owners.binary_search(&name) {
-            let bytes = session
+        let content = if let Ok(index) = plan.owners.binary_search(&name) {
+            let bytes = state
                 .weights()
                 .nth(index)
                 .expect("admitted owner")
@@ -420,9 +488,7 @@ pub fn publish_native_scale_child<R: Read + Seek, J: Read + Seek, S: Read + Writ
         } else {
             source
                 .parent
-                .visit_tensor(&session.plan.parent.level, &name, |chunk| {
-                    spool.write_all(chunk)
-                })?;
+                .visit_tensor(&plan.parent.level, &name, |chunk| spool.write_all(chunk))?;
             original_id
         };
         blobs.push(TritSpoolBlob {
@@ -456,40 +522,28 @@ pub fn publish_native_scale_child<R: Read + Seek, J: Read + Seek, S: Read + Writ
         ));
     }
     spool.flush()?;
-    let summary = source.replay.summary();
-    let replay = NativeScaleReplayObserved {
-        plan: summary.plan(),
-        journal: summary.journal(),
-        journal_bytes: summary.bytes(),
-        checkpoint: summary.checkpoint(),
-        checkpoint_bytes: summary.checkpoint_bytes(),
-        completed_updates: summary.updates(),
-    };
+    let summary = state.binding();
     recorder.emit(
         "refinement",
         None,
         0,
         &NativeRefinementStarted {
-            plan: session.plan.clone(),
+            plan: plan.clone(),
             execution,
         },
     )?;
-    recorder.emit("numerical-replay", Some("refinement"), 1, &replay)?;
+    state.emit(&mut recorder)?;
     recorder.emit(
         "refinement",
         None,
         2,
         &NativeRefinementCheckpointed {
-            plan: session.plan_id,
-            completed_updates: session.completed_updates,
-            state: native_refinement_state_id(
-                session.plan_id,
-                session.completed_updates,
-                checkpoint_id,
-            ),
+            plan: state.id(),
+            completed_updates: state.completed(),
+            state: native_refinement_state_id(state.id(), state.completed(), checkpoint_id),
             checkpoint: checkpoint_id,
             checkpoint_bytes: checkpoint.len() as u64,
-            state_payload_bytes: session.ledger.state_payload_bytes,
+            state_payload_bytes: state.footprint().0,
             owners: selected,
         },
     )?;
@@ -498,7 +552,7 @@ pub fn publish_native_scale_child<R: Read + Seek, J: Read + Seek, S: Read + Writ
         None,
         3,
         &NativeRefinementCompleted {
-            plan: session.plan_id,
+            plan: state.id(),
             checkpoint: checkpoint_id,
             tensors: outputs,
             validation: source.validation.to_vec(),
@@ -510,12 +564,7 @@ pub fn publish_native_scale_child<R: Read + Seek, J: Read + Seek, S: Read + Writ
             "native child evidence byte limit exceeded",
         ));
     }
-    let mut views = NativeScaleChildReceiptView::fold(
-        evidence.log(),
-        source.parent,
-        source.parent_evidence,
-        &session.plan,
-    )?;
+    let mut views = state.fold(evidence.log(), source.parent, source.parent_evidence)?;
     if views.len() != 1 {
         return Err(NativeScaleChildError::Binding(
             "native child complete receipt absent",
@@ -531,16 +580,16 @@ pub fn publish_native_scale_child<R: Read + Seek, J: Read + Seek, S: Read + Writ
     let companions = TritModelCompanions {
         files: vec![
             TritModelCompanion {
-                name: NATIVE_SCALE_CHECKPOINT_FILE,
+                name: state.companions().0,
                 source: &mut checkpoint_source,
                 bytes: checkpoint.len() as u64,
                 content: checkpoint_id,
             },
             TritModelCompanion {
-                name: NATIVE_SCALE_JOURNAL_FILE,
+                name: state.companions().1,
                 source: source.journal,
-                bytes: summary.bytes(),
-                content: summary.journal(),
+                bytes: summary.bytes,
+                content: summary.journal,
             },
         ],
         max_bytes: limits.max_companion_bytes,
@@ -548,7 +597,7 @@ pub fn publish_native_scale_child<R: Read + Seek, J: Read + Seek, S: Read + Writ
     let mut receiving = limits.receiving;
     receiving.max_source_bytes = receiving
         .max_source_bytes
-        .min(session.plan.limits.max_package_bytes);
+        .min(plan.limits.max_package_bytes);
     let (model, model_id, warnings) = destination.publish_spooled_model_with_companions(
         TritModelSpool {
             manifest: receipt.manifest(),
@@ -564,11 +613,11 @@ pub fn publish_native_scale_child<R: Read + Seek, J: Read + Seek, S: Read + Writ
                 .verify(source.parent)
                 .map_err(NativeScaleChildGuardError::Parent)?;
             candidate
-                .model_id(&session.plan.child_level)
+                .model_id(&plan.child_level)
                 .map_err(NativeScaleChildGuardError::Child)
         },
     )?;
-    Ok(PublishedNativeScaleChild {
+    Ok(Published {
         model,
         evidence,
         receipt,
@@ -608,4 +657,95 @@ pub(super) fn read_tensor<R: Read + Seek>(
         ));
     }
     Ok(bytes)
+}
+
+/// Shared algorithm-independent publication error contract under a neutral name.
+pub type NativeChildPublicationError = NativeScaleChildError;
+/// P/V publication errors, retaining original replay/I/O causes.
+pub type NativePvChildError = NativeScaleChildError;
+/// Shared logical builder/output limits, not P/V qualification.
+pub type NativePvChildLimits = NativeScaleChildLimits;
+/// Shared logical builder/spool observations, not physical memory.
+pub type NativePvChildSizeLedger = NativeScaleChildSizeLedger;
+/// Shared original-parent/staged-child source guard failures.
+pub type NativePvChildGuardError = NativeScaleChildGuardError;
+/// Exact complete TNPV companion leaf.
+pub const NATIVE_PV_CHECKPOINT_FILE: &str = "checkpoint.tnpv";
+/// Exact complete TNPJ companion leaf.
+pub const NATIVE_PV_JOURNAL_FILE: &str = "gradients.tnpj";
+/// Actual original parent and P/V numerical replay, not caller approval.
+#[derive(Debug)]
+pub struct NativePvChildSource<'a, R, J> {
+    /// Actual retained immediate parent bytes.
+    pub parent: &'a mut TritModelReader<R>,
+    /// Original privately admitted parent record, not resealed metadata.
+    pub parent_evidence: &'a NativeRefinementParentView,
+    /// Actual P/V replay, rechecked against the session before publication.
+    pub replay: &'a VerifiedNativePvReplay,
+    /// Actual complete TNPJ source, copied against its replayed identity.
+    pub journal: &'a mut J,
+    /// Caller-observed machine label, not authenticated hardware.
+    pub machine: &'a str,
+    /// Ordered finite observations, not quality acceptance.
+    pub validation: &'a [NativeRefinementValidation],
+}
+/// Committed complete P/V child; no quality or release acceptance.
+#[derive(Debug)]
+pub struct PublishedNativePvChild {
+    /// Retained checked exact child file.
+    pub model: TritModelReader<File>,
+    /// Original sealed native run, including distinct P/V replay observation.
+    pub evidence: SealedEvidence,
+    /// Parent-admitted P/V record consistency, not independent replay/quality.
+    pub receipt: NativePvChildReceiptView,
+    /// Actual semantic child identity; may equal its parent's.
+    pub model_id: ModelId,
+    /// Explicit post-commit cleanup/sync caveats.
+    pub warnings: Vec<PublicationWarning>,
+    /// Logical builder payload observations, not RSS.
+    pub sizes: NativePvChildSizeLedger,
+}
+/// Read-only metadata sizing; actual parent/replay admission remains in publication.
+pub fn inspect_native_pv_child<R: Read + Seek>(
+    session: &NativePvRefinementSession,
+    parent: &TritModelReader<R>,
+    replay: &VerifiedNativePvReplay,
+) -> Result<NativePvChildSizeLedger> {
+    inspect_child(State::Pv(session, replay), parent)
+}
+/// Publish one complete unqualified P/V child through the shared guarded sink.
+/// Parent/source/spool custody remains caller-owned; no-clobber is preserved.
+pub fn publish_native_pv_child<R: Read + Seek, J: Read + Seek, S: Read + Write + Seek>(
+    session: &NativePvRefinementSession,
+    source: NativePvChildSource<'_, R, J>,
+    spool: &mut S,
+    destination: &mut DirectoryTensorSink,
+    limits: NativePvChildLimits,
+    recorder: EvidenceRecorder,
+) -> Result<PublishedNativePvChild> {
+    let out = publish_child(
+        State::Pv(session, source.replay),
+        Source {
+            parent: source.parent,
+            parent_evidence: source.parent_evidence,
+            journal: source.journal,
+            machine: source.machine,
+            validation: source.validation,
+        },
+        spool,
+        destination,
+        limits,
+        recorder,
+    )?;
+    let Receipt::Pv(receipt) = out.receipt else {
+        unreachable!("PV profile returns PV receipt")
+    };
+    Ok(PublishedNativePvChild {
+        model: out.model,
+        evidence: out.evidence,
+        receipt,
+        model_id: out.model_id,
+        warnings: out.warnings,
+        sizes: out.sizes,
+    })
 }

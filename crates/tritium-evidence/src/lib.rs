@@ -21,11 +21,16 @@ mod model_load;
 pub use model_load::{MODEL_LOADED_REGISTRATION, ModelLoadReceiptView};
 
 mod model_import;
+mod native_child_record;
+mod native_pv_child;
 mod native_refinement;
 mod native_scale_child;
 pub use model_import::{
     LEGACY_MODEL_IMPORT_BOUND_PREPARED_REGISTRATION, LEGACY_MODEL_IMPORT_PREPARED_REGISTRATION,
     LegacyModelImportBoundView, LegacyModelImportView,
+};
+pub use native_pv_child::{
+    NATIVE_PV_REPLAY_OBSERVED_REGISTRATION, NativePvChildReceiptView, NativePvChildRecordView,
 };
 pub use native_refinement::{
     NATIVE_REFINEMENT_CHECKPOINTED_REGISTRATION, NATIVE_REFINEMENT_COMPLETED_REGISTRATION,

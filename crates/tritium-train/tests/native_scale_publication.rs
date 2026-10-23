@@ -19,6 +19,8 @@ use tritium_train::pv_tuning::*;
 
 #[path = "native_scale_publication/chaining.rs"]
 mod chaining;
+#[path = "native_scale_publication/pv.rs"]
+mod pv;
 
 #[derive(Clone, Debug)]
 struct Shared {

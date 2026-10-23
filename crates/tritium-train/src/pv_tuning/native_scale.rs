@@ -31,6 +31,13 @@ pub use journal::{
     stage_native_scale_resume_bundle,
 };
 mod publication;
+pub use native_pv::{NativePvChildVerification, VerifiedNativePvChild, verify_native_pv_child};
+pub use publication::{
+    NATIVE_PV_CHECKPOINT_FILE, NATIVE_PV_JOURNAL_FILE, NativeChildPublicationError,
+    NativePvChildError, NativePvChildGuardError, NativePvChildLimits, NativePvChildSizeLedger,
+    NativePvChildSource, PublishedNativePvChild, inspect_native_pv_child, publish_native_pv_child,
+};
+pub use verification::{NativePvParentReadLimits, decode_native_pv_parents};
 mod transaction;
 mod verification;
 pub use consumers::NativeScaleContribution;

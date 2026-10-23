@@ -29,6 +29,53 @@ pub fn decode_native_scale_parents<R: Read + Seek>(
     plan: &NativeRefinementPlan,
     limits: NativeScaleParentReadLimits,
 ) -> Result<Vec<AdditiveTensor>, Error> {
+    if !matches!(
+        plan.recipe,
+        tritium_schema::NativeRecoveryRecipe::ScaleOnly { .. }
+    ) {
+        return Err(Error::Binding(
+            "native scale parent decode requires ScaleOnly",
+        ));
+    }
+    decode_parents(
+        reader,
+        parent,
+        plan,
+        limits,
+        super::publication::Profile::Scale,
+    )
+}
+/// Decode exact P/V originals under code-moment-aware state admission.
+/// This is source/record consistency, not objective/quality qualification.
+pub fn decode_native_pv_parents<R: Read + Seek>(
+    reader: &mut TritModelReader<R>,
+    parent: &NativeRefinementParentView,
+    plan: &NativeRefinementPlan,
+    limits: NativePvParentReadLimits,
+) -> Result<Vec<AdditiveTensor>, Error> {
+    if !matches!(
+        plan.recipe,
+        tritium_schema::NativeRecoveryRecipe::AlternatingPv { .. }
+    ) {
+        return Err(Error::Binding(
+            "native PV parent decode requires AlternatingPv",
+        ));
+    }
+    decode_parents(
+        reader,
+        parent,
+        plan,
+        limits,
+        super::publication::Profile::Pv,
+    )
+}
+fn decode_parents<R: Read + Seek>(
+    reader: &mut TritModelReader<R>,
+    parent: &NativeRefinementParentView,
+    plan: &NativeRefinementPlan,
+    limits: NativeScaleParentReadLimits,
+    profile: super::publication::Profile,
+) -> Result<Vec<AdditiveTensor>, Error> {
     plan.validate_parent(reader.manifest(), parent.binding())
         .map_err(|_| Error::Binding("native parent/request mismatch"))?;
     let mut retained = 0;
@@ -60,6 +107,18 @@ pub fn decode_native_scale_parents<R: Read + Seek>(
                 .checked_mul(12)
                 .ok_or(Error::Limit("native scale size"))?,
         )?;
+        if matches!(profile, super::publication::Profile::Pv) && m.plane_count() > 0 {
+            let active = m
+                .plane_trit_count(0)
+                .map_err(|_| Error::Limit("native PV base-plane count"))?
+                as u64;
+            bytes = add(
+                bytes,
+                active
+                    .checked_mul(8)
+                    .ok_or(Error::Limit("native PV code state size"))?,
+            )?;
+        }
         retained = add(retained, bytes)?;
         largest = largest.max(reader.tensor_byte_len(&plan.parent.level, name)?);
     }
@@ -173,36 +232,13 @@ pub fn verify_native_scale_child<P: Read + Seek, C: Read + Seek, J: Read + Seek>
         source.checkpoint,
         replay_limits,
     )?;
-    for (name, weight) in session.plan.owners.iter().zip(session.weights()) {
-        let length = source
-            .parent
-            .tensor_byte_len(&session.plan.parent.level, name)?;
-        // The same parent cap also admits state+checkpoint+one encoded owner at verification.
-        if add(
-            add(
-                session.ledger.state_payload_bytes,
-                limits.extra_payload_bytes,
-            )?,
-            length,
-        )? > limits.max_working_bytes
-        {
-            return Err(Error::Limit(
-                "native child encoded verification exceeds byte limit",
-            ));
-        }
-        let bytes = weight.encode_payload()?;
-        let meta = source.child.tensor_meta(&session.plan.child_level, name)?;
-        if bytes.len() as u64
-            != source
-                .child
-                .tensor_byte_len(&session.plan.child_level, name)?
-            || blake3::hash(&bytes).as_bytes() != meta.blob.id.as_bytes()
-        {
-            return Err(Error::Binding(
-                "native child bytes differ from replayed owner state",
-            ));
-        }
-    }
+    verify_encoded_state(
+        super::publication::State::Scale(&session, &replay),
+        source.parent,
+        source.child,
+        limits.extra_payload_bytes,
+        limits.max_working_bytes,
+    )?;
     source.parent_evidence.verify(source.parent)?;
     receipt.verify_child(source.child)?;
     Ok(VerifiedNativeScaleChild {
@@ -211,3 +247,33 @@ pub fn verify_native_scale_child<P: Read + Seek, C: Read + Seek, J: Read + Seek>
         replay,
     })
 }
+
+pub(super) fn verify_encoded_state<P: Read + Seek, C: Read + Seek>(
+    state: super::publication::State<'_>,
+    parent: &mut TritModelReader<P>,
+    child: &mut TritModelReader<C>,
+    extra: u64,
+    max: u64,
+) -> Result<(), Error> {
+    for (name, weight) in state.plan().owners.iter().zip(state.weights()) {
+        let length = parent.tensor_byte_len(&state.plan().parent.level, name)?;
+        // The same parent cap also admits state+checkpoint+one encoded owner at verification.
+        if add(add(state.footprint().0, extra)?, length)? > max {
+            return Err(Error::Limit(
+                "native child encoded verification exceeds byte limit",
+            ));
+        }
+        let bytes = weight.encode_payload()?;
+        let meta = child.tensor_meta(&state.plan().child_level, name)?;
+        if bytes.len() as u64 != child.tensor_byte_len(&state.plan().child_level, name)?
+            || blake3::hash(&bytes).as_bytes() != meta.blob.id.as_bytes()
+        {
+            return Err(Error::Binding(
+                "native child bytes differ from replayed owner state",
+            ));
+        }
+    }
+    Ok(())
+}
+/// Shared source/state/encoded-owner limits for P/V parent admission.
+pub type NativePvParentReadLimits = NativeScaleParentReadLimits;

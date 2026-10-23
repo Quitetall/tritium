@@ -458,6 +458,29 @@ pub struct NativeScaleResumePoint {
     pub checkpoint_bytes: u64,
 }
 
+/// Recorded P/V journal/checkpoint binding, not numerical or quality authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
+pub struct NativePvReplayObserved {
+    /// Exact frozen AlternatingPv request.
+    pub plan: NativeRefinementPlanId,
+    /// Complete TNPJ byte identity, including trailer checksum.
+    pub journal: BlobId,
+    /// Complete TNPJ byte length.
+    pub journal_bytes: u64,
+    /// Complete replayed TNPV byte identity.
+    pub checkpoint: BlobId,
+    /// Exact TNPV byte length.
+    pub checkpoint_bytes: u64,
+    /// Complete declared training-window cursor.
+    pub completed_updates: u64,
+}
+
 /// Frozen recovery inputs and emitted observations, not numerical qualification.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]

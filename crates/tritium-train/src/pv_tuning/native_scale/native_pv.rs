@@ -4,6 +4,8 @@ use tritium_core::project_additive_code_unit;
 use tritium_schema::NativeAdamWRecipe;
 
 mod checkpoint;
+mod verification;
+pub use verification::{NativePvChildVerification, VerifiedNativePvChild, verify_native_pv_child};
 mod journal;
 pub use journal::{
     NativePvJournalError, NativePvJournalLimits, NativePvJournalResume, NativePvJournalSizeLedger,
@@ -199,6 +201,18 @@ impl NativePvRefinementSession {
     /// Current hard owner tensors in frozen order.
     pub fn weights(&self) -> impl ExactSizeIterator<Item = &AdditiveTensor> {
         self.owners.iter().map(|owner| &owner.weight)
+    }
+    pub(super) fn weight_at(&self, index: usize) -> &AdditiveTensor {
+        &self.owners[index].weight
+    }
+    pub(super) fn parent_fingerprint(&self) -> [u8; 32] {
+        self.parent
+    }
+    pub(super) fn parent_hasher(plan: NativeRefinementPlanId) -> blake3::Hasher {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"tritium.native-pv.parent.v1\0");
+        hasher.update(plan.as_bytes());
+        hasher
     }
 
     /// Update all owners atomically using two independent unweighted adjoints.
@@ -550,9 +564,7 @@ fn admit(
     }
     let plan_id = native_refinement_plan_id(&plan)
         .map_err(|e| PvTuningError::invalid_config(e.to_string()))?;
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"tritium.native-pv.parent.v1\0");
-    hasher.update(plan_id.as_bytes());
+    let mut hasher = NativePvRefinementSession::parent_hasher(plan_id);
     for weight in parents {
         hash_parent_tensor(&mut hasher, weight)?;
     }
