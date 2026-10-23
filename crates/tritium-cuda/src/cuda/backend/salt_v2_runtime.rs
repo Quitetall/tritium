@@ -94,6 +94,8 @@ pub(super) struct SaltMmaScratch {
     partial: CudaSlice<f32>,
     max_k: usize,
     max_total_rows: usize,
+    /// Blocks of the GEMM resident at once on this device (two per SM).
+    resident: u32,
 }
 
 /// Most K-splits the tensor-core GEMM launches.
@@ -110,12 +112,17 @@ impl SaltMmaScratch {
         stream: &Arc<CudaStream>,
         shapes: &[(usize, usize)],
     ) -> Result<Self, BackendError> {
+        let sms = stream
+            .context()
+            .attribute(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+            .map_err(|error| driver_err("query SM count", &error))?;
+        let resident = 2 * u32::try_from(sms.max(1)).unwrap_or(1);
         let max_k = shapes.iter().map(|&(_, k)| k).max().unwrap_or(0);
         let max_total_rows = shapes.iter().map(|&(rows, _)| rows).max().unwrap_or(0);
         let partial_rows = shapes
             .iter()
             .map(|&(rows, k)| {
-                let splits = salt_v2_mma_splits(rows as u32, k as u32) as usize;
+                let splits = salt_v2_mma_splits(rows as u32, k as u32, resident) as usize;
                 if splits > 1 { splits * rows } else { 0 }
             })
             .max()
@@ -139,20 +146,35 @@ impl SaltMmaScratch {
             partial: alloc_f32(rows * partial_rows)?,
             max_k,
             max_total_rows,
+            resident,
         })
     }
 }
 
-/// K-splits for a fused group: enough blocks to cover the device about four
-/// times over (measured on the 4090 across the Qwen3.6 projection shapes), never
-/// more splits than K has tiles. A function of the weight shape only, so a row's
-/// result never depends on how many activation rows share the launch.
-fn salt_v2_mma_splits(total_rows: u32, k: u32) -> u32 {
+/// K-splits for a fused group, chosen against wave quantization: with
+/// `resident` blocks running at once, `s` splits cost about
+/// `ceil(blocks * s / resident)` waves of `ceil(tiles / s)` tiles each; take
+/// the cheapest, preferring fewer splits on a tie (each split adds a partial
+/// pass). Before this the last wave of most Qwen3.6 shapes ran 6-60% full.
+/// A function of the weight shape and the device only, so a row's result never
+/// depends on how many activation rows share the launch.
+fn salt_v2_mma_splits(total_rows: u32, k: u32, resident: u32) -> u32 {
     let blocks = total_rows.div_ceil(16 * SALT_V2_MMA_WARPS).max(1);
-    let tiles = k / SALT_V2_ALLOCATION_TILE_SIZE as u32;
-    512u32
-        .div_ceil(blocks)
-        .clamp(1, SALT_V2_MMA_MAX_SPLITS.min(tiles.max(1)))
+    let tiles = (k / SALT_V2_ALLOCATION_TILE_SIZE as u32).max(1);
+    let resident = resident.max(1);
+    // Four or more waves already: quantization costs little, and the partials of
+    // a wide group (the language head) would cost tens of MB of VRAM.
+    if blocks >= 4 * resident {
+        return 1;
+    }
+    (1..=SALT_V2_MMA_MAX_SPLITS.min(tiles))
+        .min_by_key(|&splits| {
+            (
+                (blocks * splits).div_ceil(resident) * tiles.div_ceil(splits),
+                splits,
+            )
+        })
+        .unwrap_or(1)
 }
 
 /// Tensor-core SALT V2 GEMM over a fused group: `m` (at most 64) activation rows
@@ -213,14 +235,14 @@ pub(super) fn launch_salt_v2_mma_rows_on(
     run(
         &mut builder,
         LaunchConfig {
-            grid_dim: (padded, 1, 1),
+            grid_dim: (padded, k / SALT_V2_ALLOCATION_TILE_SIZE as u32, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         },
         "launch tensor-core GEMM activation split",
     )?;
 
-    let splits = salt_v2_mma_splits(total_rows, k);
+    let splits = salt_v2_mma_splits(total_rows, k, scratch.resident);
     let (function, staged_rows) = if m <= 16 {
         (&kernels.rows16, 16)
     } else {

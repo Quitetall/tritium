@@ -545,7 +545,7 @@ __device__ __forceinline__ void mma_rows(const __half* __restrict__ act_hi,
 
 // Activation rows -> permuted f16 hi/lo halves plus one power-of-two scale per row.
 //
-// One block per row. Row `r`'s scale is 2^e with the smallest e >= 0 that brings
+// Grid (rows, k / 256). Row `r`'s scale is 2^e with the smallest e >= 0 that brings
 // max|x| under 2^14, so hi never overflows f16; the GEMM multiplies its outputs
 // back by 2^e, which is exact. Rows in [m, padded) are zero.
 //
@@ -586,11 +586,15 @@ extern "C" __global__ void salt_v2_mma_split_act(const float* __restrict__ activ
     ++e;
   }
   const float down = ldexpf(1.0f, -e);
-  if (threadIdx.x == 0U) row_scale[row] = ldexpf(1.0f, e);
+  if (threadIdx.x == 0U && blockIdx.y == 0U) row_scale[row] = ldexpf(1.0f, e);
 
+  // Block (row, y) converts tile y only (every block recomputes the row's peak,
+  // which is order-free): one block per row left 16 blocks for a verify.
   __half* out_hi = hi + static_cast<size_t>(row) * k;
   __half* out_lo = lo + static_cast<size_t>(row) * k;
-  for (uint32_t slot = threadIdx.x; slot < k; slot += blockDim.x) {
+  const uint32_t slot_end = min(k, (blockIdx.y + 1U) * salt_mma::kTile);
+  for (uint32_t slot = blockIdx.y * salt_mma::kTile + threadIdx.x; slot < slot_end;
+       slot += blockDim.x) {
     const uint32_t tile = slot / salt_mma::kTile;
     const uint32_t within = slot % salt_mma::kTile;
     const uint32_t step = within / 16U;

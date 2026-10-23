@@ -57,7 +57,7 @@ enum W8 {
         columns: usize,
     },
     /// Offset-8 nibbles with one f16 scale per 64 columns, laid out for
-    /// `dflash_w4_rows*` (see `dflash.cu`).
+    /// `dflash_w4_block*` (see `dflash.cu`).
     Int4 {
         weight: CudaSlice<u8>,
         scale: CudaSlice<u16>,
@@ -98,12 +98,38 @@ struct Functions {
     split_act: CudaFunction,
     rows16: CudaFunction,
     rows64: CudaFunction,
-    w4_rows16: CudaFunction,
-    w4_rows64: CudaFunction,
+    w4_block16: CudaFunction,
+    w4_block64: CudaFunction,
+    reduce: CudaFunction,
     concat: CudaFunction,
     norm_rope: CudaFunction,
     attention: CudaFunction,
     swiglu: CudaFunction,
+}
+
+/// Activation staging and K-split partials for the drafter's GEMMs.
+struct GemmScratch {
+    /// f16 activation staging, `[64, max k]`.
+    act16: CudaSlice<u16>,
+    /// `[splits, m, n]` partials for the widest split launch.
+    partial: CudaSlice<f32>,
+    /// `dflash_w4_block*` blocks resident at once on this device.
+    resident: u32,
+}
+
+/// K-splits for a 4-bit drafter GEMM of `rows x columns`: the fewest that
+/// minimizes waves x 256-column chunks per block (see `salt_v2_mma_splits`).
+fn gemm_splits(rows: usize, columns: usize, resident: u32) -> u32 {
+    let blocks = rows.div_ceil(128).max(1) as u32;
+    let chunks = (columns / 256).max(1) as u32;
+    (1..=8u32.min(chunks))
+        .min_by_key(|&splits| {
+            (
+                (blocks * splits).div_ceil(resident.max(1)) * chunks.div_ceil(splits),
+                splits,
+            )
+        })
+        .unwrap_or(1)
 }
 
 /// The drafter's weights, caches and scratch.
@@ -116,7 +142,7 @@ pub(super) struct Drafter {
     layers: Vec<DraftLayer>,
     inv_freq: CudaSlice<f32>,
     /// f16 activation staging, `[64, max k]`.
-    act16: CudaSlice<u16>,
+    gemm: GemmScratch,
     /// `[64, layers * hidden]` concatenated target features.
     concat: CudaSlice<f32>,
     /// `[64, hidden]` projected and normalized context.
@@ -284,8 +310,9 @@ impl Drafter {
             split_act: function("dflash_split_act")?,
             rows16: function("dflash_w8_rows16")?,
             rows64: function("dflash_w8_rows64")?,
-            w4_rows16: function("dflash_w4_rows16")?,
-            w4_rows64: function("dflash_w4_rows64")?,
+            w4_block16: function("dflash_w4_block16")?,
+            w4_block64: function("dflash_w4_block64")?,
+            reduce: function("dflash_reduce")?,
             concat: function("dflash_concat_features")?,
             norm_rope: function("dflash_norm_rope")?,
             attention: function("dflash_attention")?,
@@ -402,9 +429,42 @@ impl Drafter {
             inv_freq: stream
                 .clone_htod(&inv_freq)
                 .map_err(|error| driver_err("upload drafter RoPE", &error))?,
-            act16: stream.alloc_zeros::<u16>(rows * max_k).map_err(|error| {
-                alloc_or_backend("allocate drafter staging", &error, rows * max_k * 2)
-            })?,
+            gemm: {
+                let sms = stream
+                    .context()
+                    .attribute(
+                        sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                    )
+                    .map_err(|error| driver_err("query SM count", &error))?;
+                let resident = 4 * u32::try_from(sms.max(1)).unwrap_or(1);
+                let kv2 = 2 * kv_width;
+                // (rows, columns, activation rows) of every drafter GEMM.
+                let shapes = [
+                    (q_width, hidden, block),
+                    (kv2, hidden, block),
+                    (hidden, q_width, block),
+                    (2 * config.intermediate, hidden, block),
+                    (hidden, config.intermediate, block),
+                    (hidden, features, rows),
+                    (kv2, hidden, rows),
+                ];
+                let partial = shapes
+                    .iter()
+                    .map(|&(n, k, m)| {
+                        let splits = gemm_splits(n, k, resident) as usize;
+                        if splits > 1 { splits * m * n } else { 0 }
+                    })
+                    .max()
+                    .unwrap_or(0)
+                    .max(1);
+                GemmScratch {
+                    act16: stream.alloc_zeros::<u16>(rows * max_k).map_err(|error| {
+                        alloc_or_backend("allocate drafter staging", &error, rows * max_k * 2)
+                    })?,
+                    partial: zeros(partial, "allocate drafter partials")?,
+                    resident,
+                }
+            },
             concat: zeros(rows * features, "allocate drafter features")?,
             ctx_hidden: zeros(rows * hidden, "allocate drafter context")?,
             ctx_norm: zeros(rows * hidden, "allocate drafter context")?,
@@ -431,7 +491,7 @@ impl Drafter {
     fn w8(
         functions: &Functions,
         stream: &CudaStream,
-        act16: &mut CudaSlice<u16>,
+        gemm: &mut GemmScratch,
         weight: &W8,
         input: &CudaSlice<f32>,
         m: usize,
@@ -443,7 +503,7 @@ impl Drafter {
         let m_u32 = to_u32(m, "drafter rows")?;
         let padded = m_u32.div_ceil(8) * 8;
         let mut builder = stream.launch_builder(&functions.split_act);
-        builder.arg(input).arg(&mut *act16).arg(&m_u32).arg(&k);
+        builder.arg(input).arg(&mut gemm.act16).arg(&m_u32).arg(&k);
         run(
             &mut builder,
             LaunchConfig {
@@ -469,7 +529,7 @@ impl Drafter {
                 builder
                     .arg(weight)
                     .arg(scale)
-                    .arg(&*act16)
+                    .arg(&gemm.act16)
                     .arg(out)
                     .arg(&n)
                     .arg(&k)
@@ -479,21 +539,48 @@ impl Drafter {
             }
             W8::Int4 { weight, scale, .. } => {
                 let function = if m <= 16 {
-                    &functions.w4_rows16
+                    &functions.w4_block16
                 } else {
-                    &functions.w4_rows64
+                    &functions.w4_block64
                 };
+                let splits = gemm_splits(rows, columns, gemm.resident);
+                if splits > 1 && splits as usize * m * rows > gemm.partial.len() {
+                    return Err(invalid(format!(
+                        "drafter GEMM {rows}x{columns} over {m} rows exceeds its split scratch"
+                    )));
+                }
                 let mut builder = stream.launch_builder(function);
                 builder
                     .arg(weight)
                     .arg(scale)
-                    .arg(&*act16)
-                    .arg(out)
+                    .arg(&gemm.act16)
+                    .arg(&mut *out)
+                    .arg(&mut gemm.partial)
                     .arg(&n)
                     .arg(&k)
                     .arg(&m_u32)
                     .arg(&n);
-                run(&mut builder, cfg, "launch dflash W4 GEMM")
+                run(
+                    &mut builder,
+                    LaunchConfig {
+                        grid_dim: (n.div_ceil(128), splits, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    "launch dflash W4 GEMM",
+                )?;
+                if splits > 1 {
+                    let mut builder = stream.launch_builder(&functions.reduce);
+                    builder
+                        .arg(&gemm.partial)
+                        .arg(out)
+                        .arg(&n)
+                        .arg(&m_u32)
+                        .arg(&splits)
+                        .arg(&n);
+                    run(&mut builder, elementwise(m * rows), "launch dflash reduce")?;
+                }
+                Ok(())
             }
         }
     }
@@ -540,7 +627,7 @@ impl Drafter {
         Self::w8(
             &self.functions,
             stream,
-            &mut self.act16,
+            &mut self.gemm,
             &self.fc,
             &self.concat,
             rows,
@@ -567,7 +654,7 @@ impl Drafter {
             Self::w8(
                 &self.functions,
                 stream,
-                &mut self.act16,
+                &mut self.gemm,
                 &layer.kv,
                 &self.ctx_norm,
                 rows,
@@ -679,7 +766,7 @@ impl Drafter {
             Self::w8(
                 &self.functions,
                 stream,
-                &mut self.act16,
+                &mut self.gemm,
                 &layer.q,
                 &self.hn,
                 block,
@@ -710,7 +797,7 @@ impl Drafter {
             Self::w8(
                 &self.functions,
                 stream,
-                &mut self.act16,
+                &mut self.gemm,
                 &layer.kv,
                 &self.hn,
                 block,
@@ -768,7 +855,7 @@ impl Drafter {
             Self::w8(
                 &self.functions,
                 stream,
-                &mut self.act16,
+                &mut self.gemm,
                 &layer.o,
                 &self.attn,
                 block,
@@ -789,7 +876,7 @@ impl Drafter {
             Self::w8(
                 &self.functions,
                 stream,
-                &mut self.act16,
+                &mut self.gemm,
                 &layer.gate_up,
                 &self.hn,
                 block,
@@ -809,7 +896,7 @@ impl Drafter {
             Self::w8(
                 &self.functions,
                 stream,
-                &mut self.act16,
+                &mut self.gemm,
                 &layer.down,
                 &self.act,
                 block,
