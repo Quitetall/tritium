@@ -296,8 +296,7 @@ checkpoint stream for each cursor and retire obsolete owned named files (or use
 anonymous streams); dropping a generic file handle does not delete its path.
 `NativePvPagedReplayLimits` separates full-schedule journal and 16384-byte extra
 I/O scratch caps from owner/source limits. These are logical payload bounds, not
-RSS/VRAM qualification. Owner-paged deployed-child publication remains separate
-work.
+RSS/VRAM qualification.
 
 `stage_native_pv_paged_resume_bundle` and
 `publish_native_pv_paged_resume_bundle` reuse the standard TNPB transport and
@@ -332,5 +331,26 @@ owner loading, paged numerical replay and one additional encoded-owner allocatio
 one complete owner state plus encoded owner must still fit. This is not
 within-owner paging, source authenticity, objective/data/teacher authentication,
 quality, physical-memory or release qualification. Factory checkpoint files remain
-caller-owned and should be retired or anonymous. Streamed publication/companions,
-Python/runtime integration and within-owner/GPU state remain follow-up work.
+caller-owned and should be retired or anonymous. Python/runtime integration and
+within-owner/GPU state remain follow-up work.
+
+`publish_native_pv_paged_child` stages selected weights through the actual-parent
+source scope and bounded visitor, then uses the same canonical encoding,
+preserved tensor/asset spooling, evidence emission and no-clobber transaction as
+resident publication. It streams the current checkpoint and complete journal as
+ordinary companions; no full checkpoint `Vec` is made. Fresh retained parent and
+companion identities are checked before commit. `NativeScaleChildGuardError`
+(also the P/V alias) now includes `Companion(io::Error)`; identity/length refusals
+use `InvalidData`, and callers matching this enum must handle the new variant.
+Failures remove only owned uncommitted paths; postcommit caveats remain warnings.
+
+`inspect_native_pv_paged_child` forecasts metadata-only scoped sizes without
+authenticating current bytes. Distinct paged publication limits retain one encoded
+owner plus64KiB publisher I/O headroom, separately from source decoding and the
+session's numerical owner budget; resident checkpoint-inclusive limits are
+unchanged. Use file-backed state and spool streams for out-of-core behavior:
+caller-owned memory streams retain their encoded bytes outside these budgets.
+Raw selected-owner admission and unsupported transport/shard behavior remain
+fail-closed. Budget complete spool/checkpoint/journal disk, retain recovery proof,
+and retire obsolete owned files. Published receipts are not independent quality,
+source custody, physical-memory or release approval.

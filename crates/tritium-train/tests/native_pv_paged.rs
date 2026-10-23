@@ -25,6 +25,8 @@ use tritium_train::pv_tuning::{
 };
 #[path = "native_pv_paged/bundle.rs"]
 mod bundle;
+#[path = "native_pv_paged/publication.rs"]
+mod publication;
 #[path = "native_pv_paged/recording.rs"]
 mod recording;
 #[path = "native_pv_paged/replay.rs"]

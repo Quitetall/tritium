@@ -109,6 +109,34 @@ fn paged_verify<P: Read + Seek, C: Read + Seek, J: Read + Seek, K: Read + Seek>(
 }
 #[path = "pv_paged.rs"]
 mod paged;
+#[path = "pv_publication.rs"]
+mod paged_publication;
+fn paged_publish_limits() -> NativePvPagedChildLimits {
+    NativePvPagedChildLimits {
+        max_spool_bytes: 1_000_000,
+        max_working_bytes: 1_000_000,
+        max_evidence_bytes: 100_000,
+        max_companion_bytes: 2_000_000,
+        owners: paged_verify_limits().owners,
+        receiving: receiving(),
+    }
+}
+fn paged_session<P: Read + Seek, K: Read + Seek>(
+    parent: &mut TritModelReader<P>,
+    view: &NativeRefinementParentView,
+    plan: &NativeRefinementPlan,
+    checkpoint: K,
+) -> NativePvPagedSession<K> {
+    NativeRefinementOwnerSource::with(parent, view, plan, paged_verify_limits().owners, |source| {
+        NativePvPagedSession::reopen(
+            plan.clone(),
+            paged_verify_limits().replay.paging,
+            |i, n| source.load(i, n),
+            checkpoint,
+        )
+    })
+    .unwrap()
+}
 fn recorder(run: &str) -> EvidenceRecorder {
     EvidenceRecorder::new(
         run,
@@ -241,6 +269,54 @@ fn actual_ptq_parent_recorded_recovery_and_complete_single_level_child_reopen() 
                     let mut child =
                         publish(&mut f, &out, &mut spool, limits(), recorder("native-child"))
                             .unwrap();
+                    let mut paged = paged_session(
+                        &mut f.parent,
+                        &f.view,
+                        &f.plan,
+                        fs::File::open(out.join(NATIVE_PV_CHECKPOINT_FILE)).unwrap(),
+                    );
+                    let paged_out = root.0.join(format!("paged-{cases}"));
+                    let mut paged_child = publish_native_pv_paged_child(
+                        &mut paged,
+                        NativePvChildSource {
+                            parent: &mut f.parent,
+                            parent_evidence: &f.view,
+                            replay: &f.replay,
+                            journal: &mut fs::File::open(out.join(NATIVE_PV_JOURNAL_FILE)).unwrap(),
+                            machine: "synthetic-pv-fixture",
+                            validation: &validation(),
+                        },
+                        &mut Cursor::new(Vec::new()),
+                        &mut DirectoryTensorSink::new(&paged_out),
+                        paged_publish_limits(),
+                        recorder("native-child"),
+                    )
+                    .unwrap();
+                    assert_eq!(paged_child.model.package_id(), child.model.package_id());
+                    assert_eq!(paged_child.model_id, child.model_id);
+                    assert_eq!(paged_child.evidence.jsonl(), child.evidence.jsonl());
+                    assert_eq!(
+                        fs::read(paged_out.join("model.trit")).unwrap(),
+                        fs::read(out.join("model.trit")).unwrap()
+                    );
+                    for name in [NATIVE_PV_CHECKPOINT_FILE, NATIVE_PV_JOURNAL_FILE] {
+                        assert_eq!(
+                            fs::read(paged_out.join(name)).unwrap(),
+                            fs::read(out.join(name)).unwrap()
+                        );
+                    }
+                    paged_verify(NativePvPagedChildVerification {
+                        parent: &mut f.parent,
+                        parent_evidence: &f.view,
+                        child: &mut paged_child.model,
+                        log: paged_child.evidence.log(),
+                        plan: &f.plan,
+                        journal: &mut fs::File::open(paged_out.join(NATIVE_PV_JOURNAL_FILE))
+                            .unwrap(),
+                        checkpoint: &mut fs::File::open(paged_out.join(NATIVE_PV_CHECKPOINT_FILE))
+                            .unwrap(),
+                    })
+                    .unwrap();
                     let proof = verify_native_pv_paged_child(
                         NativePvPagedChildVerification {
                             parent: &mut f.parent,
@@ -1055,6 +1131,46 @@ fn synthetic_imported_raw_profiles_preserve_all_four_laws_codecs_bases_and_alloc
                             recorder("imported-child"),
                         )
                         .unwrap();
+                        let mut paged = paged_session(
+                            &mut parent,
+                            &view,
+                            &plan,
+                            fs::File::open(out.join(NATIVE_PV_CHECKPOINT_FILE)).unwrap(),
+                        );
+                        let paged_out = root.0.join(format!("paged-{cases}"));
+                        let mut paged_child = publish_native_pv_paged_child(
+                            &mut paged,
+                            NativePvChildSource {
+                                parent: &mut parent,
+                                parent_evidence: &view,
+                                replay: &replay,
+                                journal: &mut fs::File::open(out.join(NATIVE_PV_JOURNAL_FILE))
+                                    .unwrap(),
+                                machine: "synthetic-import",
+                                validation: &validation(),
+                            },
+                            &mut Cursor::new(Vec::new()),
+                            &mut DirectoryTensorSink::new(&paged_out),
+                            paged_publish_limits(),
+                            recorder("imported-child"),
+                        )
+                        .unwrap();
+                        assert_eq!(paged_child.model.package_id(), child.model.package_id());
+                        assert_eq!(paged_child.evidence.jsonl(), child.evidence.jsonl());
+                        paged_verify(NativePvPagedChildVerification {
+                            parent: &mut parent,
+                            parent_evidence: &view,
+                            child: &mut paged_child.model,
+                            log: paged_child.evidence.log(),
+                            plan: &plan,
+                            journal: &mut fs::File::open(paged_out.join(NATIVE_PV_JOURNAL_FILE))
+                                .unwrap(),
+                            checkpoint: &mut fs::File::open(
+                                paged_out.join(NATIVE_PV_CHECKPOINT_FILE),
+                            )
+                            .unwrap(),
+                        })
+                        .unwrap();
                         let proof = paged_verify(NativePvPagedChildVerification {
                             parent: &mut parent,
                             parent_evidence: &view,
@@ -1423,6 +1539,30 @@ fn pv_children_supply_explicit_immediate_parents_to_pv_and_scale_rounds() {
         journal_limits(),
     )
     .unwrap();
+    let mut paged_state = paged_session(
+        &mut child.model,
+        &parent,
+        &plan,
+        Cursor::new(checkpoint.clone()),
+    );
+    let paged_child = publish_native_pv_paged_child(
+        &mut paged_state,
+        NativePvChildSource {
+            parent: &mut child.model,
+            parent_evidence: &parent,
+            replay: &replay,
+            journal: &mut Cursor::new(&journal),
+            machine: "fixture",
+            validation: &validation(),
+        },
+        &mut Cursor::new(Vec::new()),
+        &mut DirectoryTensorSink::new(root.0.join("pv-again-paged")),
+        paged_publish_limits(),
+        recorder("second-pv"),
+    )
+    .unwrap();
+    assert_eq!(paged_child.model.package_id(), next.model.package_id());
+    assert_eq!(paged_child.evidence.jsonl(), next.evidence.jsonl());
     let mut scale = plan.clone();
     let paged = paged_verify(NativePvPagedChildVerification {
         parent: &mut child.model,

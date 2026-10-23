@@ -1,5 +1,18 @@
 //! Private shared streaming mechanics, not a journal profile or admission API.
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
+
+/// Private sequential read/seek loan shared by region readers and companion guards.
+pub(super) struct Shared<'a, R>(pub &'a std::cell::RefCell<R>);
+impl<R: Read> Read for Shared<'_, R> {
+    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().read(b)
+    }
+}
+impl<R: Seek> Seek for Shared<'_, R> {
+    fn seek(&mut self, s: SeekFrom) -> std::io::Result<u64> {
+        self.0.borrow_mut().seek(s)
+    }
+}
 
 pub(super) const SCRATCH: usize = 8192;
 #[derive(Debug)]

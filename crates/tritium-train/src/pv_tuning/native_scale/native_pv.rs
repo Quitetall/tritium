@@ -14,7 +14,12 @@ mod consumers;
 mod cpu;
 #[cfg(feature = "native-cpu")]
 pub use cpu::{NativeCpuPvError, NativeCpuPvJournalStageError, NativeCpuPvSession};
+mod publication;
 mod verification;
+pub use publication::{
+    NativePvPagedChildLimits, NativePvPagedChildSizeLedger, PublishedNativePvPagedChild,
+    inspect_native_pv_paged_child, publish_native_pv_paged_child,
+};
 pub use verification::{NativePvChildVerification, VerifiedNativePvChild, verify_native_pv_child};
 pub use verification::{
     NativePvPagedChildVerification, NativePvPagedChildVerificationError,

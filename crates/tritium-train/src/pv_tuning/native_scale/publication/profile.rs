@@ -29,6 +29,7 @@ impl Receipt {
         }
     }
 }
+#[derive(Clone, Copy)]
 pub(super) struct Binding {
     pub(super) journal: BlobId,
     pub(super) bytes: u64,
@@ -37,7 +38,14 @@ pub(super) struct Binding {
     pub(super) plan: NativeRefinementPlanId,
     pub(super) updates: u64,
 }
-impl State<'_> {
+#[derive(Clone, Copy)]
+pub(in crate::pv_tuning::native_scale) struct Publication<'a> {
+    plan: &'a NativeRefinementPlan,
+    profile: Profile,
+    binding: Binding,
+    state_bytes: u64,
+}
+impl<'a> State<'a> {
     pub(super) fn binding(self) -> Binding {
         macro_rules! binding {
             ($v:expr) => {{
@@ -63,22 +71,10 @@ impl State<'_> {
             Self::Pv(..) => Profile::Pv,
         }
     }
-    pub(crate) fn plan(&self) -> &NativeRefinementPlan {
+    pub(crate) fn plan(&self) -> &'a NativeRefinementPlan {
         match self {
             Self::Scale(s, _) => s.plan(),
             Self::Pv(s, _) => s.plan(),
-        }
-    }
-    pub(crate) fn id(self) -> NativeRefinementPlanId {
-        match self {
-            Self::Scale(s, _) => s.plan_id(),
-            Self::Pv(s, _) => s.plan_id(),
-        }
-    }
-    pub(crate) fn completed(self) -> u64 {
-        match self {
-            Self::Scale(s, _) => s.completed_updates(),
-            Self::Pv(s, _) => s.completed_updates(),
         }
     }
     pub(crate) fn footprint(self) -> (u64, u64) {
@@ -123,29 +119,74 @@ impl State<'_> {
             Self::Pv(s, r) => r.verify_session(s).map_err(NativeScaleChildError::PvReplay),
         }
     }
+    pub(super) fn publication(self) -> Publication<'a> {
+        Publication {
+            plan: self.plan(),
+            profile: self.kind(),
+            binding: self.binding(),
+            state_bytes: self.footprint().0,
+        }
+    }
+}
+impl<'a> Publication<'a> {
+    pub(in crate::pv_tuning::native_scale) fn pv(
+        plan: &'a NativeRefinementPlan,
+        replay: &VerifiedNativePvReplay,
+        state_bytes: u64,
+    ) -> Self {
+        let s = replay.summary();
+        Self {
+            plan,
+            profile: Profile::Pv,
+            state_bytes,
+            binding: Binding {
+                journal: s.journal(),
+                bytes: s.bytes(),
+                checkpoint: s.checkpoint(),
+                checkpoint_bytes: s.checkpoint_bytes(),
+                plan: s.plan(),
+                updates: s.updates(),
+            },
+        }
+    }
+    pub(super) fn plan(self) -> &'a NativeRefinementPlan {
+        self.plan
+    }
+    pub(super) fn binding(self) -> Binding {
+        self.binding
+    }
+    pub(super) fn id(self) -> NativeRefinementPlanId {
+        self.binding.plan
+    }
+    pub(super) fn completed(self) -> u64 {
+        self.binding.updates
+    }
+    pub(super) fn footprint(self) -> (u64, u64) {
+        (self.state_bytes, self.binding.checkpoint_bytes)
+    }
     pub(super) fn backend(self) -> &'static str {
-        match self {
-            Self::Scale(..) => "native-scale-cpu-reference-v1",
-            Self::Pv(..) => "native-pv-cpu-reference-v1",
+        match self.profile {
+            Profile::Scale => "native-scale-cpu-reference-v1",
+            Profile::Pv => "native-pv-cpu-reference-v1",
         }
     }
     pub(super) fn companions(self) -> (&'static str, &'static str) {
-        match self {
-            Self::Scale(..) => (NATIVE_SCALE_CHECKPOINT_FILE, NATIVE_SCALE_JOURNAL_FILE),
-            Self::Pv(..) => (NATIVE_PV_CHECKPOINT_FILE, NATIVE_PV_JOURNAL_FILE),
+        match self.profile {
+            Profile::Scale => (NATIVE_SCALE_CHECKPOINT_FILE, NATIVE_SCALE_JOURNAL_FILE),
+            Profile::Pv => (NATIVE_PV_CHECKPOINT_FILE, NATIVE_PV_JOURNAL_FILE),
         }
     }
     pub(super) fn check_emit(
         self,
         recorder: &EvidenceRecorder,
     ) -> std::result::Result<(), EvidenceError> {
-        match self {
-            Self::Scale(..) => recorder.check_emit::<NativeScaleReplayObserved>(
+        match self.profile {
+            Profile::Scale => recorder.check_emit::<NativeScaleReplayObserved>(
                 "numerical-replay",
                 Some("refinement"),
                 1,
             ),
-            Self::Pv(..) => recorder.check_emit::<NativePvReplayObserved>(
+            Profile::Pv => recorder.check_emit::<NativePvReplayObserved>(
                 "numerical-replay",
                 Some("refinement"),
                 1,
@@ -169,14 +210,14 @@ impl State<'_> {
                 }
             };
         }
-        match self {
-            Self::Scale(..) => recorder.emit(
+        match self.profile {
+            Profile::Scale => recorder.emit(
                 "numerical-replay",
                 Some("refinement"),
                 1,
                 &event!(NativeScaleReplayObserved),
             ),
-            Self::Pv(..) => recorder.emit(
+            Profile::Pv => recorder.emit(
                 "numerical-replay",
                 Some("refinement"),
                 1,
@@ -191,10 +232,10 @@ impl State<'_> {
         parent: &mut TritModelReader<R>,
         view: &NativeRefinementParentView,
     ) -> std::result::Result<Vec<Receipt>, EvidenceError> {
-        match self {
-            Self::Scale(..) => NativeScaleChildReceiptView::fold(log, parent, view, self.plan())
+        match self.profile {
+            Profile::Scale => NativeScaleChildReceiptView::fold(log, parent, view, self.plan())
                 .map(|v| v.into_iter().map(Receipt::Scale).collect()),
-            Self::Pv(..) => NativePvChildReceiptView::fold(log, parent, view, self.plan())
+            Profile::Pv => NativePvChildReceiptView::fold(log, parent, view, self.plan())
                 .map(|v| v.into_iter().map(Receipt::Pv).collect()),
         }
     }

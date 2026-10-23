@@ -471,17 +471,7 @@ pub(in crate::pv_tuning::native_scale) struct StreamedParts<R> {
     pub id: BlobId,
 }
 
-pub(in crate::pv_tuning::native_scale) struct Shared<'a, R>(pub &'a std::cell::RefCell<R>);
-impl<R: Read> Read for Shared<'_, R> {
-    fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
-        self.0.borrow_mut().read(b)
-    }
-}
-impl<R: Seek> Seek for Shared<'_, R> {
-    fn seek(&mut self, s: SeekFrom) -> io::Result<u64> {
-        self.0.borrow_mut().seek(s)
-    }
-}
+pub(in crate::pv_tuning::native_scale) use crate::pv_tuning::journal_io::Shared;
 
 pub(in crate::pv_tuning::native_scale) struct Prefix<R> {
     source: R,
