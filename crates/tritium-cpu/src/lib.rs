@@ -338,6 +338,73 @@ impl CpuBackend {
         )
     }
 
+    /// Count present base-plane weight coordinates, including zero trits.
+    ///
+    /// Excludes pruned tiles and additional planes. No payload decode/allocation.
+    /// # Errors
+    /// Foreign, legacy, changed-root or misreported handles are InvalidInput;
+    /// dense handles are UnsupportedTensor.
+    pub fn additive_present_weight_count(
+        &self,
+        tensor: &dyn DeviceBuffer,
+    ) -> Result<usize, BackendError> {
+        semantic::CpuTensor::additive_weight_count(tensor)
+    }
+
+    /// Accumulate `dy * (B x)` into present stored-weight cotangents.
+    ///
+    /// Uses [`tritium_core::AdditiveWeightVjpPlan::matmul`] without reading codes
+    /// or scales. Output has additive_present_weight_count f64 values in compact
+    /// base-plane order; workspace is exactly columns f32. No heap or dense
+    /// master. This is not a per-trit STE or complete training qualification.
+    /// Finite/overflow policy belongs to the caller. Empty uses change nothing.
+    /// # Errors
+    /// Handle and complete shape/product preflight precede buffer mutation.
+    /// Handle refusals match additive_present_weight_count.
+    pub fn accumulate_additive_matmul_weight_vjp(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        activations: &[f32],
+        output_gradients: &[f32],
+        batch: usize,
+        row_workspace: &mut [f32],
+        out: &mut [f64],
+    ) -> Result<(), BackendError> {
+        semantic::CpuTensor::additive_matmul_weight_vjp(
+            tensor,
+            activations,
+            output_gradients,
+            batch,
+            row_workspace,
+            out,
+        )
+    }
+
+    /// Accumulate embedding `B dy` in occurrence order into present weights.
+    ///
+    /// Uses [`tritium_core::AdditiveWeightVjpPlan::embed`], including duplicate
+    /// indices and forward signed RHT. Scratch/output/count and numerical policy
+    /// match the matmul weight adjoint. No allocation or handle mutation.
+    /// # Errors
+    /// All indices/shapes and handle/root/claimed bytes are checked before
+    /// buffer mutation. Empty uses still require the exact workspace/output.
+    pub fn accumulate_additive_embed_weight_vjp(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        ids: &[usize],
+        output_gradients: &[f32],
+        row_workspace: &mut [f32],
+        out: &mut [f64],
+    ) -> Result<(), BackendError> {
+        semantic::CpuTensor::additive_embed_weight_vjp(
+            tensor,
+            ids,
+            output_gradients,
+            row_workspace,
+            out,
+        )
+    }
+
     /// Unpack the `[N, K]` packed weights in `buf` to a flat `Vec<Trit>` (one
     /// `N·K` row-major buffer), validating the byte length against `shape`.
     ///

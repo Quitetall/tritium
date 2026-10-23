@@ -161,6 +161,37 @@ fn packed_input_adjoint_allocates_no_decoded_master_or_hidden_scratch() {
                 assert_eq!(bytes, 0);
                 assert_eq!(handle.len_bytes(), before);
                 assert!(scale_gradients.iter().all(|v| v.is_finite()));
+                let (count, bytes) =
+                    measured(|| CpuBackend::new().additive_present_weight_count(&*handle));
+                assert_eq!(bytes, 0);
+                let mut weight_gradients = vec![0.25; count.unwrap()];
+                let (result, bytes) = measured(|| {
+                    CpuBackend::new().accumulate_additive_matmul_weight_vjp(
+                        &*handle,
+                        &x,
+                        &gradients,
+                        2,
+                        &mut scratch,
+                        &mut weight_gradients,
+                    )
+                });
+                assert_eq!(result, Ok(()));
+                assert_eq!(bytes, 0);
+                let (result, bytes) = measured(|| {
+                    CpuBackend::new().accumulate_additive_embed_weight_vjp(
+                        &*handle,
+                        &ids,
+                        &de,
+                        &mut scratch,
+                        &mut weight_gradients,
+                    )
+                });
+                assert_eq!(result, Ok(()));
+                assert_eq!(bytes, 0);
+                assert!(weight_gradients.iter().all(|v| v.is_finite()));
+                eprintln!(
+                    "PACKED_PRESENT_WEIGHT_HEAP rows={rows} compact={compact} codec={codec:?} bytes={bytes}"
+                );
                 eprintln!(
                     "PACKED_EMBED_SCALE_HEAP rows={rows} compact={compact} codec={codec:?} bytes={bytes}"
                 );

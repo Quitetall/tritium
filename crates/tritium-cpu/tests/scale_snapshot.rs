@@ -2,7 +2,8 @@
 use std::sync::Arc;
 use tritium_core::{
     AdditiveView, PerTilePlan, Trit, UniformPlan, accumulate_embed_scale_vjp,
-    accumulate_ternary_matmul_scale_vjp, reference_embed, reference_ternary_matmul,
+    accumulate_embed_weight_vjp, accumulate_ternary_matmul_scale_vjp,
+    accumulate_ternary_matmul_weight_vjp, reference_embed, reference_ternary_matmul,
     reference_ternary_matmul_input_vjp,
 };
 use tritium_cpu::CpuBackend;
@@ -138,6 +139,34 @@ fn check(handle: &dyn DeviceBuffer, view: AdditiveView<'_>) {
         cpu.accumulate_additive_embed_scale_vjp(handle, &ids, &de, &mut arow, &mut actual)
             .unwrap();
         accumulate_embed_scale_vjp(&view.bind_gather(), &ids, &de, &mut erow, &mut expected)
+            .unwrap();
+        assert_eq!(bits64(&actual), bits64(&expected));
+        assert_eq!(bits32(&arow), bits32(&erow));
+        let count = cpu.additive_present_weight_count(handle).unwrap();
+        assert_eq!(
+            count,
+            if view.plane_count() == 0 {
+                0
+            } else {
+                view.plane_trits(0).unwrap().len()
+            }
+        );
+        let mut actual = vec![0.25; count];
+        let mut expected = actual.clone();
+        cpu.accumulate_additive_matmul_weight_vjp(handle, &x, &dy, batch, &mut arow, &mut actual)
+            .unwrap();
+        accumulate_ternary_matmul_weight_vjp(
+            &x,
+            &view.bind_matmul(),
+            &dy,
+            batch,
+            &mut erow,
+            &mut expected,
+        )
+        .unwrap();
+        cpu.accumulate_additive_embed_weight_vjp(handle, &ids, &de, &mut arow, &mut actual)
+            .unwrap();
+        accumulate_embed_weight_vjp(&view.bind_gather(), &ids, &de, &mut erow, &mut expected)
             .unwrap();
         assert_eq!(bits64(&actual), bits64(&expected));
         assert_eq!(bits32(&arow), bits32(&erow));
@@ -378,6 +407,27 @@ fn foreign_dense_legacy_and_misreported_handles_are_refused() {
     );
     let bad: Arc<dyn DeviceBuffer> = Arc::new(Misreported { inner });
     for (i, parent) in [dense, foreign, legacy, bad].into_iter().enumerate() {
+        let mut row = [17.0; 4];
+        let mut out = [19.0; 12];
+        assert!(cpu.additive_present_weight_count(&*parent).is_err());
+        assert!(
+            cpu.accumulate_additive_matmul_weight_vjp(
+                &*parent, &[0.25; 4], &[0.25; 3], 1, &mut row, &mut out
+            )
+            .is_err()
+        );
+        assert!(
+            cpu.accumulate_additive_embed_weight_vjp(
+                &*parent,
+                &[0],
+                &[0.25; 4],
+                &mut row,
+                &mut out
+            )
+            .is_err()
+        );
+        assert_eq!(row, [17.0; 4]);
+        assert_eq!(out, [19.0; 12]);
         let result = cpu.snapshot_additive_scales(&parent, &[0.5], &budget);
         let error = match result {
             Err(e) => e,
@@ -483,6 +533,30 @@ fn snapshot_refuses_a_wrapper_that_switches_its_backend_root() {
         .unwrap();
     select.store(true, Ordering::Release);
     let mut row = vec![17.0; 260];
+    let mut weight_out = vec![19.0; 780];
+    assert!(cpu.additive_present_weight_count(&*snapshot).is_err());
+    assert!(
+        cpu.accumulate_additive_matmul_weight_vjp(
+            &*snapshot,
+            &[0.25; 260],
+            &[0.25; 3],
+            1,
+            &mut row,
+            &mut weight_out
+        )
+        .is_err()
+    );
+    assert!(
+        cpu.accumulate_additive_embed_weight_vjp(
+            &*snapshot,
+            &[0],
+            &[0.25; 260],
+            &mut row,
+            &mut weight_out
+        )
+        .is_err()
+    );
+    assert!(weight_out.iter().all(|&v| v == 19.0));
     let mut out = [19.0; 3];
     assert!(
         cpu.matmul(TensorMatmul {

@@ -148,27 +148,37 @@ impl<'a> AdditiveScaleVjpPlan<'a> {
         Ok(())
     }
 
-    fn layout(&self) -> AdditiveLayout {
+    pub(super) fn layout(&self) -> AdditiveLayout {
         match self.allocation {
             ScaleAllocation::Uniform(plan) => plan.layout,
             ScaleAllocation::PerTile(index) => index.layout,
         }
     }
-    fn plane_count(&self) -> usize {
+    pub(super) fn plane_count(&self) -> usize {
         match self.allocation {
             ScaleAllocation::Uniform(plan) => plan.plane_count(),
             ScaleAllocation::PerTile(index) => index.plane_count(),
         }
     }
-    fn row_tiles(&self, plane: usize, row: usize) -> RowTiles<'a> {
+    pub(super) fn row_tiles(&self, plane: usize, row: usize) -> RowTiles<'a> {
         match self.allocation {
             ScaleAllocation::Uniform(plan) => RowTiles::Uniform(plan.row_tiles(plane, row)),
             ScaleAllocation::PerTile(index) => RowTiles::PerTile(index.row_tiles(plane, row)),
         }
     }
+
+    pub(super) fn present_weight_count(&self) -> usize {
+        match self.allocation {
+            ScaleAllocation::Uniform(plan) => plan.trit_count() / plan.plane_count(),
+            ScaleAllocation::PerTile(index) if index.plane_count() != 0 => {
+                index.plane_range(0).len()
+            }
+            ScaleAllocation::PerTile(_) => 0,
+        }
+    }
 }
 
-fn for_view<'a>(view: &AdditiveView<'a>) -> AdditiveScaleVjpPlan<'a> {
+pub(super) fn for_view<'a>(view: &AdditiveView<'a>) -> AdditiveScaleVjpPlan<'a> {
     match view.allocation {
         Allocation::Uniform {
             layout,

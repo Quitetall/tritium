@@ -1,7 +1,8 @@
 //! Actual packed handles; numerical conformance, not complete training acceptance.
 use tritium_core::{
     AdditiveView, GemmShape, OwnedPerTileIndex, PerTilePlan, TernaryFormat, Trit, UniformPlan,
-    accumulate_embed_scale_vjp, accumulate_ternary_matmul_scale_vjp,
+    accumulate_embed_scale_vjp, accumulate_embed_weight_vjp, accumulate_ternary_matmul_scale_vjp,
+    accumulate_ternary_matmul_weight_vjp,
 };
 use tritium_cpu::CpuBackend;
 use tritium_format::AdditiveTensor;
@@ -120,6 +121,57 @@ fn check(view: AdditiveView<'_>) -> usize {
                 assert_eq!(row, expected_row);
             }
             assert_eq!(handle.len_bytes(), bytes);
+            let count = cpu.additive_present_weight_count(&*handle).unwrap();
+            assert_eq!(
+                count,
+                if view.plane_count() == 0 {
+                    0
+                } else {
+                    view.plane_trits(0).unwrap().len()
+                }
+            );
+            let mut actual = vec![0.25; count];
+            let mut expected = actual.clone();
+            for _ in 0..2 {
+                accumulate_ternary_matmul_weight_vjp(
+                    &x,
+                    &view.bind_matmul(),
+                    &dy,
+                    batch,
+                    &mut expected_row,
+                    &mut expected,
+                )
+                .unwrap();
+                cpu.accumulate_additive_matmul_weight_vjp(
+                    &*handle,
+                    &x,
+                    &dy,
+                    batch,
+                    &mut row,
+                    &mut actual,
+                )
+                .unwrap();
+                assert_eq!(bits(&actual), bits(&expected));
+                assert_eq!(row, expected_row);
+                accumulate_embed_weight_vjp(
+                    &view.bind_gather(),
+                    &ids,
+                    &de,
+                    &mut expected_row,
+                    &mut expected,
+                )
+                .unwrap();
+                cpu.accumulate_additive_embed_weight_vjp(
+                    &*handle,
+                    &ids,
+                    &de,
+                    &mut row,
+                    &mut actual,
+                )
+                .unwrap();
+                assert_eq!(bits(&actual), bits(&expected));
+                assert_eq!(row, expected_row);
+            }
         }
     }
     6
@@ -299,6 +351,20 @@ fn bad_shapes_overflow_and_late_invalid_indices_preserve_buffers() {
         ));
         assert!(row.iter().all(|&v| v == 17.0));
         assert!(out.iter().all(|&v| v == 19.0));
+        let mut weight_out = vec![19.0; s * 4];
+        assert!(matches!(
+            cpu.accumulate_additive_matmul_weight_vjp(
+                &*handle,
+                &vec![0.25; x],
+                &vec![0.25; g],
+                batch,
+                &mut row,
+                &mut weight_out
+            ),
+            Err(BackendError::InvalidInput(_))
+        ));
+        assert!(row.iter().all(|&v| v == 17.0));
+        assert!(weight_out.iter().all(|&v| v == 19.0));
     }
     for (ids, g, r, s) in [
         (vec![0, 2, 3], 12, 4, 3),
@@ -321,6 +387,19 @@ fn bad_shapes_overflow_and_late_invalid_indices_preserve_buffers() {
         ));
         assert!(row.iter().all(|&v| v == 17.0));
         assert!(out.iter().all(|&v| v == 19.0));
+        let mut weight_out = vec![19.0; s * 4];
+        assert!(matches!(
+            cpu.accumulate_additive_embed_weight_vjp(
+                &*handle,
+                &ids,
+                &vec![0.25; g],
+                &mut row,
+                &mut weight_out
+            ),
+            Err(BackendError::InvalidInput(_))
+        ));
+        assert!(row.iter().all(|&v| v == 17.0));
+        assert!(weight_out.iter().all(|&v| v == 19.0));
     }
 }
 
@@ -357,6 +436,18 @@ fn dense_foreign_and_legacy_handles_do_not_fall_back_to_other_representations() 
         let mut row = [17.0; 4];
         let mut out = [19.0; 1];
         let errors = [
+            cpu.additive_present_weight_count(handle).unwrap_err(),
+            cpu.accumulate_additive_matmul_weight_vjp(
+                handle,
+                &[0.25; 4],
+                &[0.25],
+                1,
+                &mut row,
+                &mut out,
+            )
+            .unwrap_err(),
+            cpu.accumulate_additive_embed_weight_vjp(handle, &[0], &[0.25; 4], &mut row, &mut out)
+                .unwrap_err(),
             cpu.additive_stored_scale_count(handle).unwrap_err(),
             cpu.accumulate_additive_matmul_scale_vjp(
                 handle,

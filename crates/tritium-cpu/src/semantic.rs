@@ -281,6 +281,52 @@ impl CpuTensor {
         Self::checked_additive(tensor)?.embed_scale_vjp(ids, output_gradients, row_workspace, out)
     }
 
+    fn weight_vjp_plan(
+        tensor: &dyn DeviceBuffer,
+    ) -> Result<tritium_core::AdditiveWeightVjpPlan<'_>, BackendError> {
+        let selected = Self::checked(tensor)?;
+        if tensor.len_bytes() != selected.len_bytes() {
+            return Err(BackendError::InvalidInput(
+                "CPU handle payload bytes differ from backend storage".into(),
+            ));
+        }
+        let packed = match selected {
+            Self::Additive(packed) => packed,
+            Self::ScaleSnapshot(snapshot) => snapshot.base()?,
+            Self::Dense { .. } => return Err(BackendError::UnsupportedTensor),
+        };
+        Ok(packed.scale_vjp_plan()?.into())
+    }
+
+    pub(crate) fn additive_weight_count(tensor: &dyn DeviceBuffer) -> Result<usize, BackendError> {
+        Ok(Self::weight_vjp_plan(tensor)?.present_weight_count())
+    }
+
+    pub(crate) fn additive_matmul_weight_vjp(
+        tensor: &dyn DeviceBuffer,
+        activations: &[f32],
+        output_gradients: &[f32],
+        batch: usize,
+        row_workspace: &mut [f32],
+        out: &mut [f64],
+    ) -> Result<(), BackendError> {
+        Self::weight_vjp_plan(tensor)?
+            .matmul(activations, output_gradients, batch, row_workspace, out)
+            .map_err(|e| BackendError::InvalidInput(format!("CPU weight adjoint failed: {e:?}")))
+    }
+
+    pub(crate) fn additive_embed_weight_vjp(
+        tensor: &dyn DeviceBuffer,
+        ids: &[usize],
+        output_gradients: &[f32],
+        row_workspace: &mut [f32],
+        out: &mut [f64],
+    ) -> Result<(), BackendError> {
+        Self::weight_vjp_plan(tensor)?
+            .embed(ids, output_gradients, row_workspace, out)
+            .map_err(|e| BackendError::InvalidInput(format!("CPU weight adjoint failed: {e:?}")))
+    }
+
     fn checked_additive(tensor: &dyn DeviceBuffer) -> Result<&PackedAdditive, BackendError> {
         match Self::checked(tensor)? {
             Self::Additive(tensor) => Ok(tensor),

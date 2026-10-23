@@ -2,9 +2,9 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tritium_core::{
-    AdditiveView, Trit, UniformPlan, accumulate_embed_scale_vjp,
-    accumulate_ternary_matmul_scale_vjp, project_additive_code_unit,
-    reference_ternary_matmul_input_vjp,
+    AdditiveView, Trit, UniformPlan, accumulate_embed_scale_vjp, accumulate_embed_weight_vjp,
+    accumulate_ternary_matmul_scale_vjp, accumulate_ternary_matmul_weight_vjp,
+    project_additive_code_unit, reference_ternary_matmul_input_vjp,
 };
 use tritium_schema::{
     ADMITTED_LAWS, AdditiveLayout, Basis, PlaneAllocation, PlaneCodec, Transport,
@@ -121,6 +121,32 @@ fn input_adjoint_uses_only_caller_buffers_at_small_and_large_shapes() {
             "EMBED_SCALE_ADJOINT_HEAP_REQUESTS rows={rows} cols=256 occurrences=3 bytes={bytes}"
         );
         let mut candidate = trits.clone();
+        let mut weight_gradients = vec![0.0; rows as usize * 256];
+        let (result, bytes) = measured(|| {
+            accumulate_ternary_matmul_weight_vjp(
+                &activations,
+                &raw.bind_matmul(),
+                &gradients,
+                2,
+                &mut scratch,
+                &mut weight_gradients,
+            )
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(bytes, 0);
+        let (result, bytes) = measured(|| {
+            accumulate_embed_weight_vjp(
+                &raw.bind_gather(),
+                &ids,
+                &embedding_gradients,
+                &mut scratch,
+                &mut weight_gradients,
+            )
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(bytes, 0);
+        assert!(weight_gradients.iter().all(|v| v.is_finite()));
+        eprintln!("PRESENT_WEIGHT_ADJOINT_HEAP_REQUESTS rows={rows} cols=256 bytes={bytes}");
         let (result, bytes) =
             measured(|| project_additive_code_unit(raw, 0, &[0.0], None, &mut candidate));
         assert!(result.unwrap().changed);

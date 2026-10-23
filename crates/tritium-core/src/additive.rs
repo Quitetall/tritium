@@ -13,9 +13,13 @@ use crate::{PerTileIndex, Trit};
 
 mod code_projection;
 mod scale_adjoint;
+mod weight_adjoint;
 pub use code_projection::{CodeProjectionError, CodeProjectionStats, project_additive_code_unit};
 pub use scale_adjoint::{
     AdditiveScaleVjpPlan, accumulate_embed_scale_vjp, accumulate_ternary_matmul_scale_vjp,
+};
+pub use weight_adjoint::{
+    AdditiveWeightVjpPlan, accumulate_embed_weight_vjp, accumulate_ternary_matmul_weight_vjp,
 };
 
 /// Consumer marker: rotate activations before additive matrix multiplication.
