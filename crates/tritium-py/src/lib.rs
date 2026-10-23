@@ -42,6 +42,8 @@ mod model_level;
 mod model_refinement;
 mod module_package;
 mod native_parent;
+mod native_publication;
+mod native_pv;
 mod native_scale;
 #[cfg(feature = "onnx")]
 mod onnx;
@@ -407,6 +409,8 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<model_level::NativeModelLevel>()?;
     m.add_class::<model_level::NativePackedMatrix>()?;
     m.add_class::<native_scale::NativeScaleTraining>()?;
+    m.add_class::<native_pv::NativePvTraining>()?;
+    m.add_function(wrap_pyfunction!(native_pv::_validate_native_pv_plan, m)?)?;
     m.add_class::<native_scale::NativeScaleResumeBundle>()?;
     m.add_class::<model_refinement::NativeModelRefinement>()?;
     m.add_function(wrap_pyfunction!(model_refinement::_open_native_model, m)?)?;

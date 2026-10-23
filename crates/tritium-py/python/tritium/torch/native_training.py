@@ -1,4 +1,4 @@
-"""Explicit eager CPU scale training, recorded recovery and unqualified publication."""
+"""Explicit eager CPU scale/PV training, recording and unqualified publication."""
 from __future__ import annotations
 import json
 from types import MethodType
@@ -72,12 +72,13 @@ class _ScaleMatmul(torch.autograd.Function):
     def backward(ctx, gradient):
         if gradient is None:
             return (None,) * 6
-        _guard(ctx)
+        trainer = _guard(ctx)
         value, _ = ctx.saved_tensors  # Torch guards external input/leaf edits.
         _check_input_autograd(gradient)
         x = _compact(value.detach().to(dtype=torch.float32))
         dy = _compact(gradient.detach().to(dtype=torch.float32))
-        scales = torch.utils.dlpack.from_dlpack(ctx.handle.scale_vjp(x, dy))
+        operation = ctx.handle.pv_vjp if trainer._pv else ctx.handle.scale_vjp
+        scales = torch.utils.dlpack.from_dlpack(operation(x, dy))
         dx = _input_vjp_output(gradient, ctx.handle) if ctx.needs_input_grad[0] else None
         return dx, scales, None, None, None, None
 
@@ -97,14 +98,15 @@ class _ScaleEmbed(torch.autograd.Function):
     def backward(ctx, gradient):
         if gradient is None:
             return (None,) * 8
-        _guard(ctx)
+        trainer = _guard(ctx)
         indices, _ = ctx.saved_tensors
         _check_input_autograd(gradient)
         if ctx.padding is not None:
             gradient = gradient.masked_fill((indices == ctx.padding).unsqueeze(-1), 0)
         ids = _compact(indices.to(dtype=torch.int64))
         dy = _compact(gradient.detach().to(dtype=torch.float32))
-        scales = torch.utils.dlpack.from_dlpack(ctx.handle.embedding_scale_vjp(ids, dy))
+        operation = ctx.handle.embedding_pv_vjp if trainer._pv else ctx.handle.embedding_scale_vjp
+        scales = torch.utils.dlpack.from_dlpack(operation(ids, dy))
         return None, scales, None, None, None, None, None, None
 
 
@@ -121,6 +123,7 @@ class NativeScaleTrainer:
     higher-order/compile/vmap or code training is admitted. Recorded publication
     and recovery use the common Rust writers/readers with explicit admission.
     """
+    _pv = False
     def __init__(self, model, backend, plan, weights, max_saved_input_bytes):
         self.model, self._backend = model, backend
         self._plan_json = json.dumps(plan, allow_nan=False)
@@ -143,6 +146,8 @@ class NativeScaleTrainer:
         model._tritium_native_training_parent_artifact = self._parent
         del model._tritium_native_artifact
         model._tritium_native_unpublished_scales = True
+        if self._pv:
+            model._tritium_native_unpublished_codes = True
         object.__setattr__(model, "_apply", MethodType(_deny_apply, model))
         for owner, weight in weights.items():
             weight._native_training = (weakref.ref(self), owner)
@@ -201,9 +206,11 @@ class NativeScaleTrainer:
         self._cache[owner] = (revision, handle, leaf, None if leaf is None else leaf._version)
         return revision, handle, leaf
 
-    @staticmethod
-    def _admit(handle, inputs, gradients, indices=0):
-        count = (inputs + gradients) * 4 + handle.columns * 4 + handle.scale_count * 8 + indices * 8
+    def _gradient_count(self, handle):
+        return handle.scale_count + (handle.present_weight_count if self._pv else 0)
+
+    def _admit(self, handle, inputs, gradients, indices=0):
+        count = (inputs + gradients) * 4 + handle.columns * 4 + self._gradient_count(handle) * 8 + indices * 8
         if count > handle.max_output_bytes:
             raise ValueError("native training backward transfer/output/scratch exceeds byte limit")
 
@@ -217,7 +224,7 @@ class NativeScaleTrainer:
             _, handle, _ = self._frame(owner, False)
             return _matmul_output(value, handle)
         self._admit(handle, value.numel(), value.numel() // handle.columns * handle.rows)
-        lease = self._saved.reserve(value.numel() * value.element_size() + handle.scale_count * 8)
+        lease = self._saved.reserve(value.numel() * value.element_size() + self._gradient_count(handle) * 8)
         try:
             revision, handle, leaf = self._frame(owner, True)
             return _ScaleMatmul.apply(value, leaf, handle, weakref.ref(self), revision, lease)
@@ -238,7 +245,7 @@ class NativeScaleTrainer:
             _, handle, _ = self._frame(owner, False)
             return torch.utils.dlpack.from_dlpack(handle.gather(_compact(indices.to(dtype=torch.int64)))).to(dtype=dtype)
         self._admit(handle, 0, indices.numel() * handle.columns, indices.numel())
-        lease = self._saved.reserve(indices.numel() * indices.element_size() + handle.scale_count * 8)
+        lease = self._saved.reserve(indices.numel() * indices.element_size() + self._gradient_count(handle) * 8)
         try:
             revision, handle, leaf = self._frame(owner, True)
             return _ScaleEmbed.apply(indices, leaf, handle, weakref.ref(self), revision, lease, padding, dtype)
@@ -348,7 +355,20 @@ class NativeScaleTrainer:
             pass
 
 
-def native_scale_training(model, artifact, *, level, plan=None, load_run_id,
+class NativePvTrainer(NativeScaleTrainer):
+    """Explicit eager CPU P/V controller using the common Rust optimizer.
+
+    Private f64 leaves transport scale and present-weight gradients, never latent
+    weight values. step() returns (changed scales, changed code units). First-order
+    and graph/version restrictions are shared with native scale training.
+    """
+    _pv = True
+
+    def save_resume(self, output_dir, *, limits):
+        raise NotImplementedError("durable native P/V resume bundles are not implemented")
+
+
+def _native_training(_pv, /, model, artifact, *, level, plan=None, load_run_id,
                           max_snapshot_bytes, max_parent_bytes, max_saved_input_bytes,
                           checkpoint=None, recording=None, resume=None, **load_limits):
     """Create a private native eager CPU scale trainer, never a refined artifact.
@@ -366,6 +386,8 @@ def native_scale_training(model, artifact, *, level, plan=None, load_run_id,
         if type(limit) is not int or limit <= 0:
             raise ValueError("native training byte limits must be positive integers")
     if resume is not None:
+        if _pv:
+            raise NotImplementedError("durable native P/V resume bundles are not implemented")
         if not isinstance(resume, _tritium.NativeScaleResumeBundle):
             raise TypeError("recorded resume requires NativeScaleResumeBundle")
         if checkpoint is not None:
@@ -378,7 +400,8 @@ def native_scale_training(model, artifact, *, level, plan=None, load_run_id,
         raise ValueError("native training requires an explicit plan or recorded resume bundle")
     data = json.loads(plan, object_pairs_hook=_pairs) if isinstance(plan, str) else json.loads(json.dumps(plan))
     text = json.dumps(data, allow_nan=False)
-    _tritium._validate_native_scale_plan(text)
+    validator = _tritium._validate_native_pv_plan if _pv else _tritium._validate_native_scale_plan
+    validator(text)
     if data["parent"]["level"] != level:
         raise ValueError("native training explicit parent level differs")
     if set(load_limits) - {"max_package_bytes", "max_payload_bytes", "max_workspace_bytes", "max_output_bytes", "max_evidence_bytes"}:
@@ -426,12 +449,16 @@ def native_scale_training(model, artifact, *, level, plan=None, load_run_id,
             if resume is not None:
                 resumed = (resume, json.dumps(dict(path=journal_path, max_journal_bytes=journal_bytes,
                                                    max_working_bytes=working_bytes), allow_nan=False))
-        backend = artifact.begin_scale_training(text, [(name, selected[name].handle) for name in data["owners"]],
-                                               max_snapshot_bytes=max_snapshot_bytes, max_parent_bytes=max_parent_bytes,
-                                               checkpoint=checkpoint, recorded_resume=resumed)
+        arguments = dict(max_snapshot_bytes=max_snapshot_bytes, max_parent_bytes=max_parent_bytes, checkpoint=checkpoint)
+        if not _pv:
+            arguments["recorded_resume"] = resumed
+        begin = artifact.begin_pv_training if _pv else artifact.begin_scale_training
+        backend = begin(text, [(name, selected[name].handle) for name in data["owners"]], **arguments)
         if temporary is not None and resume is None:
-            backend.start_recording(str(Path(temporary.name) / "gradients.tnsj"), journal_bytes, working_bytes)
-        trainer = NativeScaleTrainer(private, backend, data, selected, max_saved_input_bytes)
+            name = "gradients.tnpj" if _pv else "gradients.tnsj"
+            backend.start_recording(str(Path(temporary.name) / name), journal_bytes, working_bytes)
+        trainer_type = NativePvTrainer if _pv else NativeScaleTrainer
+        trainer = trainer_type(private, backend, data, selected, max_saved_input_bytes)
         trainer._recording_work = temporary
     except BaseException:
         if backend is not None:
@@ -440,6 +467,31 @@ def native_scale_training(model, artifact, *, level, plan=None, load_run_id,
             temporary.cleanup()
         raise
     return trainer
+
+
+def native_scale_training(model, artifact, *, level, plan=None, load_run_id,
+                          max_snapshot_bytes, max_parent_bytes, max_saved_input_bytes,
+                          checkpoint=None, recording=None, resume=None, **load_limits):
+    """Explicit eager CPU ScaleOnly training; see NativeScaleTrainer."""
+    return _native_training(False, model, artifact, level=level, plan=plan, load_run_id=load_run_id,
+                            max_snapshot_bytes=max_snapshot_bytes, max_parent_bytes=max_parent_bytes,
+                            max_saved_input_bytes=max_saved_input_bytes, checkpoint=checkpoint,
+                            recording=recording, resume=resume, **load_limits)
+
+
+def native_pv_training(model, artifact, *, level, plan, load_run_id,
+                       max_snapshot_bytes, max_parent_bytes, max_saved_input_bytes,
+                       checkpoint=None, recording=None, **load_limits):
+    """Explicit first-order CPU AlternatingPv training and unqualified publication.
+
+    Raw checkpoint restart is unrecorded and may require two complete packed
+    payload sets during admission. Durable bundle resume and high-level refine's
+    P/V path are not enabled. No torch.optim or latent dense weight master.
+    """
+    return _native_training(True, model, artifact, level=level, plan=plan, load_run_id=load_run_id,
+                            max_snapshot_bytes=max_snapshot_bytes, max_parent_bytes=max_parent_bytes,
+                            max_saved_input_bytes=max_saved_input_bytes, checkpoint=checkpoint,
+                            recording=recording, **load_limits)
 
 
 def _pairs(items):
@@ -451,4 +503,4 @@ def _pairs(items):
     return result
 
 
-__all__ = ["NativeScaleTrainer", "native_scale_training"]
+__all__ = ["NativeScaleTrainer", "native_scale_training", "NativePvTrainer", "native_pv_training"]

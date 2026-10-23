@@ -76,6 +76,28 @@ impl NativePackedMatrix {
             .additive_stored_scale_count(&*self.tensor)
             .map_err(error)
     }
+    #[getter]
+    fn present_weight_count(&self) -> PyResult<usize> {
+        tritium_cpu::CpuBackend::new()
+            .additive_present_weight_count(&*self.tensor)
+            .map_err(error)
+    }
+    fn pv_vjp(
+        &self,
+        py: Python<'_>,
+        input: &Bound<'_, PyAny>,
+        gradient: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        crate::native_scale::matmul_adjoints(self, py, input, gradient, true)
+    }
+    fn embedding_pv_vjp(
+        &self,
+        py: Python<'_>,
+        indices: &Bound<'_, PyAny>,
+        gradient: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        crate::native_scale::embed_adjoints(self, py, indices, gradient, true)
+    }
     fn scale_vjp(
         &self,
         py: Python<'_>,

@@ -93,21 +93,6 @@ impl TrainingState {
     }
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PublicationLimits {
-    max_spool_bytes: u64,
-    max_working_bytes: u64,
-    max_evidence_bytes: u64,
-    max_companion_bytes: u64,
-    max_package_bytes: u64,
-    max_manifest_bytes: usize,
-    max_directory_bytes: usize,
-    max_parent_bytes: u64,
-    max_replay_working_bytes: u64,
-    max_journal_bytes: u64,
-}
-
 fn error(value: impl std::fmt::Display) -> PyErr {
     PyValueError::new_err(value.to_string())
 }
@@ -127,17 +112,28 @@ pub(crate) fn _validate_native_scale_plan(text: &str) -> PyResult<()> {
     }
     Ok(())
 }
-fn zeros(len: usize) -> PyResult<Vec<f64>> {
+pub(crate) fn zeros(len: usize) -> PyResult<Vec<f64>> {
     let mut out = Vec::new();
     out.try_reserve_exact(len).map_err(error)?;
     out.resize(len, 0.0);
     Ok(out)
 }
-fn admit_output(matrix: &NativePackedMatrix, indices: usize) -> PyResult<usize> {
+pub(crate) fn gradient_count(matrix: &NativePackedMatrix, pv: bool) -> PyResult<usize> {
+    let cpu = tritium_cpu::CpuBackend::new();
+    let handle = matrix.shared_tensor();
+    let scales = cpu.additive_stored_scale_count(&*handle).map_err(error)?;
+    let weights = if pv {
+        cpu.additive_present_weight_count(&*handle).map_err(error)?
+    } else {
+        0
+    };
+    scales
+        .checked_add(weights)
+        .ok_or_else(|| error("native gradient count overflow"))
+}
+fn admit_output(matrix: &NativePackedMatrix, indices: usize, pv: bool) -> PyResult<usize> {
     let (_, cols, max) = matrix.dimensions();
-    let count = tritium_cpu::CpuBackend::new()
-        .additive_stored_scale_count(&*matrix.shared_tensor())
-        .map_err(error)?;
+    let count = gradient_count(matrix, pv)?;
     if count
         .checked_mul(8)
         .and_then(|n| n.checked_add(cols.checked_mul(4)?))
@@ -156,6 +152,15 @@ pub(crate) fn matmul_vjp(
     input: &Bound<'_, PyAny>,
     gradient: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
+    matmul_adjoints(matrix, py, input, gradient, false)
+}
+pub(crate) fn matmul_adjoints(
+    matrix: &NativePackedMatrix,
+    py: Python<'_>,
+    input: &Bound<'_, PyAny>,
+    gradient: &Bound<'_, PyAny>,
+    pv: bool,
+) -> PyResult<Py<PyAny>> {
     let x: Dlpack = input.extract()?;
     let dy: Dlpack = gradient.extract()?;
     let xs = tensor_shape(&x, "activation")?;
@@ -168,7 +173,8 @@ pub(crate) fn matmul_vjp(
         return Err(error("native scale adjoint shape mismatch"));
     }
     let batch = checked_product(&xs[..xs.len() - 1], "batch")?;
-    let count = admit_output(matrix, 0)?;
+    let count = admit_output(matrix, 0, pv)?;
+    let scales = gradient_count(matrix, false)?;
     let x = cpu_f32(&x, "activation")?;
     let dy = cpu_f32(&dy, "cotangent")?;
     let handle = matrix.shared_tensor();
@@ -176,8 +182,27 @@ pub(crate) fn matmul_vjp(
         let mut out = zeros(count)?;
         let mut row = vec![0.0; cols];
         tritium_cpu::CpuBackend::new()
-            .accumulate_additive_matmul_scale_vjp(&*handle, x, dy, batch, &mut row, &mut out)
+            .accumulate_additive_matmul_scale_vjp(
+                &*handle,
+                x,
+                dy,
+                batch,
+                &mut row,
+                &mut out[..scales],
+            )
             .map_err(error)?;
+        if pv {
+            tritium_cpu::CpuBackend::new()
+                .accumulate_additive_matmul_weight_vjp(
+                    &*handle,
+                    x,
+                    dy,
+                    batch,
+                    &mut row,
+                    &mut out[scales..],
+                )
+                .map_err(error)?;
+        }
         Ok::<_, PyErr>(out)
     })?;
     export_array_f64(py, &[count], values, "native scale cotangent")
@@ -188,6 +213,15 @@ pub(crate) fn embed_vjp(
     indices: &Bound<'_, PyAny>,
     gradient: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
+    embed_adjoints(matrix, py, indices, gradient, false)
+}
+pub(crate) fn embed_adjoints(
+    matrix: &NativePackedMatrix,
+    py: Python<'_>,
+    indices: &Bound<'_, PyAny>,
+    gradient: &Bound<'_, PyAny>,
+    pv: bool,
+) -> PyResult<Py<PyAny>> {
     let ids: Dlpack = indices.extract()?;
     let dy: Dlpack = gradient.extract()?;
     let shape = tensor_shape(&ids, "indices")?;
@@ -197,7 +231,8 @@ pub(crate) fn embed_vjp(
         return Err(error("native embedding scale adjoint shape mismatch"));
     }
     let raw = ids.cpu_data_slice::<i64>().map_err(error)?;
-    let count = admit_output(matrix, raw.len())?;
+    let count = admit_output(matrix, raw.len(), pv)?;
+    let scales = gradient_count(matrix, false)?;
     if raw.iter().any(|&i| i < 0 || i as u64 >= rows as u64) {
         return Err(error("native embedding index out of range"));
     }
@@ -208,8 +243,19 @@ pub(crate) fn embed_vjp(
         let mut out = zeros(count)?;
         let mut row = vec![0.0; cols];
         tritium_cpu::CpuBackend::new()
-            .accumulate_additive_embed_scale_vjp(&*handle, &ids, dy, &mut row, &mut out)
+            .accumulate_additive_embed_scale_vjp(&*handle, &ids, dy, &mut row, &mut out[..scales])
             .map_err(error)?;
+        if pv {
+            tritium_cpu::CpuBackend::new()
+                .accumulate_additive_embed_weight_vjp(
+                    &*handle,
+                    &ids,
+                    dy,
+                    &mut row,
+                    &mut out[scales..],
+                )
+                .map_err(error)?;
+        }
         Ok::<_, PyErr>(out)
     })?;
     export_array_f64(py, &[count], values, "native embedding scale cotangent")
@@ -402,43 +448,12 @@ impl NativeScaleTraining {
         validation_json: &str,
         limits_json: &str,
     ) -> PyResult<crate::model_refinement::NativeModelRefinement> {
-        if validation_json.len() > 16 * 1024 * 1024 || limits_json.len() > 16384 {
-            return Err(error("native publication request exceeds byte limit"));
-        }
-        let validation: Vec<tritium_schema::NativeRefinementValidation> =
-            serde_json::from_str(validation_json).map_err(error)?;
-        let limits: PublicationLimits = serde_json::from_str(limits_json).map_err(error)?;
-        if [
-            limits.max_spool_bytes,
-            limits.max_working_bytes,
-            limits.max_evidence_bytes,
-            limits.max_companion_bytes,
-            limits.max_package_bytes,
-            limits.max_parent_bytes,
-            limits.max_replay_working_bytes,
-            limits.max_journal_bytes,
-        ]
-        .contains(&0)
-            || limits.max_manifest_bytes == 0
-            || limits.max_directory_bytes == 0
-        {
-            return Err(error("native publication byte limits must be positive"));
-        }
-        let output = crate::model_refinement::path(&output_dir)?;
-        let leaf = output
-            .file_name()
-            .ok_or_else(|| error("child output basename absent"))?
-            .to_owned();
-        let output = output
-            .parent()
-            .ok_or_else(|| error("child output parent absent"))?
-            .canonicalize()
-            .map_err(error)?
-            .join(leaf);
-        let output_text = output
-            .to_str()
-            .ok_or_else(|| error("child output path is not UTF-8"))?
-            .to_owned();
+        let crate::native_publication::Request {
+            validation,
+            limits,
+            output,
+            output_text,
+        } = crate::native_publication::Request::new(&output_dir, validation_json, limits_json)?;
         py.detach(|| {
             let mut state = self.lock()?;
             let checkpoint_bytes = state.session().size_ledger().checkpoint_bytes;

@@ -20,8 +20,8 @@ use tritium_quantize::engine::{
 };
 use tritium_train::pv_tuning::{
     NATIVE_SCALE_CHECKPOINT_FILE, NATIVE_SCALE_JOURNAL_FILE, NativeScaleChildVerification,
-    NativeScaleJournalLimits, NativeScaleParentReadLimits, PublishedNativeScaleChild,
-    verify_native_scale_child,
+    NativeScaleJournalLimits, NativeScaleParentReadLimits, PublishedNativePvChild,
+    PublishedNativeScaleChild, verify_native_scale_child,
 };
 
 mod record;
@@ -256,6 +256,26 @@ impl NativeModelRefinement {
             limits,
         }
     }
+    pub(crate) fn from_published_pv(
+        output_dir: String,
+        child: PublishedNativePvChild,
+        limits: ReadLimits,
+    ) -> Self {
+        let plan = &child.receipt.refinement().started().plan;
+        Self {
+            output_dir,
+            source_id: hex(plan.parent.source.as_bytes()),
+            package_id: hex(child.model.package_id().as_bytes()),
+            model_ids: BTreeMap::from([(plan.child_level.clone(), hex(child.model_id.as_bytes()))]),
+            evidence_root: child.evidence.log().root_digest.clone(),
+            run_id: child.evidence.run().into(),
+            parent_level: plan.parent.level.clone(),
+            parent_package_id: hex(plan.parent.package.as_bytes()),
+            recovery_recipe: "alternating-pv".into(),
+            publication_warnings: child.warnings.iter().map(|w| format!("{w:?}")).collect(),
+            limits,
+        }
+    }
     fn open_inner(output_dir: String, limits: ReadLimits) -> PyResult<Self> {
         let root = path(&output_dir)?;
         if std::fs::symlink_metadata(&root)
@@ -306,6 +326,29 @@ impl NativeModelRefinement {
 
 #[pymethods]
 impl NativeModelRefinement {
+    #[pyo3(signature=(plan_json,matrices,*,max_snapshot_bytes,max_parent_bytes,checkpoint=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn begin_pv_training(
+        &self,
+        py: Python<'_>,
+        plan_json: &str,
+        matrices: Vec<(String, Py<crate::model_level::NativePackedMatrix>)>,
+        max_snapshot_bytes: u64,
+        max_parent_bytes: u64,
+        checkpoint: Option<&Bound<'_, PyBytes>>,
+    ) -> PyResult<crate::native_pv::NativePvTraining> {
+        crate::native_pv::begin(
+            py,
+            self.clone().into(),
+            matrices,
+            crate::native_pv::BeginOptions {
+                plan_json,
+                max_snapshot_bytes,
+                max_parent_bytes,
+                checkpoint: checkpoint.map(|b| b.as_bytes()),
+            },
+        )
+    }
     /// Actual immediate refined parent tuple, not transitive lineage qualification.
     fn native_refinement_parent(&self, py: Python<'_>, level: &str) -> PyResult<String> {
         py.detach(|| {

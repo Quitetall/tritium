@@ -117,8 +117,9 @@ declarations, not authenticated replay or quality evidence. Closing exposes the
 current private inference shell marked unpublished. It does **not** publish a
 complete immutable child package, modify the parent, refine every quality level,
 or run native public `refine` orchestration. The opt-in recorded publication path
-below is separate. Code/PV updates and independent quality/performance/release
-gates remain separate work.
+below is separate. This ScaleOnly interface never updates codes; the distinct
+P/V interface is described below. Independent quality/performance/release gates
+remain separate work.
 
 To publish a child, configure `recording={"work_dir": existing_work_dir,
 "max_journal_bytes": journal_cap, "max_working_bytes": recording_cap}` when
@@ -147,7 +148,57 @@ and `export(result, new_directory)` also preserve this distinct result type.
 `trainer.close()` closes/removes only its owned temporary recording work; the
 published checkpoint/journal remain in the child directory.
 
-### Recorded save and restart
+### Explicit native P/V training
+
+`tritium.torch.native_pv_training` provides a distinct first-order eager CPU
+controller for an actual `AlternatingPv` native plan. It uses the same explicit
+parent level, canonical owners, window identities and resource arguments as the
+scale factory. The scale factory continues to reject alternating plans.
+
+```python
+from tritium.torch import native_pv_training
+
+trainer = native_pv_training(
+    fresh_shell, artifact, level="full", plan=pv_plan,
+    load_run_id="pv-load-1", max_snapshot_bytes=snapshot_limit,
+    max_parent_bytes=parent_limit, max_saved_input_bytes=saved_input_limit,
+    recording=dict(work_dir=existing_work_dir, max_journal_bytes=journal_cap,
+                   max_working_bytes=recording_cap),
+)
+trainer.zero_grad()
+objective(trainer.model, training_window).backward()
+changed_scales, changed_code_units = trainer.step(pv_plan["training"][0]["content"])
+```
+
+The private f64 gradient leaf contains stored scales followed by zero transport
+placeholders for present stored-weight coordinates. Backward uses both actual
+packed adjoints; leaf values never replace deployed weights. Rust owns code/scale
+updates and optimizer moments. This is not a latent dense master, a per-trit
+derivative, or an ordinary `torch.optim` parameter. Tied/repeated uses share one
+leaf, with the same stale/failed graph and preserved-state guards as scale
+training. Saved-input/output caps include the combined coordinate count; those
+logical caps are not full Torch/process memory admission.
+
+Unrecorded `checkpoint=trainer.checkpoint()` restarts the exact TNPV state,
+including changed codes and moments. Materializing current hard handles for a
+restart can require two packed payload sets within `max_snapshot_bytes` before
+temporary roots drop. Recorded runs must start at zero; raw checkpoints cannot
+stand in for authenticated journal history. P/V durable `save_resume` bundles
+and high-level `refine` teacher/data orchestration are not enabled yet; a scale
+resume bundle is never accepted as P/V recovery.
+
+After the complete declared recorded schedule, `trainer.publish` uses the same
+publication limit keys above, replays the actual TNPJ journal against the original
+parent, and invokes the common typed P/V child publisher. The returned
+`NativeModelRefinement.recovery_recipe` is `"alternating-pv"`; the immutable child
+contains `checkpoint.tnpv` and `gradients.tnpj`. Export/reload preserves its exact
+bytes and unqualified status. Caller validation values are observations, not
+objective/data/teacher authentication or independent model-quality approval.
+Closing removes only owned temporary recording work and leaves the private shell
+marked unpublished. Native reference state and code moments are still retained;
+this is not a production GPU/out-of-core or flagship-model memory claim.
+
+### Recorded scale save and restart
 
 ```python
 from tritium import NativeScaleResumeBundle

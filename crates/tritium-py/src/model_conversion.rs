@@ -304,6 +304,29 @@ impl NativeModelConversion {
 }
 #[pymethods]
 impl NativeModelConversion {
+    #[pyo3(signature=(plan_json,matrices,*,max_snapshot_bytes,max_parent_bytes,checkpoint=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn begin_pv_training(
+        &self,
+        py: Python<'_>,
+        plan_json: &str,
+        matrices: Vec<(String, Py<crate::model_level::NativePackedMatrix>)>,
+        max_snapshot_bytes: u64,
+        max_parent_bytes: u64,
+        checkpoint: Option<&Bound<'_, PyBytes>>,
+    ) -> PyResult<crate::native_pv::NativePvTraining> {
+        crate::native_pv::begin(
+            py,
+            self.clone().into(),
+            matrices,
+            crate::native_pv::BeginOptions {
+                plan_json,
+                max_snapshot_bytes,
+                max_parent_bytes,
+                checkpoint: checkpoint.map(|b| b.as_bytes()),
+            },
+        )
+    }
     /// Actual original parent tuple for an explicit native scale request.
     fn native_refinement_parent(&self, py: Python<'_>, level: &str) -> PyResult<String> {
         py.detach(|| serde_json::to_string(&self.refinement_parent(level)?.1).map_err(error))
