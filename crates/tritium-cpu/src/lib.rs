@@ -223,6 +223,36 @@ impl CpuBackend {
         semantic::CpuTensor::snapshot_scales(parent, scales, budget)
     }
 
+    /// Create a complete immutable packed version with new codes and scales.
+    ///
+    /// Candidate must retain the parent's exact layout, basis, law/precision,
+    /// codec, transport, plane count and per-tile counts. Full canonical symbols
+    /// and exact nonnegative stored scales are checked before allocating. Reuses
+    /// the packed uploader; no decoded or dense shadow is retained.
+    ///
+    /// Reserves the entire new packed payload, including compact auxiliary
+    /// buffers, from `budget` before allocation. The final owning handle releases
+    /// that reservation. `len_bytes()` is this exact owned charge, not shared
+    /// parent bytes or physical RSS. Caller candidate/optimizer/graph scratch and
+    /// allocator/metadata overhead are excluded; independent budgets do not
+    /// coordinate. Old graphs retain their old handles. The new handle retains
+    /// no parent or obsolete overlay, and supports ordinary inference/adjoints
+    /// and later scale/full snapshots. No optimizer, checkpoint, parent identity
+    /// authentication or complete-training qualification is produced.
+    ///
+    /// # Errors
+    /// Rejects foreign/dense/legacy/misreported or changed-root parents,
+    /// incompatible or noncanonical candidates, overflow, allocation failure or
+    /// exhausted budgets without changing old handles or leaking admission.
+    pub fn snapshot_additive_weights(
+        &self,
+        parent: &std::sync::Arc<dyn DeviceBuffer>,
+        candidate: tritium_core::AdditiveView<'_>,
+        budget: &tritium_runtime::TensorPayloadBudget,
+    ) -> Result<std::sync::Arc<dyn DeviceBuffer>, BackendError> {
+        semantic::CpuTensor::snapshot_weights(parent, candidate, budget)
+    }
+
     /// Original-coordinate input adjoint for an uploaded CPU additive matrix.
     ///
     /// Matches [`tritium_core::reference_ternary_matmul_input_vjp`] using packed

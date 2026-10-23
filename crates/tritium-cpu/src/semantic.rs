@@ -11,6 +11,7 @@ use tritium_spec::{
 
 mod packed;
 mod snapshot;
+mod weight_snapshot;
 use packed::{PackedAdditive, PackedScaleView};
 pub use snapshot::CpuScaleSnapshotBytes;
 use snapshot::ScaleSnapshot;

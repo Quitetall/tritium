@@ -356,6 +356,16 @@ impl PackedAdditive {
             .ok_or_else(|| invalid("scale snapshot byte overflow"))
     }
 
+    pub(super) fn matches_geometry(&self, view: AdditiveView<'_>) -> bool {
+        let counts = match &self.allocation {
+            Allocation::Uniform { .. } => None,
+            Allocation::PerTile { index, .. } => Some(index.tile_counts()),
+        };
+        self.layout == view.layout()
+            && self.planes == view.plane_count()
+            && counts == view.tile_counts()
+    }
+
     // Caller has validated exact values and reserved this new buffer's payload.
     pub(super) fn encode_scales(
         &self,
@@ -382,14 +392,7 @@ impl PackedAdditive {
 impl PackedScaleView<'_> {
     pub(super) fn equals_view(&self, view: AdditiveView<'_>) -> Result<bool, BackendError> {
         tritium_format::AdditiveTensor::validate_view(view).map_err(invalid)?;
-        if self.layout != view.layout() || self.planes != view.plane_count() {
-            return Ok(false);
-        }
-        let counts = match &self.tensor.allocation {
-            Allocation::Uniform { .. } => None,
-            Allocation::PerTile { index, .. } => Some(index.tile_counts()),
-        };
-        if counts != view.tile_counts() {
+        if !self.tensor.matches_geometry(view) {
             return Ok(false);
         }
         if view.scales().len() != self.tensor.scale_vjp_plan()?.stored_scale_count() {
