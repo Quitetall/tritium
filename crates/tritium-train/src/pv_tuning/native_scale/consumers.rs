@@ -242,6 +242,7 @@ fn accumulate_owner<'a, 'b, E>(
     Ok(())
 }
 /// Same reducer with only one owner's accumulation and split f32 outputs alive.
+#[cfg(feature = "native-cpu")]
 pub(in crate::pv_tuning::native_scale) fn reduce_pv_owner<'a, 'b, E>(
     view: AdditiveView<'a>,
     uses: &[NativePvContribution<'b>],
