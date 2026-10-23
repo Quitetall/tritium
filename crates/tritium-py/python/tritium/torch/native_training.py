@@ -427,7 +427,7 @@ class NativePvPagedTrainer(NativePvTrainer):
 
 def _native_training(_pv, /, model, artifact, *, level, plan=None, load_run_id,
                           max_snapshot_bytes, max_parent_bytes, max_saved_input_bytes,
-                          checkpoint=None, recording=None, resume=None, _paging=None, **load_limits):
+                          checkpoint=None, recording=None, resume=None, _paging=None, _load_limits=None):
     """Create a private native eager CPU scale trainer, never a refined artifact.
 
     plan is the complete Rust NativeRefinementPlan mapping/JSON; obtain its exact
@@ -435,6 +435,8 @@ def _native_training(_pv, /, model, artifact, *, level, plan=None, load_run_id,
     training window per step; pass its content identity to step(). Limits are
     logical, not complete Torch graph/process memory. Source shell is untouched.
     """
+    # Public **load_limits must not bind private lifecycle/paging arguments.
+    load_limits = {} if _load_limits is None else _load_limits
     if not isinstance(artifact, (_tritium.NativeModelConversion, _tritium.NativeModelRefinement)):
         raise TypeError("native scale training requires NativeModelConversion or NativeModelRefinement")
     if not isinstance(level, str) or not level or not isinstance(load_run_id, str) or not load_run_id:
@@ -539,7 +541,7 @@ def native_scale_training(model, artifact, *, level, plan=None, load_run_id,
     return _native_training(False, model, artifact, level=level, plan=plan, load_run_id=load_run_id,
                             max_snapshot_bytes=max_snapshot_bytes, max_parent_bytes=max_parent_bytes,
                             max_saved_input_bytes=max_saved_input_bytes, checkpoint=checkpoint,
-                            recording=recording, resume=resume, **load_limits)
+                            recording=recording, resume=resume, _load_limits=load_limits)
 
 
 def native_pv_training(model, artifact, *, level, plan=None, load_run_id,
@@ -555,7 +557,7 @@ def native_pv_training(model, artifact, *, level, plan=None, load_run_id,
     return _native_training(True, model, artifact, level=level, plan=plan, load_run_id=load_run_id,
                             max_snapshot_bytes=max_snapshot_bytes, max_parent_bytes=max_parent_bytes,
                             max_saved_input_bytes=max_saved_input_bytes, checkpoint=checkpoint,
-                            recording=recording, resume=resume, **load_limits)
+                            recording=recording, resume=resume, _load_limits=load_limits)
 
 
 def native_pv_paged_training(model, artifact, *, level, plan=None, load_run_id, workspace_dir, limits,
@@ -575,7 +577,7 @@ def native_pv_paged_training(model, artifact, *, level, plan=None, load_run_id, 
     return _native_training(True, model, artifact, level=level, plan=plan, load_run_id=load_run_id,
                max_snapshot_bytes=max_snapshot_bytes, max_parent_bytes=None,
                max_saved_input_bytes=max_saved_input_bytes, resume=resume,
-               _paging=(str(Path(workspace_dir).resolve()), limits), **load_limits)
+               _paging=(str(Path(workspace_dir).resolve()), limits), _load_limits=load_limits)
 
 
 def _pairs(items):

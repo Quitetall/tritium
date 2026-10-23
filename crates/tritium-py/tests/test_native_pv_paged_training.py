@@ -267,3 +267,26 @@ def test_tiny_hf_multiowner_paged_backward_publish_reload_and_generation(tmp_pat
         ids = loaded.generate(tokens, **generation)
     assert ids.shape == (1, 5) and torch.equal(ids, expected_ids)
     b.close(); assert not (tmp_path/"hf-work").exists()
+
+
+@pytest.mark.parametrize("name", ["checkpoint", "recording", "_paging", "max_parent_bytes", "unknown"])
+def test_paged_factory_rejects_resident_or_private_options_without_loading(tmp_path, name):
+    parent = _convert(tmp_path, _prepared()); work = tmp_path/"refused"
+    value = {"checkpoint": b"not a checkpoint", "recording": None,
+             "_paging": (str(work), caps()), "max_parent_bytes": 1, "unknown": 1}[name]
+    with pytest.raises(TypeError, match="unknown native training load limit"):
+        start(StateModel(), parent, work, **{name: value})
+    assert not work.exists(); parent.verify()
+
+
+@pytest.mark.parametrize("pv", [False, True])
+def test_resident_factories_cannot_bind_private_paging_from_load_options(tmp_path, pv):
+    from tritium.torch import native_scale_training, native_pv_training
+    from test_native_scale_training import plan as scale_plan
+    parent = _convert(tmp_path, _prepared()); work = tmp_path/"refused"
+    begin = native_pv_training if pv else native_scale_training
+    with pytest.raises(TypeError, match="unknown native training load limit"):
+        begin(StateModel(), parent, level="full", plan=plan(parent) if pv else scale_plan(parent),
+              load_run_id="refused-private-mode", max_parent_bytes=1, max_snapshot_bytes=1_000_000,
+              max_saved_input_bytes=1_000_000, _paging=(str(work), caps()))
+    assert not work.exists(); parent.verify()
