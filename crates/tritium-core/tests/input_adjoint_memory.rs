@@ -3,7 +3,8 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tritium_core::{
     AdditiveView, Trit, UniformPlan, accumulate_embed_scale_vjp,
-    accumulate_ternary_matmul_scale_vjp, reference_ternary_matmul_input_vjp,
+    accumulate_ternary_matmul_scale_vjp, project_additive_code_unit,
+    reference_ternary_matmul_input_vjp,
 };
 use tritium_schema::{
     ADMITTED_LAWS, AdditiveLayout, Basis, PlaneAllocation, PlaneCodec, Transport,
@@ -119,5 +120,30 @@ fn input_adjoint_uses_only_caller_buffers_at_small_and_large_shapes() {
         eprintln!(
             "EMBED_SCALE_ADJOINT_HEAP_REQUESTS rows={rows} cols=256 occurrences=3 bytes={bytes}"
         );
+        let mut candidate = trits.clone();
+        let (result, bytes) =
+            measured(|| project_additive_code_unit(raw, 0, &[0.0], None, &mut candidate));
+        assert!(result.unwrap().changed);
+        assert_eq!(bytes, 0);
+        eprintln!("DENSE_CODE_PROJECTION_HEAP_REQUESTS rows={rows} cols=256 bytes={bytes}");
+        let sparse_trits: Vec<_> = (0..trits.len())
+            .map(|i| if i % 4 == 0 { Trit::ZERO } else { Trit::POS })
+            .collect();
+        let sparse = AdditiveView::new(
+            AdditiveLayout {
+                codec: PlaneCodec::S34,
+                ..layout
+            },
+            3,
+            &sparse_trits,
+            &scales,
+        )
+        .unwrap();
+        let (result, bytes) = measured(|| {
+            project_additive_code_unit(sparse, 0, &[0.5, 0.0, 0.5, 0.5], None, &mut candidate)
+        });
+        assert!(result.unwrap().changed);
+        assert_eq!(bytes, 0);
+        eprintln!("SPARSE_CODE_PROJECTION_HEAP_REQUESTS rows={rows} cols=256 bytes={bytes}");
     }
 }

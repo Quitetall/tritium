@@ -46,10 +46,7 @@ where
             .map(|(&value, &target)| squared_error(value, target))
             .sum::<f64>();
         surrogate_before += before;
-        let candidate = match weight.structure {
-            PvTernaryStructure::Dense => best_dense_candidate(weight, unit, target[0]),
-            PvTernaryStructure::S34 => best_s34_candidate(weight, unit, &target),
-        };
+        let candidate = best_candidate(weight, unit, &target);
         let Some(candidate) = candidate else {
             surrogate_after += before;
             continue;
@@ -90,145 +87,70 @@ where
     )
 }
 
-fn best_dense_candidate(
-    weight: &PvTernaryWeight,
-    index: usize,
-    target: f32,
-) -> Option<CodeCandidate> {
-    let current: Vec<i8> = weight
-        .planes
-        .iter()
-        .map(|plane| plane.trits[index])
-        .collect();
-    let scales: Vec<f32> = weight
-        .planes
-        .iter()
-        .map(|plane| {
-            let row = index / weight.cols;
-            let col = index % weight.cols;
-            let scale_index = row * weight.groups_per_row() + col / weight.group_size;
-            f32::from(plane.scales[scale_index])
-        })
-        .collect();
-    let current_decoded = decode_tuple(&current, &scales);
-    let mut best_codes = current.clone();
-    let mut best_decoded = current_decoded;
-    let mut best_loss = squared_error(current_decoded, target);
-    let combinations = 3usize.pow(weight.planes.len() as u32);
-    for encoded in 0..combinations {
-        let mut cursor = encoded;
-        let mut codes = Vec::with_capacity(weight.planes.len());
-        for &scale in &scales {
-            let code = match cursor % 3 {
-                0 => -1,
-                1 => 0,
-                _ => 1,
-            };
-            cursor /= 3;
-            codes.push(if scale == 0.0 { 0 } else { code });
-        }
-        let value = decode_tuple(&codes, &scales);
-        let loss = squared_error(value, target);
-        if loss < best_loss {
-            best_loss = loss;
-            best_decoded = value;
-            best_codes = codes;
-        }
-    }
-    (best_codes != current).then_some(CodeCandidate {
-        start: index,
-        codes_by_plane: best_codes.into_iter().map(|code| vec![code]).collect(),
-        decoded: vec![best_decoded],
-    })
-}
-
-fn best_s34_candidate(
-    weight: &PvTernaryWeight,
-    unit: usize,
-    target: &[f32],
-) -> Option<CodeCandidate> {
-    let blocks_per_row = weight.cols / 4;
-    let start = (unit / blocks_per_row) * weight.cols + (unit % blocks_per_row) * 4;
-    let original: Vec<Vec<i8>> = weight
-        .planes
-        .iter()
-        .map(|plane| plane.trits[start..start + 4].to_vec())
-        .collect();
-    let mut codes = original.clone();
+// Both native layouts and legacy f16 PV use the same discrete search. The
+// legacy adapter widens one unit only, preserving its original f32 arithmetic
+// and outer selection/trust accounting. No dense owner conversion is involved.
+fn best_candidate(weight: &PvTernaryWeight, unit: usize, target: &[f32]) -> Option<CodeCandidate> {
+    use tritium_core::{AdditiveView, Trit, project_additive_code_unit};
+    use tritium_schema::{
+        ADMITTED_LAWS, AdditiveLayout, Basis, PlaneAllocation, PlaneCodec, Transport,
+    };
+    let width = unit_width(weight.structure);
+    let start = unit_start(weight, unit);
+    let planes = weight.planes.len();
+    let mut input = [Trit::ZERO; 12];
+    let mut scales = [0.0f32; 3];
     let scale_index =
         (start / weight.cols) * weight.groups_per_row() + (start % weight.cols) / weight.group_size;
-    let scales: Vec<f32> = weight
-        .planes
-        .iter()
-        .map(|plane| f32::from(plane.scales[scale_index]))
-        .collect();
-    for plane_index in 0..weight.planes.len() {
-        let mut best = codes[plane_index].clone();
-        let mut best_loss = block_loss(&codes, &scales, target);
-        for zero in 0..4 {
-            for signs in 0..8usize {
-                let candidate = s34_pattern(zero, signs);
-                codes[plane_index].copy_from_slice(&candidate);
-                let loss = block_loss(&codes, &scales, target);
-                if loss < best_loss {
-                    best_loss = loss;
-                    best.copy_from_slice(&candidate);
-                }
-            }
+    for (p, plane) in weight.planes.iter().enumerate() {
+        scales[p] = f32::from(plane.scales[scale_index]);
+        for offset in 0..width {
+            input[p * width + offset] = Trit::from_i8(plane.trits[start + offset])
+                .expect("validated legacy ternary coefficient");
         }
-        codes[plane_index] = best;
     }
-    if codes == original {
+    let layout = AdditiveLayout {
+        rows: 1,
+        cols: width as u64,
+        tile: 256,
+        group: 32,
+        max_planes: 3,
+        allocation: PlaneAllocation::Uniform,
+        codec: if weight.structure == PvTernaryStructure::S34 {
+            PlaneCodec::S34
+        } else {
+            PlaneCodec::D2
+        },
+        law: ADMITTED_LAWS[1].law,
+        basis: Basis::Identity,
+        transport: Transport::Raw,
+    };
+    let length = planes * width;
+    let view = AdditiveView::new(layout, planes as u8, &input[..length], &scales[..planes])
+        .expect("lossless one-unit legacy projection adapter");
+    let mut output = input;
+    let stats = project_additive_code_unit(view, 0, target, None, &mut output[..length])
+        .expect("finite validated legacy unit and proposal");
+    if !stats.changed {
         return None;
     }
-    let mut decoded = vec![0.0; 4];
-    for (plane_codes, scale) in codes.iter().zip(scales) {
-        for offset in 0..4 {
-            decoded[offset] += scale * f32::from(plane_codes[offset]);
-        }
-    }
+    let mut decoded = vec![0.0; width];
+    let codes_by_plane = (0..planes)
+        .map(|p| {
+            (0..width)
+                .map(|offset| {
+                    let code = output[p * width + offset];
+                    decoded[offset] += code.to_f32() * scales[p];
+                    code.get()
+                })
+                .collect()
+        })
+        .collect();
     Some(CodeCandidate {
         start,
-        codes_by_plane: codes,
+        codes_by_plane,
         decoded,
     })
-}
-
-fn s34_pattern(zero: usize, signs: usize) -> [i8; 4] {
-    let mut candidate = [0; 4];
-    let mut sign_index = 0;
-    for (offset, code) in candidate.iter_mut().enumerate() {
-        if offset != zero {
-            *code = if (signs >> sign_index) & 1 == 0 {
-                -1
-            } else {
-                1
-            };
-            sign_index += 1;
-        }
-    }
-    candidate
-}
-
-fn decode_tuple(codes: &[i8], scales: &[f32]) -> f32 {
-    codes
-        .iter()
-        .zip(scales)
-        .map(|(&code, &scale)| f32::from(code) * scale)
-        .sum()
-}
-
-fn block_loss(codes: &[Vec<i8>], scales: &[f32], target: &[f32]) -> f64 {
-    (0..4)
-        .map(|offset| {
-            let value = codes
-                .iter()
-                .zip(scales)
-                .map(|(plane, &scale)| f32::from(plane[offset]) * scale)
-                .sum();
-            squared_error(value, target[offset])
-        })
-        .sum()
 }
 
 #[derive(Debug)]

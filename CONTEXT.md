@@ -6,6 +6,11 @@ model ownership from stored representations and measured execution.
 
 ## Language
 
+**Code unit**:
+A jointly projected set of additive ternary coefficients for one logical weight,
+or one four-weight sparse 3:4 block, across its present planes.
+_Avoid_: optimizer step, scale group, tensor owner
+
 **Source-bound chat prompt**:
 A conversation rendered using the template and token vocabulary belonging to
 the loaded model source. It is distinct from an architecture-based approximation.

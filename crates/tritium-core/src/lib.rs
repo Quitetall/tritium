@@ -36,9 +36,10 @@ mod shape;
 mod trit;
 
 pub use additive::{
-    AdditiveError, AdditiveScaleVjpPlan, AdditiveView, BasisBound, Gather, Matmul, UniformPlan,
-    UniformTiles, accumulate_embed_scale_vjp, accumulate_ternary_matmul_scale_vjp, apply_basis,
-    apply_basis_f64, apply_inverse_basis, fast_hadamard, fast_hadamard_f64, group_is_rotatable,
+    AdditiveError, AdditiveScaleVjpPlan, AdditiveView, BasisBound, CodeProjectionError,
+    CodeProjectionStats, Gather, Matmul, UniformPlan, UniformTiles, accumulate_embed_scale_vjp,
+    accumulate_ternary_matmul_scale_vjp, apply_basis, apply_basis_f64, apply_inverse_basis,
+    fast_hadamard, fast_hadamard_f64, group_is_rotatable, project_additive_code_unit,
     reference_embed, reference_ternary_matmul, reference_ternary_matmul_input_vjp,
 };
 pub use dense::{DenseError, DenseView};
