@@ -36,6 +36,9 @@ pub use native_scale::{
     replay_native_pv_journal, replay_native_pv_journal_with_state, resume_native_pv_journal,
 };
 pub use native_scale::{
+    NativePvPagedError, NativePvPagedLimits, NativePvPagedSession, NativePvPagedSizeLedger,
+};
+pub use native_scale::{
     NativeScaleResumeBundleError, NativeScaleResumeBundleLimits, NativeScaleResumeBundleReader,
     PublishedNativeScaleResumeBundle, publish_native_scale_resume_bundle,
     stage_native_scale_resume_bundle,

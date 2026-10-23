@@ -202,3 +202,37 @@ Persistent state remains `T+I+12S+8A`. Checkpoint/journal formats and recipes ar
 unchanged. These are payload bounds, excluding metadata, allocator slack, caller
 gradients, external graphs and separately admitted packed versions—not process
 RSS, VRAM, production GPU/paged fitting or model-quality qualification.
+
+## Owner-paged native P/V state
+
+`pv_tuning::NativePvPagedSession` initializes or strictly reopens the same TNPV v1
+checkpoint from an ordered original-parent provider and a caller-owned seekable
+stream. It retains no decoded tensor owner or optimizer payload between calls.
+`step_staged` loads one owner, obtains separate unweighted scale/present-weight
+adjoints, calls the same numerical update as the resident engine, writes one
+owner into a new empty private checkpoint, and stages an optional owned runtime
+resource. It returns the complete next session, observations and resources only
+after all owners, original-parent identity, traversed old bytes, output identity
+and flush pass. The old session/cursor remains unchanged, even on late failure
+or unwind; private staged resources drop on refusal. Arbitrary callback effects
+and partial destination files remain the caller's responsibility.
+
+The original plan's aggregate logical limits still apply. Separately declare
+`NativePvPagedLimits.max_resident_payload_bytes`; the conservative worst-owner
+payload is state+update workspace+4*(stored scales+present weights)+16384 I/O
+bytes. Returned adjoints are included; provider internals, staged runtime
+resources, metadata, allocator slack, OS page cache and process RSS are not.
+Underlying stream buffers are also excluded; use file-backed streams for
+out-of-core behavior, not `Cursor<Vec<u8>>` containing the complete checkpoint.
+Checkpoint I/O requests are at most8192bytes. The resident encoder uses the same
+codec with four-byte chunks, preserving its existing small scratch envelope.
+
+Owner paging is not within-owner paging: the largest owner and its moments,
+gradients and candidates must still fit. Total on-disk state is not reduced:
+TNPV stores decoded trits and f32 moments, not a compact inference package. An
+update needs both complete old and new checkpoints, in addition to parent
+artifacts and any journal. Set a disk ceiling and delete only obsolete owned
+snapshots after their replacement is safely retained. Generic flush does not
+provide fsync durability or immutable filesystem publication. Paged journal
+recording, first-party source/runtime/Python wiring, within-owner moment paging,
+GPU execution and independent model/physical/release qualification remain open.

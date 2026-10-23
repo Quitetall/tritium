@@ -5,6 +5,10 @@ use tritium_core::project_additive_code_unit;
 use tritium_schema::NativeAdamWRecipe;
 
 mod checkpoint;
+mod paged;
+pub use paged::{
+    NativePvPagedError, NativePvPagedLimits, NativePvPagedSession, NativePvPagedSizeLedger,
+};
 mod consumers;
 #[cfg(feature = "native-cpu")]
 mod cpu;
@@ -66,6 +70,100 @@ struct PvOwner {
     weight: AdditiveTensor,
     scale: AdamState,
     code: AdamState,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PvUpdater {
+    continuous: AdamW,
+    code_optimizer: AdamW,
+    fraction: f32,
+    trust: Option<f32>,
+}
+impl PvUpdater {
+    fn from_plan(plan: &NativeRefinementPlan) -> Result<Self, PvTuningError> {
+        plan.validate().map_err(|e| {
+            PvTuningError::invalid_config(format!("invalid native PV request: {e:?}"))
+        })?;
+        let NativeRecoveryRecipe::AlternatingPv {
+            continuous_optimizer,
+            code_optimizer,
+            max_code_change_fraction,
+            max_relative_code_change,
+        } = plan.recipe
+        else {
+            return Err(PvTuningError::invalid_config(
+                "native PV requires AlternatingPv",
+            ));
+        };
+        Ok(Self {
+            continuous: adam(continuous_optimizer),
+            code_optimizer: adam(code_optimizer),
+            fraction: max_code_change_fraction,
+            trust: max_relative_code_change,
+        })
+    }
+
+    fn candidate(
+        &self,
+        owner: &PvOwner,
+        scales: &[f32],
+        weights: &[f32],
+        window_weight: f64,
+        next: u64,
+    ) -> Result<(PvOwner, usize, NativePvOwnerStep), PvTuningError> {
+        // Both adapters preflight their complete supplied owner adjoints before
+        // this private update; do not add a second model-sized scan here.
+        let (changed, continuous) = prepare_scale_candidate(
+            &owner.weight,
+            &owner.scale,
+            self.continuous,
+            next,
+            window_weight,
+            scales,
+        )?;
+        let mut weight = AdditiveTensor::from_view(owner.weight.view()).map_err(invalid_tensor)?;
+        weight
+            .replace_scales(continuous.values)
+            .map_err(invalid_tensor)?;
+        let mut candidate = PvOwner {
+            weight,
+            scale: continuous.state,
+            code: AdamState {
+                m: copied(&owner.code.m)?,
+                v: copied(&owner.code.v)?,
+            },
+        };
+        let stats = self.project(&mut candidate, weights, window_weight, next)?;
+        Ok((candidate, changed, stats))
+    }
+}
+
+fn check_gradients(owner: &PvOwner, scales: &[f32], weights: &[f32]) -> Result<(), PvTuningError> {
+    if scales.len() != owner.weight.scales().len()
+        || weights.len() != owner.code.m.len()
+        || scales.iter().chain(weights).any(|value| !value.is_finite())
+    {
+        return Err(PvTuningError::step(
+            "native PV gradient shape/values mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn initial_owner(weight: AdditiveTensor) -> Result<PvOwner, PvTuningError> {
+    let scales = weight.scales().len();
+    let active = active_count(&weight)?;
+    Ok(PvOwner {
+        weight,
+        scale: AdamState {
+            m: zeroed(scales)?,
+            v: zeroed(scales)?,
+        },
+        code: AdamState {
+            m: zeroed(active)?,
+            v: zeroed(active)?,
+        },
+    })
 }
 
 /// Exact native CPU P/V reference with bounded compact optimizer state.
@@ -197,19 +295,7 @@ impl NativePvRefinementSession {
     }
     fn with_parents(mut self, parents: Vec<AdditiveTensor>) -> Result<Self, PvTuningError> {
         for weight in parents {
-            let scales = weight.scales().len();
-            let active = active_count(&weight)?;
-            self.owners.push(PvOwner {
-                weight,
-                scale: AdamState {
-                    m: zeroed(scales)?,
-                    v: zeroed(scales)?,
-                },
-                code: AdamState {
-                    m: zeroed(active)?,
-                    v: zeroed(active)?,
-                },
-            });
+            self.owners.push(initial_owner(weight)?);
         }
         Ok(self)
     }
@@ -292,15 +378,7 @@ impl NativePvRefinementSession {
             return Err(PvTuningError::step("native PV gradient owner inventory mismatch").into());
         }
         for ((owner, scale), weight) in self.owners.iter().zip(scales).zip(weights) {
-            if scale.len() != owner.weight.scales().len()
-                || weight.len() != owner.code.m.len()
-                || scale
-                    .iter()
-                    .chain(weight.iter())
-                    .any(|value| !value.is_finite())
-            {
-                return Err(PvTuningError::step("native PV gradient shape/values mismatch").into());
-            }
+            check_gradients(owner, scale, weight)?;
         }
         let next = self.completed + 1;
         let mut candidates = reserved(self.owners.len())?;
@@ -309,32 +387,17 @@ impl NativePvRefinementSession {
             changed_scales: 0,
             owners: reserved(self.owners.len())?,
         };
+        let updater = PvUpdater {
+            continuous: self.continuous,
+            code_optimizer: self.code_optimizer,
+            fraction: self.fraction,
+            trust: self.trust,
+        };
         for ((owner, scale), gradient) in self.owners.iter().zip(scales).zip(weights) {
-            let (changed, continuous) = prepare_scale_candidate(
-                &owner.weight,
-                &owner.scale,
-                self.continuous,
-                next,
-                window.weight,
-                scale,
-            )?;
-            let mut weight =
-                AdditiveTensor::from_view(owner.weight.view()).map_err(invalid_tensor)?;
-            weight
-                .replace_scales(continuous.values)
-                .map_err(invalid_tensor)?;
-            let mut candidate = PvOwner {
-                weight,
-                scale: continuous.state,
-                code: AdamState {
-                    m: copied(&owner.code.m)?,
-                    v: copied(&owner.code.v)?,
-                },
-            };
+            let (candidate, changed, observation) =
+                updater.candidate(owner, scale, gradient, window.weight, next)?;
             stats.changed_scales += changed;
-            stats
-                .owners
-                .push(self.project(&mut candidate, gradient, window.weight, next)?);
+            stats.owners.push(observation);
             candidates.push(candidate);
         }
         let staged = stage(NativePvCandidate {
@@ -347,7 +410,9 @@ impl NativePvRefinementSession {
         self.completed = next;
         Ok((stats, staged))
     }
+}
 
+impl PvUpdater {
     fn project(
         &self,
         owner: &mut PvOwner,
@@ -513,19 +578,7 @@ fn admit(
     plan: NativeRefinementPlan,
     parents: &[AdditiveTensor],
 ) -> Result<NativePvRefinementSession, PvTuningError> {
-    plan.validate()
-        .map_err(|e| PvTuningError::invalid_config(format!("invalid native PV request: {e:?}")))?;
-    let NativeRecoveryRecipe::AlternatingPv {
-        continuous_optimizer,
-        code_optimizer,
-        max_code_change_fraction,
-        max_relative_code_change,
-    } = plan.recipe
-    else {
-        return Err(PvTuningError::invalid_config(
-            "native PV requires AlternatingPv",
-        ));
-    };
+    let updater = PvUpdater::from_plan(&plan)?;
     if parents.len() != plan.owners.len() {
         return Err(PvTuningError::invalid_weight(
             "native PV parent owner inventory mismatch",
@@ -537,65 +590,9 @@ fn admit(
         checkpoint_bytes: checkpoint::FIXED_BYTES,
     };
     for weight in parents {
-        let t = weight.trits().len() as u64;
-        let s = weight.scales().len() as u64;
-        let a = active_count(weight)? as u64;
-        let c = weight.layout().cols;
-        let i = weight
-            .view()
-            .auxiliary_buffer_len_bytes()
-            .map_err(invalid_tensor)? as u64;
-        if unit_width(weight) == 4 && !c.is_multiple_of(4) {
-            return Err(PvTuningError::invalid_weight(
-                "native PV S34 columns must be divisible by4",
-            ));
-        }
-        let sizes = || -> Option<(u64, u64, u64)> {
-            let state = t
-                .checked_add(i)?
-                .checked_add(s.checked_mul(12)?)?
-                .checked_add(a.checked_mul(8)?)?;
-            let workspace = t
-                .checked_mul(2)?
-                .checked_add(i)?
-                .checked_add(s.checked_mul(20)?)?
-                .checked_add(a.checked_mul(12)?)?
-                .checked_add(
-                    (selected_count(
-                        (a / unit_width(weight) as u64).try_into().ok()?,
-                        max_code_change_fraction,
-                    ) as u64)
-                        .checked_mul(std::mem::size_of::<Rank>() as u64)?,
-                )?
-                .checked_add(c.checked_mul(4)?)?;
-            let checkpoint = 24u64
-                .checked_add(t)?
-                .checked_add(s.checked_mul(8 + scale_width(weight.layout().law.precision).ok()?)?)?
-                .checked_add(a.checked_mul(8)?)?;
-            Some((state, workspace, checkpoint))
-        };
-        let (state, workspace, checkpoint) = sizes().ok_or_else(size_overflow)?;
-        ledger.state_payload_bytes = ledger
-            .state_payload_bytes
-            .checked_add(state)
-            .ok_or_else(size_overflow)?;
-        ledger.update_workspace_bytes = ledger
-            .update_workspace_bytes
-            .checked_add(workspace)
-            .ok_or_else(size_overflow)?;
-        ledger.checkpoint_bytes = ledger
-            .checkpoint_bytes
-            .checked_add(checkpoint)
-            .ok_or_else(size_overflow)?;
+        add_sizes(&mut ledger, owner_sizes(weight, updater.fraction)?)?;
     }
-    if ledger.state_payload_bytes > plan.limits.max_state_bytes
-        || ledger.update_workspace_bytes > plan.limits.max_workspace_bytes
-        || ledger.checkpoint_bytes > plan.limits.max_checkpoint_bytes
-    {
-        return Err(PvTuningError::invalid_config(
-            "native PV state/workspace/checkpoint limit exceeded",
-        ));
-    }
+    check_sizes(&plan, ledger)?;
     let plan_id = native_refinement_plan_id(&plan)
         .map_err(|e| PvTuningError::invalid_config(e.to_string()))?;
     let mut hasher = NativePvRefinementSession::parent_hasher(plan_id);
@@ -606,12 +603,92 @@ fn admit(
         plan,
         plan_id,
         parent: *hasher.finalize().as_bytes(),
-        continuous: adam(continuous_optimizer),
-        code_optimizer: adam(code_optimizer),
-        fraction: max_code_change_fraction,
-        trust: max_relative_code_change,
+        continuous: updater.continuous,
+        code_optimizer: updater.code_optimizer,
+        fraction: updater.fraction,
+        trust: updater.trust,
         owners: reserved(parents.len())?,
         completed: 0,
         ledger,
     })
+}
+
+fn owner_sizes(
+    weight: &AdditiveTensor,
+    fraction: f32,
+) -> Result<NativePvSizeLedger, PvTuningError> {
+    let t = weight.trits().len() as u64;
+    let s = weight.scales().len() as u64;
+    let a = active_count(weight)? as u64;
+    let c = weight.layout().cols;
+    let i = weight
+        .view()
+        .auxiliary_buffer_len_bytes()
+        .map_err(invalid_tensor)? as u64;
+    if unit_width(weight) == 4 && !c.is_multiple_of(4) {
+        return Err(PvTuningError::invalid_weight(
+            "native PV S34 columns must be divisible by4",
+        ));
+    }
+    let sizes = || -> Option<(u64, u64, u64)> {
+        let state = t
+            .checked_add(i)?
+            .checked_add(s.checked_mul(12)?)?
+            .checked_add(a.checked_mul(8)?)?;
+        let workspace = t
+            .checked_mul(2)?
+            .checked_add(i)?
+            .checked_add(s.checked_mul(20)?)?
+            .checked_add(a.checked_mul(12)?)?
+            .checked_add(
+                (selected_count((a / unit_width(weight) as u64).try_into().ok()?, fraction) as u64)
+                    .checked_mul(std::mem::size_of::<Rank>() as u64)?,
+            )?
+            .checked_add(c.checked_mul(4)?)?;
+        let checkpoint = 24u64
+            .checked_add(t)?
+            .checked_add(s.checked_mul(8 + scale_width(weight.layout().law.precision).ok()?)?)?
+            .checked_add(a.checked_mul(8)?)?;
+        Some((state, workspace, checkpoint))
+    };
+    let (state, workspace, checkpoint) = sizes().ok_or_else(size_overflow)?;
+    Ok(NativePvSizeLedger {
+        state_payload_bytes: state,
+        update_workspace_bytes: workspace,
+        checkpoint_bytes: checkpoint,
+    })
+}
+
+fn add_sizes(
+    ledger: &mut NativePvSizeLedger,
+    owner: NativePvSizeLedger,
+) -> Result<(), PvTuningError> {
+    ledger.state_payload_bytes = ledger
+        .state_payload_bytes
+        .checked_add(owner.state_payload_bytes)
+        .ok_or_else(size_overflow)?;
+    ledger.update_workspace_bytes = ledger
+        .update_workspace_bytes
+        .checked_add(owner.update_workspace_bytes)
+        .ok_or_else(size_overflow)?;
+    ledger.checkpoint_bytes = ledger
+        .checkpoint_bytes
+        .checked_add(owner.checkpoint_bytes)
+        .ok_or_else(size_overflow)?;
+    Ok(())
+}
+
+fn check_sizes(
+    plan: &NativeRefinementPlan,
+    ledger: NativePvSizeLedger,
+) -> Result<(), PvTuningError> {
+    if ledger.state_payload_bytes > plan.limits.max_state_bytes
+        || ledger.update_workspace_bytes > plan.limits.max_workspace_bytes
+        || ledger.checkpoint_bytes > plan.limits.max_checkpoint_bytes
+    {
+        return Err(PvTuningError::invalid_config(
+            "native PV state/workspace/checkpoint limit exceeded",
+        ));
+    }
+    Ok(())
 }

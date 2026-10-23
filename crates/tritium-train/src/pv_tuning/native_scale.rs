@@ -24,6 +24,9 @@ pub use native_pv::{
     NativePvJournalSummary, NativePvJournalWriter, NativePvResumeTail, VerifiedNativePvReplay,
     replay_native_pv_journal, replay_native_pv_journal_with_state, resume_native_pv_journal,
 };
+pub use native_pv::{
+    NativePvPagedError, NativePvPagedLimits, NativePvPagedSession, NativePvPagedSizeLedger,
+};
 mod consumers;
 #[cfg(feature = "native-cpu")]
 mod cpu;

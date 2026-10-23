@@ -46,6 +46,12 @@ A self-contained recorded resume point and its recovery history. It is training
 recovery input, not a refined child or qualification receipt.
 _Avoid_: deployable model, qualified checkpoint
 
+**Owner-paged recovery**:
+Recovery that retains committed training state outside resident owner payloads
+and materializes one tensor owner at a time. It is distinct from within-owner
+paging, a resident-memory measurement, or a qualified trained model.
+_Avoid_: GPU training, memory-mapped model, completed refinement
+
 **Owner calibration recipe**:
 An ordered, weighted set of declared scalar objectives and observation limits
 for tensor owners. It is distinct from captured observations and qualification.

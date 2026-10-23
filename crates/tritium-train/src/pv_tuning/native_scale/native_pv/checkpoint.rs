@@ -1,10 +1,9 @@
 use super::*;
-use crate::pv_tuning::wire::{Reader, write_adam_state};
-use tritium_core::Trit;
+use std::io::{Cursor, Seek};
 
-const MAGIC: [u8; 4] = *b"TNPV";
-const VERSION: u8 = 1;
-pub(super) const FIXED_BYTES: u64 = 4 + 1 + 32 + 32 + 8 + 8 + 32;
+mod stream;
+pub(super) use stream::*;
+pub(super) const FIXED_BYTES: u64 = 117;
 
 impl NativePvRefinementSession {
     /// Exact TNPV state, not an inference package or numerical replay proof.
@@ -12,35 +11,17 @@ impl NativePvRefinementSession {
     pub fn checkpoint_bytes(&self) -> Result<Vec<u8>, PvTuningError> {
         let length = usize::try_from(self.ledger.checkpoint_bytes).map_err(|_| size_overflow())?;
         let mut bytes = reserved(length)?;
-        bytes.extend_from_slice(&MAGIC);
-        bytes.push(VERSION);
-        bytes.extend_from_slice(self.plan_id.as_bytes());
-        bytes.extend_from_slice(&self.parent);
-        bytes.extend_from_slice(&self.completed.to_le_bytes());
-        bytes.extend_from_slice(&(self.owners.len() as u64).to_le_bytes());
-        for owner in &self.owners {
-            bytes.extend_from_slice(&(owner.weight.trits().len() as u64).to_le_bytes());
-            bytes.extend(owner.weight.trits().iter().map(|code| code.get() as u8));
-            bytes.extend_from_slice(&(owner.weight.scales().len() as u64).to_le_bytes());
-            for &value in owner.weight.scales() {
-                match owner.weight.layout().law.precision {
-                    ScalePrecision::F16 => {
-                        bytes.extend_from_slice(&f16::from_f32(value).to_bits().to_le_bytes())
-                    }
-                    ScalePrecision::Bf16 => {
-                        bytes.extend_from_slice(&bf16::from_f32(value).to_bits().to_le_bytes())
-                    }
-                    ScalePrecision::F32 => bytes.extend_from_slice(&value.to_bits().to_le_bytes()),
-                    _ => {
-                        return Err(PvTuningError::checkpoint(
-                            "unsupported native PV scale precision",
-                        ));
-                    }
-                }
+        bytes.extend_from_slice(
+            &Header {
+                plan: self.plan_id,
+                parent: self.parent,
+                completed: self.completed,
+                owners: self.owners.len() as u64,
             }
-            write_adam_state(&mut bytes, &owner.scale);
-            bytes.extend_from_slice(&(owner.code.m.len() as u64).to_le_bytes());
-            write_adam_state(&mut bytes, &owner.code);
+            .bytes(),
+        );
+        for owner in &self.owners {
+            write_owner::<4>(&mut bytes, owner).map_err(numerical_error)?;
         }
         bytes.extend_from_slice(blake3::hash(&bytes).as_bytes());
         debug_assert_eq!(bytes.len(), length);
@@ -48,10 +29,7 @@ impl NativePvRefinementSession {
     }
 
     /// Resume exact code/scale/moment state against the original parents and plan.
-    ///
-    /// Rejects other checkpoint families, bad caps/identity/shape/checksum, invalid
-    /// codec/scales/moments and changed zero-step state. Valid contents do not
-    /// prove any gradient, objective, parent custody or prior training execution.
+    /// Checksum integrity is not proof of gradient/objective execution or custody.
     pub fn resume(
         plan: NativeRefinementPlan,
         parents: Vec<AdditiveTensor>,
@@ -69,105 +47,38 @@ impl NativePvRefinementSession {
                 "native PV checkpoint checksum mismatch",
             ));
         }
-        let mut reader = Reader::new(body);
-        if reader.array::<4>()? != MAGIC || reader.u8()? != VERSION {
-            return Err(PvTuningError::checkpoint(
-                "unsupported native PV checkpoint format",
-            ));
-        }
-        if reader.array::<32>()? != *session.plan_id.as_bytes()
-            || reader.array::<32>()? != session.parent
-        {
+        let mut reader = Cursor::new(body);
+        let header = read_header(&mut reader).map_err(numerical_error)?;
+        if header.plan != session.plan_id || header.parent != session.parent {
             return Err(PvTuningError::checkpoint(
                 "native PV checkpoint plan/parent mismatch",
             ));
         }
-        session.completed = reader.u64()?;
-        if session.completed > session.plan.training.len() as u64
-            || reader.usize()? != parents.len()
+        if header.completed > session.plan.training.len() as u64
+            || header.owners != parents.len() as u64
         {
             return Err(PvTuningError::checkpoint(
                 "native PV checkpoint cursor/owner mismatch",
             ));
         }
-        for mut weight in parents {
-            let active = active_count(&weight)?;
-            if reader.usize()? != weight.trits().len() {
-                return Err(PvTuningError::checkpoint(
-                    "native PV checkpoint trit count mismatch",
-                ));
-            }
-            let mut codes = reserved(weight.trits().len())?;
-            for _ in 0..weight.trits().len() {
-                codes.push(
-                    Trit::from_i8(reader.u8()? as i8).map_err(|_| {
-                        PvTuningError::checkpoint("invalid native PV checkpoint trit")
-                    })?,
-                );
-            }
-            let scales = weight.scales().len();
-            if reader.usize()? != scales {
-                return Err(PvTuningError::checkpoint(
-                    "native PV checkpoint scale count mismatch",
-                ));
-            }
-            let mut values = reserved(scales)?;
-            for _ in 0..scales {
-                values.push(match weight.layout().law.precision {
-                    ScalePrecision::F16 => f16::from_bits(reader.u16()?).to_f32(),
-                    ScalePrecision::Bf16 => bf16::from_bits(reader.u16()?).to_f32(),
-                    ScalePrecision::F32 => f32::from_bits(reader.u32()?),
-                    _ => {
-                        return Err(PvTuningError::checkpoint(
-                            "unsupported native PV scale precision",
-                        ));
-                    }
-                });
-            }
-            let scale = read_state(&mut reader, scales)?;
-            if reader.usize()? != active {
-                return Err(PvTuningError::checkpoint(
-                    "native PV checkpoint code count mismatch",
-                ));
-            }
-            let code = read_state(&mut reader, active)?;
-            if session.completed == 0 {
-                if codes != weight.trits()
-                    || values
-                        .iter()
-                        .zip(weight.scales())
-                        .any(|(a, b)| a.to_bits() != b.to_bits())
-                    || scale
-                        .m
-                        .iter()
-                        .chain(&scale.v)
-                        .chain(&code.m)
-                        .chain(&code.v)
-                        .any(|v| v.to_bits() != 0)
-                {
-                    return Err(PvTuningError::checkpoint(
-                        "native PV zero-step state differs from parent",
-                    ));
-                }
-            } else {
-                check_corrected_moments(session.continuous, session.completed, &scale)
-                    .map_err(PvTuningError::checkpoint)?;
-                check_corrected_moments(session.code_optimizer, session.completed, &code)
-                    .map_err(PvTuningError::checkpoint)?;
-            }
-            weight.replace_scales(values).map_err(|e| {
-                PvTuningError::checkpoint(format!("native PV checkpoint scales: {e:?}"))
-            })?;
-            weight.replace_trits(codes).map_err(|e| {
-                PvTuningError::checkpoint(format!("native PV checkpoint codes: {e:?}"))
-            })?;
-            session.owners.push(PvOwner {
-                weight,
-                scale,
-                code,
-            });
+        session.completed = header.completed;
+        let updater = PvUpdater {
+            continuous: session.continuous,
+            code_optimizer: session.code_optimizer,
+            fraction: session.fraction,
+            trust: session.trust,
+        };
+        for weight in parents {
+            session.owners.push(
+                read_owner::<4>(&mut reader, weight, header.completed, updater)
+                    .map_err(numerical_error)?,
+            );
         }
-        if reader.remaining() != 0 {
+        if reader
+            .stream_position()
+            .map_err(|e| PvTuningError::checkpoint(e.to_string()))?
+            != body.len() as u64
+        {
             return Err(PvTuningError::checkpoint(
                 "native PV checkpoint trailing body",
             ));
@@ -176,22 +87,11 @@ impl NativePvRefinementSession {
     }
 }
 
-fn read_state(reader: &mut Reader<'_>, length: usize) -> Result<AdamState, PvTuningError> {
-    let mut read_values = |variance: bool| -> Result<Vec<f32>, PvTuningError> {
-        let mut values = reserved(length)?;
-        for _ in 0..length {
-            let value = f32::from_bits(reader.u32()?);
-            if !value.is_finite() || (variance && value.is_sign_negative()) {
-                return Err(PvTuningError::checkpoint(
-                    "native PV checkpoint invalid optimizer moment",
-                ));
-            }
-            values.push(value);
+fn numerical_error(error: WireError) -> PvTuningError {
+    match error {
+        WireError::Invalid(error) => error,
+        WireError::Io(error) => {
+            PvTuningError::checkpoint(format!("native PV checkpoint I/O: {error}"))
         }
-        Ok(values)
-    };
-    Ok(AdamState {
-        m: read_values(false)?,
-        v: read_values(true)?,
-    })
+    }
 }
