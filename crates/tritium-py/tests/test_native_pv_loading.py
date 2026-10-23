@@ -74,10 +74,10 @@ def _prepare(root):
             asset_paths={name: directory / name for name in ("config.json", "tokenizer.json")})
         save_file({name: value.detach().contiguous().clone() for name, value in model.state_dict().items()},
                   directory / "source.safetensors")
-        optimizer = dict(lr=0.01, beta1=0.9, beta2=0.99, eps=1e-8, weight_decay=0.0)
+        optimizer = dict(lr=0.0001, beta1=0.9, beta2=0.99, eps=1e-8, weight_decay=0.0)
         request = dict(parent=json.loads(parent.native_refinement_parent("full")), child_level="pv-child",
             owners=sorted(actions), recipe={"AlternatingPv": dict(continuous_optimizer=optimizer,
-                code_optimizer={**optimizer, "lr": 0.6}, max_code_change_fraction=1.0,
+                code_optimizer={**optimizer, "lr": 0.01 if case == "hf" else 0.05}, max_code_change_fraction=0.5,
                 max_relative_code_change=None)}, objective=[7]*32, teacher_source=None,
             training=[dict(content=[10+i]*32, weight=1.0) for i in range(4)],
             validation=[dict(content=[30]*32, weight=1.0)],
@@ -93,7 +93,7 @@ def corpus():
     return Path(value)
 
 def _input(case):
-    return torch.tensor([[1, 2, 3]]) if case == "hf" else torch.linspace(-1, 1, 64).reshape(2, 32)
+    return torch.tensor([[1, 2, 3]]) if case == "hf" else torch.stack((torch.linspace(-1, 1, 32), torch.cos(torch.arange(32)*0.4)))
 
 def _forward(model, case):
     return model(_input(case), use_cache=False).logits if case == "hf" else model(_input(case))
@@ -127,6 +127,8 @@ def test_actual_rust_pv_child_load_export_replay_and_standalone_parity(corpus, t
     expected = _expected(directory, case)
     with torch.no_grad():
         actual = _forward(loaded, case); torch.testing.assert_close(actual, _forward(expected, case), rtol=2e-4, atol=2e-4)
+        assert actual.abs().sum() > 0
+        if case != "hf": assert (actual[0] - actual[1]).abs().max() > 1e-3
         tokens = loaded.generate(_input(case), max_new_tokens=3, do_sample=False, pad_token_id=0) if case == "hf" else None
     if case == "hf": assert loaded.model.embed_tokens.packed_weight is loaded.lm_head.packed_weight
     else:
@@ -181,6 +183,14 @@ def test_profile_companions_are_not_selected_by_existence_and_training_stays_gua
     with pytest.raises(ValueError, match="ScaleOnly"):
         native_scale_training(TiedState(), parent, level="full", plan=request, load_run_id="still-guarded",
             max_snapshot_bytes=1_000_000, max_parent_bytes=4_000_000, max_saved_input_bytes=1_000_000)
+
+@pytest.mark.parametrize("name", ["evidence.jsonl", "checkpoint.tnpv", "gradients.tnpj"])
+def test_swapped_same_profile_records_or_companions_do_not_rebind(corpus, tmp_path, name):
+    target = tmp_path / "swapped"; shutil.copytree(corpus / CASES[0] / "child", target)
+    original = NativeModelRefinement.open(str(target))
+    shutil.copyfile(corpus / CASES[1] / "child" / name, target / name)
+    with pytest.raises(ValueError): original.verify()
+    with pytest.raises(ValueError): NativeModelRefinement.open(str(target))
 
 def test_pv_parent_supports_a_fresh_scale_round_and_rejects_wrong_parent(corpus, tmp_path):
     from test_native_scale_training import plan, start

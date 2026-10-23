@@ -97,7 +97,11 @@ fn publish_pv(
         .collect();
     let weights: Vec<_> = parents
         .iter()
-        .map(|w| vec![0.25; w.view().plane_trits(0).unwrap().len()])
+        .map(|w| {
+            (0..w.view().plane_trits(0).unwrap().len())
+                .map(|i| ((i % 7) as f32 - 3.0) * 0.125)
+                .collect::<Vec<_>>()
+        })
         .collect();
     for _ in &plan.training {
         s.step_recorded(
@@ -157,6 +161,10 @@ fn publish_pv(
             &mut values,
         )
         .unwrap();
+        assert!(
+            values.iter().any(|v| *v != values[0]),
+            "fixture hard matrix must not collapse to a constant"
+        );
         expected.push(serde_json::json!({"name":name,"rows":rows,"cols":cols,"values":values}));
     }
     fs::write(
