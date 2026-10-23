@@ -234,5 +234,21 @@ update needs both complete old and new checkpoints, in addition to parent
 artifacts and any journal. Set a disk ceiling and delete only obsolete owned
 snapshots after their replacement is safely retained. Generic flush does not
 provide fsync durability or immutable filesystem publication. Paged journal
-recording, first-party source/runtime/Python wiring, within-owner moment paging,
+recording, complete runtime/Python wiring, within-owner moment paging,
 GPU execution and independent model/physical/release qualification remain open.
+
+`NativeRefinementOwnerSource::with` supplies a first-party original-package loader
+for both scale and P/V plans. It binds the actual `TritModelReader` to the original
+`NativeRefinementParentView` and selected level, preflights aggregate state and
+largest-owner metadata limits, and decodes each named owner through bounded blob
+visits rather than an encoded-owner buffer or retained parent vector. Call
+`required_working_bytes` to forecast the decode cap without reading source bytes;
+this metadata estimate is not provenance. Inside the scope, pass
+`|index, name| source.load(index, name)` to paged initialize/reopen/staged update.
+An owned result leaves the scope only after complete ordered traversal and fresh
+terminal parent verification. Ignored load errors poison the scope; callback
+effects must remain private. `NativeRefinementOwnerReadLimits` covers decoded
+owner plus codec/carry and64KiB source window, with explicit overlapping caller
+payload. It does not include arbitrary consumer storage, model metadata, caller
+stream buffers, allocator slack or OS caches. Existing resident parent-decoder
+limits and all checkpoint/journal/publication gates are unchanged.

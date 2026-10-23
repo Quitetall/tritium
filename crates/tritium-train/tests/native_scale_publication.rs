@@ -19,6 +19,8 @@ use tritium_train::pv_tuning::*;
 
 #[path = "native_scale_publication/chaining.rs"]
 mod chaining;
+#[path = "native_scale_publication/owner_source.rs"]
+mod owner_source;
 #[path = "native_scale_publication/pv.rs"]
 mod pv;
 

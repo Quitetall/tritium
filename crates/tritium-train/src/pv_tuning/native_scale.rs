@@ -64,6 +64,9 @@ pub use publication::{
 };
 pub use transaction::{NativeScaleStageError, NativeScaleStep};
 pub use verification::{
+    NativeRefinementOwnerReadLimits, NativeRefinementOwnerSource, NativeRefinementOwnerSourceError,
+};
+pub use verification::{
     NativeScaleChildVerification, NativeScaleParentReadLimits, VerifiedNativeScaleChild,
     decode_native_scale_parents, verify_native_scale_child,
 };

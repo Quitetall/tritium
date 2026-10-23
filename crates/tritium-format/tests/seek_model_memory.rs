@@ -2,6 +2,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs::{self, File};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tritium_format::trit_model::decode_additive_payload;
 use tritium_format::trit_model::{TritModelReader, read_trit_model};
 #[path = "support/typed_seek_fixture.rs"]
 mod fixture;
@@ -100,4 +101,51 @@ fn retained_file_typed_validation_does_not_allocate_a_dense_or_encoded_payload_m
         requests[0].abs_diff(requests[1]) <= 1024,
         "payload growth must not grow a reader-owned payload master: {requests:?}"
     );
+
+    // The output owner is deliberately allocated, but no encoded-owner copy
+    // accompanies it. Both Uniform and PerTile use an actual retained File.
+    let bytes = fixture::fixture(1_048_577, 68);
+    let path = std::env::temp_dir().join(format!(
+        "tritium-owner-decode-memory-{}.trit",
+        std::process::id()
+    ));
+    let mut file = File::create_new(&path).unwrap();
+    std::io::Write::write_all(&mut file, &bytes).unwrap();
+    drop(file);
+    let mut reader =
+        TritModelReader::open(File::open(&path).unwrap(), parity::limits(&bytes)).unwrap();
+    for level in ["child", "parent"] {
+        let model = read_trit_model(&bytes).unwrap();
+        let (meta, payload) = model.tensor(level, "weight").unwrap();
+        let expected = decode_additive_payload(meta, payload).unwrap();
+        let mut stream = reader.tensor_stream(level, "weight").unwrap();
+        let required = stream.additive_decode_working_bytes().unwrap();
+        ALLOCATED.store(0, Ordering::Relaxed);
+        TRACK.store(true, Ordering::Relaxed);
+        assert!(stream.decode_additive(required - 1).is_err());
+        TRACK.store(false, Ordering::Relaxed);
+        let rejected = ALLOCATED.load(Ordering::Relaxed);
+        assert!(
+            rejected < 16384,
+            "cap refusal allocated owner payload {rejected}"
+        );
+        ALLOCATED.store(0, Ordering::Relaxed);
+        TRACK.store(true, Ordering::Relaxed);
+        let actual = stream.decode_additive(required).unwrap();
+        TRACK.store(false, Ordering::Relaxed);
+        let requested = ALLOCATED.load(Ordering::Relaxed);
+        assert_eq!(actual, expected);
+        assert!(
+            (requested as u64) < required - 65536 + 16384,
+            "encoded-owner copy or duplicate decoded payload: {requested}, budget {required}"
+        );
+        eprintln!(
+            "OWNER_STREAM_DECODE level={level} encoded_bytes={} decoded_trits={} cumulative_heap_requests={requested} declared_working={required} rejected_heap_requests={rejected}",
+            payload.len(),
+            actual.trits().len()
+        );
+    }
+    reader.verify().unwrap();
+    drop(reader);
+    fs::remove_file(path).unwrap();
 }

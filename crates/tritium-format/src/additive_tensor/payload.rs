@@ -6,7 +6,7 @@ use tritium_schema::PlaneCounts;
 
 mod prefix;
 mod stream;
-pub use stream::AdditiveStreamValidator;
+pub use stream::{AdditiveStreamDecoder, AdditiveStreamValidator};
 
 const SCRATCH_TRITS: usize = D2_TRITS_PER_BYTE * B3_TRITS_PER_BYTE * (8 * S34_TRITS_PER_GROUP);
 pub(crate) const RANGE_BYTES: usize = 64 * 1024;

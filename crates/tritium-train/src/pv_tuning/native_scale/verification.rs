@@ -7,6 +7,11 @@ use tritium_format::trit_model::{TritModelReader, decode_additive_payload};
 use tritium_schema::{PlaneCounts, TensorStorage};
 use tritium_spec::AdditiveMetadata;
 
+mod owner_source;
+pub use owner_source::{
+    NativeRefinementOwnerReadLimits, NativeRefinementOwnerSource, NativeRefinementOwnerSourceError,
+};
+
 /// Logical decoded state and one encoded parent plus explicit caller payload.
 #[derive(Clone, Copy, Debug)]
 pub struct NativeScaleParentReadLimits {
@@ -78,6 +83,38 @@ fn decode_parents<R: Read + Seek>(
 ) -> Result<Vec<AdditiveTensor>, Error> {
     plan.validate_parent(reader.manifest(), parent.binding())
         .map_err(|_| Error::Binding("native parent/request mismatch"))?;
+    let (retained, largest) = parent_state_sizes(reader, plan, profile)?;
+    if limits.max_working_bytes == 0
+        || retained > plan.limits.max_state_bytes
+        || add(add(retained, largest)?, limits.extra_payload_bytes)? > limits.max_working_bytes
+    {
+        return Err(Error::Limit(
+            "native decoded parent/state exceeds byte limit",
+        ));
+    }
+    parent.verify(reader)?;
+    let mut parents = Vec::new();
+    parents
+        .try_reserve_exact(plan.owners.len())
+        .map_err(|_| Error::Allocation {
+            requested: plan.owners.len(),
+        })?;
+    for name in &plan.owners {
+        let bytes = read_tensor(reader, &plan.parent.level, name)?;
+        parents.push(decode_additive_payload(
+            reader.tensor_meta(&plan.parent.level, name)?,
+            &bytes,
+        )?);
+    }
+    reader.verify()?;
+    Ok(parents)
+}
+
+fn parent_state_sizes<R: Read + Seek>(
+    reader: &TritModelReader<R>,
+    plan: &NativeRefinementPlan,
+    profile: super::publication::Profile,
+) -> Result<(u64, u64), Error> {
     let mut retained = 0;
     let mut largest = 0;
     for name in &plan.owners {
@@ -122,30 +159,7 @@ fn decode_parents<R: Read + Seek>(
         retained = add(retained, bytes)?;
         largest = largest.max(reader.tensor_byte_len(&plan.parent.level, name)?);
     }
-    if limits.max_working_bytes == 0
-        || retained > plan.limits.max_state_bytes
-        || add(add(retained, largest)?, limits.extra_payload_bytes)? > limits.max_working_bytes
-    {
-        return Err(Error::Limit(
-            "native decoded parent/state exceeds byte limit",
-        ));
-    }
-    parent.verify(reader)?;
-    let mut parents = Vec::new();
-    parents
-        .try_reserve_exact(plan.owners.len())
-        .map_err(|_| Error::Allocation {
-            requested: plan.owners.len(),
-        })?;
-    for name in &plan.owners {
-        let bytes = read_tensor(reader, &plan.parent.level, name)?;
-        parents.push(decode_additive_payload(
-            reader.tensor_meta(&plan.parent.level, name)?,
-            &bytes,
-        )?);
-    }
-    reader.verify()?;
-    Ok(parents)
+    Ok((retained, largest))
 }
 
 /// Actual original-parent, journal, checkpoint and encoded-child numerical binding.

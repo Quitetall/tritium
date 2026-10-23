@@ -82,7 +82,8 @@ pub mod trit_salience;
 pub mod trit_salience_conversion;
 
 pub use additive_tensor::{
-    AdditivePayload, AdditiveStreamValidator, AdditiveTensor, AdditiveTensorError,
+    AdditivePayload, AdditiveStreamDecoder, AdditiveStreamValidator, AdditiveTensor,
+    AdditiveTensorError,
 };
 pub use artifact::{
     ArtifactError, ModelId, PackageHasher, PackageId, SemanticModelManifest, SemanticTensor,

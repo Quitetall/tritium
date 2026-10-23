@@ -12,7 +12,7 @@ use crate::salt_v2::{
 };
 
 mod payload;
-pub use payload::{AdditivePayload, AdditiveStreamValidator};
+pub use payload::{AdditivePayload, AdditiveStreamDecoder, AdditiveStreamValidator};
 pub(crate) use payload::{PayloadPlan, PayloadSource, RANGE_BYTES};
 
 /// Failure constructing an owned [`AdditiveTensor`].
@@ -41,6 +41,13 @@ pub enum AdditiveTensorError {
     AllocationFailed {
         /// Exact byte or element count requested by the failed reservation.
         requested: usize,
+    },
+    /// Explicit logical decode working cap, not an allocator or RSS failure.
+    DecodeWorkingLimit {
+        /// Required decoded payload and fixed scratch bytes.
+        required: u64,
+        /// Caller-supplied logical working ceiling.
+        limit: u64,
     },
     /// This tensor-level codec does not itself apply the outer entropy transport.
     UnsupportedTransport,

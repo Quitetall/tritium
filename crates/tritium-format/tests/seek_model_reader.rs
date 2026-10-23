@@ -36,6 +36,10 @@ fn named_tensor_stream_borrows_exact_metadata_repeats_and_preserves_faults() {
         let mut stream = reader.tensor_stream("child", "weight").unwrap();
         assert_eq!(stream.metadata() as *const _, pointer);
         assert_eq!(stream.encoded_bytes(), expected.len() as u64);
+        let working = stream.additive_decode_working_bytes().unwrap();
+        assert!(stream.decode_additive(working - 1).is_err());
+        let decoded = stream.decode_additive(working).unwrap();
+        assert_eq!(decoded.encode_payload().unwrap(), expected);
         for _ in 0..2 {
             let mut actual = Vec::new();
             stream
@@ -58,6 +62,7 @@ fn named_tensor_stream_borrows_exact_metadata_repeats_and_preserves_faults() {
             .unwrap();
         mutable.borrow_mut()[raw] ^= 1;
         assert!(stream.visit(|_| Ok::<_, u8>(())).is_err());
+        assert!(stream.decode_additive(working).is_err());
     }
     assert!(reader.verify().is_err());
 }

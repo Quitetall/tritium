@@ -76,16 +76,29 @@ impl<'a> AdditiveStreamValidator<'a> {
     /// Trailing bytes, noncanonical codes/tails, invalid scales or prior poison.
     /// Any error poisons the validator; no later success can hide ignored errors.
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), AdditiveTensorError> {
+        self.push_with(bytes, |_| {}, |_| {})
+    }
+    fn push_with(
+        &mut self,
+        bytes: &[u8],
+        mut trits: impl FnMut(&[Trit]),
+        mut scales: impl FnMut(f32),
+    ) -> Result<(), AdditiveTensorError> {
         if self.poisoned {
             return Err(AdditiveTensorError::StreamPoisoned);
         }
-        let result = self.push_inner(bytes);
+        let result = self.push_inner(bytes, &mut trits, &mut scales);
         if result.is_err() {
             self.poisoned = true;
         }
         result
     }
-    fn push_inner(&mut self, mut bytes: &[u8]) -> Result<(), AdditiveTensorError> {
+    fn push_inner(
+        &mut self,
+        mut bytes: &[u8],
+        trit_values: &mut impl FnMut(&[Trit]),
+        scale_values: &mut impl FnMut(f32),
+    ) -> Result<(), AdditiveTensorError> {
         let total = self
             .total
             .checked_add(bytes.len())
@@ -131,6 +144,7 @@ impl<'a> AdditiveStreamValidator<'a> {
                     self.trit_at,
                     byte_at,
                 )?;
+                trit_values(&self.scratch);
                 self.trit_at += trits;
             } else {
                 validate_scale_chunk(
@@ -138,10 +152,9 @@ impl<'a> AdditiveStreamValidator<'a> {
                     self.plan.planes.len(),
                     &self.pending[..wanted],
                 )?;
-                self.maximum_scale = self.maximum_scale.max(stored_scale(
-                    self.plan.layout.law.precision,
-                    &self.pending[..wanted],
-                )?);
+                let value = stored_scale(self.plan.layout.law.precision, &self.pending[..wanted])?;
+                self.maximum_scale = self.maximum_scale.max(value);
+                scale_values(value);
             }
             self.pending_len = 0;
         }
@@ -163,5 +176,120 @@ impl<'a> AdditiveStreamValidator<'a> {
             });
         }
         Ok(self.maximum_scale)
+    }
+}
+
+/// Bounded owned decoding through the same incremental canonical validator.
+///
+/// Retains one decoded owner, not its encoded payload. Counts remain borrowed
+/// until finish; the returned tensor then owns one compact index. Logical caps
+/// include coefficients, widened scales, index and fixed codec/carry scratch,
+/// excluding metadata, allocation slack and external source buffers/RSS.
+pub struct AdditiveStreamDecoder<'a> {
+    validator: AdditiveStreamValidator<'a>,
+    trits: Vec<Trit>,
+    scales: Vec<f32>,
+}
+impl core::fmt::Debug for AdditiveStreamDecoder<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AdditiveStreamDecoder")
+            .field("validator", &self.validator)
+            .field("decoded_trits", &self.trits.len())
+            .field("decoded_scales", &self.scales.len())
+            .finish_non_exhaustive()
+    }
+}
+impl<'a> AdditiveStreamDecoder<'a> {
+    /// Forecast logical decoded payload plus fixed codec/carry scratch. No
+    /// coefficient, scale or compact index payload is allocated by this query.
+    pub fn working_bytes(
+        layout: AdditiveLayout,
+        planes: &PlaneCounts,
+        length: usize,
+    ) -> Result<u64, AdditiveTensorError> {
+        Self::sizes(&PayloadPlan::new(layout, planes, length)?)
+    }
+    fn sizes(plan: &PayloadPlan<'_>) -> Result<u64, AdditiveTensorError> {
+        let index = match plan.allocation {
+            Allocation::Uniform(_) => 0,
+            Allocation::PerTile(counts) => PerTilePlan::new(plan.layout, counts)
+                .and_then(|p| p.buffer_len_bytes())
+                .map_err(AdditiveTensorError::InvalidView)?,
+        };
+        plan.scale_count
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(plan.trit_count))
+            .and_then(|n| n.checked_add(index))
+            .and_then(|n| n.checked_add(2 * SCRATCH_TRITS))
+            .map(|n| n as u64)
+            .ok_or(AdditiveTensorError::LengthOverflow)
+    }
+    /// Validate geometry and cap before allocating decoded owner payloads.
+    /// Unsupported transport/laws and malformed lengths remain fail-closed.
+    pub fn new(
+        layout: AdditiveLayout,
+        planes: &'a PlaneCounts,
+        length: usize,
+        max_working_bytes: u64,
+    ) -> Result<Self, AdditiveTensorError> {
+        let plan = PayloadPlan::new(layout, planes, length)?;
+        let required = Self::sizes(&plan)?;
+        if required > max_working_bytes {
+            return Err(AdditiveTensorError::DecodeWorkingLimit {
+                required,
+                limit: max_working_bytes,
+            });
+        }
+        let trits = reserved_payload(plan.trit_count)?;
+        let scales = reserved_payload(plan.scale_count)?;
+        Ok(Self {
+            validator: AdditiveStreamValidator::new(plan)?,
+            trits,
+            scales,
+        })
+    }
+    /// Consume arbitrary successive windows. Any error poisons the shared
+    /// validator; ignoring it can never make finish succeed.
+    pub fn push(&mut self, bytes: &[u8]) -> Result<(), AdditiveTensorError> {
+        let Self {
+            validator,
+            trits,
+            scales,
+        } = self;
+        validator.push_with(
+            bytes,
+            |values| trits.extend_from_slice(values),
+            |value| scales.push(value),
+        )
+    }
+    /// Return the single validated owner only after exact complete validation.
+    /// Enclosing blob/package/source verification remains the loader's duty.
+    pub fn finish(self) -> Result<AdditiveTensor, AdditiveTensorError> {
+        let Self {
+            validator,
+            trits,
+            scales,
+        } = self;
+        let layout = validator.plan.layout;
+        let allocation = validator.plan.allocation;
+        let (t, s, length, total) = (
+            validator.plan.trit_count,
+            validator.plan.scale_count,
+            validator.plan.length,
+            validator.total,
+        );
+        validator.finish()?;
+        if trits.len() != t || scales.len() != s {
+            return Err(AdditiveTensorError::PayloadLength {
+                expected: length,
+                got: total,
+            });
+        }
+        match allocation {
+            Allocation::Uniform(count) => AdditiveTensor::new(layout, count, trits, scales),
+            Allocation::PerTile(counts) => {
+                AdditiveTensor::new_per_tile(layout, copy_payload(counts)?, trits, scales)
+            }
+        }
     }
 }
