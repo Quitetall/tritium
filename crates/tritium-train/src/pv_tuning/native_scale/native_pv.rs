@@ -4,6 +4,11 @@ use tritium_core::project_additive_code_unit;
 use tritium_schema::NativeAdamWRecipe;
 
 mod checkpoint;
+mod consumers;
+#[cfg(feature = "native-cpu")]
+mod cpu;
+#[cfg(feature = "native-cpu")]
+pub use cpu::{NativeCpuPvError, NativeCpuPvJournalStageError, NativeCpuPvSession};
 mod verification;
 pub use verification::{NativePvChildVerification, VerifiedNativePvChild, verify_native_pv_child};
 mod journal;

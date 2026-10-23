@@ -25,8 +25,8 @@ pub use native_scale::{
     inspect_native_pv_child, publish_native_pv_child, verify_native_pv_child,
 };
 pub use native_scale::{
-    NativePvCandidate, NativePvOwnerStep, NativePvRefinementSession, NativePvSizeLedger,
-    NativePvStageError, NativePvStepStats,
+    NativePvCandidate, NativePvContribution, NativePvOwnerStep, NativePvRefinementSession,
+    NativePvSizeLedger, NativePvStageError, NativePvStepStats,
 };
 pub use native_scale::{
     NativePvJournalError, NativePvJournalLimits, NativePvJournalResume, NativePvJournalSizeLedger,
@@ -61,7 +61,8 @@ pub use native_scale::{
 };
 #[cfg(feature = "native-cpu")]
 pub use native_scale::{
-    NativeCpuScaleError, NativeCpuScaleJournalStageError, NativeCpuScaleSession,
+    NativeCpuPvError, NativeCpuPvJournalStageError, NativeCpuPvSession, NativeCpuScaleError,
+    NativeCpuScaleJournalStageError, NativeCpuScaleSession,
 };
 pub use native_scale::{
     NativeScaleContribution, NativeScaleJournalError, NativeScaleJournalLimits,

@@ -136,8 +136,14 @@ fn pruned_coordinates_have_no_dense_moments_and_caps_reject_before_payload_alloc
         let (result, bytes) = measured(|| s.step(&[&[]], &[&[]]));
         assert_eq!(result.unwrap().owners[0].selected_units, 0);
         assert!(bytes < 32768, "pruned step allocated {bytes}");
+        let (result, consumer_bytes) = measured(|| s.step_from_consumers(&[&[]]));
+        assert_eq!(result.unwrap().owners[0].selected_units, 0);
+        assert!(
+            consumer_bytes < 32768,
+            "pruned consumer step allocated {consumer_bytes}"
+        );
         eprintln!(
-            "NATIVE_PV_PRUNED rows={rows} logical_coordinates={} step_allocated_requests={bytes}",
+            "NATIVE_PV_PRUNED rows={rows} logical_coordinates={} step_allocated_requests={bytes} consumer_allocated_requests={consumer_bytes}",
             rows * 256
         );
     }
@@ -148,4 +154,20 @@ fn pruned_coordinates_have_no_dense_moments_and_caps_reject_before_payload_alloc
     assert!(result.is_err());
     assert!(bytes < 65536, "rejected admission allocated {bytes}");
     eprintln!("NATIVE_PV_REJECTED_STATE logical_coordinates=1048576 allocated_requests={bytes}");
+
+    let mut p = plan(1);
+    p.limits.max_state_bytes = 64_000_000;
+    p.limits.max_workspace_bytes = 64_000_000;
+    p.limits.max_checkpoint_bytes = 64_000_000;
+    let weight = parent(4096, false);
+    let probe = Session::new(p.clone(), vec![weight.clone()]).unwrap();
+    p.limits.max_workspace_bytes = probe.size_ledger().update_workspace_bytes;
+    drop(probe);
+    let mut state = Session::new(p, vec![weight]).unwrap();
+    let before = state.checkpoint_bytes().unwrap();
+    let (result, bytes) = measured(|| state.step_from_consumers(&[&[]]));
+    assert!(result.unwrap_err().to_string().contains("workspace"));
+    assert!(bytes < 4096, "consumer cap rejection allocated {bytes}");
+    assert_eq!(state.checkpoint_bytes().unwrap(), before);
+    eprintln!("NATIVE_PV_CONSUMER_CAP logical_coordinates=1048576 allocated_requests={bytes}");
 }

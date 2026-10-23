@@ -11,6 +11,8 @@ use crate::optim::{AdamState, AdamW, Optimizer};
 
 mod checkpoint;
 mod native_pv;
+#[cfg(feature = "native-cpu")]
+pub use native_pv::{NativeCpuPvError, NativeCpuPvJournalStageError, NativeCpuPvSession};
 pub use native_pv::{
     NativePvCandidate, NativePvOwnerStep, NativePvRefinementSession, NativePvSizeLedger,
     NativePvStageError, NativePvStepStats,
@@ -40,7 +42,7 @@ pub use publication::{
 pub use verification::{NativePvParentReadLimits, decode_native_pv_parents};
 mod transaction;
 mod verification;
-pub use consumers::NativeScaleContribution;
+pub use consumers::{NativePvContribution, NativeScaleContribution};
 #[cfg(feature = "native-cpu")]
 pub use cpu::{NativeCpuScaleError, NativeCpuScaleJournalStageError, NativeCpuScaleSession};
 pub use journal::{

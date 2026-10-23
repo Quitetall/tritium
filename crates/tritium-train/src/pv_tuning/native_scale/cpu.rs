@@ -223,7 +223,7 @@ fn stage_handles(
 fn stage_error(message: &str) -> NativeCpuScaleError {
     NativeScaleStageError::Stage(BackendError::InvalidInput(message.into()))
 }
-fn handle_storage(len: usize) -> Result<Vec<Arc<dyn DeviceBuffer>>, BackendError> {
+pub(super) fn handle_storage(len: usize) -> Result<Vec<Arc<dyn DeviceBuffer>>, BackendError> {
     let requested = len
         .checked_mul(std::mem::size_of::<Arc<dyn DeviceBuffer>>())
         .ok_or_else(|| BackendError::InvalidInput("CPU handle metadata size overflow".into()))?;
