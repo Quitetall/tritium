@@ -235,7 +235,11 @@ pub(super) fn launch_salt_v2_mma_rows_on(
     run(
         &mut builder,
         LaunchConfig {
-            grid_dim: (padded, k / SALT_V2_ALLOCATION_TILE_SIZE as u32, 1),
+            grid_dim: (
+                padded,
+                (k / SALT_V2_ALLOCATION_TILE_SIZE as u32).clamp(1, 8),
+                1,
+            ),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         },

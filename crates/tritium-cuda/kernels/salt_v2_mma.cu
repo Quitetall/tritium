@@ -545,7 +545,7 @@ __device__ __forceinline__ void mma_rows(const __half* __restrict__ act_hi,
 
 // Activation rows -> permuted f16 hi/lo halves plus one power-of-two scale per row.
 //
-// Grid (rows, k / 256). Row `r`'s scale is 2^e with the smallest e >= 0 that brings
+// Grid (rows, Y): block (r, y) converts tiles y, y + Y, ... of row r. Row `r`'s scale is 2^e with the smallest e >= 0 that brings
 // max|x| under 2^14, so hi never overflows f16; the GEMM multiplies its outputs
 // back by 2^e, which is exact. Rows in [m, padded) are zero.
 //
@@ -588,32 +588,33 @@ extern "C" __global__ void salt_v2_mma_split_act(const float* __restrict__ activ
   const float down = ldexpf(1.0f, -e);
   if (threadIdx.x == 0U && blockIdx.y == 0U) row_scale[row] = ldexpf(1.0f, e);
 
-  // Block (row, y) converts tile y only (every block recomputes the row's peak,
-  // which is order-free): one block per row left 16 blocks for a verify.
+  // Every block recomputes the row's peak (a max, order-free), so Y stays small:
+  // one block per row left 16 blocks for a verify, one per tile re-read a
+  // 17408-wide row 68 times.
   __half* out_hi = hi + static_cast<size_t>(row) * k;
   __half* out_lo = lo + static_cast<size_t>(row) * k;
-  const uint32_t slot_end = min(k, (blockIdx.y + 1U) * salt_mma::kTile);
-  for (uint32_t slot = blockIdx.y * salt_mma::kTile + threadIdx.x; slot < slot_end;
-       slot += blockDim.x) {
-    const uint32_t tile = slot / salt_mma::kTile;
-    const uint32_t within = slot % salt_mma::kTile;
-    const uint32_t step = within / 16U;
-    const uint32_t c = (within / 4U) % 4U;
-    const uint32_t j = within % 4U;
-    uint32_t trit;
-    if (step < 15U) {
-      // Steps 5G .. 5G + 3 take digits 0-3 of byte c of word 4G + s; step 5G + 4
-      // takes digit 4 of byte c of words 4G .. 4G + 3.
-      const uint32_t group = step / 5U;
-      const uint32_t s = step % 5U;
-      trit = s < 4U ? 20U * (4U * group + s) + 5U * c + j : 20U * (4U * group + j) + 5U * c + 4U;
-    } else {
-      trit = 240U + 4U * c + j;
+  const uint32_t tiles = k / salt_mma::kTile;
+  for (uint32_t tile = blockIdx.y; tile < tiles; tile += gridDim.y) {
+    for (uint32_t within = threadIdx.x; within < salt_mma::kTile; within += blockDim.x) {
+      const uint32_t slot = tile * salt_mma::kTile + within;
+      const uint32_t step = within / 16U;
+      const uint32_t c = (within / 4U) % 4U;
+      const uint32_t j = within % 4U;
+      uint32_t trit;
+      if (step < 15U) {
+        // Steps 5G .. 5G + 3 take digits 0-3 of byte c of word 4G + s; step 5G + 4
+        // takes digit 4 of byte c of words 4G .. 4G + 3.
+        const uint32_t group = step / 5U;
+        const uint32_t s = step % 5U;
+        trit = s < 4U ? 20U * (4U * group + s) + 5U * c + j : 20U * (4U * group + j) + 5U * c + 4U;
+      } else {
+        trit = 240U + 4U * c + j;
+      }
+      const float value = row < m ? x[tile * salt_mma::kTile + trit] * down : 0.0f;
+      const __half h = __float2half_rn(value);
+      out_hi[slot] = h;
+      out_lo[slot] = __float2half_rn(value - __half2float(h));
     }
-    const float value = row < m ? x[tile * salt_mma::kTile + trit] * down : 0.0f;
-    const __half h = __float2half_rn(value);
-    out_hi[slot] = h;
-    out_lo[slot] = __float2half_rn(value - __half2float(h));
   }
 }
 
