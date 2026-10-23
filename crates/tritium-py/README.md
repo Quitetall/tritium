@@ -185,7 +185,8 @@ restart can require two packed payload sets within `max_snapshot_bytes` before
 temporary roots drop. Fresh recorded runs must start at zero; raw checkpoints
 cannot stand in for replayed journal history. Durable P/V recovery uses the
 distinct bundle below; a scale bundle is never accepted as P/V recovery.
-High-level `refine` teacher/data orchestration for P/V is not enabled yet.
+The high-level `refine` facade below can use this recipe with its original-teacher,
+bounded-data and observed held-out retention checks.
 
 After the complete declared recorded schedule, `trainer.publish` uses the same
 publication limit keys above, replays the actual TNPJ journal against the original
@@ -234,8 +235,8 @@ Save/recovery outputs cannot overlap the original parent, old work or saved
 bundle. Existing paths are not overwritten. Closed, failed or sealed recording
 is not silently reopened. `NativeScaleResumeBundle`/`resume.tnsb` remain separate
 and retain their original bytes and numerical profile. P/V recovery does not
-authenticate objective/data/teacher, qualify physical durability, or open the
-high-level P/V teacher/data facade.
+authenticate objective/data/teacher or qualify physical durability, model quality,
+or release readiness.
 
 ### Recorded scale save and restart
 
@@ -291,6 +292,13 @@ persistent-state digest must match the immutable native Torch catalog; declare
 `plan["teacher_source"] = plan["parent"]["source"]`. Official source authentication,
 arbitrary Python forward-code attestation and independent quality remain separate.
 
+The exact native plan recipe selects the existing controller: `ScaleOnly` uses
+native scale training and `AlternatingPv` uses actual native P/V code/scale
+training. Both use this same objective/data/teacher/retention orchestration; an
+invalid P/V plan never falls back to ScaleOnly. There is no separate caller label
+that can override the frozen recipe. A discrete step may keep the same codes;
+recipe identity is not a promise of code movement or improvement.
+
 ```python
 from tritium.torch import NativeRefinementConfig, refine
 
@@ -342,7 +350,7 @@ but no child. Older checkpoints are never pruned automatically. Postcommit train
 cleanup caveats are operational `publication_warnings`, not altered evidence or a
 false failed commit. Return type remains the unqualified `NativeModelRefinement`;
 legacy `RefinementConfig` and its artifact/profile gates stay unchanged. Native
-code/PV, objective/data attestation and accelerator/
+objective/data attestation and accelerator/
 distributed/physical/quality/release qualification remain open.
 
 ### Refining an existing native child
@@ -350,10 +358,10 @@ distributed/physical/quality/release qualification remain open.
 A `NativeModelRefinement` can supply actual hard starting values to another run
 without being relabeled a PTQ conversion. Obtain its exact immediate tuple with
 `child.native_refinement_parent(selected_level)`, build a new explicit plan, and
-pass it to `native_scale_training` or public `refine`. The same level label may
+pass it to `native_scale_training`, `native_pv_training` or public `refine`. The same level label may
 appear in distinct packages; exact PackageId/model/source/evidence bindings, not
 labels alone, identify the parent. New rounds start at cursor0 with fresh moments;
-the previous TNSR is not silently imported as the new optimizer state. Use a saved
+the previous TNSR/TNPV is not silently imported as the new optimizer state. Use a saved
 bundle only to resume the same new-round plan and immediate parent.
 
 The parent descriptor admits actual model/strict log/checkpoint/journal bytes.

@@ -1,4 +1,4 @@
-"""Public native ScaleOnly orchestration; observed consistency, not qualification."""
+"""Public native scale/PV orchestration; observed consistency, not qualification."""
 from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
@@ -10,7 +10,7 @@ from collections.abc import Mapping
 import torch
 import torch.nn.functional as F
 from .. import _tritium
-from .native_training import native_scale_training, _pairs
+from .native_training import native_scale_training, native_pv_training, _pairs
 from .native_load import load_native_module
 from .ptq import _hash_field, _hash_tensor, _source_model_digest, _invoke_model
 from .errors import TritiumError
@@ -43,6 +43,16 @@ def _objective(temperature):
     return _json(dict(profile="tritium.native.logit-kd@1", temperature=_temperature(temperature),
                       mask="attention-mask-and-labels@1", roundoff="per-position-clamp-zero")).encode()
 
+def _profile(plan):
+    if type(plan) is not dict:
+        raise ValueError("native refinement requires a Rust plan mapping")
+    recipe = plan.get("recipe")
+    if type(recipe) is dict and set(recipe) == {"ScaleOnly"}:
+        return _tritium._validate_native_scale_plan, native_scale_training, _tritium.NativeScaleResumeBundle
+    if type(recipe) is dict and set(recipe) == {"AlternatingPv"}:
+        return _tritium._validate_native_pv_plan, native_pv_training, _tritium.NativePvResumeBundle
+    raise ValueError("native refinement requires exactly one ScaleOnly or AlternatingPv recipe")
+
 @dataclass(frozen=True, init=False)
 class NativeRefinementConfig:
     """Frozen explicit native run inputs; not a legacy recipe or quality verdict."""
@@ -58,7 +68,8 @@ class NativeRefinementConfig:
                  data_limits, temperature=1.0, checkpoint_steps=(), checkpoint_limits=None):
         data = json.loads(plan, object_pairs_hook=_pairs) if isinstance(plan, str) else json.loads(_json(plan))
         text = _json(data)
-        _tritium._validate_native_scale_plan(text)
+        validator, _, _ = _profile(data)
+        validator(text)
         if not isinstance(level, str) or data["parent"]["level"] != level:
             raise ValueError("native refinement requires its explicit parent level")
         for label in (run_id, machine):
@@ -299,11 +310,12 @@ def refine_native(parent, *, teacher, training, validation, config, work_dir, ou
         raise TypeError("native refine requires NativeRefinementConfig and a dense teacher")
     if not isinstance(parent, (_tritium.NativeModelConversion, _tritium.NativeModelRefinement)):
         raise TypeError("native refinement requires an actual native conversion or refined parent")
-    if resume is not None and not isinstance(resume, _tritium.NativeScaleResumeBundle):
-        raise TypeError("native refinement resume requires NativeScaleResumeBundle")
+    plan, resources = config.plan, config.resources
+    _, training_factory, bundle_type = _profile(plan)
+    if resume is not None and not isinstance(resume, bundle_type):
+        raise TypeError(f"native refinement resume requires {bundle_type.__name__}")
     if on_checkpoint is not None and (not callable(on_checkpoint) or not config.checkpoint_steps):
         raise ValueError("checkpoint callback requires an explicit checkpoint schedule")
-    plan, resources = config.plan, config.resources
     if resume is not None and json.loads(resume.plan_json) != plan:
         raise ValueError("native refinement resume plan differs")
     output = _new_directory(output_dir)
@@ -354,7 +366,7 @@ def refine_native(parent, *, teacher, training, validation, config, work_dir, ou
             predecessor.eval()
             before = _evaluate(predecessor, teacher, guard, windows, config)
             del predecessor
-        trainer = native_scale_training(teacher, parent, level=config.level, plan=plan,
+        trainer = training_factory(teacher, parent, level=config.level, plan=plan,
             load_run_id=config.run_id + "-load", resume=resume,
             recording=dict(work_dir=work, max_journal_bytes=resources["publication"]["max_journal_bytes"],
                            max_working_bytes=resources["publication"]["max_replay_working_bytes"]), **resources["training"])
