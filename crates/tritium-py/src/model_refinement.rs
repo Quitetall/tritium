@@ -24,6 +24,9 @@ use tritium_train::pv_tuning::{
     verify_native_scale_child,
 };
 
+mod record;
+use record::Record;
+
 fn error(v: impl std::fmt::Display) -> PyErr {
     PyValueError::new_err(v.to_string())
 }
@@ -101,11 +104,7 @@ fn hash_file(
 fn open_recorded(
     root: &Path,
     limits: ReadLimits,
-) -> PyResult<(
-    TritModelReader<File>,
-    VerifiedLog,
-    NativeScaleChildRecordView,
-)> {
+) -> PyResult<(TritModelReader<File>, VerifiedLog, Record)> {
     limits.check()?;
     let text =
         read_original_file_bounded(&root.join("evidence.jsonl"), limits.evidence).map_err(error)?;
@@ -113,13 +112,13 @@ fn open_recorded(
     let file = open_original_file(&root.join("model.trit")).map_err(error)?;
     let package_bytes = file.metadata().map_err(error)?.len();
     let mut model = TritModelReader::open(file, limits.receiving()).map_err(error)?;
-    let view = NativeScaleChildRecordView::from_child(&log, &mut model).map_err(error)?;
+    let view = Record::open(&log, &mut model)?;
     if package_bytes > view.started().plan.limits.max_package_bytes {
         return Err(error("native refinement exceeds declared package limit"));
     }
     hash_file(
         root,
-        NATIVE_SCALE_CHECKPOINT_FILE,
+        view.names().0,
         limits
             .checkpoint
             .min(view.started().plan.limits.max_checkpoint_bytes),
@@ -128,7 +127,7 @@ fn open_recorded(
     )?;
     hash_file(
         root,
-        NATIVE_SCALE_JOURNAL_FILE,
+        view.names().1,
         limits.journal,
         view.replay().journal_bytes,
         &view.replay().journal,
@@ -208,6 +207,8 @@ pub(crate) struct NativeModelRefinement {
     parent_package_id: String,
     #[pyo3(get)]
     publication_warnings: Vec<String>,
+    #[pyo3(get)]
+    recovery_recipe: String,
     limits: ReadLimits,
 }
 impl NativeModelRefinement {
@@ -222,10 +223,7 @@ impl NativeModelRefinement {
         tritium_evidence::NativeRefinementParentView,
     )> {
         let (mut model, _, view) = self.verified(self.limits)?;
-        let parent = tritium_evidence::NativeRefinementParentView::from_refined_record(
-            &mut model, level, &view,
-        )
-        .map_err(error)?;
+        let parent = view.parent(&mut model, level)?;
         Ok((model, parent))
     }
     pub(crate) fn add_warning(&mut self, message: String) {
@@ -253,6 +251,7 @@ impl NativeModelRefinement {
             run_id: child.evidence.run().into(),
             parent_level: parent.level.clone(),
             parent_package_id: hex(parent.package.as_bytes()),
+            recovery_recipe: "scale-only".into(),
             publication_warnings: child.warnings.iter().map(|w| format!("{w:?}")).collect(),
             limits,
         }
@@ -286,20 +285,18 @@ impl NativeModelRefinement {
             parent_level: parent.level.clone(),
             parent_package_id: hex(parent.package.as_bytes()),
             publication_warnings: Vec::new(),
+            recovery_recipe: view.profile().into(),
             limits,
         })
     }
     fn verified(
         &self,
         limits: ReadLimits,
-    ) -> PyResult<(
-        TritModelReader<File>,
-        VerifiedLog,
-        NativeScaleChildRecordView,
-    )> {
+    ) -> PyResult<(TritModelReader<File>, VerifiedLog, Record)> {
         let values = open_recorded(Path::new(&self.output_dir), limits)?;
         if hex(values.0.package_id().as_bytes()) != self.package_id
             || values.1.root_digest != self.evidence_root
+            || values.2.profile() != self.recovery_recipe
         {
             return Err(error("native refinement package/evidence identity changed"));
         }
@@ -420,17 +417,14 @@ impl NativeModelRefinement {
             return Err(error("native parent/replay limits must be positive"));
         }
         let parent = crate::native_parent::NativeTrainingParent::extract(parent)?;
-        py.detach(||{
+        py.detach(|| {
             let(mut child,log,view)=self.verified(self.limits)?;
             let(mut reader,parent_view)=parent.refinement_parent_view(&view.started().plan.parent.level)?;
-            let checkpoint=read_original_file_bounded(&Path::new(&self.output_dir).join(NATIVE_SCALE_CHECKPOINT_FILE),self.limits.checkpoint.min(view.started().plan.limits.max_checkpoint_bytes).min(max_parent_bytes)).map_err(error)?;
-            let mut journal=open_original_file(&Path::new(&self.output_dir).join(NATIVE_SCALE_JOURNAL_FILE)).map_err(error)?;
-            let verified=verify_native_scale_child(NativeScaleChildVerification{parent:&mut reader,parent_evidence:&parent_view,child:&mut child,log:&log,plan:&view.started().plan,journal:&mut journal,checkpoint:&checkpoint},
-                NativeScaleParentReadLimits{max_working_bytes:max_parent_bytes,extra_payload_bytes:0},NativeScaleJournalLimits{max_journal_bytes:self.limits.journal,max_working_bytes:max_replay_working_bytes}).map_err(error)?;
+            let checkpoint=read_original_file_bounded(&Path::new(&self.output_dir).join(view.names().0),self.limits.checkpoint.min(view.started().plan.limits.max_checkpoint_bytes).min(max_parent_bytes)).map_err(error)?;
+            let mut journal=open_original_file(&Path::new(&self.output_dir).join(view.names().1)).map_err(error)?;
+            let (package,journal_id)=view.verify_with_parent(record::Sources {parent:&mut reader,parent_view:&parent_view,child:&mut child,log:&log,checkpoint:&checkpoint,journal:&mut journal},max_parent_bytes,max_replay_working_bytes,self.limits.journal)?;
             self.verified(self.limits)?;
-            Ok(serde_json::json!({"scope":"parent-backed-numerical-replay","package_id":hex(verified.package().as_bytes()),"journal_id":hex(verified.replay().summary().journal().as_bytes()),
-                "lineage_scope":"immediate-parent-only","parent_admission":parent.admission(),
-                "objective_authenticated":false,"quality_qualified":false}).to_string())
+            Ok(serde_json::json!({"scope":"parent-backed-numerical-replay","package_id":hex(package.as_bytes()),"journal_id":hex(journal_id.as_bytes()),"lineage_scope":"immediate-parent-only","parent_admission":parent.admission(),"objective_authenticated":false,"quality_qualified":false}).to_string())
         })
     }
     #[pyo3(signature=(output_dir,*,max_package_bytes=None,max_evidence_bytes=None))]
@@ -489,10 +483,8 @@ impl NativeModelRefinement {
                 .collect();
             let manifest = original.manifest().clone();
             let mut spool = open_original_file(&root.join("model.trit")).map_err(error)?;
-            let mut checkpoint =
-                open_original_file(&root.join(NATIVE_SCALE_CHECKPOINT_FILE)).map_err(error)?;
-            let mut journal =
-                open_original_file(&root.join(NATIVE_SCALE_JOURNAL_FILE)).map_err(error)?;
+            let mut checkpoint = open_original_file(&root.join(view.names().0)).map_err(error)?;
+            let mut journal = open_original_file(&root.join(view.names().1)).map_err(error)?;
             let maximum = view
                 .replay()
                 .checkpoint_bytes
@@ -501,13 +493,13 @@ impl NativeModelRefinement {
             let companions = TritModelCompanions {
                 files: vec![
                     TritModelCompanion {
-                        name: NATIVE_SCALE_CHECKPOINT_FILE,
+                        name: view.names().0,
                         source: &mut checkpoint,
                         bytes: view.replay().checkpoint_bytes,
                         content: view.replay().checkpoint,
                     },
                     TritModelCompanion {
-                        name: NATIVE_SCALE_JOURNAL_FILE,
+                        name: view.names().1,
                         source: &mut journal,
                         bytes: view.replay().journal_bytes,
                         content: view.replay().journal,
@@ -590,7 +582,7 @@ impl NativeModelRefinement {
             let log = verify_jsonl(std::str::from_utf8(&text).map_err(error)?).map_err(error)?;
             let mut reader = TritModelReader::open(std::io::Cursor::new(bytes), limits.receiving())
                 .map_err(error)?;
-            NativeScaleChildRecordView::from_child(&log, &mut reader).map_err(error)?;
+            Record::for_reader(&log, &mut reader)?;
             if hex(reader.package_id().as_bytes()) != self.package_id
                 || log.root_digest != self.evidence_root
             {

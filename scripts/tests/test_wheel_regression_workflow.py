@@ -89,6 +89,21 @@ class WheelRegressionWorkflowTests(unittest.TestCase):
             self.assertIn(f"ScalePrecision::{precision}", producer)
         self.assertIn('for mode in ["direct", "gram", "calibrated"]', producer)
 
+    def test_native_pv_corpus_probe_uses_the_installed_candidate_and_is_triggered(self):
+        workflow = (ROOT / ".github/workflows/wheels.yml").read_text(encoding="utf-8")
+        marker = "      - name: test exact-wheel native PV child loading and export\n"
+        step = workflow.split(marker, 1)[1].split("      - name:", 1)[0]
+        for value in ('TRITIUM_TEST_INSTALLED_WHEEL: "1"', "TRITIUM_TEST_CANDIDATE_WHEEL_DIR: dist",
+                      'TRITIUM_PV_TEST_PYTHON="$(python -c', "timeout 900 cargo test --locked -p tritium-train --test native_python_pv",
+                      "actual_pv_publisher_installed_python_descriptor_round_trip", "-- --ignored --exact --nocapture"):
+            self.assertIn(value, step)
+        paths = workflow.split("  pull_request:\n", 1)[1].split("  workflow_dispatch:", 1)[0]
+        self.assertIn('      - "crates/tritium-train/tests/native_python_pv.rs"', paths)
+        producer = (ROOT / "crates/tritium-train/tests/native_python_pv.rs").read_text(encoding="utf-8")
+        self.assertIn('"-I",', producer)
+        self.assertIn("publish_native_pv_child", producer)
+        self.assertIn("test_native_pv_loading.py", producer)
+
 
 if __name__ == "__main__":
     unittest.main()

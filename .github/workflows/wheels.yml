@@ -48,6 +48,7 @@ on:
       - "crates/tritium-py/**"
       - "crates/tritium-cli/tests/convert_plan_cli.rs"
       - "crates/tritium-cli/tests/convert_plan_cli/**"
+      - "crates/tritium-train/tests/native_python_pv.rs"
       # The wheel links the whole workspace, so a dependency or toolchain move can
       # break it without touching a path above. #34 bumped burn and the lockfile
       # and never reached this workflow; that bump happened to be outside the wheel's
@@ -439,6 +440,19 @@ jobs:
           TRITIUM_NATIVE_TEST_PYTHON="$(python -c 'import sys; print(sys.executable)')" \
             timeout 900 cargo test --locked -p tritium-cli --test convert_plan_cli \
             python::actual_python_file_conversion_matches_core_and_cli \
+            -- --ignored --exact --nocapture
+      - name: test exact-wheel native PV child loading and export
+        shell: bash
+        env:
+          TRITIUM_TEST_INSTALLED_WHEEL: "1"
+          TRITIUM_TEST_CANDIDATE_WHEEL_DIR: dist
+          RAYON_NUM_THREADS: "1"
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          set -euo pipefail
+          TRITIUM_PV_TEST_PYTHON="$(python -c 'import sys; print(sys.executable)')" \
+            timeout 900 cargo test --locked -p tritium-train --test native_python_pv \
+            actual_pv_publisher_installed_python_descriptor_round_trip \
             -- --ignored --exact --nocapture
       - name: test installed tutorial receipt admission
         run: >-
