@@ -26,6 +26,12 @@ the source files of the integrating crates.
   - ExLlamaV2 — (MIT)
       EXL2 quantization + 4-bit kernels.
       https://github.com/turboderp-org/exllamav2
+  - QTEA — The QTEA Authors (MIT, Copyright 2026)
+      Native group/column reference arithmetic derived from revision
+      e39bd8c0297e3427daeb404427c74cb6e202b683 (quantizer.py and qtea.py).
+      Ported files: crates/tritium-quantize/src/qtea_reference/{group,column,saliency,sparse}.rs.
+      Full upstream license: crates/tritium-quantize/src/qtea_reference/LICENSE-MIT.
+      https://github.com/Intelligent-Microsystems-Lab/QTEA
   - MiniJinja and MiniJinja contrib — Armin Ronacher (Apache-2.0)
       Fixed no-import WebAssembly chat renderer. Dependency notices (including
       conservative build-time entries) are packaged in

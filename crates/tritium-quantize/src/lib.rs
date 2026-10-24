@@ -40,6 +40,7 @@ mod conversion;
 pub mod engine;
 pub mod fisher;
 mod plane;
+pub mod qtea_reference;
 mod quantize;
 mod qwen35_coverage;
 mod recon;
