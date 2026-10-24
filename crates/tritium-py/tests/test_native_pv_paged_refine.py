@@ -155,7 +155,7 @@ def test_aggregate_code_moments_exceed_owner_cap_without_resident_fallback(tmp_p
     torch.manual_seed(103); teacher = Many(); owners = [f"layers.{i}.weight" for i in range(72)]
     parent = _convert(tmp_path, _prepared(teacher), actions={n: _fit() for n in owners},
         limits=dict(max_source_bytes=65536, max_asset_bytes=262144, max_retained_blob_bytes=1_000_000, max_package_bytes=2_000_000))
-    x = torch.linspace(-1, 1, 64).reshape(2, 32); training = [x]; validation = [x]
+    x = torch.linspace(-1, 1, 64).reshape(2, 32); training = [x]; validation = [x + 0.125]
     cfg = paged(configuration(parent, training, validation, owners=owners, lr=0.000001, steps=(1,)),
                 paging_limits=caps(max_owner_resident_bytes=18000))
     # Two f32 code moments alone exceed the admitted largest-owner payload.
