@@ -165,3 +165,42 @@ def test_aggregate_code_moments_exceed_owner_cap_without_resident_fallback(tmp_p
         work_dir=work, output_dir=tmp_path/"child", checkpoint_dir=checkpoints, on_checkpoint=saved.append)
     assert len(saved) == 1 and isinstance(saved[0], NativePvPagedResumeBundle)
     assert result.recovery_recipe == "alternating-pv" and list(work.iterdir()) == []
+
+
+@pytest.mark.parametrize("fault", ["foreign", "replacement", "callback-error"])
+def test_checkpoint_workspace_faults_preserve_foreign_bytes_and_primary_errors(tmp_path, fault):
+    teacher, parent, training, validation, work = fixture(tmp_path)
+    training = training[:1]; flags = [m.training for m in teacher.modules()]
+    cfg = paged(configuration(parent, training, validation, steps=(1,)))
+    checkpoints = tmp_path/"checkpoints"; checkpoints.mkdir(); observed = {}
+    def inject(bundle):
+        assert isinstance(bundle, NativePvPagedResumeBundle)
+        entries = list(work.iterdir()); assert len(entries) == 1 and entries[0].is_dir()
+        workspace = entries[0]; observed.update(workspace=workspace, bundle=bundle)
+        if fault == "replacement":
+            moved = workspace.with_name(workspace.name + "-moved")
+            workspace.rename(moved); workspace.mkdir(); observed["moved"] = moved
+        foreign = workspace/"caller-owned.txt"; foreign.write_text("preserve caller bytes")
+        observed["foreign"] = foreign
+        if fault == "callback-error": raise RuntimeError("intentional callback failure")
+    arguments = dict(teacher=teacher, training=training, validation=validation, config=cfg,
+        work_dir=work, output_dir=tmp_path/"child", checkpoint_dir=checkpoints, on_checkpoint=inject)
+    with pytest.warns(RuntimeWarning):
+        if fault == "foreign":
+            result = refine(parent, **arguments)
+            assert not result.quality_qualified and (tmp_path/"child").is_dir()
+        else:
+            failure = ValueError if fault == "replacement" else RuntimeError
+            message = "identity" if fault == "replacement" else "intentional callback failure"
+            with pytest.raises(failure, match=message): refine(parent, **arguments)
+            assert not (tmp_path/"child").exists()
+    assert observed["foreign"].read_text() == "preserve caller bytes"
+    assert [m.training for m in teacher.modules()] == flags
+    observed["bundle"].verify()
+    assert set(observed["workspace"].iterdir()) == {observed["foreign"]}
+    # The test alone owns these injected fixture bytes; production left them intact.
+    observed["foreign"].unlink(); observed["workspace"].rmdir()
+    if "moved" in observed:
+        assert list(observed["moved"].iterdir()) == []
+        observed["moved"].rmdir()
+    assert list(work.iterdir()) == []
