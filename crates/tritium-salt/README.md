@@ -40,6 +40,16 @@ the same `QteaModelInventory` plans as cold loading, before tensor fitting.
 The observer's input plan is observation only; its actions are not QTEA output
 recipes or completed KeepDense fitting evidence.
 
+For inspect-then-run selection, `inspect_owner(name, curvature, recipe, callback)`
+prepares actual observed bytes and returns caller-owned data from a borrowed work
+plan (proposed ADR0169). It uses the same preparation as fitting and never accesses
+the spool, fits or marks an owner complete. Inspection errors are retryable; they
+do not poison the cohort. Widened weights are dropped, not cached for execution.
+Inspection is not SPD validation, aggregate spool availability, physical admission
+or a fit receipt. Bind the selected request to the inspected work identity: fitting
+rereads the source and reconstructs the work, so changed bytes/curvature/recipes
+cannot reuse a stale request. Existing selected plan identity checks still apply.
+
 Call `fit_owner` exactly once for every canonical matrix. Supply either actual
 `QteaOwnerCurvature::Calibrated` Full/Matmul/input-only statistics or an explicit
 `Native` bound Gram; grouped/gather/Fisher data do not become an identity fallback.
@@ -50,7 +60,7 @@ through `QteaSelectedAdmission`. It never creates measurements or a completed
 frontier stage receipt. Tensor source bytes are checked and widened one at a time
 with the shared decoder; known widened/spool refusals precede fitting.
 
-Any failed/duplicate/unsupported owner poisons the unpublished cohort. `finish`
+Any failed/duplicate/unsupported `fit_owner` poisons the unpublished cohort. `finish`
 requires a complete matrix inventory and empty private Read/Write/Seek output.
 It preserves original non-matrix float state and asset bytes, adds bounded
 `qtea-fit.json` software observations, writes from the bounded spool and checks

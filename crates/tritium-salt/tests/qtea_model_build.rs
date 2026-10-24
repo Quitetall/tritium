@@ -340,22 +340,66 @@ fn fitted_builder<'a>(
         }
         if original.name.ends_with("embed_tokens.weight") {
             let g = gram(original.shape[1] as usize, model);
+            let inspected = builder
+                .inspect_owner(
+                    &original.name,
+                    QteaOwnerCurvature::Native(&g),
+                    fit_config(),
+                    |w| {
+                        Ok((
+                            w.input_id(),
+                            w.metadata(),
+                            w.memory(),
+                            w.byte_ledger(),
+                            select(w),
+                        ))
+                    },
+                )
+                .unwrap();
             builder
                 .fit_owner(
                     &original.name,
                     QteaOwnerCurvature::Native(&g),
                     fit_config(),
-                    |w| Ok(select(w)),
+                    |w| {
+                        assert_eq!(
+                            (w.input_id(), w.metadata(), w.memory(), w.byte_ledger()),
+                            (inspected.0, inspected.1, inspected.2, inspected.3)
+                        );
+                        Ok(inspected.4)
+                    },
                 )
                 .unwrap();
         } else {
             let c = calibrated(original, model);
+            let inspected = builder
+                .inspect_owner(
+                    &original.name,
+                    QteaOwnerCurvature::Calibrated(&c),
+                    fit_config(),
+                    |w| {
+                        Ok((
+                            w.input_id(),
+                            w.metadata(),
+                            w.memory(),
+                            w.byte_ledger(),
+                            select(w),
+                        ))
+                    },
+                )
+                .unwrap();
             builder
                 .fit_owner(
                     &original.name,
                     QteaOwnerCurvature::Calibrated(&c),
                     fit_config(),
-                    |w| Ok(select(w)),
+                    |w| {
+                        assert_eq!(
+                            (w.input_id(), w.metadata(), w.memory(), w.byte_ledger()),
+                            (inspected.0, inspected.1, inspected.2, inspected.3)
+                        );
+                        Ok(inspected.4)
+                    },
                 )
                 .unwrap();
         }
@@ -771,6 +815,18 @@ fn partial_spool_errors_poison_and_duplicate_owner_has_no_retry() {
             ));
         } else {
             fitted.unwrap();
+            assert!(
+                builder
+                    .inspect_owner::<()>(
+                        "model.embed_tokens.weight",
+                        QteaOwnerCurvature::Native(&g),
+                        fit_config(),
+                        |_| panic!("fitted owner reached inspector")
+                    )
+                    .unwrap_err()
+                    .to_string()
+                    .contains("duplicate")
+            );
             let mut selections = 0;
             assert!(
                 builder
@@ -845,6 +901,220 @@ fn tampered_fit_observations_never_verify_as_binding_or_qualification() {
     }
 }
 
+struct GuardedSpool {
+    inner: Cursor<Vec<u8>>,
+    forbidden: Arc<std::sync::atomic::AtomicBool>,
+}
+impl GuardedSpool {
+    fn check(&self) {
+        assert!(
+            !self.forbidden.load(std::sync::atomic::Ordering::SeqCst),
+            "inspection must not access the spool"
+        );
+    }
+}
+impl Read for GuardedSpool {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.check();
+        self.inner.read(bytes)
+    }
+}
+impl Write for GuardedSpool {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.check();
+        self.inner.write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.check();
+        self.inner.flush()
+    }
+}
+impl Seek for GuardedSpool {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.check();
+        self.inner.seek(position)
+    }
+}
+
+#[test]
+fn inspection_never_accesses_spool_or_marks_an_owner_fitted_and_errors_are_retryable() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mut raw = source(false, true, ScalePrecision::F32);
+    let p = observation_plan(&raw, false);
+    let observed = ObservedWeightSource::new(&p, &mut raw).unwrap();
+    let model = observed.source_id();
+    let forbidden = Arc::new(AtomicBool::new(false));
+    let mut builder = QteaModelBuilder::new(
+        observed,
+        QteaModelProfile::Standard,
+        campaign(),
+        GuardedSpool {
+            inner: Cursor::new(vec![]),
+            forbidden: forbidden.clone(),
+        },
+        limits(),
+    )
+    .unwrap();
+    forbidden.store(true, Ordering::SeqCst);
+    let g = gram(8, model);
+    let wrong_model = gram(8, OriginalSourceId::from_bytes([9; 32]));
+    let wrong_shape = gram(4, model);
+    for (name, curvature, config) in [
+        ("absent", &g, fit_config()),
+        ("model.norm.weight", &g, fit_config()),
+        ("model.embed_tokens.weight", &wrong_model, fit_config()),
+        ("model.embed_tokens.weight", &wrong_shape, fit_config()),
+        (
+            "model.embed_tokens.weight",
+            &g,
+            TensorFitConfig {
+                group_size: 0,
+                ..fit_config()
+            },
+        ),
+    ] {
+        let error = builder
+            .inspect_owner::<()>(name, QteaOwnerCurvature::Native(curvature), config, |_| {
+                panic!("invalid work reached inspector")
+            })
+            .unwrap_err();
+        assert!(!error.to_string().contains("poisoned"));
+    }
+    let name = "model.embed_tokens.weight";
+    let callback_error = builder
+        .inspect_owner(name, QteaOwnerCurvature::Native(&g), fit_config(), |_| {
+            Err::<(), _>(QteaModelBuildError::selection(std::io::Error::other(
+                "inspection declined",
+            )))
+        })
+        .unwrap_err();
+    assert!(callback_error.to_string().contains("inspection declined"));
+    let inspected = builder
+        .inspect_owner(name, QteaOwnerCurvature::Native(&g), fit_config(), |w| {
+            Ok(select(w))
+        })
+        .unwrap();
+    let repeated = builder
+        .inspect_owner(name, QteaOwnerCurvature::Native(&g), fit_config(), |w| {
+            Ok(w.input_id())
+        })
+        .unwrap();
+    assert_eq!(repeated, inspected.request.input_id());
+    // A successful inspection leaves the cohort incomplete, and finish refuses
+    // before touching its guarded spool or output.
+    let mut output = Cursor::new(vec![]);
+    assert!(
+        builder
+            .finish(&mut output)
+            .unwrap_err()
+            .to_string()
+            .contains("unfitted")
+    );
+    assert!(output.into_inner().is_empty());
+}
+
+#[test]
+fn inspection_is_not_spd_validation_or_native_fit_success() {
+    let mut raw = source(false, true, ScalePrecision::F32);
+    let p = observation_plan(&raw, false);
+    let observed = ObservedWeightSource::new(&p, &mut raw).unwrap();
+    let model = observed.source_id();
+    let mut singular =
+        InputGramAccumulator::new_bound(8, gram(8, model).source_id().unwrap(), 0).unwrap();
+    singular.accumulate_batch(&[0.; 64], 8, None, None).unwrap();
+    let singular = singular.finish().unwrap();
+    let mut builder = QteaModelBuilder::new(
+        observed,
+        QteaModelProfile::Standard,
+        campaign(),
+        Cursor::new(vec![]),
+        limits(),
+    )
+    .unwrap();
+    let selection = builder
+        .inspect_owner(
+            "model.embed_tokens.weight",
+            QteaOwnerCurvature::Native(&singular),
+            fit_config(),
+            |w| Ok(select(w)),
+        )
+        .unwrap();
+    let mut calls = 0;
+    assert!(
+        builder
+            .fit_owner(
+                "model.embed_tokens.weight",
+                QteaOwnerCurvature::Native(&singular),
+                fit_config(),
+                |_| {
+                    calls += 1;
+                    Ok(selection)
+                }
+            )
+            .is_err()
+    );
+    assert_eq!(calls, 1);
+    assert!(
+        builder
+            .inspect_owner::<()>(
+                "model.embed_tokens.weight",
+                QteaOwnerCurvature::Native(&singular),
+                fit_config(),
+                |_| panic!("poisoned work inspected")
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("poisoned")
+    );
+    let mut output = Cursor::new(vec![]);
+    assert!(builder.finish(&mut output).is_err());
+    assert!(output.into_inner().is_empty());
+}
+
+#[test]
+fn inspection_enforces_the_same_widened_native_work_and_wire_caps() {
+    for fault in 0..5 {
+        let mut raw = source(false, true, ScalePrecision::F32);
+        let p = observation_plan(&raw, false);
+        let observed = ObservedWeightSource::new(&p, &mut raw).unwrap();
+        let g = gram(8, observed.source_id());
+        let mut caps = limits();
+        match fault {
+            0 => caps.max_widened_tensor_bytes = 1,
+            1 => caps.max_native_work_bytes = 1,
+            2 => caps.max_tensor_work_bytes = 1,
+            3 => caps.model.tensor.max_tensor_bytes = 1,
+            _ => caps.model.tensor.max_validation_bytes = 1,
+        }
+        let mut builder = QteaModelBuilder::new(
+            observed,
+            QteaModelProfile::Standard,
+            campaign(),
+            Cursor::new(vec![]),
+            caps,
+        )
+        .unwrap();
+        let inspect = builder
+            .inspect_owner::<()>(
+                "model.embed_tokens.weight",
+                QteaOwnerCurvature::Native(&g),
+                fit_config(),
+                |_| panic!("over-cap work reached inspector"),
+            )
+            .unwrap_err();
+        let fit = builder
+            .fit_owner(
+                "model.embed_tokens.weight",
+                QteaOwnerCurvature::Native(&g),
+                fit_config(),
+                |_| panic!("over-cap work reached selector"),
+            )
+            .unwrap_err();
+        assert_eq!(inspect.to_string(), fit.to_string());
+        assert!(!fit.to_string().contains("poisoned"));
+    }
+}
+
 struct SharedSource(std::rc::Rc<std::cell::RefCell<InMemoryWeightSource>>);
 impl WeightSource for SharedSource {
     fn inventory(
@@ -881,6 +1151,98 @@ impl WeightSource for SharedSource {
         Ok(std::borrow::Cow::Owned(
             self.0.borrow_mut().input_gram(name, max)?.into_owned(),
         ))
+    }
+}
+
+#[test]
+fn execution_rereads_original_and_refuses_stale_curvature_or_recipe_selection() {
+    for fault in 0..3 {
+        let data = std::rc::Rc::new(std::cell::RefCell::new(source(
+            false,
+            true,
+            ScalePrecision::F32,
+        )));
+        let mut raw = SharedSource(data.clone());
+        let p = observation_plan(&raw, false);
+        let observed = ObservedWeightSource::new(&p, &mut raw).unwrap();
+        let model = observed.source_id();
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut builder = QteaModelBuilder::new(
+            observed,
+            QteaModelProfile::Standard,
+            campaign(),
+            BrokenStream {
+                inner: Cursor::new(vec![]),
+                left: usize::MAX,
+                writes: writes.clone(),
+            },
+            limits(),
+        )
+        .unwrap();
+        let name = "model.embed_tokens.weight";
+        let g = gram(8, model);
+        let selection = builder
+            .inspect_owner(name, QteaOwnerCurvature::Native(&g), fit_config(), |w| {
+                Ok(select(w))
+            })
+            .unwrap();
+        let mut changed = InputGramAccumulator::new_bound(8, g.source_id().unwrap(), 0).unwrap();
+        let mut values = [0.; 64];
+        for c in 0..8 {
+            values[c * 8 + c] = 2.;
+        }
+        changed.accumulate_batch(&values, 8, None, None).unwrap();
+        let changed = changed.finish().unwrap();
+        let curvature = if fault == 1 { &changed } else { &g };
+        let config = if fault == 2 {
+            TensorFitConfig {
+                salient_ratio: 0.,
+                ..fit_config()
+            }
+        } else {
+            fit_config()
+        };
+        if fault == 0 {
+            data.borrow_mut().tensors.get_mut(name).unwrap().bytes[0] ^= 1;
+            let error = builder
+                .inspect_owner::<()>(name, QteaOwnerCurvature::Native(curvature), config, |_| {
+                    panic!("changed original reached inspector")
+                })
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("observed tensor content changed"),
+                "{error}"
+            );
+        } else {
+            let changed_id = builder
+                .inspect_owner(name, QteaOwnerCurvature::Native(curvature), config, |w| {
+                    Ok(w.input_id())
+                })
+                .unwrap();
+            assert_ne!(changed_id, selection.request.input_id());
+        }
+        let mut calls = 0;
+        let error = builder
+            .fit_owner(name, QteaOwnerCurvature::Native(curvature), config, |_| {
+                calls += 1;
+                Ok(selection)
+            })
+            .unwrap_err();
+        assert_eq!(calls, usize::from(fault != 0));
+        if fault == 0 {
+            assert!(
+                error
+                    .to_string()
+                    .contains("observed tensor content changed"),
+                "{error}"
+            );
+        }
+        assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let mut output = Cursor::new(vec![]);
+        assert!(builder.finish(&mut output).is_err());
+        assert!(output.into_inner().is_empty());
     }
 }
 #[test]
@@ -1036,6 +1398,20 @@ fn grouped_and_gather_statistics_are_not_relabelled_or_retried_as_native() {
         )
         .unwrap();
         let mut selections = 0;
+        let inspected_error = builder
+            .inspect_owner::<()>(
+                "model.embed_tokens.weight",
+                QteaOwnerCurvature::Calibrated(&c),
+                fit_config(),
+                |_| panic!("unsupported capture reached inspector"),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            std::error::Error::source(&inspected_error)
+                .unwrap()
+                .downcast_ref::<QteaCalibrationError>(),
+            Some(QteaCalibrationError::RequiresInputOnlyFullGram)
+        ));
         let error = builder
             .fit_owner(
                 "model.embed_tokens.weight",

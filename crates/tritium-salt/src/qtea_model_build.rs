@@ -189,6 +189,76 @@ pub struct QteaModelBuilder<'a, S> {
     record: QteaModelBuildRecord,
     poisoned: bool,
 }
+/// One freshly verified and widened owner, dropped after inspection or fitting.
+/// Never retained across the inspect/execute source revalidation boundary.
+struct PreparedOwner {
+    binding: QuantSourceBinding,
+    index: u32,
+    weights: Vec<f32>,
+}
+impl PreparedOwner {
+    fn work<'a>(
+        &'a self,
+        curvature: QteaOwnerCurvature<'a>,
+        config: TensorFitConfig,
+        source_model: OriginalSourceId,
+        campaign: ContentId,
+        limits: QteaModelBuildLimits,
+    ) -> Result<(QteaTensorWorkPlan<'a>, &'static str), QteaModelBuildError> {
+        let origin = QteaTensorOrigin {
+            source_id: campaign,
+            owner: &self.binding.source.name,
+            tensor_index: self.index,
+            source_tensor_digest: *self.binding.content.as_bytes(),
+        };
+        match curvature {
+            QteaOwnerCurvature::Calibrated(calibration) => Ok((
+                QteaTensorWorkPlan::from_calibrated(
+                    QteaCalibratedTensorInput {
+                        original: &self.binding.source,
+                        source_model,
+                        weights: &self.weights,
+                        calibration,
+                        origin,
+                    },
+                    config,
+                    limits.model.tensor,
+                    limits.max_native_work_bytes,
+                    limits.max_tensor_work_bytes,
+                )
+                .map_err(cause)?,
+                "captured_full_matmul",
+            )),
+            QteaOwnerCurvature::Native(gram) => {
+                if gram
+                    .source_id()
+                    .is_none_or(|s| s.source_model_digest() != *source_model.as_bytes())
+                {
+                    return Err(fail("native Gram source-model mismatch"));
+                }
+                let numerical = TensorFit::plan(
+                    &self.weights,
+                    usize::try_from(self.binding.source.shape[0]).map_err(cause)?,
+                    usize::try_from(self.binding.source.shape[1]).map_err(cause)?,
+                    gram,
+                    config,
+                    limits.max_native_work_bytes,
+                )
+                .map_err(cause)?;
+                Ok((
+                    QteaTensorWorkPlan::new(
+                        numerical,
+                        origin,
+                        limits.model.tensor,
+                        limits.max_tensor_work_bytes,
+                    )
+                    .map_err(cause)?,
+                    "native_supplied",
+                ))
+            }
+        }
+    }
+}
 impl<S> std::fmt::Debug for QteaModelBuilder<'_, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QteaModelBuilder")
@@ -327,6 +397,37 @@ impl<'a, S: Read + Write + Seek> QteaModelBuilder<'a, S> {
             poisoned: false,
         })
     }
+    /// Inspect actual owner work without fitting, spool access or owner insertion.
+    /// The callback can select admission or copy planning data, but only borrows
+    /// the plan. Widened weights are dropped on return, never cached for execution.
+    /// Errors do not poison this cohort. Already fitted/poisoned owners are refused.
+    ///
+    /// Not SPD/fit success, aggregate spool availability, machine/physical admission
+    /// or source authentication. A later fit rereads the source and reconstructs
+    /// work; the caller must bind its selected request to that exact work identity.
+    /// # Errors
+    /// Source/owner/curvature, allocation and numerical/work cap refusals shared
+    /// with fitting, or the caller's inspection error. No spool operation occurs.
+    pub fn inspect_owner<R>(
+        &mut self,
+        name: &str,
+        curvature: QteaOwnerCurvature<'_>,
+        config: TensorFitConfig,
+        inspect: impl FnOnce(&QteaTensorWorkPlan<'_>) -> Result<R, QteaModelBuildError>,
+    ) -> Result<R, QteaModelBuildError> {
+        if self.poisoned {
+            return Err(fail("QTEA cohort is poisoned"));
+        }
+        let prepared = self.prepare_owner(name)?;
+        let (work, _) = prepared.work(
+            curvature,
+            config,
+            self.record.source_model,
+            self.record.campaign,
+            self.limits,
+        )?;
+        inspect(&work)
+    }
     /// Fit one canonical matrix from its actual observed raw bytes and explicit
     /// curvature. Runs the existing exact admission before the native fitter.
     /// Any refusal poisons this cohort; no retry/fallback or measured receipt.
@@ -346,19 +447,19 @@ impl<'a, S: Read + Write + Seek> QteaModelBuilder<'a, S> {
             return Err(fail("QTEA cohort is poisoned"));
         }
         self.poisoned = true;
-        self.fit_checked(name, curvature, config, select)?;
+        let prepared = self.prepare_owner(name)?;
+        let (work, kind) = prepared.work(
+            curvature,
+            config,
+            self.record.source_model,
+            self.record.campaign,
+            self.limits,
+        )?;
+        self.fit_planned(work, kind, select)?;
         self.poisoned = false;
         Ok(())
     }
-    fn fit_checked(
-        &mut self,
-        name: &str,
-        curvature: QteaOwnerCurvature<'_>,
-        config: TensorFitConfig,
-        select: impl FnOnce(
-            &QteaTensorWorkPlan<'_>,
-        ) -> Result<QteaSelectedAdmission, QteaModelBuildError>,
-    ) -> Result<(), QteaModelBuildError> {
+    fn prepare_owner(&mut self, name: &str) -> Result<PreparedOwner, QteaModelBuildError> {
         let (index, binding) = self
             .record
             .source_tensors
@@ -403,58 +504,23 @@ impl<'a, S: Read + Write + Seek> QteaModelBuilder<'a, S> {
             decoder.push(&raw).map_err(cause)?;
             decoder.finish().map_err(cause)?;
         }
-        let origin = QteaTensorOrigin {
-            source_id: self.record.campaign,
-            owner: name,
-            tensor_index: u32::try_from(index).map_err(cause)?,
-            source_tensor_digest: *binding.content.as_bytes(),
-        };
-        let (work, kind) = match curvature {
-            QteaOwnerCurvature::Calibrated(calibration) => (
-                QteaTensorWorkPlan::from_calibrated(
-                    QteaCalibratedTensorInput {
-                        original: &binding.source,
-                        source_model: self.record.source_model,
-                        weights: &weights,
-                        calibration,
-                        origin,
-                    },
-                    config,
-                    self.limits.model.tensor,
-                    self.limits.max_native_work_bytes,
-                    self.limits.max_tensor_work_bytes,
-                )
-                .map_err(cause)?,
-                "captured_full_matmul",
-            ),
-            QteaOwnerCurvature::Native(gram) => {
-                if gram
-                    .source_id()
-                    .is_none_or(|s| s.source_model_digest() != *self.record.source_model.as_bytes())
-                {
-                    return Err(fail("native Gram source-model mismatch"));
-                }
-                let numerical = TensorFit::plan(
-                    &weights,
-                    *rows as usize,
-                    *cols as usize,
-                    gram,
-                    config,
-                    self.limits.max_native_work_bytes,
-                )
-                .map_err(cause)?;
-                (
-                    QteaTensorWorkPlan::new(
-                        numerical,
-                        origin,
-                        self.limits.model.tensor,
-                        self.limits.max_tensor_work_bytes,
-                    )
-                    .map_err(cause)?,
-                    "native_supplied",
-                )
-            }
-        };
+        Ok(PreparedOwner {
+            binding,
+            index: u32::try_from(index).map_err(cause)?,
+            weights,
+        })
+    }
+    fn fit_planned(
+        &mut self,
+        work: QteaTensorWorkPlan<'_>,
+        kind: &'static str,
+        select: impl FnOnce(
+            &QteaTensorWorkPlan<'_>,
+        ) -> Result<QteaSelectedAdmission, QteaModelBuildError>,
+    ) -> Result<(), QteaModelBuildError> {
+        let origin = work.origin();
+        let name = origin.owner;
+        let metadata = work.metadata();
         let offset = self.spool.seek(SeekFrom::End(0)).map_err(cause)?;
         let available = self
             .limits
@@ -487,8 +553,8 @@ impl<'a, S: Read + Write + Seek> QteaModelBuilder<'a, S> {
             name.into(),
             QteaModelTensor::Qtea {
                 blob,
-                rows: *rows,
-                columns: *cols,
+                rows: metadata.rows as u64,
+                columns: metadata.columns as u64,
             },
         );
         self.blobs.push(TritSpoolBlob {
@@ -499,7 +565,7 @@ impl<'a, S: Read + Write + Seek> QteaModelBuilder<'a, S> {
         });
         self.record.fits.push(QteaOwnerFitObservation {
             name: name.into(),
-            source_tensor_index: u32::try_from(index).map_err(cause)?,
+            source_tensor_index: origin.tensor_index,
             curvature: kind.into(),
             input_id: result.input_id(),
             plan_id: fitted.plan_id(),
