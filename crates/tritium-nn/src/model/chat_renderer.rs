@@ -60,6 +60,8 @@ const GUEST_MEMORY_BYTES: usize = 32 * 1024 * 1024;
 const GUEST_FUEL: u64 = 50_000_000;
 
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+pub(super) static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn error(message: impl std::fmt::Display) -> NnError {
     NnError::Tokenizer(format!("source chat template: {message}"))
@@ -313,7 +315,7 @@ impl SourceChatTemplate {
 mod tests {
     use super::*;
 
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::TEST_SERIAL as SERIAL;
 
     fn source(text: &str) -> SourceChatTemplate {
         SourceChatTemplate::from_config(json!({"chat_template":text}).as_object().unwrap())

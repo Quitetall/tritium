@@ -4,12 +4,11 @@ use super::{
     hf::{NameSchema, declared_vocab_size, resolve_optional_attention_names},
     standard::{StandardModelPlan, TensorGeometry},
 };
-use crate::{ArchSpec, HostQteaLinear, ModelConfig, NnError, Projection, TokenEmbedding};
+use crate::{ArchSpec, ModelConfig, NnError, Projection, TokenEmbedding};
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     io::{Read, Seek},
-    sync::Arc,
 };
 use tritium_format::{
     TritPackageReadLimits,
@@ -30,18 +29,86 @@ pub struct HostQteaModelLimits {
     /// Maximum staging bytes per individual projection/gather call, not concurrent aggregate.
     pub max_staging_bytes: usize,
 }
-fn invalid(message: &str) -> NnError {
+pub(super) fn invalid(message: &str) -> NnError {
     NnError::InvalidArtifact(message.into())
 }
-fn failure(error: impl core::fmt::Display) -> NnError {
+pub(super) fn failure(error: impl core::fmt::Display) -> NnError {
     NnError::InvalidArtifact(error.to_string())
 }
-fn add_weight(used: &mut usize, bytes: usize, limit: usize) -> Result<(), NnError> {
+pub(super) fn add_weight(used: &mut usize, bytes: usize, limit: usize) -> Result<(), NnError> {
     *used = used
         .checked_add(bytes)
         .filter(|sum| *sum <= limit)
         .ok_or_else(|| invalid("QTEA weight payload ceiling exceeded"))?;
     Ok(())
+}
+
+#[cfg(feature = "tokenizer")]
+pub(super) fn read_tokenizer<R: Read + Seek>(
+    reader: &mut QteaModelReader<R>,
+    vocab: usize,
+) -> Result<super::HfJsonTokenizer, NnError> {
+    for (name, cap) in [
+        ("tokenizer.json", 256_u64 * 1024 * 1024),
+        ("tokenizer_config.json", 1024 * 1024),
+    ] {
+        let bytes = reader
+            .asset_bytes(name)
+            .map_err(|error| NnError::Tokenizer(error.to_string()))?;
+        if bytes > cap {
+            return Err(NnError::Tokenizer(format!(
+                "{name} exceeds QTEA text source size limit"
+            )));
+        }
+    }
+    let token_bytes = reader
+        .asset("tokenizer.json")
+        .map_err(|error| NnError::Tokenizer(error.to_string()))?;
+    let config_bytes = reader
+        .asset("tokenizer_config.json")
+        .map_err(|error| NnError::Tokenizer(error.to_string()))?;
+    let tokenizer = super::HfJsonTokenizer::from_bytes(&token_bytes, &config_bytes)?;
+    tokenizer.validate_model_vocab(vocab)?;
+    Ok(tokenizer)
+}
+
+#[cfg(feature = "tokenizer")]
+pub(super) fn publish(
+    mut runner: super::Runner,
+    tokenizer: super::HfJsonTokenizer,
+    package: tritium_format::PackageId,
+    expected_source_model: [u8; 32],
+    physical_device: String,
+    context: tritium_runtime::TensorUploadContext<'_>,
+) -> Result<super::LoadedModel, NnError> {
+    runner.qtea_package = Some(package);
+    let architecture = runner.architecture().clone();
+    let observation = tritium_schema::ModelLoaded {
+        source: tritium_schema::LoadedSourceIdentity::Qtea {
+            package_id: tritium_schema::PackageId::from_bytes(*package.as_bytes()),
+            declared_source_model: expected_source_model,
+        },
+        architecture: architecture.name().into(),
+        backend: "qtea-scalar-host".into(),
+        physical_device,
+        vocab_size: architecture.vocab_size() as u64,
+        layer_count: architecture.layer_count() as u64,
+    };
+    let receipt = context
+        .recorder
+        .emit_model_loaded(
+            context.span,
+            context.parent,
+            context.logical_time,
+            &observation,
+        )
+        .map_err(|e| NnError::Backend(format!("model load evidence: {e}")))?;
+    Ok(super::LoadedModel {
+        runner,
+        tokenizer,
+        architecture,
+        receipt,
+    })
 }
 
 impl ModelWeights {
@@ -122,75 +189,18 @@ impl ModelWeights {
                 QteaModelTensor::Vector { length, .. } => {
                     TensorGeometry::Vector { length: *length }
                 }
+                QteaModelTensor::Preserved { .. } => TensorGeometry::Unsupported,
             })
         })?;
-        let mut planned = 0;
-        let mut unique = BTreeSet::new();
-        for (name, tensor) in &manifest.tensors {
-            let bytes = match tensor {
-                QteaModelTensor::Qtea { blob, .. } if unique.insert(*blob.as_bytes()) => {
-                    usize::try_from(reader.tensor_bytes(name).map_err(failure)?).map_err(failure)?
-                }
-                QteaModelTensor::Qtea { .. } => 0,
-                QteaModelTensor::Vector { length, .. } => usize::try_from(*length)
-                    .map_err(failure)?
-                    .checked_mul(4)
-                    .ok_or_else(|| invalid("QTEA vector size overflow"))?,
-            };
-            add_weight(&mut planned, bytes, limits.max_weight_bytes)?;
-        }
-        // Retain only a bounded metadata inventory while mutable reads proceed.
-        let names: Vec<_> = manifest.tensors.keys().cloned().collect();
+        super::qtea_owners::plan(&reader, limits.max_weight_bytes)?;
         let admission = admit(&mut reader, &config, vocab)?;
-        let mut packed = BTreeMap::new();
-        let mut vectors = BTreeMap::new();
-        let mut cache = BTreeMap::<[u8; 32], Arc<HostQteaLinear>>::new();
-        let mut retained = 0;
-        for name in names {
-            match reader.manifest().tensors[&name].clone() {
-                QteaModelTensor::Qtea {
-                    blob,
-                    rows,
-                    columns,
-                } => {
-                    let key = *blob.as_bytes();
-                    let matrix = if let Some(matrix) = cache.get(&key) {
-                        if matrix.rows() as u64 != rows || matrix.columns() as u64 != columns {
-                            return Err(invalid(
-                                "shared QTEA blob has incompatible owner geometry",
-                            ));
-                        }
-                        Arc::clone(matrix)
-                    } else {
-                        let tensor = reader.qtea(&name).map_err(failure)?;
-                        add_weight(
-                            &mut retained,
-                            tensor.buffer_capacity_bytes(),
-                            limits.max_weight_bytes,
-                        )?;
-                        let matrix = Arc::new(HostQteaLinear::from_tensor(
-                            tensor,
-                            limits.max_staging_bytes,
-                        ));
-                        cache.insert(key, Arc::clone(&matrix));
-                        matrix
-                    };
-                    packed.insert(name, matrix);
-                }
-                QteaModelTensor::Vector { .. } => {
-                    let values = reader.vector(&name).map_err(failure)?;
-                    add_weight(
-                        &mut retained,
-                        values
-                            .capacity()
-                            .checked_mul(4)
-                            .ok_or_else(|| invalid("QTEA vector capacity overflow"))?,
-                        limits.max_weight_bytes,
-                    )?;
-                    vectors.insert(name, values);
-                }
-            }
-        }
+        let owners = super::qtea_owners::read(&mut reader, limits)?;
+        let mut packed = owners.matrices;
+        let vectors = owners
+            .preserved
+            .into_iter()
+            .map(|(name, (_, values))| (name, values))
+            .collect::<BTreeMap<_, _>>();
         let embedding = packed
             .remove(NameSchema::Hf.top("token_embd"))
             .ok_or_else(|| invalid("QTEA embedding absent"))?;
@@ -285,61 +295,21 @@ impl super::LoadedModel {
                 limits,
                 |reader, config, vocab| {
                     let admission = super::CacheAdmission::standard(config, stream)?;
-                    for (name, cap) in [
-                        ("tokenizer.json", 256_u64 * 1024 * 1024),
-                        ("tokenizer_config.json", 1024 * 1024),
-                    ] {
-                        let bytes = reader
-                            .asset_bytes(name)
-                            .map_err(|error| NnError::Tokenizer(error.to_string()))?;
-                        if bytes > cap {
-                            return Err(NnError::Tokenizer(format!(
-                                "{name} exceeds QTEA text source size limit"
-                            )));
-                        }
-                    }
-                    let token_bytes = reader
-                        .asset("tokenizer.json")
-                        .map_err(|error| NnError::Tokenizer(error.to_string()))?;
-                    let config_bytes = reader
-                        .asset("tokenizer_config.json")
-                        .map_err(|error| NnError::Tokenizer(error.to_string()))?;
-                    let tokenizer =
-                        super::HfJsonTokenizer::from_bytes(&token_bytes, &config_bytes)?;
-                    tokenizer.validate_model_vocab(vocab)?;
+                    let tokenizer = read_tokenizer(reader, vocab)?;
                     Ok((admission, tokenizer))
                 },
             )?;
         let backend = tritium_cpu::CpuBackend::new();
-        let observation = tritium_schema::ModelLoaded {
-            source: tritium_schema::LoadedSourceIdentity::Qtea {
-                package_id: tritium_schema::PackageId::from_bytes(*package.as_bytes()),
-                declared_source_model: expected_source_model,
-            },
-            architecture: config.arch.clone(),
-            backend: "qtea-scalar-host".into(),
-            physical_device: tritium_spec::TernaryBackend::physical_device_id(&backend).to_owned(),
-            vocab_size: u64::try_from(weights.vocab).map_err(failure)?,
-            layer_count: u64::from(config.n_layers),
-        };
-        let mut runner =
+        let physical_device = tritium_spec::TernaryBackend::physical_device_id(&backend).to_owned();
+        let runner =
             super::Runner::standard(config, weights, Box::new(backend), spec, Some(admission))?;
-        runner.qtea_package = Some(package);
-        let architecture = runner.architecture().clone();
-        let receipt = context
-            .recorder
-            .emit_model_loaded(
-                context.span,
-                context.parent,
-                context.logical_time,
-                &observation,
-            )
-            .map_err(|error| NnError::Backend(format!("model load evidence: {error}")))?;
-        Ok(Self {
+        publish(
             runner,
             tokenizer,
-            architecture,
-            receipt,
-        })
+            package,
+            expected_source_model,
+            physical_device,
+            context,
+        )
     }
 }

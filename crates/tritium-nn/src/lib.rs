@@ -53,6 +53,8 @@ pub use layers::{
     Qwen35FullAttentionWeights, Relu2Mlp, SaltLinear, SwiGluMlp, TensorLoader, TernaryLinear,
     TokenEmbedding, TransformerBlock,
 };
+#[cfg(all(feature = "host-qtea", feature = "tokenizer"))]
+pub use model::HostQteaHybridModelLimits;
 #[cfg(feature = "host-qtea")]
 pub use model::HostQteaModelLimits;
 #[cfg(all(feature = "host-qtea", feature = "tokenizer"))]

@@ -58,7 +58,9 @@ Readiness reports `production_artifact=false`, no production startup receipt,
 host execution and the actual bounded context/segment. Logical caps do not
 measure RSS; HTTP200 from a synthetic model is not pretrained coherence,
 original-source authentication, security clearance or release qualification.
-Hybrid Qwen/MTP import and physical/runtime/quality release gates remain open.
+The explicit hybrid load profile is described in the shared NN contract; its
+language/MTP matrices stay packed and MTP remains Unverified. Real-model capture
+and physical/runtime/quality release gates remain open.
 
 ## Typed portable candidates
 

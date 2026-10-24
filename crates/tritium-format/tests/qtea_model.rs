@@ -105,6 +105,150 @@ fn open(
     QteaModelReader::open(Cursor::new(bytes), receiving(), caps, [3; 32])
 }
 
+fn hybrid_fixture() -> Fixture {
+    let mut f = Fixture::new();
+    f.manifest.profile = tritium_format::qtea::model::QTEA_HYBRID_MODEL_PROFILE.into();
+    let values = (0..8)
+        .map(|i| i as f32 / 8.)
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    f.manifest.tensors.insert(
+        "conv".into(),
+        QteaModelTensor::Preserved {
+            blob: id(&values),
+            shape: vec![2, 1, 4],
+            precision: ScalePrecision::F32,
+        },
+    );
+    f.blobs
+        .push((TritBlobKind::DenseTensor(DType::F32), values));
+    f
+}
+fn hybrid_bytes(f: &Fixture) -> Vec<u8> {
+    let metadata =
+        tritium_format::qtea::model::encode_qtea_hybrid_model_manifest(&f.manifest, 16384).unwrap();
+    write_trit_package_bounded(&metadata, &f.blob_refs(), 1 << 20).unwrap()
+}
+fn open_hybrid(
+    bytes: Vec<u8>,
+    cap: usize,
+) -> Result<QteaModelReader<Cursor<Vec<u8>>>, QteaModelError> {
+    QteaModelReader::open_hybrid(
+        Cursor::new(bytes),
+        receiving(),
+        tritium_format::qtea::model::QteaHybridModelReadLimits {
+            base: limits(),
+            max_preserved_tensor_elements: cap,
+        },
+        [3; 32],
+    )
+}
+#[test]
+fn explicit_hybrid_profile_retains_shapes_and_never_changes_standard_admission() {
+    let f = hybrid_fixture();
+    let bytes = hybrid_bytes(&f);
+    assert!(open(bytes.clone(), limits()).is_err());
+    assert!(open_hybrid(Fixture::new().bytes(), 8).is_err());
+    assert!(encode_qtea_model_manifest(&f.manifest, 16384).is_err());
+    let mut reader = open_hybrid(bytes.clone(), 8).unwrap();
+    assert_eq!(
+        reader.preserved("conv").unwrap(),
+        (0..8).map(|i| i as f32 / 8.).collect::<Vec<_>>()
+    );
+    assert!(reader.vector("conv").is_err());
+    assert!(reader.preserved("norm").is_err());
+    reader.qtea("matrix").unwrap();
+    reader.vector("norm").unwrap();
+    reader.verify().unwrap();
+    assert!(open_hybrid(bytes.clone(), 7).is_err());
+    assert!(open_hybrid(bytes, 0).is_err());
+}
+#[test]
+fn hybrid_preserved_rank_product_length_and_numerics_are_separate_refusals() {
+    for shape in [
+        vec![],
+        vec![8],
+        vec![2, 0, 4],
+        vec![1; 5],
+        vec![u64::MAX, 2],
+    ] {
+        let mut f = hybrid_fixture();
+        let QteaModelTensor::Preserved { shape: stored, .. } =
+            f.manifest.tensors.get_mut("conv").unwrap()
+        else {
+            unreachable!()
+        };
+        *stored = shape;
+        assert!(
+            tritium_format::qtea::model::encode_qtea_hybrid_model_manifest(&f.manifest, 16384)
+                .is_err()
+        );
+    }
+    let mut f = hybrid_fixture();
+    let QteaModelTensor::Preserved { shape, .. } = f.manifest.tensors.get_mut("conv").unwrap()
+    else {
+        unreachable!()
+    };
+    *shape = vec![2, 1, 3];
+    assert!(open_hybrid(hybrid_bytes(&f), 8).is_err());
+    let mut f = hybrid_fixture();
+    let payload = f.blobs.last_mut().unwrap();
+    payload.1[0..4].copy_from_slice(&f32::NAN.to_le_bytes());
+    let QteaModelTensor::Preserved { blob, .. } = f.manifest.tensors.get_mut("conv").unwrap()
+    else {
+        unreachable!()
+    };
+    *blob = id(&payload.1);
+    let mut reader = open_hybrid(hybrid_bytes(&f), 8).unwrap();
+    assert!(reader.preserved("conv").is_err());
+}
+
+#[test]
+fn hybrid_preserved_precisions_widen_without_shape_loss() {
+    for precision in [
+        ScalePrecision::F16,
+        ScalePrecision::Bf16,
+        ScalePrecision::F32,
+    ] {
+        let mut f = hybrid_fixture();
+        let (dtype, bytes) = match precision {
+            ScalePrecision::F16 => (
+                DType::F16,
+                vec![half::f16::from_f32(0.125).to_bits().to_le_bytes(); 8]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>(),
+            ),
+            ScalePrecision::Bf16 => (
+                DType::BF16,
+                vec![half::bf16::from_f32(0.125).to_bits().to_le_bytes(); 8]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>(),
+            ),
+            _ => (
+                DType::F32,
+                vec![0.125_f32.to_le_bytes(); 8]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>(),
+            ),
+        };
+        f.manifest.tensors.insert(
+            "conv".into(),
+            QteaModelTensor::Preserved {
+                blob: id(&bytes),
+                shape: vec![2, 1, 4],
+                precision,
+            },
+        );
+        *f.blobs.last_mut().unwrap() = (TritBlobKind::DenseTensor(dtype), bytes);
+        let mut reader = open_hybrid(hybrid_bytes(&f), 8).unwrap();
+        assert_eq!(reader.preserved("conv").unwrap(), [0.125; 8]);
+        reader.verify().unwrap();
+    }
+}
+
 #[test]
 fn named_model_uses_existing_envelope_and_spool_without_relabelling() {
     let fixture = Fixture::new();

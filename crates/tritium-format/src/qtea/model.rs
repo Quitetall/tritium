@@ -10,8 +10,10 @@ use std::{
 use tritium_core::DType;
 use tritium_schema::{BlobId, ScalePrecision};
 
-/// Only supported residual-bearing model manifest profile.
+/// Standard-transformer residual-bearing model manifest profile.
 pub const QTEA_MODEL_PROFILE: &str = "tritium.qtea-model.v1";
+/// Separate exact-shaped hybrid language/MTP profile; not admitted by standard readers.
+pub const QTEA_HYBRID_MODEL_PROFILE: &str = "tritium.qtea-hybrid-model.v1";
 
 /// One exact named physical owner. Matrices cannot use a dense fallback.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,23 +37,38 @@ pub enum QteaModelTensor {
         /// Original stored floating-point precision.
         precision: ScalePrecision,
     },
+    /// Exact higher-rank non-matrix state, only in the explicitly hybrid profile.
+    /// Architecture admission must still prove this is a preserved role, not a
+    /// dense projection fallback. Rank is bounded to2..=4 by the wire reader.
+    Preserved {
+        /// Exact stored blob identity.
+        blob: BlobId,
+        /// Original unflattened positive dimensions.
+        shape: Vec<u64>,
+        /// Original finite floating-point precision.
+        precision: ScalePrecision,
+    },
 }
 impl QteaModelTensor {
     /// Exact original blob identity, not a source-owner attestation.
     pub const fn blob(&self) -> BlobId {
         match self {
-            Self::Qtea { blob, .. } | Self::Vector { blob, .. } => *blob,
+            Self::Qtea { blob, .. } | Self::Vector { blob, .. } | Self::Preserved { blob, .. } => {
+                *blob
+            }
         }
     }
     fn kind(&self) -> Result<TritBlobKind, QteaModelError> {
         Ok(match self {
             Self::Qtea { .. } => TritBlobKind::QteaTensor,
-            Self::Vector { precision, .. } => TritBlobKind::DenseTensor(match precision {
-                ScalePrecision::F16 => DType::F16,
-                ScalePrecision::Bf16 => DType::BF16,
-                ScalePrecision::F32 => DType::F32,
-                _ => return Err(invalid("unsupported preserved precision")),
-            }),
+            Self::Vector { precision, .. } | Self::Preserved { precision, .. } => {
+                TritBlobKind::DenseTensor(match precision {
+                    ScalePrecision::F16 => DType::F16,
+                    ScalePrecision::Bf16 => DType::BF16,
+                    ScalePrecision::F32 => DType::F32,
+                    _ => return Err(invalid("unsupported preserved precision")),
+                })
+            }
         })
     }
 }
@@ -91,6 +108,16 @@ pub struct QteaModelReadLimits {
     pub tensor: QteaLimits,
 }
 
+/// Explicit hybrid receiver; existing vector caps retain their original domain.
+#[derive(Clone, Copy, Debug)]
+pub struct QteaHybridModelReadLimits {
+    /// Common source-independent owner/asset/vector/QTEA ceilings.
+    pub base: QteaModelReadLimits,
+    /// Positive ceiling for elements in each higher-rank preserved tensor.
+    /// Not an aggregate payload, decode-transient or RSS measurement.
+    pub max_preserved_tensor_elements: usize,
+}
+
 /// Profile, format, read or allocation refusal. Never a qualification verdict.
 #[derive(Debug)]
 pub struct QteaModelError(String);
@@ -107,8 +134,24 @@ fn failure(error: impl core::fmt::Display) -> QteaModelError {
     QteaModelError(error.to_string())
 }
 
-fn validate(manifest: &QteaModelManifest) -> Result<(), QteaModelError> {
-    if manifest.profile != QTEA_MODEL_PROFILE
+fn preserved_elements(shape: &[u64]) -> Result<u64, QteaModelError> {
+    if !(2..=4).contains(&shape.len()) || shape.contains(&0) {
+        return Err(invalid(
+            "preserved tensor requires positive rank2..=4 shape",
+        ));
+    }
+    shape.iter().try_fold(1_u64, |n, d| {
+        n.checked_mul(*d)
+            .ok_or_else(|| invalid("preserved tensor shape overflow"))
+    })
+}
+fn validate(manifest: &QteaModelManifest, hybrid: bool) -> Result<(), QteaModelError> {
+    if manifest.profile
+        != if hybrid {
+            QTEA_HYBRID_MODEL_PROFILE
+        } else {
+            QTEA_MODEL_PROFILE
+        }
         || manifest.version != 1
         || manifest.tensors.is_empty()
         || manifest.source_model == [0; 32]
@@ -134,6 +177,14 @@ fn validate(manifest: &QteaModelManifest) -> Result<(), QteaModelError> {
             QteaModelTensor::Vector { length: 0, .. } => {
                 return Err(invalid("empty preserved vector"));
             }
+            QteaModelTensor::Preserved { shape, .. } => {
+                if !hybrid {
+                    return Err(invalid(
+                        "standard QTEA profile forbids higher-rank preserved state",
+                    ));
+                }
+                preserved_elements(shape)?;
+            }
             _ => {}
         }
         tensor.kind()?;
@@ -149,7 +200,24 @@ pub fn encode_qtea_model_manifest(
     manifest: &QteaModelManifest,
     max_bytes: usize,
 ) -> Result<Vec<u8>, QteaModelError> {
-    validate(manifest)?;
+    encode_profile(manifest, max_bytes, false)
+}
+/// Encode the separate hybrid inventory, retaining exact preserved state shapes.
+/// Does not prove architecture coverage, numerical execution or source custody.
+/// # Errors
+/// Invalid profile/rank/shape/precision, allocation or encoded metadata cap.
+pub fn encode_qtea_hybrid_model_manifest(
+    manifest: &QteaModelManifest,
+    max_bytes: usize,
+) -> Result<Vec<u8>, QteaModelError> {
+    encode_profile(manifest, max_bytes, true)
+}
+fn encode_profile(
+    manifest: &QteaModelManifest,
+    max_bytes: usize,
+    hybrid: bool,
+) -> Result<Vec<u8>, QteaModelError> {
+    validate(manifest, hybrid)?;
     crate::trit_package::encode_borrowed_metadata(manifest, max_bytes)
         .map_err(failure)?
         .ok_or_else(|| invalid("unsupported QTEA metadata encoding"))
@@ -165,6 +233,7 @@ pub struct QteaModelReader<R> {
     config_index: usize,
     asset_indices: BTreeMap<String, usize>,
     limits: QteaModelReadLimits,
+    preserved_cap: Option<usize>,
 }
 impl<R> core::fmt::Debug for QteaModelReader<R> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -186,12 +255,44 @@ impl<R: Read + Seek> QteaModelReader<R> {
         limits: QteaModelReadLimits,
         expected_source_model: [u8; 32],
     ) -> Result<Self, QteaModelError> {
+        Self::open_profile(source, receiving, limits, expected_source_model, None)
+    }
+    /// Admit only the explicit hybrid profile under its separate preserved cap.
+    /// # Errors
+    /// Standard open errors, zero preserved cap or unsupported profile/rank/shape.
+    pub fn open_hybrid(
+        source: R,
+        receiving: TritPackageReadLimits,
+        limits: QteaHybridModelReadLimits,
+        expected_source_model: [u8; 32],
+    ) -> Result<Self, QteaModelError> {
+        if limits.max_preserved_tensor_elements == 0 {
+            return Err(invalid("hybrid preserved tensor cap must be positive"));
+        }
+        Self::open_profile(
+            source,
+            receiving,
+            limits.base,
+            expected_source_model,
+            Some(limits.max_preserved_tensor_elements),
+        )
+    }
+    fn open_profile(
+        source: R,
+        receiving: TritPackageReadLimits,
+        limits: QteaModelReadLimits,
+        expected_source_model: [u8; 32],
+        preserved_cap: Option<usize>,
+    ) -> Result<Self, QteaModelError> {
         let package = TritPackageReader::open(source, receiving).map_err(failure)?;
         let manifest: QteaModelManifest =
             ciborium::de::from_reader(package.manifest()).map_err(failure)?;
-        validate(&manifest)?;
-        if encode_qtea_model_manifest(&manifest, receiving.max_manifest_bytes)?
-            != package.manifest()
+        validate(&manifest, preserved_cap.is_some())?;
+        if encode_profile(
+            &manifest,
+            receiving.max_manifest_bytes,
+            preserved_cap.is_some(),
+        )? != package.manifest()
         {
             return Err(invalid("noncanonical QTEA manifest"));
         }
@@ -260,6 +361,25 @@ impl<R: Read + Seek> QteaModelReader<R> {
                         return Err(invalid("QTEA vector cap or length mismatch"));
                     }
                 }
+                QteaModelTensor::Preserved {
+                    shape, precision, ..
+                } => {
+                    let elements = preserved_elements(shape)?;
+                    let cap = preserved_cap.ok_or_else(|| {
+                        invalid("higher-rank state requires explicit hybrid receiver")
+                    })?;
+                    let width = if *precision == ScalePrecision::F32 {
+                        4
+                    } else {
+                        2
+                    };
+                    if elements > cap as u64 || elements.checked_mul(width) != Some(bytes) {
+                        return Err(invalid(
+                            "preserved tensor cap or exact byte-length mismatch",
+                        ));
+                    }
+                    usize::try_from(elements).map_err(failure)?;
+                }
             }
             used.insert(index);
             indices.insert(name.clone(), index);
@@ -274,6 +394,7 @@ impl<R: Read + Seek> QteaModelReader<R> {
             config_index,
             asset_indices,
             limits,
+            preserved_cap,
         })
     }
 
@@ -378,6 +499,26 @@ impl<R: Read + Seek> QteaModelReader<R> {
             .ok_or_else(|| invalid("vector cap overflow"))?;
         let bytes = self.bytes(self.indices[name], cap)?;
         crate::trit_model::decode_dense_f32(name, &[length], precision, &bytes).map_err(failure)
+    }
+    /// Decode finite exact-shaped non-matrix state from the hybrid profile only.
+    /// # Errors
+    /// Wrong role/profile, shape/byte/cap mismatch, nonfinite values, allocation or I/O.
+    pub fn preserved(&mut self, name: &str) -> Result<Vec<f32>, QteaModelError> {
+        let Some(QteaModelTensor::Preserved {
+            shape, precision, ..
+        }) = self.manifest.tensors.get(name)
+        else {
+            return Err(invalid("owner is not exact-shaped preserved state"));
+        };
+        let shape = shape.clone();
+        let precision = *precision;
+        let cap = self
+            .preserved_cap
+            .ok_or_else(|| invalid("hybrid receiver required"))?
+            .checked_mul(4)
+            .ok_or_else(|| invalid("preserved decode cap overflow"))?;
+        let bytes = self.bytes(self.indices[name], cap)?;
+        crate::trit_model::decode_dense_f32(name, &shape, precision, &bytes).map_err(failure)
     }
     /// Terminal whole-source recheck before publishing assembled weights.
     /// # Errors

@@ -20,6 +20,11 @@ use tritium_nn::{
 };
 use tritium_schema::{BlobId, ScalePrecision};
 
+// Template tests share a process with a fail-closed four-operation renderer.
+// Coordinate test-owned work rather than changing production admission limits.
+#[cfg(feature = "tokenizer")]
+static TEXT_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct Fixture {
     manifest: QteaModelManifest,
     blobs: Vec<(TritBlobKind, Vec<u8>)>,
@@ -262,6 +267,9 @@ impl Fixture {
                     .len(),
                 QteaModelTensor::Qtea { .. } => 0,
                 QteaModelTensor::Vector { length, .. } => *length as usize * 4,
+                QteaModelTensor::Preserved { .. } => {
+                    panic!("standard fixture must remain vector-only")
+                }
             })
             .sum()
     }
@@ -464,6 +472,7 @@ fn shared_command_config_is_strict_capped_and_revalidated_before_model_io() {
 #[cfg(feature = "tokenizer")]
 #[test]
 fn shared_command_config_loads_real_packed_models_and_checks_source_size() {
+    let _serial = TEXT_SERIAL.lock().unwrap();
     use tritium_nn::{QteaLoadConfig, Tokenizer};
     let root = CommandScratch::new();
     let path = root.0.join("load.json");
@@ -745,6 +754,7 @@ fn stream() -> tritium_nn::StreamLimits {
 #[cfg(feature = "tokenizer")]
 #[test]
 fn source_bound_text_load_renders_encodes_generates_and_replays() {
+    let _serial = TEXT_SERIAL.lock().unwrap();
     use tritium_evidence::{
         EvidenceRecorder, MODEL_LOADED_REGISTRATION, ModelLoadReceiptView,
         verify_jsonl_with_registry,
@@ -869,6 +879,7 @@ fn source_bound_text_load_renders_encodes_generates_and_replays() {
 #[cfg(feature = "tokenizer")]
 #[test]
 fn bad_tokenizer_assets_fail_before_publishing_a_load_observation() {
+    let _serial = TEXT_SERIAL.lock().unwrap();
     use tritium_evidence::{EvidenceRecorder, MODEL_LOADED_REGISTRATION};
     for bad in [
         "missing-tokenizer",
@@ -932,6 +943,7 @@ fn bad_tokenizer_assets_fail_before_publishing_a_load_observation() {
 #[cfg(feature = "tokenizer")]
 #[test]
 fn tokenizer_validation_precedes_actual_matrix_decode_and_caps_owned_assets() {
+    let _serial = TEXT_SERIAL.lock().unwrap();
     use tritium_evidence::{EvidenceRecorder, MODEL_LOADED_REGISTRATION};
     let mut fixture = Fixture::new(true, false);
     fixture.text(false, Some("{{ messages[0]['content'] }}".into()));
@@ -1007,6 +1019,7 @@ fn tokenizer_validation_precedes_actual_matrix_decode_and_caps_owned_assets() {
 #[cfg(feature = "tokenizer")]
 #[test]
 fn source_absence_stays_absent_and_asset_changes_rebind_package_identity() {
+    let _serial = TEXT_SERIAL.lock().unwrap();
     use tritium_evidence::{EvidenceRecorder, MODEL_LOADED_REGISTRATION};
     use tritium_nn::{LoadedModel, Tokenizer};
     let mut fixture = Fixture::new(true, false);

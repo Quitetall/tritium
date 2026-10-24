@@ -30,7 +30,20 @@ pub struct QteaLoadConfig {
     max_validation_bytes: usize,
     max_weight_bytes: usize,
     max_staging_bytes: usize,
+    #[serde(default, deserialize_with = "present_preserved_cap")]
+    max_preserved_tensor_elements: Option<usize>,
     stream_limits: StreamConfig,
+}
+fn present_preserved_cap<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<usize>, D::Error> {
+    let value = usize::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(serde::de::Error::custom(
+            "hybrid preserved tensor cap must be positive",
+        ));
+    }
+    Ok(Some(value))
 }
 impl QteaLoadConfig {
     /// Read at most16KiB of regular JSON, without opening model/device state.
@@ -52,8 +65,10 @@ impl QteaLoadConfig {
         self.stream_limits.limits()
     }
     fn validate(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        if self.profile != "tritium.qtea-host-load.v1" {
-            return Err("--qtea unsupported load profile".into());
+        match (self.profile.as_str(), self.max_preserved_tensor_elements) {
+            ("tritium.qtea-host-load.v1", None) => {}
+            ("tritium.qtea-hybrid-host-load.v1", Some(cap)) if cap > 0 => {}
+            _ => return Err("--qtea unsupported load profile or preserved-cap selection".into()),
         }
         if !self.path().is_absolute()
             || self.path.len() > 4096
@@ -135,6 +150,18 @@ impl QteaLoadConfig {
             max_weight_bytes: self.max_weight_bytes,
             max_staging_bytes: self.max_staging_bytes,
         };
+        if let Some(max_preserved_tensor_elements) = self.max_preserved_tensor_elements {
+            return Ok(super::LoadedModel::load_qtea_hybrid(
+                file,
+                self.expected_source_model,
+                super::HostQteaHybridModelLimits {
+                    base: limits,
+                    max_preserved_tensor_elements,
+                },
+                self.stream_limits(),
+                context,
+            )?);
+        }
         Ok(super::LoadedModel::load_qtea(
             file,
             self.expected_source_model,

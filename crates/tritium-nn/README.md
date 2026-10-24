@@ -62,7 +62,7 @@ Identical immutable packed blobs share one allocation without inventing trainabl
 aliases. Config tying requires one embedding/head owner, not a second head tensor.
 The payload ceiling excludes metadata, transient decode, allocator/Arc overhead,
 staging, caches and physical RSS. Ordinary typed SALT loading rejects this profile.
-Official Qwen/hybrid/MTP loading, source authentication, pretrained coherence,
+Official-model Qwen/hybrid/MTP capture, source authentication, pretrained coherence,
 production/UI integration, GPU/browser and performance remain unqualified;
 toy text-model tests do not pass those gates. Initial load recording/replay is
 not independent source, memory, quality or release qualification.
@@ -109,6 +109,38 @@ Logical weights, per-call staging, source/metadata and host cache caps are separ
 from tokenizer/allocator overhead and physical RSS. Source agreement is not
 authentication. `HfJsonTokenizer::has_source_chat_template()` reports parsed
 template presence only, not whether every message/control combination renders.
+
+### Explicit hybrid language/MTP profile (experimental)
+
+The separate proposed ADR0166 `tritium.qtea-hybrid-model.v1` profile carries the
+complete canonical Qwen-family language/MTP inventory. Its `Preserved` role
+retains exact rank/dimensions for non-matrix state such as convolution; it is not
+a flattened norm vector or permission for dense matrix fallback. All schema
+matrices, including embedding/head/MTP projections, must be QTEA. Higher-rank
+preserved state has its own mandatory element cap. F16/BF16/F32 state alone widens
+to finite F32; matrix bytes remain packed and share immutable storage.
+
+`QteaModelReader::open_hybrid` and `encode_qtea_hybrid_model_manifest` select this
+profile explicitly. Standard readers/encoders still reject it and the new role;
+old standard-profile bytes and vector limits are unchanged. Exhaustive matches
+on the pre-release Rust `QteaModelTensor` enum must now handle or reject
+`Preserved`. No standard-artifact migration/reinterpretation is implied.
+
+With `host-qtea,tokenizer`, `LoadedModel::load_qtea_hybrid` takes
+`HostQteaHybridModelLimits { base, max_preserved_tensor_elements }`. It checks
+actual checkpoint configuration and exact language/MTP names, roles and original
+shapes, then reuses the existing Qwen assembler and common host runner. Real
+tokenizer/cache admission precedes weights; final source verification precedes
+the load observation. Unsupported MTP geometry and vision tensors do not become
+an inferred partial model. MTP is retained as `Unverified`, not executable draft
+authority or a quality claim.
+
+CLI and serving use the same `--qtea` selector and base JSON above, but explicitly
+set `profile` to `tritium.qtea-hybrid-host-load.v1` and add a positive
+`max_preserved_tensor_elements`. The standard load profile rejects this field;
+hybrid omission, null and zero refuse. Existing CPU/loopback/template/no-fallback
+restrictions remain. Tiny native-fit DeltaNet/attention graph tests do not prove
+official pretrained Qwen quality, physical memory, performance or release status.
 
 ## Source-bound chat prompts (experimental)
 

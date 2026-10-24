@@ -20,7 +20,13 @@ mod load_config;
 #[cfg(feature = "host-qtea")]
 mod qtea;
 #[cfg(all(feature = "host-qtea", feature = "tokenizer"))]
+mod qtea_hybrid;
+#[cfg(all(feature = "host-qtea", feature = "tokenizer"))]
 mod qtea_load_config;
+#[cfg(feature = "host-qtea")]
+mod qtea_owners;
+#[cfg(all(feature = "host-qtea", feature = "tokenizer"))]
+pub use qtea_hybrid::HostQteaHybridModelLimits;
 #[cfg(all(feature = "host-qtea", feature = "tokenizer"))]
 pub use qtea_load_config::QteaLoadConfig;
 mod qwen35;
