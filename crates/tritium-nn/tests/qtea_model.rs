@@ -26,6 +26,54 @@ struct Fixture {
     decoded: BTreeMap<String, Vec<f32>>,
     tied: bool,
 }
+
+#[cfg(feature = "tokenizer")]
+impl Fixture {
+    fn asset(&mut self, name: &str, bytes: Vec<u8>) {
+        self.manifest.assets.insert(name.into(), id(&bytes));
+        self.blobs
+            .retain(|(kind, _)| *kind != TritBlobKind::Asset(name.into()));
+        self.blobs.push((TritBlobKind::Asset(name.into()), bytes));
+    }
+    fn text(&mut self, extra_id: bool, template: Option<serde_json::Value>) {
+        let mut vocab = [
+            "[UNK]",
+            "Testing",
+            "partner",
+            "[EOS]",
+            "[BOS]",
+            "user",
+            "assistant",
+            "reply",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(id, word)| (word.to_owned(), id as u32))
+        .collect::<Vec<_>>();
+        if extra_id {
+            vocab.push(("outside-model".into(), 8));
+        }
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(vocab.into_iter().collect())
+            .unk_token("[UNK]".into())
+            .build()
+            .unwrap();
+        let mut tokenizer = tokenizers::Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(tokenizers::pre_tokenizers::whitespace::Whitespace));
+        self.asset(
+            "tokenizer.json",
+            tokenizer.to_string(false).unwrap().into_bytes(),
+        );
+        let mut config = serde_json::json!({"bos_token":"[BOS]","eos_token":"[EOS]","tokenizer_class":"PreTrainedTokenizerFast"});
+        if let Some(template) = template {
+            config["chat_template"] = template;
+        }
+        self.asset(
+            "tokenizer_config.json",
+            serde_json::to_vec(&config).unwrap(),
+        );
+    }
+}
 fn id(bytes: &[u8]) -> BlobId {
     BlobId::from_bytes(*blake3::hash(bytes).as_bytes())
 }
@@ -185,6 +233,9 @@ impl Fixture {
             .push((TritBlobKind::DenseTensor(tritium_core::DType::F32), bytes));
     }
     fn bytes(&self) -> Vec<u8> {
+        self.bytes_with_limit(1 << 20)
+    }
+    fn bytes_with_limit(&self, maximum: usize) -> Vec<u8> {
         let manifest = encode_qtea_model_manifest(&self.manifest, 1 << 16).unwrap();
         let blobs = self
             .blobs
@@ -194,7 +245,7 @@ impl Fixture {
                 bytes,
             })
             .collect::<Vec<_>>();
-        write_trit_package_bounded(&manifest, &blobs, 1 << 20).unwrap()
+        write_trit_package_bounded(&manifest, &blobs, maximum).unwrap()
     }
     fn payload_bytes(&self) -> usize {
         let mut used = BTreeSet::new();
@@ -463,4 +514,393 @@ fn common_host_runner_loads_the_same_carrier_without_dense_fallback() {
     );
     actual.reset();
     assert_eq!(actual.cache_len(), 0);
+}
+
+#[cfg(feature = "tokenizer")]
+fn stream() -> tritium_nn::StreamLimits {
+    tritium_nn::StreamLimits {
+        max_context: 8,
+        max_segment_tokens: 3,
+        max_host_cache_payload_bytes: 4096,
+    }
+}
+
+#[cfg(feature = "tokenizer")]
+#[test]
+fn source_bound_text_load_renders_encodes_generates_and_replays() {
+    use tritium_evidence::{
+        EvidenceRecorder, MODEL_LOADED_REGISTRATION, ModelLoadReceiptView,
+        verify_jsonl_with_registry,
+    };
+    use tritium_nn::{ChatRenderOptions, LoadedModel, Tokenizer};
+    let template = concat!(
+        "{% for message in messages %}{% if message['role'] not in ['system','user','assistant','tool'] %}{{ raise_exception('invalid role') }}{% endif %}{% endfor %}",
+        "{% if enable_thinking is defined and enable_thinking %}reply {% endif %}{{ messages[0]['content'] }} partner"
+    );
+    for tied in [true, false] {
+        let mut fixture = Fixture::new(tied, true);
+        fixture.text(false, Some(template.into()));
+        let bytes = fixture.bytes();
+        let package = tritium_format::PackageId::from_package_bytes(&bytes);
+        let mut recorder = EvidenceRecorder::new("qtea-text", [MODEL_LOADED_REGISTRATION]).unwrap();
+        let mut loaded = LoadedModel::load_qtea(
+            Cursor::new(&bytes),
+            [3; 32],
+            limits(),
+            stream(),
+            tritium_runtime::TensorUploadContext {
+                recorder: &mut recorder,
+                span: "load",
+                parent: None,
+                logical_time: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(loaded.runner.qtea_package_id(), Some(package));
+        let prompt = loaded
+            .tokenizer
+            .render_chat_prompt(&[("user", "Testing")], 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prompt, "Testing partner");
+        let input = loaded.tokenizer.encode(&prompt).unwrap();
+        assert_eq!(input, [1, 2]);
+        let controlled = loaded
+            .tokenizer
+            .render_chat_prompt_with_options(
+                &[("user", "Testing")],
+                ChatRenderOptions::default().with_thinking(true),
+                1024,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(controlled, "reply Testing partner");
+        assert_eq!(loaded.tokenizer.encode(&controlled).unwrap(), [7, 1, 2]);
+        assert!(
+            loaded
+                .tokenizer
+                .render_chat_prompt(&[("user", "Testing")], 1)
+                .is_err()
+        );
+        let mut reference = ModelRunner::try_from_weights(
+            config(),
+            fixture.oracle(),
+            Box::new(tritium_cpu::CpuBackend::new()),
+        )
+        .unwrap();
+        assert_eq!(
+            bits(&loaded.runner.forward(&input, &[0, 1]).unwrap()),
+            bits(&reference.forward(&input, &[0, 1]).unwrap())
+        );
+        let generated = loaded
+            .runner
+            .generate(&input, 3, loaded.tokenizer.eos())
+            .unwrap();
+        assert_eq!(
+            generated,
+            reference
+                .generate(&input, 3, loaded.tokenizer.eos())
+                .unwrap()
+        );
+        loaded.tokenizer.decode(&generated).unwrap();
+        if let Some(destination) = std::env::var_os("TRITIUM_QTEA_TEXT_FIXTURE_OUTPUT") {
+            use std::io::Write;
+            let destination =
+                std::path::PathBuf::from(destination).join(if tied { "tied" } else { "untied" });
+            std::fs::create_dir(&destination).unwrap();
+            let write = |name: &str, data: &[u8]| {
+                std::fs::File::create_new(destination.join(name))
+                    .unwrap()
+                    .write_all(data)
+                    .unwrap();
+            };
+            for name in ["config.json", "tokenizer.json", "tokenizer_config.json"] {
+                let (_, data) = fixture
+                    .blobs
+                    .iter()
+                    .find(|(kind, _)| *kind == TritBlobKind::Asset(name.into()))
+                    .unwrap();
+                write(name, data);
+            }
+            write("model.trit", &bytes);
+            write("actual-text.json",&serde_json::to_vec(&serde_json::json!({
+                "schema":"tritium.qtea.text-software-observation.v1","qualified":false,
+                "package_id":package.as_bytes(),"messages":[{"role":"user","content":"Testing"}],
+                "prompt":prompt,"input_ids":input,"thinking_prompt":controlled,
+                "thinking_input_ids":loaded.tokenizer.encode(&controlled).unwrap(),"generated_ids":generated,
+            })).unwrap());
+        }
+        let observation = loaded.receipt.observation();
+        assert_eq!(observation.backend, "qtea-scalar-host");
+        assert_eq!(
+            observation.source,
+            tritium_schema::LoadedSourceIdentity::Qtea {
+                package_id: tritium_schema::PackageId::from_bytes(*package.as_bytes()),
+                declared_source_model: [3; 32]
+            }
+        );
+        assert_eq!(recorder.events().len(), 1);
+        let log =
+            verify_jsonl_with_registry(&recorder.to_jsonl().unwrap(), [MODEL_LOADED_REGISTRATION])
+                .unwrap();
+        assert_eq!(ModelLoadReceiptView::fold(&log).unwrap(), [loaded.receipt]);
+    }
+}
+
+#[cfg(feature = "tokenizer")]
+#[test]
+fn bad_tokenizer_assets_fail_before_publishing_a_load_observation() {
+    use tritium_evidence::{EvidenceRecorder, MODEL_LOADED_REGISTRATION};
+    for bad in [
+        "missing-tokenizer",
+        "missing-config",
+        "json",
+        "duplicate-config",
+        "ambiguous",
+        "syntax",
+        "vocab",
+    ] {
+        let mut fixture = Fixture::new(true, false);
+        fixture.text(bad == "vocab", Some("{{ messages[0]['content'] }}".into()));
+        match bad {
+            "missing-tokenizer" | "missing-config" => {
+                let name = if bad == "missing-tokenizer" {
+                    "tokenizer.json"
+                } else {
+                    "tokenizer_config.json"
+                };
+                fixture.manifest.assets.remove(name);
+                fixture
+                    .blobs
+                    .retain(|(kind, _)| *kind != TritBlobKind::Asset(name.into()));
+            }
+            "json" => fixture.asset("tokenizer.json", b"{}".to_vec()),
+            "duplicate-config" => fixture.asset(
+                "tokenizer_config.json",
+                br#"{"eos_token":"[EOS]","eos_token":"[BOS]"}"#.to_vec(),
+            ),
+            "ambiguous" => fixture.text(false, Some(serde_json::json!({"a":"A","b":"B"}))),
+            "syntax" => fixture.text(false, Some("{% if".into())),
+            _ => {}
+        }
+        let mut recorder =
+            EvidenceRecorder::new("qtea-invalid", [MODEL_LOADED_REGISTRATION]).unwrap();
+        let before = recorder.root_digest();
+        let result = tritium_nn::LoadedModel::load_qtea(
+            Cursor::new(fixture.bytes()),
+            [3; 32],
+            limits(),
+            stream(),
+            tritium_runtime::TensorUploadContext {
+                recorder: &mut recorder,
+                span: "load",
+                parent: None,
+                logical_time: 0,
+            },
+        );
+        let Err(error) = result else {
+            panic!("invalid {bad} accepted")
+        };
+        assert!(
+            matches!(error, tritium_nn::NnError::Tokenizer(_)),
+            "{bad}: {error}"
+        );
+        assert!(recorder.events().is_empty());
+        assert_eq!(recorder.root_digest(), before);
+    }
+}
+
+#[cfg(feature = "tokenizer")]
+#[test]
+fn tokenizer_validation_precedes_actual_matrix_decode_and_caps_owned_assets() {
+    use tritium_evidence::{EvidenceRecorder, MODEL_LOADED_REGISTRATION};
+    let mut fixture = Fixture::new(true, false);
+    fixture.text(false, Some("{{ messages[0]['content'] }}".into()));
+    let name = "model.layers.0.self_attn.q_proj.weight";
+    let old = fixture.manifest.tensors[name].blob();
+    let (_, bytes) = fixture
+        .blobs
+        .iter_mut()
+        .find(|(_, b)| id(b) == old)
+        .unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    let new = id(bytes);
+    let QteaModelTensor::Qtea { blob, .. } = fixture.manifest.tensors.get_mut(name).unwrap() else {
+        unreachable!()
+    };
+    *blob = new;
+    for malformed in [true, false] {
+        if malformed {
+            fixture.asset("tokenizer.json", b"{}".to_vec());
+        } else {
+            fixture.text(false, Some("{{ messages[0]['content'] }}".into()));
+        }
+        let mut recorder = EvidenceRecorder::new("predecode", [MODEL_LOADED_REGISTRATION]).unwrap();
+        let result = tritium_nn::LoadedModel::load_qtea(
+            Cursor::new(fixture.bytes()),
+            [3; 32],
+            limits(),
+            stream(),
+            tritium_runtime::TensorUploadContext {
+                recorder: &mut recorder,
+                span: "load",
+                parent: None,
+                logical_time: 0,
+            },
+        );
+        let Err(error) = result else {
+            panic!("bad matrix accepted")
+        };
+        if malformed {
+            assert!(matches!(error, tritium_nn::NnError::Tokenizer(_)));
+        } else {
+            assert!(matches!(error, tritium_nn::NnError::InvalidArtifact(_)));
+        }
+        assert!(recorder.events().is_empty());
+    }
+    let mut fixture = Fixture::new(true, false);
+    fixture.text(false, None);
+    fixture.asset("tokenizer_config.json", vec![b' '; 1024 * 1024 + 1]);
+    let mut cap = limits();
+    cap.model.max_asset_bytes = 2 * 1024 * 1024;
+    cap.receiving.max_source_bytes = 4 * 1024 * 1024;
+    let mut recorder = EvidenceRecorder::new("tokenizer-cap", [MODEL_LOADED_REGISTRATION]).unwrap();
+    let result = tritium_nn::LoadedModel::load_qtea(
+        Cursor::new(fixture.bytes_with_limit(4 << 20)),
+        [3; 32],
+        cap,
+        stream(),
+        tritium_runtime::TensorUploadContext {
+            recorder: &mut recorder,
+            span: "load",
+            parent: None,
+            logical_time: 0,
+        },
+    );
+    let Err(error) = result else {
+        panic!("oversized config accepted")
+    };
+    assert!(error.to_string().contains("source size limit"), "{error}");
+    assert!(recorder.events().is_empty());
+}
+
+#[cfg(feature = "tokenizer")]
+#[test]
+fn source_absence_stays_absent_and_asset_changes_rebind_package_identity() {
+    use tritium_evidence::{EvidenceRecorder, MODEL_LOADED_REGISTRATION};
+    use tritium_nn::{LoadedModel, Tokenizer};
+    let mut fixture = Fixture::new(true, false);
+    fixture.text(false, None);
+    let absent = fixture.bytes();
+    let absent_id = tritium_format::PackageId::from_package_bytes(&absent);
+    let mut recorder =
+        EvidenceRecorder::new("absent-template", [MODEL_LOADED_REGISTRATION]).unwrap();
+    let loaded = LoadedModel::load_qtea(
+        Cursor::new(absent),
+        [3; 32],
+        limits(),
+        stream(),
+        tritium_runtime::TensorUploadContext {
+            recorder: &mut recorder,
+            span: "load",
+            parent: None,
+            logical_time: 0,
+        },
+    )
+    .unwrap();
+    assert!(
+        loaded
+            .tokenizer
+            .render_chat_prompt(&[("user", "Testing")], 1024)
+            .unwrap()
+            .is_none()
+    );
+    fixture.text(false, Some("partner".into()));
+    let bytes = fixture.bytes();
+    let changed_id = tritium_format::PackageId::from_package_bytes(&bytes);
+    assert_ne!(changed_id, absent_id);
+    let mut recorder =
+        EvidenceRecorder::new("changed-template", [MODEL_LOADED_REGISTRATION]).unwrap();
+    let changed = LoadedModel::load_qtea(
+        Cursor::new(bytes),
+        [3; 32],
+        limits(),
+        stream(),
+        tritium_runtime::TensorUploadContext {
+            recorder: &mut recorder,
+            span: "load",
+            parent: None,
+            logical_time: 0,
+        },
+    )
+    .unwrap();
+    assert_eq!(changed.runner.qtea_package_id(), Some(changed_id));
+    assert_eq!(
+        changed
+            .tokenizer
+            .render_chat_prompt(&[("user", "Testing")], 1024)
+            .unwrap()
+            .as_deref(),
+        Some("partner")
+    );
+    assert_ne!(
+        changed.receipt.observation().source,
+        loaded.receipt.observation().source
+    );
+}
+
+#[cfg(feature = "tokenizer")]
+#[test]
+fn recording_context_is_checked_before_source_io() {
+    use std::{
+        cell::Cell,
+        io::{self, Read, Seek, SeekFrom},
+        rc::Rc,
+    };
+    use tritium_evidence::{EvidenceRecorder, MODEL_LOADED_REGISTRATION};
+    struct Count {
+        source: Cursor<Vec<u8>>,
+        calls: Rc<Cell<usize>>,
+    }
+    impl Read for Count {
+        fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+            self.calls.set(self.calls.get() + 1);
+            self.source.read(b)
+        }
+    }
+    impl Seek for Count {
+        fn seek(&mut self, p: SeekFrom) -> io::Result<u64> {
+            self.calls.set(self.calls.get() + 1);
+            self.source.seek(p)
+        }
+    }
+    for registered in [false, true] {
+        let calls = Rc::new(Cell::new(0));
+        let source = Count {
+            source: Cursor::new(vec![]),
+            calls: Rc::clone(&calls),
+        };
+        let registrations = if registered {
+            vec![MODEL_LOADED_REGISTRATION]
+        } else {
+            vec![]
+        };
+        let mut recorder = EvidenceRecorder::new("preflight", registrations).unwrap();
+        let result = tritium_nn::LoadedModel::load_qtea(
+            source,
+            [3; 32],
+            limits(),
+            stream(),
+            tritium_runtime::TensorUploadContext {
+                recorder: &mut recorder,
+                span: if registered { "" } else { "load" },
+                parent: None,
+                logical_time: 0,
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 0);
+        assert!(recorder.events().is_empty());
+    }
 }

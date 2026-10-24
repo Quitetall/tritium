@@ -329,6 +329,16 @@ impl<R: Read + Seek> QteaModelReader<R> {
             .ok_or_else(|| invalid("unknown QTEA asset"))?;
         self.bytes(index, self.limits.max_asset_bytes)
     }
+    /// Admitted encoded size of an additional asset, without materializing it.
+    /// # Errors
+    /// Unknown additional asset name (config is queried separately).
+    pub fn asset_bytes(&self, name: &str) -> Result<u64, QteaModelError> {
+        let index = *self
+            .asset_indices
+            .get(name)
+            .ok_or_else(|| invalid("unknown QTEA asset"))?;
+        Ok(self.package.blobs()[index].length)
+    }
     /// Read actual packed bytes, checking geometry and declared source agreement.
     /// # Errors
     /// Wrong owner role, malformed wire, mismatch, caps, mutation or I/O.

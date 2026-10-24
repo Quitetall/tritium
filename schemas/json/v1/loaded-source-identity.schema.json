@@ -58,6 +58,42 @@
       "required": [
         "HuggingFace"
       ]
+    },
+    {
+      "description": "Checked residual-bearing QTEA carrier, not a typed SALT level or semantic ModelId.",
+      "type": "object",
+      "properties": {
+        "Qtea": {
+          "type": "object",
+          "properties": {
+            "declared_source_model": {
+              "description": "Producer's source-model assertion; not authenticated original custody.",
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "maximum": 255,
+                "minimum": 0
+              },
+              "maxItems": 32,
+              "minItems": 32
+            },
+            "package_id": {
+              "description": "Exact physical carrier bytes, including tokenizer assets.",
+              "$ref": "#/$defs/PackageId"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "package_id",
+            "declared_source_model"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Qtea"
+      ]
     }
   ],
   "$defs": {

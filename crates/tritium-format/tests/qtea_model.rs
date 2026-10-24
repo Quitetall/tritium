@@ -144,6 +144,8 @@ fn named_model_uses_existing_envelope_and_spool_without_relabelling() {
     assert_eq!(reader.package_id(), written);
     assert_eq!(reader.config().unwrap(), b"{}");
     assert_eq!(reader.asset("tokenizer.json").unwrap(), b"[]");
+    assert_eq!(reader.asset_bytes("tokenizer.json").unwrap(), 2);
+    assert!(reader.asset_bytes("missing").is_err());
     assert_eq!(
         reader.qtea("matrix").unwrap().as_bytes(),
         fixture.blobs[2].1

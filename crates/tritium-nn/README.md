@@ -42,6 +42,18 @@ standard-transformer carrier into the common host executor under explicit
 `HostQteaModelLimits` and `StreamLimits`; `qtea_package_id()` retains its exact
 byte identity. This method does not select or interpret tokenizer/chat assets.
 
+With both features, `LoadedModel::load_qtea(source, expected_source, limits,
+stream, context)` returns the existing text-model interface instead. It reads
+both tokenizer assets from the same retained package, checks their encoded size
+and complete vocabulary IDs before materializing weights, and uses the existing
+source-template renderer and common runner. Missing, invalid or ambiguous assets
+refuse; no family-based tokenizer/template or dense/GPU fallback is introduced.
+Only `MODEL_LOADED_REGISTRATION` is required by this explicit host path. Its
+observation records `LoadedSourceIdentity::Qtea` with exact PackageId and a clearly
+declared source digest, never an invented semantic ModelId/SALT level or tensor
+upload. Older strict observation readers reject this additive proposed ADR 0164
+source tag. Existing source variants retain their V1 serialization.
+
 All matrices, including embedding and untied head, stay packed. Only preserved
 F16/BF16/F32 vectors widen to F32. Complete inventory/roles/shapes, source agreement
 and logical payload/cache caps are admitted before weight materialization;
@@ -50,9 +62,10 @@ Identical immutable packed blobs share one allocation without inventing trainabl
 aliases. Config tying requires one embedding/head owner, not a second head tensor.
 The payload ceiling excludes metadata, transient decode, allocator/Arc overhead,
 staging, caches and physical RSS. Ordinary typed SALT loading rejects this profile.
-Official Qwen/hybrid/MTP loading, source authentication, chat integration, quality,
-GPU/browser and performance remain unqualified; toy standard models do not pass
-those gates. No qualification or loaded-model receipt is fabricated by this loader.
+Official Qwen/hybrid/MTP loading, source authentication, pretrained coherence,
+public CLI/serving/UI selection, GPU/browser and performance remain unqualified;
+toy text-model tests do not pass those gates. Initial load recording/replay is
+not independent source, memory, quality or release qualification.
 
 ## Source-bound chat prompts (experimental)
 

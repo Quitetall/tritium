@@ -114,6 +114,11 @@ A model whose stored state includes ternary bases with non-ternary corrections
 or affine offsets. It is distinct from a pure additive-ternary model.
 _Avoid_: pure ternary model, multiply-free model
 
+**Declared source identity**:
+A producer's assertion about which original model supplied stored state.
+Agreement with that assertion is not independent source custody or authentication.
+_Avoid_: verified source, official source, authenticated provenance
+
 **Recovery replay**:
 Re-execution of a ternary training recipe from its original training payload,
 reproducing the same training snapshot. It is distinct from authenticating the
