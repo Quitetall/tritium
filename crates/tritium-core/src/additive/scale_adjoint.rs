@@ -1,6 +1,6 @@
 use super::{
-    AdditiveError, AdditiveView, Allocation, BasisBound, Gather, Matmul, RowTiles, UniformPlan,
-    apply_basis,
+    AdditiveAdjointSpan, AdditiveError, AdditiveView, Allocation, BasisBound, Gather, Matmul,
+    RowTiles, UniformPlan, apply_basis,
 };
 use crate::{PerTileIndex, Trit};
 use tritium_schema::{AdditiveLayout, PlaneRelation, ScaleAnchor, ScalePrecision};
@@ -80,6 +80,28 @@ impl<'a> AdditiveScaleVjpPlan<'a> {
         batch: usize,
         row_workspace: &mut [f32],
         out: &mut [f64],
+        read: impl FnMut(usize, usize) -> Trit,
+    ) -> Result<(), AdditiveError> {
+        self.matmul_span(
+            activations,
+            output_gradients,
+            batch,
+            row_workspace,
+            AdditiveAdjointSpan::full(out),
+            read,
+        )
+    }
+
+    /// Accumulate a contiguous stored-scale span, preserving the full VJP's
+    /// per-coordinate accumulation order and tied-plane factors. No allocation.
+    /// Full input/span preflight precedes payload reads or buffer mutation.
+    pub fn matmul_span(
+        &self,
+        activations: &[f32],
+        output_gradients: &[f32],
+        batch: usize,
+        row_workspace: &mut [f32],
+        output: AdditiveAdjointSpan<'_>,
         mut read: impl FnMut(usize, usize) -> Trit,
     ) -> Result<(), AdditiveError> {
         let rows = usize::try_from(self.layout().rows).map_err(|_| AdditiveError::SizeOverflow)?;
@@ -89,9 +111,13 @@ impl<'a> AdditiveScaleVjpPlan<'a> {
         if activations.len() != inputs
             || output_gradients.len() != outputs
             || row_workspace.len() != cols
-            || out.len() != self.stored_scale_count()
         {
             return Err(AdditiveError::MatmulShape);
+        }
+        let (span, out) = output.checked(self.stored_scale_count())?;
+        let selected_rows = super::adjoint_span::rows_for_span(self, rows, &span, false);
+        if selected_rows.is_empty() {
+            return Ok(());
         }
         for (activation, dy) in activations
             .chunks_exact(cols)
@@ -99,13 +125,14 @@ impl<'a> AdditiveScaleVjpPlan<'a> {
         {
             row_workspace.copy_from_slice(activation);
             apply_basis(row_workspace, self.layout().basis)?;
-            for (row, &gradient) in dy.iter().enumerate() {
+            for row in selected_rows.clone() {
                 accumulate_row(
                     self,
                     row,
                     row_workspace,
-                    f64::from(gradient),
+                    f64::from(dy[row]),
                     out,
+                    &span,
                     &mut read,
                 );
             }
@@ -123,6 +150,26 @@ impl<'a> AdditiveScaleVjpPlan<'a> {
         output_gradients: &[f32],
         row_workspace: &mut [f32],
         out: &mut [f64],
+        read: impl FnMut(usize, usize) -> Trit,
+    ) -> Result<(), AdditiveError> {
+        self.embed_span(
+            ids,
+            output_gradients,
+            row_workspace,
+            AdditiveAdjointSpan::full(out),
+            read,
+        )
+    }
+
+    /// Accumulate an embedding's contiguous stored-scale span, including tied
+    /// planes and duplicate ids in occurrence order. No allocation. All shapes,
+    /// indices and span bounds are checked before reads or mutation.
+    pub fn embed_span(
+        &self,
+        ids: &[usize],
+        output_gradients: &[f32],
+        row_workspace: &mut [f32],
+        output: AdditiveAdjointSpan<'_>,
         mut read: impl FnMut(usize, usize) -> Trit,
     ) -> Result<(), AdditiveError> {
         let rows = usize::try_from(self.layout().rows).map_err(|_| AdditiveError::SizeOverflow)?;
@@ -131,19 +178,21 @@ impl<'a> AdditiveScaleVjpPlan<'a> {
             .len()
             .checked_mul(cols)
             .ok_or(AdditiveError::SizeOverflow)?;
-        if output_gradients.len() != outputs
-            || row_workspace.len() != cols
-            || out.len() != self.stored_scale_count()
-        {
+        if output_gradients.len() != outputs || row_workspace.len() != cols {
             return Err(AdditiveError::MatmulShape);
         }
+        let (span, out) = output.checked(self.stored_scale_count())?;
         if ids.iter().any(|&row| row >= rows) {
             return Err(AdditiveError::RowOutOfRange);
         }
+        let full = span.start == 0 && span.end == self.stored_scale_count();
         for (&row, dy) in ids.iter().zip(output_gradients.chunks_exact(cols)) {
+            if !full && !super::adjoint_span::row_intersects(self, row, &span, false) {
+                continue;
+            }
             row_workspace.copy_from_slice(dy);
             apply_basis(row_workspace, self.layout().basis)?;
-            accumulate_row(self, row, row_workspace, 1.0, out, &mut read);
+            accumulate_row(self, row, row_workspace, 1.0, out, &span, &mut read);
         }
         Ok(())
     }
@@ -271,6 +320,7 @@ fn accumulate_row(
     values: &[f32],
     dy: f64,
     out: &mut [f64],
+    span: &core::ops::Range<usize>,
     read: &mut impl FnMut(usize, usize) -> Trit,
 ) {
     let layout = weights.layout();
@@ -278,16 +328,28 @@ fn accumulate_row(
     let mut plane_factor = 1.0f32;
     for plane in 0..weights.plane_count() {
         for tile in weights.row_tiles(plane, row) {
+            let scale_end = tile.scale
+                + if layout.law.anchor == ScaleAnchor::Group {
+                    tile.len.div_ceil(group)
+                } else {
+                    1
+                };
+            if tile.scale >= span.end || scale_end <= span.start {
+                continue;
+            }
             for offset in 0..tile.len {
+                let scale = tile.scale
+                    + if layout.law.anchor == ScaleAnchor::Group {
+                        offset / group
+                    } else {
+                        0
+                    };
+                if !span.contains(&scale) {
+                    continue;
+                }
                 let trit = read(plane, tile.trit + offset);
                 if !trit.is_zero() {
-                    let scale = tile.scale
-                        + if layout.law.anchor == ScaleAnchor::Group {
-                            offset / group
-                        } else {
-                            0
-                        };
-                    out[scale] += f64::from(values[tile.col + offset])
+                    out[scale - span.start] += f64::from(values[tile.col + offset])
                         * f64::from(trit.get())
                         * dy
                         * f64::from(plane_factor);

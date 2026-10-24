@@ -1,8 +1,8 @@
 //! Actual packed handles; numerical conformance, not complete training acceptance.
 use tritium_core::{
-    AdditiveView, GemmShape, OwnedPerTileIndex, PerTilePlan, TernaryFormat, Trit, UniformPlan,
-    accumulate_embed_scale_vjp, accumulate_embed_weight_vjp, accumulate_ternary_matmul_scale_vjp,
-    accumulate_ternary_matmul_weight_vjp,
+    AdditiveAdjointSpan, AdditiveView, GemmShape, OwnedPerTileIndex, PerTilePlan, TernaryFormat,
+    Trit, UniformPlan, accumulate_embed_scale_vjp, accumulate_embed_weight_vjp,
+    accumulate_ternary_matmul_scale_vjp, accumulate_ternary_matmul_weight_vjp,
 };
 use tritium_cpu::CpuBackend;
 use tritium_format::AdditiveTensor;
@@ -121,6 +121,7 @@ fn check(view: AdditiveView<'_>) -> usize {
                 assert_eq!(row, expected_row);
             }
             assert_eq!(handle.len_bytes(), bytes);
+            let expected_scales = expected.clone();
             let count = cpu.additive_present_weight_count(&*handle).unwrap();
             assert_eq!(
                 count,
@@ -171,6 +172,56 @@ fn check(view: AdditiveView<'_>) -> usize {
                 .unwrap();
                 assert_eq!(bits(&actual), bits(&expected));
                 assert_eq!(row, expected_row);
+            }
+            for weights in [false, true] {
+                let n = if weights { count } else { view.scales().len() };
+                let mut spans = vec![0.25; n];
+                for _ in 0..2 {
+                    for (ordinal, part) in spans.chunks_mut(37).enumerate() {
+                        let start = ordinal * 37;
+                        if weights {
+                            cpu.accumulate_additive_matmul_weight_vjp_span(
+                                &*handle,
+                                &x,
+                                &dy,
+                                batch,
+                                &mut row,
+                                AdditiveAdjointSpan::new(start, part),
+                            )
+                            .unwrap();
+                            cpu.accumulate_additive_embed_weight_vjp_span(
+                                &*handle,
+                                &ids,
+                                &de,
+                                &mut row,
+                                AdditiveAdjointSpan::new(start, part),
+                            )
+                            .unwrap();
+                        } else {
+                            cpu.accumulate_additive_matmul_scale_vjp_span(
+                                &*handle,
+                                &x,
+                                &dy,
+                                batch,
+                                &mut row,
+                                AdditiveAdjointSpan::new(start, part),
+                            )
+                            .unwrap();
+                            cpu.accumulate_additive_embed_scale_vjp_span(
+                                &*handle,
+                                &ids,
+                                &de,
+                                &mut row,
+                                AdditiveAdjointSpan::new(start, part),
+                            )
+                            .unwrap();
+                        }
+                    }
+                }
+                assert_eq!(
+                    bits(&spans),
+                    bits(if weights { &expected } else { &expected_scales })
+                );
             }
         }
     }

@@ -3,6 +3,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 const HEADER: [u8; 8] = *b"TPVG\0\0\0\x01";
 const IO: usize = 8192;
 pub(super) const HEADROOM: u64 = 16384;
+const MAX_SPAN_VALUES: usize = 2 * 1024 * 1024;
 fn invalid(s: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, s)
 }
@@ -113,10 +114,60 @@ impl<R: Read + Write + Seek> Window<R> {
             return Err(invalid("capture gradient shape/nonfinite"));
         }
         self.check()?;
+        self.write_span(i, 0, values)?;
+        self.finish_capture(i)
+    }
+
+    pub fn capture_from(
+        &mut self,
+        i: usize,
+        expected_values: usize,
+        maximum_values: usize,
+        mut fill: impl FnMut(usize, &mut [f64]) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.admit(i)?;
+        self.poisoned = true;
+        self.check()?;
+        let count = self.layout.count(i)?;
+        if count != expected_values {
+            return Err(invalid("capture gradient shape/nonfinite"));
+        }
+        let maximum = count.min(maximum_values).min(MAX_SPAN_VALUES);
+        if count != 0 && maximum == 0 {
+            return Err(invalid("capture span working cap exceeded"));
+        }
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(maximum)
+            .map_err(io::Error::other)?;
+        values.resize(maximum, 0.0);
+        if count == 0 {
+            fill(0, &mut [])?;
+        }
+        let mut start = 0;
+        while start < count {
+            let length = (count - start).min(maximum);
+            let part = &mut values[..length];
+            part.fill(0.0);
+            fill(start, part)?;
+            if part.iter().any(|n| !n.is_finite()) {
+                return Err(invalid("capture gradient shape/nonfinite"));
+            }
+            self.write_span(i, start, part)?;
+            start += length;
+        }
+        self.finish_capture(i)
+    }
+
+    fn write_span(&mut self, i: usize, start: usize, values: &[f64]) -> io::Result<()> {
+        let count = self.layout.count(i)?;
+        if start.checked_add(values.len()).is_none_or(|n| n > count) {
+            return Err(invalid("capture span differs from owner"));
+        }
         let (offset, _, _) = self.layout.owners[i];
         let mut buffer = [0u8; IO];
         for (ordinal, chunk) in values.chunks(IO / 8).enumerate() {
-            let at = offset + (ordinal * IO) as u64;
+            let at = offset + (start * 8 + ordinal * IO) as u64;
             let bytes = &mut buffer[..chunk.len() * 8];
             if self.seen[i] {
                 self.file.seek(SeekFrom::Start(at))?;
@@ -147,6 +198,10 @@ impl<R: Read + Write + Seek> Window<R> {
                 self.file.write_all(bytes)?;
             }
         }
+        Ok(())
+    }
+
+    fn finish_capture(&mut self, i: usize) -> io::Result<()> {
         self.file.flush()?;
         self.check()?;
         self.seen[i] = true;
@@ -211,6 +266,96 @@ impl<R: Read + Write + Seek> Window<R> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    #[test]
+    fn streamed_callbacks_match_borrowed_contributions_at_misaligned_spans() {
+        let layout = Layout::new(&[(3, 5000), (0, 0)], 100_000, HEADROOM + 50_000).unwrap();
+        let mut full = Window::new(Cursor::new(Vec::new()), layout.clone(), 4).unwrap();
+        let mut spans = Window::new(Cursor::new(Vec::new()), layout, 4).unwrap();
+        for pass in 0..3 {
+            let values: Vec<_> = (0..5003)
+                .map(|i| match (pass, i % 5) {
+                    (0, 0) => 1e16,
+                    (1, 0) => 1.0,
+                    (2, 0) => -1e16,
+                    (0, 1) => -0.0,
+                    (_, 1) => 0.0,
+                    _ => (i % 13) as f64 * 0.125 - pass as f64,
+                })
+                .collect();
+            full.capture(0, &values).unwrap();
+            let mut next = 0;
+            spans
+                .capture_from(0, values.len(), 137, |start, part| {
+                    assert_eq!(start, next);
+                    assert!(part.len() <= 137);
+                    part.copy_from_slice(&values[start..start + part.len()]);
+                    next += part.len();
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(next, values.len());
+            assert_eq!(spans.contributions, full.contributions);
+            assert_eq!(spans.file.get_ref(), full.file.get_ref());
+        }
+        let mut calls = 0;
+        spans
+            .capture_from(1, 0, 0, |start, part| {
+                assert_eq!(start, 0);
+                assert!(part.is_empty());
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(spans.contributions, 4);
+    }
+
+    #[test]
+    fn late_reader_error_wrong_geometry_and_unwind_poison_partial_work() {
+        let layout = Layout::new(&[(2, 20)], 1000, HEADROOM + 1000).unwrap();
+        for failure in 0..4 {
+            let mut window = Window::new(Cursor::new(Vec::new()), layout.clone(), 2).unwrap();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                window.capture_from(0, if failure == 0 { 21 } else { 22 }, 3, |start, part| {
+                    part.fill(1.0);
+                    if start >= 3 {
+                        match failure {
+                            1 => return Err(io::Error::other("late reader")),
+                            2 => part[0] = f64::NAN,
+                            3 => panic!("late reader panic"),
+                            _ => (),
+                        }
+                    }
+                    Ok(())
+                })
+            }));
+            assert!(result.is_err() || result.unwrap().is_err());
+            assert!(window.poisoned);
+            assert!(!window.seen[0]);
+            assert_eq!(window.contributions, 0);
+            assert!(window.gradients(0, 2, 20).is_err());
+        }
+    }
+
+    #[test]
+    fn large_sparse_capture_never_requests_a_full_owner_callback_buffer() {
+        let count = MAX_SPAN_VALUES * 2 + 17;
+        let layout = Layout::new(&[(0, count)], 100_000_000, HEADROOM + 100_000_000).unwrap();
+        let mut window = Window::new(tempfile::tempfile().unwrap(), layout, 2).unwrap();
+        let mut maximum = 0;
+        let mut calls = 0;
+        window
+            .capture_from(0, count, usize::MAX, |_, part| {
+                maximum = maximum.max(part.len());
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(maximum, MAX_SPAN_VALUES);
+        assert_eq!(window.contributions, 1);
+        assert!(!window.poisoned);
+    }
     #[test]
     fn ordered_capture_narrows_once_and_unseen_owners_are_zero() {
         let layout = Layout::new(&[(1, 2), (0, 3), (0, 0)], 1000, HEADROOM + 100).unwrap();

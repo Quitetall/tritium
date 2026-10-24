@@ -135,9 +135,18 @@ capture = NativePvPagedGradientLimits(
 
 These are small-fixture caps, not Qwen sizing. The logical spool extent is
 `8 + 8*sum(S+A)` bytes, where each owner has `S` stored scales and `A` present
-weight adjoints. Largest-owner working admission is `16384 + 8*max(S+A)` for
-one VJP contribution plus bounded I/O, separately from source/numerical/packed/
-saved-input caps and the step's f32 transfer limit. Every callback, including
+weight adjoints. Largest-owner working admission retains the conservative
+`16384 + 8*max(S+A)` bound; it is not silently redefined as a chunk budget.
+Capture-mode backward computes stored-coordinate spans directly in Rust, with
+at most16MiB of f64 contribution scratch (less when required by the existing
+native output cap after transfer/row/index scratch). No complete owner-gradient
+tensor is exported to Torch in this mode. Each coordinate's callback reduction
+finishes from zero before it is added once to the pending window, preserving
+the full operation's per-coordinate arithmetic order rather than reassociating
+per-batch fragments. Source/numerical/packed/saved-input caps and the step's f32
+transfer limit remain separate. One complete numerical optimizer owner and its
+returned f32 adjoints still require memory; this is not GPU or whole-model memory
+qualification. Every callback, including
 repeated/tied and empty contributions, consumes the contribution counter. The
 spool also consumes the existing aggregate anonymous-workspace budget/file cap.
 Sparse-file initialization avoids a whole-window zero buffer, not the eventual

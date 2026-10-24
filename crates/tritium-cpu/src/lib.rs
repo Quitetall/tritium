@@ -63,7 +63,7 @@
 
 use core::any::Any;
 
-use tritium_core::{GemmShape, TernaryFormat, Trit};
+use tritium_core::{AdditiveAdjointSpan, GemmShape, TernaryFormat, Trit};
 use tritium_format::{
     TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row, unpack_tq2_0_row,
 };
@@ -427,6 +427,98 @@ impl CpuBackend {
         out: &mut [f64],
     ) -> Result<(), BackendError> {
         semantic::CpuTensor::additive_embed_weight_vjp(
+            tensor,
+            ids,
+            output_gradients,
+            row_workspace,
+            out,
+        )
+    }
+
+    /// Accumulate one contiguous stored-scale span of a packed matmul VJP.
+    /// Per-coordinate order, basis and tied-plane factors match the full VJP;
+    /// only caller row/output buffers are used. No handle or payload mutation.
+    /// # Errors
+    /// InvalidInput for foreign/misreported handles, shapes or invalid spans;
+    /// UnsupportedTensor for dense handles. Refusal precedes buffer mutation.
+    pub fn accumulate_additive_matmul_scale_vjp_span(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        activations: &[f32],
+        output_gradients: &[f32],
+        batch: usize,
+        row_workspace: &mut [f32],
+        out: AdditiveAdjointSpan<'_>,
+    ) -> Result<(), BackendError> {
+        semantic::CpuTensor::additive_matmul_scale_vjp_span(
+            tensor,
+            activations,
+            output_gradients,
+            batch,
+            row_workspace,
+            out,
+        )
+    }
+
+    /// Accumulate one contiguous stored-scale span of a packed embedding VJP.
+    /// Duplicate ids retain occurrence order; forward basis matches the full VJP.
+    /// No allocation or handle mutation; this is not a new training operation.
+    /// # Errors
+    /// Same refusals as the matmul span, including all out-of-range indices.
+    pub fn accumulate_additive_embed_scale_vjp_span(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        ids: &[usize],
+        output_gradients: &[f32],
+        row_workspace: &mut [f32],
+        out: AdditiveAdjointSpan<'_>,
+    ) -> Result<(), BackendError> {
+        semantic::CpuTensor::additive_embed_scale_vjp_span(
+            tensor,
+            ids,
+            output_gradients,
+            row_workspace,
+            out,
+        )
+    }
+
+    /// Accumulate one contiguous present-weight span of a packed matmul VJP.
+    /// Uses the full VJP's compact base-plane coordinates and per-coordinate
+    /// accumulation order, without reading codes/scales or allocating a master.
+    /// # Errors
+    /// Handle/shape/span preflight precedes mutation, matching scale spans.
+    pub fn accumulate_additive_matmul_weight_vjp_span(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        activations: &[f32],
+        output_gradients: &[f32],
+        batch: usize,
+        row_workspace: &mut [f32],
+        out: AdditiveAdjointSpan<'_>,
+    ) -> Result<(), BackendError> {
+        semantic::CpuTensor::additive_matmul_weight_vjp_span(
+            tensor,
+            activations,
+            output_gradients,
+            batch,
+            row_workspace,
+            out,
+        )
+    }
+
+    /// Accumulate one contiguous present-weight span of a packed embedding VJP.
+    /// Repeated ids and signed forward basis match the full VJP. No allocation.
+    /// # Errors
+    /// Handle/shape/index/span preflight precedes output/workspace mutation.
+    pub fn accumulate_additive_embed_weight_vjp_span(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        ids: &[usize],
+        output_gradients: &[f32],
+        row_workspace: &mut [f32],
+        out: AdditiveAdjointSpan<'_>,
+    ) -> Result<(), BackendError> {
+        semantic::CpuTensor::additive_embed_weight_vjp_span(
             tensor,
             ids,
             output_gradients,

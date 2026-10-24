@@ -137,8 +137,10 @@ explicitly select `native_pv_paged_training` with `NativePvPagedTrainingLimits`
 and a new private workspace for recorded updates, streamed resume bundles and
 child publication. Optional `NativePvPagedGradientLimits` capture uses scalar
 autograd tokens and a bounded private adjoint spool instead of all-owner Torch
-gradient leaves. One owner VJP, activations, packed models and disk/I/O costs
-still remain; this is not whole-model memory qualification. The high-level
+gradient leaves. Capture streams stored-coordinate adjoints with at most16MiB
+of f64 contribution scratch rather than exporting a full owner VJP. One numerical
+optimizer owner, step-transfer buffers, activations, packed models and disk/I/O
+costs still remain; this is not whole-model memory qualification. The high-level
 teacher/data `refine` workflow explicitly selects this storage with
 `NativePvPagedRefinementConfig` and mandatory bounded capture. Default resident
 controllers/configuration retain their existing semantics. See [training](docs/book/src/training.md)

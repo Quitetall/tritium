@@ -69,6 +69,11 @@ Uncommitted owner adjoints associated with one current training revision. It is
 distinct from a committed training snapshot or authenticated objective execution.
 _Avoid_: trained checkpoint, recovery bundle, qualification receipt
 
+**Owner adjoint span**:
+A contiguous range of one owner's stored-scale or present-weight loss
+derivatives. It is not a separate owner, training plan or complete gradient window.
+_Avoid_: tensor shard, quantization group, mini-owner
+
 **Owner calibration recipe**:
 An ordered, weighted set of declared scalar objectives and observation limits
 for tensor owners. It is distinct from captured observations and qualification.

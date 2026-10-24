@@ -10,7 +10,7 @@ use dlpark::legacy::Dlpack;
 use pyo3::{prelude::*, types::PyAny};
 use std::{
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 use tritium_cpu::CpuBackend;
 use tritium_runtime::TensorPayloadBudget;
@@ -225,6 +225,60 @@ impl NativePvPagedTraining {
         }
         Ok(s.pending.as_mut().expect("admitted pending gradients"))
     }
+    fn capture_adjoint(
+        &self,
+        py: Python<'_>,
+        owner: &str,
+        revision: u64,
+        matrix: &NativePackedMatrix,
+        input: crate::native_scale::spans::Input<'_>,
+    ) -> PyResult<()> {
+        if self.capture_limits.is_none() {
+            return Err(error("gradient capture is not enabled"));
+        }
+        let handle = matrix.shared_tensor();
+        let dimensions = matrix.dimensions();
+        py.detach(|| {
+            let mut lock = self.lock()?;
+            let s = Self::runtime(&mut lock)?;
+            let result = (|| {
+                if s.driver.session().completed_updates() != revision {
+                    return Err(error("stale capture revision"));
+                }
+                if revision >= s.driver.session().plan().training.len() as u64
+                    || !matches!(s.recording, Recording::Writing(_))
+                {
+                    return Err(error("capture schedule exhausted or recording sealed"));
+                }
+                let i = s
+                    .driver
+                    .session()
+                    .plan()
+                    .owners
+                    .iter()
+                    .position(|n| n == owner)
+                    .ok_or_else(|| error("capture owner absent"))?;
+                let current = s.driver.handles().nth(i).expect("bound owner").1;
+                if !Arc::ptr_eq(current, &handle) {
+                    return Err(error("foreign or stale capture handle"));
+                }
+                let mut program =
+                    crate::native_scale::spans::Program::new(input, handle, dimensions)?;
+                self.pending(s)?
+                    .capture_from(i, program.count(), program.maximum_values, |start, out| {
+                        program.fill(start, out)
+                    })
+                    .map_err(error)
+            })();
+            if result.is_err()
+                && let Some(pending) = s.pending.as_mut()
+            {
+                pending.poisoned = true;
+            }
+            result
+        })
+    }
+
     fn update(
         &self,
         s: &mut Runtime,
@@ -497,9 +551,10 @@ impl NativePvPagedTraining {
                     .map_err(error)?
                     .checked_add(cpu.additive_present_weight_count(&**h).map_err(error)?)
                     .ok_or_else(|| error("paged leaf size overflow"))?;
-                if count
-                    .checked_mul(8)
-                    .is_none_or(|n| n > matrix.dimensions().2)
+                if self.capture_limits.is_none()
+                    && count
+                        .checked_mul(8)
+                        .is_none_or(|n| n > matrix.dimensions().2)
                 {
                     return Err(error("paged gradient leaf exceeds output cap"));
                 }
@@ -654,6 +709,30 @@ impl NativePvPagedTraining {
                 .ok_or_else(|| error("capture owner absent"))?;
             self.pending(s)?.capture(i, values).map_err(error)
         })
+    }
+    fn capture_matmul_gradient(
+        &self,
+        py: Python<'_>,
+        owner: &str,
+        revision: u64,
+        matrix: &NativePackedMatrix,
+        input: Dlpack,
+        gradient: Dlpack,
+    ) -> PyResult<()> {
+        let input = crate::native_scale::spans::Input::matmul(matrix, &input, &gradient)?;
+        self.capture_adjoint(py, owner, revision, matrix, input)
+    }
+    fn capture_embed_gradient(
+        &self,
+        py: Python<'_>,
+        owner: &str,
+        revision: u64,
+        matrix: &NativePackedMatrix,
+        indices: Dlpack,
+        gradient: Dlpack,
+    ) -> PyResult<()> {
+        let input = crate::native_scale::spans::Input::embed(matrix, &indices, &gradient)?;
+        self.capture_adjoint(py, owner, revision, matrix, input)
     }
     fn poison_capture(&self) {
         if let Ok(mut lock) = self.state.lock()

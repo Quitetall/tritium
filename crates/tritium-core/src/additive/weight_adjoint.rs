@@ -1,6 +1,6 @@
 use super::{
-    AdditiveError, AdditiveScaleVjpPlan, AdditiveView, BasisBound, Gather, Matmul, UniformPlan,
-    apply_basis, scale_adjoint,
+    AdditiveAdjointSpan, AdditiveError, AdditiveScaleVjpPlan, AdditiveView, BasisBound, Gather,
+    Matmul, UniformPlan, apply_basis, scale_adjoint,
 };
 use crate::PerTileIndex;
 
@@ -59,6 +59,26 @@ impl<'a> AdditiveWeightVjpPlan<'a> {
         row_workspace: &mut [f32],
         out: &mut [f64],
     ) -> Result<(), AdditiveError> {
+        self.matmul_span(
+            activations,
+            output_gradients,
+            batch,
+            row_workspace,
+            AdditiveAdjointSpan::full(out),
+        )
+    }
+
+    /// Accumulate a contiguous present-weight output span with the full VJP's
+    /// per-coordinate order and preflight. No allocation or dense gradient.
+    /// Invalid spans refuse before mutation; empty uses leave buffers untouched.
+    pub fn matmul_span(
+        &self,
+        activations: &[f32],
+        output_gradients: &[f32],
+        batch: usize,
+        row_workspace: &mut [f32],
+        output: AdditiveAdjointSpan<'_>,
+    ) -> Result<(), AdditiveError> {
         let layout = self.geometry.layout();
         let rows = usize::try_from(layout.rows).map_err(|_| AdditiveError::SizeOverflow)?;
         let cols = usize::try_from(layout.cols).map_err(|_| AdditiveError::SizeOverflow)?;
@@ -67,11 +87,15 @@ impl<'a> AdditiveWeightVjpPlan<'a> {
         if activations.len() != inputs
             || output_gradients.len() != outputs
             || row_workspace.len() != cols
-            || out.len() != self.present_weight_count()
         {
             return Err(AdditiveError::MatmulShape);
         }
+        let (span, out) = output.checked(self.present_weight_count())?;
         if self.geometry.plane_count() == 0 {
+            return Ok(());
+        }
+        let selected_rows = super::adjoint_span::rows_for_span(&self.geometry, rows, &span, true);
+        if selected_rows.is_empty() {
             return Ok(());
         }
         for (x, dy) in activations
@@ -80,8 +104,8 @@ impl<'a> AdditiveWeightVjpPlan<'a> {
         {
             row_workspace.copy_from_slice(x);
             apply_basis(row_workspace, layout.basis)?;
-            for (row, &gradient) in dy.iter().enumerate() {
-                self.accumulate_row(row, row_workspace, f64::from(gradient), out);
+            for row in selected_rows.clone() {
+                self.accumulate_row(row, row_workspace, f64::from(dy[row]), &span, out);
             }
         }
         Ok(())
@@ -100,6 +124,24 @@ impl<'a> AdditiveWeightVjpPlan<'a> {
         row_workspace: &mut [f32],
         out: &mut [f64],
     ) -> Result<(), AdditiveError> {
+        self.embed_span(
+            ids,
+            output_gradients,
+            row_workspace,
+            AdditiveAdjointSpan::full(out),
+        )
+    }
+
+    /// Accumulate an embedding's contiguous present-weight output span.
+    /// Duplicate-index order and forward basis match the full VJP. All indices
+    /// and span bounds are checked before mutation, even for an empty span.
+    pub fn embed_span(
+        &self,
+        ids: &[usize],
+        output_gradients: &[f32],
+        row_workspace: &mut [f32],
+        output: AdditiveAdjointSpan<'_>,
+    ) -> Result<(), AdditiveError> {
         let layout = self.geometry.layout();
         let rows = usize::try_from(layout.rows).map_err(|_| AdditiveError::SizeOverflow)?;
         let cols = usize::try_from(layout.cols).map_err(|_| AdditiveError::SizeOverflow)?;
@@ -107,30 +149,39 @@ impl<'a> AdditiveWeightVjpPlan<'a> {
             .len()
             .checked_mul(cols)
             .ok_or(AdditiveError::SizeOverflow)?;
-        if output_gradients.len() != outputs
-            || row_workspace.len() != cols
-            || out.len() != self.present_weight_count()
-        {
+        if output_gradients.len() != outputs || row_workspace.len() != cols {
             return Err(AdditiveError::MatmulShape);
         }
+        let (span, out) = output.checked(self.present_weight_count())?;
         if ids.iter().any(|&row| row >= rows) {
             return Err(AdditiveError::RowOutOfRange);
         }
         if self.geometry.plane_count() == 0 {
             return Ok(());
         }
+        let full = span.start == 0 && span.end == self.present_weight_count();
         for (&row, dy) in ids.iter().zip(output_gradients.chunks_exact(cols)) {
+            if !full && !super::adjoint_span::row_intersects(&self.geometry, row, &span, true) {
+                continue;
+            }
             row_workspace.copy_from_slice(dy);
             apply_basis(row_workspace, layout.basis)?;
-            self.accumulate_row(row, row_workspace, 1.0, out);
+            self.accumulate_row(row, row_workspace, 1.0, &span, out);
         }
         Ok(())
     }
 
-    fn accumulate_row(&self, row: usize, values: &[f32], dy: f64, out: &mut [f64]) {
+    fn accumulate_row(
+        &self,
+        row: usize,
+        values: &[f32],
+        dy: f64,
+        span: &core::ops::Range<usize>,
+        out: &mut [f64],
+    ) {
         for tile in self.geometry.row_tiles(0, row) {
-            for offset in 0..tile.len {
-                out[tile.trit + offset] += f64::from(values[tile.col + offset]) * dy;
+            for index in tile.trit.max(span.start)..(tile.trit + tile.len).min(span.end) {
+                out[index - span.start] += f64::from(values[tile.col + index - tile.trit]) * dy;
             }
         }
     }

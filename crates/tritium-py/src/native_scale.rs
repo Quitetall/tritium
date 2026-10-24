@@ -25,6 +25,7 @@ use tritium_train::pv_tuning::{
     publish_native_scale_child, replay_native_scale_journal,
 };
 pub(crate) mod recovery;
+pub(crate) mod spans;
 pub(crate) use recovery::NativeScaleResumeBundle;
 
 enum Recording {

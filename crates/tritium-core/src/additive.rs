@@ -11,9 +11,11 @@ use tritium_schema::{
 use crate::per_tile::{ActiveTile, ActiveTiles};
 use crate::{PerTileIndex, Trit};
 
+mod adjoint_span;
 mod code_projection;
 mod scale_adjoint;
 mod weight_adjoint;
+pub use adjoint_span::AdditiveAdjointSpan;
 pub use code_projection::{CodeProjectionError, CodeProjectionStats, project_additive_code_unit};
 pub use scale_adjoint::{
     AdditiveScaleVjpPlan, accumulate_embed_scale_vjp, accumulate_ternary_matmul_scale_vjp,

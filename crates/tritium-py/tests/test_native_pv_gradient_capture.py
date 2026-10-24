@@ -15,6 +15,33 @@ def capture_limits(**changes):
     return NativePvPagedGradientLimits(**args)
 
 
+def test_captured_backward_streams_below_the_full_owner_vjp_output_cap(tmp_path):
+    parent = _convert(tmp_path, _prepared())
+    request = plan(parent, updates=1)
+    a = start(StateModel(), parent, tmp_path/"ordinary", request)
+    b = start(StateModel(), parent, tmp_path/"capture", request,
+              gradient_capture=capture_limits(), max_output_bytes=384)
+    stats = []
+    for trainer in (a, b):
+        trainer.zero_grad()
+        x = torch.linspace(-1, 1, 32).reshape(1, 32)
+        trainer.model(x).square().mean().backward()
+        if trainer is b:
+            handle = b._cache["a.weight"][1]
+            assert (handle.scale_count + handle.present_weight_count) * 8 + handle.columns * 4 > handle.max_output_bytes
+            # The old complete-output path actually refuses this same handle.
+            with pytest.raises(ValueError, match="exceeds byte limit"):
+                handle.pv_vjp(b.model.norm(x).detach().contiguous(), torch.ones(1, 1))
+            assert b.workspace_report["pending_contributions"] == 2
+        stats.append(trainer.step([10]*32))
+    assert stats[0] == stats[1]
+    reference = publish(a, tmp_path/"reference")
+    child = publish(b, tmp_path/"child")
+    for name in ("checkpoint.tnpv", "gradients.tnpj"):
+        assert (Path(reference.output_dir)/name).read_bytes() == (Path(child.output_dir)/name).read_bytes()
+    a.close(); b.close()
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("codec", ["D2", "B3"])
 @pytest.mark.parametrize("basis", ["Identity", {"SignedRht":dict(block=32,seed=13,domain=29)}])
@@ -113,7 +140,8 @@ def test_window_source_refusal_and_pending_resume_omit_uncommitted_observations(
     c.close()
 
 
-def test_public_convert_tied_gather_repeated_uses_and_unused_owners_match(tmp_path):
+@pytest.mark.parametrize("maximum", [640, 1_000_000])
+def test_public_convert_tied_gather_repeated_uses_and_unused_owners_match(tmp_path, maximum):
     from test_owner_phases import _public_source,_recipe
     from test_owner_capture import TiedModel,_window,_objective
     from tritium.torch import calibrate,convert
@@ -121,15 +149,43 @@ def test_public_convert_tied_gather_repeated_uses_and_unused_owners_match(tmp_pa
     parent=convert(source,calibration,output_dir=tmp_path/"parent",run_id="captured-parent")
     request=plan(parent,owners="embed.weight",updates=1)
     a=start(TiedModel(),parent,tmp_path/"ordinary",request)
-    b=start(TiedModel(),parent,tmp_path/"capture",request,gradient_capture=capture_limits())
+    b=start(TiedModel(),parent,tmp_path/"capture",request,gradient_capture=capture_limits(),max_output_bytes=maximum)
     results=[]
     for t in (a,b):
-        t.zero_grad();_objective(t.model,_window()).backward();results.append(t.step([10]*32))
+        t.zero_grad();_objective(t.model,_window()).backward()
+        if t is b:
+            assert b.workspace_report["pending_contributions"] == 4
+            if maximum == 640:
+                handle = b._cache["embed.weight"][1]
+                assert (handle.scale_count + handle.present_weight_count) * 8 > maximum
+                with pytest.raises(ValueError, match="exceeds byte limit"):
+                    handle.embedding_pv_vjp(_window()["input_ids"], torch.ones(3, 32))
+        results.append(t.step([10]*32))
     assert results[0]==results[1]
     ref=publish(a,tmp_path/"reference");child=publish(b,tmp_path/"child")
     for name in ("checkpoint.tnpv","gradients.tnpj"):
         assert (Path(ref.output_dir)/name).read_bytes()==(Path(child.output_dir)/name).read_bytes()
     a.close();b.close()
+
+
+def test_streamed_capture_rejects_foreign_same_geometry_handle_and_requires_clear(tmp_path):
+    parent = _convert(tmp_path, _prepared())
+    a = start(StateModel(), parent, tmp_path/"first", gradient_capture=capture_limits())
+    b = start(StateModel(), parent, tmp_path/"second", gradient_capture=capture_limits())
+    x = torch.ones(2, 32)
+    a.model(x)
+    b.model(x)
+    foreign = a._cache["a.weight"][1]
+    with pytest.raises(ValueError, match="foreign or stale capture handle"):
+        b._backend.capture_matmul_gradient("a.weight", 0, foreign, x, torch.ones(2, 1))
+    assert b.workspace_report["pending_gradient_poisoned"] and b.revision == 0
+    with pytest.raises(ValueError, match="poisoned"):
+        b.step([10]*32)
+    b.zero_grad()
+    b.model(x).sum().backward()
+    b.step([10]*32)
+    assert b.revision == 1
+    a.close(); b.close()
 
 
 @pytest.mark.parametrize("failure", ["stale","higher-order","input-version","leaf-version","preserved-state"])

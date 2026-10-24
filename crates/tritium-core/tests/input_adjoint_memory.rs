@@ -2,7 +2,8 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tritium_core::{
-    AdditiveView, Trit, UniformPlan, accumulate_embed_scale_vjp, accumulate_embed_weight_vjp,
+    AdditiveAdjointSpan, AdditiveScaleVjpPlan, AdditiveView, AdditiveWeightVjpPlan, Trit,
+    UniformPlan, accumulate_embed_scale_vjp, accumulate_embed_weight_vjp,
     accumulate_ternary_matmul_scale_vjp, accumulate_ternary_matmul_weight_vjp,
     project_additive_code_unit, reference_ternary_matmul_input_vjp,
 };
@@ -147,6 +148,57 @@ fn input_adjoint_uses_only_caller_buffers_at_small_and_large_shapes() {
         assert_eq!(bytes, 0);
         assert!(weight_gradients.iter().all(|v| v.is_finite()));
         eprintln!("PRESENT_WEIGHT_ADJOINT_HEAP_REQUESTS rows={rows} cols=256 bytes={bytes}");
+        let scale_plan = AdditiveScaleVjpPlan::from_uniform(plan);
+        let weight_plan = AdditiveWeightVjpPlan::from(scale_plan);
+        let mut scale_span = vec![0.0; scale_plan.stored_scale_count().min(17)];
+        let scale_start = scale_plan.stored_scale_count() - scale_span.len();
+        let mut weight_span = vec![0.0; 17];
+        let weight_start = weight_plan.present_weight_count() - weight_span.len();
+        let (result, bytes) = measured(|| {
+            scale_plan.matmul_span(
+                &activations,
+                &gradients,
+                2,
+                &mut scratch,
+                AdditiveAdjointSpan::new(scale_start, &mut scale_span),
+                |_, i| trits[i],
+            )
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(bytes, 0);
+        let (result, bytes) = measured(|| {
+            scale_plan.embed_span(
+                &ids,
+                &embedding_gradients,
+                &mut scratch,
+                AdditiveAdjointSpan::new(scale_start, &mut scale_span),
+                |_, i| trits[i],
+            )
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(bytes, 0);
+        let (result, bytes) = measured(|| {
+            weight_plan.matmul_span(
+                &activations,
+                &gradients,
+                2,
+                &mut scratch,
+                AdditiveAdjointSpan::new(weight_start, &mut weight_span),
+            )
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(bytes, 0);
+        let (result, bytes) = measured(|| {
+            weight_plan.embed_span(
+                &ids,
+                &embedding_gradients,
+                &mut scratch,
+                AdditiveAdjointSpan::new(weight_start, &mut weight_span),
+            )
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(bytes, 0);
+        eprintln!("OWNER_ADJOINT_SPAN_HEAP_REQUESTS rows={rows} bytes=0");
         let (result, bytes) =
             measured(|| project_additive_code_unit(raw, 0, &[0.0], None, &mut candidate));
         assert!(result.unwrap().changed);

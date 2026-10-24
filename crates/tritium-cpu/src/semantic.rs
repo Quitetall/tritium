@@ -1,7 +1,7 @@
 //! Packed semantic execution; legacy packed SIMD dispatch is unchanged.
 
 use core::any::Any;
-use tritium_core::DenseView;
+use tritium_core::{AdditiveAdjointSpan, DenseView};
 use tritium_format::AdditiveTensor;
 use tritium_spec::{
     BackendError, DeviceBuffer, TENSOR_STREAM_CHUNK_BYTES, TensorCaps, TensorExecution,
@@ -285,18 +285,23 @@ impl CpuTensor {
     fn weight_vjp_plan(
         tensor: &dyn DeviceBuffer,
     ) -> Result<tritium_core::AdditiveWeightVjpPlan<'_>, BackendError> {
+        Ok(Self::checked_adjoint_tensor(tensor)?
+            .scale_vjp_plan()?
+            .into())
+    }
+
+    fn checked_adjoint_tensor(tensor: &dyn DeviceBuffer) -> Result<&PackedAdditive, BackendError> {
         let selected = Self::checked(tensor)?;
         if tensor.len_bytes() != selected.len_bytes() {
             return Err(BackendError::InvalidInput(
                 "CPU handle payload bytes differ from backend storage".into(),
             ));
         }
-        let packed = match selected {
-            Self::Additive(packed) => packed,
-            Self::ScaleSnapshot(snapshot) => snapshot.base()?,
-            Self::Dense { .. } => return Err(BackendError::UnsupportedTensor),
-        };
-        Ok(packed.scale_vjp_plan()?.into())
+        match selected {
+            Self::Additive(packed) => Ok(packed),
+            Self::ScaleSnapshot(snapshot) => snapshot.base(),
+            Self::Dense { .. } => Err(BackendError::UnsupportedTensor),
+        }
     }
 
     pub(crate) fn additive_weight_count(tensor: &dyn DeviceBuffer) -> Result<usize, BackendError> {
@@ -334,6 +339,63 @@ impl CpuTensor {
             Self::ScaleSnapshot(snapshot) => snapshot.base(),
             Self::Dense { .. } => Err(BackendError::UnsupportedTensor),
         }
+    }
+
+    pub(crate) fn additive_matmul_scale_vjp_span(
+        tensor: &dyn DeviceBuffer,
+        activations: &[f32],
+        output_gradients: &[f32],
+        batch: usize,
+        row_workspace: &mut [f32],
+        out: AdditiveAdjointSpan<'_>,
+    ) -> Result<(), BackendError> {
+        Self::checked_adjoint_tensor(tensor)?.matmul_scale_vjp_span(
+            activations,
+            output_gradients,
+            batch,
+            row_workspace,
+            out,
+        )
+    }
+
+    pub(crate) fn additive_embed_scale_vjp_span(
+        tensor: &dyn DeviceBuffer,
+        ids: &[usize],
+        output_gradients: &[f32],
+        row_workspace: &mut [f32],
+        out: AdditiveAdjointSpan<'_>,
+    ) -> Result<(), BackendError> {
+        Self::checked_adjoint_tensor(tensor)?.embed_scale_vjp_span(
+            ids,
+            output_gradients,
+            row_workspace,
+            out,
+        )
+    }
+
+    pub(crate) fn additive_matmul_weight_vjp_span(
+        tensor: &dyn DeviceBuffer,
+        activations: &[f32],
+        output_gradients: &[f32],
+        batch: usize,
+        row_workspace: &mut [f32],
+        out: AdditiveAdjointSpan<'_>,
+    ) -> Result<(), BackendError> {
+        Self::weight_vjp_plan(tensor)?
+            .matmul_span(activations, output_gradients, batch, row_workspace, out)
+            .map_err(|e| BackendError::InvalidInput(format!("CPU weight adjoint failed: {e:?}")))
+    }
+
+    pub(crate) fn additive_embed_weight_vjp_span(
+        tensor: &dyn DeviceBuffer,
+        ids: &[usize],
+        output_gradients: &[f32],
+        row_workspace: &mut [f32],
+        out: AdditiveAdjointSpan<'_>,
+    ) -> Result<(), BackendError> {
+        Self::weight_vjp_plan(tensor)?
+            .embed_span(ids, output_gradients, row_workspace, out)
+            .map_err(|e| BackendError::InvalidInput(format!("CPU weight adjoint failed: {e:?}")))
     }
 
     fn checked_additive_view(

@@ -83,13 +83,12 @@ class _ScaleMatmul(torch.autograd.Function):
         _check_input_autograd(gradient)
         x = _compact(value.detach().to(dtype=torch.float32))
         dy = _compact(gradient.detach().to(dtype=torch.float32))
-        operation = ctx.handle.pv_vjp if trainer._pv else ctx.handle.scale_vjp
         if getattr(trainer, "_capture_limits", None) is not None:
-            trainer._backend.admit_capture(ctx.owner, ctx.revision)
-        scales = torch.utils.dlpack.from_dlpack(operation(x, dy))
-        if getattr(trainer, "_capture_limits", None) is not None:
-            trainer._backend.capture_gradient(ctx.owner, ctx.revision, scales)
+            trainer._backend.capture_matmul_gradient(ctx.owner, ctx.revision, ctx.handle, x, dy)
             scales = None
+        else:
+            operation = ctx.handle.pv_vjp if trainer._pv else ctx.handle.scale_vjp
+            scales = torch.utils.dlpack.from_dlpack(operation(x, dy))
         dx = _input_vjp_output(gradient, ctx.handle) if ctx.needs_input_grad[0] else None
         return dx, scales, None, None, None, None, None
 
@@ -117,13 +116,12 @@ class _ScaleEmbed(torch.autograd.Function):
             gradient = gradient.masked_fill((indices == ctx.padding).unsqueeze(-1), 0)
         ids = _compact(indices.to(dtype=torch.int64))
         dy = _compact(gradient.detach().to(dtype=torch.float32))
-        operation = ctx.handle.embedding_pv_vjp if trainer._pv else ctx.handle.embedding_scale_vjp
         if getattr(trainer, "_capture_limits", None) is not None:
-            trainer._backend.admit_capture(ctx.owner, ctx.revision)
-        scales = torch.utils.dlpack.from_dlpack(operation(ids, dy))
-        if getattr(trainer, "_capture_limits", None) is not None:
-            trainer._backend.capture_gradient(ctx.owner, ctx.revision, scales)
+            trainer._backend.capture_embed_gradient(ctx.owner, ctx.revision, ctx.handle, ids, dy)
             scales = None
+        else:
+            operation = ctx.handle.embedding_pv_vjp if trainer._pv else ctx.handle.embedding_scale_vjp
+            scales = torch.utils.dlpack.from_dlpack(operation(ids, dy))
         return None, scales, None, None, None, None, None, None, None
 
 
@@ -401,7 +399,14 @@ class NativePvPagedTrainer(NativePvTrainer):
         return 1 if self._capture_limits is not None else super()._leaf_count(handle)
 
     def _admit(self, handle, inputs, gradients, indices=0):
-        super()._admit(handle, inputs, gradients, indices)
+        if self._capture_limits is None:
+            super()._admit(handle, inputs, gradients, indices)
+        else:
+            # Rust chooses a bounded contribution span from the remaining cap.
+            count = (inputs + gradients) * 4 + handle.columns * 4 + indices * 8
+            count += 8 if self._gradient_count(handle) else 0
+            if count > handle.max_output_bytes:
+                raise ValueError("native training backward transfer/output/scratch exceeds byte limit")
         if (self._capture_limits is not None
                 and self._gradient_count(handle)*8+16384 > self._capture_limits.max_owner_working_bytes):
             raise ValueError("capture owner working cap exceeded")

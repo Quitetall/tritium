@@ -710,6 +710,40 @@ impl PackedAdditive {
             })
             .map_err(invalid)
     }
+
+    pub(super) fn matmul_scale_vjp_span(
+        &self,
+        activations: &[f32],
+        output_gradients: &[f32],
+        batch: usize,
+        row_workspace: &mut [f32],
+        out: tritium_core::AdditiveAdjointSpan<'_>,
+    ) -> Result<(), BackendError> {
+        self.scale_vjp_plan()?
+            .matmul_span(
+                activations,
+                output_gradients,
+                batch,
+                row_workspace,
+                out,
+                |plane, index| self.scale_vjp_trit(plane, index),
+            )
+            .map_err(invalid)
+    }
+
+    pub(super) fn embed_scale_vjp_span(
+        &self,
+        ids: &[usize],
+        output_gradients: &[f32],
+        row_workspace: &mut [f32],
+        out: tritium_core::AdditiveAdjointSpan<'_>,
+    ) -> Result<(), BackendError> {
+        self.scale_vjp_plan()?
+            .embed_span(ids, output_gradients, row_workspace, out, |plane, index| {
+                self.scale_vjp_trit(plane, index)
+            })
+            .map_err(invalid)
+    }
 }
 
 const B3_DIGITS: [[i8; 5]; 243] = {
