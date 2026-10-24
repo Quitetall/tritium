@@ -1084,6 +1084,7 @@ fn complete_builders_publish_unqualified_standard_and_hybrid_candidates_without_
     ] {
         let mut original = source(hybrid, tied, precision);
         let mut private_source = original.clone();
+        #[cfg(feature = "host-qtea")]
         let expected_source = original.clone();
         let (private_bytes, private_result) = build(&mut private_source, hybrid, tied);
         let (builder, model) = fitted_builder(&mut original, hybrid);
