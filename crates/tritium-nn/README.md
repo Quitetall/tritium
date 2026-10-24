@@ -9,6 +9,29 @@ exact byte accounting and receipt-backed benchmarks.
 See the [repository README](https://github.com/Quitetall/tritium#readme) and the
 [book](https://github.com/Quitetall/tritium/tree/main/docs/book) for usage.
 
+## Packed host QTEA projections (experimental)
+
+`HostQteaLinear::read_from` reads one strict bounded QTEA tensor with its affine
+centers, column multipliers and sparse FP8 corrections intact. Wrap it in
+`Projection::HostQtea(Arc::new(matrix))` when explicitly constructing model
+weights. Existing attention/MLP/head execution then consumes the packed bytes
+without retaining a decoded dense weight matrix. `from_tensor` instead moves
+already checked storage without a copy. These are proposed ADR 0162 interfaces.
+
+This is explicitly scalar **host** execution with F32 activations, not a native
+backend upload, GPU decoder, pure SALT representation or pretrained model loader.
+Inspectable-master training and requested-resident graph compilation refuse this
+projection. Embedded digests do not authenticate its original source or owner.
+
+Each matrix requires an explicit per-call staging-byte ceiling. `forward` checks
+batch geometry and allocates one fallible output-sized F32 staging buffer;
+`forward_into` uses exact caller-owned staging without a heap request. Failures
+leave output unchanged (staging may be dirty). Encoded limits, staging limits,
+caller/cache/model memory and physical RSS are separate domains. Limits do not
+aggregate across calls or concurrent matrices. Packed embedding gather, complete
+QTEA model packages, official Qwen/MTP loading, quality and performance remain
+unqualified; synthetic transformer checks are not those gates.
+
 ## Source-bound chat prompts (experimental)
 
 With `tokenizer`, `HfJsonTokenizer` retains the embedded `chat_template` from the

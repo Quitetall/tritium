@@ -1587,6 +1587,11 @@ fn extract_dense(
                 "{name} is already host SALT V2; a latent fp32 master is required"
             )));
         }
+        Projection::HostQtea(_) => {
+            return Err(unsupported(&format!(
+                "{name} is residual-bearing host QTEA; a latent fp32 master is required"
+            )));
+        }
         #[cfg(feature = "cuda")]
         Projection::SaltV2(_) => {
             return Err(unsupported(&format!(

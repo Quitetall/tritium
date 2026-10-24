@@ -981,7 +981,8 @@ mod tests {
             | Projection::Tensor(_)
             | Projection::Ternary(_)
             | Projection::Q2(_)
-            | Projection::HostSaltV2(_) => {
+            | Projection::HostSaltV2(_)
+            | Projection::HostQtea(_) => {
                 panic!("SALT loader must retain packed additive planes")
             }
             #[cfg(feature = "cuda")]

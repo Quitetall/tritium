@@ -45,9 +45,9 @@ pub use error::ResidentOpError;
 pub use evaluation::{TeacherForcedPerplexity, teacher_forced_perplexity_windows};
 pub use kv_cache::KvCache;
 pub use layers::{
-    ActivationPrecision, BlockDump, BlockScratch, DenseLinear, HostSaltV2Linear, Linear, Mlp,
-    Projection, ProjectionActivationMode, Q2Linear, Qwen35DeltaNet, Qwen35DeltaNetCache,
-    Qwen35DeltaNetWeights, Qwen35FullAttention, Qwen35FullAttentionCache,
+    ActivationPrecision, BlockDump, BlockScratch, DenseLinear, HostQteaLinear, HostSaltV2Linear,
+    Linear, Mlp, Projection, ProjectionActivationMode, Q2Linear, Qwen35DeltaNet,
+    Qwen35DeltaNetCache, Qwen35DeltaNetWeights, Qwen35FullAttention, Qwen35FullAttentionCache,
     Qwen35FullAttentionWeights, Relu2Mlp, SaltLinear, SwiGluMlp, TensorLoader, TernaryLinear,
     TokenEmbedding, TransformerBlock,
 };

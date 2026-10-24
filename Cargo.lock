@@ -4919,6 +4919,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "sha2",
  "tokenizers 0.23.1",
  "tritium-core",
  "tritium-cpu",

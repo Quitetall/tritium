@@ -20,6 +20,9 @@ tritium-evidence = { workspace = true }
 tritium-schema = { workspace = true }
 tritium-train = { workspace = true }
 tritium-quantize = { workspace = true }
+# Reuse the packed scalar QTEA arithmetic for explicit host model projections.
+# This does not make QTEA a backend tensor or introduce a dense weight shadow.
+tritium-cpu = { workspace = true }
 half = { workspace = true }
 blake3 = { workspace = true }
 # Data-parallel host matmul for DenseLinear (the SALT/fp accuracy-eval projection).
@@ -47,15 +50,12 @@ wasmi = { version = "=2.0.0", default-features = false, features = ["std", "vali
 libc = { workspace = true }
 
 [dev-dependencies]
+sha2 = { workspace = true }
 # Golden vectors pinning the DeltaNet activation kernels, which are duplicated in tritium-onnx
 # purely so the two backends agree (ADR 0039 WS-G). testkit does not depend on tritium-nn, so
 # this dev-only edge introduces no cycle.
 tritium-testkit = { workspace = true }
 proptest = { workspace = true }
-# A concrete backend for the layer/forward integration tests (WF-3): the layers
-# speak the `tritium-spec` contract, so the tests drive them through the CPU
-# ternary mpGEMM. Not a runtime dependency of the crate.
-tritium-cpu = { workspace = true }
 # `cargo test -p tritium-nn --features cuda` enables the CUDA backend (and its
 # build.rs `nvcc` PTX compile) so the GPU acceptance + CPU↔CUDA parity tests in
 # `tests/acceptance.rs` can build a `ModelRunner` on the `"cuda"` backend, and the

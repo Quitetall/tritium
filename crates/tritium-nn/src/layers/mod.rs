@@ -11,6 +11,7 @@ mod mlp;
 mod packed_salt;
 mod projection;
 mod q2;
+mod qtea;
 mod qwen35_deltanet;
 mod qwen35_full_attention;
 mod salt;
@@ -27,6 +28,7 @@ pub use linear::TernaryLinear;
 pub use mlp::{Mlp, Relu2Mlp, SwiGluMlp};
 pub use projection::{Projection, ProjectionActivationMode};
 pub use q2::Q2Linear;
+pub use qtea::HostQteaLinear;
 pub use qwen35_deltanet::{Qwen35DeltaNet, Qwen35DeltaNetCache, Qwen35DeltaNetWeights};
 pub use qwen35_full_attention::{
     Qwen35FullAttention, Qwen35FullAttentionCache, Qwen35FullAttentionWeights,
