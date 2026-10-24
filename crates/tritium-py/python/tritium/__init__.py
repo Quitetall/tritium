@@ -48,7 +48,7 @@ from ._tritium import (
     ste_quantize_vjp,
     ternary_matmul,
 )
-from . import onnx, portable, salt
+from . import onnx, portable, qtea, salt
 
 __all__ = [
     "NativeModelConversion",
@@ -95,6 +95,7 @@ __all__ = [
     "salt",
     "onnx",
     "portable",
+    "qtea",
 ]
 
 # The torch wrappers are optional: importing them requires PyTorch. Inference (Model/ternary_matmul)

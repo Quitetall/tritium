@@ -62,6 +62,7 @@ mod migrate;
 #[cfg(feature = "cuda")]
 mod nvml_probe;
 mod pull;
+mod qtea_campaign;
 mod quantize;
 mod quantize_ladder;
 mod release;
@@ -101,6 +102,11 @@ struct Cli {
 /// The `tritium` subcommands.
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Explicit experimental QTEA inspection and unqualified candidate fitting.
+    Qtea {
+        #[command(subcommand)]
+        qtea: qtea_campaign::QteaCommand,
+    },
     /// Import legacy originals and replay their actual prepared evidence.
     Migrate {
         #[command(subcommand)]
@@ -433,6 +439,7 @@ impl Command {
     fn evidence_name(&self) -> &'static str {
         match self {
             Self::Inspect { .. } => "inspect",
+            Self::Qtea { .. } => "qtea",
             Self::InspectTrit { .. } => "inspect-trit",
             Self::Migrate { .. } => "migrate",
             Self::ListBackends => "list-backends",
@@ -638,6 +645,7 @@ fn main() -> anyhow::Result<()> {
     let command_result = (|| -> anyhow::Result<()> {
         match cli.command {
             Command::Inspect { path } => inspect::run(&path)?,
+            Command::Qtea { qtea } => qtea_campaign::run(qtea)?,
             Command::InspectTrit { args } => inspect_trit::run(*args)?,
             Command::Migrate { migrate: command } => migrate::run(command)?,
             Command::ListBackends => backends::run(),

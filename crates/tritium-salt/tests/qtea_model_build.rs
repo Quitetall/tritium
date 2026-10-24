@@ -1,4 +1,6 @@
 //! Actual source/collector/admitted-fit/model stream; synthetic, not qualification.
+#[path = "qtea_model_build/file_campaign.rs"]
+mod file_campaign;
 use std::{
     collections::BTreeMap,
     io::{Cursor, Read, Seek, SeekFrom, Write},

@@ -20,6 +20,13 @@ use serde::{Deserialize, Serialize};
 mod frontier_v3;
 mod pipeline;
 mod qtea_calibration;
+mod qtea_file_campaign;
+pub use qtea_file_campaign::{
+    QteaCallerEstimate, QteaCampaignCurvature, QteaCampaignFiles, QteaCampaignInspection,
+    QteaCampaignLimits, QteaCampaignModelProfile, QteaCampaignOwner, QteaCampaignOwnerInspection,
+    QteaFileCampaignRequest, QteaFileCampaignResult, inspect_qtea_file_campaign,
+    run_qtea_file_campaign, run_qtea_file_campaign_to_directory,
+};
 mod qtea_model_build;
 mod qtea_tensor_work;
 pub use qtea_model_build::{

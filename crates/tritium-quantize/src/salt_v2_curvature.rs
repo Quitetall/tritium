@@ -7,6 +7,8 @@
 
 use super::salt_v2::DensePsdMetric;
 use core::ops::Range;
+mod input_transport;
+pub use input_transport::InputGramDecodeError;
 
 const INPUT_GRAM_MAGIC: [u8; 4] = *b"SIG2";
 const OUTPUT_FISHER_MAGIC: [u8; 4] = *b"SOF2";

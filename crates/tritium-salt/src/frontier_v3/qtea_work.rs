@@ -144,6 +144,23 @@ impl<'a> QteaTensorWorkPlan<'a> {
         request: &FrontierStageRequest,
         expected_plan_id: ContentId,
     ) -> Result<QteaAdmittedTensorWork<'a>, QteaFrontierWorkError> {
+        self.check_admission(plan, request, expected_plan_id)?;
+        Ok(QteaAdmittedTensorWork {
+            work: self,
+            plan_id: plan.content_id(),
+            stage_request_id: request.content_id(),
+            estimate: plan.resource_estimate(),
+        })
+    }
+
+    // Shared with inspect-then-run orchestration; a successful check is still
+    // not an execution token, fit result or serialized authority.
+    pub(crate) fn check_admission(
+        &self,
+        plan: &AdmittedSolverPlan,
+        request: &FrontierStageRequest,
+        expected_plan_id: ContentId,
+    ) -> Result<(), QteaFrontierWorkError> {
         let plan_id = plan.content_id();
         if plan_id != expected_plan_id {
             return Err(QteaFrontierWorkError::PlanIdentityMismatch);
@@ -201,12 +218,7 @@ impl<'a> QteaTensorWorkPlan<'a> {
         ] {
             require_bytes(dimension, required, provided)?;
         }
-        Ok(QteaAdmittedTensorWork {
-            work: self,
-            plan_id,
-            stage_request_id: request.content_id(),
-            estimate: plan.resource_estimate(),
-        })
+        Ok(())
     }
 }
 

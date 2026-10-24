@@ -269,6 +269,9 @@ impl<S> std::fmt::Debug for QteaModelBuilder<'_, S> {
     }
 }
 impl<'a, S: Read + Write + Seek> QteaModelBuilder<'a, S> {
+    pub(crate) fn revalidate_original_source(&mut self) -> Result<(), QteaModelBuildError> {
+        self.source.revalidate().map_err(cause)
+    }
     /// Build and commit an explicitly unqualified candidate through the shared
     /// no-clobber directory transaction. Source/numeric/record checks in finish
     /// precede the sink's independent actual-byte admission and commit marker.

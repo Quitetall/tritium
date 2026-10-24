@@ -27,7 +27,7 @@ pub(crate) struct NamedPath {
     name: String,
     path: PathBuf,
 }
-fn parse_named_path(value: &str) -> std::result::Result<NamedPath, String> {
+pub(crate) fn parse_named_path(value: &str) -> std::result::Result<NamedPath, String> {
     let (name, path) = value.split_once('=').ok_or("expected NAME=PATH")?;
     if name.is_empty() || path.is_empty() {
         return Err("NAME and PATH must be nonempty".into());
@@ -94,7 +94,7 @@ impl Request {
     }
 }
 
-fn paths(bindings: &[NamedPath]) -> Result<BTreeMap<String, PathBuf>> {
+pub(crate) fn paths(bindings: &[NamedPath]) -> Result<BTreeMap<String, PathBuf>> {
     let mut result = BTreeMap::new();
     for binding in bindings {
         ensure!(

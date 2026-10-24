@@ -1,6 +1,6 @@
 # Generated v1.0 to v1.1 API diff
 
-Report identity: `sha256:50321b9e7c8a1a75440bbc4dd845f8e03324f8681bf832b05684a7e740d4d3f9`
+Report identity: `sha256:65cfbf8ca729e510111066fb62b07dde79729af3cd8bb8623a2a9269c503d118`
 
 This is a structural source report for candidate `1.1.0-rc.2`
 against `v1.0.0`. It is not a package-install or runtime receipt.
@@ -59,6 +59,7 @@ Added in v1.1:
 - `nn`
 - `onnx`
 - `portable`
+- `qtea`
 - `salt`
 - `ste_absmean_scale`
 - `ste_quantize_forward`

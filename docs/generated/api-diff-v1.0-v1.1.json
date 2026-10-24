@@ -43,6 +43,7 @@
       "nn",
       "onnx",
       "portable",
+      "qtea",
       "salt",
       "ste_absmean_scale",
       "ste_quantize_forward",
@@ -55,7 +56,7 @@
       "ternary_matmul"
     ]
   },
-  "report_id": "sha256:50321b9e7c8a1a75440bbc4dd845f8e03324f8681bf832b05684a7e740d4d3f9",
+  "report_id": "sha256:65cfbf8ca729e510111066fb62b07dde79729af3cd8bb8623a2a9269c503d118",
   "rust": {
     "frozen_crates": [
       "tritium-core",

@@ -19,7 +19,8 @@ pub const TENSOR_FIT_ID: &str = "qtea.cpu-tensor.f32.v1";
 pub use plan::numerical_input_digest;
 
 /// Explicit full-tensor recipe; validated before fitting/allocation.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TensorFitConfig {
     /// Original column-group and feedback-block width,2..=4096.
     pub group_size: usize,

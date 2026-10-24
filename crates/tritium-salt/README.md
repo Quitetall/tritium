@@ -31,6 +31,14 @@ cannot underreport known raw artifact length; they are not qualification.
 
 ## Observed-source QTEA model building (experimental)
 
+The shared `inspect_qtea_file_campaign` / `run_qtea_file_campaign` interface now
+connects explicit original safetensors and canonical Gram/actual calibration-cache
+files to that builder, with strict versioned requests and stale-selection checks.
+CLI `tritium qtea inspect/run` and Python `tritium.qtea.inspect/run` are thin
+adapters over it; see [`QTEA-CAMPAIGNS`](../../docs/QTEA-CAMPAIGNS.md) (proposed
+ADR0170). Outputs remain unqualified, and imported metrics/caller estimates are
+not authenticated capture or measured hardware. Existing SALT routes are unchanged.
+
 `QteaModelBuilder` joins actual original-byte observation, the common calibrated
 bridge/native fitter, exact caller-selected admission and the seek-backed model
 writer (proposed ADR0167). It requires an `ObservedWeightSource`, explicit
@@ -85,7 +93,7 @@ The `host-qtea` feature enables matching NN cold-runtime checks. Tests cover ful
 standard tied/untied and hybrid language/retained-MTP builds from F32/F16/BF16
 originals, actual collector/native admitted work, exact asset/state preservation,
 partial writers, source mutation and tampered records. MTP remains Unverified;
-real-model capture/metric choice, CLI/Python campaign orchestration, durable
+real-model capture/metric choice and orchestration qualification, durable
 qualified release publication and independent qualification remain required.
 
 For explicit local candidate storage, `builder.publish_candidate(&mut sink)`

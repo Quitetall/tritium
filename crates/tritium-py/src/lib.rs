@@ -49,6 +49,7 @@ mod native_workspace;
 #[cfg(feature = "onnx")]
 mod onnx;
 mod ops;
+mod qtea_campaign;
 mod qwen;
 mod salt;
 mod stage7;
@@ -430,6 +431,11 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(model_conversion::convert_model_plan, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        qtea_campaign::_inspect_qtea_file_campaign,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(qtea_campaign::_run_qtea_file_campaign, m)?)?;
     m.add_function(wrap_pyfunction!(
         model_conversion::convert_owner_model_plan,
         m
