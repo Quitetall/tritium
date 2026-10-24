@@ -8,6 +8,7 @@ use super::{
 use crate::{CurvatureSourceId, InputGram};
 use tritium_core::Trit;
 
+mod export;
 mod sweep;
 
 /// Native scalar-f32/SPD-only single-tensor numerical policy, not a solver catalog ID.

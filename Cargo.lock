@@ -4817,6 +4817,7 @@ dependencies = [
  "tritium-core",
  "tritium-evidence",
  "tritium-format",
+ "tritium-quantize",
  "tritium-runtime",
  "tritium-schema",
  "tritium-spec",

@@ -104,6 +104,11 @@ A discrete additive-ternary representation intended for loading or inference.
 It does not contain the latent training state needed to resume optimization.
 _Avoid_: QAT checkpoint, dense master
 
+**Residual-bearing ternary tensor**:
+A tensor with a ternary base and affine offsets or non-ternary residual corrections,
+beyond ordinary reconstruction scales. It is not a pure additive-ternary artifact.
+_Avoid_: pure ternary, multiply-free SALT
+
 **Recovery replay**:
 Re-execution of a ternary training recipe from its original training payload,
 reproducing the same training snapshot. It is distinct from authenticating the

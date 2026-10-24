@@ -51,6 +51,7 @@ mod i2s_int8;
 mod le_cursor;
 mod legacy_salt_import;
 mod q2_0;
+pub mod qtea;
 mod rows;
 mod runtime_evidence;
 mod safetensors;

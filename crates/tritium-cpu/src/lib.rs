@@ -96,6 +96,8 @@ mod kernel;
 #[allow(unsafe_code)]
 mod simd;
 
+/// Scalar packed residual-bearing QTEA reference, independent of the offline fitter.
+pub mod qtea;
 /// Exact, allocation-accounted SALT V2 CPU semantic reference.
 pub mod salt_v2;
 mod semantic;
