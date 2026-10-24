@@ -112,6 +112,12 @@ template presence only, not whether every message/control combination renders.
 
 ### Explicit hybrid language/MTP profile (experimental)
 
+`QteaModelInventory::prepare` is the shared metadata-only source/cold-loader
+interface for these explicit profiles. It owns complete names/original shapes and
+uses the existing standard plan or canonical Qwen language/MTP schema; it is not
+raw-byte/precision/custody validation, backend initialization or runtime fit.
+Metadata growth is bounded by actual capped owner count before graph planning.
+
 The separate proposed ADR0166 `tritium.qtea-hybrid-model.v1` profile carries the
 complete canonical Qwen-family language/MTP inventory. Its `Preserved` role
 retains exact rank/dimensions for non-matrix state such as convolution; it is not

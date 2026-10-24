@@ -82,6 +82,7 @@ pub use model::{
     GgufBpeTokenizer, HfJsonTokenizer, LoadedModel, ModelLoadResources, ModelResourceAdmission,
     TypedLoadConfig, load, load_streamed_with_resources, load_with_limits, load_with_resources,
 };
+pub use model::{QteaModelInventory, QteaModelProfile};
 #[cfg(feature = "cuda")]
 pub use model::{
     SaltV2LoadedTensorReceipt, SaltV2ModelAllocationReceipt, SaltV2PreservedTensorReceipt,

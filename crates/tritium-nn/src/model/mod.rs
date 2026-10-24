@@ -15,6 +15,8 @@ mod hf_shards;
 #[cfg(feature = "tokenizer")]
 mod host;
 mod limits;
+mod qtea_inventory;
+pub use qtea_inventory::{QteaModelInventory, QteaModelProfile};
 #[cfg(feature = "tokenizer")]
 mod load_config;
 #[cfg(feature = "host-qtea")]

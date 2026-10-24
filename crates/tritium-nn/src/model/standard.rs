@@ -15,14 +15,7 @@ use crate::{
 pub(super) enum TensorGeometry<'a> {
     Native(&'a [usize]),
     Stored(&'a [u64]),
-    Matrix {
-        rows: u64,
-        cols: u64,
-    },
-    #[cfg(feature = "host-qtea")]
-    Vector {
-        length: u64,
-    },
+    Matrix { rows: u64, cols: u64 },
     Unsupported,
 }
 
@@ -41,10 +34,6 @@ impl TensorGeometry<'_> {
                 expected.len() == 2
                     && usize::try_from(rows) == Ok(expected[0])
                     && usize::try_from(cols) == Ok(expected[1])
-            }
-            #[cfg(feature = "host-qtea")]
-            Self::Vector { length } => {
-                expected.len() == 1 && usize::try_from(length) == Ok(expected[0])
             }
             Self::Unsupported => false,
         }

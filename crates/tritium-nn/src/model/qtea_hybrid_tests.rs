@@ -1,6 +1,9 @@
 use super::*;
-use crate::{ChatRenderOptions, Qwen35MtpStatus, Tokenizer};
+use crate::{
+    ChatRenderOptions, Qwen35CheckpointConfig, Qwen35MtpStatus, Qwen35TensorSchemaRole, Tokenizer,
+};
 use std::{collections::BTreeMap, io::Cursor};
+use tritium_format::qtea::model::QteaModelTensor;
 use tritium_format::{
     TritBlob, TritBlobKind, TritPackageReadLimits,
     qtea::model::{

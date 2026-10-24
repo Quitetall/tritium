@@ -1,4 +1,15 @@
 //! Owner-bound native QTEA work, below machine/frontier admission or publication.
+pub(crate) fn work_input_id(origin: QteaTensorOrigin<'_>, numerical: [u8; 32]) -> ContentId {
+    let mut hash = blake3::Hasher::new_derive_key(CONTENT_ID_CONTEXT);
+    hash.update(b"tritium qtea tensor work input v1\0");
+    hash.update(origin.source_id.as_bytes());
+    hash.update(&(origin.owner.len() as u64).to_le_bytes());
+    hash.update(origin.owner.as_bytes());
+    hash.update(&origin.tensor_index.to_le_bytes());
+    hash.update(&origin.source_tensor_digest);
+    hash.update(&numerical);
+    ContentId::from_digest(*hash.finalize().as_bytes())
+}
 
 use std::{error::Error, fmt, io::Write, mem::size_of};
 use tritium_format::qtea::{QteaByteLedger, QteaError, QteaLimits, QteaMetadata};
@@ -133,17 +144,7 @@ impl<'a> QteaTensorWorkPlan<'a> {
             validation_bytes: c,
             total_logical_bytes,
         };
-        // Same generic ContentId context and explicit namespace as other tensor
-        // work IDs; stream the bounded origin without an intermediate allocation.
-        let mut hash = blake3::Hasher::new_derive_key(CONTENT_ID_CONTEXT);
-        hash.update(b"tritium qtea tensor work input v1\0");
-        hash.update(origin.source_id.as_bytes());
-        hash.update(&(origin.owner.len() as u64).to_le_bytes());
-        hash.update(origin.owner.as_bytes());
-        hash.update(&origin.tensor_index.to_le_bytes());
-        hash.update(&origin.source_tensor_digest);
-        hash.update(&numerical.input_digest());
-        let input_id = ContentId::from_digest(*hash.finalize().as_bytes());
+        let input_id = work_input_id(origin, numerical.input_digest());
         Ok(Self {
             numerical,
             origin,

@@ -20,6 +20,7 @@ mod artifact;
 mod compatibility;
 mod orchestration;
 mod qtea_work;
+pub(crate) use qtea_work::qtea_output_id;
 mod receipt;
 mod solvers;
 
@@ -889,22 +890,28 @@ impl AdmittedSolverPlan {
 
     /// Stable identity of descriptor, request, estimate, machine, and evidence.
     pub fn content_id(&self) -> ContentId {
-        let descriptor =
-            serde_json::to_vec(&self.descriptor).expect("frontier solver descriptor serializes");
-        let request =
-            serde_json::to_vec(&self.request).expect("frontier solver request serializes");
-        let resources = serde_json::to_vec(&self.estimate.resources())
-            .expect("frontier resource vector serializes");
-        let mut identity = Vec::new();
-        identity.extend_from_slice(b"tritium frontier admitted solver plan v1\0");
-        for field in [&descriptor, &request, &resources] {
-            identity.extend_from_slice(&(field.len() as u64).to_le_bytes());
-            identity.extend_from_slice(field);
-        }
-        identity.extend_from_slice(self.estimate.machine_id().as_bytes());
-        identity.extend_from_slice(self.estimate.evidence_id().as_bytes());
-        ContentId::of_bytes(&identity)
+        admitted_plan_id(&self.descriptor, &self.request, self.estimate)
     }
+}
+
+pub(crate) fn admitted_plan_id(
+    descriptor: &SolverDescriptor,
+    request: &SolverRequest,
+    estimate: FrontierResourceEstimate,
+) -> ContentId {
+    let descriptor = serde_json::to_vec(descriptor).expect("frontier solver descriptor serializes");
+    let request = serde_json::to_vec(request).expect("frontier solver request serializes");
+    let resources =
+        serde_json::to_vec(&estimate.resources()).expect("frontier resource vector serializes");
+    let mut identity = Vec::new();
+    identity.extend_from_slice(b"tritium frontier admitted solver plan v1\0");
+    for field in [&descriptor, &request, &resources] {
+        identity.extend_from_slice(&(field.len() as u64).to_le_bytes());
+        identity.extend_from_slice(field);
+    }
+    identity.extend_from_slice(estimate.machine_id().as_bytes());
+    identity.extend_from_slice(estimate.evidence_id().as_bytes());
+    ContentId::of_bytes(&identity)
 }
 
 /// Deterministic registry of explicitly installed solver implementations.

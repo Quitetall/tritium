@@ -12,6 +12,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+tritium-core = { workspace = true }
+tritium-evidence = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -28,11 +30,13 @@ tritium-schema = { workspace = true }
 libc = "0.2"
 
 [dev-dependencies]
+tritium-runtime = { workspace = true }
 half = { workspace = true }
 tritium-nn = { workspace = true, features = ["test-fixtures"] }
 
 [features]
 default = []
+host-qtea = ["tritium-nn/host-qtea", "tritium-nn/tokenizer"]
 cuda = ["dep:tritium-cuda", "tritium-nn/cuda"]
 
 [lints]

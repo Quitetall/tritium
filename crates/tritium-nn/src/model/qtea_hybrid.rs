@@ -7,12 +7,12 @@ use super::{
     qtea_owners::Owners,
     qwen35_hf::{Qwen35HfTensorSource, load_language_weights, load_mtp_weights},
 };
-use crate::{NnError, Projection, Qwen35CheckpointConfig, Qwen35TensorSchemaRole, TokenEmbedding};
+use crate::{NnError, Projection, TokenEmbedding};
 use std::{
     cell::RefCell,
     io::{Read, Seek},
 };
-use tritium_format::qtea::model::{QteaHybridModelReadLimits, QteaModelReader, QteaModelTensor};
+use tritium_format::qtea::model::{QteaHybridModelReadLimits, QteaModelReader};
 
 /// Explicit hybrid limits. Preserved higher-rank tensors are not norm vectors.
 #[derive(Clone, Copy, Debug)]
@@ -106,51 +106,16 @@ impl super::LoadedModel {
         )
         .map_err(failure)?;
         let bytes = reader.config().map_err(failure)?;
-        let config =
-            Qwen35CheckpointConfig::from_hf_config(std::str::from_utf8(&bytes).map_err(failure)?)?;
-        let minimum = config
-            .text
-            .layer_types
-            .len()
-            .checked_mul(7)
-            .and_then(|n| n.checked_add(17))
-            .ok_or_else(|| invalid("hybrid schema size overflow"))?;
-        if minimum > reader.manifest().tensors.len() {
-            return Err(invalid(
-                "hybrid architecture exceeds capped owner inventory",
-            ));
-        }
-        let schema = crate::qwen35_language_mtp_tensor_schema(&config.text)?;
-        if schema.len() != reader.manifest().tensors.len() {
-            return Err(invalid(
-                "hybrid QTEA requires complete exact language/MTP owner inventory",
-            ));
-        }
-        for entry in schema {
-            let tensor = reader
-                .manifest()
-                .tensors
-                .get(&entry.name)
-                .ok_or_else(|| invalid("missing canonical hybrid QTEA owner"))?;
-            let admitted = match (entry.role, tensor) {
-                (Qwen35TensorSchemaRole::Matrix, QteaModelTensor::Qtea { rows, columns, .. }) => {
-                    entry.shape.as_slice() == [*rows as usize, *columns as usize]
-                }
-                (Qwen35TensorSchemaRole::Preserved, QteaModelTensor::Vector { length, .. }) => {
-                    entry.shape.as_slice() == [*length as usize]
-                }
-                (Qwen35TensorSchemaRole::Preserved, QteaModelTensor::Preserved { shape, .. }) => {
-                    shape
-                        .iter()
-                        .copied()
-                        .eq(entry.shape.iter().map(|d| *d as u64))
-                }
-                _ => false,
-            };
-            if !admitted {
-                return Err(invalid("hybrid QTEA original role/shape mismatch"));
-            }
-        }
+        let inventory = super::QteaModelInventory::from_manifest(
+            &bytes,
+            super::QteaModelProfile::Qwen35Hybrid,
+            reader.manifest(),
+            model.max_tensors,
+        )?;
+        let super::qtea_inventory::PreparedGraph::Hybrid(config) = inventory.graph else {
+            return Err(invalid("hybrid QTEA profile mismatch"));
+        };
+        let config = *config;
         super::qtea_owners::plan(&reader, limits.base.max_weight_bytes)?;
         let admission = super::CacheAdmission::hybrid(&config, stream)?;
         let tokenizer = read_tokenizer(&mut reader, config.text.vocab_size as usize)?;

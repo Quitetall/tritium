@@ -19,7 +19,10 @@ pub use column::RefinedColumn;
 pub use group::GroupParameters;
 pub use saliency::SalientRanking;
 pub use sparse::SparseResidualColumn;
-pub use tensor::{TENSOR_FIT_ID, TensorFit, TensorFitConfig, TensorFitPlan, TensorResidual};
+pub use tensor::{
+    TENSOR_FIT_ID, TensorFit, TensorFitConfig, TensorFitPlan, TensorResidual,
+    numerical_input_digest,
+};
 
 /// Numerical-policy identity, deliberately distinct from a frontier solver ID.
 pub const ARITHMETIC_ID: &str = "qtea.cpu-arithmetic.f32.v1";

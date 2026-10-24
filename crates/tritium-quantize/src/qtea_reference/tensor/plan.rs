@@ -95,12 +95,14 @@ impl<'a> TensorFitPlan<'a> {
         let weights_digest = *weights_hash.finalize().as_bytes();
         let gram_digest = gram.digest();
         let recipe_digest = config.digest();
-        let mut hash = blake3::Hasher::new_derive_key("tritium qtea numerical input plan v1");
-        hash.update(&(rows as u64).to_le_bytes());
-        hash.update(&(columns as u64).to_le_bytes());
-        for digest in [weights_digest, gram_digest, recipe_digest, source.digest()] {
-            hash.update(&digest);
-        }
+        let input_digest = numerical_input_digest(metadata(
+            rows,
+            columns,
+            config,
+            source,
+            weights_digest,
+            gram_digest,
+        ))?;
         Ok(Self {
             weights,
             gram,
@@ -111,7 +113,7 @@ impl<'a> TensorFitPlan<'a> {
             weights_digest,
             gram_digest,
             recipe_digest,
-            input_digest: *hash.finalize().as_bytes(),
+            input_digest,
             required_work_bytes,
         })
     }
@@ -150,6 +152,35 @@ impl<'a> TensorFitPlan<'a> {
     pub fn fit(self) -> Result<TensorFit, ArithmeticError> {
         TensorFit::fit_prepared(self)
     }
+}
+
+/// Reconstruct the existing mathematical input fingerprint from declared wire
+/// metadata. This checks basic geometry/source IDs, not original weights/Gram,
+/// execution, recipe validity, machine admission or source authenticity.
+/// # Errors
+/// Empty/overflowing geometry or unbound source identity.
+pub fn numerical_input_digest(meta: QteaMetadata) -> Result<[u8; 32], ArithmeticError> {
+    if meta.rows == 0 || meta.columns == 0 || meta.rows.checked_mul(meta.columns).is_none() {
+        return Err(ArithmeticError::InvalidShape);
+    }
+    let source = CurvatureSourceId::new(
+        meta.bindings.source_model,
+        meta.bindings.activation_cache,
+        meta.bindings.token_stream,
+    )
+    .map_err(|_| ArithmeticError::UnboundGram)?;
+    let mut hash = blake3::Hasher::new_derive_key("tritium qtea numerical input plan v1");
+    hash.update(&(meta.rows as u64).to_le_bytes());
+    hash.update(&(meta.columns as u64).to_le_bytes());
+    for digest in [
+        meta.bindings.weights,
+        meta.bindings.gram,
+        meta.recipe.digest(),
+        source.digest(),
+    ] {
+        hash.update(&digest);
+    }
+    Ok(*hash.finalize().as_bytes())
 }
 
 pub(super) fn metadata(

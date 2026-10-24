@@ -29,6 +29,55 @@ returned stage output do. Execution cannot create Registered/Certified status.
 Receipts require explicit caller observations and
 cannot underreport known raw artifact length; they are not qualification.
 
+## Observed-source QTEA model building (experimental)
+
+`QteaModelBuilder` joins actual original-byte observation, the common calibrated
+bridge/native fitter, exact caller-selected admission and the seek-backed model
+writer (proposed ADR0167). It requires an `ObservedWeightSource`, explicit
+`QteaModelProfile`, campaign identity, empty private spool and positive
+`QteaModelBuildLimits`. Source config/names/original shapes are admitted through
+the same `QteaModelInventory` plans as cold loading, before tensor fitting.
+The observer's input plan is observation only; its actions are not QTEA output
+recipes or completed KeepDense fitting evidence.
+
+Call `fit_owner` exactly once for every canonical matrix. Supply either actual
+`QteaOwnerCurvature::Calibrated` Full/Matmul/input-only statistics or an explicit
+`Native` bound Gram; grouped/gather/Fisher data do not become an identity fallback.
+In particular, native embedding metric selection is explicit caller work, not a
+claim that embedding gather was captured as matmul. The callback supplies the
+existing opaque selected plan, exact request and separately selected expected ID
+through `QteaSelectedAdmission`. It never creates measurements or a completed
+frontier stage receipt. Tensor source bytes are checked and widened one at a time
+with the shared decoder; known widened/spool refusals precede fitting.
+
+Any failed/duplicate/unsupported owner poisons the unpublished cohort. `finish`
+requires a complete matrix inventory and empty private Read/Write/Seek output.
+It preserves original non-matrix float state and asset bytes, adds bounded
+`qtea-fit.json` software observations, writes from the bounded spool and checks
+all actual wire/record/numerical identity bindings. Whole original-source
+revalidation and final output verification precede a successful result.
+
+`verify_qtea_model_build_record` repeats structural package/observation binding
+checks with the existing identity derivations. It does not reconstruct an opaque
+admission token, authenticate original/capture/producer execution, approve a
+resource estimate or rerun the fitting algorithm. Record identities and estimates
+are not measured resource vectors or source/quality signatures. The asset is not
+a sealed production model-fit log and cannot satisfy Stage7 by itself.
+
+The returned `QteaModelBuildResult` is a private candidate stream, NOT fsync,
+no-clobber directory publication or distribution permission. Late errors may
+leave private spool/output bytes; the caller must discard them. Logical source,
+widened/native/export, spool and observation caps exclude caller-retained
+calibration/model/metadata/allocator/process RSS. No new dense model shadow,
+automatic planner, GPU promise or trust promotion is introduced.
+
+The `host-qtea` feature enables matching NN cold-runtime checks. Tests cover full
+standard tied/untied and hybrid language/retained-MTP builds from F32/F16/BF16
+originals, actual collector/native admitted work, exact asset/state preservation,
+partial writers, source mutation and tampered records. MTP remains Unverified;
+real-model capture/metric choice, CLI/Python campaign orchestration, durable
+publication and independent release qualification remain required.
+
 The bounded synthetic `qtea_conformance` example exercises the same public
 adapter/registry/admitted writer, actual cold reader and packed CPU forward. Only
 the resource-estimator fixture is synthetic, not the mathematical solver.

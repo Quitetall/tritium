@@ -1,9 +1,5 @@
 //! Complete standard-model admission over the distinct packed QTEA carrier.
-use super::{
-    ModelWeights,
-    hf::{NameSchema, declared_vocab_size, resolve_optional_attention_names},
-    standard::{StandardModelPlan, TensorGeometry},
-};
+use super::{ModelWeights, hf::NameSchema};
 use crate::{ArchSpec, ModelConfig, NnError, Projection, TokenEmbedding};
 use std::{
     cell::RefCell,
@@ -12,7 +8,7 @@ use std::{
 };
 use tritium_format::{
     TritPackageReadLimits,
-    qtea::model::{QteaModelReadLimits, QteaModelReader, QteaModelTensor},
+    qtea::model::{QteaModelReadLimits, QteaModelReader},
 };
 
 /// Explicit source, per-owner and model weight-payload limits for host QTEA.
@@ -151,47 +147,21 @@ impl ModelWeights {
         )
         .map_err(failure)?;
         let config_bytes = reader.config().map_err(failure)?;
-        let config_text = std::str::from_utf8(&config_bytes).map_err(failure)?;
-        let (config, mut spec) = ModelConfig::from_hf_config(config_text)?;
-        let json = serde_json::from_str(config_text).map_err(failure)?;
-        let manifest = reader.manifest();
-        // Bound layer metadata by the already capped complete owner inventory.
-        let minimum = (config.n_layers as usize)
-            .checked_mul(9)
-            .and_then(|n| n.checked_add(2))
-            .ok_or_else(|| invalid("QTEA architecture inventory overflow"))?;
-        if minimum > manifest.tensors.len() {
-            return Err(invalid("QTEA architecture exceeds owner inventory"));
-        }
-        (spec.qkv_bias, spec.qk_norm) = resolve_optional_attention_names(
-            &config,
-            &json,
-            manifest.tensors.keys().map(String::as_str),
+        let inventory = super::QteaModelInventory::from_manifest(
+            &config_bytes,
+            super::QteaModelProfile::Standard,
+            reader.manifest(),
+            model_limits.max_tensors,
         )?;
-        let Some(QteaModelTensor::Qtea { rows, columns, .. }) =
-            manifest.tensors.get(NameSchema::Hf.top("token_embd"))
-        else {
-            return Err(invalid("QTEA model requires a packed embedding owner"));
+        let super::qtea_inventory::PreparedGraph::Standard(prepared) = inventory.graph else {
+            return Err(invalid("standard QTEA profile mismatch"));
         };
-        let vocab = usize::try_from(*rows).map_err(failure)?;
-        if *columns != u64::from(config.n_embd)
-            || declared_vocab_size(&json)?.is_some_and(|v| v != vocab)
-        {
-            return Err(invalid("QTEA embedding/config geometry mismatch"));
-        }
-        let plan = StandardModelPlan::new(&config, &spec, NameSchema::Hf, vocab)?;
-        plan.admit_inventory(manifest.tensors.len(), |name| {
-            manifest.tensors.get(name).map(|tensor| match tensor {
-                QteaModelTensor::Qtea { rows, columns, .. } => TensorGeometry::Matrix {
-                    rows: *rows,
-                    cols: *columns,
-                },
-                QteaModelTensor::Vector { length, .. } => {
-                    TensorGeometry::Vector { length: *length }
-                }
-                QteaModelTensor::Preserved { .. } => TensorGeometry::Unsupported,
-            })
-        })?;
+        let super::qtea_inventory::StandardInventory {
+            config,
+            spec,
+            plan,
+            vocab,
+        } = *prepared;
         super::qtea_owners::plan(&reader, limits.max_weight_bytes)?;
         let admission = admit(&mut reader, &config, vocab)?;
         let owners = super::qtea_owners::read(&mut reader, limits)?;

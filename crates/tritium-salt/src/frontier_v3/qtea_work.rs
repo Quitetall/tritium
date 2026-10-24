@@ -1,5 +1,26 @@
 //! Exact experimental admission for real owner-bound QTEA work.
-//! CPU reference adapter and exact experimental admission; never qualification.
+pub(crate) fn qtea_output_id(
+    stage_request_id: ContentId,
+    plan_id: ContentId,
+    estimate: FrontierResourceEstimate,
+    input_id: ContentId,
+    tensor_id: ContentId,
+) -> ContentId {
+    let mut hash = blake3::Hasher::new_derive_key(CONTENT_ID_CONTEXT);
+    hash.update(b"tritium frontier admitted qtea tensor output v1\0");
+    for id in [
+        stage_request_id,
+        plan_id,
+        estimate.machine_id(),
+        estimate.evidence_id(),
+        input_id,
+        tensor_id,
+    ] {
+        hash.update(id.as_bytes());
+    }
+    ContentId::from_digest(*hash.finalize().as_bytes())
+}
+// CPU reference adapter and exact experimental admission; never qualification.
 
 use std::{error::Error, fmt, io::Write, sync::Arc};
 
@@ -230,19 +251,13 @@ impl QteaAdmittedTensorWork<'_> {
         let plan_id = self.plan_id;
         let stage_request_id = self.stage_request_id;
         let estimate = self.estimate;
-        let mut hash = blake3::Hasher::new_derive_key(CONTENT_ID_CONTEXT);
-        hash.update(b"tritium frontier admitted qtea tensor output v1\0");
-        for id in [
+        let output_id = qtea_output_id(
             stage_request_id,
             plan_id,
-            estimate.machine_id(),
-            estimate.evidence_id(),
+            estimate,
             work.input_id(),
             work.tensor_id(),
-        ] {
-            hash.update(id.as_bytes());
-        }
-        let output_id = ContentId::from_digest(*hash.finalize().as_bytes());
+        );
         Ok(QteaAdmittedTensorFitResult {
             work,
             plan_id,

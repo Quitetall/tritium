@@ -20,7 +20,13 @@ use serde::{Deserialize, Serialize};
 mod frontier_v3;
 mod pipeline;
 mod qtea_calibration;
+mod qtea_model_build;
 mod qtea_tensor_work;
+pub use qtea_model_build::{
+    QteaModelBuildError, QteaModelBuildLimits, QteaModelBuildRecord, QteaModelBuildResult,
+    QteaModelBuilder, QteaOwnerCurvature, QteaOwnerFitObservation, QteaSelectedAdmission,
+    verify_qtea_model_build_record,
+};
 mod qwen36_preflight;
 mod qwen36_source_admission;
 mod qwen36_source_identity;

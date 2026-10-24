@@ -16,6 +16,7 @@ pub use plan::TensorFitPlan;
 
 /// Native scalar-f32/SPD-only single-tensor numerical policy, not a solver catalog ID.
 pub const TENSOR_FIT_ID: &str = "qtea.cpu-tensor.f32.v1";
+pub use plan::numerical_input_digest;
 
 /// Explicit full-tensor recipe; validated before fitting/allocation.
 #[derive(Clone, Copy, Debug, PartialEq)]
