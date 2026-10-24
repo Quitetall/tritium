@@ -180,13 +180,13 @@ fn preexisting_files_directories_and_symlinks_refuse_before_emitter() {
     fs::write(&file, b"sentinel").unwrap();
     let directory = root.0.join("directory");
     fs::create_dir(&directory).unwrap();
-    let mut paths = vec![file.clone(), directory.clone()];
+    let paths = [file.clone(), directory.clone()];
     #[cfg(unix)]
-    {
+    let paths = {
         let link = root.0.join("link");
         std::os::unix::fs::symlink(&directory, &link).unwrap();
-        paths.push(link);
-    }
+        paths.into_iter().chain(std::iter::once(link))
+    };
     for path in paths {
         let mut called = false;
         let error = DirectoryTensorSink::new(path)
