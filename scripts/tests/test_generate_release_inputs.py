@@ -34,6 +34,21 @@ def sbom(path: Path, *, artifact_id: str, filename: str) -> None:
 
 
 class GenerateReleaseInputsTests(unittest.TestCase):
+    def test_final_inventory_keeps_final_names_and_exact_sbom_bindings(self):
+        with tempfile.TemporaryDirectory() as raw:
+            staged = Path(raw)
+            for filename, artifact_id in (
+                ("pytritium-1.1.0-cp39-abi3-manylinux_2_28_x86_64.whl", "wheel-final"),
+                ("tritium-core-1.1.0.crate", "crate-final"),
+                ("tritium-ai-web-1.1.0.tgz", "npm-final"),
+            ):
+                (staged / filename).write_bytes(b"fixture-only:" + filename.encode())
+                sbom(staged / f"{artifact_id}.cdx.json", artifact_id=artifact_id, filename=filename)
+            document = build_inputs(staged, **{**self.args(), "release": "1.1.0"})
+            self.assertEqual(document["release"], "1.1.0")
+            self.assertEqual(len(document["artifacts"]), 3)
+            self.assertTrue(all("rc" not in row["path"] for row in document["artifacts"]))
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -122,7 +137,7 @@ class GenerateReleaseInputsTests(unittest.TestCase):
     def test_rejects_noncanonical_revision_and_release(self):
         for args in (
             {**self.args(), "source_revision": "A" * 40},
-            {**self.args(), "release": "1.1.0"},
+            {**self.args(), "release": "1.1.0rc2"},
         ):
             with self.subTest(args=args), self.assertRaises(ReleaseInputsError):
                 build_inputs(self.staged, **args)

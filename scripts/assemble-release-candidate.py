@@ -42,7 +42,7 @@ TOP_FIELDS = {"schema", "release", "source_revision", "builder", "artifacts"}
 BUILDER_FIELDS = {"id", "build_type", "invocation_id"}
 ARTIFACT_FIELDS = {"id", "kind", "path", "sbom"}
 ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9_.-]*")
-RC_PATTERN = re.compile(r"1\.1\.0-rc\.(0|[1-9][0-9]*)")
+RC_PATTERN = runpy.run_path(Path(__file__).with_name("_release_version.py"))["RELEASE_PATTERN"]
 HEX = frozenset("0123456789abcdef")
 
 
@@ -116,7 +116,7 @@ def _validate_input(document: Any) -> tuple[str, str, dict[str, str], list[dict[
         raise ReleaseError(f"inputs.schema must equal {INPUT_SCHEMA!r}")
     release = _string(value.get("release"), "inputs.release")
     if RC_PATTERN.fullmatch(release) is None:
-        raise ReleaseError("inputs.release must be a canonical 1.1.0-rc.N version")
+        raise ReleaseError("inputs.release must be a canonical Cargo release or RC version")
     revision = _string(value.get("source_revision"), "inputs.source_revision")
     if len(revision) != 40 or any(character not in HEX for character in revision):
         raise ReleaseError("inputs.source_revision must be a full lowercase Git object ID")

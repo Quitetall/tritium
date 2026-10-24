@@ -130,6 +130,12 @@ Evidence bound to a declared artifact, source, workload, and execution scope.
 It is distinct from a structural plan or a claim of human authorization.
 _Avoid_: capability declaration, approval
 
+**Release candidate cohort**:
+The exact source-, version- and byte-bound Tritium artifact inventory awaiting
+qualification and public activation. Its version may be final or prerelease;
+its existence is not publication authorization.
+_Avoid_: prerelease label, published release, release approval
+
 **Resident payload envelope**:
 A reserved logical ceiling covering a resident model's matrices and execution
 state. It is distinct from actual payload consumption and measured physical memory.

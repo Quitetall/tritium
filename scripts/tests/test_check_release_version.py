@@ -1,7 +1,10 @@
 import importlib.util
+import runpy
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).parents[1] / "check-release-version.py"
@@ -12,6 +15,12 @@ SPEC.loader.exec_module(MODULE)
 
 
 class ReleaseVersionTests(unittest.TestCase):
+    def test_parser_does_not_require_the_workspace_toml_dependency(self):
+        with mock.patch.dict(sys.modules, {"tomllib": None}):
+            policy = runpy.run_path(SCRIPT.with_name("_release_version.py"))
+            self.assertEqual(policy["candidate_version"]("1.1.0"), "1.1.0")
+            self.assertEqual(policy["pypi_version"]("0.1.0-rc.2"), "0.1.0rc2")
+
     def test_candidate_accepts_any_canonical_release_or_rc(self):
         """Format is the contract here, not one particular version.
 
@@ -26,7 +35,7 @@ class ReleaseVersionTests(unittest.TestCase):
         would have failed ci-required on the release commit itself. A gate that
         forbids shipping the next version is not protecting anything.
         """
-        for valid in ("1.1.0-rc.0", "1.1.0-rc.12", "1.1.0", "1.2.0-rc.0", "2.0.0"):
+        for valid in ("0.0.0", "0.1.0", "1.1.0-rc.0", "1.1.0-rc.12", "1.1.0", "1.2.0-rc.0", "2.0.0"):
             with self.subTest(valid=valid):
                 self.assertEqual(MODULE.candidate_version(valid), valid)
 
@@ -39,8 +48,17 @@ class ReleaseVersionTests(unittest.TestCase):
             "v1.1.0",       # tag spelling, not a version
             "1.1.0-rc",     # rc without an ordinal
             "1.1.0-alpha.1",
+            "0",
+            "00.1.0",
+            "1.01.0",
+            "1.1.00",
+            "1.1.0+build.1",
+            " 1.1.0",
+            "1.1.0\n",
             "",
             None,
+            True,
+            1,
         ):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 MODULE.candidate_version(invalid)

@@ -26,6 +26,7 @@ inspect_archive = CRATE_SBOM["inspect_archive"]
 CrateSbomError = CRATE_SBOM["CrateSbomError"]
 
 SCHEMA = "tritium.crate-archive-qualification.v1"
+RELEASE_PATTERN = runpy.run_path(Path(__file__).with_name("_release_version.py"))["RELEASE_PATTERN"]
 TOP_FIELDS = {
     "schema", "receipt_id", "release", "source_revision", "run_id",
     "started_at_utc", "duration_ms", "machine", "toolchain", "command_contract",
@@ -152,7 +153,7 @@ def qualify(
 ) -> dict[str, Any]:
     if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
         raise ArchiveError("source revision must be a full Git object ID")
-    if re.fullmatch(r"1\.1\.0-rc\.(0|[1-9][0-9]*)", release) is None:
+    if RELEASE_PATTERN.fullmatch(release) is None:
         raise ArchiveError("release must be a canonical v1.1 candidate")
     if not run_id:
         raise ArchiveError("run id must be non-empty")

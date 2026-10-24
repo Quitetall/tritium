@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import runpy
 import secrets
 import shutil
 import subprocess
@@ -25,7 +26,7 @@ SCHEMA = "tritium.oci-security-qualification.v1"
 HEX = frozenset("0123456789abcdef")
 MAX_REPORT_BYTES = 128 * 1024 * 1024
 MAX_LAYOUT_MEMBER_BYTES = 512 * 1024 * 1024
-RC_PATTERN = re.compile(r"1\.1\.0-rc\.(0|[1-9][0-9]*)")
+RC_PATTERN = runpy.run_path(Path(__file__).with_name("_release_version.py"))["RELEASE_PATTERN"]
 RUN_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 VERSION_PATTERN = re.compile(r"v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?")
 MIN_TRIVY_VERSION = (0, 69, 0)

@@ -61,6 +61,8 @@ on:
       - "scripts/verify-workflow-source.py"
       - "scripts/tests/test_verify_workflow_source.py"
       - "scripts/_qualification_git.py"
+      - "scripts/_release_version.py"
+      - "scripts/tests/test_check_release_version.py"
       - "scripts/tests/test_qualification_git_context.py"
       - "scripts/tests/test_release_source_git_context.py"
       - "scripts/aggregate-wheel-smoke.py"

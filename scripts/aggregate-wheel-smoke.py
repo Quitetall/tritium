@@ -8,11 +8,15 @@ import hashlib
 import json
 import os
 import re
+import runpy
 import tempfile
 from pathlib import Path
 
 
 SCHEMA = "tritium.wheel-smoke.v1"
+_VERSION_POLICY = runpy.run_path(Path(__file__).with_name("_release_version.py"))
+RELEASE_PATTERN = _VERSION_POLICY["RELEASE_PATTERN"]
+_pypi_version = _VERSION_POLICY["pypi_version"]
 RECEIPT_SCHEMA = "tritium.abi3-matrix-qualification.v1"
 TARGET_ID = "python-abi3-39-plus"
 MAX_EVIDENCE_BYTES = 1024 * 1024
@@ -155,7 +159,7 @@ def aggregate(
 ) -> dict[str, object]:
     if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
         raise AggregateError("source revision must be a full lowercase Git object ID")
-    if re.fullmatch(r"1\.1\.0-rc\.(0|[1-9][0-9]*)", release) is None:
+    if RELEASE_PATTERN.fullmatch(release) is None:
         raise AggregateError("release must be a canonical v1.1 candidate")
     if not run_id:
         raise AggregateError("run id must be non-empty")
@@ -181,6 +185,8 @@ def aggregate(
         raise AggregateError(
             f"ABI3 matrix must use one candidate version, found {sorted(map(str, candidate_versions))}"
         )
+    if candidate_versions != {_pypi_version(release)}:
+        raise AggregateError("ABI3 matrix version differs from release cohort")
     expected = expected_cells()
     if set(cells) != expected:
         raise AggregateError(
@@ -267,7 +273,7 @@ def validate_receipt(
         )
         if (
             wheel_match is None
-            or wheel_match.group("version") != release.replace("1.1.0-rc.", "1.1.0rc")
+            or wheel_match.group("version") != _pypi_version(release)
             or re.fullmatch(platform_pattern, wheel_match.group("platform")) is None
         ):
             raise AggregateError("compatibility receipt wheel target/version mismatch")

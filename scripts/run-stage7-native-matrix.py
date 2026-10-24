@@ -13,23 +13,13 @@ import re
 import runpy
 import subprocess
 import sys
-import tomllib
 
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_REVISION = "effd688a12921b4cc83e3312b6feb579f70f9c71"
 QUALIFIER_PATH = ROOT / "scripts/qualify-stage7-recipe-freeze.py"
 _run_git = runpy.run_path(ROOT / "scripts/_qualification_git.py")["run_git"]
-_candidate_version = runpy.run_path(ROOT / "scripts/check-release-version.py")["candidate_version"]
-
-
-def _source_release() -> str:
-    cargo = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
-    try:
-        version = cargo["workspace"]["package"]["version"]
-    except (KeyError, TypeError) as error:
-        raise ValueError("Cargo.toml must declare workspace.package.version") from error
-    return _candidate_version(version)
+_workspace_version = runpy.run_path(ROOT / "scripts/_release_version.py")["workspace_version"]
 
 
 def _load_qualifier():
@@ -82,7 +72,7 @@ def run(output: Path, *, device: int = 0, target_dir: Path | None = None) -> dic
         raise RuntimeError("HEAD is not a full lowercase Git revision")
     if _git("status", "--porcelain"):
         raise RuntimeError("native qualification requires a clean source worktree")
-    release = _source_release()
+    release = _workspace_version(ROOT)
 
     version_result = subprocess.run(
         ["compute-sanitizer", "--version"],

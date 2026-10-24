@@ -16,6 +16,7 @@ import xml.etree.ElementTree as ET
 
 
 SCHEMA = "tritium.torch-dispatch-cuda-qualification.v1"
+RELEASE_PATTERN = runpy.run_path(Path(__file__).with_name("_release_version.py"))["RELEASE_PATTERN"]
 SOURCE_PATH = "crates/tritium-py/tests/test_torch_dispatch.py"
 CUDA_TESTS = (
     "test_native_cuda_compiled_autocast_preserves_master_cache_and_backward",
@@ -194,9 +195,7 @@ def validate(
         raise ReceiptError("receipt is not passed CUDA dispatcher evidence")
     if receipt["source_revision"] != revision:
         raise ReceiptError("receipt source revision differs from candidate")
-    if receipt["release"] != expected_release or re.fullmatch(
-        r"1\.1\.0-rc\.(0|[1-9][0-9]*)", expected_release
-    ) is None:
+    if receipt["release"] != expected_release or RELEASE_PATTERN.fullmatch(expected_release) is None:
         raise ReceiptError("receipt release differs from canonical v1.1 candidate")
     _string(receipt["run_id"], "receipt.run_id")
     _artifact(receipt["artifact"], expected_wheel)

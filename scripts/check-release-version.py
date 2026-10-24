@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import argparse
-import re
+import runpy
 import subprocess
 import sys
 import tomllib
@@ -13,15 +13,11 @@ from pathlib import Path
 from typing import Any
 
 
-# A release version: X.Y.Z, optionally -rc.N. This used to be pinned literally to
-# `1.1.0-rc.N`, which meant the workspace could not hold any other version -- and
-# because this runs inside check-publish.sh, which is in the REQUIRED `publish-check`
-# CI job, tagging the 1.1.0 FINAL release would have turned ci-required red on the
-# release commit itself. A gate that forbids shipping is not a gate.
-RELEASE_PATTERN = re.compile(
-    r"(?P<base>0|[1-9][0-9]*(?:\.(?:0|[1-9][0-9]*)){2})"
-    r"(?:-rc\.(?P<rc>0|[1-9][0-9]*))?"
-)
+# Keep this script's callable surface while sharing policy with qualification.
+_VERSION_POLICY = runpy.run_path(Path(__file__).with_name("_release_version.py"))
+RELEASE_PATTERN = _VERSION_POLICY["RELEASE_PATTERN"]
+candidate_version = _VERSION_POLICY["candidate_version"]
+pypi_version = _VERSION_POLICY["pypi_version"]
 
 
 def require_equal(actual: Any, expected: str, label: str) -> None:
@@ -32,20 +28,6 @@ def require_equal(actual: Any, expected: str, label: str) -> None:
 def require_contains(text: str, expected: str, label: str) -> None:
     if expected not in text:
         raise ValueError(f"{label} is missing current release text {expected!r}")
-
-
-def candidate_version(value: Any) -> str:
-    if not isinstance(value, str) or RELEASE_PATTERN.fullmatch(value) is None:
-        raise ValueError(
-            f"workspace version {value!r} is not a canonical X.Y.Z or X.Y.Z-rc.N"
-        )
-    return value
-
-
-def pypi_version(value: str) -> str:
-    """Convert the accepted Cargo prerelease spelling to the wheel spelling."""
-
-    return re.sub(r"-rc\.(\d+)$", r"rc\1", value)
 
 
 def read_json(path: Path) -> dict[str, Any]:

@@ -46,16 +46,16 @@ class NativeBrowserReferenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             (root / "Cargo.toml").write_text(
-                '[workspace.package]\nversion = "1.1.0-rc.12"\n',
+                '[workspace.package]\nversion = "1.1.0"\n',
                 encoding="utf-8",
             )
-            self.assertEqual(release_version(root), "1.1.0-rc.12")
+            self.assertEqual(release_version(root), "1.1.0")
 
     def test_release_version_rejects_non_candidate_workspace_version(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             (root / "Cargo.toml").write_text(
-                '[workspace.package]\nversion = "1.1.0"\n',
+                '[workspace.package]\nversion = "1.1.0rc2"\n',
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(NativeReferenceError, "canonical v1.1"):

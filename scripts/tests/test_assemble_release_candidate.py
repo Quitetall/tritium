@@ -39,7 +39,7 @@ def fake_tool(path: Path) -> Path:
     return tool
 
 
-def candidate_fixture(base: Path, *, corrupt_sbom: bool = False) -> tuple[Path, Path, Path]:
+def candidate_fixture(base: Path, *, corrupt_sbom: bool = False, release: str = "1.1.0-rc.0") -> tuple[Path, Path, Path]:
     candidate = base / "candidate"
     candidate.mkdir()
     artifacts = [
@@ -80,7 +80,7 @@ def candidate_fixture(base: Path, *, corrupt_sbom: bool = False) -> tuple[Path, 
         descriptor,
         {
             "schema": "tritium.release-inputs.v1",
-            "release": "1.1.0-rc.0",
+            "release": release,
             "source_revision": "a" * 40,
             "builder": {
                 "id": "https://github.com/tritium/ci/release",
@@ -187,6 +187,15 @@ def missing_oci_fixture(base: Path) -> tuple[Path, Path, Path]:
 
 
 class AssembleReleaseCandidateTests(unittest.TestCase):
+    def test_final_version_cohort_assembles_and_strictly_reloads(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            candidate, inputs, tool = candidate_fixture(base, release="1.1.0")
+            output = candidate / "manifest.json"
+            manifest = assemble(inputs, output, str(tool))
+            self.assertEqual(manifest["release"], "1.1.0")
+            self.assertEqual(candidate_validate(output, str(tool)), manifest)
+
     def test_assembly_generates_missing_canonical_oci_sbom(self):
         with tempfile.TemporaryDirectory() as raw:
             base = Path(raw)

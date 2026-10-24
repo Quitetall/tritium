@@ -14,14 +14,14 @@ SPEC.loader.exec_module(MODULE)
 
 
 class WheelFunctionalSmokeTests(unittest.TestCase):
-    def _evidence(self, wheel: Path) -> dict:
+    def _evidence(self, wheel: Path, version="1.1.0rc0") -> dict:
         return {
             "schema": MODULE.SCHEMA,
             "source_revision": "a" * 40,
             "passed": True,
             "wheel": wheel.name,
             "wheel_sha256": MODULE._sha256(wheel),
-            "distribution_version": "1.1.0rc0",
+            "distribution_version": version,
             "python_version": "3.13.5",
             "torch_version": "2.11.0",
             "transformers_version": "5.5.3",
@@ -32,6 +32,22 @@ class WheelFunctionalSmokeTests(unittest.TestCase):
             "converted_parameters": 256,
             "operations": sorted(MODULE.REQUIRED_OPERATIONS),
         }
+
+    def test_final_and_rc_receipts_refuse_cross_cohort_reload(self):
+        for release in ("1.1.0", "1.2.3-rc.7"):
+            with self.subTest(release=release), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                version = release.replace("-rc.", "rc")
+                wheel = root / f"pytritium-{version}-cp39-abi3-linux_x86_64.whl"
+                wheel.write_bytes(b"fixture-only-wheel")
+                receipt = MODULE.build_receipt(self._evidence(wheel, version), wheel,
+                    release, "format-fixture", "2026-10-23T00:00:00Z", 1.0)
+                path = root / "receipt.json"
+                MODULE._atomic_write(path, receipt)
+                self.assertEqual(MODULE.validate_receipt(path, "a" * 40, release, wheel), receipt)
+                other = "1.1.0-rc.0" if release == "1.1.0" else "1.1.0"
+                with self.assertRaises(MODULE.SmokeError):
+                    MODULE.validate_receipt(path, "a" * 40, other, wheel)
 
     def test_functional_receipt_binds_wheel_revision_run_and_coverage(self):
         with tempfile.TemporaryDirectory() as raw:

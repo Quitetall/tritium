@@ -32,6 +32,7 @@ validate_oci_archive = OCI_ARCHIVE["validate"]
 OciError = OCI_ARCHIVE["OciError"]
 
 SCHEMA = "tritium.oci-runtime-qualification.v4"
+RELEASE_PATTERN = runpy.run_path(Path(__file__).with_name("_release_version.py"))["RELEASE_PATTERN"]
 HEX = frozenset("0123456789abcdef")
 MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_SSE_RESPONSE_BYTES = 1024 * 1024
@@ -688,7 +689,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         raise QualificationError("flavor must be cpu or cuda")
     if args.profile not in {"compact-v1", "near-lossless-v1"}:
         raise QualificationError("profile is not admitted")
-    if re.fullmatch(r"1\.1\.0-rc\.(0|[1-9][0-9]*)", args.release) is None:
+    if RELEASE_PATTERN.fullmatch(args.release) is None:
         raise QualificationError("release must be a canonical 1.1.0 release candidate")
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", args.run_id) is None:
         raise QualificationError("run ID is not a safe canonical identifier")
@@ -986,9 +987,7 @@ def validate_receipt(receipt: dict[str, Any], *, revision: str | None = None,
         raise QualificationError("runtime receipt checks differ")
     receipt_revision = exact_hex(receipt.get("source_revision"), 40, "runtime source revision")
     receipt_release = receipt.get("release")
-    if not isinstance(receipt_release, str) or re.fullmatch(
-        r"1\.1\.0-rc\.(0|[1-9][0-9]*)", receipt_release
-    ) is None:
+    if not isinstance(receipt_release, str) or RELEASE_PATTERN.fullmatch(receipt_release) is None:
         raise QualificationError("runtime receipt release is malformed")
     if not isinstance(receipt.get("run_id"), str) or re.fullmatch(
         r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", receipt["run_id"]
