@@ -4814,6 +4814,7 @@ dependencies = [
  "linkme",
  "proptest",
  "rayon",
+ "sha2",
  "tritium-core",
  "tritium-evidence",
  "tritium-format",

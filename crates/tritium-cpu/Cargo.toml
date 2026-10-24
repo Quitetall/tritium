@@ -22,6 +22,7 @@ half = { workspace = true }
 linkme = { workspace = true }
 
 [dev-dependencies]
+sha2 = { workspace = true }
 tritium-quantize = { workspace = true }
 tritium-testkit = { workspace = true }
 tritium-evidence = { workspace = true }
