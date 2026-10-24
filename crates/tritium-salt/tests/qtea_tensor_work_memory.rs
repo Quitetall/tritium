@@ -2,9 +2,16 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tritium_format::qtea::QteaLimits;
+use tritium_quantize::engine::{
+    CalibrationBatch, CalibrationCollector, CalibrationInput, CalibrationOutputBatch,
+};
 use tritium_quantize::qtea_reference::{TensorFit, TensorFitConfig};
 use tritium_quantize::{CurvatureSourceId, InputGramAccumulator};
-use tritium_salt::{ContentId, QteaTensorOrigin, QteaTensorWorkPlan};
+use tritium_salt::{ContentId, QteaCalibratedTensorInput, QteaTensorOrigin, QteaTensorWorkPlan};
+use tritium_schema::{
+    CalibrationConsumer, CalibrationOutput, CalibrationPartition, CalibrationPlan,
+    CalibrationSource, FitInputDigest, OriginalSourceId, QuantSourceTensor, ScalePrecision,
+};
 
 struct Allocator;
 static TRACK: AtomicBool = AtomicBool::new(false);
@@ -89,5 +96,56 @@ fn owner_bound_work_planning_requests_no_heap() {
         });
         assert!(work.unwrap().byte_ledger().total_bytes > 0);
         assert_eq!(requests, 0);
+        let original = QuantSourceTensor {
+            name: origin.owner.into(),
+            shape: vec![rows as u64, columns as u64],
+            precision: ScalePrecision::F32,
+        };
+        let mut p = CalibrationPlan {
+            tensor: original.clone(),
+            source: CalibrationSource {
+                model: FitInputDigest([1; 32]),
+                cache: FitInputDigest([2; 32]),
+                tokens: FitInputDigest([3; 32]),
+            },
+            partition: CalibrationPartition::Full,
+            consumer: CalibrationConsumer::Matmul,
+            output: CalibrationOutput::None,
+            sample_start: 0,
+            damping: 0.,
+            max_numeric_bytes: u64::MAX,
+        };
+        p.max_numeric_bytes = CalibrationCollector::required_numeric_bytes(&p).unwrap();
+        let mut capture = CalibrationCollector::new(p).unwrap();
+        capture
+            .accumulate(CalibrationBatch {
+                samples: 1,
+                input: CalibrationInput::Activations(&vec![1.; columns]),
+                output: CalibrationOutputBatch::None,
+                weights: None,
+                mask: None,
+            })
+            .unwrap();
+        let calibrated = capture.finish().unwrap();
+        let (work, requests) = measured(|| {
+            QteaTensorWorkPlan::from_calibrated(
+                QteaCalibratedTensorInput {
+                    original: &original,
+                    source_model: OriginalSourceId::from_bytes([1; 32]),
+                    weights: &weights,
+                    calibration: &calibrated,
+                    origin,
+                },
+                config,
+                QteaLimits {
+                    max_tensor_bytes: 1 << 20,
+                    max_validation_bytes: columns,
+                },
+                cap,
+                usize::MAX,
+            )
+        });
+        assert!(work.is_ok());
+        assert_eq!(requests, 0, "calibrated C={columns}");
     }
 }

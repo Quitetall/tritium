@@ -38,6 +38,16 @@ argument to compare its24 observations with the separately supplied, SHA-bound
 Python reference. The default `tritium-cpu` producer remains a direct-fitter
 comparison; neither producer certifies quality or performance.
 
+`QteaTensorWorkPlan::from_calibrated` consumes the common immutable
+`CalibratedTensor` produced by `CalibrationCollector` or finalized-cache replay.
+It borrows the actual full input Gram without another reducer, format or matrix
+copy. Exact expected tensor/precision/model/owner must agree; grouped, gather and
+output-Fisher inputs refuse rather than being relabelled as full input capture.
+The common selected-weight normalization is preserved, not claimed as author
+sequence-normalized capture reproduction. This is still Experimental; original
+stored-byte authenticity, corpus completeness, model loading and physical memory
+remain separate obligations. Capture and fit/export have separate logical caps.
+
 Part of [Tritium](https://github.com/Quitetall/tritium) — Apache-2.0 infrastructure for
 quantizing, training, and serving additive-ternary ({-1, 0, +1}) neural networks with
 exact byte accounting and receipt-backed benchmarks.

@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 mod frontier_v3;
 mod pipeline;
+mod qtea_calibration;
 mod qtea_tensor_work;
 mod qwen36_preflight;
 mod qwen36_source_admission;
@@ -52,6 +53,7 @@ pub use pipeline::{
     QualityEvidence, SaltDriver, SaltPipeline, SaltReceipt, StageArtifact, StageOutput,
     StageReceiptRecord, StageRequest,
 };
+pub use qtea_calibration::{QteaCalibratedTensorInput, QteaCalibrationError};
 pub use qtea_tensor_work::{
     QteaTensorOrigin, QteaTensorWorkError, QteaTensorWorkMemory, QteaTensorWorkPlan,
     QteaTensorWorkResult,

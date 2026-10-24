@@ -11,13 +11,20 @@ use std::{
 };
 use tritium_cpu::qtea::matmul_into;
 use tritium_format::qtea::{QteaLimits, QteaTensor};
+use tritium_quantize::engine::{
+    CalibrationBatch, CalibrationCollector, CalibrationInput, CalibrationOutputBatch,
+};
 use tritium_quantize::qtea_reference::{TensorFit, TensorFitConfig};
-use tritium_quantize::{CurvatureSourceId, InputGramAccumulator};
 use tritium_salt::{
     AdmittedSolverPlan, ContentId, FrontierOrdering, FrontierProfile, FrontierProfileId,
     FrontierResourceEstimate, FrontierResourceEstimator, FrontierSolverError, FrontierStage,
-    FrontierStageRequest, QteaFrontierSolver, QteaReferenceAdapter, QteaTensorOrigin,
-    QteaTensorWorkPlan, ResourceVector, SolverRegistry, SolverRequest, SolverTrust,
+    FrontierStageRequest, QteaCalibratedTensorInput, QteaFrontierSolver, QteaReferenceAdapter,
+    QteaTensorOrigin, QteaTensorWorkPlan, ResourceVector, SolverRegistry, SolverRequest,
+    SolverTrust,
+};
+use tritium_schema::{
+    CalibrationConsumer, CalibrationOutput, CalibrationPartition, CalibrationPlan,
+    CalibrationSource, FitInputDigest, OriginalSourceId, QuantSourceTensor, ScalePrecision,
 };
 
 // Only the resource fixture is synthetic; mathematical execution uses the real adapter.
@@ -162,38 +169,68 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         inputs[1] = 0.4;
         inputs[columns + 1] = 0.8;
-        // Declared synthetic identities, explicitly not authenticated model data.
-        let source = CurvatureSourceId::new([1; 32], [2; 32], [3; 32])?;
-        let mut builder = InputGramAccumulator::new_bound(columns, source, 0)?;
-        builder.accumulate_batch(&inputs, columns, None, None)?;
-        let gram = builder.finish()?;
-        let numerical = TensorFit::plan(
-            &weights,
-            rows,
-            columns,
-            &gram,
+        let stem = format!("case-{case:03}");
+        let owner = format!("{stem}.weight");
+        let original_tensor = QuantSourceTensor {
+            name: owner.clone(),
+            shape: vec![u64::try_from(rows)?, u64::try_from(columns)?],
+            precision: ScalePrecision::F32,
+        };
+        // Same actual samples/reduction as the direct producer, through the common collector.
+        // Declared synthetic context is not original checkpoint authentication.
+        let mut capture_plan = CalibrationPlan {
+            tensor: original_tensor.clone(),
+            source: CalibrationSource {
+                model: FitInputDigest([1; 32]),
+                cache: FitInputDigest([2; 32]),
+                tokens: FitInputDigest([3; 32]),
+            },
+            partition: CalibrationPartition::Full,
+            output: CalibrationOutput::None,
+            consumer: CalibrationConsumer::Matmul,
+            sample_start: 0,
+            damping: 0.,
+            max_numeric_bytes: u64::MAX,
+        };
+        capture_plan.max_numeric_bytes =
+            CalibrationCollector::required_numeric_bytes(&capture_plan)?;
+        let mut collector = CalibrationCollector::new(capture_plan)?;
+        collector.accumulate(CalibrationBatch {
+            samples: columns,
+            input: CalibrationInput::Activations(&inputs),
+            output: CalibrationOutputBatch::None,
+            weights: None,
+            mask: None,
+        })?;
+        let calibration = collector.finish()?;
+        drop(collector);
+        drop(inputs); // Do not retain capture buffers during fit/export.
+        let mut original = Sha256::new();
+        for value in &weights {
+            original.update(value.to_bits().to_le_bytes());
+        }
+        let work = QteaTensorWorkPlan::from_calibrated(
+            QteaCalibratedTensorInput {
+                original: &original_tensor,
+                source_model: OriginalSourceId::from_bytes([1; 32]),
+                weights: &weights,
+                calibration: &calibration,
+                origin: QteaTensorOrigin {
+                    source_id: ContentId::of_bytes(
+                        b"synthetic qtea conformance source artifact v1",
+                    ),
+                    owner: &owner,
+                    tensor_index: case as u32,
+                    source_tensor_digest: original.finalize().into(),
+                },
+            },
             TensorFitConfig {
                 group_size: width,
                 salient_ratio: ratio,
                 ..TensorFitConfig::default()
             },
-            TensorFit::required_work_bytes(rows, columns)?,
-        )?;
-        let stem = format!("case-{case:03}");
-        let owner = format!("{stem}.weight");
-        let mut original = Sha256::new();
-        for value in &weights {
-            original.update(value.to_bits().to_le_bytes());
-        }
-        let work = QteaTensorWorkPlan::new(
-            numerical,
-            QteaTensorOrigin {
-                source_id: ContentId::of_bytes(b"synthetic qtea conformance source artifact v1"),
-                owner: &owner,
-                tensor_index: case as u32,
-                source_tensor_digest: original.finalize().into(),
-            },
             limits,
+            TensorFit::required_work_bytes(rows, columns)?,
             1 << 24,
         )?;
         let (solver, plan, request) = synthetic_admission(&work)?;

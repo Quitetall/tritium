@@ -22,6 +22,7 @@ tritium-train = { workspace = true }
 tritium-cpu = { workspace = true }
 tritium-cuda = { workspace = true, optional = true }
 tritium-quantize = { workspace = true }
+tritium-schema = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
