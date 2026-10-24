@@ -68,10 +68,11 @@ pub(super) fn run(
             }
             let d = upper[position * columns + position];
             let curvature = finite(d / diagonal_mean)?.clamp(0.3, 3.0);
-            let gamma = finite(
-                (-fit.config.decay * f64::from(curvature) * local as f64 / width as f64).exp()
-                    as f32,
-            )?;
+            let exponent = -fit.config.decay * f64::from(curvature) * local as f64 / width as f64;
+            if !exponent.is_finite() {
+                return Err(ArithmeticError::NonFiniteArithmetic);
+            }
+            let gamma = finite(exponent.exp() as f32)?;
             for row in 0..rows {
                 let error = finite(finite(column_values[row] - values[row])? / d)?;
                 errors[row * width + local] = error;

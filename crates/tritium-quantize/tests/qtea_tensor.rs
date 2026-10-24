@@ -270,3 +270,24 @@ fn missing_curvature_singular_geometry_budgets_and_nonfinite_inputs_fail_without
         );
     }
 }
+
+#[test]
+fn finite_decay_with_overflowing_exponent_rejects_instead_of_silently_zeroing_feedback() {
+    let weights = [-3., -1., 1., 3.].repeat(4);
+    let evidence = gram(&identity(4), 4, Some(binding(1)));
+    let bound = TensorFit::required_work_bytes(4, 4).unwrap();
+    assert_eq!(
+        TensorFit::fit(
+            &weights,
+            4,
+            4,
+            &evidence,
+            TensorFitConfig {
+                decay: f64::MAX,
+                ..config(4)
+            },
+            bound
+        ),
+        Err(ArithmeticError::NonFiniteArithmetic)
+    );
+}
