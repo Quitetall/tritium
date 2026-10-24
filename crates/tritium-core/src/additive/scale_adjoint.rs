@@ -216,6 +216,39 @@ impl<'a> AdditiveScaleVjpPlan<'a> {
         }
     }
 
+    pub(super) fn row_trit_range(&self, plane: usize, row: usize) -> core::ops::Range<usize> {
+        match self.allocation {
+            ScaleAllocation::Uniform(plan) => {
+                let cols = plan.layout.cols as usize;
+                let start = (plane * plan.layout.rows as usize + row) * cols;
+                start..start + cols
+            }
+            ScaleAllocation::PerTile(index) => index.row_trit_range(plane, row),
+        }
+    }
+
+    pub(super) fn row_scale_range(&self, plane: usize, row: usize) -> core::ops::Range<usize> {
+        match self.allocation {
+            ScaleAllocation::Uniform(plan) => {
+                let base = if plan.layout.law.relation == PlaneRelation::Free {
+                    plane * plan.scale_units
+                } else {
+                    0
+                };
+                let per_row = match plan.layout.law.anchor {
+                    ScaleAnchor::Tensor => return base..base + 1,
+                    ScaleAnchor::Group => {
+                        (plan.layout.cols as usize).div_ceil(usize::from(plan.layout.group))
+                    }
+                    _ => 1, // Checked uniform Row/Channel anchors.
+                };
+                let start = base + row * per_row;
+                start..start + per_row
+            }
+            ScaleAllocation::PerTile(index) => index.row_scale_range(plane, row),
+        }
+    }
+
     pub(super) fn present_weight_count(&self) -> usize {
         match self.allocation {
             ScaleAllocation::Uniform(plan) => plan.trit_count() / plan.plane_count(),

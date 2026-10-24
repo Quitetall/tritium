@@ -309,6 +309,36 @@ impl<'a> PerTileIndex<'a> {
             scale: span.scale,
         }
     }
+
+    pub(crate) fn row_trit_range(&self, plane: usize, row: usize) -> core::ops::Range<usize> {
+        let slot = plane * self.geometry.rows + row;
+        let end = if row + 1 < self.geometry.rows {
+            self.spans[slot + 1].trit
+        } else {
+            self.plane_range(plane).end
+        };
+        self.spans[slot].trit..end
+    }
+
+    // Group scales have monotone row prefixes. Derived tied planes reuse plane0.
+    // Tensor scales are shared across rows and must instead be selected by their
+    // plane's coefficient-prefix occupancy, not binary-searched as row prefixes.
+    pub(crate) fn row_scale_range(&self, plane: usize, row: usize) -> core::ops::Range<usize> {
+        if self.layout.law.anchor == ScaleAnchor::Tensor {
+            return plane..plane + usize::from(!self.row_trit_range(plane, row).is_empty());
+        }
+        let tied = matches!(self.layout.law.relation, PlaneRelation::Tied { .. });
+        let plane = if tied { 0 } else { plane };
+        let slot = plane * self.geometry.rows + row;
+        let end = if row + 1 < self.geometry.rows {
+            self.spans[slot + 1].scale
+        } else if !tied && plane + 1 < self.geometry.planes {
+            self.spans[(plane + 1) * self.geometry.rows].scale
+        } else {
+            self.geometry.scales
+        };
+        self.spans[slot].scale..end
+    }
 }
 
 /// Opaque present tile yielded by the shared compact row cursor.
