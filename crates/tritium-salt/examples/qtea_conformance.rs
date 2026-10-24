@@ -18,6 +18,16 @@ fn new_file(path: PathBuf) -> io::Result<File> {
     OpenOptions::new().write(true).create_new(true).open(path)
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::with_capacity(64);
+    for &byte in Sha256::digest(bytes).iter() {
+        text.push(char::from(HEX[usize::from(byte >> 4)]));
+        text.push(char::from(HEX[usize::from(byte & 15)]));
+    }
+    text
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args_os().skip(1);
     let destination = PathBuf::from(args.next().ok_or_else(|| {
@@ -114,7 +124,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let cold = QteaTensor::read_from(&mut File::open(&tensor_path)?, limits)?;
         assert_eq!(result.tensor_id(), ContentId::of_bytes(cold.as_bytes()));
         assert_eq!(result.wire_digest(), cold.view().content_digest());
-        let sha256 = format!("{:x}", Sha256::digest(cold.as_bytes()));
+        let sha256 = sha256_hex(cold.as_bytes());
         for batch in [0, 1, 3] {
             let input = (0..batch * columns)
                 .map(|i| (i % 7) as f32 * 0.125 - 0.375)
@@ -134,4 +144,21 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     println!("Produced8 synthetic native tensors and24 CPU observations; NOT qualification");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sha256_hex;
+
+    #[test]
+    fn actual_observation_digest_encoder_matches_sha256_known_answers() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 }
