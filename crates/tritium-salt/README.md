@@ -13,19 +13,26 @@ returns the actual complete-file identity only after a successful unpublished
 write. Caller sink buffers, other model/cache/process state and physical RAM
 measurements are separate scope. Source binding is not authenticated custody.
 This is residual-bearing tensor work, not a pure additive-ternary artifact,
-registered frontier solver, deployable model or qualification receipt. The QTEA
-builtin remains unavailable until its complete admission/conformance work lands.
+qualified model runtime, deployable model or qualification receipt.
+
+`QteaReferenceAdapter` is an installable **Experimental CPU tensor fitter** when
+paired with an explicit caller `FrontierResourceEstimator`. Its catalog descriptor
+matches that real implementation. Registry creation installs nothing automatically;
+minimum-Registered and Certified profiles still refuse it. Availability does not
+promise model capture/import/loading, GPU, quality, performance or source custody.
 
 Its optional `admit` path consumes an existing Experimental registry plan and
 portable Fit request plus the caller's independently selected plan ID. It checks
 descriptor, source/input/shape and known logical resource floors before execution.
 V1 requests alone do not bind machine/evidence IDs; the selected plan ID and
-returned stage output do. This research path creates no installable descriptor or
-Registered/Certified status. Receipts require explicit caller observations and
+returned stage output do. Execution cannot create Registered/Certified status.
+Receipts require explicit caller observations and
 cannot underreport known raw artifact length; they are not qualification.
 
 The bounded synthetic `qtea_conformance` example exercises the same public
-work-plan writer, actual cold reader and packed CPU forward. The repository's
+adapter/registry/admitted writer, actual cold reader and packed CPU forward. Only
+the resource-estimator fixture is synthetic, not the mathematical solver.
+The repository's
 `scripts/verify-qtea-reference.sh` can explicitly select `tritium-salt` as its fifth
 argument to compare its24 observations with the separately supplied, SHA-bound
 Python reference. The default `tritium-cpu` producer remains a direct-fitter

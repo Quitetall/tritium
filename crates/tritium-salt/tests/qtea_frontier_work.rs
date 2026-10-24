@@ -283,9 +283,14 @@ fn actual_admitted_writer_preserves_bytes_and_binds_exact_selected_plan() {
         .unwrap();
     assert!(matches!(
         qtea.status(),
-        BuiltinSolverStatus::Unavailable { .. }
+        BuiltinSolverStatus::Available {
+            trust: SolverTrust::Experimental
+        }
     ));
-    assert!(qtea.descriptor().is_none());
+    assert_eq!(
+        qtea.descriptor(),
+        Some(QteaReferenceAdapter::new().unwrap().descriptor())
+    );
 }
 
 #[test]

@@ -15,21 +15,18 @@ use tritium_quantize::qtea_reference::{TensorFit, TensorFitConfig};
 use tritium_quantize::{CurvatureSourceId, InputGramAccumulator};
 use tritium_salt::{
     AdmittedSolverPlan, ContentId, FrontierOrdering, FrontierProfile, FrontierProfileId,
-    FrontierResourceEstimate, FrontierSolver, FrontierSolverError, FrontierStage,
-    FrontierStageRequest, QteaTensorOrigin, QteaTensorWorkPlan, ResourceVector, SolverDescriptor,
-    SolverFamily, SolverId, SolverRegistry, SolverRequest, SolverTrust,
+    FrontierResourceEstimate, FrontierResourceEstimator, FrontierSolverError, FrontierStage,
+    FrontierStageRequest, QteaFrontierSolver, QteaReferenceAdapter, QteaTensorOrigin,
+    QteaTensorWorkPlan, ResourceVector, SolverRegistry, SolverRequest, SolverTrust,
 };
 
-// Planning-only synthetic fixture: no builtin installer, inventory or measurements.
+// Only the resource fixture is synthetic; mathematical execution uses the real adapter.
+// These labels/estimates are not inventory or physical measurements.
 #[derive(Debug)]
-struct SyntheticPlanner {
-    descriptor: SolverDescriptor,
+struct SyntheticResources {
     estimate: FrontierResourceEstimate,
 }
-impl FrontierSolver for SyntheticPlanner {
-    fn descriptor(&self) -> &SolverDescriptor {
-        &self.descriptor
-    }
+impl FrontierResourceEstimator for SyntheticResources {
     fn estimate(&self, _: &SolverRequest) -> Result<FrontierResourceEstimate, FrontierSolverError> {
         Ok(self.estimate)
     }
@@ -37,14 +34,16 @@ impl FrontierSolver for SyntheticPlanner {
 
 fn synthetic_admission(
     work: &QteaTensorWorkPlan<'_>,
-) -> Result<(AdmittedSolverPlan, FrontierStageRequest), Box<dyn Error>> {
-    let id = SolverId::new("qtea-salient-residual.v1")?;
-    let descriptor = SolverDescriptor::new(
-        id.clone(),
-        SolverFamily::QteaSalientResidual,
-        SolverTrust::Experimental,
-        1,
-    )?;
+) -> Result<
+    (
+        Arc<QteaFrontierSolver>,
+        AdmittedSolverPlan,
+        FrontierStageRequest,
+    ),
+    Box<dyn Error>,
+> {
+    let adapter = QteaReferenceAdapter::new()?;
+    let id = adapter.descriptor().id().clone();
     let m = work.memory();
     let resources = ResourceVector::new(
         u64::try_from(m.total_logical_bytes)?,
@@ -80,10 +79,9 @@ fn synthetic_admission(
         false,
     )?;
     let mut registry = SolverRegistry::new();
-    registry.register(Arc::new(SyntheticPlanner {
-        descriptor,
-        estimate,
-    }))?;
+    let solver =
+        Arc::new(adapter.with_resource_estimator(Arc::new(SyntheticResources { estimate })));
+    registry.register(solver.clone())?;
     let meta = work.metadata();
     let plan = registry.plan(
         &id,
@@ -99,7 +97,7 @@ fn synthetic_admission(
         &plan,
         work.input_id(),
     )?;
-    Ok((plan, request))
+    Ok((solver, plan, request))
 }
 
 fn new_file(path: PathBuf) -> io::Result<File> {
@@ -198,11 +196,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             limits,
             1 << 24,
         )?;
-        let (plan, request) = synthetic_admission(&work)?;
-        let work = work.admit(&plan, &request, plan.content_id())?;
+        let (solver, plan, request) = synthetic_admission(&work)?;
         let tensor_path = destination.join(format!("{stem}.qtea"));
         let mut file = new_file(tensor_path.clone())?;
-        let admitted_result = work.fit_to(&mut file)?;
+        let admitted_result =
+            solver.fit_admitted_tensor(work, &plan, &request, plan.content_id(), &mut file)?;
         let result = admitted_result.work_result();
         file.sync_all()?;
         drop(file);

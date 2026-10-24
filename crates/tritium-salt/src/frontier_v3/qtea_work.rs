@@ -1,18 +1,100 @@
 //! Exact experimental admission for real owner-bound QTEA work.
-//! No descriptor factory, installer, availability promotion or qualification.
+//! CPU reference adapter and exact experimental admission; never qualification.
 
-use std::{error::Error, fmt, io::Write};
+use std::{error::Error, fmt, io::Write, sync::Arc};
 
 use super::{
     AdmittedSolverPlan, FRONTIER_SOLVER_ABI_V1, FrontierPlanError, FrontierResourceEstimate,
-    FrontierStage, FrontierStageOutcome, FrontierStageReceipt, FrontierStageRequest,
-    ResourceDimension, ResourceVector, SolverFamily, SolverTrust,
+    FrontierResourceEstimator, FrontierSolver, FrontierSolverError, FrontierStage,
+    FrontierStageOutcome, FrontierStageReceipt, FrontierStageRequest, ResourceDimension,
+    ResourceVector, SolverDescriptor, SolverFamily, SolverId, SolverRequest, SolverTrust,
 };
 use crate::{
     CONTENT_ID_CONTEXT, ContentId, QteaTensorWorkError, QteaTensorWorkPlan, QteaTensorWorkResult,
 };
 
-const CANDIDATE_ID: &str = "qtea-salient-residual.v1";
+/// Existing reserved identity, now backed by an Experimental CPU tensor fitter.
+pub const FRONTIER_QTEA_REFERENCE_SOLVER_ID: &str = "qtea-salient-residual.v1";
+
+/// Real native scalar-f32/SPD-only tensor adapter; not a model-runtime promise.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QteaReferenceAdapter {
+    descriptor: SolverDescriptor,
+}
+
+impl QteaReferenceAdapter {
+    /// Construct the fixed Experimental descriptor; no trust promotion is exposed.
+    ///
+    /// # Errors
+    /// Refuses invalid source-controlled identity or ABI metadata.
+    pub fn new() -> Result<Self, FrontierPlanError> {
+        Ok(Self {
+            descriptor: SolverDescriptor::new(
+                SolverId::new(FRONTIER_QTEA_REFERENCE_SOLVER_ID)?,
+                SolverFamily::QteaSalientResidual,
+                SolverTrust::Experimental,
+                FRONTIER_SOLVER_ABI_V1,
+            )?,
+        })
+    }
+    /// Exact source-controlled implementation identity and Experimental maturity.
+    pub const fn descriptor(&self) -> &SolverDescriptor {
+        &self.descriptor
+    }
+    /// Pair with caller-owned complete resource evidence; no invented measurements.
+    pub fn with_resource_estimator(
+        &self,
+        estimator: Arc<dyn FrontierResourceEstimator>,
+    ) -> QteaFrontierSolver {
+        QteaFrontierSolver {
+            adapter: self.clone(),
+            estimator,
+        }
+    }
+}
+
+/// Installable experimental planning implementation plus actual admitted execution.
+#[derive(Debug)]
+pub struct QteaFrontierSolver {
+    adapter: QteaReferenceAdapter,
+    estimator: Arc<dyn FrontierResourceEstimator>,
+}
+impl QteaFrontierSolver {
+    /// Mathematical adapter paired with this explicit estimator.
+    pub const fn adapter(&self) -> &QteaReferenceAdapter {
+        &self.adapter
+    }
+    /// Execute only the exact selected admission through the real native writer.
+    /// Does not call the estimator again, replan, publish or qualify a model.
+    ///
+    /// # Errors
+    /// Refuses another descriptor before delegating all exact-plan/work/resource
+    /// and native/codec/sink checks. A failed write yields no completed result.
+    pub fn fit_admitted_tensor(
+        &self,
+        work: QteaTensorWorkPlan<'_>,
+        plan: &AdmittedSolverPlan,
+        request: &FrontierStageRequest,
+        expected_plan_id: ContentId,
+        sink: &mut impl Write,
+    ) -> Result<QteaAdmittedTensorFitResult, QteaFrontierWorkError> {
+        if plan.descriptor() != self.adapter.descriptor() {
+            return Err(QteaFrontierWorkError::SolverMismatch);
+        }
+        work.admit(plan, request, expected_plan_id)?.fit_to(sink)
+    }
+}
+impl FrontierSolver for QteaFrontierSolver {
+    fn descriptor(&self) -> &SolverDescriptor {
+        self.adapter.descriptor()
+    }
+    fn estimate(
+        &self,
+        request: &SolverRequest,
+    ) -> Result<FrontierResourceEstimate, FrontierSolverError> {
+        self.estimator.estimate(request)
+    }
+}
 
 /// Immutable selected plan/request identities and exact inputs, not completed execution.
 #[derive(Debug)]
@@ -29,7 +111,8 @@ impl<'a> QteaTensorWorkPlan<'a> {
     /// V1 requests do not bind machine/evidence IDs. `expected_plan_id` must come
     /// from the caller's selected admission record, not be inferred from a received
     /// request. It prevents substitution, but does not authenticate that record.
-    /// This method creates no descriptor or installable builtin implementation.
+    /// This method itself creates no descriptor or installer; use the explicit
+    /// [`QteaReferenceAdapter`] with a caller estimator for builtin planning.
     ///
     /// # Errors
     /// Refuses wrong plan/descriptor/trust/stage/source/input/shape, byte-scope
@@ -46,7 +129,7 @@ impl<'a> QteaTensorWorkPlan<'a> {
         }
         request.validate_plan(plan)?;
         let descriptor = plan.descriptor();
-        if descriptor.id().as_str() != CANDIDATE_ID
+        if descriptor.id().as_str() != FRONTIER_QTEA_REFERENCE_SOLVER_ID
             || descriptor.family() != SolverFamily::QteaSalientResidual
             || descriptor.abi_version() != FRONTIER_SOLVER_ABI_V1
             || descriptor.trust() != SolverTrust::Experimental

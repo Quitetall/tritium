@@ -10,10 +10,10 @@ use tritium_quantize::{
 };
 
 use super::{
-    AdmittedSolverPlan, FRONTIER_SOLVER_ABI_V1, FrontierPlanError, FrontierResourceEstimate,
-    FrontierSolver, FrontierSolverError, FrontierStage, FrontierStageOutcome, FrontierStageReceipt,
-    FrontierStageRequest, ResourceVector, SolverDescriptor, SolverFamily, SolverId, SolverRequest,
-    SolverTrust,
+    AdmittedSolverPlan, FRONTIER_QTEA_REFERENCE_SOLVER_ID, FRONTIER_SOLVER_ABI_V1,
+    FrontierPlanError, FrontierResourceEstimate, FrontierSolver, FrontierSolverError,
+    FrontierStage, FrontierStageOutcome, FrontierStageReceipt, FrontierStageRequest,
+    ResourceVector, SolverDescriptor, SolverFamily, SolverId, SolverRequest, SolverTrust,
 };
 use crate::ContentId;
 
@@ -44,7 +44,9 @@ pub enum BuiltinSolverStatus {
     },
 }
 
-/// Fail-closed capability record for one built-in method family.
+/// Fail-closed planning/native-fitting capability for one built-in method family.
+/// Availability does not assert model capture/import/runtime, physical backend
+/// support, source authenticity, quality, performance or release qualification.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BuiltinSolverCapability {
     id: SolverId,
@@ -116,9 +118,10 @@ pub fn builtin_solver_capabilities() -> Result<Vec<BuiltinSolverCapability>, Fro
             SolverFamily::Salt,
             SolverTrust::Registered,
         )?,
-        BuiltinSolverCapability::unavailable(
-            "qtea-salient-residual.v1",
+        BuiltinSolverCapability::available(
+            FRONTIER_QTEA_REFERENCE_SOLVER_ID,
             SolverFamily::QteaSalientResidual,
+            SolverTrust::Experimental,
         )?,
         BuiltinSolverCapability::unavailable("externd.v1", SolverFamily::ExTernD)?,
         BuiltinSolverCapability::unavailable("twla.v1", SolverFamily::Twla)?,

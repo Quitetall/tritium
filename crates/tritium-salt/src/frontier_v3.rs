@@ -32,7 +32,10 @@ pub use orchestration::{
     FRONTIER_RUN_RECEIPT_SCHEMA_V1, FRONTIER_STAGE_REQUEST_SCHEMA_V1, FrontierRunReceipt,
     FrontierStageRequest,
 };
-pub use qtea_work::{QteaAdmittedTensorFitResult, QteaAdmittedTensorWork, QteaFrontierWorkError};
+pub use qtea_work::{
+    FRONTIER_QTEA_REFERENCE_SOLVER_ID, QteaAdmittedTensorFitResult, QteaAdmittedTensorWork,
+    QteaFrontierSolver, QteaFrontierWorkError, QteaReferenceAdapter,
+};
 pub use receipt::{
     FRONTIER_PARETO_RECEIPT_SCHEMA_V1, FRONTIER_STAGE_RECEIPT_SCHEMA_V1,
     FrontierObjectiveDirection, FrontierObjectiveSpec, FrontierObjectiveValue,

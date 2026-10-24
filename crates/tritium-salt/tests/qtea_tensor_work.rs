@@ -115,9 +115,18 @@ fn real_work_writer_is_byte_identical_and_cold_runtime_owns_execution() {
         .unwrap();
     assert!(matches!(
         qtea.status(),
-        BuiltinSolverStatus::Unavailable { .. }
+        BuiltinSolverStatus::Available {
+            trust: tritium_salt::SolverTrust::Experimental
+        }
     ));
-    assert!(qtea.descriptor().is_none());
+    assert_eq!(
+        qtea.descriptor(),
+        Some(
+            tritium_salt::QteaReferenceAdapter::new()
+                .unwrap()
+                .descriptor()
+        )
+    );
 }
 
 #[test]
