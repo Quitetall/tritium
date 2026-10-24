@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 mod frontier_v3;
 mod pipeline;
+mod qtea_tensor_work;
 mod qwen36_preflight;
 mod qwen36_source_admission;
 mod qwen36_source_identity;
@@ -48,6 +49,10 @@ pub use pipeline::{
     MetricReceipt, PhysicalLedger, PipelineStatus, ProvenanceReceipt, PublishedArtifact,
     QualityEvidence, SaltDriver, SaltPipeline, SaltReceipt, StageArtifact, StageOutput,
     StageReceiptRecord, StageRequest,
+};
+pub use qtea_tensor_work::{
+    QteaTensorOrigin, QteaTensorWorkError, QteaTensorWorkMemory, QteaTensorWorkPlan,
+    QteaTensorWorkResult,
 };
 pub use qwen36_preflight::{
     Qwen36CampaignPreflight, Qwen36CampaignPreflightError, Qwen36CampaignPreflightReceipt,

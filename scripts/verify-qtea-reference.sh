@@ -2,14 +2,19 @@
 # Explicit external-reference replay of bounded synthetic native CPU output.
 # No installation, downloads, catalog activation or qualification receipts.
 set -euo pipefail
-if test "$#" -ne 4; then
-    echo "usage: $0 PYTHON REFERENCE_SCRIPT REFERENCE_SHA256 NEW_OUTPUT_DIRECTORY" >&2
+if test "$#" -ne 4 && test "$#" -ne 5; then
+    echo "usage: $0 PYTHON REFERENCE_SCRIPT REFERENCE_SHA256 NEW_OUTPUT_DIRECTORY [tritium-cpu|tritium-salt]" >&2
     exit 2
 fi
 python=$1
 reference=$2
 expected_reference=$3
 output=$4
+producer=${5:-tritium-cpu}
+case "$producer" in
+    tritium-cpu|tritium-salt) ;;
+    *) echo 'unsupported conformance producer; no fallback' >&2; exit 2 ;;
+esac
 repo=$(timeout 10 git rev-parse --show-toplevel)
 test -x "$python"
 test -f "$reference"
@@ -32,7 +37,7 @@ export RAYON_NUM_THREADS=1 OMP_NUM_THREADS=1
 export CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
 cd "$repo"
-timeout 600 cargo run --locked --offline -p tritium-cpu --example qtea_conformance -- "$output"
+timeout 600 cargo run --locked --offline -p "$producer" --example qtea_conformance -- "$output"
 shopt -s nullglob dotglob
 produced=("$output"/*)
 test "${#produced[@]}" = 32
@@ -56,5 +61,5 @@ test "${#produced[@]}" = 56
 test "$(timeout 10 git rev-parse HEAD)" = "$expected_product"
 test -z "$(timeout 10 git status --porcelain)"
 test "$(sha256sum "$reference" | cut -d ' ' -f 1)" = "$expected_reference"
-printf 'QTEA_NATIVE_REFERENCE_MATCH product=%s checker_sha256=%s observations=%s (not qualification)\n' \
-    "$expected_product" "$expected_reference" "$count"
+printf 'QTEA_NATIVE_REFERENCE_MATCH product=%s producer=%s checker_sha256=%s observations=%s (not qualification)\n' \
+    "$expected_product" "$producer" "$expected_reference" "$count"
