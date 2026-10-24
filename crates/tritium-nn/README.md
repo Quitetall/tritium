@@ -11,6 +11,8 @@ See the [repository README](https://github.com/Quitetall/tritium#readme) and the
 
 ## Packed host QTEA projections (experimental)
 
+Enable `host-qtea` explicitly; the default normal dependency graph does not link
+the host CPU backend for this path. This feature is not a browser backend.
 `HostQteaLinear::read_from` reads one strict bounded QTEA tensor with its affine
 centers, column multipliers and sparse FP8 corrections intact. Wrap it in
 `Projection::HostQtea(Arc::new(matrix))` when explicitly constructing model

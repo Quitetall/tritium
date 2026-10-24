@@ -22,7 +22,7 @@ tritium-train = { workspace = true }
 tritium-quantize = { workspace = true }
 # Reuse the packed scalar QTEA arithmetic for explicit host model projections.
 # This does not make QTEA a backend tensor or introduce a dense weight shadow.
-tritium-cpu = { workspace = true }
+tritium-cpu = { workspace = true, optional = true }
 half = { workspace = true }
 blake3 = { workspace = true }
 # Data-parallel host matmul for DenseLinear (the SALT/fp accuracy-eval projection).
@@ -51,6 +51,7 @@ libc = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+tritium-cpu = { workspace = true }
 # Golden vectors pinning the DeltaNet activation kernels, which are duplicated in tritium-onnx
 # purely so the two backends agree (ADR 0039 WS-G). testkit does not depend on tritium-nn, so
 # this dev-only edge introduces no cycle.
@@ -64,11 +65,25 @@ proptest = { workspace = true }
 # toolkit) green.
 [features]
 default = []
+# Explicit native scalar QTEA projections; not a browser backend.
+host-qtea = ["dep:tritium-cpu"]
 cuda = ["dep:tritium-cuda", "tritium-cuda/cuda"]
 # Real text tokenization (GGUF-embedded byte-level BPE via the `tokenizers` crate).
 tokenizer = ["dep:tokenizers", "dep:wasmi"]
 # Small non-pinned Qwen bundle fixtures used only by cross-crate integration tests.
 test-fixtures = []
+
+[[test]]
+name = "qtea_projection"
+required-features = ["host-qtea"]
+
+[[test]]
+name = "qtea_memory"
+required-features = ["host-qtea"]
+
+[[example]]
+name = "qtea_host_observation"
+required-features = ["host-qtea"]
 
 [lints]
 workspace = true
