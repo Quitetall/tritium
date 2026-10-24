@@ -109,6 +109,11 @@ A tensor with a ternary base and affine offsets or non-ternary residual correcti
 beyond ordinary reconstruction scales. It is not a pure additive-ternary artifact.
 _Avoid_: pure ternary, multiply-free SALT
 
+**Residual-bearing model**:
+A model whose stored state includes ternary bases with non-ternary corrections
+or affine offsets. It is distinct from a pure additive-ternary model.
+_Avoid_: pure ternary model, multiply-free model
+
 **Recovery replay**:
 Re-execution of a ternary training recipe from its original training payload,
 reproducing the same training snapshot. It is distinct from authenticating the

@@ -17,7 +17,11 @@ mod host;
 mod limits;
 #[cfg(feature = "tokenizer")]
 mod load_config;
+#[cfg(feature = "host-qtea")]
+mod qtea;
 mod qwen35;
+#[cfg(feature = "host-qtea")]
+pub use qtea::HostQteaModelLimits;
 mod qwen35_execution;
 mod qwen35_hf;
 mod qwen35_hf_source;

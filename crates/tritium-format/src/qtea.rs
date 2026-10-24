@@ -5,6 +5,7 @@
 //! Caller limits are logical/owned byte bounds, not allocator overhead or RSS.
 
 mod layout;
+pub mod model;
 mod tensor;
 mod write;
 

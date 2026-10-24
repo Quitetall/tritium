@@ -81,6 +81,10 @@ required-features = ["host-qtea"]
 name = "qtea_memory"
 required-features = ["host-qtea"]
 
+[[test]]
+name = "qtea_model"
+required-features = ["host-qtea"]
+
 [[example]]
 name = "qtea_host_observation"
 required-features = ["host-qtea"]

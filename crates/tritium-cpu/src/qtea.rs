@@ -11,6 +11,11 @@ use tritium_format::qtea::{QteaError, QteaTensorView};
 pub enum QteaCpuError {
     /// Input/output/staging counts do not match checked batch geometry.
     Shape,
+    /// A requested embedding row is not in the checked vocabulary.
+    InvalidRow {
+        /// Requested row, without source/model contents.
+        row: u32,
+    },
     /// A caller input is nonfinite.
     NonFiniteInput {
         /// Flat input index, without printing input values.
@@ -31,6 +36,48 @@ impl From<QteaError> for QteaCpuError {
     fn from(error: QteaError) -> Self {
         Self::Format(error)
     }
+}
+
+/// Gather exact packed rows into `[tokens.len(), columns]`, without expanding
+/// the complete weight matrix. Output changes only after all rows succeed;
+/// staging is caller-owned, exact output-sized and may be dirty on refusal.
+/// # Errors
+/// Shape/count overflow, out-of-vocabulary rows or checked numeric/accessor errors.
+pub fn gather_into(
+    tensor: QteaTensorView<'_>,
+    tokens: &[u32],
+    output: &mut [f32],
+    staging: &mut [f32],
+) -> Result<(), QteaCpuError> {
+    let meta = tensor.metadata();
+    if tokens.len().checked_mul(meta.columns) != Some(output.len()) || staging.len() != output.len()
+    {
+        return Err(QteaCpuError::Shape);
+    }
+    for &row in tokens {
+        if !usize::try_from(row).is_ok_and(|row| row < meta.rows) {
+            return Err(QteaCpuError::InvalidRow { row });
+        }
+    }
+    for (&row, destination) in tokens.iter().zip(staging.chunks_exact_mut(meta.columns)) {
+        let mut residuals = tensor.residuals();
+        let mut residual = residuals.next();
+        for (column, slot) in destination.iter_mut().enumerate() {
+            let mut weight = tensor.base_weight(row as usize, column)?;
+            if let Some(record) = residual.filter(|record| record.column() == column) {
+                if let Some(value) = record.value_at_row(row as usize)? {
+                    weight += value;
+                }
+                residual = residuals.next();
+            }
+            if !weight.is_finite() {
+                return Err(QteaCpuError::ArithmeticOverflow);
+            }
+            *slot = weight;
+        }
+    }
+    output.copy_from_slice(staging);
+    Ok(())
 }
 
 /// Execute `[batch,columns] * tensor^T` into exact `[batch,rows]` output.

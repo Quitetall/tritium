@@ -19,6 +19,17 @@ pub(crate) fn fixture(
     ratio: f64,
     seed: usize,
 ) -> (QteaTensor, Vec<f32>) {
+    fixture_source(rows, cols, group, ratio, seed, [3; 32])
+}
+
+pub(crate) fn fixture_source(
+    rows: usize,
+    cols: usize,
+    group: usize,
+    ratio: f64,
+    seed: usize,
+    source_model: [u8; 32],
+) -> (QteaTensor, Vec<f32>) {
     let meta = QteaMetadata {
         rows,
         columns: cols,
@@ -35,7 +46,7 @@ pub(crate) fn fixture(
         bindings: QteaBindings {
             weights: [1; 32],
             gram: [2; 32],
-            source_model: [3; 32],
+            source_model,
             activation_cache: [4; 32],
             token_stream: [5; 32],
         },

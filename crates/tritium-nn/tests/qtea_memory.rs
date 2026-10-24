@@ -64,9 +64,19 @@ fn packed_move_and_caller_workspace_do_not_expand_weights() {
     assert!(count > 0 && bytes >= 8192);
     for (rows, columns) in [(4, 4), (68, 258), (128, 512)] {
         let (tensor, decoded) = common::fixture(rows, columns, 2, 1., 0);
+        let tokens = [0, rows as u32 - 1, 0];
+        let gathered = tokens
+            .iter()
+            .flat_map(|&row| {
+                decoded[row as usize * columns..(row as usize + 1) * columns]
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
         drop(decoded);
         let encoded_capacity = tensor.buffer_capacity_bytes();
-        let (matrix, count, bytes) = measured(|| HostQteaLinear::from_tensor(tensor, 3 * rows * 4));
+        let (matrix, count, bytes) =
+            measured(|| HostQteaLinear::from_tensor(tensor, 3 * rows.max(columns) * 4));
         assert_eq!((count, bytes), (0, 0));
         assert_eq!(matrix.encoded_capacity_bytes(), encoded_capacity);
         let matrix = Arc::new(matrix);
@@ -85,6 +95,17 @@ fn packed_move_and_caller_workspace_do_not_expand_weights() {
         result.unwrap();
         assert_eq!((count, bytes), (1, 3 * rows * 4));
         assert_eq!(output, expected);
+        let mut gather_output = vec![55.; 3 * columns];
+        let mut gather_staging = vec![66.; gather_output.len()];
+        let (result, count, bytes) =
+            measured(|| matrix.gather_into(&tokens, &mut gather_output, &mut gather_staging));
+        result.unwrap();
+        assert_eq!((count, bytes), (0, 0));
+        assert_eq!(gather_output, gathered);
+        let (result, count, bytes) = measured(|| matrix.gather(&tokens, &mut gather_output));
+        result.unwrap();
+        assert_eq!((count, bytes), (1, 3 * columns * 4));
+        assert_eq!(gather_output, gathered);
         let (result, count, bytes) = measured(|| matrix.forward(&[], 0, &mut []));
         result.unwrap();
         assert_eq!((count, bytes), (0, 0));

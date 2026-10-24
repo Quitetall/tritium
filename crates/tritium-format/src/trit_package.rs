@@ -44,6 +44,8 @@ const MAX_DIRECTORY_BYTES: usize = 256 * 1024 * 1024;
 pub enum TritBlobKind {
     /// Additive ternary tensor payload.
     AdditiveTensor,
+    /// Complete residual-bearing QTEA V1 tensor, never additive SALT.
+    QteaTensor,
     /// Dense tensor payload with its element dtype.
     DenseTensor(DType),
     /// Model asset such as config, tokenizer, or chat template.
@@ -981,6 +983,7 @@ fn decode_borrowed_directory(bytes: &[u8]) -> Result<Option<Vec<TritBlobInfo>>, 
         };
         let kind = match (entry.kind, entry.aux) {
             (0, None) => TritBlobKind::AdditiveTensor,
+            (3, None) => TritBlobKind::QteaTensor,
             (1, Some(name)) => match dtype_from_str(name) {
                 Ok(dtype) => TritBlobKind::DenseTensor(dtype),
                 Err(_) => return Ok(None),
@@ -1068,6 +1071,7 @@ fn decode_reference_directory(bytes: &[u8]) -> Result<Vec<TritBlobInfo>, TritPac
 fn encode_kind(kind: &TritBlobKind) -> (u64, Value) {
     match kind {
         TritBlobKind::AdditiveTensor => (0, Value::Null),
+        TritBlobKind::QteaTensor => (3, Value::Null),
         TritBlobKind::DenseTensor(dtype) => (1, Value::Text(dtype.to_string())),
         TritBlobKind::Asset(name) => (2, Value::Text(name.clone())),
     }
@@ -1076,6 +1080,7 @@ fn encode_kind(kind: &TritBlobKind) -> (u64, Value) {
 fn decode_kind(tag: u64, value: &Value) -> Result<TritBlobKind, TritPackageError> {
     match (tag, value) {
         (0, Value::Null) => Ok(TritBlobKind::AdditiveTensor),
+        (3, Value::Null) => Ok(TritBlobKind::QteaTensor),
         (1, Value::Text(name)) => dtype_from_str(name).map(TritBlobKind::DenseTensor),
         (2, Value::Text(name)) if !name.is_empty() => Ok(TritBlobKind::Asset(name.clone())),
         _ => Err(TritPackageError::InvalidDirectory),
@@ -1203,6 +1208,7 @@ fn integer(value: &Value) -> Result<u64, TritPackageError> {
 fn kind_sort_key(kind: &TritBlobKind) -> (u8, String) {
     match kind {
         TritBlobKind::AdditiveTensor => (0, String::new()),
+        TritBlobKind::QteaTensor => (3, String::new()),
         TritBlobKind::DenseTensor(dtype) => (1, dtype.to_string()),
         TritBlobKind::Asset(name) => (2, name.clone()),
     }

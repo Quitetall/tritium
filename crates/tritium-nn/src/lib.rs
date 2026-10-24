@@ -53,6 +53,8 @@ pub use layers::{
     Qwen35FullAttentionWeights, Relu2Mlp, SaltLinear, SwiGluMlp, TensorLoader, TernaryLinear,
     TokenEmbedding, TransformerBlock,
 };
+#[cfg(feature = "host-qtea")]
+pub use model::HostQteaModelLimits;
 pub use model::{ArchitectureSpec, CacheAdmission, LayerKind, Runner, StreamLimits};
 pub use model::{
     ChatRenderOptions, ForwardDump, LayerWeights, ModelRunner, ModelSource, ModelWeights,

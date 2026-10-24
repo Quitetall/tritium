@@ -1,5 +1,16 @@
 # tritium-format
 
+The proposed `qtea::model` profile carries named residual-bearing models in the
+existing seek-backed `.trit` envelope using directory kind `QteaTensor` (3/null).
+It is distinct from typed additive-SALT `TensorStorage` and is rejected by that
+ordinary model reader. Canonical metadata binds config/assets, exact owner names,
+declared source and QTEA matrices or preserved floating-point vectors. Explicit
+source/metadata/per-owner limits, actual blob checks and terminal source recheck
+remain necessary; names/digest agreement is not source or quality qualification.
+The existing package/spool encoders accept the new kind without changing old
+kind bytes. `QteaModelReader` validates payload numerics lazily; complete model
+coverage/execution is the model loader's obligation, not a successful outer parse.
+
 Ternary weight formats: TQ1_0/TQ2_0/Q2_0 pack-unpack, GGUF and safetensors readers, SALT packages.
 
 Part of [Tritium](https://github.com/Quitetall/tritium) — Apache-2.0 infrastructure for

@@ -112,6 +112,8 @@ pub struct Runner {
     architecture: ArchitectureSpec,
     executor: Box<dyn Executor>,
     admission: Option<CacheAdmission>,
+    #[cfg(feature = "host-qtea")]
+    pub(super) qtea_package: Option<tritium_format::PackageId>,
     #[cfg(feature = "tokenizer")]
     resources: Option<(
         super::ModelResourceAdmission,
@@ -120,6 +122,13 @@ pub struct Runner {
     )>,
 }
 impl Runner {
+    /// Exact QTEA carrier identity retained by this loader, if selected.
+    /// This is byte provenance, not original-source/quality qualification.
+    #[cfg(feature = "host-qtea")]
+    #[must_use]
+    pub const fn qtea_package_id(&self) -> Option<tritium_format::PackageId> {
+        self.qtea_package
+    }
     /// Actual selected graph implementation, not a quality/performance verdict.
     #[must_use]
     pub fn execution(&self) -> tritium_spec::DecoderExecution {
@@ -152,6 +161,8 @@ impl Runner {
             executor,
             admission,
             resources: None,
+            #[cfg(feature = "host-qtea")]
+            qtea_package: None,
         })
     }
     #[cfg(feature = "tokenizer")]
@@ -180,6 +191,8 @@ impl Runner {
             executor,
             admission,
             resources: None,
+            #[cfg(feature = "host-qtea")]
+            qtea_package: None,
         })
     }
     #[cfg(feature = "tokenizer")]

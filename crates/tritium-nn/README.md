@@ -30,9 +30,29 @@ batch geometry and allocates one fallible output-sized F32 staging buffer;
 `forward_into` uses exact caller-owned staging without a heap request. Failures
 leave output unchanged (staging may be dirty). Encoded limits, staging limits,
 caller/cache/model memory and physical RSS are separate domains. Limits do not
-aggregate across calls or concurrent matrices. Packed embedding gather, complete
-QTEA model packages, official Qwen/MTP loading, quality and performance remain
-unqualified; synthetic transformer checks are not those gates.
+aggregate across calls or concurrent matrices. Packed token gather retains the
+same shared QTEA bytes for tied-head execution; `is_packed_salt()` remains false.
+
+The separate proposed ADR 0163 `tritium.qtea-model.v1` carrier uses the existing
+seek-backed `.trit` envelope with an explicit QTEA directory kind. It binds a
+declared source, config/assets and complete named matrix/vector inventory.
+`ModelWeights::load_qtea` returns config, architecture variation, owned packed
+weights and the exact PackageId. With `tokenizer`, `Runner::load_qtea` loads this
+standard-transformer carrier into the common host executor under explicit
+`HostQteaModelLimits` and `StreamLimits`; `qtea_package_id()` retains its exact
+byte identity. This method does not select or interpret tokenizer/chat assets.
+
+All matrices, including embedding and untied head, stay packed. Only preserved
+F16/BF16/F32 vectors widen to F32. Complete inventory/roles/shapes, source agreement
+and logical payload/cache caps are admitted before weight materialization;
+actual payload checks and terminal source verification precede successful return.
+Identical immutable packed blobs share one allocation without inventing trainable
+aliases. Config tying requires one embedding/head owner, not a second head tensor.
+The payload ceiling excludes metadata, transient decode, allocator/Arc overhead,
+staging, caches and physical RSS. Ordinary typed SALT loading rejects this profile.
+Official Qwen/hybrid/MTP loading, source authentication, chat integration, quality,
+GPU/browser and performance remain unqualified; toy standard models do not pass
+those gates. No qualification or loaded-model receipt is fabricated by this loader.
 
 ## Source-bound chat prompts (experimental)
 

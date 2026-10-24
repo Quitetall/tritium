@@ -95,9 +95,14 @@ impl HostQteaLinear {
     /// input or arithmetic overflow without changing output.
     pub fn forward(&self, input: &[f32], batch: usize, output: &mut [f32]) -> Result<(), NnError> {
         self.check_geometry(input, batch, output)?;
+        let mut staging = self.staging(output.len())?;
+        self.forward_into(input, batch, output, &mut staging)
+    }
+
+    fn staging(&self, elements: usize) -> Result<Vec<f32>, NnError> {
         let mut staging = Vec::<f32>::new();
         staging
-            .try_reserve_exact(output.len())
+            .try_reserve_exact(elements)
             .map_err(|error| NnError::Backend(format!("host QTEA staging allocation: {error}")))?;
         if staging
             .capacity()
@@ -108,8 +113,8 @@ impl HostQteaLinear {
                 "host QTEA staging capacity exceeded".into(),
             ));
         }
-        staging.resize(output.len(), 0.0);
-        self.forward_into(input, batch, output, &mut staging)
+        staging.resize(elements, 0.0);
+        Ok(staging)
     }
 
     /// Execute with caller-owned exact output-sized staging and no heap request.
@@ -127,6 +132,46 @@ impl HostQteaLinear {
     ) -> Result<(), NnError> {
         self.check_geometry(input, batch, output)?;
         tritium_cpu::qtea::matmul_into(self.tensor.view(), input, batch, output, staging)
+            .map_err(|error| NnError::Backend(error.to_string()))
+    }
+
+    fn check_gather(&self, tokens: &[u32], output: &[f32]) -> Result<(), NnError> {
+        if tokens.len().checked_mul(self.columns()) != Some(output.len())
+            || output
+                .len()
+                .checked_mul(4)
+                .is_none_or(|bytes| bytes > self.max_staging_bytes)
+        {
+            return Err(NnError::Backend(
+                "host QTEA gather geometry/staging cap mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Gather packed token rows with one fallible output-sized staging buffer.
+    /// This never expands the complete table and leaves output unchanged on error.
+    /// # Errors
+    /// Shape/row/cap, allocation or numeric refusal.
+    pub fn gather(&self, tokens: &[u32], output: &mut [f32]) -> Result<(), NnError> {
+        self.check_gather(tokens, output)?;
+        let mut staging = self.staging(output.len())?;
+        self.gather_into(tokens, output, &mut staging)
+    }
+
+    /// Gather with exact caller-owned staging and no successful heap request.
+    /// Staging may change on error; output never does. The cap covers its slice,
+    /// not other memory retained by the caller.
+    /// # Errors
+    /// Shape/row/cap or numeric refusal.
+    pub fn gather_into(
+        &self,
+        tokens: &[u32],
+        output: &mut [f32],
+        staging: &mut [f32],
+    ) -> Result<(), NnError> {
+        self.check_gather(tokens, output)?;
+        tritium_cpu::qtea::gather_into(self.tensor.view(), tokens, output, staging)
             .map_err(|error| NnError::Backend(error.to_string()))
     }
 }

@@ -300,3 +300,62 @@ fn shared_packed_projection_has_independent_concurrent_workspace() {
     }
     assert_eq!(Arc::strong_count(&matrix), 1);
 }
+
+#[test]
+fn packed_embedding_gather_and_tied_head_keep_the_same_residual_weights() {
+    let (tensor, decoded) = common::fixture(8, 12, 6, 1., 3);
+    let matrix = Arc::new(HostQteaLinear::from_tensor(tensor, 3 * 12 * 4));
+    let table = tritium_nn::TokenEmbedding::from_host_qtea(Arc::clone(&matrix));
+    let clone = table.clone();
+    assert_eq!(Arc::strong_count(&matrix), 3);
+    assert!(table.as_dense().is_none());
+    assert!(!table.is_packed_salt());
+    assert!(table.tensor_caps().is_none());
+    assert_eq!(table.sparse_plane_count(), 0);
+    let tokens = [7, 0, 7];
+    let expected = tokens
+        .iter()
+        .flat_map(|&r| {
+            decoded[r as usize * 12..(r as usize + 1) * 12]
+                .iter()
+                .copied()
+        })
+        .collect::<Vec<_>>();
+    let mut output = [99.; 36];
+    table.gather(&tokens, &mut output).unwrap();
+    assert_eq!(bits(&output), bits(&expected));
+    let mut staging = [77.; 36];
+    matrix
+        .gather_into(&tokens, &mut output, &mut staging)
+        .unwrap();
+    assert_eq!(bits(&output), bits(&expected));
+    let unchanged = output;
+    assert!(table.gather(&[0, 8, 0], &mut output).is_err());
+    assert_eq!(output, unchanged);
+    assert!(
+        matrix
+            .gather_into(&tokens, &mut output, &mut staging[..35])
+            .is_err()
+    );
+    assert_eq!(output, unchanged);
+    table.gather(&[], &mut []).unwrap();
+    let hidden = [0.125; 12];
+    let mut logits = [0.; 8];
+    clone.unembed_exact(&hidden, &mut logits).unwrap();
+    let expected: Vec<_> = decoded
+        .as_chunks::<12>()
+        .0
+        .iter()
+        .map(|row| row.iter().fold(0_f32, |sum, w| sum + 0.125 * w))
+        .collect();
+    assert_eq!(bits(&logits), bits(&expected));
+    let cpu = tritium_cpu::CpuBackend::new();
+    clone
+        .gather_with_backend(&cpu, &tokens, &mut output)
+        .unwrap();
+    assert_eq!(output, unchanged);
+    clone
+        .unembed_exact_with_backend(&cpu, &hidden, &mut logits)
+        .unwrap();
+    assert_eq!(bits(&logits), bits(&expected));
+}
