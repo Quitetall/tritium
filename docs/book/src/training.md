@@ -41,8 +41,8 @@ one explicit parent level and a complete `NativeRefinementPlan`; obtain its exac
 parent tuple with `parent.native_refinement_parent(level)`. It shares the packed
 CPU kernels, optimizer, TNPJ journal, TNPB resume transport and immutable child
 publisher with the resident path. It does not retain all decoded optimizer
-owners or materialize checkpoint bytes. The ordinary resident factories and
-high-level teacher/data `refine` facade are unchanged.
+owners or materialize checkpoint bytes. The ordinary resident factories are
+unchanged; high-level teacher/data refinement selects paging explicitly below.
 
 Small-fixture example (these caps are **not** Qwen sizing):
 
@@ -163,6 +163,49 @@ This removes one all-owner retention source, not every memory bottleneck. A full
 owner VJP and numerical owner, caller activations, packed current/old graphs,
 teacher state, raw checkpoints/journals/spools and their I/O remain. Physical
 memory, GPU/within-owner/compact-state and model-quality gates are still open.
+
+### Teacher/data refinement with paged storage
+
+Select `NativePvPagedRefinementConfig` for the existing public `refine` workflow.
+It accepts only `AlternatingPv`, requires both typed `paging_limits` and
+`gradient_capture`, and uses the same teacher/source checks, bounded data windows,
+masked KD, held-out predecessor retention and immutable child publisher. There
+is no resident fallback. `NativeRefinementConfig` retains its existing behavior.
+
+```python
+from tritium.torch import NativePvPagedRefinementConfig, refine
+
+config = NativePvPagedRefinementConfig(
+    plan, level="full", run_id="paged-kd", machine="local-fixture",
+    training_limits=load_snapshot_saved_limits,
+    paging_limits=caps, gradient_capture=capture,
+    publication_limits=publication_limits, data_limits=data_limits,
+)
+child = refine(
+    parent, teacher=teacher, training=training, validation=validation,
+    config=config, work_dir=existing_work_dir, output_dir=new_child_dir,
+)
+```
+
+Supply exact positive mappings explicitly. `training_limits` contains
+`max_snapshot_bytes`, `max_saved_input_bytes`, `max_package_bytes`,
+`max_payload_bytes`, `max_workspace_bytes`, `max_output_bytes` and
+`max_evidence_bytes`; these load/snapshot scopes are distinct from the typed
+paging workspace/owner scopes. It does not accept resident `max_parent_bytes`.
+`publication_limits` has exactly the seven paged fields listed above. `data_limits`
+contains `max_window_bytes`, `max_validation_bytes`, `max_nodes`, `max_depth` and
+`max_loss_bytes`. This is not a reinterpretation of resident aggregate limits.
+
+The existing work directory receives a new private anonymous-workspace child,
+retired on completion/refusal without recursive foreign-file cleanup. Optional
+`checkpoint_steps`/`checkpoint_limits`, `checkpoint_dir` and `on_checkpoint` retain
+the common orchestration semantics, but callbacks/resume use only
+`NativePvPagedResumeBundle`. Resume rechecks the declared input prefix and the
+original-parent baseline; it never bridges through resident checkpoint bytes.
+Teacher modes restore on success/refusal. Source/objective/quality qualification
+flags and immediate-parent lineage scope do not change. Dense teacher, retained
+validation, activations/logits, packed snapshots, one owner and disk/I/O costs
+remain; a successful local fixture is not whole-model or release qualification.
 
 ## LoRA on a frozen ternary base
 

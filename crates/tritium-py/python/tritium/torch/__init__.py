@@ -94,7 +94,7 @@ from .native_source import convert_native_module
 from .native_load import load_native_module
 from .native_training import NativeScaleTrainer, native_scale_training, NativePvTrainer, native_pv_training
 from .native_training import NativePvPagedTrainer, native_pv_paged_training
-from .native_refinement import NativeRefinementConfig
+from .native_refinement import NativeRefinementConfig, NativePvPagedRefinementConfig
 from .native_calibration import (NativeModulePreparation, NativeModuleCalibration,
     prepare_native_module, calibrate_native_module, convert_calibrated_native_module)
 from .owner_conversion import convert_owner_native_module
@@ -149,6 +149,7 @@ __all__ = [
     "NativePvPagedTrainer",
     "native_pv_paged_training",
     "NativeRefinementConfig",
+    "NativePvPagedRefinementConfig",
     "native_scale_training",
     "AbsMeanSTE",
     "ActivationCalibrationReceipt",

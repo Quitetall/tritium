@@ -7,10 +7,11 @@ import math
 from pathlib import Path
 import struct
 from collections.abc import Mapping
+from uuid import uuid4
 import torch
 import torch.nn.functional as F
 from .. import _tritium
-from .native_training import native_scale_training, native_pv_training, _pairs
+from .native_training import native_scale_training, native_pv_training, native_pv_paged_training, _pairs
 from .native_load import load_native_module
 from .ptq import _hash_field, _hash_tensor, _source_model_digest, _invoke_model
 from .errors import TritiumError
@@ -63,6 +64,8 @@ class NativeRefinementConfig:
     machine: str
     temperature: float
     checkpoint_steps: tuple
+    _training_fields = frozenset(_TRAIN)
+    _publication_fields = frozenset(_PUBLISH)
 
     def __init__(self, plan, *, level, run_id, machine, training_limits, publication_limits,
                  data_limits, temperature=1.0, checkpoint_steps=(), checkpoint_limits=None):
@@ -81,7 +84,8 @@ class NativeRefinementConfig:
             raise ValueError("native refinement objective differs from built-in KD profile")
         if data["teacher_source"] != data["parent"]["source"]:
             raise ValueError("native KD teacher_source must explicitly equal original parent source")
-        resources = dict(training=_limits(training_limits, _TRAIN), publication=_limits(publication_limits, _PUBLISH),
+        resources = dict(training=_limits(training_limits, self._training_fields),
+                         publication=_limits(publication_limits, self._publication_fields),
                          data=_limits(data_limits, _DATA), checkpoint=None)
         if resources["data"]["max_depth"] > 64:
             raise ValueError("native data maximum depth cannot exceed 64")
@@ -118,6 +122,38 @@ class NativeRefinementConfig:
         digest = hashlib.sha256(b"tritium.native.refinement.window.v1\0")
         _hash_node(digest, batch)
         return list(digest.digest())
+
+
+@dataclass(frozen=True, init=False)
+class NativePvPagedRefinementConfig(NativeRefinementConfig):
+    """Explicit CPU owner-paged P/V refinement with bounded adjoint capture.
+
+    Load/snapshot/saved-input limits stay separate from the typed optimizer,
+    workspace and gradient-window scopes. The teacher, packed images, activations
+    and one numerical owner still need memory. Not physical-memory qualification.
+    """
+    paging_limits: _tritium.NativePvPagedTrainingLimits
+    gradient_capture: _tritium.NativePvPagedGradientLimits
+    _training_fields = frozenset(_TRAIN - {"max_parent_bytes"})
+    _publication_fields = frozenset(_PUBLISH - {
+        "max_parent_bytes", "max_replay_working_bytes", "max_journal_bytes"})
+
+    def __init__(self, plan, *, level, run_id, machine, training_limits, paging_limits,
+                 gradient_capture, publication_limits, data_limits, temperature=1.0,
+                 checkpoint_steps=(), checkpoint_limits=None):
+        if not isinstance(paging_limits, _tritium.NativePvPagedTrainingLimits):
+            raise TypeError("paged refinement requires NativePvPagedTrainingLimits")
+        if not isinstance(gradient_capture, _tritium.NativePvPagedGradientLimits):
+            raise TypeError("paged refinement requires NativePvPagedGradientLimits")
+        super().__init__(plan, level=level, run_id=run_id, machine=machine,
+            training_limits=training_limits, publication_limits=publication_limits,
+            data_limits=data_limits, temperature=temperature,
+            checkpoint_steps=checkpoint_steps, checkpoint_limits=checkpoint_limits)
+        if set(self.plan["recipe"]) != {"AlternatingPv"}:
+            raise ValueError("paged refinement requires AlternatingPv")
+        object.__setattr__(self, "paging_limits", paging_limits)
+        object.__setattr__(self, "gradient_capture", gradient_capture)
+
 
 def _measure(batch, limits):
     size, nodes = 0, 0
@@ -312,6 +348,9 @@ def refine_native(parent, *, teacher, training, validation, config, work_dir, ou
         raise TypeError("native refinement requires an actual native conversion or refined parent")
     plan, resources = config.plan, config.resources
     _, training_factory, bundle_type = _profile(plan)
+    paged = isinstance(config, NativePvPagedRefinementConfig)
+    if paged:
+        training_factory, bundle_type = native_pv_paged_training, _tritium.NativePvPagedResumeBundle
     if resume is not None and not isinstance(resume, bundle_type):
         raise TypeError(f"native refinement resume requires {bundle_type.__name__}")
     if on_checkpoint is not None and (not callable(on_checkpoint) or not config.checkpoint_steps):
@@ -366,10 +405,15 @@ def refine_native(parent, *, teacher, training, validation, config, work_dir, ou
             predecessor.eval()
             before = _evaluate(predecessor, teacher, guard, windows, config)
             del predecessor
+        if paged:
+            storage = dict(workspace_dir=work / ("native-pv-" + uuid4().hex),
+                           limits=config.paging_limits, gradient_capture=config.gradient_capture)
+        else:
+            storage = dict(recording=dict(work_dir=work,
+                max_journal_bytes=resources["publication"]["max_journal_bytes"],
+                max_working_bytes=resources["publication"]["max_replay_working_bytes"]))
         trainer = training_factory(teacher, parent, level=config.level, plan=plan,
-            load_run_id=config.run_id + "-load", resume=resume,
-            recording=dict(work_dir=work, max_journal_bytes=resources["publication"]["max_journal_bytes"],
-                           max_working_bytes=resources["publication"]["max_replay_working_bytes"]), **resources["training"])
+            load_run_id=config.run_id + "-load", resume=resume, **storage, **resources["training"])
         trainer.model.eval()
         if resume is None:
             before = _evaluate(trainer.model, teacher, guard, windows, config)
