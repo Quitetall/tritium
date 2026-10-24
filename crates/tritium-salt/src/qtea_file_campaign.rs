@@ -28,7 +28,7 @@ use tritium_quantize::{
 };
 use tritium_schema::{
     CalibrationCacheId, CalibrationCacheLimits, CalibrationPartition, ModelQuantPlan,
-    OriginalSourceId, QuantAction, QuantPlan,
+    NamedAssetDigest, OriginalSourceId, QuantAction, QuantPlan, QuantSourceBinding,
 };
 
 fn error(e: impl std::fmt::Display) -> QteaModelBuildError {
@@ -183,6 +183,110 @@ impl From<QteaCampaignModelProfile> for QteaModelProfile {
         }
     }
 }
+/// Source-only preparation before real curvature/cache identities exist.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QteaFileSourceRequest {
+    /// Must equal tritium.qtea.source-preparation.v1.
+    pub schema: String,
+    /// Declared campaign context, not original-source authentication.
+    pub campaign: ContentId,
+    /// Complete original-only plan.
+    pub source: QuantPlan,
+    /// Explicit supported graph profile.
+    pub model_profile: QteaCampaignModelProfile,
+    /// Same explicit positive model/work/output limits as subsequent campaigns.
+    pub limits: QteaCampaignLimits,
+}
+fn validate_original(
+    source: &QuantPlan,
+    limits: QteaCampaignLimits,
+    campaign: ContentId,
+) -> Result<(), QteaModelBuildError> {
+    source.validate().map_err(error)?;
+    limits.build()?;
+    if campaign.as_bytes() == &[0; 32] || source.tensors.len() > limits.max_tensors {
+        return Err(error("source campaign identity/inventory mismatch"));
+    }
+    if source
+        .tensors
+        .iter()
+        .any(|t| !matches!(t.action, QuantAction::KeepDense))
+    {
+        return Err(error(
+            "QTEA observation plan requires original-only KeepDense actions",
+        ));
+    }
+    Ok(())
+}
+impl QteaFileSourceRequest {
+    /// Receive strict bounded source data, without placeholder curvature/run IDs.
+    /// # Errors
+    /// JSON cap/syntax/schema/source/limit/campaign refusal.
+    pub fn from_slice(bytes: &[u8], max_bytes: usize) -> Result<Self, QteaModelBuildError> {
+        if max_bytes == 0 || bytes.len() > max_bytes {
+            return Err(error("source request exceeds positive JSON cap"));
+        }
+        let value: Self = serde_json::from_slice(bytes).map_err(error)?;
+        value.validate()?;
+        Ok(value)
+    }
+    fn validate(&self) -> Result<(), QteaModelBuildError> {
+        if self.schema != "tritium.qtea.source-preparation.v1" {
+            return Err(error("unsupported QTEA source schema"));
+        }
+        validate_original(&self.source, self.limits, self.campaign)
+    }
+}
+/// Actual content observation after complete graph admission; data, not a lock or approval.
+#[derive(Clone, Debug)]
+pub struct QteaOriginalSourceObservation {
+    /// Actual declared and graph-checked architecture.
+    pub architecture: String,
+    /// Actual original raw tensor/asset content identity.
+    pub source_model: OriginalSourceId,
+    /// Complete actual original tensor byte bindings.
+    pub tensors: Vec<QuantSourceBinding>,
+    /// Complete actual original asset byte bindings.
+    pub assets: Vec<NamedAssetDigest>,
+}
+/// Observe actual files and admit source graph before any calibration exists.
+/// # Errors
+/// Invalid source, unexpected curvature paths, actual byte/config/graph or cap refusal.
+pub fn prepare_qtea_file_source(
+    r: &QteaFileSourceRequest,
+    files: &QteaCampaignFiles,
+) -> Result<QteaOriginalSourceObservation, QteaModelBuildError> {
+    r.validate()?;
+    if !files.curvature.is_empty() {
+        return Err(error(
+            "source-only preparation cannot ignore curvature files",
+        ));
+    }
+    let mut raw = FileWeightSource::open(
+        ModelQuantPlan::Uncalibrated(&r.source),
+        &files.source_shards,
+        files.assets.clone(),
+        BTreeMap::new(),
+    )
+    .map_err(error)?;
+    let observed = ObservedWeightSource::new(&r.source, &mut raw).map_err(error)?;
+    let result = QteaOriginalSourceObservation {
+        architecture: observed.architecture().to_owned(),
+        source_model: observed.source_id(),
+        tensors: observed.tensor_bindings().to_vec(),
+        assets: observed.asset_bindings().to_vec(),
+    };
+    let mut builder = QteaModelBuilder::new(
+        observed,
+        r.model_profile.into(),
+        r.campaign,
+        Cursor::new(Vec::new()),
+        r.limits.build()?,
+    )?;
+    builder.revalidate_original_source()?;
+    Ok(result)
+}
 /// Imported data mode; neither variant authenticates its producer or capture.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -276,8 +380,7 @@ impl QteaFileCampaignRequest {
         Ok(value)
     }
     fn validate(&self) -> Result<(), QteaModelBuildError> {
-        self.source.validate().map_err(error)?;
-        self.limits.build()?;
+        validate_original(&self.source, self.limits, self.campaign)?;
         if self.schema != "tritium.qtea.file-campaign.v1"
             || self.campaign.as_bytes() == &[0; 32]
             || self.run.as_bytes() == &[0; 32]
@@ -285,16 +388,6 @@ impl QteaFileCampaignRequest {
             || self.owners.is_empty()
         {
             return Err(error("campaign schema/identity/inventory mismatch"));
-        }
-        if self
-            .source
-            .tensors
-            .iter()
-            .any(|t| !matches!(t.action, QuantAction::KeepDense))
-        {
-            return Err(error(
-                "QTEA observation plan requires original-only KeepDense actions",
-            ));
         }
         let expected = self
             .source

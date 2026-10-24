@@ -437,6 +437,10 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(qtea_campaign::_run_qtea_file_campaign, m)?)?;
     m.add_function(wrap_pyfunction!(
+        qtea_campaign::_prepare_qtea_file_source,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
         model_conversion::convert_owner_model_plan,
         m
     )?)?;

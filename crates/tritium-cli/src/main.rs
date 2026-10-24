@@ -1,6 +1,6 @@
 //! The `tritium` command-line tool.
 //!
-//! One binary, fifteen subcommands, grouped by concern:
+//! One binary with subcommands grouped by concern:
 //! - **inspect / list-backends / generate** — parse a GGUF and print its
 //!   metadata + tensor table, enumerate the discovered compute backends,
 //!   greedily decode from a reproducible JSON token file.

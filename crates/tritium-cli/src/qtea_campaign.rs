@@ -92,10 +92,43 @@ pub(crate) fn run(command: QteaCommand) -> Result<()> {
             )?
         }
     };
-    std::io::stdout()
-        .lock()
-        .write_all(&bytes)
-        .context("write unqualified QTEA observations")?;
-    println!();
+    write_observations(&mut std::io::stdout().lock(), &bytes)?;
     Ok(())
+}
+fn write_observations(output: &mut impl Write, bytes: &[u8]) -> Result<()> {
+    output
+        .write_all(bytes)
+        .and_then(|_| output.write_all(b"\n"))
+        .context("write unqualified QTEA observations")
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn json_and_newline_failures_are_returned_without_panicking() {
+        struct FailAfter(usize);
+        impl Write for FailAfter {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                let n = b.len().min(self.0);
+                self.0 -= n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for bytes_before_failure in [0, 2] {
+            let e = write_observations(&mut FailAfter(bytes_before_failure), b"{}").unwrap_err();
+            assert_eq!(
+                e.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
+        }
+        let mut out = Vec::new();
+        write_observations(&mut out, b"{}").unwrap();
+        assert_eq!(out, b"{}\n");
+    }
 }

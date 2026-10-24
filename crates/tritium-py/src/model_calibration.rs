@@ -28,7 +28,7 @@ use tritium_schema::{
     DirectFitMetric, ModelQuantPlan, NamedAssetDigest, OriginalSourceId, OwnerQuantAction,
     OwnerQuantPlan, OwnerQuantTensorPlan, OwnerScoreCacheBinding, OwnerScoreCacheLimits,
     OwnerScoreFitPlan, OwnerScoreWindowMeta, QuantAction, QuantPlan, QuantSourceBinding,
-    WeightedOwnerCache,
+    ScalePrecision, WeightedOwnerCache,
 };
 
 fn error(value: impl std::fmt::Display) -> PyErr {
@@ -308,6 +308,17 @@ pub(crate) struct NativeSourceObservation {
     #[pyo3(get)]
     publication_warnings: Vec<String>,
 }
+impl NativeSourceObservation {
+    pub(crate) fn from_qtea(value: tritium_salt::QteaOriginalSourceObservation) -> Self {
+        Self {
+            architecture: value.architecture,
+            source: value.source_model,
+            tensors: value.tensors,
+            assets: value.assets,
+            publication_warnings: Vec::new(),
+        }
+    }
+}
 
 #[pyfunction]
 pub(crate) fn _observe_model_plan_source(
@@ -346,6 +357,77 @@ pub(crate) fn _observe_model_plan_source(
 
 #[pymethods]
 impl NativeSourceObservation {
+    /// Compare actual live CPU bytes against the existing original binding.
+    /// Geometry labels are checked too; this is content equality, not writer custody.
+    fn validate_tensor_bytes(
+        &self,
+        name: &str,
+        precision_json: &str,
+        shape: Vec<u64>,
+        bytes: Dlpack,
+        max_bytes: usize,
+    ) -> PyResult<()> {
+        let binding = self
+            .tensors
+            .iter()
+            .find(|b| b.source.name == name)
+            .ok_or_else(|| error("tensor absent from observed source"))?;
+        let precision: ScalePrecision = json(precision_json)?;
+        let count = usize::try_from(binding.source.byte_len().map_err(error)?).map_err(error)?;
+        if max_bytes == 0
+            || count > max_bytes
+            || shape != binding.source.shape
+            || precision != binding.source.precision
+            || tensor_shape(&bytes, "live source bytes")?.as_slice() != [count]
+        {
+            return Err(error("live source tensor interpretation/cap differs"));
+        }
+        let raw = bytes.cpu_data_slice::<u8>().map_err(error)?;
+        if blake3::hash(raw).as_bytes() != binding.content.as_bytes() {
+            return Err(error("live source tensor content differs"));
+        }
+        Ok(())
+    }
+    /// Preflight an explicitly imported native metric, without fitting/rebinding it.
+    fn validate_native_curvature(
+        &self,
+        name: &str,
+        spec_json: &str,
+        path: &str,
+        max_file_bytes: u64,
+    ) -> PyResult<()> {
+        let tensor = &self
+            .tensors
+            .iter()
+            .find(|b| b.source.name == name)
+            .ok_or_else(|| error("native metric owner absent from source"))?
+            .source;
+        let [_, columns] = tensor.shape.as_slice() else {
+            return Err(error("native metric owner must be a matrix"));
+        };
+        let spec: tritium_salt::QteaCampaignCurvature = json(spec_json)?;
+        let tritium_salt::QteaCampaignCurvature::Native {
+            digest,
+            max_value_bytes,
+        } = spec
+        else {
+            return Err(error("explicit native curvature required"));
+        };
+        if max_file_bytes == 0 {
+            return Err(error("native metric file cap must be positive"));
+        }
+        let bytes = read_original_file_bounded(Path::new(path), max_file_bytes).map_err(error)?;
+        let gram = tritium_quantize::InputGram::decode_canonical(&bytes, digest, max_value_bytes)
+            .map_err(error)?;
+        if gram.dimension() as u64 != *columns
+            || gram
+                .source_id()
+                .is_none_or(|s| s.source_model_digest() != *self.source.as_bytes())
+        {
+            return Err(error("native metric shape/source differs"));
+        }
+        Ok(())
+    }
     /// Geometry/source come from actual original inventory, never caller hashes.
     fn _owner_window(
         &self,

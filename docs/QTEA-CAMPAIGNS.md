@@ -72,6 +72,57 @@ Python accepts request/selection dictionaries and path-like inputs. Native work
 releases the GIL. Paths are made absolute before that release; there is no Python
 numerical planner or copy of the fitting/publication policy.
 
+## Live Torch/Hugging Face capture (opt-in CPU profile)
+
+`tritium.torch.prepare_qtea_source` binds a caller's live CPU model to the exact
+existing source files before calibration. It accepts a separate
+`tritium.qtea.source-preparation.v1` request with `campaign`, `source`,
+`model_profile` and `limits`; no placeholder run/cache identities are required.
+Supply `source_shards`, `asset_paths` and a positive `max_live_tensor_bytes`.
+The adapter does not load/download a model, save another full checkpoint, invent
+SALT fitting actions or mutate parameters. It compares complete persistent state,
+canonical aliases, shapes/dtypes and actual bytes through the shared Rust observer.
+Unsupported devices/state/views/configurations refuse. Preparation and verification
+read whole-source content; this is bounded state comparison, not cheap metadata
+inspection or a lock against concurrent writers.
+
+```python
+from tritium.torch import prepare_qtea_source
+
+source = prepare_qtea_source(model, source_request,
+    source_shards=shards, asset_paths=assets, max_live_tensor_bytes=tensor_cap)
+calibration = source.calibrate(windows, objective,
+    native_curvature=explicit_native_metrics, objective_bytes=objective_recipe,
+    cache_limits=cache_limits, max_total_payload_bytes=total_cache_cap)
+selected = calibration.inspect(run_id, owner_options, work_dir=work,
+    max_numeric_bytes=numeric_cap, max_batch_samples=chunk)
+result = calibration.run(run_id, owner_options, selected,
+    output_dir=new_candidate, work_dir=work,
+    max_numeric_bytes=numeric_cap, max_batch_samples=chunk)
+```
+
+Every matrix must be covered either by exact, unmodified `nn.Linear` consumers or
+`native_curvature[owner] = {"spec": native_spec, "path": canonical_gram_file}`.
+Embedding/shared gather-Matmul owners require the latter explicitly. Native file
+digest/shape/source are checked **before objective execution**. There is no default
+embedding identity or scientifically qualified metric choice supplied here.
+
+The existing cache producer records actual Linear inputs/token selection, guarded
+by the existing owner-dispatch checks against functional/view/regularizer reads.
+Actual finished cache IDs fill the subsequent file request. `owner_options` must
+provide every matrix's explicit `recipe`, `profile` and caller `estimate`. The run
+ID is supplied by the caller. The complete content request is selected, so changes
+to operational request fields (including replay chunk caps) require reinspection,
+even where the numerical work/encoded candidate remains identical.
+
+Private cache packages/spools live only under the supplied existing work directory
+and are removed after each inspection/run. Source files/live ownership and graph
+options are revalidated; source/cleanup errors after commit are not rollback.
+This is not GPU/out-of-core capture, arbitrary custom-module graph proof, source/
+objective/data/teacher attestation, MTP coverage qualification, physical admission
+or a large-model quality/performance result (proposed ADR0171). The existing generic
+native calibration API continues to use the same capture loop and keeps its profile.
+
 ## Execution and publication
 
 Execution reobserves source bytes, reloads curvature and reconstructs opaque

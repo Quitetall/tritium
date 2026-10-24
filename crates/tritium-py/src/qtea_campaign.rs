@@ -2,11 +2,28 @@
 use pyo3::{exceptions::PyValueError, prelude::*};
 use std::path::PathBuf;
 use tritium_salt::{
-    QteaCampaignFiles, QteaCampaignInspection, QteaFileCampaignRequest, inspect_qtea_file_campaign,
-    run_qtea_file_campaign_to_directory,
+    QteaCampaignFiles, QteaCampaignInspection, QteaFileCampaignRequest, QteaFileSourceRequest,
+    inspect_qtea_file_campaign, prepare_qtea_file_source, run_qtea_file_campaign_to_directory,
 };
 fn error(e: impl std::fmt::Display) -> PyErr {
     PyValueError::new_err(e.to_string())
+}
+#[pyfunction]
+#[pyo3(signature=(request_json,files_json,*,max_json_bytes=16_777_216))]
+pub(crate) fn _prepare_qtea_file_source(
+    py: Python<'_>,
+    request_json: &str,
+    files_json: &str,
+    max_json_bytes: usize,
+) -> PyResult<crate::model_calibration::NativeSourceObservation> {
+    let request = QteaFileSourceRequest::from_slice(request_json.as_bytes(), max_json_bytes)
+        .map_err(error)?;
+    let (files, _) = file_inputs(files_json, max_json_bytes)?;
+    py.detach(move || {
+        prepare_qtea_file_source(&request, &files)
+            .map(crate::model_calibration::NativeSourceObservation::from_qtea)
+            .map_err(error)
+    })
 }
 fn inputs(
     request: &str,
@@ -14,7 +31,11 @@ fn inputs(
     max: usize,
 ) -> PyResult<(QteaFileCampaignRequest, QteaCampaignFiles, PathBuf)> {
     let request = QteaFileCampaignRequest::from_slice(request.as_bytes(), max).map_err(error)?;
-    if files.len() > max {
+    let (files, cwd) = file_inputs(files, max)?;
+    Ok((request, files, cwd))
+}
+fn file_inputs(files: &str, max: usize) -> PyResult<(QteaCampaignFiles, PathBuf)> {
+    if max == 0 || files.len() > max {
         return Err(error("file inventory JSON exceeds cap"));
     }
     let files: QteaCampaignFiles = serde_json::from_str(files).map_err(error)?;
@@ -36,7 +57,7 @@ fn inputs(
             .map(|(n, p)| (n, cwd.join(p)))
             .collect(),
     };
-    Ok((request, files, cwd))
+    Ok((files, cwd))
 }
 #[pyfunction]
 #[pyo3(signature=(request_json,files_json,*,max_json_bytes=16_777_216,max_report_bytes=16_777_216))]

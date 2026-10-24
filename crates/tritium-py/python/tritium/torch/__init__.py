@@ -91,6 +91,7 @@ from .ptq import (
     quantize,
 )
 from .native_source import convert_native_module
+from .qtea import QteaPreparedSource, QteaModelCalibration, prepare_qtea_source
 from .native_load import load_native_module
 from .native_training import NativeScaleTrainer, native_scale_training, NativePvTrainer, native_pv_training
 from .native_training import NativePvPagedTrainer, native_pv_paged_training
@@ -175,6 +176,9 @@ __all__ = [
     "convert_native_module",
     "load_native_module",
     "NativeModulePreparation",
+    "QteaPreparedSource",
+    "QteaModelCalibration",
+    "prepare_qtea_source",
     "OwnerCalibrationRecipe",
     "NativeOwnerCalibration",
     "NativeModuleCalibration",

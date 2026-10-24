@@ -491,3 +491,39 @@ fn ambiguous_path_maps_and_nested_recipe_fields_are_not_silently_accepted() {
         QteaFileCampaignRequest::from_slice(&serde_json::to_vec(&v).unwrap(), 1 << 20).is_err()
     );
 }
+
+#[test]
+fn source_preparation_needs_no_placeholder_curvature_or_run_and_checks_complete_graph() {
+    for hybrid in [false, true] {
+        let f = fixture(hybrid, false, ScalePrecision::F32);
+        let request = QteaFileSourceRequest {
+            schema: "tritium.qtea.source-preparation.v1".into(),
+            campaign: f.request.campaign,
+            source: f.request.source.clone(),
+            model_profile: f.request.model_profile,
+            limits: f.request.limits,
+        };
+        assert!(prepare_qtea_file_source(&request, &f.files).is_err());
+        let mut files = f.files.clone();
+        files.curvature.clear();
+        let bytes = serde_json::to_vec(&request).unwrap();
+        assert!(QteaFileSourceRequest::from_slice(&bytes, 1).is_err());
+        let parsed = QteaFileSourceRequest::from_slice(&bytes, bytes.len()).unwrap();
+        let observed = prepare_qtea_file_source(&parsed, &files).unwrap();
+        assert_eq!(
+            observed.source_model,
+            inspect_qtea_file_campaign(&f.request, &f.files)
+                .unwrap()
+                .source_model()
+        );
+        assert_eq!(observed.tensors.len(), parsed.source.tensors.len());
+        assert_eq!(observed.assets.len(), parsed.source.assets.len());
+        let mut wrong = parsed.clone();
+        wrong.model_profile = if hybrid {
+            QteaCampaignModelProfile::Standard
+        } else {
+            QteaCampaignModelProfile::Qwen35Hybrid
+        };
+        assert!(prepare_qtea_file_source(&wrong, &files).is_err());
+    }
+}

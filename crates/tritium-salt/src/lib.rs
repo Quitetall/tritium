@@ -24,7 +24,8 @@ mod qtea_file_campaign;
 pub use qtea_file_campaign::{
     QteaCallerEstimate, QteaCampaignCurvature, QteaCampaignFiles, QteaCampaignInspection,
     QteaCampaignLimits, QteaCampaignModelProfile, QteaCampaignOwner, QteaCampaignOwnerInspection,
-    QteaFileCampaignRequest, QteaFileCampaignResult, inspect_qtea_file_campaign,
+    QteaFileCampaignRequest, QteaFileCampaignResult, QteaFileSourceRequest,
+    QteaOriginalSourceObservation, inspect_qtea_file_campaign, prepare_qtea_file_source,
     run_qtea_file_campaign, run_qtea_file_campaign_to_directory,
 };
 mod qtea_model_build;
