@@ -314,11 +314,10 @@ fn select(work: &QteaTensorWorkPlan<'_>) -> QteaSelectedAdmission {
         request,
     }
 }
-fn build(
-    source: &mut dyn WeightSource,
+fn fitted_builder<'a>(
+    source: &'a mut dyn WeightSource,
     hybrid: bool,
-    tied: bool,
-) -> (Vec<u8>, QteaModelBuildResult) {
+) -> (QteaModelBuilder<'a, Cursor<Vec<u8>>>, OriginalSourceId) {
     let request = observation_plan(source, hybrid);
     let observed = ObservedWeightSource::new(&request, source).unwrap();
     let model = observed.source_id();
@@ -361,6 +360,24 @@ fn build(
                 .unwrap();
         }
     }
+
+    (builder, model)
+}
+fn build(
+    source: &mut dyn WeightSource,
+    hybrid: bool,
+    tied: bool,
+) -> (Vec<u8>, QteaModelBuildResult) {
+    if !hybrid && tied {
+        assert!(
+            !source
+                .inventory()
+                .unwrap()
+                .iter()
+                .any(|t| t.name == "lm_head.weight")
+        );
+    }
+    let (builder, model) = fitted_builder(source, hybrid);
     let mut output = Cursor::new(vec![]);
     let result = builder.finish(&mut output).unwrap();
     let bytes = output.into_inner();
@@ -369,14 +386,6 @@ fn build(
         tritium_format::PackageId::from_package_bytes(&bytes)
     );
     assert_eq!(result.record().source_model(), model);
-    if !hybrid && tied {
-        assert!(
-            !request
-                .tensors
-                .iter()
-                .any(|t| t.source.name == "lm_head.weight")
-        );
-    }
     (bytes, result)
 }
 fn reader(bytes: &[u8], hybrid: bool, model: OriginalSourceId) -> QteaModelReader<Cursor<&[u8]>> {
@@ -441,6 +450,7 @@ fn observed_collector_admitted_fits_build_complete_standard_and_hybrid_models() 
             tied,
             result.record().source_model(),
             &expected,
+            None,
         );
     }
 }
@@ -451,6 +461,7 @@ fn cold_and_export(
     tied: bool,
     source: OriginalSourceId,
     original: &InMemoryWeightSource,
+    published: Option<&std::path::Path>,
 ) {
     use tritium_nn::{
         ChatRenderOptions, HostQteaHybridModelLimits, HostQteaModelLimits, LoadedModel,
@@ -542,7 +553,15 @@ fn cold_and_export(
                 .unwrap()
         };
         let mut model = reader(bytes, hybrid, source);
-        write("model.trit", bytes);
+        if let Some(path) = published {
+            std::fs::hard_link(path, dir.join("model.trit")).unwrap();
+            write(
+                "candidate.json",
+                &std::fs::read(path.parent().unwrap().join("candidate.json")).unwrap(),
+            );
+        } else {
+            write("model.trit", bytes);
+        }
         let mut without = original.clone();
         let mut tokenizer_config: serde_json::Value =
             serde_json::from_slice(&without.assets["tokenizer_config.json"]).unwrap();
@@ -1039,4 +1058,137 @@ fn grouped_and_gather_statistics_are_not_relabelled_or_retried_as_native() {
         assert!(builder.finish(&mut output).is_err());
         assert!(output.into_inner().is_empty());
     }
+}
+
+#[test]
+fn complete_builders_publish_unqualified_standard_and_hybrid_candidates_without_overwrite() {
+    use tritium_quantize::engine::{DirectoryTensorSink, UnqualifiedCandidateRecord};
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "qtea-candidate-builder-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    std::fs::create_dir(&root).unwrap();
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+    let _cleanup = Cleanup(root.clone());
+    for (hybrid, tied, precision) in [
+        (false, true, ScalePrecision::F32),
+        (false, false, ScalePrecision::F16),
+        (true, false, ScalePrecision::Bf16),
+    ] {
+        let mut original = source(hybrid, tied, precision);
+        let mut private_source = original.clone();
+        let expected_source = original.clone();
+        let (private_bytes, private_result) = build(&mut private_source, hybrid, tied);
+        let (builder, model) = fitted_builder(&mut original, hybrid);
+        let dir = root.join(if hybrid {
+            "hybrid"
+        } else if tied {
+            "tied"
+        } else {
+            "untied"
+        });
+        let mut sink = DirectoryTensorSink::new(&dir);
+        let (published, warnings) = builder.publish_candidate(&mut sink).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(published.package_id(), private_result.package_id());
+        let bytes = std::fs::read(dir.join("model.trit")).unwrap();
+        assert_eq!(bytes, private_bytes);
+        let record = UnqualifiedCandidateRecord::from_slice(
+            &std::fs::read(dir.join("candidate.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            record.package_id().as_bytes(),
+            published.package_id().as_bytes()
+        );
+        assert!(!dir.join("evidence.jsonl").exists());
+        assert!(!dir.join(".pending.trit").exists());
+        let mut read = reader(&bytes, hybrid, model);
+        verify_qtea_model_build_record(&mut read, 1 << 20).unwrap();
+        let (retry, _) = fitted_builder(&mut private_source, hybrid);
+        assert!(retry.publish_candidate(&mut sink).is_err());
+        assert_eq!(std::fs::read(dir.join("model.trit")).unwrap(), bytes);
+        #[cfg(feature = "host-qtea")]
+        {
+            use tritium_nn::{
+                HostQteaHybridModelLimits, HostQteaModelLimits, LoadedModel, StreamLimits,
+            };
+            let mut evidence = tritium_evidence::EvidenceRecorder::new(
+                "published-cold",
+                [tritium_evidence::MODEL_LOADED_REGISTRATION],
+            )
+            .unwrap();
+            let context = tritium_runtime::TensorUploadContext {
+                recorder: &mut evidence,
+                span: "load",
+                parent: None,
+                logical_time: 0,
+            };
+            let base = HostQteaModelLimits {
+                receiving: limits().receiving,
+                model: limits().model,
+                max_weight_bytes: 1 << 22,
+                max_staging_bytes: 1 << 16,
+            };
+            let stream = StreamLimits {
+                max_context: 8,
+                max_segment_tokens: 3,
+                max_host_cache_payload_bytes: 4096,
+            };
+            let file = std::fs::File::open(dir.join("model.trit")).unwrap();
+            let mut loaded = if hybrid {
+                LoadedModel::load_qtea_hybrid(
+                    file,
+                    *model.as_bytes(),
+                    HostQteaHybridModelLimits {
+                        base,
+                        max_preserved_tensor_elements: 64,
+                    },
+                    stream,
+                    context,
+                )
+                .unwrap()
+            } else {
+                LoadedModel::load_qtea(file, *model.as_bytes(), base, stream, context).unwrap()
+            };
+            loaded.runner.generate_bounded(&[1, 2], 3, 3).unwrap();
+            assert_eq!(
+                loaded.runner.mtp_status(),
+                hybrid.then_some(tritium_nn::Qwen35MtpStatus::Unverified)
+            );
+            cold_and_export(
+                &bytes,
+                hybrid,
+                tied,
+                model,
+                &expected_source,
+                Some(&dir.join("model.trit")),
+            );
+        }
+    }
+    let mut source = source(false, true, ScalePrecision::F32);
+    let plan = observation_plan(&source, false);
+    let observed = ObservedWeightSource::new(&plan, &mut source).unwrap();
+    let builder = QteaModelBuilder::new(
+        observed,
+        QteaModelProfile::Standard,
+        campaign(),
+        Cursor::new(vec![]),
+        limits(),
+    )
+    .unwrap();
+    let failed = root.join("incomplete");
+    assert!(
+        builder
+            .publish_candidate(&mut DirectoryTensorSink::new(&failed))
+            .is_err()
+    );
+    assert!(!failed.exists());
 }

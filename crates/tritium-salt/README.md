@@ -64,7 +64,7 @@ resource estimate or rerun the fitting algorithm. Record identities and estimate
 are not measured resource vectors or source/quality signatures. The asset is not
 a sealed production model-fit log and cannot satisfy Stage7 by itself.
 
-The returned `QteaModelBuildResult` is a private candidate stream, NOT fsync,
+The `finish` result is a private candidate stream, NOT fsync,
 no-clobber directory publication or distribution permission. Late errors may
 leave private spool/output bytes; the caller must discard them. Logical source,
 widened/native/export, spool and observation caps exclude caller-retained
@@ -76,7 +76,17 @@ standard tied/untied and hybrid language/retained-MTP builds from F32/F16/BF16
 originals, actual collector/native admitted work, exact asset/state preservation,
 partial writers, source mutation and tampered records. MTP remains Unverified;
 real-model capture/metric choice, CLI/Python campaign orchestration, durable
-publication and independent release qualification remain required.
+qualified release publication and independent qualification remain required.
+
+For explicit local candidate storage, `builder.publish_candidate(&mut sink)`
+uses `DirectoryTensorSink`'s shared unqualified transaction (proposed ADR0168).
+Complete `finish` source/numeric/observation checks run in the private pending
+file; the sink then independently checks actual framing/blob/package identity,
+syncs the files and commits without overwrite. Output has `candidate.json` with
+`qualification=false`, not a counterfeit sealed `evidence.jsonl`. Returned
+post-commit warnings must be reported; they are not permission to roll back.
+No published candidate becomes Registered/Certified, verified MTP, authenticated
+source, qualified runtime or an approved public release merely by being stored.
 
 The bounded synthetic `qtea_conformance` example exercises the same public
 adapter/registry/admitted writer, actual cold reader and packed CPU forward. Only

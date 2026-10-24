@@ -20,6 +20,30 @@ files; unexpected files are preserved. Generic companion bytes are not interpret
 as training checkpoints by this module. Source/directory custody, power-loss,
 security, physical memory, model lineage and distribution approval remain external.
 
+## Explicit unqualified candidates
+
+`DirectoryTensorSink::publish_unqualified_candidate(limits, emit)` reuses that
+same owned-file/sync/no-clobber transaction without fabricating a sealed log.
+The emitter receives an empty readable pending file and returns its value plus
+expected exact PackageId. Actual framing, every blob digest and terminal identity
+must pass under positive receiving limits before commit. Metadata is generated
+from those admitted bytes, not from a filename or caller status assertion.
+
+Candidate output has `model.trit` and `candidate.json`, never an invented
+`evidence.jsonl`. The fixed `tritium.unqualified-candidate.v1` record has
+`qualification=false` and the actual package identity. Its at-most4KiB strict
+`UnqualifiedCandidateRecord::from_slice` parser cannot accept qualification=true,
+unknown/duplicate fields, unsupported schema or a zero ID. Parsing alone does not
+verify model bytes or approve source/runtime/quality.
+
+The `model.trit` no-clobber hard link is the commit marker. Existing destinations
+refuse before emission; pre-commit errors clean only owned paths, preserving
+unexpected foreign files. Post-commit cleanup/directory-sync caveats remain
+explicit `PublicationWarning`s, not rollback. Existing sealed metadata is still
+written/synced before its emitter; its names and admission are unchanged.
+Parent-directory/pending-file custody, adversarial writers, power-loss, security,
+distribution and independent release qualification remain outside this module.
+
 See the [repository README](https://github.com/Quitetall/tritium#readme) and the
 [book](https://github.com/Quitetall/tritium/tree/main/docs/book) for usage.
 

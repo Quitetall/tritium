@@ -21,12 +21,12 @@ tritium-evidence = { workspace = true }
 half = { workspace = true }
 blake3 = { workspace = true }
 rayon = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 tritium-testkit = { workspace = true }
 proptest = { workspace = true }
-serde_json = { workspace = true }
-serde = { workspace = true }
 ciborium = { workspace = true }
 
 [lints]

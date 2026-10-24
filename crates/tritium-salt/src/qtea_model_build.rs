@@ -199,6 +199,31 @@ impl<S> std::fmt::Debug for QteaModelBuilder<'_, S> {
     }
 }
 impl<'a, S: Read + Write + Seek> QteaModelBuilder<'a, S> {
+    /// Build and commit an explicitly unqualified candidate through the shared
+    /// no-clobber directory transaction. Source/numeric/record checks in finish
+    /// precede the sink's independent actual-byte admission and commit marker.
+    /// Does not create evidence.jsonl, qualify MTP/model/resources/security or
+    /// authorize distribution. Post-commit warnings are returned, not rollback.
+    /// # Errors
+    /// Original build/validation/no-clobber/pre-commit I/O refusal; owned pending
+    /// paths are cleaned without recursively deleting unexpected foreign files.
+    pub fn publish_candidate(
+        self,
+        sink: &mut tritium_quantize::engine::DirectoryTensorSink,
+    ) -> Result<
+        (
+            QteaModelBuildResult,
+            Vec<tritium_quantize::engine::PublicationWarning>,
+        ),
+        tritium_quantize::engine::CandidatePublicationError<QteaModelBuildError>,
+    > {
+        let limits = self.limits.receiving;
+        sink.publish_unqualified_candidate(limits, |file| {
+            let built = self.finish(file)?;
+            let id = built.package_id();
+            Ok((built, id))
+        })
+    }
     /// Prepare complete actual observed source metadata before fitting/spool writes.
     /// No source lock, machine estimate, dense model or publication is created.
     /// # Errors

@@ -1,6 +1,8 @@
 //! No-overwrite destinations for a checked package and actual sealed fit log.
+mod candidate;
 use super::companions::{TritModelCompanions, TritModelSpool, copy_companion, verify_companion};
 use super::{PublicationWarning, QuantEngineError, TensorSink};
+pub use candidate::{CandidatePublicationError, UnqualifiedCandidateRecord};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, Write},
@@ -42,6 +44,20 @@ impl<E: std::error::Error + 'static> std::error::Error for TritModelPublicationE
 enum WriteFailure<E> {
     Emitter(E),
     Publication(QuantEngineError),
+}
+
+#[derive(Clone, Copy)]
+enum PublicationRecord<'a> {
+    Sealed(&'a str),
+    Candidate,
+}
+impl PublicationRecord<'_> {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Sealed(_) => "evidence.jsonl",
+            Self::Candidate => "candidate.json",
+        }
+    }
 }
 impl<E> From<std::io::Error> for WriteFailure<E> {
     fn from(error: std::io::Error) -> Self {
@@ -324,8 +340,23 @@ impl DirectoryTensorSink {
         &mut self,
         original_jsonl: &str,
         readable: bool,
-        mut companions: TritModelCompanions<'_>,
+        companions: TritModelCompanions<'_>,
         emit: impl FnOnce(&mut File) -> Result<R, E>,
+    ) -> Result<(R, Vec<PublicationWarning>), WriteFailure<E>> {
+        self.publish_transaction(
+            PublicationRecord::Sealed(original_jsonl),
+            readable,
+            companions,
+            |file| emit(file).map(|value| (value, None)),
+        )
+    }
+
+    fn publish_transaction<R, E>(
+        &mut self,
+        record: PublicationRecord<'_>,
+        readable: bool,
+        mut companions: TritModelCompanions<'_>,
+        emit: impl FnOnce(&mut File) -> Result<(R, Option<Vec<u8>>), E>,
     ) -> Result<(R, Vec<PublicationWarning>), WriteFailure<E>> {
         companions.validate().map_err(WriteFailure::Publication)?;
         let mut owned_companions = Vec::new();
@@ -339,16 +370,18 @@ impl DirectoryTensorSink {
                 QuantEngineError::Io(e)
             })
         })?;
-        let log = self.directory.join("evidence.jsonl");
+        let log = self.directory.join(record.name());
         let pending = self.directory.join(".pending.trit");
         let model = self.directory.join("model.trit");
         let mut owned_log = false;
         let mut owned_pending = false;
         let result = (|| {
-            let mut file = OpenOptions::new().write(true).create_new(true).open(&log)?;
+            let mut log_file = OpenOptions::new().write(true).create_new(true).open(&log)?;
             owned_log = true;
-            file.write_all(original_jsonl.as_bytes())?;
-            file.sync_all()?;
+            if let PublicationRecord::Sealed(original_jsonl) = record {
+                log_file.write_all(original_jsonl.as_bytes())?;
+                log_file.sync_all()?;
+            }
             for companion in &mut companions.files {
                 let path = self.directory.join(companion.name);
                 let file = OpenOptions::new()
@@ -367,11 +400,24 @@ impl DirectoryTensorSink {
                 .create_new(true)
                 .open(&pending)?;
             owned_pending = true;
-            let value = emit(&mut file).map_err(WriteFailure::Emitter)?;
+            let (value, deferred) = emit(&mut file).map_err(WriteFailure::Emitter)?;
+            match (record, deferred) {
+                (PublicationRecord::Sealed(_), None) => {}
+                (PublicationRecord::Candidate, Some(bytes)) => {
+                    log_file.write_all(&bytes)?;
+                    log_file.sync_all()?;
+                }
+                _ => {
+                    return Err(WriteFailure::Publication(QuantEngineError::Binding(
+                        "publication metadata mode mismatch",
+                    )));
+                }
+            }
             file.sync_all()?;
             for (_, companion, bytes, content) in &mut owned_companions {
                 verify_companion(companion, *bytes, *content).map_err(WriteFailure::Publication)?;
             }
+            drop(log_file);
             fs::hard_link(&pending, &model)?;
             Ok::<R, WriteFailure<E>>(value)
         })();

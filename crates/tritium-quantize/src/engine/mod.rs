@@ -58,7 +58,10 @@ pub use model_import::{
     import_salt_v2_model_bound, inspect_salt_v2_model_import, verify_imported_model_evidence,
     verify_imported_model_with_log,
 };
-pub use sinks::{DirectoryTensorSink, MemoryTensorSink, TritModelPublicationError};
+pub use sinks::{
+    CandidatePublicationError, DirectoryTensorSink, MemoryTensorSink, TritModelPublicationError,
+    UnqualifiedCandidateRecord,
+};
 pub use source_stage::{PublishedSalienceStage, StagedSalienceSource};
 pub use source_transform::{
     DeclaredSalienceStatistics, DerivedSalienceSource, RecordedSalienceSource, SalienceSourceError,

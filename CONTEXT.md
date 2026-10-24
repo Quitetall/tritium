@@ -124,6 +124,11 @@ A complete named set of fitted matrix outputs belonging to one observed original
 model. It is distinct from durable publication, authenticated source or qualification.
 _Avoid_: released model, qualified checkpoint, partial success
 
+**Published candidate**:
+An artifact whose exact bytes and scoped identity have been committed to storage.
+It is distinct from qualification, distribution permission or public activation.
+_Avoid_: approved release, qualified model, public acceptance
+
 **Recovery replay**:
 Re-execution of a ternary training recipe from its original training payload,
 reproducing the same training snapshot. It is distinct from authenticating the
