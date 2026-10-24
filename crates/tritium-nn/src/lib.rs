@@ -55,6 +55,8 @@ pub use layers::{
 };
 #[cfg(feature = "host-qtea")]
 pub use model::HostQteaModelLimits;
+#[cfg(all(feature = "host-qtea", feature = "tokenizer"))]
+pub use model::QteaLoadConfig;
 pub use model::{ArchitectureSpec, CacheAdmission, LayerKind, Runner, StreamLimits};
 pub use model::{
     ChatRenderOptions, ForwardDump, LayerWeights, ModelRunner, ModelSource, ModelWeights,

@@ -110,6 +110,13 @@ fn token(value: Option<&Value>, label: &str) -> Result<Option<String>, NnError> 
 }
 
 impl HfJsonTokenizer {
+    /// Whether an actual source template was parsed; not proof every request renders.
+    /// Explicit candidate chat serving can require this instead of a legacy formatter.
+    #[must_use]
+    pub fn has_source_chat_template(&self) -> bool {
+        self.chat_template.is_some()
+    }
+
     /// Load tokenizer graph and special-token contract from bundle assets.
     ///
     /// Qwen does not add BOS during chat encoding. When `bos_token` is absent,

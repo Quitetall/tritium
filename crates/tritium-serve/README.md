@@ -35,6 +35,31 @@ Omitting controls preserves the existing fallback only when no source template
 exists; declared template errors never fall back. Clients that support extension
 request bodies can send the object there. No serving default is changed.
 
+## Explicit host QTEA candidates (experimental)
+
+Build `tritium-serve` with `--features host-qtea` and run:
+
+```text
+tritium-serve --qtea /absolute/load.json --host 127.0.0.1 --port 8080
+```
+
+`TRITIUM_QTEA` and the launch config's `qtea` key select the same source, with
+the existing file/environment/CLI precedence. It is exclusive with every other
+model source. The strict load JSON is shared with CLI generation through
+[`QteaLoadConfig`](../tritium-nn/README.md#explicit-qtea-command-request-experimental).
+It loads the actual packed model, tokenizer and template into the existing
+common runner and OpenAI HTTP/SSE paths. The tokenizer's EOS is used. Missing
+source template refuses startup, rather than inventing a family formatter.
+
+This path requires CPU, loopback and one stream. Raw-ID chat, speculative/draft,
+batching and paged-KV selections refuse before model/backend initialization.
+QTEA matrices stay packed, with scalar-host execution and no GPU/dense fallback.
+Readiness reports `production_artifact=false`, no production startup receipt,
+host execution and the actual bounded context/segment. Logical caps do not
+measure RSS; HTTP200 from a synthetic model is not pretrained coherence,
+original-source authentication, security clearance or release qualification.
+Hybrid Qwen/MTP import and physical/runtime/quality release gates remain open.
+
 ## Typed portable candidates
 
 `--typed /absolute/path/load.json` loads a complete selected `.trit` level through

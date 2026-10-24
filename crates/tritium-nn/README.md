@@ -63,9 +63,52 @@ aliases. Config tying requires one embedding/head owner, not a second head tenso
 The payload ceiling excludes metadata, transient decode, allocator/Arc overhead,
 staging, caches and physical RSS. Ordinary typed SALT loading rejects this profile.
 Official Qwen/hybrid/MTP loading, source authentication, pretrained coherence,
-public CLI/serving/UI selection, GPU/browser and performance remain unqualified;
+production/UI integration, GPU/browser and performance remain unqualified;
 toy text-model tests do not pass those gates. Initial load recording/replay is
 not independent source, memory, quality or release qualification.
+
+### Explicit QTEA command request (experimental)
+
+With `host-qtea,tokenizer`, `QteaLoadConfig::read` and `load` share one request
+contract between CLI generation and loopback serving (proposed ADR0165). JSON
+must be a regular file of at most16KiB. Unknown/duplicate fields, invalid profile,
+relative paths, zero digest/caps or invalid stream limits refuse before loading.
+The actual model is opened once as a regular file; no directory discovery,
+SALT level selection, GPU upload or dense fallback is inferred.
+
+Every field is mandatory. This is an illustrative tiny-fixture configuration,
+not capacity guidance or an official-model identity. Replace the absolute path,
+declared source digest and caps for the actual artifact:
+
+```json
+{
+  "profile": "tritium.qtea-host-load.v1",
+  "path": "/absolute/path/to/model.trit",
+  "expected_source_model": [3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3],
+  "max_source_bytes": 1048576,
+  "max_manifest_bytes": 65536,
+  "max_directory_bytes": 65536,
+  "max_tensors": 64,
+  "max_assets": 8,
+  "max_asset_bytes": 65536,
+  "max_config_bytes": 4096,
+  "max_vector_elements": 32,
+  "max_tensor_bytes": 1048576,
+  "max_validation_bytes": 65536,
+  "max_weight_bytes": 1048576,
+  "max_staging_bytes": 65536,
+  "stream_limits": {
+    "max_context": 8,
+    "max_segment_tokens": 3,
+    "max_host_cache_payload_bytes": 4096
+  }
+}
+```
+
+Logical weights, per-call staging, source/metadata and host cache caps are separate
+from tokenizer/allocator overhead and physical RSS. Source agreement is not
+authentication. `HfJsonTokenizer::has_source_chat_template()` reports parsed
+template presence only, not whether every message/control combination renders.
 
 ## Source-bound chat prompts (experimental)
 

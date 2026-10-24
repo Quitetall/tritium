@@ -77,6 +77,7 @@ tokenizers = { workspace = true }
 
 [features]
 default = []
+host-qtea = ["tritium-nn/host-qtea"]
 cuda = [
     "dep:tritium-cuda",
     "dep:tritium-testkit",

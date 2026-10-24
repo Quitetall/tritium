@@ -149,20 +149,24 @@ enum Command {
     #[command(group(clap::ArgGroup::new("joined_generation")
         .args(["original_captured_stage"])
         .requires_all(["model", "conversion_evidence", "level", "max_payload_bytes", "eos"])))]
+    #[command(group(clap::ArgGroup::new("admitted_generation").args(["typed", "qtea"])))]
     Generate {
         /// A `.gguf` file, a legacy converted directory, or explicit joined C `.trit`.
         #[arg(
             long,
             alias = "input",
-            required_unless_present = "typed",
-            conflicts_with = "typed"
+            required_unless_present_any = ["typed", "qtea"],
+            conflicts_with_all = ["typed", "qtea"]
         )]
         model: Option<PathBuf>,
         /// Shared typed load JSON; requires encoded resource admission and explicit EOS.
         #[arg(long, requires = "eos", conflicts_with = "original_captured_stage")]
         typed: Option<PathBuf>,
-        /// Registry backend for typed generation only (defaults to cpu).
-        #[arg(long, requires = "typed")]
+        /// Explicit scalar-host QTEA load JSON (requires host-qtea build feature).
+        #[arg(long, requires = "eos", conflicts_with = "original_captured_stage")]
+        qtea: Option<PathBuf>,
+        /// Backend for explicit generation (QTEA only accepts cpu).
+        #[arg(long, requires = "admitted_generation")]
         backend: Option<String>,
         /// Explicit original-captured joined admission; ordinary readers never unwrap it.
         #[command(flatten)]
@@ -647,6 +651,7 @@ fn main() -> anyhow::Result<()> {
             Command::Generate {
                 model,
                 typed,
+                qtea,
                 backend,
                 joined,
                 tokens,
@@ -655,7 +660,17 @@ fn main() -> anyhow::Result<()> {
                 greedy,
                 eos,
             } => {
-                if let Some(path) = typed {
+                if let Some(path) = qtea {
+                    generate::run_qtea(
+                        &path,
+                        backend.as_deref().unwrap_or("cpu"),
+                        tokens.as_deref(),
+                        prompt.as_deref(),
+                        max_new,
+                        greedy,
+                        eos.context("QTEA generation requires --eos")?,
+                    )?;
+                } else if let Some(path) = typed {
                     generate::run_typed(
                         &path,
                         backend.as_deref().unwrap_or("cpu"),

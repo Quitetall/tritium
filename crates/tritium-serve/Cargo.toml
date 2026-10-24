@@ -46,6 +46,7 @@ tritium-schema = { workspace = true, optional = true }
 
 [features]
 default = []
+host-qtea = ["serve", "tritium-nn/host-qtea"]
 serve = ["dep:tokio", "dep:axum", "dep:tower", "dep:async-stream", "dep:futures-core", "dep:http-body", "dep:blake3", "dep:getrandom", "dep:opentelemetry", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk", "dep:tracing", "dep:tracing-futures", "dep:tracing-opentelemetry", "dep:tracing-subscriber", "dep:tritium-cpu", "dep:tritium-runtime", "dep:tritium-format", "dep:tritium-evidence", "dep:tritium-schema", "tritium-nn/tokenizer"]
 # Link the CUDA backend so `--backend cuda` can resolve (needs nvcc at build time).
 cuda = ["serve", "dep:tritium-cuda", "tritium-nn/cuda"]

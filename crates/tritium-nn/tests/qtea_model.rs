@@ -314,6 +314,223 @@ fn bits(v: &[f32]) -> Vec<u32> {
     v.iter().map(|x| x.to_bits()).collect()
 }
 
+#[cfg(feature = "tokenizer")]
+fn command_config(path: &std::path::Path) -> serde_json::Value {
+    serde_json::json!({
+        "profile":"tritium.qtea-host-load.v1", "path":path,"expected_source_model":vec![3;32],
+        "max_source_bytes":1<<20,"max_manifest_bytes":1<<16,"max_directory_bytes":1<<16,
+        "max_tensors":64,"max_assets":8,"max_asset_bytes":1<<16,"max_config_bytes":4096,
+        "max_vector_elements":32,"max_tensor_bytes":1<<20,"max_validation_bytes":1<<16,
+        "max_weight_bytes":1<<20,"max_staging_bytes":1<<16,
+        "stream_limits":{"max_context":8,"max_segment_tokens":3,"max_host_cache_payload_bytes":4096}
+    })
+}
+
+#[cfg(feature = "tokenizer")]
+struct CommandScratch(std::path::PathBuf);
+#[cfg(feature = "tokenizer")]
+impl CommandScratch {
+    fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "qtea-command-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+}
+#[cfg(feature = "tokenizer")]
+impl Drop for CommandScratch {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).unwrap();
+    }
+}
+
+#[cfg(feature = "tokenizer")]
+#[test]
+fn shared_command_config_is_strict_capped_and_revalidated_before_model_io() {
+    use tritium_nn::QteaLoadConfig;
+    let root = CommandScratch::new();
+    let path = root.0.join("load.json");
+    let valid = command_config(&root.0.join("absent.trit"));
+    let mut invalid = Vec::new();
+    for field in [
+        "max_source_bytes",
+        "max_manifest_bytes",
+        "max_directory_bytes",
+        "max_tensors",
+        "max_assets",
+        "max_asset_bytes",
+        "max_config_bytes",
+        "max_vector_elements",
+        "max_tensor_bytes",
+        "max_validation_bytes",
+        "max_weight_bytes",
+        "max_staging_bytes",
+    ] {
+        let mut request = valid.clone();
+        request[field] = 0.into();
+        invalid.push(request);
+    }
+    for field in [
+        "max_context",
+        "max_segment_tokens",
+        "max_host_cache_payload_bytes",
+    ] {
+        let mut request = valid.clone();
+        request["stream_limits"][field] = 0.into();
+        invalid.push(request);
+    }
+    for (field, value) in [
+        ("profile", serde_json::json!("tritium.qtea-host-load.v2")),
+        ("path", serde_json::json!("relative.trit")),
+        ("expected_source_model", serde_json::json!(vec![0; 32])),
+    ] {
+        let mut request = valid.clone();
+        request[field] = value;
+        invalid.push(request);
+    }
+    let mut overflow = valid.clone();
+    overflow["stream_limits"]["max_segment_tokens"] = 9.into();
+    invalid.push(overflow);
+    for request in invalid {
+        std::fs::write(&path, request.to_string()).unwrap();
+        assert!(QteaLoadConfig::read(&path).is_err(), "{request}");
+        // Even a caller deserializing directly cannot bypass validation at load.
+        let config: QteaLoadConfig = serde_json::from_value(request).unwrap();
+        let mut recorder = tritium_evidence::EvidenceRecorder::new(
+            "revalidate",
+            [tritium_evidence::MODEL_LOADED_REGISTRATION],
+        )
+        .unwrap();
+        let error = config
+            .load(tritium_runtime::TensorUploadContext {
+                recorder: &mut recorder,
+                span: "load",
+                parent: None,
+                logical_time: 0,
+            })
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("--qtea"), "{error}");
+        assert!(recorder.events().is_empty());
+    }
+    for raw in [
+        valid.to_string().replacen('{', "{\"unexpected\":true,", 1),
+        valid.to_string().replacen('{', "{\"max_tensors\":64,", 1),
+        valid
+            .to_string()
+            .replace("\"max_context\":8", "\"max_context\":8,\"unknown\":0"),
+    ] {
+        std::fs::write(&path, raw).unwrap();
+        assert!(QteaLoadConfig::read(&path).is_err());
+    }
+    std::fs::write(&path, vec![b' '; 16385]).unwrap();
+    assert!(
+        QteaLoadConfig::read(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("16KiB")
+    );
+    assert!(
+        QteaLoadConfig::read(&root.0)
+            .unwrap_err()
+            .to_string()
+            .contains("regular file")
+    );
+    std::fs::write(&path, valid.to_string()).unwrap();
+    let mut recorder = tritium_evidence::EvidenceRecorder::new("unregistered", []).unwrap();
+    let error = QteaLoadConfig::read(&path)
+        .unwrap()
+        .load(tritium_runtime::TensorUploadContext {
+            recorder: &mut recorder,
+            span: "load",
+            parent: None,
+            logical_time: 0,
+        })
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        !error.contains("No such file"),
+        "context refusal must precede absent model I/O: {error}"
+    );
+    assert!(recorder.events().is_empty());
+}
+
+#[cfg(feature = "tokenizer")]
+#[test]
+fn shared_command_config_loads_real_packed_models_and_checks_source_size() {
+    use tritium_nn::{QteaLoadConfig, Tokenizer};
+    let root = CommandScratch::new();
+    let path = root.0.join("load.json");
+    let model = root.0.join("model.trit");
+    for tied in [true, false] {
+        let mut fixture = Fixture::new(tied, true);
+        fixture.text(false, Some("{{ messages[0]['content'] }} partner".into()));
+        let bytes = fixture.bytes();
+        std::fs::write(&model, &bytes).unwrap();
+        let mut config = command_config(&model);
+        for insufficient in [true, false] {
+            config["max_source_bytes"] = if insufficient {
+                bytes.len() - 1
+            } else {
+                bytes.len()
+            }
+            .into();
+            std::fs::write(&path, config.to_string()).unwrap();
+            let mut recorder = tritium_evidence::EvidenceRecorder::new(
+                "shared",
+                [tritium_evidence::MODEL_LOADED_REGISTRATION],
+            )
+            .unwrap();
+            let result =
+                QteaLoadConfig::read(&path)
+                    .unwrap()
+                    .load(tritium_runtime::TensorUploadContext {
+                        recorder: &mut recorder,
+                        span: "load",
+                        parent: None,
+                        logical_time: 0,
+                    });
+            if insufficient {
+                assert!(
+                    result
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("max_source_bytes")
+                );
+                assert!(recorder.events().is_empty());
+                continue;
+            }
+            let mut loaded = result.unwrap();
+            assert!(loaded.tokenizer.has_source_chat_template());
+            assert_eq!(
+                loaded.runner.qtea_package_id(),
+                Some(tritium_format::PackageId::from_package_bytes(&bytes))
+            );
+            let mut oracle = ModelRunner::try_from_weights(
+                crate::config(),
+                fixture.oracle(),
+                Box::new(tritium_cpu::CpuBackend::new()),
+            )
+            .unwrap();
+            assert_eq!(
+                loaded
+                    .runner
+                    .generate_bounded(&[1, 2], 3, loaded.tokenizer.eos())
+                    .unwrap(),
+                oracle.generate(&[1, 2], 3, loaded.tokenizer.eos()).unwrap()
+            );
+            assert_eq!(recorder.events().len(), 1);
+        }
+    }
+}
+
 #[test]
 fn named_cold_models_and_native_fit_exports_run_packed() {
     for tied in [true, false] {
@@ -623,6 +840,8 @@ fn source_bound_text_load_renders_encodes_generates_and_replays() {
                 write(name, data);
             }
             write("model.trit", &bytes);
+            fixture.text(false, None);
+            write("model-no-template.trit", &fixture.bytes());
             write("actual-text.json",&serde_json::to_vec(&serde_json::json!({
                 "schema":"tritium.qtea.text-software-observation.v1","qualified":false,
                 "package_id":package.as_bytes(),"messages":[{"role":"user","content":"Testing"}],

@@ -69,6 +69,50 @@ fn model_sources_are_mutually_exclusive() {
 }
 
 #[test]
+fn qtea_launch_refuses_incompatible_modes_before_source_or_backend_init() {
+    for (args, expected) in [
+        (vec!["--backend", "cuda"], "--qtea requires --backend cpu"),
+        (
+            vec!["--host", "0.0.0.0"],
+            "--qtea candidates require loopback",
+        ),
+        (vec!["--raw-tokens"], "--qtea forbids"),
+        (vec!["--spec", "lookup"], "--qtea forbids"),
+        (vec!["--draft-model", "/absent.gguf"], "--qtea forbids"),
+        (vec!["--batch-slots", "2"], "--qtea forbids"),
+        (vec!["--kv-pool-tokens", "8"], "--qtea forbids"),
+        (
+            vec!["--typed", "/absent-typed.json"],
+            "provide exactly one of",
+        ),
+        (vec!["--model", "/absent.gguf"], "provide exactly one of"),
+    ] {
+        let output = clean_command()
+            .args(["--qtea", "/absent-qtea.json"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(expected), "{error}");
+        assert!(!error.contains("No such file"), "{error}");
+    }
+}
+
+#[cfg(not(feature = "host-qtea"))]
+#[test]
+fn qtea_feature_off_is_explicit_before_source_io() {
+    let output = clean_command()
+        .args(["--qtea", "/absent-qtea.json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--qtea requires build feature host-qtea")
+    );
+}
+
+#[test]
 fn typed_source_rejects_bad_launch_and_limits_before_backend_init() {
     let root = Scratch::new("reject");
     let load_path = root.0.join("load.json");

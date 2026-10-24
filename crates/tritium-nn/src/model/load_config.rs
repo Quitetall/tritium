@@ -15,19 +15,36 @@ impl Default for Execution {
 }
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StreamConfig {
+pub(super) struct StreamConfig {
     max_context: usize,
     max_segment_tokens: usize,
     max_host_cache_payload_bytes: u64,
 }
 impl StreamConfig {
-    fn limits(self) -> super::StreamLimits {
+    pub(super) fn limits(self) -> super::StreamLimits {
         super::StreamLimits {
             max_context: self.max_context,
             max_segment_tokens: self.max_segment_tokens,
             max_host_cache_payload_bytes: self.max_host_cache_payload_bytes,
         }
     }
+}
+
+pub(super) fn read_config<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    selector: &str,
+) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
+    let file = super::retained_plan::open_source_file(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_LOAD_JSON {
+        return Err(format!("{selector} load JSON must be a regular file of at most 16KiB").into());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_LOAD_JSON + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_LOAD_JSON {
+        return Err(format!("{selector} load JSON grew beyond 16KiB").into());
+    }
+    Ok(serde_json::from_slice(&bytes)?)
 }
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -64,17 +81,7 @@ impl TypedLoadConfig {
     /// # Errors
     /// I/O, malformed/unknown JSON fields, invalid paths/levels/limits/selections.
     pub fn read(path: &Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let file = super::retained_plan::open_source_file(path)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.len() > MAX_LOAD_JSON {
-            return Err("--typed load JSON must be a regular file of at most 16KiB".into());
-        }
-        let mut bytes = Vec::new();
-        file.take(MAX_LOAD_JSON + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_LOAD_JSON {
-            return Err("--typed load JSON grew beyond 16KiB".into());
-        }
-        let config: Self = serde_json::from_slice(&bytes)?;
+        let config: Self = read_config(path, "--typed")?;
         config.validate()?;
         Ok(config)
     }

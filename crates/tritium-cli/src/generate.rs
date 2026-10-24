@@ -72,6 +72,82 @@ impl CliRunner {
     }
 }
 
+/// Explicit scalar-host QTEA continuation; shares the request with serving.
+#[cfg(feature = "host-qtea")]
+pub(crate) fn run_qtea(
+    path: &Path,
+    backend_name: &str,
+    token_file: Option<&Path>,
+    text: Option<&str>,
+    max_new: usize,
+    greedy: bool,
+    eos: u32,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        backend_name == "cpu",
+        "--qtea requires --backend cpu; no GPU or resident fallback"
+    );
+    anyhow::ensure!(
+        greedy,
+        "--greedy=false: sampling is not implemented in this subcommand"
+    );
+    let config = tritium_nn::QteaLoadConfig::read(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    anyhow::ensure!(
+        max_new > 0 && max_new <= config.stream_limits().max_context,
+        "--qtea --max-new must be positive and fit admitted context"
+    );
+    let ids = token_file
+        .map(|path| -> anyhow::Result<Vec<u32>> {
+            let bytes = read_bounded(path, DEFAULT_MAX_JSON_BYTES)?;
+            serde_json::from_slice(&bytes).context("QTEA prompt token IDs")
+        })
+        .transpose()?;
+    let prompt = match (&ids, text) {
+        (Some(ids), None) => Prompt::Ids(ids),
+        (None, Some(text)) => Prompt::Text(text),
+        _ => bail!("QTEA generation requires exactly one of --tokens or --prompt"),
+    };
+    let model_path = config.path().to_path_buf();
+    let mut recorder = tritium_evidence::EvidenceRecorder::new(
+        "qtea-generation-load",
+        [tritium_evidence::MODEL_LOADED_REGISTRATION],
+    )?;
+    let loaded = config
+        .load(tritium_runtime::TensorUploadContext {
+            recorder: &mut recorder,
+            span: "load",
+            parent: None,
+            logical_time: 0,
+        })
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    eprintln!(
+        "QTEA scalar-host candidate, not production-qualified: {}",
+        serde_json::to_string(loaded.receipt.observation())?
+    );
+    recorder.seal()?;
+    decode_and_print(
+        CliRunner::Bounded(Box::new(loaded.runner)),
+        Some(Box::new(loaded.tokenizer)),
+        &model_path,
+        &prompt,
+        max_new,
+        eos,
+    )
+}
+
+#[cfg(not(feature = "host-qtea"))]
+pub(crate) fn run_qtea(
+    _path: &Path,
+    _backend_name: &str,
+    _token_file: Option<&Path>,
+    _text: Option<&str>,
+    _max_new: usize,
+    _greedy: bool,
+    _eos: u32,
+) -> anyhow::Result<()> {
+    bail!("--qtea requires build feature host-qtea")
+}
+
 /// Explicit typed generation; same load JSON and common streaming path as serving.
 pub(crate) fn run_typed(
     path: &Path,
