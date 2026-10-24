@@ -10,9 +10,9 @@ use super::{
 /// A refined column's actual trits, multiplier and affine reconstructed values.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RefinedColumn {
-    trits: Vec<Trit>,
-    multiplier: f32,
-    values: Vec<f32>,
+    pub(super) trits: Vec<Trit>,
+    pub(super) multiplier: f32,
+    pub(super) values: Vec<f32>,
 }
 
 impl RefinedColumn {

@@ -4,18 +4,22 @@
 //! `e39bd8c0297e3427daeb404427c74cb6e202b683`, not a mixture with paper Eq.5.
 //! Scalar f32 reductions are left-to-right; Torch parallel reductions may differ.
 //! Input/intermediate overflow and degenerate initial groups fail explicitly.
-//! No complete feedback sweep, Gram admission, model conversion, compressed
-//! payload, GPU implementation or empirical qualification is implied.
+//! [`TensorFit`] adds a complete source-bound-Gram/SPD-only CPU feedback sweep.
+//! No model converter, compressed codec/backend handle, GPU implementation,
+//! frontier registration or empirical qualification is implied.
 
 mod column;
+mod factor;
 mod group;
 mod saliency;
 mod sparse;
+mod tensor;
 
 pub use column::RefinedColumn;
 pub use group::GroupParameters;
 pub use saliency::SalientRanking;
 pub use sparse::SparseResidualColumn;
+pub use tensor::{TENSOR_FIT_ID, TensorFit, TensorFitConfig, TensorResidual};
 
 /// Numerical-policy identity, deliberately distinct from a frontier solver ID.
 pub const ARITHMETIC_ID: &str = "qtea.cpu-arithmetic.f32.v1";
@@ -38,6 +42,10 @@ pub enum ArithmeticError {
         /// Input-column index in the supplied diagonal.
         column: usize,
     },
+    /// Full tensor fitting requires a source-bound Gram.
+    UnboundGram,
+    /// Gram is asymmetric, indefinite, numerically singular or needs a forbidden pivot.
+    InvalidGram,
     /// Initial group row has no entries outside its dead zone.
     DegenerateRow {
         /// Output-row index in the group.

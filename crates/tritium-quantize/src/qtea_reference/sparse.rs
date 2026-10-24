@@ -91,7 +91,7 @@ impl SparseResidualColumn {
     }
 }
 
-fn decode(code: u8) -> f32 {
+pub(super) fn decode(code: u8) -> f32 {
     let magnitude = code & 0x7f;
     let exponent = i32::from(magnitude >> 3);
     let fraction = f32::from(magnitude & 7);

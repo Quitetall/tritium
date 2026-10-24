@@ -4,9 +4,18 @@ Copyright 2026 Brian Lam
 This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
 Tritium incorporates designs, algorithms, and/or code derived from the
-following upstream projects. Their license terms (MIT and Apache-2.0, both
+following upstream projects. Their license terms (MIT, Apache-2.0 and BSD-style,
 compatible with redistribution under Apache-2.0) are preserved here and in
 the source files of the integrating crates.
+
+The LAPACK port additionally retains the upstream BSD-style terms below.
+
+  - Reference LAPACK (BSD-style)
+      Native SPD-only Bunch-Kaufman pivot selection in
+      crates/tritium-quantize/src/qtea_reference/factor.rs, from SSYTF2 revision
+      6ec7f2bc4ecf4c4a93496aa2fa519575bc0e39ca (v3.12.1).
+      Full notice: crates/tritium-quantize/src/qtea_reference/LICENSE-LAPACK.
+      https://github.com/Reference-LAPACK/lapack
 
   - T-MAC — Microsoft Research (MIT)
       LUT-based mpGEMM for low-bit LLM inference on CPU/NPU.
@@ -30,6 +39,7 @@ the source files of the integrating crates.
       Native group/column reference arithmetic derived from revision
       e39bd8c0297e3427daeb404427c74cb6e202b683 (quantizer.py and qtea.py).
       Ported files: crates/tritium-quantize/src/qtea_reference/{group,column,saliency,sparse}.rs.
+      Full feedback port: qtea_reference/tensor.rs and tensor/sweep.rs in that crate.
       Full upstream license: crates/tritium-quantize/src/qtea_reference/LICENSE-MIT.
       https://github.com/Intelligent-Microsystems-Lab/QTEA
   - MiniJinja and MiniJinja contrib — Armin Ronacher (Apache-2.0)

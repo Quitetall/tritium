@@ -19,8 +19,8 @@ HASHES = {
 }
 
 
-def main():
-    root = Path(sys.argv[1]).resolve()
+def load_reference(root):
+    root = Path(root).resolve()
     sources = {}
     for name, digest in HASHES.items():
         source = (root / "qtea" / name).read_bytes()
@@ -41,6 +41,11 @@ def main():
         exec(compile(sources[name], str(root / "qtea" / name), "exec"), module.__dict__)
     reference = sys.modules[package_name + ".qtea"]
     quantizer = sys.modules[package_name + ".quantizer"]
+    return reference, quantizer
+
+
+def main():
+    reference, quantizer = load_reference(sys.argv[1])
     import torch
 
     torch.set_num_threads(1)

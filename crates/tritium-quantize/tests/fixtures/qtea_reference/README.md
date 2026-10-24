@@ -33,3 +33,19 @@ Upstream equal-score sort ties are not a portable contract: native ranking
 deliberately uses ascending original index and tests that policy separately.
 Native constant/empty-initial-assignment groups refuse rather than returning
 upstream NaN. No quality, throughput, physical-memory or release claim follows.
+
+## Full tensor sweep
+
+`generate_tensor.py` uses the same authenticated source loader and executes the
+actual pinned full driver on CPU (Torch2.14.1, SciPy1.18.1). `tensor.json` contains
+72 small cases across8/12 columns,2/4-column groups, salient ratios0/0.25/0.5/1,
+decay0/1, dead channels and forced LDL pivot swaps. All Grams come from supplied
+tiny activations; fallback paths and CUDA initialization are rejected by the
+generator. No model/dataset is loaded. Native tests compare actual order, exact
+trits/residual positions, and column-v/dense values within5e-5*(1+abs(expected)).
+
+Run with the same environment/source-parent as the command above, replacing
+`generate.py` with `generate_tensor.py` and setting OPENBLAS_NUM_THREADS=1.
+These are unblocked/SPD-only scalar-f32 fitting tests, not universal LAPACK/BLAS
+bitwise conformance. Input Gram hashing is separately checked against its
+unchanged canonical-byte digest. Codec/reopen/backend/model qualification remains.

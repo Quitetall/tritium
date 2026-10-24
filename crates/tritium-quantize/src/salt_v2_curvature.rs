@@ -1297,7 +1297,40 @@ impl InputGram {
     /// Domain-separated identity of [`Self::canonical_bytes`].
     #[must_use]
     pub fn digest(&self) -> [u8; 32] {
-        domain_hash(INPUT_GRAM_DIGEST_CONTEXT, &self.canonical_bytes())
+        // Same canonical byte stream without a second full Gram allocation.
+        let mut hasher = blake3::Hasher::new_derive_key(INPUT_GRAM_DIGEST_CONTEXT);
+        hasher.update(&INPUT_GRAM_MAGIC);
+        hasher.update(&[CANONICAL_VERSION]);
+        hasher.update(
+            &u64::try_from(self.dimension)
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        hasher.update(&self.sample_count.to_le_bytes());
+        hasher.update(&self.selected_count.to_le_bytes());
+        hasher.update(&canonical_f64_bits(self.total_weight).to_le_bytes());
+        match self.source_id {
+            Some(source) => {
+                hasher.update(&[1]);
+                hasher.update(&source.source_model_digest);
+                hasher.update(&source.activation_cache_digest);
+                hasher.update(&source.token_stream_digest);
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+        hasher.update(&self.selection_trace);
+        hasher.update(&self.data_trace);
+        hasher.update(
+            &u64::try_from(self.values.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        for &value in &self.values {
+            hasher.update(&canonical_f64_bits(value).to_le_bytes());
+        }
+        *hasher.finalize().as_bytes()
     }
 }
 
