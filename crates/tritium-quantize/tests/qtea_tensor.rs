@@ -87,6 +87,30 @@ fn complete_tensor_sweep_matches_pinned_author_driver() {
             TensorFit::required_work_bytes(case.rows, case.columns).unwrap(),
         )
         .unwrap();
+        let input_plan = TensorFit::plan(
+            &case.weights,
+            case.rows,
+            case.columns,
+            &input,
+            recipe,
+            TensorFit::required_work_bytes(case.rows, case.columns).unwrap(),
+        )
+        .unwrap();
+        let limits = tritium_format::qtea::QteaLimits {
+            max_tensor_bytes: 1 << 20,
+            max_validation_bytes: 4096,
+        };
+        let predicted = input_plan.encoded_ledger(limits).unwrap();
+        let metadata = input_plan.metadata();
+        let planned = input_plan.fit().unwrap();
+        assert_eq!(planned, fitted);
+        let encoded = planned.to_qtea_tensor(limits).unwrap();
+        assert_eq!(encoded.view().metadata(), metadata);
+        assert_eq!(encoded.view().byte_ledger(), predicted);
+        assert_eq!(
+            encoded.as_bytes(),
+            fitted.to_qtea_tensor(limits).unwrap().as_bytes()
+        );
         assert_eq!(
             fitted.fitting_order(),
             case.order,

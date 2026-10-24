@@ -95,6 +95,18 @@ pub struct QteaLimits {
     pub max_validation_bytes: usize,
 }
 
+impl QteaMetadata {
+    /// Plan exact encoded bytes and receiver caps without allocation/encoding.
+    /// Geometry/recipe/source validation is shared with the actual wire codec.
+    /// This neither validates fitted parameters nor proves successful execution.
+    ///
+    /// # Errors
+    /// Refuses invalid/overflowing metadata or insufficient receiver limits.
+    pub fn byte_ledger(self, limits: QteaLimits) -> Result<QteaByteLedger, QteaError> {
+        Ok(layout::Layout::new(self)?.admit(limits)?.ledger)
+    }
+}
+
 /// Borrowed original group parameters; all slices must have exactly `rows` values.
 #[derive(Clone, Copy, Debug)]
 pub struct QteaGroupRef<'a> {

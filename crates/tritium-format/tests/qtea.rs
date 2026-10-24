@@ -151,6 +151,10 @@ fn borrowed_owned_stream_roundtrips_and_all_trit_position_tails() {
             for ratio in [0., 1.] {
                 let t = tensor(rows, columns, ratio);
                 let view = QteaTensorView::from_bytes(t.as_bytes(), limits()).unwrap();
+                assert_eq!(
+                    view.metadata().byte_ledger(limits()).unwrap(),
+                    view.byte_ledger()
+                );
                 assert_eq!(view.metadata(), meta(rows, columns, ratio));
                 assert_eq!(
                     view.fitting_order().collect::<Vec<_>>(),

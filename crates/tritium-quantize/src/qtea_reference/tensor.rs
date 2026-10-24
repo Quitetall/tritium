@@ -2,14 +2,17 @@
 // e39bd8c0297e3427daeb404427c74cb6e202b683. MIT notice in LICENSE-MIT.
 
 use super::{
-    ArithmeticError, GroupParameters, SalientRanking, SparseResidualColumn, budget, check_input,
-    check_iterations, filled, finite,
+    ArithmeticError, GroupParameters, SalientRanking, SparseResidualColumn, check_iterations,
+    filled,
 };
 use crate::{CurvatureSourceId, InputGram};
 use tritium_core::Trit;
 
 mod export;
+mod plan;
 mod sweep;
+
+pub use plan::TensorFitPlan;
 
 /// Native scalar-f32/SPD-only single-tensor numerical policy, not a solver catalog ID.
 pub const TENSOR_FIT_ID: &str = "qtea.cpu-tensor.f32.v1";
@@ -174,37 +177,38 @@ impl TensorFit {
         config: TensorFitConfig,
         max_work_bytes: usize,
     ) -> Result<Self, ArithmeticError> {
-        let required = Self::required_work_bytes(rows, columns)?;
-        config.validate(columns)?;
-        if rows.checked_mul(columns) != Some(weights.len())
-            || gram.dimension() != columns
-            || gram.as_slice().len() != columns * columns
-        {
-            return Err(ArithmeticError::InvalidShape);
-        }
-        let source = gram.source_id().ok_or(ArithmeticError::UnboundGram)?;
-        budget(Some(required), max_work_bytes)?;
-        check_input(weights)?;
+        Self::plan(weights, rows, columns, gram, config, max_work_bytes)?.fit()
+    }
+
+    /// Bind exact immutable inputs and validate the logical fitting cap before allocation.
+    /// Planning performs linear input scans/hashing, not factorization or fitting.
+    ///
+    /// # Errors
+    /// Rejects invalid geometry/recipe/source/cap and nonfinite or inconsistent inputs.
+    pub fn plan<'a>(
+        weights: &'a [f32],
+        rows: usize,
+        columns: usize,
+        gram: &'a InputGram,
+        config: TensorFitConfig,
+        max_work_bytes: usize,
+    ) -> Result<TensorFitPlan<'a>, ArithmeticError> {
+        TensorFitPlan::new(weights, rows, columns, gram, config, max_work_bytes)
+    }
+
+    fn fit_prepared(plan: TensorFitPlan<'_>) -> Result<Self, ArithmeticError> {
+        let weights = plan.weights;
+        let gram = plan.gram;
+        let (rows, columns, config) = (plan.rows, plan.columns, plan.config);
         let mut original = filled(weights.len(), 0.0)?;
         original.copy_from_slice(weights);
         let mut h = filled(columns * columns, 0.0)?;
         for (output, &value) in h.iter_mut().zip(gram.as_slice()) {
-            *output = finite(value as f32)?;
+            *output = value as f32; // Validated once by the immutable input plan.
         }
         let mut diagonal = filled(columns, 0.0)?;
         for column in 0..columns {
-            for row in 0..columns {
-                if h[row * columns + column] != h[column * columns + row] {
-                    return Err(ArithmeticError::InvalidGram);
-                }
-            }
-            if h[column * columns + column] < 0.0 {
-                return Err(ArithmeticError::InvalidGram);
-            }
             if h[column * columns + column] == 0.0 {
-                if (0..columns).any(|row| h[row * columns + column] != 0.0) {
-                    return Err(ArithmeticError::InvalidGram);
-                }
                 h[column * columns + column] = 1.0;
                 for row in 0..rows {
                     original[row * columns + column] = 0.0;
@@ -257,12 +261,6 @@ impl TensorFit {
         )?;
         let permuted = super::factor::permuted(&h, columns, &order, config.damping)?;
         let upper = super::factor::inverse_upper(permuted, columns, config.relative_pivot_floor)?;
-        let mut hash = blake3::Hasher::new_derive_key("tritium qtea original weights v1");
-        hash.update(&(rows as u64).to_le_bytes());
-        hash.update(&(columns as u64).to_le_bytes());
-        for weight in weights {
-            hash.update(&weight.to_bits().to_le_bytes());
-        }
         let mut residuals = Vec::new();
         residuals
             .try_reserve_exact(salient)
@@ -276,10 +274,10 @@ impl TensorFit {
             multipliers: filled(columns, 1.0)?,
             residuals,
             order,
-            source,
-            gram_digest: gram.digest(),
-            weights_digest: *hash.finalize().as_bytes(),
-            recipe_digest: config.digest(),
+            source: plan.source,
+            gram_digest: plan.gram_digest,
+            weights_digest: plan.weights_digest,
+            recipe_digest: plan.recipe_digest,
         };
         sweep::run(&mut result, &original, &upper, salient)?;
         result

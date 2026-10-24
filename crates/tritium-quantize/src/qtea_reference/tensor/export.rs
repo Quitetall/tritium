@@ -1,8 +1,5 @@
 use super::TensorFit;
-use tritium_format::qtea::{
-    QteaBindings, QteaError, QteaGroupRef, QteaLimits, QteaMetadata, QteaRecipe, QteaResidualRef,
-    QteaTensor,
-};
+use tritium_format::qtea::{QteaError, QteaGroupRef, QteaLimits, QteaResidualRef, QteaTensor};
 
 impl TensorFit {
     /// Export exact executable parameters to the bounded residual-bearing format.
@@ -14,28 +11,14 @@ impl TensorFit {
     /// # Errors
     /// Refuses format/identity/cap/allocation errors with no partial result.
     pub fn to_qtea_tensor(&self, limits: QteaLimits) -> Result<QteaTensor, QteaError> {
-        let c = self.config;
-        let meta = QteaMetadata {
-            rows: self.rows,
-            columns: self.columns,
-            recipe: QteaRecipe {
-                group_size: c.group_size,
-                salient_ratio: c.salient_ratio,
-                delta_coefficient: c.delta_coefficient,
-                fit_iterations: c.fit_iterations,
-                rescale_iterations: c.rescale_iterations,
-                damping: c.damping,
-                decay: c.decay,
-                relative_pivot_floor: c.relative_pivot_floor,
-            },
-            bindings: QteaBindings {
-                weights: self.weights_digest,
-                gram: self.gram_digest,
-                source_model: self.source.source_model_digest(),
-                activation_cache: self.source.activation_cache_digest(),
-                token_stream: self.source.token_stream_digest(),
-            },
-        };
+        let meta = super::plan::metadata(
+            self.rows,
+            self.columns,
+            self.config,
+            self.source,
+            self.weights_digest,
+            self.gram_digest,
+        );
         let encoded = QteaTensor::from_parts(
             meta,
             &self.trits,

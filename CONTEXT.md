@@ -135,6 +135,11 @@ An immutable, content-bound piece of intermediate conversion work for one tensor
 It is distinct from a deployable model, a training snapshot and a qualification receipt.
 _Avoid_: model checkpoint, completion proof
 
+**Tensor fit input plan**:
+Immutable identity-bound inputs and a numerical recipe for one pending conversion.
+It is distinct from machine-level admission, fitted output and qualification.
+_Avoid_: completed fit, admitted solver plan, qualification receipt
+
 **Qualification receipt**:
 Evidence bound to a declared artifact, source, workload, and execution scope.
 It is distinct from a structural plan or a claim of human authorization.
