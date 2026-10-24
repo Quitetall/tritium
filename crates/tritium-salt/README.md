@@ -16,6 +16,14 @@ This is residual-bearing tensor work, not a pure additive-ternary artifact,
 registered frontier solver, deployable model or qualification receipt. The QTEA
 builtin remains unavailable until its complete admission/conformance work lands.
 
+Its optional `admit` path consumes an existing Experimental registry plan and
+portable Fit request plus the caller's independently selected plan ID. It checks
+descriptor, source/input/shape and known logical resource floors before execution.
+V1 requests alone do not bind machine/evidence IDs; the selected plan ID and
+returned stage output do. This research path creates no installable descriptor or
+Registered/Certified status. Receipts require explicit caller observations and
+cannot underreport known raw artifact length; they are not qualification.
+
 The bounded synthetic `qtea_conformance` example exercises the same public
 work-plan writer, actual cold reader and packed CPU forward. The repository's
 `scripts/verify-qtea-reference.sh` can explicitly select `tritium-salt` as its fifth

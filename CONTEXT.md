@@ -140,6 +140,11 @@ Immutable identity-bound inputs and a numerical recipe for one pending conversio
 It is distinct from machine-level admission, fitted output and qualification.
 _Avoid_: completed fit, admitted solver plan, qualification receipt
 
+**Admitted tensor work**:
+One pending tensor conversion bound to a selected solver plan and stage request.
+It is distinct from completed output and independently qualified execution.
+_Avoid_: completed model, qualified artifact, publication authorization
+
 **Qualification receipt**:
 Evidence bound to a declared artifact, source, workload, and execution scope.
 It is distinct from a structural plan or a claim of human authorization.

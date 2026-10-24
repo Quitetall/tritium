@@ -1,4 +1,4 @@
-//! Owner-bound synthesis producer for the separate ADR0157 Python reference.
+//! Admitted experimental synthesis producer for the separate ADR0157 Python reference.
 //! Not a model benchmark, producer attestation or qualification receipt.
 
 use sha2::{Digest, Sha256};
@@ -7,12 +7,100 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::PathBuf,
+    sync::Arc,
 };
 use tritium_cpu::qtea::matmul_into;
 use tritium_format::qtea::{QteaLimits, QteaTensor};
 use tritium_quantize::qtea_reference::{TensorFit, TensorFitConfig};
 use tritium_quantize::{CurvatureSourceId, InputGramAccumulator};
-use tritium_salt::{ContentId, QteaTensorOrigin, QteaTensorWorkPlan};
+use tritium_salt::{
+    AdmittedSolverPlan, ContentId, FrontierOrdering, FrontierProfile, FrontierProfileId,
+    FrontierResourceEstimate, FrontierSolver, FrontierSolverError, FrontierStage,
+    FrontierStageRequest, QteaTensorOrigin, QteaTensorWorkPlan, ResourceVector, SolverDescriptor,
+    SolverFamily, SolverId, SolverRegistry, SolverRequest, SolverTrust,
+};
+
+// Planning-only synthetic fixture: no builtin installer, inventory or measurements.
+#[derive(Debug)]
+struct SyntheticPlanner {
+    descriptor: SolverDescriptor,
+    estimate: FrontierResourceEstimate,
+}
+impl FrontierSolver for SyntheticPlanner {
+    fn descriptor(&self) -> &SolverDescriptor {
+        &self.descriptor
+    }
+    fn estimate(&self, _: &SolverRequest) -> Result<FrontierResourceEstimate, FrontierSolverError> {
+        Ok(self.estimate)
+    }
+}
+
+fn synthetic_admission(
+    work: &QteaTensorWorkPlan<'_>,
+) -> Result<(AdmittedSolverPlan, FrontierStageRequest), Box<dyn Error>> {
+    let id = SolverId::new("qtea-salient-residual.v1")?;
+    let descriptor = SolverDescriptor::new(
+        id.clone(),
+        SolverFamily::QteaSalientResidual,
+        SolverTrust::Experimental,
+        1,
+    )?;
+    let m = work.memory();
+    let resources = ResourceVector::new(
+        u64::try_from(m.total_logical_bytes)?,
+        0,
+        0,
+        u64::try_from(work.byte_ledger().total_bytes)?,
+        0,
+        u64::try_from(m.total_logical_bytes - m.borrowed_input_bytes)?,
+        0,
+        None,
+    );
+    let estimate = FrontierResourceEstimate::new(
+        resources,
+        ContentId::of_bytes(b"synthetic conformance machine label; not inventory"),
+        ContentId::of_bytes(b"synthetic logical estimate; not observations"),
+    )?;
+    let profile = FrontierProfile::new(
+        FrontierProfileId::new("test.qtea-admitted-conformance")?,
+        FrontierOrdering::Fixed,
+        vec![id.clone()],
+        SolverTrust::Experimental,
+        ResourceVector::new(
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            None,
+        ),
+        None,
+        false,
+    )?;
+    let mut registry = SolverRegistry::new();
+    registry.register(Arc::new(SyntheticPlanner {
+        descriptor,
+        estimate,
+    }))?;
+    let meta = work.metadata();
+    let plan = registry.plan(
+        &id,
+        SolverTrust::Experimental,
+        &profile.request(u64::try_from(meta.rows)?, u64::try_from(meta.columns)?)?,
+    )?;
+    let request = FrontierStageRequest::new(
+        ContentId::of_bytes(b"synthetic conformance run"),
+        work.origin().source_id,
+        0,
+        FrontierStage::Fit,
+        &profile,
+        &plan,
+        work.input_id(),
+    )?;
+    Ok((plan, request))
+}
 
 fn new_file(path: PathBuf) -> io::Result<File> {
     OpenOptions::new().write(true).create_new(true).open(path)
@@ -110,15 +198,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             limits,
             1 << 24,
         )?;
+        let (plan, request) = synthetic_admission(&work)?;
+        let work = work.admit(&plan, &request, plan.content_id())?;
         let tensor_path = destination.join(format!("{stem}.qtea"));
         let mut file = new_file(tensor_path.clone())?;
-        let result = work.fit_to(&mut file)?;
+        let admitted_result = work.fit_to(&mut file)?;
+        let result = admitted_result.work_result();
         file.sync_all()?;
         drop(file);
         println!(
-            "work_input={} tensor={}",
+            "work_input={} tensor={} stage_output={}",
             result.input_id(),
-            result.tensor_id()
+            result.tensor_id(),
+            admitted_result.output_id()
         );
         // Forward uses only the actual reopened file, not retained fitter state.
         let cold = QteaTensor::read_from(&mut File::open(&tensor_path)?, limits)?;

@@ -19,6 +19,7 @@ use crate::ContentId;
 mod artifact;
 mod compatibility;
 mod orchestration;
+mod qtea_work;
 mod receipt;
 mod solvers;
 
@@ -31,6 +32,7 @@ pub use orchestration::{
     FRONTIER_RUN_RECEIPT_SCHEMA_V1, FRONTIER_STAGE_REQUEST_SCHEMA_V1, FrontierRunReceipt,
     FrontierStageRequest,
 };
+pub use qtea_work::{QteaAdmittedTensorFitResult, QteaAdmittedTensorWork, QteaFrontierWorkError};
 pub use receipt::{
     FRONTIER_PARETO_RECEIPT_SCHEMA_V1, FRONTIER_STAGE_RECEIPT_SCHEMA_V1,
     FrontierObjectiveDirection, FrontierObjectiveSpec, FrontierObjectiveValue,
