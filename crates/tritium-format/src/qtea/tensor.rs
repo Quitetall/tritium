@@ -116,6 +116,19 @@ impl<'a> QteaTensorView<'a> {
     pub const fn byte_ledger(&self) -> QteaByteLedger {
         self.layout.ledger
     }
+    /// Allocation-free offsets derived from this checked view's admitted layout.
+    /// Does not change wire bytes or authenticate source/qualification claims.
+    pub const fn execution_layout(&self) -> QteaExecutionLayout {
+        QteaExecutionLayout {
+            trits_offset: QTEA_HEADER_BYTES,
+            group_parameters_offset: self.layout.params,
+            column_multipliers_offset: self.layout.multipliers,
+            residuals_offset: self.layout.residuals,
+            residual_record_bytes: self.layout.record_bytes,
+            residual_position_bytes: self.layout.position_bytes,
+            residual_count: self.layout.salient,
+        }
+    }
     /// Domain-separated digest over all header/body bytes, not a signature.
     pub fn content_digest(&self) -> [u8; 32] {
         self.bytes[self.layout.trailer..]

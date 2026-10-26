@@ -156,6 +156,32 @@ fn borrowed_owned_stream_roundtrips_and_all_trit_position_tails() {
                     view.byte_ledger()
                 );
                 assert_eq!(view.metadata(), meta(rows, columns, ratio));
+                let layout = view.execution_layout();
+                let ledger = view.byte_ledger();
+                assert_eq!(layout.trits_offset, QTEA_HEADER_BYTES);
+                assert_eq!(layout.group_parameters_offset, 384 + ledger.trit_bytes);
+                assert_eq!(
+                    layout.column_multipliers_offset,
+                    layout.group_parameters_offset + ledger.group_parameter_bytes
+                );
+                assert_eq!(
+                    layout.residuals_offset,
+                    layout.column_multipliers_offset
+                        + ledger.column_multiplier_bytes
+                        + ledger.order_bytes
+                );
+                assert_eq!(layout.residual_position_bytes, (rows / 4).div_ceil(4));
+                assert_eq!(
+                    layout.residual_record_bytes,
+                    8 + layout.residual_position_bytes + rows / 4
+                );
+                assert_eq!(layout.residual_count, view.residuals().count());
+                assert_eq!(
+                    layout.residuals_offset
+                        + layout.residual_count * layout.residual_record_bytes
+                        + 32,
+                    view.as_bytes().len()
+                );
                 assert_eq!(
                     view.fitting_order().collect::<Vec<_>>(),
                     (0..columns).rev().collect::<Vec<_>>()

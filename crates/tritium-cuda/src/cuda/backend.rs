@@ -16,6 +16,8 @@ mod decoder;
 mod decoder_plan;
 mod delta_mixer;
 pub(super) mod deltanet;
+mod qtea;
+pub use qtea::{QteaCudaAllocationLedger, QteaCudaLimits, QteaResidentTensor};
 mod salt_v2_reader_upload;
 mod salt_v2_runtime;
 mod semantic;
@@ -1047,6 +1049,8 @@ pub struct CudaBackend {
     /// projection path. Qwen prompt/decode invokes hundreds of projections;
     /// retaining these buffers removes a cuMemAlloc/cuMemFree pair per call.
     pub(super) salt_v2_workspace: Mutex<SaltV2Workspace>,
+    /// Loaded only for explicit packed QTEA execution, never for legacy init.
+    qtea_kernels: Mutex<Option<Arc<qtea::QteaKernels>>>,
     pub(super) semantic_swiglu_enabled: bool,
     pub(super) resident_decoder_budget: Option<usize>,
     pub(super) semantic_swiglu_workspace: Mutex<Option<semantic::SwigluWorkspace>>,
@@ -1710,6 +1714,7 @@ impl CudaBackend {
             imma_jit: Mutex::new(HashMap::new()),
             tuned_tiles: Mutex::new(HashMap::new()),
             salt_v2_workspace: Mutex::new(SaltV2Workspace::default()),
+            qtea_kernels: Mutex::new(None),
             semantic_swiglu_enabled: false,
             resident_decoder_budget: None,
             semantic_swiglu_workspace: Mutex::new(None),

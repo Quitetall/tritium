@@ -20,6 +20,27 @@ pub const QTEA_HEADER_BYTES: usize = 384;
 /// Exact native numerical recipe being stored, not a frontier solver ID.
 pub const QTEA_NUMERICAL_ID: &str = "qtea.cpu-tensor.f32.v1";
 
+/// Byte offsets for direct execution of an already checked V1 view.
+/// Descriptive layout only: not validation, ownership or an execution grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct QteaExecutionLayout {
+    /// Start of row-major radix3 trits.
+    pub trits_offset: usize,
+    /// Start of interleaved f32 alpha/beta pairs, group then row.
+    pub group_parameters_offset: usize,
+    /// Start of original-column f32 multipliers.
+    pub column_multipliers_offset: usize,
+    /// Start of sorted original-column sparse records.
+    pub residuals_offset: usize,
+    /// Fixed stride of each sparse record.
+    pub residual_record_bytes: usize,
+    /// Packed position bytes per sparse record, after its eight-byte prefix.
+    pub residual_position_bytes: usize,
+    /// Number of sparse records.
+    pub residual_count: usize,
+}
+
 /// Original native numerical recipe. Hashing alone does not admit its values.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct QteaRecipe {

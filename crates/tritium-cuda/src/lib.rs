@@ -28,8 +28,11 @@
 //! the result back. The result matches [`tritium_core::reference_mpgemm`] within
 //! the `1e-4` relative tolerance from ADR 0002.
 //!
-//! Only [`TernaryFormat::Tq2_0`](tritium_core::TernaryFormat::Tq2_0) is supported
-//! by the kernel; TQ1_0 returns
+//! The legacy trait mpgemm kernel supports only
+//! [`TernaryFormat::Tq2_0`](tritium_core::TernaryFormat::Tq2_0).
+//! Separate opt-in packed QTEA upload/ordered matmul/gather primitives are
+//! described in `docs/QTEA-CUDA.md`; they are not full model GPU dispatch.
+//! Legacy trait mpgemm with TQ1_0 returns
 //! [`BackendError::UnsupportedFormat`](tritium_spec::BackendError::UnsupportedFormat).
 #![deny(unsafe_code)]
 
@@ -49,6 +52,8 @@ pub use cuda::{
     ExternalLinearBackward, ExternalLinearForward, ExternalLinearGeometry, ExternalLinearPack,
     ExternalLinearScalar,
 };
+#[cfg(feature = "cuda")]
+pub use cuda::{QteaCudaAllocationLedger, QteaCudaLimits, QteaResidentTensor};
 
 // v0.3.1 (ADR 0013): the device-resident M=1 decode forward. The runner downcasts
 // its `dyn TernaryBackend` to `CudaBackend`, builds a `CudaDecodeModel` once from a

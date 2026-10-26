@@ -260,8 +260,9 @@ pub use backend::deltanet::DeltaNetResidentState;
 #[cfg_attr(not(test), allow(unused_imports))]
 use backend::*;
 pub use backend::{
-    CudaBackend, SaltResidentLinear, SaltV2Forward, SaltV2ForwardMode, SaltV2ForwardReceipt,
-    SaltV2GatherReceipt, SaltV2ResidentAllocationReceipt, SaltV2ResidentTensor,
+    CudaBackend, QteaCudaAllocationLedger, QteaCudaLimits, QteaResidentTensor, SaltResidentLinear,
+    SaltV2Forward, SaltV2ForwardMode, SaltV2ForwardReceipt, SaltV2GatherReceipt,
+    SaltV2ResidentAllocationReceipt, SaltV2ResidentTensor,
 };
 #[allow(unused_imports)] // TrainingSaltLinear is the Track D tape seam.
 pub(crate) use backend::{EmbedSegments, TrainingSaltLinear};
