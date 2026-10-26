@@ -4,6 +4,8 @@
 use tritium_core::Trit;
 use tritium_cuda::{CudaBackend, QteaCudaAllocationLedger, QteaCudaLimits};
 use tritium_format::qtea::*;
+use tritium_runtime::TensorPayloadBudget;
+use tritium_spec::{TensorSwiGlu, TensorView, TernaryBackend};
 
 fn wire_limits() -> QteaLimits {
     QteaLimits {
@@ -131,6 +133,266 @@ fn fixture(rows: usize, columns: usize, group: usize, ratio: f64, mode: u8) -> Q
 }
 fn bits(values: &[f32]) -> Vec<u32> {
     values.iter().map(|x| x.to_bits()).collect()
+}
+
+#[test]
+#[ignore = "explicit physical CUDA budgeted cache reuse/eviction across real shared and QTEA paths"]
+fn budgeted_workspace_reuses_capacity_and_evicts_before_cross_kind_allocation() {
+    use tritium_cuda::{SwiGluWorkspaceKind as Kind, SwiGluWorkspaceResources as Resources};
+    let device = TensorPayloadBudget::new(150);
+    let host = TensorPayloadBudget::new(52);
+    let cuda = CudaBackend::new(0)
+        .expect("physical CUDA required")
+        .with_device_swiglu()
+        .with_swiglu_workspace_resources(Resources::new(&device, &host).unwrap())
+        .unwrap();
+    assert!(cuda.swiglu_workspace_admission_enabled());
+    let gate = cuda
+        .upload_tensor(TensorView::Dense {
+            rows: 8,
+            cols: 4,
+            values: &[0.1; 32],
+        })
+        .unwrap();
+    let down = cuda
+        .upload_tensor(TensorView::Dense {
+            rows: 4,
+            cols: 8,
+            values: &[0.1; 32],
+        })
+        .unwrap();
+    let mut output = [77.; 4];
+    for value in [0.25, 0.5] {
+        assert!(
+            cuda.try_tensor_swiglu(TensorSwiGlu {
+                act: &[value; 4],
+                gate: &*gate,
+                up: &*gate,
+                down: &*down,
+                batch: 1,
+                out: &mut output
+            })
+            .unwrap()
+        );
+        assert!(output.iter().all(|v| v.is_finite() && *v > 0.));
+    }
+    let shared = cuda.swiglu_workspace_snapshot().unwrap().unwrap();
+    assert_eq!(
+        (
+            shared.plan.kind,
+            shared.allocations,
+            shared.reuse_selections
+        ),
+        (Kind::SharedTensor, 1, 1)
+    );
+    assert!(shared.admitted);
+    assert_eq!((device.used_bytes(), host.used_bytes()), (148, 20));
+    let g = fixture(8, 4, 2, 0.5, 0);
+    let d = fixture(4, 8, 2, 0.5, 0);
+    let g = cuda.upload_qtea(g.view(), 1 << 20).unwrap();
+    let d = cuda.upload_qtea(d.view(), 1 << 20).unwrap();
+    let caps = QteaCudaLimits {
+        max_device_staging_bytes: 100,
+        max_host_staging_bytes: 20,
+    };
+    let first = cuda
+        .qtea_swiglu_device_into(&g, &g, &d, &[0.1; 4], 1, &mut output, caps)
+        .unwrap();
+    assert!(first.workspace_retained && !first.workspace_reused);
+    assert_eq!((device.used_bytes(), host.used_bytes()), (100, 20));
+    let snapshot = cuda.swiglu_workspace_snapshot().unwrap().unwrap();
+    assert_eq!(
+        (snapshot.plan.kind, snapshot.allocations),
+        (Kind::PackedQtea, 2)
+    );
+    let previous = output;
+    let second = cuda
+        .qtea_swiglu_device_into(&g, &g, &d, &[0.2; 4], 1, &mut output, caps)
+        .unwrap();
+    assert!(second.workspace_retained && second.workspace_reused);
+    assert_ne!(
+        bits(&output),
+        bits(&previous),
+        "capacity reuse must not reuse prior activations"
+    );
+    let empty = cuda
+        .qtea_swiglu_device_into(
+            &g,
+            &g,
+            &d,
+            &[],
+            0,
+            &mut [],
+            QteaCudaLimits {
+                max_device_staging_bytes: 1,
+                max_host_staging_bytes: 1,
+            },
+        )
+        .unwrap();
+    assert!(!empty.workspace_reused && !empty.workspace_retained);
+    assert_eq!((device.used_bytes(), host.used_bytes()), (100, 20));
+    output.fill(77.);
+    assert!(
+        cuda.qtea_swiglu_device_into(
+            &g,
+            &g,
+            &d,
+            &[0.1; 4],
+            1,
+            &mut output,
+            QteaCudaLimits {
+                max_device_staging_bytes: 99,
+                ..caps
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(output, [77.; 4]);
+    assert!(
+        cuda.qtea_swiglu_device_into(&g, &g, &d, &[1e30; 4], 1, &mut output, caps)
+            .is_err()
+    );
+    assert_eq!(output, [77.; 4]);
+    cuda.qtea_swiglu_device_into(&g, &g, &d, &[0.1; 4], 1, &mut output, caps)
+        .unwrap();
+    cuda.release_swiglu_workspace().unwrap();
+    assert!(cuda.swiglu_workspace_snapshot().unwrap().is_none());
+    assert_eq!((device.used_bytes(), host.used_bytes()), (0, 0));
+    assert!(
+        cuda.try_tensor_swiglu(TensorSwiGlu {
+            act: &[0.1; 4],
+            gate: &*gate,
+            up: &*gate,
+            down: &*down,
+            batch: 1,
+            out: &mut output
+        })
+        .unwrap()
+    );
+    let mut larger = [77.; 8];
+    assert!(
+        cuda.try_tensor_swiglu(TensorSwiGlu {
+            act: &[0.1; 8],
+            gate: &*gate,
+            up: &*gate,
+            down: &*down,
+            batch: 2,
+            out: &mut larger
+        })
+        .is_err()
+    );
+    assert_eq!(larger, [77.; 8]);
+    assert!(cuda.swiglu_workspace_snapshot().unwrap().is_none());
+    assert_eq!((device.used_bytes(), host.used_bytes()), (0, 0));
+    assert!(
+        cuda.try_tensor_swiglu(TensorSwiGlu {
+            act: &[0.1; 4],
+            gate: &*gate,
+            up: &*gate,
+            down: &*down,
+            batch: 1,
+            out: &mut output
+        })
+        .unwrap()
+    );
+    drop(cuda);
+    assert_eq!((device.used_bytes(), host.used_bytes()), (0, 0));
+}
+
+#[test]
+#[ignore = "explicit physical CUDA shared-ledger constructor peak and external contention"]
+fn workspace_budgets_aggregate_domains_and_other_reservations_without_fallback() {
+    use tritium_cuda::SwiGluWorkspaceResources as Resources;
+    for limit in [199, 200] {
+        let aggregate = TensorPayloadBudget::new(limit);
+        let cuda = CudaBackend::new(0)
+            .expect("physical CUDA required")
+            .with_device_swiglu()
+            .with_swiglu_workspace_resources(Resources::new(&aggregate, &aggregate).unwrap())
+            .unwrap();
+        let gate = cuda
+            .upload_tensor(TensorView::Dense {
+                rows: 8,
+                cols: 4,
+                values: &[0.1; 32],
+            })
+            .unwrap();
+        let down = cuda
+            .upload_tensor(TensorView::Dense {
+                rows: 4,
+                cols: 8,
+                values: &[0.1; 32],
+            })
+            .unwrap();
+        let mut output = [77.; 4];
+        let result = cuda.try_tensor_swiglu(TensorSwiGlu {
+            act: &[0.1; 4],
+            gate: &*gate,
+            up: &*gate,
+            down: &*down,
+            batch: 1,
+            out: &mut output,
+        });
+        if limit == 199 {
+            assert!(result.is_err());
+            assert_eq!(output, [77.; 4]);
+            assert_eq!(aggregate.used_bytes(), 0);
+            assert!(cuda.swiglu_workspace_snapshot().unwrap().is_none());
+        } else {
+            assert!(result.unwrap());
+            assert_eq!(aggregate.used_bytes(), 168);
+            let external = aggregate.reserve_storage(22).unwrap();
+            assert!(
+                cuda.try_tensor_swiglu(TensorSwiGlu {
+                    act: &[0.2; 4],
+                    gate: &*gate,
+                    up: &*gate,
+                    down: &*down,
+                    batch: 1,
+                    out: &mut output
+                })
+                .unwrap()
+            );
+            assert_eq!(aggregate.used_bytes(), 190);
+            assert_eq!(
+                cuda.swiglu_workspace_snapshot()
+                    .unwrap()
+                    .unwrap()
+                    .allocations,
+                1
+            );
+            cuda.release_swiglu_workspace().unwrap();
+            assert_eq!(aggregate.used_bytes(), 22);
+            output.fill(77.);
+            assert!(
+                cuda.try_tensor_swiglu(TensorSwiGlu {
+                    act: &[0.1; 4],
+                    gate: &*gate,
+                    up: &*gate,
+                    down: &*down,
+                    batch: 1,
+                    out: &mut output
+                })
+                .is_err()
+            );
+            assert_eq!(output, [77.; 4]);
+            assert_eq!(aggregate.used_bytes(), 22);
+            drop(external);
+            assert!(
+                cuda.try_tensor_swiglu(TensorSwiGlu {
+                    act: &[0.1; 4],
+                    gate: &*gate,
+                    up: &*gate,
+                    down: &*down,
+                    batch: 1,
+                    out: &mut output
+                })
+                .unwrap()
+            );
+            drop(cuda);
+            assert_eq!(aggregate.used_bytes(), 0);
+        }
+    }
 }
 
 fn swiglu_reference(

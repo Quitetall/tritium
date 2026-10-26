@@ -29,6 +29,10 @@ not full workspace/model memory admission or a physical VRAM/RSS bound; allocato
 driver, model/cache and other calls remain separate. No new weight copy, global
 toggle, source-authority claim or qualification receipt is introduced.
 
+Explicit [workspace resources](SWIGLU-WORKSPACE.md) can separately admit scratch
+and coordinate it with other logical domains. Legacy execution stays outside
+weight-only admission unless those resources are selected.
+
 Tiny explicit physical regressions are ignored in ordinary runs and never silently
 skip without a device. The full physical target also retains its previous dense,
 additive, rotated, compact, mixed, empty and repeated-call tests with unchanged

@@ -4,7 +4,7 @@ use super::*;
 /// Execution identity, not the stored wire/fitting numerical identity.
 pub const QTEA_DEVICE_SWIGLU_NUMERICAL_ID: &str = "qtea.cuda-device-swiglu.f32.v1";
 
-/// Logical per-call requested buffers, NOT physical/model peak qualification.
+/// Logical active workspace footprint, possibly reused capacity, NOT physical/model qualification.
 /// Excludes other weights/calls, caller buffers and allocator/driver/module/events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -27,6 +27,10 @@ pub struct QteaSwiGluAllocationLedger {
     pub requested_device_peak_bytes: u64,
     /// Always zero: no auxiliary weight shadow.
     pub dense_weight_bytes: u64,
+    /// This call reused already admitted capacity, not prior activation values.
+    pub workspace_reused: bool,
+    /// This call's active workspace remains cached; empty calls select no workspace.
+    pub workspace_retained: bool,
 }
 
 fn plan(
@@ -77,6 +81,8 @@ fn plan(
             .checked_add(device)
             .ok_or_else(|| invalid("QTEA SwiGLU peak overflow"))?,
         dense_weight_bytes: 0,
+        workspace_reused: false,
+        workspace_retained: false,
     })
 }
 
@@ -132,69 +138,63 @@ impl CudaBackend {
         if batch == 0 {
             return Ok(ledger);
         }
-        let mut staged = stage(output.len(), limits.max_host_staging_bytes - 4)?;
-        ledger.host_staging_capacity_bytes = byte_count(staged.capacity())?
-            .checked_add(4)
-            .filter(|n| *n <= limits.max_host_staging_bytes)
-            .ok_or_else(|| invalid("QTEA SwiGLU host capacity exceeds limit"))?;
-        let hidden = batch * f; // Checked by plan before allocation.
-        let alloc = |n| {
-            self.stream.alloc_zeros::<f32>(n).map_err(|e| {
-                alloc_or_backend(
-                    "allocate QTEA SwiGLU buffer",
-                    &e,
-                    byte_count(n).unwrap_or(usize::MAX),
-                )
-            })
-        };
-        let device_input = self.stream.clone_htod(input).map_err(|e| {
-            alloc_or_backend(
-                "upload QTEA SwiGLU input",
-                &e,
-                byte_count(input.len()).unwrap_or(usize::MAX),
-            )
-        })?;
-        let mut device_gate = alloc(hidden)?;
-        let mut device_up = alloc(hidden)?;
-        let mut device_output = alloc(output.len())?;
-        let mut status = self
-            .stream
-            .alloc_zeros::<u32>(1)
-            .map_err(|e| alloc_or_backend("allocate QTEA SwiGLU status", &e, 4))?;
-        let hidden_count = u32::try_from(hidden).map_err(|_| invalid("QTEA SwiGLU hidden ABI"))?;
-        let out_count =
-            u32::try_from(output.len()).map_err(|_| invalid("QTEA SwiGLU output ABI"))?;
-        self.launch_qtea_matmul(gate, &device_input, &mut device_gate, hidden_count)?;
-        self.launch_qtea_matmul(up, &device_input, &mut device_up, hidden_count)?;
-        let mut launch = self.stream.launch_builder(&gate.kernels.swiglu);
-        launch
-            .arg(&mut device_gate)
-            .arg(&device_up)
-            .arg(&mut status)
-            .arg(&hidden_count);
-        // SAFETY: exact same-context disjoint buffers, checked u32 count and
-        // private initialized status. Every thread writes one gate element;
-        // status uses atomicOr, and all launches share the ordered backend stream.
-        #[allow(unsafe_code)]
-        unsafe { launch.launch(LaunchConfig::for_num_elems(hidden_count)) }
-            .map_err(|e| driver_err("launch QTEA device SwiGLU", &e))?;
-        drop(launch);
-        self.launch_qtea_matmul(down, &device_gate, &mut device_output, out_count)?;
-        let mut flag = [0u32];
-        self.stream
-            .memcpy_dtoh(&device_output, &mut staged)
-            .map_err(|e| driver_err("read QTEA SwiGLU output", &e))?;
-        self.stream
-            .memcpy_dtoh(&status, &mut flag)
-            .map_err(|e| driver_err("read QTEA SwiGLU status", &e))?;
-        self.stream
-            .synchronize()
-            .map_err(|e| driver_err("finish QTEA SwiGLU", &e))?;
-        if flag[0] != 0 || staged.iter().any(|x| !x.is_finite()) {
-            return Err(invalid("QTEA device SwiGLU nonfinite intermediate/output"));
-        }
-        output.copy_from_slice(&staged);
-        Ok(ledger)
+        self.with_swiglu_workspace(
+            SwiGluWorkspaceKind::PackedQtea,
+            batch,
+            k,
+            f,
+            Some(limits),
+            |w, reused, retained| {
+                ledger.workspace_reused = reused;
+                ledger.workspace_retained = retained;
+                ledger.host_staging_capacity_bytes = byte_count(w.host_output.capacity())?
+                    .checked_add(4)
+                    .filter(|n| *n <= limits.max_host_staging_bytes)
+                    .ok_or_else(|| invalid("QTEA SwiGLU host capacity exceeds limit"))?;
+                let hidden = batch * f; // Checked by plan before allocation.
+                self.stream
+                    .memset_zeros(&mut w.invalid)
+                    .map_err(|e| driver_err("reset QTEA SwiGLU status", &e))?;
+                self.stream
+                    .memcpy_htod(input, &mut w.input)
+                    .map_err(|e| driver_err("upload QTEA SwiGLU input", &e))?;
+                let hidden_count =
+                    u32::try_from(hidden).map_err(|_| invalid("QTEA SwiGLU hidden ABI"))?;
+                let out_count =
+                    u32::try_from(output.len()).map_err(|_| invalid("QTEA SwiGLU output ABI"))?;
+                self.launch_qtea_matmul(gate, &w.input, &mut w.gate, hidden_count)?;
+                self.launch_qtea_matmul(up, &w.input, &mut w.up, hidden_count)?;
+                let mut launch = self.stream.launch_builder(&gate.kernels.swiglu);
+                launch
+                    .arg(&mut w.gate)
+                    .arg(&w.up)
+                    .arg(&mut w.invalid)
+                    .arg(&hidden_count);
+                // SAFETY: exact same-context disjoint buffers, checked u32 count and
+                // private initialized status. Every thread writes one gate element;
+                // status uses atomicOr, and all launches share the ordered backend stream.
+                #[allow(unsafe_code)]
+                unsafe { launch.launch(LaunchConfig::for_num_elems(hidden_count)) }
+                    .map_err(|e| driver_err("launch QTEA device SwiGLU", &e))?;
+                drop(launch);
+                self.launch_qtea_matmul(down, &w.gate, &mut w.output, out_count)?;
+                let mut flag = [0u32];
+                self.stream
+                    .memcpy_dtoh(&w.output, &mut w.host_output)
+                    .map_err(|e| driver_err("read QTEA SwiGLU output", &e))?;
+                self.stream
+                    .memcpy_dtoh(&w.invalid, &mut flag)
+                    .map_err(|e| driver_err("read QTEA SwiGLU status", &e))?;
+                self.stream
+                    .synchronize()
+                    .map_err(|e| driver_err("finish QTEA SwiGLU", &e))?;
+                if flag[0] != 0 || w.host_output.iter().any(|x| !x.is_finite()) {
+                    return Err(invalid("QTEA device SwiGLU nonfinite intermediate/output"));
+                }
+                output.copy_from_slice(&w.host_output);
+                Ok(ledger)
+            },
+        )
     }
 }
 

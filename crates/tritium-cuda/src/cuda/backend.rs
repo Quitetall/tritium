@@ -24,7 +24,11 @@ pub use qtea::{
 mod salt_v2_reader_upload;
 mod salt_v2_runtime;
 mod semantic;
+mod swiglu_workspace;
 pub use salt_v2_runtime::SaltV2GatherReceipt;
+pub use swiglu_workspace::{
+    SwiGluWorkspaceKind, SwiGluWorkspacePlan, SwiGluWorkspaceResources, SwiGluWorkspaceSnapshot,
+};
 
 /// A logical prefix of cudarc page-locked memory.
 ///
@@ -1057,7 +1061,8 @@ pub struct CudaBackend {
     qtea_kernels: Mutex<Option<Arc<qtea::QteaKernels>>>,
     pub(super) semantic_swiglu_enabled: bool,
     pub(super) resident_decoder_budget: Option<usize>,
-    pub(super) semantic_swiglu_workspace: Mutex<Option<semantic::SwigluWorkspace>>,
+    swiglu_workspace: Mutex<swiglu_workspace::Cache>,
+    swiglu_workspace_resources: Option<SwiGluWorkspaceResources>,
 }
 
 /// Process-local pool for transient SALT V2 activation/output buffers.
@@ -1731,7 +1736,8 @@ impl CudaBackend {
             qtea_kernels: Mutex::new(None),
             semantic_swiglu_enabled: false,
             resident_decoder_budget: None,
-            semantic_swiglu_workspace: Mutex::new(None),
+            swiglu_workspace: Mutex::new(swiglu_workspace::Cache::default()),
+            swiglu_workspace_resources: None,
         })
     }
 

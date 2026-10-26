@@ -20,7 +20,6 @@ mod packed;
 mod stream_copy;
 pub(super) mod swiglu;
 use packed::PackedAdditive;
-pub(super) use swiglu::Workspace as SwigluWorkspace;
 
 pub(super) struct CudaTensor {
     rows: usize,

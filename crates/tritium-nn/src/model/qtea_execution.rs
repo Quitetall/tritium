@@ -53,6 +53,13 @@ impl Execution {
             .and_then(|b| b.downcast_ref::<tritium_cuda::CudaBackend>())
             .is_some_and(|b| b.device_swiglu_enabled())
         {
+            if backend
+                .as_concrete()
+                .and_then(|b| b.downcast_ref::<tritium_cuda::CudaBackend>())
+                .is_some_and(|b| b.swiglu_workspace_admission_enabled())
+            {
+                return "qtea-cuda-ordered-device-swiglu-reuse-host-orchestrated";
+            }
             return "qtea-cuda-ordered-device-swiglu-host-orchestrated";
         }
         "qtea-cuda-ordered-host-orchestrated"

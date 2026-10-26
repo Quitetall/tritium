@@ -263,7 +263,8 @@ pub use backend::{
     CudaBackend, QTEA_DEVICE_SWIGLU_NUMERICAL_ID, QteaCudaAllocationLedger, QteaCudaLimits,
     QteaResidentTensor, QteaSwiGluAllocationLedger, SaltResidentLinear, SaltV2Forward,
     SaltV2ForwardMode, SaltV2ForwardReceipt, SaltV2GatherReceipt, SaltV2ResidentAllocationReceipt,
-    SaltV2ResidentTensor,
+    SaltV2ResidentTensor, SwiGluWorkspaceKind, SwiGluWorkspacePlan, SwiGluWorkspaceResources,
+    SwiGluWorkspaceSnapshot,
 };
 #[allow(unused_imports)] // TrainingSaltLinear is the Track D tape seam.
 pub(crate) use backend::{EmbedSegments, TrainingSaltLinear};

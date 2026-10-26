@@ -350,11 +350,7 @@ impl super::LoadedModel {
                     ))
                 },
             )?;
-        let execution = if backend.device_swiglu_enabled() {
-            "qtea-cuda-ordered-device-swiglu-host-orchestrated"
-        } else {
-            "qtea-cuda-ordered-host-orchestrated"
-        };
+        let execution = Execution::Cuda(limits).label(backend.as_ref());
         let physical =
             tritium_spec::TernaryBackend::physical_device_id(backend.as_ref()).to_owned();
         let runner = super::Runner::standard(config, weights, backend, spec, Some(admission))?;

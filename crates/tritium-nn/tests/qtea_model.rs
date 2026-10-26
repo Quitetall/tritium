@@ -494,13 +494,14 @@ fn cuda_request_profiles_are_explicit_positive_nonnull_and_build_gated() {
 fn device_swiglu_request_profiles_require_explicit_cuda_and_hybrid_cap() {
     let root = CommandScratch::new();
     let path = root.0.join("region.json");
-    for hybrid in [false, true] {
+    for (hybrid, reuse) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut request = command_config(&root.0.join("absent.trit"));
-        request["profile"] = (if hybrid {
-            "tritium.qtea-hybrid-cuda-swiglu-host-load.v1"
-        } else {
-            "tritium.qtea-cuda-swiglu-host-load.v1"
-        })
+        request["profile"] = match (hybrid, reuse) {
+            (true, true) => "tritium.qtea-hybrid-cuda-swiglu-reuse-host-load.v1",
+            (false, true) => "tritium.qtea-cuda-swiglu-reuse-host-load.v1",
+            (true, false) => "tritium.qtea-hybrid-cuda-swiglu-host-load.v1",
+            (false, false) => "tritium.qtea-cuda-swiglu-host-load.v1",
+        }
         .into();
         request["cuda"] = serde_json::json!({"device":0,"max_device_weight_bytes":4096,"max_device_staging_bytes":4096});
         if hybrid {
@@ -794,6 +795,90 @@ fn device_swiglu_optin_reaches_nn_and_preserves_default_profile() {
                 assert!((a - b).abs() <= 1e-4 + 1e-4 * b.abs(), "{a} != {b}");
             }
         }
+    }
+}
+
+#[cfg(all(feature = "cuda", feature = "tokenizer"))]
+#[test]
+#[ignore = "explicit physical CUDA bounded-reuse full-model continuity and reservation lifetime"]
+fn budgeted_reuse_model_matches_uncached_device_bits_and_releases_on_drop() {
+    use tritium_evidence::{EvidenceRecorder, MODEL_LOADED_REGISTRATION};
+    use tritium_runtime::TensorPayloadBudget;
+    let _serial = TEXT_SERIAL.lock().unwrap();
+    for tied in [true, false] {
+        let mut f = Fixture::new(tied, true);
+        f.text(false, Some("{{ messages[0]['content'] }} partner".into()));
+        let bytes = f.bytes();
+        let device = TensorPayloadBudget::new(4096);
+        let host = TensorPayloadBudget::new(4096);
+        let backend = tritium_cuda::CudaBackend::new(0)
+            .expect("physical CUDA required")
+            .with_device_swiglu()
+            .with_swiglu_workspace_resources(
+                tritium_cuda::SwiGluWorkspaceResources::new(&device, &host).unwrap(),
+            )
+            .unwrap();
+        let mut recorder =
+            EvidenceRecorder::new("reused-model", [MODEL_LOADED_REGISTRATION]).unwrap();
+        let mut reused = tritium_nn::LoadedModel::load_qtea_cuda(
+            Cursor::new(&bytes),
+            [3; 32],
+            cuda_limits(&f),
+            stream(),
+            Box::new(backend),
+            tritium_runtime::TensorUploadContext {
+                recorder: &mut recorder,
+                span: "load",
+                parent: None,
+                logical_time: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            reused.receipt.observation().backend,
+            "qtea-cuda-ordered-device-swiglu-reuse-host-orchestrated"
+        );
+        assert_eq!((device.used_bytes(), host.used_bytes()), (0, 0));
+        let mut recorder =
+            EvidenceRecorder::new("uncached-model", [MODEL_LOADED_REGISTRATION]).unwrap();
+        let mut uncached = tritium_nn::LoadedModel::load_qtea_cuda(
+            Cursor::new(&bytes),
+            [3; 32],
+            cuda_limits(&f),
+            stream(),
+            Box::new(
+                tritium_cuda::CudaBackend::new(0)
+                    .unwrap()
+                    .with_device_swiglu(),
+            ),
+            tritium_runtime::TensorUploadContext {
+                recorder: &mut recorder,
+                span: "load",
+                parent: None,
+                logical_time: 0,
+            },
+        )
+        .unwrap();
+        for (tokens, positions) in [
+            (&[1, 2][..], &[0, 1][..]),
+            (&[4][..], &[2][..]),
+            (&[5][..], &[3][..]),
+        ] {
+            assert_eq!(
+                bits(&reused.runner.forward(tokens, positions).unwrap()),
+                bits(&uncached.runner.forward(tokens, positions).unwrap())
+            );
+            assert!(device.used_bytes() > 0 && device.used_bytes() <= 4096);
+            assert!(host.used_bytes() > 0 && host.used_bytes() <= 4096);
+        }
+        reused.runner.reset();
+        uncached.runner.reset();
+        assert_eq!(
+            reused.runner.generate_bounded(&[1, 2], 3, 3).unwrap(),
+            uncached.runner.generate_bounded(&[1, 2], 3, 3).unwrap()
+        );
+        drop(reused);
+        assert_eq!((device.used_bytes(), host.used_bytes()), (0, 0));
     }
 }
 

@@ -94,6 +94,8 @@ impl QteaLoadConfig {
             ("tritium.qtea-hybrid-cuda-ordered-host-load.v1", Some(cap), true) if cap > 0 => {}
             ("tritium.qtea-cuda-swiglu-host-load.v1", None, true) => {}
             ("tritium.qtea-hybrid-cuda-swiglu-host-load.v1", Some(cap), true) if cap > 0 => {}
+            ("tritium.qtea-cuda-swiglu-reuse-host-load.v1", None, true) => {}
+            ("tritium.qtea-hybrid-cuda-swiglu-reuse-host-load.v1", Some(cap), true) if cap > 0 => {}
             _ => return Err("--qtea unsupported load profile or preserved-cap selection".into()),
         }
         if let Some(cuda) = &self.cuda {
@@ -189,13 +191,31 @@ impl QteaLoadConfig {
         #[cfg(feature = "cuda")]
         if let Some(cuda) = &self.cuda {
             let backend = tritium_cuda::CudaBackend::new(cuda.device)?;
+            let backend = if matches!(
+                self.profile.as_str(),
+                "tritium.qtea-cuda-swiglu-host-load.v1"
+                    | "tritium.qtea-hybrid-cuda-swiglu-host-load.v1"
+                    | "tritium.qtea-cuda-swiglu-reuse-host-load.v1"
+                    | "tritium.qtea-hybrid-cuda-swiglu-reuse-host-load.v1"
+            ) {
+                backend.with_device_swiglu()
+            } else {
+                backend
+            };
             let backend = Box::new(
                 if matches!(
                     self.profile.as_str(),
-                    "tritium.qtea-cuda-swiglu-host-load.v1"
-                        | "tritium.qtea-hybrid-cuda-swiglu-host-load.v1"
+                    "tritium.qtea-cuda-swiglu-reuse-host-load.v1"
+                        | "tritium.qtea-hybrid-cuda-swiglu-reuse-host-load.v1"
                 ) {
-                    backend.with_device_swiglu()
+                    let device =
+                        tritium_runtime::TensorPayloadBudget::new(cuda.max_device_staging_bytes);
+                    let host = tritium_runtime::TensorPayloadBudget::new(u64::try_from(
+                        self.max_staging_bytes,
+                    )?);
+                    backend.with_swiglu_workspace_resources(
+                        tritium_cuda::SwiGluWorkspaceResources::new(&device, &host)?,
+                    )?
                 } else {
                     backend
                 },

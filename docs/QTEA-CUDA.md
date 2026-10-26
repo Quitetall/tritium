@@ -117,8 +117,9 @@ The low-level `qtea_swiglu_device_into` is an explicit operation with its own
 `qtea.cuda-device-swiglu.f32.v1` (not the wire/fitting identity). It uploads one
 input, retains input plus two hidden arrays plus final output and a four-byte
 status buffer on device, then reads back only the final output and status. Hidden
-arrays are never transferred to host. Private per-call scratch is not cached or
-pooled, and no dense weight shadow is retained. The NN seam uses the minimum
+arrays are never transferred to host. Without explicit workspace resources,
+private per-call scratch is not cached or pooled. No dense weight shadow is
+retained. The NN seam uses the minimum
 host/device staging caps of its three selected owners; selected execution errors
 never silently fall back. The default unsupported/disabled region keeps its old
 path, following ADR0073.
@@ -132,6 +133,11 @@ caller output. Ledgers exclude other weights/calls, caller buffers and allocator
 driver/module/event/shared-memory overhead; they are not measured physical peaks.
 The fixture tolerance of absolute/relative1e-4 is an opt-in numerical observation,
 not a universal whole-model quality bound or permission to relax old bit tests.
+
+An additional explicit budgeted-reuse profile is described in
+[SwiGLU workspace](SWIGLU-WORKSPACE.md). It retains admitted capacity and reports
+reuse/retention flags without changing this numerical mode or the uncached
+profile's behavior. It is not whole-model physical admission.
 
 ## Explicit physical checks
 
