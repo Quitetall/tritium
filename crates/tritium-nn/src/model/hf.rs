@@ -987,7 +987,7 @@ mod tests {
             #[cfg(feature = "host-qtea")]
             Projection::HostQtea(_) => panic!("SALT loader must retain packed additive planes"),
             #[cfg(feature = "cuda")]
-            Projection::SaltV2(_) => {
+            Projection::SaltV2(_) | Projection::CudaQtea(_) => {
                 panic!("legacy SALT loader must retain host-packed additive planes")
             }
         }

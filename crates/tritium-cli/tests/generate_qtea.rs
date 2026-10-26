@@ -51,7 +51,7 @@ fn qtea_unsupported_build_or_backend_refuses_before_source_read() {
             "--eos",
             "3",
             "--backend",
-            "cuda",
+            "metal",
         ])
         .output()
         .unwrap();
@@ -59,7 +59,7 @@ fn qtea_unsupported_build_or_backend_refuses_before_source_read() {
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(
         error.contains(if cfg!(feature = "host-qtea") {
-            "--qtea requires --backend cpu"
+            "--qtea requires --backend cpu or cuda"
         } else {
             "--qtea requires build feature host-qtea"
         }),

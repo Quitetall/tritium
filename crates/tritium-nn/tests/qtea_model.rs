@@ -322,6 +322,319 @@ fn bits(v: &[f32]) -> Vec<u32> {
     v.iter().map(|x| x.to_bits()).collect()
 }
 
+#[cfg(feature = "cuda")]
+fn cuda_limits(f: &Fixture) -> tritium_nn::CudaQteaModelLimits {
+    let mut used = BTreeSet::new();
+    let (mut encoded, mut largest, mut preserved) = (0usize, 0usize, 0usize);
+    for tensor in f.manifest.tensors.values() {
+        match tensor {
+            QteaModelTensor::Qtea { blob, .. } if used.insert(*blob.as_bytes()) => {
+                let bytes = f
+                    .blobs
+                    .iter()
+                    .find(|(_, b)| id(b) == *blob)
+                    .unwrap()
+                    .1
+                    .len();
+                encoded += bytes;
+                largest = largest.max(bytes);
+            }
+            QteaModelTensor::Vector { length, .. } => preserved += *length as usize * 4,
+            QteaModelTensor::Qtea { .. } => {}
+            _ => panic!("standard vectors only"),
+        }
+    }
+    let mut host = limits();
+    host.max_weight_bytes = preserved + largest;
+    assert!(
+        host.max_weight_bytes < f.payload_bytes(),
+        "must stream instead of retaining all host matrices"
+    );
+    tritium_nn::CudaQteaModelLimits {
+        host,
+        max_device_weight_bytes: encoded as u64,
+        max_device_staging_bytes: 1 << 16,
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "explicit physical CUDA standard-model parity/caps/sharing; never silent skip"]
+fn cuda_cold_model_streams_unique_packed_owners_and_matches_host_bits() {
+    for tied in [true, false] {
+        let mut f = Fixture::new(tied, true);
+        let q = "model.layers.0.self_attn.q_proj.weight";
+        let o = "model.layers.0.self_attn.o_proj.weight";
+        let old = f.manifest.tensors[o].blob();
+        f.manifest
+            .tensors
+            .insert(o.into(), f.manifest.tensors[q].clone());
+        f.blobs.retain(|(_, b)| id(b) != old);
+        f.decoded.insert(o.into(), f.decoded[q].clone());
+        let bytes = f.bytes();
+        let cuda = Box::new(tritium_cuda::CudaBackend::new(0).expect("physical CUDA required"));
+        let caps = cuda_limits(&f);
+        for cap in [
+            tritium_nn::CudaQteaModelLimits {
+                max_device_weight_bytes: caps.max_device_weight_bytes - 1,
+                ..caps
+            },
+            tritium_nn::CudaQteaModelLimits {
+                host: HostQteaModelLimits {
+                    max_weight_bytes: caps.host.max_weight_bytes - 1,
+                    ..caps.host
+                },
+                ..caps
+            },
+            tritium_nn::CudaQteaModelLimits {
+                max_device_staging_bytes: 0,
+                ..caps
+            },
+        ] {
+            assert!(
+                ModelWeights::load_qtea_cuda(Cursor::new(&bytes), [3; 32], cap, &cuda).is_err()
+            );
+        }
+        let (cfg, _, weights, package) =
+            ModelWeights::load_qtea_cuda(Cursor::new(&bytes), [3; 32], caps, &cuda).unwrap();
+        assert_eq!(
+            package,
+            tritium_format::PackageId::from_package_bytes(&bytes)
+        );
+        let (Projection::CudaQtea(q), Projection::CudaQtea(o)) =
+            (&weights.layers[0].q_proj, &weights.layers[0].o_proj)
+        else {
+            panic!("must remain CUDA packed")
+        };
+        assert!(Arc::ptr_eq(q, o));
+        let mut sentinel = [77.; 8];
+        assert!(
+            q.forward(&tritium_cpu::CpuBackend::new(), &[0.; 8], 1, &mut sentinel)
+                .is_err()
+        );
+        assert_eq!(sentinel, [77.; 8]);
+        assert!(weights.token_embd.as_dense().is_none());
+        assert!(weights.token_embd.gather(&[0], &mut sentinel).is_err());
+        assert_eq!(sentinel, [77.; 8]);
+        let mut actual = ModelRunner::try_from_weights(cfg, weights, cuda).unwrap();
+        let (_, _, host, _) =
+            ModelWeights::load_qtea(Cursor::new(&bytes), [3; 32], limits()).unwrap();
+        let mut expected =
+            ModelRunner::try_from_weights(config(), host, Box::new(tritium_cpu::CpuBackend::new()))
+                .unwrap();
+        for (tokens, positions) in [
+            (&[1, 2, 3][..], &[0, 1, 2][..]),
+            (&[4][..], &[3][..]),
+            (&[5][..], &[4][..]),
+        ] {
+            assert_eq!(
+                bits(&actual.forward(tokens, positions).unwrap()),
+                bits(&expected.forward(tokens, positions).unwrap())
+            );
+        }
+        actual.reset();
+        expected.reset();
+        assert_eq!(
+            actual.generate(&[1, 2], 3, 3).unwrap(),
+            expected.generate(&[1, 2], 3, 3).unwrap()
+        );
+    }
+}
+
+#[cfg(feature = "tokenizer")]
+#[test]
+fn cuda_request_profiles_are_explicit_positive_nonnull_and_build_gated() {
+    let root = CommandScratch::new();
+    let path = root.0.join("load.json");
+    let mut request = command_config(&root.0.join("absent.trit"));
+    request["profile"] = "tritium.qtea-cuda-ordered-host-load.v1".into();
+    request["cuda"] = serde_json::json!({"device":0,"max_device_weight_bytes":4096,"max_device_staging_bytes":4096});
+    let write =
+        |v: &serde_json::Value| std::fs::write(&path, serde_json::to_vec(v).unwrap()).unwrap();
+    write(&request);
+    let mut missing = request.clone();
+    missing.as_object_mut().unwrap().remove("cuda");
+    write(&missing);
+    assert!(tritium_nn::QteaLoadConfig::read(&path).is_err());
+    write(&request);
+    if cfg!(feature = "cuda") {
+        assert_eq!(
+            tritium_nn::QteaLoadConfig::read(&path)
+                .unwrap()
+                .backend_name(),
+            "cuda"
+        );
+    } else {
+        assert!(
+            tritium_nn::QteaLoadConfig::read(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("build feature cuda")
+        );
+    }
+    for value in [
+        serde_json::Value::Null,
+        serde_json::json!({}),
+        serde_json::json!({"device":0,"max_device_weight_bytes":0,"max_device_staging_bytes":4096}),
+        serde_json::json!({"device":0,"max_device_weight_bytes":4096,"max_device_staging_bytes":0}),
+        serde_json::json!({"device":usize::MAX,"max_device_weight_bytes":4096,"max_device_staging_bytes":4096}),
+    ] {
+        let mut changed = request.clone();
+        changed["cuda"] = value;
+        write(&changed);
+        assert!(tritium_nn::QteaLoadConfig::read(&path).is_err());
+    }
+    request["profile"] = "tritium.qtea-host-load.v1".into();
+    write(&request);
+    assert!(tritium_nn::QteaLoadConfig::read(&path).is_err());
+}
+
+#[cfg(all(feature = "cuda", feature = "tokenizer"))]
+#[test]
+#[ignore = "explicit physical CUDA text-model load/recording/generation; never silent skip"]
+fn cuda_text_model_publishes_distinct_execution_and_matches_host() {
+    let _serial = TEXT_SERIAL.lock().unwrap();
+    use tritium_evidence::{EvidenceRecorder, MODEL_LOADED_REGISTRATION};
+    use tritium_nn::{LoadedModel, Tokenizer};
+    for tied in [true, false] {
+        let mut f = Fixture::new(tied, true);
+        f.text(false, Some("{{ messages[0]['content'] }} partner".into()));
+        let bytes = f.bytes();
+        let mut recorder = EvidenceRecorder::new("cuda-text", [MODEL_LOADED_REGISTRATION]).unwrap();
+        let mut gpu = LoadedModel::load_qtea_cuda(
+            Cursor::new(&bytes),
+            [3; 32],
+            cuda_limits(&f),
+            stream(),
+            Box::new(tritium_cuda::CudaBackend::new(0).expect("physical CUDA required")),
+            tritium_runtime::TensorUploadContext {
+                recorder: &mut recorder,
+                span: "load",
+                parent: None,
+                logical_time: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            gpu.receipt.observation().backend,
+            "qtea-cuda-ordered-host-orchestrated"
+        );
+        assert_eq!(recorder.events().len(), 1);
+        let prompt = gpu
+            .tokenizer
+            .render_chat_prompt(&[("user", "Testing")], 1024)
+            .unwrap()
+            .unwrap();
+        let input = gpu.tokenizer.encode(&prompt).unwrap();
+        let mut recorder = EvidenceRecorder::new("host-text", [MODEL_LOADED_REGISTRATION]).unwrap();
+        let mut host = LoadedModel::load_qtea(
+            Cursor::new(&bytes),
+            [3; 32],
+            limits(),
+            stream(),
+            tritium_runtime::TensorUploadContext {
+                recorder: &mut recorder,
+                span: "load",
+                parent: None,
+                logical_time: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            gpu.runner.generate_bounded(&input, 3, 3).unwrap(),
+            host.runner.generate_bounded(&input, 3, 3).unwrap()
+        );
+    }
+}
+
+#[cfg(all(feature = "cuda", feature = "tokenizer"))]
+#[test]
+#[ignore = "explicit physical CUDA late-load I/O failure remains unpublished"]
+fn cuda_text_load_late_io_failure_does_not_publish_a_model() {
+    use std::{
+        cell::Cell,
+        io::{Read, Seek, SeekFrom},
+        rc::Rc,
+    };
+    struct Fault {
+        source: Cursor<Vec<u8>>,
+        reads: Rc<Cell<usize>>,
+        fail_at: usize,
+    }
+    impl Read for Fault {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.reads.get() + 1;
+            self.reads.set(n);
+            if n == self.fail_at {
+                return Err(std::io::Error::other("injected final source read failure"));
+            }
+            self.source.read(out)
+        }
+    }
+    impl Seek for Fault {
+        fn seek(&mut self, p: SeekFrom) -> std::io::Result<u64> {
+            self.source.seek(p)
+        }
+    }
+    let _serial = TEXT_SERIAL.lock().unwrap();
+    let mut f = Fixture::new(true, true);
+    f.text(false, Some("{{ messages[0]['content'] }} partner".into()));
+    let cuda = || Box::new(tritium_cuda::CudaBackend::new(0).expect("physical CUDA required"));
+    let reads = Rc::new(Cell::new(0));
+    let mut rec = tritium_evidence::EvidenceRecorder::new(
+        "initial",
+        [tritium_evidence::MODEL_LOADED_REGISTRATION],
+    )
+    .unwrap();
+    let loaded = tritium_nn::LoadedModel::load_qtea_cuda(
+        Fault {
+            source: Cursor::new(f.bytes()),
+            reads: Rc::clone(&reads),
+            fail_at: usize::MAX,
+        },
+        [3; 32],
+        cuda_limits(&f),
+        stream(),
+        cuda(),
+        tritium_runtime::TensorUploadContext {
+            recorder: &mut rec,
+            span: "load",
+            parent: None,
+            logical_time: 0,
+        },
+    )
+    .unwrap();
+    drop(loaded);
+    let last = reads.get();
+    assert!(last > 10);
+    reads.set(0);
+    let mut rec = tritium_evidence::EvidenceRecorder::new(
+        "failed",
+        [tritium_evidence::MODEL_LOADED_REGISTRATION],
+    )
+    .unwrap();
+    let result = tritium_nn::LoadedModel::load_qtea_cuda(
+        Fault {
+            source: Cursor::new(f.bytes()),
+            reads: Rc::clone(&reads),
+            fail_at: last,
+        },
+        [3; 32],
+        cuda_limits(&f),
+        stream(),
+        cuda(),
+        tritium_runtime::TensorUploadContext {
+            recorder: &mut rec,
+            span: "load",
+            parent: None,
+            logical_time: 0,
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(reads.get(), last);
+    assert!(rec.events().is_empty());
+}
+
 #[cfg(feature = "tokenizer")]
 fn command_config(path: &std::path::Path) -> serde_json::Value {
     serde_json::json!({

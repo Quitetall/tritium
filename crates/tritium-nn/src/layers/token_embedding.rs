@@ -26,6 +26,8 @@ enum Storage {
     #[cfg(feature = "host-qtea")]
     HostQtea(Arc<HostQteaLinear>),
     #[cfg(feature = "cuda")]
+    CudaQtea(Arc<crate::CudaQteaLinear>),
+    #[cfg(feature = "cuda")]
     SaltV2(Arc<tritium_cuda::SaltV2ResidentTensor>),
 }
 
@@ -65,6 +67,16 @@ fn rotate_row(row: &mut [f32], group: usize) {
 }
 
 impl TokenEmbedding {
+    /// Share one packed CUDA allocation for original-row gather and tied logits.
+    #[cfg(feature = "cuda")]
+    pub fn from_cuda_qtea(tensor: Arc<crate::CudaQteaLinear>) -> Self {
+        Self {
+            rows: tensor.rows(),
+            cols: tensor.columns(),
+            rotation: None,
+            storage: Storage::CudaQtea(tensor),
+        }
+    }
     /// Share residual-bearing host QTEA storage for gather and tied unembedding.
     /// Constructor-checked geometry is immutable; no dense table is retained.
     #[cfg(feature = "host-qtea")]
@@ -289,6 +301,8 @@ impl TokenEmbedding {
             #[cfg(feature = "host-qtea")]
             Storage::HostQtea(_) => None,
             #[cfg(feature = "cuda")]
+            Storage::CudaQtea(_) => None,
+            #[cfg(feature = "cuda")]
             Storage::SaltV2(_) => None,
         }
     }
@@ -318,6 +332,8 @@ impl TokenEmbedding {
             Storage::Dense(_) | Storage::Tensor(_) => false,
             #[cfg(feature = "host-qtea")]
             Storage::HostQtea(_) => false,
+            #[cfg(feature = "cuda")]
+            Storage::CudaQtea(_) => false,
         }
     }
 
@@ -332,6 +348,8 @@ impl TokenEmbedding {
             #[cfg(feature = "host-qtea")]
             Storage::HostQtea(_) => 0,
             #[cfg(feature = "cuda")]
+            Storage::CudaQtea(_) => 0,
+            #[cfg(feature = "cuda")]
             Storage::SaltV2(_) => 0,
         }
     }
@@ -339,6 +357,8 @@ impl TokenEmbedding {
     /// Retained payload and metadata bytes, excluding this wrapper.
     /// Cloned packed tables share arenas, so summing this value across clones double-counts them.
     /// Shared backend tensors report only owned payload, excluding backend overhead.
+    /// CUDA QTEA reports encoded device bytes only, excluding Rust/driver metadata;
+    /// this is logical payload accounting, not measured physical VRAM.
     #[must_use]
     pub fn resident_bytes(&self) -> usize {
         match &self.storage {
@@ -350,6 +370,8 @@ impl TokenEmbedding {
             Storage::HostQtea(tensor) => tensor
                 .encoded_capacity_bytes()
                 .saturating_add(size_of::<HostQteaLinear>()),
+            #[cfg(feature = "cuda")]
+            Storage::CudaQtea(tensor) => tensor.encoded_bytes(),
             #[cfg(feature = "cuda")]
             Storage::SaltV2(tensor) => {
                 usize::try_from(tensor.allocation_receipt().steady_resident_bytes())
@@ -380,6 +402,10 @@ impl TokenEmbedding {
             Storage::HostSaltV2(tensor) => tensor.gather_rows(tokens, out),
             #[cfg(feature = "host-qtea")]
             Storage::HostQtea(tensor) => tensor.gather(tokens, out),
+            #[cfg(feature = "cuda")]
+            Storage::CudaQtea(_) => Err(NnError::Backend(
+                "QTEA CUDA gather requires gather_with_backend".into(),
+            )),
             #[cfg(feature = "cuda")]
             Storage::SaltV2(_) => Err(NnError::Backend(
                 "resident SALT V2 embedding gather requires the backend-aware gather_with_backend"
@@ -472,6 +498,8 @@ impl TokenEmbedding {
             }
             #[cfg(feature = "host-qtea")]
             Storage::HostQtea(_) => self.gather(tokens, out),
+            #[cfg(feature = "cuda")]
+            Storage::CudaQtea(tensor) => tensor.gather(backend, tokens, out),
         }
     }
 
@@ -513,6 +541,8 @@ impl TokenEmbedding {
             #[cfg(feature = "host-qtea")]
             Storage::HostQtea(tensor) => tensor.forward(hidden, 1, logits),
             #[cfg(feature = "cuda")]
+            Storage::CudaQtea(_) => Err(NnError::Backend("QTEA CUDA unembedding requires unembed_exact_with_backend".into())),
+            #[cfg(feature = "cuda")]
             Storage::SaltV2(_) => Err(NnError::Backend(
                 "resident SALT V2 unembedding requires the backend-aware unembed_exact_with_backend"
                     .into(),
@@ -552,6 +582,8 @@ impl TokenEmbedding {
             }
             #[cfg(feature = "host-qtea")]
             Storage::HostQtea(_) => self.unembed_exact(hidden, logits),
+            #[cfg(feature = "cuda")]
+            Storage::CudaQtea(tensor) => tensor.forward(backend, hidden, 1, logits),
         }
     }
 }

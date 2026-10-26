@@ -1029,7 +1029,7 @@ mod tests {
             #[cfg(feature = "host-qtea")]
             Projection::HostQtea(_) => panic!("reference loader must dequantize to exact dense"),
             #[cfg(feature = "cuda")]
-            Projection::SaltV2(_) => {
+            Projection::SaltV2(_) | Projection::CudaQtea(_) => {
                 panic!("reference loader must not publish resident SALT V2")
             }
         }
@@ -1202,7 +1202,7 @@ mod tests {
                 panic!("reference loader must dequantize the head to exact dense")
             }
             #[cfg(feature = "cuda")]
-            Projection::SaltV2(_) => {
+            Projection::SaltV2(_) | Projection::CudaQtea(_) => {
                 panic!("reference loader must not publish a resident SALT V2 head")
             }
         }

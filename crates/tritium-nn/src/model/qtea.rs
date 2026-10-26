@@ -1,6 +1,7 @@
 //! Complete standard-model admission over the distinct packed QTEA carrier.
+use super::qtea_execution::Execution;
 use super::{ModelWeights, hf::NameSchema};
-use crate::{ArchSpec, ModelConfig, NnError, Projection, TokenEmbedding};
+use crate::{ArchSpec, ModelConfig, NnError};
 use std::{
     cell::RefCell,
     collections::BTreeMap,
@@ -75,6 +76,7 @@ pub(super) fn publish(
     package: tritium_format::PackageId,
     expected_source_model: [u8; 32],
     physical_device: String,
+    execution: &str,
     context: tritium_runtime::TensorUploadContext<'_>,
 ) -> Result<super::LoadedModel, NnError> {
     runner.qtea_package = Some(package);
@@ -85,7 +87,7 @@ pub(super) fn publish(
             declared_source_model: expected_source_model,
         },
         architecture: architecture.name().into(),
-        backend: "qtea-scalar-host".into(),
+        backend: execution.into(),
         physical_device,
         vocab_size: architecture.vocab_size() as u64,
         layer_count: architecture.layer_count() as u64,
@@ -123,7 +125,8 @@ impl ModelWeights {
         let (config, spec, weights, package, ()) = Self::load_qtea_with_admission(
             source,
             expected_source_model,
-            limits,
+            Execution::Host(limits),
+            None,
             |_, _, _| Ok(()),
         )?;
         Ok((config, spec, weights, package))
@@ -132,9 +135,11 @@ impl ModelWeights {
     fn load_qtea_with_admission<R: Read + Seek, A>(
         source: R,
         expected_source_model: [u8; 32],
-        limits: HostQteaModelLimits,
+        target: Execution,
+        backend: Option<&dyn tritium_spec::TernaryBackend>,
         admit: impl FnOnce(&mut QteaModelReader<R>, &ModelConfig, usize) -> Result<A, NnError>,
     ) -> Result<(ModelConfig, ArchSpec, Self, tritium_format::PackageId, A), NnError> {
+        let limits = target.host();
         let mut model_limits = limits.model;
         model_limits.max_config_bytes = model_limits
             .max_config_bytes
@@ -162,9 +167,9 @@ impl ModelWeights {
             plan,
             vocab,
         } = *prepared;
-        super::qtea_owners::plan(&reader, limits.max_weight_bytes)?;
+        super::qtea_owners::plan_target(&reader, target)?;
         let admission = admit(&mut reader, &config, vocab)?;
-        let owners = super::qtea_owners::read(&mut reader, limits)?;
+        let owners = super::qtea_owners::read_target(&mut reader, target, backend)?;
         let mut packed = owners.matrices;
         let vectors = owners
             .preserved
@@ -178,7 +183,7 @@ impl ModelWeights {
         let weights = plan.assemble(
             &config,
             &spec,
-            TokenEmbedding::from_host_qtea(embedding),
+            embedding.embedding(),
             |name, _| {
                 vectors
                     .borrow_mut()
@@ -188,7 +193,7 @@ impl ModelWeights {
             |name, _, _| {
                 packed
                     .remove(name)
-                    .map(Projection::HostQtea)
+                    .map(super::qtea_owners::Matrix::projection)
                     .ok_or_else(|| NnError::MissingTensor(name.into()))
             },
         )?;
@@ -216,7 +221,8 @@ impl super::Runner {
         let (config, spec, weights, package, admission) = ModelWeights::load_qtea_with_admission(
             source,
             expected_source_model,
-            limits,
+            Execution::Host(limits),
+            None,
             |_, config, _| super::CacheAdmission::standard(config, stream),
         )?;
         let mut runner = Self::standard(
@@ -262,7 +268,8 @@ impl super::LoadedModel {
             ModelWeights::load_qtea_with_admission(
                 source,
                 expected_source_model,
-                limits,
+                Execution::Host(limits),
+                None,
                 |reader, config, vocab| {
                     let admission = super::CacheAdmission::standard(config, stream)?;
                     let tokenizer = read_tokenizer(reader, vocab)?;
@@ -279,6 +286,80 @@ impl super::LoadedModel {
             package,
             expected_source_model,
             physical_device,
+            "qtea-scalar-host",
+            context,
+        )
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl ModelWeights {
+    /// Cold-load packed matrices directly to CUDA, preserving vectors on host.
+    /// Uses one encoded upload Vec at a time and shared immutable blob ownership.
+    /// # Errors
+    /// Same source/schema/numeric refusals as host loading plus aggregate caps and CUDA errors.
+    pub fn load_qtea_cuda(
+        source: impl Read + Seek,
+        expected_source_model: [u8; 32],
+        limits: super::CudaQteaModelLimits,
+        backend: &tritium_cuda::CudaBackend,
+    ) -> Result<(ModelConfig, ArchSpec, Self, tritium_format::PackageId), NnError> {
+        let (config, spec, weights, package, ()) = Self::load_qtea_with_admission(
+            source,
+            expected_source_model,
+            Execution::Cuda(limits),
+            Some(backend),
+            |_, _, _| Ok(()),
+        )?;
+        Ok((config, spec, weights, package))
+    }
+}
+
+#[cfg(all(feature = "cuda", feature = "tokenizer"))]
+impl super::LoadedModel {
+    /// Explicit packed-CUDA model, with host attention/state/orchestration.
+    /// Not a fully resident graph, fast-mode claim or independent qualification.
+    /// # Errors
+    /// Recording/text/cache/source/weight admission, aggregate caps, CUDA or final publication failure.
+    pub fn load_qtea_cuda(
+        source: impl Read + Seek,
+        expected_source_model: [u8; 32],
+        limits: super::CudaQteaModelLimits,
+        stream: super::StreamLimits,
+        backend: Box<tritium_cuda::CudaBackend>,
+        context: tritium_runtime::TensorUploadContext<'_>,
+    ) -> Result<Self, NnError> {
+        context
+            .recorder
+            .check_emit::<tritium_schema::ModelLoaded>(
+                context.span,
+                context.parent,
+                context.logical_time,
+            )
+            .map_err(failure)?;
+        let (config, spec, weights, package, (admission, tokenizer)) =
+            ModelWeights::load_qtea_with_admission(
+                source,
+                expected_source_model,
+                Execution::Cuda(limits),
+                Some(backend.as_ref()),
+                |reader, config, vocab| {
+                    Ok((
+                        super::CacheAdmission::standard(config, stream)?,
+                        read_tokenizer(reader, vocab)?,
+                    ))
+                },
+            )?;
+        let physical =
+            tritium_spec::TernaryBackend::physical_device_id(backend.as_ref()).to_owned();
+        let runner = super::Runner::standard(config, weights, backend, spec, Some(admission))?;
+        publish(
+            runner,
+            tokenizer,
+            package,
+            expected_source_model,
+            physical,
+            "qtea-cuda-ordered-host-orchestrated",
             context,
         )
     }

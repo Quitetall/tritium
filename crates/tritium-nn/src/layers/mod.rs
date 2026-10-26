@@ -13,6 +13,8 @@ mod projection;
 mod q2;
 #[cfg(feature = "host-qtea")]
 mod qtea;
+#[cfg(feature = "cuda")]
+mod qtea_cuda;
 mod qwen35_deltanet;
 mod qwen35_full_attention;
 mod salt;
@@ -31,6 +33,8 @@ pub use projection::{Projection, ProjectionActivationMode};
 pub use q2::Q2Linear;
 #[cfg(feature = "host-qtea")]
 pub use qtea::HostQteaLinear;
+#[cfg(feature = "cuda")]
+pub use qtea_cuda::CudaQteaLinear;
 pub use qwen35_deltanet::{Qwen35DeltaNet, Qwen35DeltaNetCache, Qwen35DeltaNetWeights};
 pub use qwen35_full_attention::{
     Qwen35FullAttention, Qwen35FullAttentionCache, Qwen35FullAttentionWeights,

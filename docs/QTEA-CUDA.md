@@ -41,10 +41,60 @@ It excludes driver/context/module/events, shared memory, allocation rounding,
 caller buffers and other handles. It is not physical VRAM/RSS measurement,
 whole-model peak admission or a compression/release receipt.
 
-Full NN/embedding/serving dispatch and resident activation chaining are not wired
-by this primitive. Existing QTEA model loading/serving remains CPU-only. GPU and
-out-of-core fitting, large-model quality/MTP, speed, other devices and independent
-release gates remain open. No experimental method is promoted by this API.
+The primitives also support explicit host-orchestrated NN/embedding/model loading
+and CLI/loopback serving (proposed ADR0173), described below. Existing host profiles
+remain CPU-only. Resident activation chaining, GPU/out-of-core fitting, large-model
+quality/MTP, speed, other devices and independent release gates remain open. No
+experimental method is promoted by inference support.
+
+## Explicit host-orchestrated models
+
+`tritium-nn` with `host-qtea,cuda` adds `CudaQteaLinear`, `Projection::CudaQtea`,
+`TokenEmbedding::from_cuda_qtea`, `ModelWeights::load_qtea_cuda` and, with
+`tokenizer`, `LoadedModel::load_qtea_cuda` / `load_qtea_hybrid_cuda`.
+One encoded device allocation per unique blob is shared across projections and
+embedding/tied unembedding. Loading streams one encoded host tensor at a time;
+there is no complete retained CPU matrix set or dense matrix shadow. All QTEA
+matrix operations execute on the concrete CUDA backend; a CPU/wrong-context
+backend refuses. Existing CPU constructors and numerical identities are unchanged.
+
+`CudaQteaModelLimits` separates aggregate unique encoded `max_device_weight_bytes`
+and per-call `max_device_staging_bytes`. Its `host` field carries existing source/
+per-owner limits, but `host.max_weight_bytes` now explicitly bounds retained
+preserved F32 Vec capacities plus the one current encoded upload Vec. It does not
+count the aggregate device weights again. The complete preserved-payload sum plus
+largest encoded tensor is planned before device weight allocation, and actual
+capacities are checked while loading. `host.max_staging_bytes` bounds private
+per-call host output staging. Metadata, transient preserved-vector byte decoding,
+attention/state/activation/cache memory, concurrent calls/models and driver/
+allocator overhead remain separate and are not physical admission.
+
+The shared CLI/server JSON request keeps existing fields and adds a required
+nonnull `cuda` object only in the new profiles:
+
+```json
+{
+  "profile": "tritium.qtea-cuda-ordered-host-load.v1",
+  "cuda": {"device": 0, "max_device_weight_bytes": 1073741824,
+           "max_device_staging_bytes": 16777216}
+}
+```
+
+This is a fragment, not a complete load request. Supply all existing path/source/
+read/host-load/staging/stream fields. The hybrid profile is
+`tritium.qtea-hybrid-cuda-ordered-host-load.v1` and also requires the existing
+positive `max_preserved_tensor_elements`. Device caps must be positive. Host
+profiles reject the CUDA object; missing/null CUDA selection refuses. Builds
+without CUDA refuse the new profiles before model/device loading. Both CLI and
+server require `--backend cuda` to match a CUDA profile; host profiles require
+`--backend cpu`. No automatic selection or fallback is available. Serving remains
+loopback-only and unqualified, without speculative/batching/resident modes.
+
+ModelLoaded observations say `qtea-cuda-ordered-host-orchestrated`: projections,
+gather and unembedding execute on GPU, but attention/norms/state/orchestration stay
+host-side and activations cross the host boundary per operation. This is **not**
+a fully resident graph or speed promise. MTP remains Unverified; explicit
+draft-only synthetic parity never promotes it or qualifies the real Qwen model.
 
 ## Explicit physical checks
 

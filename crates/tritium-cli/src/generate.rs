@@ -72,7 +72,7 @@ impl CliRunner {
     }
 }
 
-/// Explicit scalar-host QTEA continuation; shares the request with serving.
+/// Explicit QTEA continuation; execution request is shared with serving.
 #[cfg(feature = "host-qtea")]
 pub(crate) fn run_qtea(
     path: &Path,
@@ -84,14 +84,18 @@ pub(crate) fn run_qtea(
     eos: u32,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
-        backend_name == "cpu",
-        "--qtea requires --backend cpu; no GPU or resident fallback"
+        matches!(backend_name, "cpu" | "cuda"),
+        "--qtea requires --backend cpu or cuda matching its explicit profile; no fallback"
     );
     anyhow::ensure!(
         greedy,
         "--greedy=false: sampling is not implemented in this subcommand"
     );
     let config = tritium_nn::QteaLoadConfig::read(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    anyhow::ensure!(
+        backend_name == config.backend_name(),
+        "--qtea --backend must match its explicit execution profile; no fallback"
+    );
     anyhow::ensure!(
         max_new > 0 && max_new <= config.stream_limits().max_context,
         "--qtea --max-new must be positive and fit admitted context"
@@ -121,7 +125,7 @@ pub(crate) fn run_qtea(
         })
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     eprintln!(
-        "QTEA scalar-host candidate, not production-qualified: {}",
+        "QTEA candidate with explicit execution profile, not production-qualified: {}",
         serde_json::to_string(loaded.receipt.observation())?
     );
     recorder.seal()?;

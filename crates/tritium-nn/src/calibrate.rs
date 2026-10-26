@@ -82,7 +82,9 @@ pub fn dense(p: &Projection) -> (Vec<f32>, usize, usize) {
             panic!("from_hf builds Dense projections")
         }
         #[cfg(feature = "cuda")]
-        Projection::SaltV2(_) => panic!("from_hf builds Dense projections"),
+        Projection::SaltV2(_) | Projection::CudaQtea(_) => {
+            panic!("from_hf builds Dense projections")
+        }
         #[cfg(feature = "host-qtea")]
         Projection::HostQtea(_) => panic!("from_hf builds Dense projections"),
     }

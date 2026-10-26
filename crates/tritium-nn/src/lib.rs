@@ -44,6 +44,8 @@ pub use error::NnError;
 pub use error::ResidentOpError;
 pub use evaluation::{TeacherForcedPerplexity, teacher_forced_perplexity_windows};
 pub use kv_cache::KvCache;
+#[cfg(feature = "cuda")]
+pub use layers::CudaQteaLinear;
 #[cfg(feature = "host-qtea")]
 pub use layers::HostQteaLinear;
 pub use layers::{
@@ -53,6 +55,8 @@ pub use layers::{
     Qwen35FullAttentionWeights, Relu2Mlp, SaltLinear, SwiGluMlp, TensorLoader, TernaryLinear,
     TokenEmbedding, TransformerBlock,
 };
+#[cfg(all(feature = "host-qtea", feature = "cuda"))]
+pub use model::CudaQteaModelLimits;
 #[cfg(all(feature = "host-qtea", feature = "tokenizer"))]
 pub use model::HostQteaHybridModelLimits;
 #[cfg(feature = "host-qtea")]

@@ -316,6 +316,134 @@ fn close(actual: &[f32], expected: &[f32]) {
     }
     eprintln!("synthetic hybrid QTEA/decoded max_abs_error={maximum}; not quality qualification");
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "explicit physical CUDA hybrid language/text and draft-only MTP parity; no silent skip"]
+fn cuda_hybrid_model_and_unverified_draft_execute_packed() {
+    let _serial = crate::model::chat_renderer::TEST_SERIAL.lock().unwrap();
+    let f = Fixture::new();
+    let caps = super::super::CudaQteaModelLimits {
+        host: limits().base,
+        max_device_weight_bytes: 1 << 20,
+        max_device_staging_bytes: 1 << 16,
+    };
+    let mut recorder = tritium_evidence::EvidenceRecorder::new(
+        "hybrid-cuda",
+        [tritium_evidence::MODEL_LOADED_REGISTRATION],
+    )
+    .unwrap();
+    let mut actual = super::super::LoadedModel::load_qtea_hybrid_cuda(
+        Cursor::new(f.bytes()),
+        [3; 32],
+        caps,
+        limits().max_preserved_tensor_elements,
+        stream(),
+        Box::new(tritium_cuda::CudaBackend::new(0).expect("physical CUDA required")),
+        tritium_runtime::TensorUploadContext {
+            recorder: &mut recorder,
+            span: "load",
+            parent: None,
+            logical_time: 0,
+        },
+    )
+    .unwrap();
+    let mut expected = load(&f, limits()).unwrap();
+    assert_eq!(
+        actual.receipt.observation().backend,
+        "qtea-cuda-ordered-host-orchestrated"
+    );
+    assert_eq!(
+        actual.runner.mtp_status(),
+        Some(Qwen35MtpStatus::Unverified)
+    );
+    let bit = |v: Vec<f32>| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        bit(actual.runner.forward(&[1, 2], &[0, 1]).unwrap()),
+        bit(expected.runner.forward(&[1, 2], &[0, 1]).unwrap())
+    );
+    assert_eq!(
+        bit(actual.runner.step(4).unwrap()),
+        bit(expected.runner.step(4).unwrap())
+    );
+    actual.runner.reset();
+    expected.runner.reset();
+    assert_eq!(
+        actual.runner.generate_bounded(&[1, 2], 3, 3).unwrap(),
+        expected.runner.generate_bounded(&[1, 2], 3, 3).unwrap()
+    );
+    assert_eq!(recorder.events().len(), 1);
+
+    // Exercise the existing explicitly non-promoting draft-only interface with
+    // real assembled packed owners. No fabricated oracle trace or promotion.
+    let parts = |gpu: bool| {
+        let backend: Box<dyn tritium_spec::TernaryBackend> = if gpu {
+            Box::new(tritium_cuda::CudaBackend::new(0).expect("physical CUDA required"))
+        } else {
+            Box::new(tritium_cpu::CpuBackend::new())
+        };
+        let mut reader = QteaModelReader::open_hybrid(
+            Cursor::new(f.bytes()),
+            caps.host.receiving,
+            QteaHybridModelReadLimits {
+                base: caps.host.model,
+                max_preserved_tensor_elements: limits().max_preserved_tensor_elements,
+            },
+            [3; 32],
+        )
+        .unwrap();
+        let target = if gpu {
+            Execution::Cuda(caps)
+        } else {
+            Execution::Host(caps.host)
+        };
+        super::super::qtea_owners::plan_target(&reader, target).unwrap();
+        let owners = Source(RefCell::new(
+            super::super::qtea_owners::read_target(&mut reader, target, Some(backend.as_ref()))
+                .unwrap(),
+        ));
+        let language_weights = load_language_weights(&owners, &config().text).unwrap();
+        let mtp_weights = load_mtp_weights(&owners, &config().text).unwrap();
+        let language =
+            super::super::Qwen35TextRunner::new(&config().text, language_weights, backend).unwrap();
+        let mtp = super::super::UnverifiedQwen35Mtp::new(&language, mtp_weights).unwrap();
+        reader.verify().unwrap();
+        (language, mtp)
+    };
+    let (gpu, gpu_mtp) = parts(true);
+    let (host, host_mtp) = parts(false);
+    let mut gc = gpu.new_cache(8).unwrap();
+    let mut hc = host.new_cache(8).unwrap();
+    let go = gpu.forward(&[1, 2], &mut gc).unwrap();
+    let ho = host.forward(&[1, 2], &mut hc).unwrap();
+    let gd = gpu_mtp.draft_only_runner();
+    let hd = host_mtp.draft_only_runner();
+    let mut gdc = gd.new_cache(8).unwrap();
+    let mut hdc = hd.new_cache(8).unwrap();
+    let got = gd.forward(&gpu, &go, 4, &mut gdc).unwrap();
+    let want = hd.forward(&host, &ho, 4, &mut hdc).unwrap();
+    assert_eq!(
+        got.final_hidden_states()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        want.final_hidden_states()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        got.last_logits()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        want.last_logits()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(gpu_mtp.status(), Qwen35MtpStatus::Unverified);
+}
 #[test]
 fn native_fit_hybrid_language_mtp_loads_packed_and_runs_source_bound() {
     let _serial = crate::model::chat_renderer::TEST_SERIAL.lock().unwrap();

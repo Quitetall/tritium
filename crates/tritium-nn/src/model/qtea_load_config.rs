@@ -1,4 +1,4 @@
-//! Shared explicit host-QTEA command request. Logical caps, not qualification.
+//! Shared explicit QTEA execution request. Logical caps, not qualification.
 use super::load_config::{StreamConfig, read_config};
 use serde::Deserialize;
 use std::{error::Error, path::Path};
@@ -30,9 +30,21 @@ pub struct QteaLoadConfig {
     max_validation_bytes: usize,
     max_weight_bytes: usize,
     max_staging_bytes: usize,
+    #[serde(default, deserialize_with = "present_cuda")]
+    cuda: Option<CudaOptions>,
     #[serde(default, deserialize_with = "present_preserved_cap")]
     max_preserved_tensor_elements: Option<usize>,
     stream_limits: StreamConfig,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CudaOptions {
+    device: usize,
+    max_device_weight_bytes: u64,
+    max_device_staging_bytes: u64,
+}
+fn present_cuda<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<CudaOptions>, D::Error> {
+    CudaOptions::deserialize(d).map(Some)
 }
 fn present_preserved_cap<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
@@ -64,11 +76,33 @@ impl QteaLoadConfig {
     pub fn stream_limits(&self) -> super::StreamLimits {
         self.stream_limits.limits()
     }
+    /// Required explicit command backend, derived from the admitted profile.
+    /// CUDA is host-orchestrated packed matrix execution, not a resident graph.
+    #[must_use]
+    pub fn backend_name(&self) -> &'static str {
+        if self.cuda.is_some() { "cuda" } else { "cpu" }
+    }
     fn validate(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        match (self.profile.as_str(), self.max_preserved_tensor_elements) {
-            ("tritium.qtea-host-load.v1", None) => {}
-            ("tritium.qtea-hybrid-host-load.v1", Some(cap)) if cap > 0 => {}
+        match (
+            self.profile.as_str(),
+            self.max_preserved_tensor_elements,
+            self.cuda.is_some(),
+        ) {
+            ("tritium.qtea-host-load.v1", None, false) => {}
+            ("tritium.qtea-hybrid-host-load.v1", Some(cap), false) if cap > 0 => {}
+            ("tritium.qtea-cuda-ordered-host-load.v1", None, true) => {}
+            ("tritium.qtea-hybrid-cuda-ordered-host-load.v1", Some(cap), true) if cap > 0 => {}
             _ => return Err("--qtea unsupported load profile or preserved-cap selection".into()),
+        }
+        if let Some(cuda) = &self.cuda {
+            if i32::try_from(cuda.device).is_err()
+                || cuda.max_device_weight_bytes == 0
+                || cuda.max_device_staging_bytes == 0
+            {
+                return Err("--qtea invalid CUDA device or nonpositive device caps".into());
+            }
+            #[cfg(not(feature = "cuda"))]
+            return Err("--qtea CUDA profile requires build feature cuda; no host fallback".into());
         }
         if !self.path().is_absolute()
             || self.path.len() > 4096
@@ -112,8 +146,8 @@ impl QteaLoadConfig {
         }
         Ok(())
     }
-    /// Open one regular model and use the existing source-bound scalar-host loader.
-    /// No backend selector, GPU initialization, upload or dense fallback exists.
+    /// Open one regular model with its explicit admitted execution profile.
+    /// Host defaults stay unchanged. CUDA requests never fall back to host/dense.
     /// # Errors
     /// Invalid context/configuration/source, model/text admission or construction.
     pub fn load(
@@ -150,6 +184,37 @@ impl QteaLoadConfig {
             max_weight_bytes: self.max_weight_bytes,
             max_staging_bytes: self.max_staging_bytes,
         };
+        #[cfg(feature = "cuda")]
+        if let Some(cuda) = &self.cuda {
+            let backend = Box::new(tritium_cuda::CudaBackend::new(cuda.device)?);
+            let gpu = super::CudaQteaModelLimits {
+                host: limits,
+                max_device_weight_bytes: cuda.max_device_weight_bytes,
+                max_device_staging_bytes: cuda.max_device_staging_bytes,
+            };
+            return Ok(
+                if let Some(max_preserved) = self.max_preserved_tensor_elements {
+                    super::LoadedModel::load_qtea_hybrid_cuda(
+                        file,
+                        self.expected_source_model,
+                        gpu,
+                        max_preserved,
+                        self.stream_limits(),
+                        backend,
+                        context,
+                    )?
+                } else {
+                    super::LoadedModel::load_qtea_cuda(
+                        file,
+                        self.expected_source_model,
+                        gpu,
+                        self.stream_limits(),
+                        backend,
+                        context,
+                    )?
+                },
+            );
+        }
         if let Some(max_preserved_tensor_elements) = self.max_preserved_tensor_elements {
             return Ok(super::LoadedModel::load_qtea_hybrid(
                 file,

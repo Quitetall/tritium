@@ -52,6 +52,9 @@ pub enum Projection {
     /// Residual-bearing QTEA bytes, explicitly executed on the scalar host path.
     #[cfg(feature = "host-qtea")]
     HostQtea(Arc<HostQteaLinear>),
+    /// Direct packed ordered CUDA QTEA, with host-orchestrated activations.
+    #[cfg(feature = "cuda")]
+    CudaQtea(Arc<crate::CudaQteaLinear>),
     /// A SALT V2 matrix retained in its physical codec on a CUDA device.
     #[cfg(feature = "cuda")]
     SaltV2(Arc<tritium_cuda::SaltV2ResidentTensor>),
@@ -147,6 +150,8 @@ impl Projection {
             #[cfg(feature = "host-qtea")]
             Projection::HostQtea(_) => ProjectionActivationMode::F32,
             #[cfg(feature = "cuda")]
+            Projection::CudaQtea(_) => ProjectionActivationMode::F32,
+            #[cfg(feature = "cuda")]
             Projection::SaltV2(_) => ProjectionActivationMode::F32,
             Projection::Dense(linear) => {
                 if linear.quantizes_activations() {
@@ -167,6 +172,8 @@ impl Projection {
             Projection::Salt(_) | Projection::HostSaltV2(_) | Projection::Tensor(_) => Ok(()),
             #[cfg(feature = "host-qtea")]
             Projection::HostQtea(_) => Ok(()),
+            #[cfg(feature = "cuda")]
+            Projection::CudaQtea(_) => Ok(()),
             #[cfg(feature = "cuda")]
             Projection::SaltV2(_) => Ok(()),
         }
@@ -208,6 +215,8 @@ impl Projection {
             Projection::HostQtea(_) => {
                 // Immutable QTEA construction validates geometry and every parameter.
             }
+            #[cfg(feature = "cuda")]
+            Projection::CudaQtea(_) => { /* Immutable checked upload. */ }
             Projection::Tensor(_) => {
                 // Private loader construction validates immutable geometry and parameters.
             }
@@ -242,6 +251,8 @@ impl Projection {
             #[cfg(feature = "host-qtea")]
             Projection::HostQtea(l) => l.forward(act, m, out),
             #[cfg(feature = "cuda")]
+            Projection::CudaQtea(l) => l.forward(backend, act, m, out),
+            #[cfg(feature = "cuda")]
             Projection::SaltV2(tensor) => salt_v2_forward_exact(backend, tensor, act, m, out),
             Projection::Dense(l) => l.forward(act, m, out),
             Projection::Tensor(l) => l.forward(backend, act, m, out),
@@ -258,6 +269,8 @@ impl Projection {
             #[cfg(feature = "host-qtea")]
             Projection::HostQtea(l) => l.rows(),
             #[cfg(feature = "cuda")]
+            Projection::CudaQtea(l) => l.rows(),
+            #[cfg(feature = "cuda")]
             Projection::SaltV2(tensor) => tensor.rows(),
             Projection::Dense(l) => l.n_out,
             Projection::Tensor(l) => l.n_out(),
@@ -273,6 +286,8 @@ impl Projection {
             Projection::HostSaltV2(l) => l.columns(),
             #[cfg(feature = "host-qtea")]
             Projection::HostQtea(l) => l.columns(),
+            #[cfg(feature = "cuda")]
+            Projection::CudaQtea(l) => l.columns(),
             #[cfg(feature = "cuda")]
             Projection::SaltV2(tensor) => tensor.columns(),
             Projection::Dense(l) => l.k_in,
@@ -293,6 +308,8 @@ impl Projection {
             #[cfg(feature = "host-qtea")]
             Projection::HostQtea(_) => None,
             #[cfg(feature = "cuda")]
+            Projection::CudaQtea(_) => None,
+            #[cfg(feature = "cuda")]
             Projection::SaltV2(_) => None,
         }
     }
@@ -309,6 +326,8 @@ impl Projection {
             | Projection::Tensor(_) => None,
             #[cfg(feature = "host-qtea")]
             Projection::HostQtea(_) => None,
+            #[cfg(feature = "cuda")]
+            Projection::CudaQtea(_) => None,
             #[cfg(feature = "cuda")]
             Projection::SaltV2(_) => None,
         }

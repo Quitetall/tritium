@@ -1,4 +1,4 @@
-//! Explicit experimental scalar-host QTEA selection, not production admission.
+//! Explicit experimental QTEA execution selection, not production admission.
 use std::{error::Error, path::Path};
 
 pub(crate) struct QteaConfig {
@@ -6,6 +6,16 @@ pub(crate) struct QteaConfig {
     config: tritium_nn::QteaLoadConfig,
 }
 impl QteaConfig {
+    pub(crate) fn backend_name(&self) -> &'static str {
+        #[cfg(feature = "host-qtea")]
+        {
+            self.config.backend_name()
+        }
+        #[cfg(not(feature = "host-qtea"))]
+        {
+            "unavailable"
+        }
+    }
     pub(crate) fn read(path: &Path) -> Result<Self, Box<dyn Error>> {
         #[cfg(feature = "host-qtea")]
         {
@@ -40,7 +50,7 @@ impl QteaConfig {
                 return Err("--qtea serving requires a packaged source chat template; no inferred formatter".into());
             }
             eprintln!(
-                "WARNING: QTEA scalar-host candidate, not production-qualified: {}",
+                "WARNING: QTEA candidate with explicit execution profile, not production-qualified: {}",
                 serde_json::to_string(model.receipt.observation())?
             );
             eprintln!(

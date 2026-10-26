@@ -4,6 +4,7 @@
 mod tests;
 use super::{
     qtea::{HostQteaModelLimits, failure, invalid, publish, read_tokenizer},
+    qtea_execution::Execution,
     qtea_owners::Owners,
     qwen35_hf::{Qwen35HfTensorSource, load_language_weights, load_mtp_weights},
 };
@@ -48,10 +49,10 @@ impl Qwen35HfTensorSource for Source {
             .matrices
             .remove(name)
             .ok_or_else(|| invalid("missing/consumed QTEA matrix owner"))?;
-        if matrix.rows() != rows || matrix.columns() != columns {
+        if matrix.shape() != (rows, columns) {
             return Err(invalid("hybrid packed matrix shape mismatch"));
         }
-        Ok(Projection::HostQtea(matrix))
+        Ok(matrix.projection())
     }
     fn token_embedding_exact(
         &self,
@@ -59,10 +60,16 @@ impl Qwen35HfTensorSource for Source {
         rows: usize,
         columns: usize,
     ) -> Result<TokenEmbedding, NnError> {
-        let Projection::HostQtea(matrix) = self.projection_exact(name, rows, columns)? else {
-            return Err(invalid("hybrid embedding must remain packed"));
-        };
-        Ok(TokenEmbedding::from_host_qtea(matrix))
+        let matrix = self
+            .0
+            .borrow_mut()
+            .matrices
+            .remove(name)
+            .ok_or_else(|| invalid("missing/consumed QTEA embedding owner"))?;
+        if matrix.shape() != (rows, columns) {
+            return Err(invalid("hybrid packed embedding shape mismatch"));
+        }
+        Ok(matrix.embedding())
     }
 }
 impl super::LoadedModel {
@@ -78,6 +85,54 @@ impl super::LoadedModel {
         expected_source_model: [u8; 32],
         limits: HostQteaHybridModelLimits,
         stream: super::StreamLimits,
+        context: tritium_runtime::TensorUploadContext<'_>,
+    ) -> Result<Self, NnError> {
+        Self::load_qtea_hybrid_target(
+            source,
+            expected_source_model,
+            limits,
+            Execution::Host(limits.base),
+            stream,
+            Box::new(tritium_cpu::CpuBackend::new()),
+            context,
+        )
+    }
+
+    /// Explicit Qwen hybrid packed-CUDA matrices; nonmatrix ops remain on host.
+    /// MTP remains retained Unverified, not promoted by synthetic execution.
+    /// # Errors
+    /// All hybrid source/text/schema/cache/weight checks and aggregate/device refusals.
+    #[cfg(feature = "cuda")]
+    pub fn load_qtea_hybrid_cuda(
+        source: impl Read + Seek,
+        expected_source_model: [u8; 32],
+        limits: super::CudaQteaModelLimits,
+        max_preserved_tensor_elements: usize,
+        stream: super::StreamLimits,
+        backend: Box<tritium_cuda::CudaBackend>,
+        context: tritium_runtime::TensorUploadContext<'_>,
+    ) -> Result<Self, NnError> {
+        Self::load_qtea_hybrid_target(
+            source,
+            expected_source_model,
+            HostQteaHybridModelLimits {
+                base: limits.host,
+                max_preserved_tensor_elements,
+            },
+            Execution::Cuda(limits),
+            stream,
+            backend,
+            context,
+        )
+    }
+
+    fn load_qtea_hybrid_target(
+        source: impl Read + Seek,
+        expected_source_model: [u8; 32],
+        limits: HostQteaHybridModelLimits,
+        target: Execution,
+        stream: super::StreamLimits,
+        backend: Box<dyn tritium_spec::TernaryBackend>,
         context: tritium_runtime::TensorUploadContext<'_>,
     ) -> Result<Self, NnError> {
         context
@@ -116,12 +171,13 @@ impl super::LoadedModel {
             return Err(invalid("hybrid QTEA profile mismatch"));
         };
         let config = *config;
-        super::qtea_owners::plan(&reader, limits.base.max_weight_bytes)?;
+        super::qtea_owners::plan_target(&reader, target)?;
         let admission = super::CacheAdmission::hybrid(&config, stream)?;
         let tokenizer = read_tokenizer(&mut reader, config.text.vocab_size as usize)?;
-        let owners = Source(RefCell::new(super::qtea_owners::read(
+        let owners = Source(RefCell::new(super::qtea_owners::read_target(
             &mut reader,
-            limits.base,
+            target,
+            Some(backend.as_ref()),
         )?));
         let language_weights = load_language_weights(&owners, &config.text)?;
         let mtp_weights = load_mtp_weights(&owners, &config.text)?;
@@ -129,10 +185,8 @@ impl super::LoadedModel {
         if !owners.matrices.is_empty() || !owners.preserved.is_empty() {
             return Err(invalid("unconsumed hybrid QTEA owner"));
         }
-        let backend = tritium_cpu::CpuBackend::new();
-        let physical_device = tritium_spec::TernaryBackend::physical_device_id(&backend).to_owned();
-        let language =
-            super::Qwen35TextRunner::new(&config.text, language_weights, Box::new(backend))?;
+        let physical_device = backend.physical_device_id().to_owned();
+        let language = super::Qwen35TextRunner::new(&config.text, language_weights, backend)?;
         let mtp = super::UnverifiedQwen35Mtp::new(&language, mtp_weights)?;
         let runner = super::Runner::hybrid(config, language, mtp, Some(admission))?;
         reader.verify().map_err(failure)?;
@@ -142,6 +196,11 @@ impl super::LoadedModel {
             reader.package_id(),
             expected_source_model,
             physical_device,
+            if target.is_cuda() {
+                "qtea-cuda-ordered-host-orchestrated"
+            } else {
+                "qtea-scalar-host"
+            },
             context,
         )
     }

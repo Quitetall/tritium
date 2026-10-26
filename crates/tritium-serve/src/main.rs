@@ -8,7 +8,7 @@
 //! serving but neither local path satisfies production readiness.
 //! `--typed <load-json>` is an explicitly bounded, loopback-only candidate source,
 //! not schema-v3 production admission or public-release authority.
-//! `--qtea <load-json>` selects the separate opt-in scalar-host residual-bearing
+//! `--qtea <load-json>` selects a separate explicit residual-bearing execution
 //! profile, using the same common runner and source-bound chat machinery.
 
 use std::sync::Arc;
@@ -402,7 +402,7 @@ usage: tritium-serve (--bundle <schema-v3-dir> | --model <legacy.gguf> | --conve
 model source (exactly one):
   --bundle <dir>            strict schema-v3 Qwen bundle (production path)
   --typed <load-json>       bounded retained .trit candidate (loopback only; TRITIUM_TYPED)
-  --qtea <load-json>        scalar-host QTEA candidate (host-qtea feature; loopback only; TRITIUM_QTEA)
+  --qtea <load-json>        explicit QTEA candidate profile (host-qtea; optional cuda; loopback only; TRITIUM_QTEA)
   --model <path.gguf>       legacy GGUF model (compatibility serving)
   --converted <dir>         directory written by `tritium convert` (local path)
 
@@ -670,8 +670,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         if !host_ip.is_loopback() {
             return Err("--qtea candidates require loopback --host".into());
         }
-        if backend_name != "cpu" {
-            return Err("--qtea requires --backend cpu; no GPU or resident fallback".into());
+        if !matches!(backend_name.as_str(), "cpu" | "cuda") {
+            return Err(
+                "--qtea requires --backend cpu or cuda matching its explicit profile; no fallback"
+                    .into(),
+            );
         }
         if raw_tokens
             || spec.is_some()
@@ -681,7 +684,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         {
             return Err("--qtea forbids --raw-tokens, --spec, --draft-model, --batch-slots != 1, and --kv-pool-tokens".into());
         }
-        Some(qtea_source::QteaConfig::read(std::path::Path::new(&path))?)
+        let config = qtea_source::QteaConfig::read(std::path::Path::new(&path))?;
+        if backend_name != config.backend_name() {
+            return Err(
+                "--qtea --backend must match its explicit execution profile; no fallback".into(),
+            );
+        }
+        Some(config)
     } else {
         None
     };

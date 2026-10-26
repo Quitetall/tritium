@@ -71,7 +71,10 @@ fn model_sources_are_mutually_exclusive() {
 #[test]
 fn qtea_launch_refuses_incompatible_modes_before_source_or_backend_init() {
     for (args, expected) in [
-        (vec!["--backend", "cuda"], "--qtea requires --backend cpu"),
+        (
+            vec!["--backend", "metal"],
+            "--qtea requires --backend cpu or cuda",
+        ),
         (
             vec!["--host", "0.0.0.0"],
             "--qtea candidates require loopback",

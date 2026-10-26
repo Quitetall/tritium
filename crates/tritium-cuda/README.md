@@ -5,8 +5,8 @@ CUDA backend: dp4a decode, IMMA tensor-core prefill, device-resident training ke
 Experimental direct packed QTEA upload, ordered-f32 matmul and selected-row gather
 are also available with explicit logical allocation limits and no dense shadow.
 See [QTEA-CUDA](../../docs/QTEA-CUDA.md) for API, explicit device tests and evidence
-boundaries. Full QTEA model dispatch remains CPU-only; these primitives are not a
-whole-model speed or release qualification claim.
+boundaries and explicit host-orchestrated CUDA model profiles. These are not a
+fully resident graph, whole-model speed or release qualification claim.
 
 Part of [Tritium](https://github.com/Quitetall/tritium) — Apache-2.0 infrastructure for
 quantizing, training, and serving additive-ternary ({-1, 0, +1}) neural networks with
