@@ -1,5 +1,7 @@
 use serde::Deserialize;
-use tritium_quantize::qtea_reference::{ArithmeticError, TensorFit, TensorFitConfig};
+use tritium_quantize::qtea_reference::{
+    ArithmeticError, SeekBackedFitLimits, TensorFit, TensorFitConfig,
+};
 use tritium_quantize::{CurvatureSourceId, InputGram, InputGramAccumulator};
 
 #[derive(Deserialize)]
@@ -105,6 +107,32 @@ fn complete_tensor_sweep_matches_pinned_author_driver() {
         let planned = input_plan.fit().unwrap();
         assert_eq!(planned, fitted);
         let encoded = planned.to_qtea_tensor(limits).unwrap();
+        let mut scratch = std::io::Cursor::new(Vec::new());
+        let spilled = TensorFit::fit_seek_backed(
+            &case.weights,
+            case.rows,
+            case.columns,
+            &input,
+            recipe,
+            &mut scratch,
+            SeekBackedFitLimits {
+                max_work_bytes: TensorFit::required_seek_work_bytes(
+                    case.rows,
+                    case.columns,
+                    case.group_size,
+                )
+                .unwrap(),
+                max_scratch_bytes: TensorFit::required_seek_scratch_bytes(case.rows, case.columns)
+                    .unwrap(),
+            },
+        )
+        .unwrap();
+        assert_eq!(spilled, fitted);
+        assert_eq!(
+            spilled.to_qtea_tensor(limits).unwrap().as_bytes(),
+            encoded.as_bytes()
+        );
+        assert_eq!(scratch.get_ref().len(), case.rows * case.columns * 4);
         assert_eq!(encoded.view().metadata(), metadata);
         assert_eq!(encoded.view().byte_ledger(), predicted);
         assert_eq!(

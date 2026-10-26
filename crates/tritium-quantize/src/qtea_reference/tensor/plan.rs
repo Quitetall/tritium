@@ -58,6 +58,26 @@ impl<'a> TensorFitPlan<'a> {
         max_work_bytes: usize,
     ) -> Result<Self, ArithmeticError> {
         let required_work_bytes = TensorFit::required_work_bytes(rows, columns)?;
+        Self::with_work_bytes(
+            weights,
+            rows,
+            columns,
+            gram,
+            config,
+            max_work_bytes,
+            required_work_bytes,
+        )
+    }
+
+    pub(super) fn with_work_bytes(
+        weights: &'a [f32],
+        rows: usize,
+        columns: usize,
+        gram: &'a InputGram,
+        config: TensorFitConfig,
+        max_work_bytes: usize,
+        required_work_bytes: usize,
+    ) -> Result<Self, ArithmeticError> {
         config.validate(columns)?;
         if rows.checked_mul(columns) != Some(weights.len())
             || gram.dimension() != columns
@@ -150,7 +170,7 @@ impl<'a> TensorFitPlan<'a> {
     /// Fitting can still reject conditioning, group/data arithmetic or allocation.
     /// Planning is not a positive fit or qualification receipt.
     pub fn fit(self) -> Result<TensorFit, ArithmeticError> {
-        TensorFit::fit_prepared(self)
+        TensorFit::fit_prepared(self, None)
     }
 }
 

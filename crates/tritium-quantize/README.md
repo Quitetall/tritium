@@ -2,6 +2,11 @@
 
 SALT quantization: additive ternary planes, exact joint fitting, curvature-guided allocation.
 
+Native QTEA also has an explicit [seek-backed feedback fit](../../docs/QTEA-SEEK-FITTING.md).
+It preserves the scalar recipe while spilling only mutable feedback, with separate
+logical array and scratch caps. Full source/curvature/result streaming, GPU fitting
+and physical-memory/model qualification remain outside that path.
+
 Part of [Tritium](https://github.com/Quitetall/tritium) — Apache-2.0 infrastructure for
 quantizing, training, and serving additive-ternary ({-1, 0, +1}) neural networks with
 exact byte accounting and receipt-backed benchmarks.

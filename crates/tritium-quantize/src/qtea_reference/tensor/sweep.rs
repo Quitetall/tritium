@@ -9,14 +9,11 @@ pub(super) fn run(
     original: &[f32],
     upper: &[f32],
     salient: usize,
+    scratch: Option<&mut dyn super::working::ScratchIo>,
 ) -> Result<(), ArithmeticError> {
     let (rows, columns, width) = (fit.rows, fit.columns, fit.config.group_size);
-    let mut working = filled(original.len(), 0.0)?;
-    for row in 0..rows {
-        for (column, &source) in fit.order.iter().enumerate() {
-            working[row * columns + column] = original[row * columns + source];
-        }
-    }
+    let mut working = super::working::Working::new(original, rows, columns, &fit.order, scratch)?;
+    let mut tail = filled(columns - width, 0.0)?;
     let mut block = filled(rows * width, 0.0)?;
     let mut errors = filled(rows * width, 0.0)?;
     let mut column_values = filled(rows, 0.0)?;
@@ -25,8 +22,7 @@ pub(super) fn run(
     for start in (0..columns).step_by(width) {
         let stop = start + width;
         for row in 0..rows {
-            block[row * width..(row + 1) * width]
-                .copy_from_slice(&working[row * columns + start..row * columns + stop]);
+            working.read(row, start, &mut block[row * width..(row + 1) * width])?;
         }
         let diagonal_mean = finite(
             (0..width).try_fold(0.0, |sum, i| {
@@ -84,6 +80,11 @@ pub(super) fn run(
             }
         }
         for row in 0..rows {
+            if stop == columns {
+                break;
+            }
+            let tail = &mut tail[..columns - stop];
+            working.read(row, stop, tail)?;
             for target in stop..columns {
                 let mut correction = 0.0;
                 for local in 0..width {
@@ -95,10 +96,10 @@ pub(super) fn run(
                             )?,
                     )?;
                 }
-                working[row * columns + target] =
-                    finite(working[row * columns + target] - correction)?;
+                tail[target - stop] = finite(tail[target - stop] - correction)?;
             }
+            working.write(row, stop, tail)?;
         }
     }
-    Ok(())
+    working.finish()
 }

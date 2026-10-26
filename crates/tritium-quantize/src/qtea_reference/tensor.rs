@@ -11,8 +11,19 @@ use tritium_core::Trit;
 mod export;
 mod plan;
 mod sweep;
+mod working;
 
 pub use plan::TensorFitPlan;
+
+/// Independent logical array and exact scratch-payload caps for seek-backed fitting.
+/// Neither cap measures allocator overhead, stream-owned buffers, page cache or RSS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeekBackedFitLimits {
+    /// Positive ceiling for newly owned fitting arrays, excluding borrowed inputs.
+    pub max_work_bytes: usize,
+    /// Positive ceiling for the private row-major f32 feedback payload.
+    pub max_scratch_bytes: u64,
+}
 
 /// Native scalar-f32/SPD-only single-tensor numerical policy, not a solver catalog ID.
 pub const TENSOR_FIT_ID: &str = "qtea.cpu-tensor.f32.v1";
@@ -198,7 +209,98 @@ impl TensorFit {
         TensorFitPlan::new(weights, rows, columns, gram, config, max_work_bytes)
     }
 
-    fn fit_prepared(plan: TensorFitPlan<'_>) -> Result<Self, ArithmeticError> {
+    /// Conservative seek-backed live-array ceiling:
+    /// 32C²+32RC+16RG+64R+512C+8192, where G is the group width.
+    ///
+    /// Includes original working copy, full curvature/factors, retained fitted
+    /// arrays/metadata, group/block/column work and exact-I/O row staging. Excludes
+    /// borrowed weights/Gram, stream-owned buffers, page cache and allocator/RSS.
+    /// It is not a complete out-of-core or physical-memory admission claim.
+    /// # Errors
+    /// Unsupported geometry/group width or checked byte arithmetic overflow.
+    pub fn required_seek_work_bytes(
+        rows: usize,
+        columns: usize,
+        group_size: usize,
+    ) -> Result<usize, ArithmeticError> {
+        Self::required_work_bytes(rows, columns)?;
+        if !(2..=4096).contains(&group_size) || !columns.is_multiple_of(group_size) {
+            return Err(ArithmeticError::InvalidShape);
+        }
+        let terms = [
+            columns.checked_mul(columns).and_then(|n| n.checked_mul(32)),
+            rows.checked_mul(columns).and_then(|n| n.checked_mul(32)),
+            rows.checked_mul(group_size).and_then(|n| n.checked_mul(16)),
+            rows.checked_mul(64),
+            columns.checked_mul(512),
+            Some(8192),
+        ];
+        terms.into_iter().try_fold(0_usize, |sum, term| {
+            sum.checked_add(term.ok_or(ArithmeticError::InvalidShape)?)
+                .ok_or(ArithmeticError::InvalidShape)
+        })
+    }
+
+    /// Exact scratch payload, separate from resident fitting arrays.
+    /// # Errors
+    /// Unsupported geometry or checked byte arithmetic overflow.
+    pub fn required_seek_scratch_bytes(
+        rows: usize,
+        columns: usize,
+    ) -> Result<u64, ArithmeticError> {
+        Self::required_work_bytes(rows, columns)?;
+        u64::try_from(rows)
+            .ok()
+            .and_then(|r| u64::try_from(columns).ok().and_then(|c| r.checked_mul(c)))
+            .and_then(|n| n.checked_mul(4))
+            .ok_or(ArithmeticError::InvalidShape)
+    }
+
+    /// Fit the unchanged scalar recipe with only mutable feedback state spilled.
+    ///
+    /// Caps and numerical inputs are checked before scratch access or fitting.
+    /// `scratch` must be empty, private and exclusively held; it is not a resume
+    /// file. The caller owns disposal of its bytes on success or error. No path,
+    /// file creation/deletion, campaign selection or durable publication occurs.
+    /// Full borrowed inputs, curvature factors and the fitted result stay in RAM.
+    /// # Errors
+    /// Ordinary numerical/allocation refusals plus scratch caps, nonempty stream,
+    /// exact I/O/position errors and nonfinite readback. No fallback/result on error.
+    pub fn fit_seek_backed(
+        weights: &[f32],
+        rows: usize,
+        columns: usize,
+        gram: &InputGram,
+        config: TensorFitConfig,
+        scratch: &mut (impl std::io::Read + std::io::Write + std::io::Seek),
+        limits: SeekBackedFitLimits,
+    ) -> Result<Self, ArithmeticError> {
+        let work_bytes = Self::required_seek_work_bytes(rows, columns, config.group_size)?;
+        super::budget(Some(work_bytes), limits.max_work_bytes)?;
+        let required = Self::required_seek_scratch_bytes(rows, columns)?;
+        if required > limits.max_scratch_bytes {
+            return Err(ArithmeticError::ScratchLimit {
+                required,
+                limit: limits.max_scratch_bytes,
+            });
+        }
+        let plan = TensorFitPlan::with_work_bytes(
+            weights,
+            rows,
+            columns,
+            gram,
+            config,
+            limits.max_work_bytes,
+            work_bytes,
+        )?;
+        working::check_empty(scratch)?;
+        Self::fit_prepared(plan, Some(scratch))
+    }
+
+    fn fit_prepared(
+        plan: TensorFitPlan<'_>,
+        scratch: Option<&mut dyn working::ScratchIo>,
+    ) -> Result<Self, ArithmeticError> {
         let weights = plan.weights;
         let gram = plan.gram;
         let (rows, columns, config) = (plan.rows, plan.columns, plan.config);
@@ -250,6 +352,8 @@ impl TensorFit {
             config.salient_ratio,
             columns * (size_of::<usize>() + 4),
         )?;
+        drop(group_weights);
+        drop(diagonal);
         let salient = ranking.salient_count();
         let mut order = filled(columns, 0_usize)?;
         order.copy_from_slice(ranking.columns());
@@ -262,6 +366,7 @@ impl TensorFit {
             config.relative_pivot_floor,
         )?;
         let permuted = super::factor::permuted(&h, columns, &order, config.damping)?;
+        drop(h);
         let upper = super::factor::inverse_upper(permuted, columns, config.relative_pivot_floor)?;
         let mut residuals = Vec::new();
         residuals
@@ -281,7 +386,7 @@ impl TensorFit {
             weights_digest: plan.weights_digest,
             recipe_digest: plan.recipe_digest,
         };
-        sweep::run(&mut result, &original, &upper, salient)?;
+        sweep::run(&mut result, &original, &upper, salient, scratch)?;
         result
             .residuals
             .sort_unstable_by_key(|record| record.column);

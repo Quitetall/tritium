@@ -5,6 +5,7 @@
 //! Scalar f32 reductions are left-to-right; Torch parallel reductions may differ.
 //! Input/intermediate overflow and degenerate initial groups fail explicitly.
 //! [`TensorFit`] adds a complete source-bound-Gram/SPD-only CPU feedback sweep.
+//! An explicit seek-backed fit can spill feedback state, not the full fitter.
 //! No model converter, compressed codec/backend handle, GPU implementation,
 //! frontier registration or empirical qualification is implied.
 
@@ -20,7 +21,7 @@ pub use group::GroupParameters;
 pub use saliency::SalientRanking;
 pub use sparse::SparseResidualColumn;
 pub use tensor::{
-    TENSOR_FIT_ID, TensorFit, TensorFitConfig, TensorFitPlan, TensorResidual,
+    SeekBackedFitLimits, TENSOR_FIT_ID, TensorFit, TensorFitConfig, TensorFitPlan, TensorResidual,
     numerical_input_digest,
 };
 
@@ -65,6 +66,20 @@ pub enum ArithmeticError {
     },
     /// Fallible vector reservation failed after logical-budget admission.
     AllocationFailed,
+    /// Scratch payload exceeds the independently declared byte cap.
+    ScratchLimit {
+        /// Exact row-major f32 payload bytes.
+        required: u64,
+        /// Caller's maximum scratch payload bytes.
+        limit: u64,
+    },
+    /// Scratch must be empty; existing caller data is never overwritten.
+    ScratchNotEmpty,
+    /// Exact scratch I/O or positioning failed; discard the private stream.
+    ScratchIo {
+        /// Original I/O kind, or InvalidData for an inconsistent seek result.
+        kind: std::io::ErrorKind,
+    },
 }
 
 impl std::fmt::Display for ArithmeticError {
