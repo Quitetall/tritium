@@ -191,12 +191,22 @@ extern "C" __global__ void semantic_causal_attention(
     if (lane < dim) output[q_at + lane] = accumulator / shared[blockDim.x + 2];
 }
 
-extern "C" __global__ void semantic_swiglu(float *gate, const float *up, uint32_t count) {
+extern "C" __global__ void semantic_swiglu(float *gate, const float *up, uint32_t *invalid, uint32_t count) {
     uint64_t at = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (at < count) {
         float z = gate[at];
-        gate[at] = (z / (1.0f + expf(-z))) * up[at];
+        float u = up[at];
+        float value = (z / (1.0f + expf(-z))) * u;
+        if (!isfinite(z) || !isfinite(u) || !isfinite(value)) atomicOr(invalid, 1u);
+        gate[at] = value;
     }
+}
+
+// Preserve invalid transformed input even when a pruned matrix masks it.
+extern "C" __global__ void semantic_activation_check_finite(
+    const float *values, uint32_t *invalid, uint32_t count) {
+    uint64_t at = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (at < count && !isfinite(values[at])) atomicOr(invalid, 1u);
 }
 
 __device__ __forceinline__ uint64_t semantic_splitmix(uint64_t value) {

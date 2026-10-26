@@ -2,6 +2,11 @@
 
 CUDA backend: dp4a decode, IMMA tensor-core prefill, device-resident training kernels.
 
+The explicit shared-tensor device SwiGLU region rejects nonfinite input,
+intermediates and output atomically; see
+[shared-tensor SwiGLU](../../docs/SHARED-TENSOR-SWIGLU.md) for numerical policy,
+private scratch exclusions and explicit physical regression commands.
+
 Experimental direct packed QTEA upload, ordered-f32 matmul and selected-row gather
 are also available with explicit logical allocation limits and no dense shadow.
 See [QTEA-CUDA](../../docs/QTEA-CUDA.md) for API, explicit device tests and evidence

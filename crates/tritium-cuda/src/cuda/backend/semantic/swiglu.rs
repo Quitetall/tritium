@@ -1,9 +1,9 @@
-//! Opt-in device-f32 region; real shared weights, one reusable bounded workspace.
+//! Opt-in device-f32 region; real shared weights, geometry-keyed private scratch.
+//! Full workspace/model payload admission remains a separate contract.
 use super::*;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use tritium_spec::TensorSwiGlu;
 
-#[derive(Debug)]
 pub(crate) struct Workspace {
     shape: (usize, usize, usize),
     input: CudaSlice<f32>,
@@ -13,6 +13,20 @@ pub(crate) struct Workspace {
     output: CudaSlice<f32>,
     ones: CudaSlice<f32>,
     host_output: Vec<f32>,
+    invalid: CudaSlice<u32>,
+}
+
+impl core::fmt::Debug for Workspace {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SwiGluWorkspace")
+            .field("shape", &self.shape)
+            .field(
+                "host_output_capacity_elements",
+                &self.host_output.capacity(),
+            )
+            .field("status_words", &self.invalid.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Workspace {
@@ -52,8 +66,34 @@ impl Workspace {
             output: alloc(input)?,
             ones,
             host_output,
+            invalid: backend
+                .stream
+                .alloc_zeros::<u32>(1)
+                .map_err(|e| alloc_or_backend("SwiGLU private status", &e, 4))?,
         })
     }
+}
+
+fn check_finite(
+    backend: &CudaBackend,
+    values: &CudaSlice<f32>,
+    status: &mut CudaSlice<u32>,
+) -> Result<(), BackendError> {
+    let count = u32::try_from(values.len())
+        .map_err(|_| invalid("SwiGLU activation exceeds u32 index ABI"))?;
+    if count == 0 {
+        return Ok(());
+    }
+    let mut launch = backend
+        .stream
+        .launch_builder(&backend.func_semantic_activation_check_finite);
+    launch.arg(values).arg(status).arg(&count);
+    // SAFETY: checked u32 length and same-context workspace. One reader per
+    // value; private status uses atomicOr and is reset on the owning stream.
+    #[allow(unsafe_code)]
+    unsafe { launch.launch(LaunchConfig::for_num_elems(count)) }
+        .map_err(|e| driver_err("SwiGLU transformed activation finite check", &e))?;
+    Ok(())
 }
 
 fn project(
@@ -112,6 +152,9 @@ pub(crate) fn forward(backend: &CudaBackend, p: TensorSwiGlu<'_>) -> Result<bool
     if m == 0 {
         return Ok(true);
     }
+    if p.act.iter().any(|v| !v.is_finite()) {
+        return Err(invalid("SwiGLU input contains a non-finite value"));
+    }
     CudaBackend::check_grad_launch_bounds(m, f, k)?;
     CudaBackend::check_grad_launch_bounds(m, k, f)?;
     let mut slot = backend
@@ -127,6 +170,10 @@ pub(crate) fn forward(backend: &CudaBackend, p: TensorSwiGlu<'_>) -> Result<bool
         .ok_or_else(|| invalid("SwiGLU workspace absent"))?;
     backend
         .stream
+        .memset_zeros(&mut w.invalid)
+        .map_err(|e| driver_err("reset SwiGLU private status", &e))?;
+    backend
+        .stream
         .memcpy_htod(p.act, &mut w.input)
         .map_err(|e| driver_err("SwiGLU input upload", &e))?;
     let mut last_basis = None;
@@ -140,6 +187,7 @@ pub(crate) fn forward(backend: &CudaBackend, p: TensorSwiGlu<'_>) -> Result<bool
                     .memcpy_dtod(&w.input, &mut w.rotated)
                     .map_err(|e| driver_err("SwiGLU basis copy", &e))?;
                 super::basis::apply(backend, &mut w.rotated, k, tensor.basis, false)?;
+                check_finite(backend, &w.rotated, &mut w.invalid)?;
                 last_basis = Some(tensor.basis);
             }
             &w.rotated
@@ -148,18 +196,39 @@ pub(crate) fn forward(backend: &CudaBackend, p: TensorSwiGlu<'_>) -> Result<bool
     }
     let count = u32::try_from(w.gate.len()).map_err(|_| invalid("SwiGLU hidden index overflow"))?;
     let mut launch = backend.stream.launch_builder(&backend.func_semantic_swiglu);
-    launch.arg(&mut w.gate).arg(&w.up).arg(&count);
+    launch
+        .arg(&mut w.gate)
+        .arg(&w.up)
+        .arg(&mut w.invalid)
+        .arg(&count);
     #[allow(unsafe_code)]
     // SAFETY: validated shape bounds one thread per disjoint gate/up lane.
     unsafe { launch.launch(LaunchConfig::for_num_elems(count)) }
         .map_err(|e| driver_err("SwiGLU device activation", &e))?;
     drop(launch);
     super::basis::apply(backend, &mut w.gate, f, down.basis, false)?;
+    if down.basis != Basis::Identity {
+        check_finite(backend, &w.gate, &mut w.invalid)?;
+    }
     project(backend, down, &w.gate, &mut w.output, &w.ones, m)?;
     backend
         .stream
         .memcpy_dtoh(&w.output, &mut w.host_output)
         .map_err(|e| driver_err("SwiGLU staged readback", &e))?;
+    let mut invalid_values = [0u32];
+    backend
+        .stream
+        .memcpy_dtoh(&w.invalid, &mut invalid_values)
+        .map_err(|e| driver_err("SwiGLU private status readback", &e))?;
+    backend
+        .stream
+        .synchronize()
+        .map_err(|e| driver_err("SwiGLU readback synchronization", &e))?;
+    if invalid_values[0] != 0 || w.host_output.iter().any(|v| !v.is_finite()) {
+        return Err(invalid(
+            "SwiGLU computed a non-finite intermediate or output",
+        ));
+    }
     p.out.copy_from_slice(&w.host_output);
     Ok(true)
 }

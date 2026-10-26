@@ -263,6 +263,9 @@ impl fmt::Debug for TensorMatmul<'_> {
 /// `gate`/`up` are `[F,K]`, `down` is `[K,F]`; activations/output are `[batch,K]`.
 /// Device exponential rounding may differ from the ordinary host expression;
 /// an implementation must require explicit numerical-policy opt-in.
+/// A selected region accepts finite input and refuses nonfinite computed
+/// intermediates/results without changing output. Unsupported/disabled decline
+/// remains distinct from execution and from an error.
 pub struct TensorSwiGlu<'a> {
     /// Input activations.
     pub act: &'a [f32],
@@ -529,6 +532,8 @@ pub trait TernaryBackend: Send + Sync {
     /// False is unsupported/disabled, with output untouched. Errors are not
     /// fallback; successful execution returns true. Default preserves host
     /// behavior. This does not grant model-quality or whole-graph residency.
+    /// Selected execution must refuse nonfinite input/intermediate/output rather
+    /// than publishing NaN/Inf as successful output. Default decline is unchanged.
     fn try_tensor_swiglu(&self, _p: TensorSwiGlu<'_>) -> Result<bool, BackendError> {
         Ok(false)
     }

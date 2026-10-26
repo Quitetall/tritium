@@ -823,6 +823,7 @@ pub struct CudaBackend {
     pub(super) func_semantic_basis_butterfly: CudaFunction,
     pub(super) func_semantic_basis_finish: CudaFunction,
     pub(super) func_semantic_swiglu: CudaFunction,
+    pub(super) func_semantic_activation_check_finite: CudaFunction,
     pub(super) func_semantic_attention: CudaFunction,
     pub(super) func_decoder_dense_gather: CudaFunction,
     pub(super) func_decoder_norm: CudaFunction,
@@ -1542,6 +1543,9 @@ impl CudaBackend {
         let func_semantic_swiglu = semantic_module
             .load_function("semantic_swiglu")
             .map_err(|e| driver_err("resolve semantic SwiGLU", &e))?;
+        let func_semantic_activation_check_finite = semantic_module
+            .load_function("semantic_activation_check_finite")
+            .map_err(|e| driver_err("resolve semantic activation finite check", &e))?;
         let func_semantic_attention = semantic_module
             .load_function("semantic_causal_attention")
             .map_err(|e| driver_err("resolve semantic causal attention", &e))?;
@@ -1599,6 +1603,7 @@ impl CudaBackend {
             func_semantic_basis_butterfly,
             func_semantic_basis_finish,
             func_semantic_swiglu,
+            func_semantic_activation_check_finite,
             func_semantic_attention,
             func_decoder_dense_gather,
             func_decoder_norm,
