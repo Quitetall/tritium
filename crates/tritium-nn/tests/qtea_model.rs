@@ -489,6 +489,45 @@ fn cuda_request_profiles_are_explicit_positive_nonnull_and_build_gated() {
     assert!(tritium_nn::QteaLoadConfig::read(&path).is_err());
 }
 
+#[cfg(feature = "tokenizer")]
+#[test]
+fn device_swiglu_request_profiles_require_explicit_cuda_and_hybrid_cap() {
+    let root = CommandScratch::new();
+    let path = root.0.join("region.json");
+    for hybrid in [false, true] {
+        let mut request = command_config(&root.0.join("absent.trit"));
+        request["profile"] = (if hybrid {
+            "tritium.qtea-hybrid-cuda-swiglu-host-load.v1"
+        } else {
+            "tritium.qtea-cuda-swiglu-host-load.v1"
+        })
+        .into();
+        request["cuda"] = serde_json::json!({"device":0,"max_device_weight_bytes":4096,"max_device_staging_bytes":4096});
+        if hybrid {
+            request["max_preserved_tensor_elements"] = 64.into();
+        }
+        std::fs::write(&path, serde_json::to_vec(&request).unwrap()).unwrap();
+        if cfg!(feature = "cuda") {
+            assert_eq!(
+                tritium_nn::QteaLoadConfig::read(&path)
+                    .unwrap()
+                    .backend_name(),
+                "cuda"
+            );
+        } else {
+            assert!(
+                tritium_nn::QteaLoadConfig::read(&path)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("build feature cuda")
+            );
+        }
+        request.as_object_mut().unwrap().remove("cuda");
+        std::fs::write(&path, serde_json::to_vec(&request).unwrap()).unwrap();
+        assert!(tritium_nn::QteaLoadConfig::read(&path).is_err());
+    }
+}
+
 #[cfg(all(feature = "cuda", feature = "tokenizer"))]
 #[test]
 #[ignore = "explicit physical CUDA text-model load/recording/generation; never silent skip"]
@@ -633,6 +672,129 @@ fn cuda_text_load_late_io_failure_does_not_publish_a_model() {
     assert!(result.is_err());
     assert_eq!(reads.get(), last);
     assert!(rec.events().is_empty());
+}
+
+#[cfg(all(feature = "cuda", feature = "tokenizer"))]
+#[test]
+#[ignore = "explicit physical CUDA opt-in device-SiLU MLP/model fixture bounds, not default bit parity"]
+fn device_swiglu_optin_reaches_nn_and_preserves_default_profile() {
+    use tritium_nn::{CudaQteaLinear, LoadedModel, SwiGluMlp};
+    let _serial = TEXT_SERIAL.lock().unwrap();
+    let enabled = tritium_cuda::CudaBackend::new(0)
+        .expect("physical CUDA required")
+        .with_device_swiglu();
+    let ordinary = tritium_cuda::CudaBackend::new(0).expect("physical CUDA required");
+    assert!(enabled.device_swiglu_enabled());
+    assert!(!ordinary.device_swiglu_enabled());
+    let projection = |rows, cols, seed, cap| {
+        let (t, _) = common::fixture(rows, cols, 2, 0.5, seed);
+        Projection::CudaQtea(Arc::new(
+            CudaQteaLinear::upload(
+                &enabled,
+                t.view(),
+                1 << 20,
+                tritium_cuda::QteaCudaLimits {
+                    max_device_staging_bytes: cap,
+                    max_host_staging_bytes: 1 << 16,
+                },
+            )
+            .unwrap(),
+        ))
+    };
+    let mlp = SwiGluMlp::new(
+        projection(12, 8, 1, 4096),
+        projection(12, 8, 2, 4096),
+        projection(8, 12, 3, 4096),
+    )
+    .unwrap();
+    for batch in [0, 1, 3, 1] {
+        let input = (0..batch * 8)
+            .map(|i| (i % 7) as f32 * 0.17 - 0.35)
+            .collect::<Vec<_>>();
+        let mut want = vec![0.; input.len()];
+        let mut got = vec![77.; input.len()];
+        mlp.forward(&ordinary, &input, batch, &mut want).unwrap();
+        mlp.forward(&enabled, &input, batch, &mut got).unwrap();
+        for (a, b) in got.iter().zip(&want) {
+            assert!((a - b).abs() <= 1e-4 + 1e-4 * b.abs(), "{a} != {b}");
+        }
+        if batch > 0 {
+            assert!(want.iter().any(|v| v.abs() > 1e-5));
+            assert!(got.iter().any(|v| v.abs() > 1e-5));
+        }
+    }
+    // The ordinary independent calls fit64 bytes each; the selected device
+    // region needs100. An error proves real dispatch and no silent fallback.
+    let capped = SwiGluMlp::new(
+        projection(8, 4, 1, 64),
+        projection(8, 4, 2, 64),
+        projection(4, 8, 3, 64),
+    )
+    .unwrap();
+    let mut output = [77.; 4];
+    assert!(capped.forward(&enabled, &[0.1; 4], 1, &mut output).is_err());
+    assert_eq!(output, [77.; 4]);
+    capped
+        .forward(&ordinary, &[0.1; 4], 1, &mut output)
+        .unwrap();
+
+    for tied in [true, false] {
+        let mut f = Fixture::new(tied, true);
+        f.text(false, Some("{{ messages[0]['content'] }} partner".into()));
+        let bytes = f.bytes();
+        let mut rec = tritium_evidence::EvidenceRecorder::new(
+            "device-silu",
+            [tritium_evidence::MODEL_LOADED_REGISTRATION],
+        )
+        .unwrap();
+        let mut gpu = LoadedModel::load_qtea_cuda(
+            Cursor::new(&bytes),
+            [3; 32],
+            cuda_limits(&f),
+            stream(),
+            Box::new(
+                tritium_cuda::CudaBackend::new(0)
+                    .unwrap()
+                    .with_device_swiglu(),
+            ),
+            tritium_runtime::TensorUploadContext {
+                recorder: &mut rec,
+                span: "load",
+                parent: None,
+                logical_time: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            gpu.receipt.observation().backend,
+            "qtea-cuda-ordered-device-swiglu-host-orchestrated"
+        );
+        let mut rec = tritium_evidence::EvidenceRecorder::new(
+            "host-silu",
+            [tritium_evidence::MODEL_LOADED_REGISTRATION],
+        )
+        .unwrap();
+        let mut host = LoadedModel::load_qtea(
+            Cursor::new(&bytes),
+            [3; 32],
+            limits(),
+            stream(),
+            tritium_runtime::TensorUploadContext {
+                recorder: &mut rec,
+                span: "load",
+                parent: None,
+                logical_time: 0,
+            },
+        )
+        .unwrap();
+        for (tokens, positions) in [(&[1, 2][..], &[0, 1][..]), (&[4][..], &[2][..])] {
+            let a = gpu.runner.forward(tokens, positions).unwrap();
+            let b = host.runner.forward(tokens, positions).unwrap();
+            for (a, b) in a.iter().zip(&b) {
+                assert!((a - b).abs() <= 1e-4 + 1e-4 * b.abs(), "{a} != {b}");
+            }
+        }
+    }
 }
 
 #[cfg(feature = "tokenizer")]

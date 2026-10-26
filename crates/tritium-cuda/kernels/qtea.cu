@@ -97,3 +97,17 @@ extern "C" __global__ void qtea_gather(
         output[item] = QTEA_WEIGHT(row, column);
     }
 }
+
+// Separate explicit numerical mode: device expf is not host exp bit parity.
+// Status is private per-call scratch and is inspected before host publication.
+extern "C" __global__ void qtea_swiglu_device(
+    float* gate, const float* up, unsigned* status, unsigned count) {
+    const U64 item = U64(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (item < count) {
+        const float z = gate[item];
+        const float u = up[item];
+        const float value = __fmul_rn(__fdiv_rn(z, __fadd_rn(1.0f, expf(-z))), u);
+        if (!isfinite(z) || !isfinite(u) || !isfinite(value)) atomicOr(status, 1u);
+        gate[item] = value;
+    }
+}

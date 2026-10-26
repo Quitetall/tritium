@@ -53,7 +53,10 @@ pub use cuda::{
     ExternalLinearScalar,
 };
 #[cfg(feature = "cuda")]
-pub use cuda::{QteaCudaAllocationLedger, QteaCudaLimits, QteaResidentTensor};
+pub use cuda::{
+    QTEA_DEVICE_SWIGLU_NUMERICAL_ID, QteaCudaAllocationLedger, QteaCudaLimits, QteaResidentTensor,
+    QteaSwiGluAllocationLedger,
+};
 
 // v0.3.1 (ADR 0013): the device-resident M=1 decode forward. The runner downcasts
 // its `dyn TernaryBackend` to `CudaBackend`, builds a `CudaDecodeModel` once from a

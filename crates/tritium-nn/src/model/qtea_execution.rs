@@ -39,4 +39,22 @@ impl Execution {
             Self::Cuda(_) => true,
         }
     }
+    #[cfg(feature = "tokenizer")]
+    pub(super) fn label(
+        self,
+        #[allow(unused_variables)] backend: &dyn tritium_spec::TernaryBackend,
+    ) -> &'static str {
+        if !self.is_cuda() {
+            return "qtea-scalar-host";
+        }
+        #[cfg(feature = "cuda")]
+        if backend
+            .as_concrete()
+            .and_then(|b| b.downcast_ref::<tritium_cuda::CudaBackend>())
+            .is_some_and(|b| b.device_swiglu_enabled())
+        {
+            return "qtea-cuda-ordered-device-swiglu-host-orchestrated";
+        }
+        "qtea-cuda-ordered-host-orchestrated"
+    }
 }

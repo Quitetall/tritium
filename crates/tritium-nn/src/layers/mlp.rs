@@ -211,6 +211,14 @@ impl SwiGluMlp {
         }
         let hidden_len = checked_buffer_len(m, n_ff, x.len())?;
 
+        #[cfg(feature = "cuda")]
+        if let (Projection::CudaQtea(gate), Projection::CudaQtea(up), Projection::CudaQtea(down)) =
+            (&self.gate, &self.up, &self.down)
+            && gate.try_device_swiglu(up, down, backend, x, m, out)?
+        {
+            return Ok(());
+        }
+
         let mut staged_out = zeroed_scratch(output_len, "SwiGLU output")?;
         if let (Projection::Tensor(gate), Projection::Tensor(up), Projection::Tensor(down)) =
             (&self.gate, &self.up, &self.down)

@@ -96,6 +96,43 @@ host-side and activations cross the host boundary per operation. This is **not**
 a fully resident graph or speed promise. MTP remains Unverified; explicit
 draft-only synthetic parity never promotes it or qualifies the real Qwen model.
 
+## Opt-in device SwiGLU regions
+
+Proposed ADR0174 extends the existing explicit `CudaBackend::with_device_swiglu()`
+mode to packed QTEA MLPs. The kernel evaluates
+`(z / (1 + expf(-z))) * up` on CUDA, while the three matrix projections keep their
+existing ordered separate-rounding arithmetic. Device expf is not host exp bit
+parity. Old CPU and `cuda-ordered-host` profiles do **not** select this mode.
+
+To select it explicitly, use `tritium.qtea-cuda-swiglu-host-load.v1` or
+`tritium.qtea-hybrid-cuda-swiglu-host-load.v1` with the same complete CUDA request
+fields/caps and `--backend cuda`. Observations identify
+`qtea-cuda-ordered-device-swiglu-host-orchestrated`. The mode keeps eligible
+packed-QTEA gate/up/activation/down intermediates on the device. Other activation
+families, attention, norms, state and orchestration remain on the existing host
+path. This is not a fully resident model or a performance/quality claim.
+
+The low-level `qtea_swiglu_device_into` is an explicit operation with its own
+`QteaSwiGluAllocationLedger` and numerical identity
+`qtea.cuda-device-swiglu.f32.v1` (not the wire/fitting identity). It uploads one
+input, retains input plus two hidden arrays plus final output and a four-byte
+status buffer on device, then reads back only the final output and status. Hidden
+arrays are never transferred to host. Private per-call scratch is not cached or
+pooled, and no dense weight shadow is retained. The NN seam uses the minimum
+host/device staging caps of its three selected owners; selected execution errors
+never silently fall back. The default unsupported/disabled region keeps its old
+path, following ADR0073.
+
+For batch `m`, input/output width `k`, hidden width `f`, requested device staging
+is `4*(2*m*k + 2*m*f) + 4` bytes for a nonempty call. Host staging is actual output
+Vec capacity bytes plus four status bytes. Empty calls allocate none but still
+validate geometry, context and positive caps. Nonfinite inputs, intermediates,
+results, arithmetic/ABI/shape/cap errors and CUDA failures refuse without changing
+caller output. Ledgers exclude other weights/calls, caller buffers and allocator/
+driver/module/event/shared-memory overhead; they are not measured physical peaks.
+The fixture tolerance of absolute/relative1e-4 is an opt-in numerical observation,
+not a universal whole-model quality bound or permission to relax old bit tests.
+
 ## Explicit physical checks
 
 Tiny checks require a real device and fail if CUDA cannot initialize. They are

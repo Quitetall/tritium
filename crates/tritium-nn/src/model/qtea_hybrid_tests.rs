@@ -444,6 +444,62 @@ fn cuda_hybrid_model_and_unverified_draft_execute_packed() {
     );
     assert_eq!(gpu_mtp.status(), Qwen35MtpStatus::Unverified);
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "explicit physical CUDA hybrid device-SiLU model fixture bounds; not MTP promotion"]
+fn device_swiglu_hybrid_profile_is_explicit_and_mtp_remains_unverified() {
+    let _serial = crate::model::chat_renderer::TEST_SERIAL.lock().unwrap();
+    let f = Fixture::new();
+    let mut recorder = tritium_evidence::EvidenceRecorder::new(
+        "hybrid-device-silu",
+        [tritium_evidence::MODEL_LOADED_REGISTRATION],
+    )
+    .unwrap();
+    let mut actual = super::super::LoadedModel::load_qtea_hybrid_cuda(
+        Cursor::new(f.bytes()),
+        [3; 32],
+        super::super::CudaQteaModelLimits {
+            host: limits().base,
+            max_device_weight_bytes: 1 << 20,
+            max_device_staging_bytes: 1 << 16,
+        },
+        limits().max_preserved_tensor_elements,
+        stream(),
+        Box::new(
+            tritium_cuda::CudaBackend::new(0)
+                .expect("physical CUDA required")
+                .with_device_swiglu(),
+        ),
+        tritium_runtime::TensorUploadContext {
+            recorder: &mut recorder,
+            span: "load",
+            parent: None,
+            logical_time: 0,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        actual.receipt.observation().backend,
+        "qtea-cuda-ordered-device-swiglu-host-orchestrated"
+    );
+    assert_eq!(
+        actual.runner.mtp_status(),
+        Some(Qwen35MtpStatus::Unverified)
+    );
+    let mut expected = load(&f, limits()).unwrap();
+    for (tokens, positions) in [(&[1, 2][..], &[0, 1][..]), (&[4][..], &[2][..])] {
+        let a = actual.runner.forward(tokens, positions).unwrap();
+        let b = expected.runner.forward(tokens, positions).unwrap();
+        for (a, b) in a.iter().zip(&b) {
+            assert!((a - b).abs() <= 1e-4 + 1e-4 * b.abs(), "{a} != {b}");
+        }
+    }
+    assert_eq!(
+        actual.runner.mtp_status(),
+        Some(Qwen35MtpStatus::Unverified)
+    );
+}
 #[test]
 fn native_fit_hybrid_language_mtp_loads_packed_and_runs_source_bound() {
     let _serial = crate::model::chat_renderer::TEST_SERIAL.lock().unwrap();

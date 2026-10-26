@@ -1,13 +1,16 @@
 //! Direct checked-wire CUDA execution. No dense shadow or fallback (ADR0172).
 use super::*;
 use tritium_format::qtea::{QteaExecutionLayout, QteaTensorView};
+mod swiglu;
+pub use swiglu::{QTEA_DEVICE_SWIGLU_NUMERICAL_ID, QteaSwiGluAllocationLedger};
 
 /// Positive per-call logical staging caps, not whole-model/physical admission.
 #[derive(Clone, Copy, Debug)]
 pub struct QteaCudaLimits {
     /// Sum of requested global device input/index and output allocation bytes.
     pub max_device_staging_bytes: u64,
-    /// Actual element capacity bytes of the private output Vec.
+    /// Actual private output Vec capacity bytes; device SwiGLU additionally
+    /// includes its four-byte host status value, as documented by that operation.
     pub max_host_staging_bytes: usize,
 }
 
@@ -60,6 +63,7 @@ pub(super) struct QteaKernels {
     _module: Arc<CudaModule>,
     matmul: CudaFunction,
     gather: CudaFunction,
+    swiglu: CudaFunction,
 }
 #[derive(Clone, Copy, Debug)]
 struct Geometry {
@@ -183,6 +187,9 @@ impl CudaBackend {
             gather: module
                 .load_function("qtea_gather")
                 .map_err(|e| driver_err("load QTEA gather", &e))?,
+            swiglu: module
+                .load_function("qtea_swiglu_device")
+                .map_err(|e| driver_err("load QTEA device SwiGLU", &e))?,
             _module: module,
         });
         *cache = Some(Arc::clone(&kernels));
@@ -273,12 +280,26 @@ impl CudaBackend {
                 byte_count(output.len()).unwrap_or(usize::MAX),
             )
         })?;
+        self.launch_qtea_matmul(tensor, &device_input, &mut device_output, count)?;
+        self.finish_qtea(&device_output, &mut staged, output)?;
+        Ok(ledger)
+    }
+
+    // Shared launch only: callers preflight geometry, contexts, shapes and caps.
+    // Separate kernel operations and original-column reduction remain unchanged.
+    fn launch_qtea_matmul(
+        &self,
+        tensor: &QteaResidentTensor,
+        device_input: &CudaSlice<f32>,
+        device_output: &mut CudaSlice<f32>,
+        count: u32,
+    ) -> Result<(), BackendError> {
         let g = tensor.geometry;
         let mut launch = self.stream.launch_builder(&tensor.kernels.matmul);
         launch
             .arg(&tensor.bytes)
-            .arg(&device_input)
-            .arg(&mut device_output)
+            .arg(device_input)
+            .arg(device_output)
             .arg(&count)
             .arg(&g.rows)
             .arg(&g.columns)
@@ -303,8 +324,7 @@ impl CudaBackend {
                 })
                 .map_err(|e| driver_err("launch QTEA ordered matmul", &e))?;
         }
-        self.finish_qtea(&device_output, &mut staged, output)?;
-        Ok(ledger)
+        Ok(())
     }
 
     /// Reconstruct only requested original rows into `[row_ids.len(),columns]`.
@@ -496,7 +516,7 @@ mod tests {
             bytes: stream.clone_htod(&[0u8]).unwrap(),
             geometry: Geometry {
                 rows: 4,
-                columns: 2,
+                columns: 4,
                 group: 2,
                 residual_count: 0,
                 trits: 0,
@@ -521,6 +541,11 @@ mod tests {
         assert!(
             backend
                 .qtea_gather_into(&tensor, &[], &mut [], limits)
+                .is_err()
+        );
+        assert!(
+            backend
+                .qtea_swiglu_device_into(&tensor, &tensor, &tensor, &[], 0, &mut [], limits)
                 .is_err()
         );
         foreign.synchronize().unwrap();

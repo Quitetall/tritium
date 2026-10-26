@@ -92,6 +92,8 @@ impl QteaLoadConfig {
             ("tritium.qtea-hybrid-host-load.v1", Some(cap), false) if cap > 0 => {}
             ("tritium.qtea-cuda-ordered-host-load.v1", None, true) => {}
             ("tritium.qtea-hybrid-cuda-ordered-host-load.v1", Some(cap), true) if cap > 0 => {}
+            ("tritium.qtea-cuda-swiglu-host-load.v1", None, true) => {}
+            ("tritium.qtea-hybrid-cuda-swiglu-host-load.v1", Some(cap), true) if cap > 0 => {}
             _ => return Err("--qtea unsupported load profile or preserved-cap selection".into()),
         }
         if let Some(cuda) = &self.cuda {
@@ -186,7 +188,18 @@ impl QteaLoadConfig {
         };
         #[cfg(feature = "cuda")]
         if let Some(cuda) = &self.cuda {
-            let backend = Box::new(tritium_cuda::CudaBackend::new(cuda.device)?);
+            let backend = tritium_cuda::CudaBackend::new(cuda.device)?;
+            let backend = Box::new(
+                if matches!(
+                    self.profile.as_str(),
+                    "tritium.qtea-cuda-swiglu-host-load.v1"
+                        | "tritium.qtea-hybrid-cuda-swiglu-host-load.v1"
+                ) {
+                    backend.with_device_swiglu()
+                } else {
+                    backend
+                },
+            );
             let gpu = super::CudaQteaModelLimits {
                 host: limits,
                 max_device_weight_bytes: cuda.max_device_weight_bytes,

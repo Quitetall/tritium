@@ -12,6 +12,44 @@ pub struct CudaQteaLinear {
     staging: QteaCudaLimits,
 }
 impl CudaQteaLinear {
+    pub(crate) fn try_device_swiglu(
+        &self,
+        up: &Self,
+        down: &Self,
+        backend: &dyn TernaryBackend,
+        input: &[f32],
+        batch: usize,
+        output: &mut [f32],
+    ) -> Result<bool, NnError> {
+        let backend = Self::backend(backend)?;
+        if !backend.device_swiglu_enabled() {
+            return Ok(false);
+        }
+        let staging = QteaCudaLimits {
+            max_device_staging_bytes: self
+                .staging
+                .max_device_staging_bytes
+                .min(up.staging.max_device_staging_bytes)
+                .min(down.staging.max_device_staging_bytes),
+            max_host_staging_bytes: self
+                .staging
+                .max_host_staging_bytes
+                .min(up.staging.max_host_staging_bytes)
+                .min(down.staging.max_host_staging_bytes),
+        };
+        backend
+            .qtea_swiglu_device_into(
+                &self.tensor,
+                &up.tensor,
+                &down.tensor,
+                input,
+                batch,
+                output,
+                staging,
+            )
+            .map(|_| true)
+            .map_err(|e| NnError::Backend(e.to_string()))
+    }
     /// Upload checked canonical bytes with positive residency and staging caps.
     /// The caller retains its source; this handle retains only encoded CUDA bytes.
     /// # Errors

@@ -186,6 +186,7 @@ impl super::LoadedModel {
             return Err(invalid("unconsumed hybrid QTEA owner"));
         }
         let physical_device = backend.physical_device_id().to_owned();
+        let execution = target.label(backend.as_ref());
         let language = super::Qwen35TextRunner::new(&config.text, language_weights, backend)?;
         let mtp = super::UnverifiedQwen35Mtp::new(&language, mtp_weights)?;
         let runner = super::Runner::hybrid(config, language, mtp, Some(admission))?;
@@ -196,11 +197,7 @@ impl super::LoadedModel {
             reader.package_id(),
             expected_source_model,
             physical_device,
-            if target.is_cuda() {
-                "qtea-cuda-ordered-host-orchestrated"
-            } else {
-                "qtea-scalar-host"
-            },
+            execution,
             context,
         )
     }

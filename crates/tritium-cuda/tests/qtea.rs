@@ -132,6 +132,169 @@ fn fixture(rows: usize, columns: usize, group: usize, ratio: f64, mode: u8) -> Q
 fn bits(values: &[f32]) -> Vec<u32> {
     values.iter().map(|x| x.to_bits()).collect()
 }
+
+fn swiglu_reference(
+    gate: &QteaTensor,
+    up: &QteaTensor,
+    down: &QteaTensor,
+    input: &[f32],
+    batch: usize,
+) -> Vec<f32> {
+    let hidden = batch * gate.view().metadata().rows;
+    let mut g = vec![0.; hidden];
+    let mut u = vec![0.; hidden];
+    let mut scratch = vec![0.; hidden];
+    tritium_cpu::qtea::matmul_into(gate.view(), input, batch, &mut g, &mut scratch).unwrap();
+    tritium_cpu::qtea::matmul_into(up.view(), input, batch, &mut u, &mut scratch).unwrap();
+    for (g, u) in g.iter_mut().zip(u) {
+        *g = (*g / (1. + (-*g).exp())) * u;
+    }
+    let mut output = vec![0.; batch * down.view().metadata().rows];
+    let mut scratch = output.clone();
+    tritium_cpu::qtea::matmul_into(down.view(), &g, batch, &mut output, &mut scratch).unwrap();
+    output
+}
+
+#[test]
+#[ignore = "explicit physical CUDA device-expf region parity/ledger; not host-bit or release qualification"]
+fn device_swiglu_keeps_intermediates_resident_with_declared_fixture_bounds() {
+    let cuda = CudaBackend::new(0).expect("physical CUDA required");
+    let g = fixture(12, 8, 2, 0.5, 0);
+    let u = fixture(12, 8, 4, 1., 0);
+    let d = fixture(8, 12, 3, 0.25, 0);
+    let upload = |t: &QteaTensor| {
+        cuda.upload_qtea(t.view(), t.as_bytes().len() as u64)
+            .unwrap()
+    };
+    let gate = upload(&g);
+    let up = upload(&u);
+    let down = upload(&d);
+    for batch in [0, 1, 3] {
+        let input = (0..batch * 8)
+            .map(|i| (i % 7) as f32 * 0.1731 - 0.35)
+            .collect::<Vec<_>>();
+        let expected = swiglu_reference(&g, &u, &d, &input, batch);
+        let mut output = vec![77.; input.len()];
+        let device = ((2 * batch * 8 + 2 * batch * 12) * 4 + if batch == 0 { 0 } else { 4 }) as u64;
+        let host = batch * 8 * 4 + if batch == 0 { 0 } else { 4 };
+        let limits = QteaCudaLimits {
+            max_device_staging_bytes: device.max(1),
+            max_host_staging_bytes: host.max(1),
+        };
+        let ledger = cuda
+            .qtea_swiglu_device_into(&gate, &up, &down, &input, batch, &mut output, limits)
+            .unwrap();
+        assert_eq!(ledger.device_staging_bytes, device);
+        assert_eq!(ledger.host_staging_capacity_bytes, host);
+        assert_eq!(
+            ledger.encoded_resident_bytes,
+            (g.as_bytes().len() + u.as_bytes().len() + d.as_bytes().len()) as u64
+        );
+        assert_eq!(ledger.dense_weight_bytes, 0);
+        for (a, b) in output.iter().zip(&expected) {
+            assert!(
+                (a - b).abs() <= 1e-4 + 1e-4 * b.abs(),
+                "device-expf fixture mismatch {a} != {b}"
+            );
+        }
+        if batch != 0 {
+            assert!(expected.iter().any(|v| v.abs() > 1e-3));
+            assert!(output.iter().any(|v| v.abs() > 1e-3));
+            for limits in [
+                QteaCudaLimits {
+                    max_device_staging_bytes: device - 1,
+                    ..limits
+                },
+                QteaCudaLimits {
+                    max_host_staging_bytes: host - 1,
+                    ..limits
+                },
+            ] {
+                output.fill(77.);
+                assert!(
+                    cuda.qtea_swiglu_device_into(
+                        &gate,
+                        &up,
+                        &down,
+                        &input,
+                        batch,
+                        &mut output,
+                        limits
+                    )
+                    .is_err()
+                );
+                assert!(output.iter().all(|x| *x == 77.));
+            }
+        }
+    }
+    let square = upload(&fixture(8, 8, 2, 0., 0));
+    let mut output = [77.; 8];
+    let generous = QteaCudaLimits {
+        max_device_staging_bytes: 1024,
+        max_host_staging_bytes: 1024,
+    };
+    let ledger = cuda
+        .qtea_swiglu_device_into(
+            &square,
+            &square,
+            &square,
+            &[0.1; 8],
+            1,
+            &mut output,
+            generous,
+        )
+        .unwrap();
+    assert_eq!(ledger.encoded_resident_bytes, square.encoded_bytes() as u64);
+}
+
+#[test]
+#[ignore = "explicit physical CUDA device SwiGLU numeric/shape/limit refusal transactionality"]
+fn device_swiglu_refuses_without_publishing_partial_output() {
+    let cuda = CudaBackend::new(0).expect("physical CUDA required");
+    let g = fixture(12, 8, 2, 1., 0);
+    let d = fixture(8, 12, 3, 1., 0);
+    let gate = cuda.upload_qtea(g.view(), 1 << 20).unwrap();
+    let down = cuda.upload_qtea(d.view(), 1 << 20).unwrap();
+    let limits = QteaCudaLimits {
+        max_device_staging_bytes: 4096,
+        max_host_staging_bytes: 4096,
+    };
+    let mut output = [77.; 8];
+    for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX, 1e30] {
+        assert!(
+            cuda.qtea_swiglu_device_into(&gate, &gate, &down, &[value; 8], 1, &mut output, limits)
+                .is_err()
+        );
+        assert_eq!(output, [77.; 8]);
+    }
+    assert!(
+        cuda.qtea_swiglu_device_into(&gate, &down, &down, &[0.; 8], 1, &mut output, limits)
+            .is_err()
+    );
+    assert!(
+        cuda.qtea_swiglu_device_into(&gate, &gate, &down, &[0.; 7], 1, &mut output, limits)
+            .is_err()
+    );
+    for limits in [
+        QteaCudaLimits {
+            max_device_staging_bytes: 0,
+            ..limits
+        },
+        QteaCudaLimits {
+            max_host_staging_bytes: 0,
+            ..limits
+        },
+    ] {
+        assert!(
+            cuda.qtea_swiglu_device_into(&gate, &gate, &down, &[0.; 8], 1, &mut output, limits)
+                .is_err()
+        );
+        assert_eq!(output, [77.; 8]);
+    }
+    cuda.qtea_swiglu_device_into(&gate, &gate, &down, &[0.; 8], 1, &mut output, limits)
+        .unwrap();
+    assert!(output.iter().all(|v| v.is_finite()));
+}
 fn check_ledger(ledger: QteaCudaAllocationLedger, wire: usize, input: usize, output: usize) {
     assert_eq!(ledger.encoded_resident_bytes, wire as u64);
     assert_eq!(ledger.input_or_index_bytes, (input * 4) as u64);

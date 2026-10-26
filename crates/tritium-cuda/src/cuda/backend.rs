@@ -17,7 +17,10 @@ mod decoder_plan;
 mod delta_mixer;
 pub(super) mod deltanet;
 mod qtea;
-pub use qtea::{QteaCudaAllocationLedger, QteaCudaLimits, QteaResidentTensor};
+pub use qtea::{
+    QTEA_DEVICE_SWIGLU_NUMERICAL_ID, QteaCudaAllocationLedger, QteaCudaLimits, QteaResidentTensor,
+    QteaSwiGluAllocationLedger,
+};
 mod salt_v2_reader_upload;
 mod salt_v2_runtime;
 mod semantic;
@@ -1127,6 +1130,12 @@ impl CudaBackend {
             self.device_id.push_str(":swiglu-device-f32");
         }
         self
+    }
+    /// Whether explicit device-f32 SwiGLU numerical mode was selected.
+    /// Not a declaration that every graph/activation family executes on device.
+    #[must_use]
+    pub fn device_swiglu_enabled(&self) -> bool {
+        self.semantic_swiglu_enabled
     }
     /// Open CUDA device `ordinal`, load the TQ2_0 add kernel, and return a backend.
     ///
