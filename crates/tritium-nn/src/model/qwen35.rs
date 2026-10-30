@@ -501,6 +501,95 @@ impl Qwen35TextRunner {
         Ok(logits)
     }
 
+    /// Build a device-resident executor for this model, when the backend is CUDA
+    /// and every weight it needs is a resident SALT V2 tensor the executor serves.
+    ///
+    /// `Ok(None)` means this model or backend cannot use it and the caller should
+    /// keep the host-orchestrated [`Self::forward`]. The executor is fast-tier: it is
+    /// close to this runner's output, not bit-identical to it, so callers should only
+    /// take it where they have opted into the fast tier.
+    ///
+    /// # Errors
+    /// Returns [`NnError::Backend`] if the backend accepts the model but the build
+    /// fails, for example on a device allocation.
+    #[cfg(feature = "cuda")]
+    pub fn cuda_resident(
+        &self,
+        max_context: usize,
+    ) -> Result<Option<tritium_cuda::Qwen35Resident>, NnError> {
+        let Some(cuda) = self
+            .backend
+            .as_concrete()
+            .and_then(|concrete| concrete.downcast_ref::<tritium_cuda::CudaBackend>())
+        else {
+            return Ok(None);
+        };
+        let Some(embedding) = self.embedding.unrotated_salt_v2_resident() else {
+            return Ok(None);
+        };
+        let Projection::SaltV2(lm_head) = &self.lm_head else {
+            return Ok(None);
+        };
+        let resident = |projection: &Projection| match projection {
+            Projection::SaltV2(tensor) => Some(Arc::clone(tensor)),
+            _ => None,
+        };
+        let mut rope: Option<(f32, usize)> = None;
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            let mixer = match &layer.mixer {
+                Qwen35TextMixer::DeltaNet(mixer) => mixer.resident_mixer_spec(),
+                Qwen35TextMixer::FullAttention(mixer) => {
+                    rope = Some((mixer.rope_theta(), mixer.rotary_dim()));
+                    mixer.resident_mixer_spec()
+                }
+            };
+            let (Some(mixer), Some(gate), Some(up), Some(down)) = (
+                mixer,
+                resident(&layer.mlp.gate),
+                resident(&layer.mlp.up),
+                resident(&layer.mlp.down),
+            ) else {
+                return Ok(None);
+            };
+            layers.push(tritium_cuda::Qwen35ResidentLayerSpec {
+                input_norm: &layer.input_norm,
+                mixer,
+                post_attention_norm: &layer.post_attention_norm,
+                gate,
+                up,
+                down,
+            });
+        }
+        let delta = &self.config.delta_net;
+        let attention = &self.config.full_attention;
+        let (rope_theta, rotary_dim) = rope.unwrap_or((
+            self.config.rope.theta as f32,
+            self.config.rope.rotary_dim as usize,
+        ));
+        let spec = tritium_cuda::Qwen35ResidentSpec {
+            embedding: Arc::clone(embedding),
+            layers,
+            final_norm: &self.final_norm,
+            lm_head: Arc::clone(lm_head),
+            rms_norm_eps: self.rms_norm_eps,
+            deltanet_key_heads: delta.num_key_heads as usize,
+            deltanet_value_heads: delta.num_value_heads as usize,
+            deltanet_key_head_dim: delta.key_head_dim as usize,
+            deltanet_value_head_dim: delta.value_head_dim as usize,
+            deltanet_conv_kernel: delta.conv_kernel_dim as usize,
+            attention_heads: attention.num_heads as usize,
+            attention_kv_heads: attention.num_key_value_heads as usize,
+            attention_head_dim: attention.head_dim as usize,
+            attention_rotary_dim: rotary_dim,
+            rope_theta,
+            max_context: max_context.min(self.max_context),
+        };
+        cuda.build_qwen35_resident(&spec)
+            .map(Some)
+            .map_err(|error| NnError::Backend(error.to_string()))
+    }
+
     pub(crate) fn project_shared_head(
         &self,
         hidden_states: &[f32],

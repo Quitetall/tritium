@@ -503,7 +503,7 @@ fn salt_v2_cuda_matches_cpu_and_dense_without_dense_weight_storage() {
             // K-sum. Assert against whichever kernel the receipt says ran, so
             // this covers both without assuming which shapes are eligible.
             match fast.receipt.mode() {
-                SaltV2ForwardMode::FastWarpReduce => {
+                SaltV2ForwardMode::FastWarpReduce | SaltV2ForwardMode::FastRowStream => {
                     let scale = exact
                         .output
                         .iter()
@@ -5617,6 +5617,101 @@ fn lm_head_i8_warp_and_tiled_match_host_oracle_bitwise() {
     );
 }
 
+/// `lm_head_warp_f16` pins its fold order: lane `l` folds `k = l, l+32, ...`
+/// ascending as `__fadd_rn(acc, __fmul_rn(h[k], f16(row[k])))`, then the
+/// 16/8/4/2/1 shuffle-down tree. A host emulation of exactly that order must
+/// match bit for bit, including a width with a partial last trip, so a loop
+/// restructuring (unrolling, prefetching) cannot silently reorder the sum.
+#[test]
+fn lm_head_warp_f16_matches_lane_fold_oracle_bitwise() {
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+    use cudarc::nvrtc::Ptx;
+
+    let ctx = match CudaContext::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping lm_head f16 fold gate: no device ({e})");
+            return;
+        }
+    };
+    let stream = ctx.default_stream();
+    let dm = ctx
+        .load_module(Ptx::from_src(DECODE_PTX))
+        .expect("load decode module");
+    let f_f16 = dm.load_function("lm_head_warp_f16").expect("f16 fn");
+
+    let mut s = 0x1F16_C0DEu64;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        ((s >> 11) as f32 / (1u64 << 53) as f32) * 2.0 - 1.0
+    };
+    for (vocab, n_embd) in [(1031usize, 2560usize), (517, 2600), (64, 40)] {
+        let table: Vec<u16> = (0..vocab * n_embd)
+            .map(|_| half::f16::from_f32(next()).to_bits())
+            .collect();
+        let h: Vec<f32> = (0..n_embd).map(|_| next()).collect();
+        let want: Vec<f32> = (0..vocab)
+            .map(|v| {
+                let row = &table[v * n_embd..(v + 1) * n_embd];
+                let mut lanes = [0.0f32; 32];
+                for (lane, acc) in lanes.iter_mut().enumerate() {
+                    let mut k = lane;
+                    while k < n_embd {
+                        *acc += h[k] * half::f16::from_bits(row[k]).to_f32();
+                        k += 32;
+                    }
+                }
+                let mut off = 16;
+                while off > 0 {
+                    let prev = lanes;
+                    for lane in 0..32 {
+                        if lane + off < 32 {
+                            lanes[lane] = prev[lane] + prev[lane + off];
+                        }
+                    }
+                    off >>= 1;
+                }
+                lanes[0]
+            })
+            .collect();
+
+        let d_table = stream.clone_htod(&table).expect("table htod");
+        let d_h = stream.clone_htod(&h).expect("h htod");
+        let mut d_logits: cudarc::driver::CudaSlice<f32> =
+            stream.alloc_zeros(vocab).expect("logits");
+        let (ne_i, v_i) = (n_embd as i32, vocab as i32);
+        let mut launch = stream.launch_builder(&f_f16);
+        launch
+            .arg(&d_h)
+            .arg(&d_table)
+            .arg(&ne_i)
+            .arg(&v_i)
+            .arg(&mut d_logits);
+        // SAFETY: one warp per vocab row over a [vocab, n_embd] f16 table and an
+        // n_embd f32 vector, both sized above; the kernel bounds-checks the warp.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(LaunchConfig {
+                    grid_dim: ((vocab as u32).div_ceil(8), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .expect("launch lm_head_warp_f16");
+        }
+        let got = stream.clone_dtoh(&d_logits).expect("logits dtoh");
+        for (v, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "lm_head_warp_f16 [{vocab}x{n_embd}] row {v}: got {g} want {w}"
+            );
+        }
+    }
+}
+
 /// ADR 0036 L2 head-format kernel A/B at equal M=1 shapes (the ≥1.6× gate):
 /// `lm_head_warp_i8` vs `lm_head_warp_f16` on the 2B4T head shape
 /// (vocab 128256 × n_embd 2560 — 656 MB f16 / 328 MB i8 + 20.5 MB scales, both
@@ -8260,4 +8355,95 @@ fn sparsity_crossover_sweep() {
          is byte-bound, and a denser or sparser format has room to pay. Round 16 measured only the \
          L2-resident column."
     );
+}
+
+/// The decode graph's `rmsnorm_quant_i8` (fused RMSNorm + int8 activation quant)
+/// against the host oracle, bit for bit: the canonical 256-slot sum of squares,
+/// `x * inv * w`, absmax scale and round-ties-even quant. Covers both BitNet
+/// widths, a width past the kernel's register-held weight slots (7200 > 14 * 512)
+/// and edge lengths, at the decode graph's 512 threads.
+#[test]
+fn rmsnorm_quant_i8_bit_matches_host() {
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+    use cudarc::nvrtc::Ptx;
+
+    let ctx = match CudaContext::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping rmsnorm_quant_i8 bit-match: no device ({e})");
+            return;
+        }
+    };
+    let stream = ctx.default_stream();
+    let dm = ctx
+        .load_module(Ptx::from_src(DECODE_PTX))
+        .expect("load decode module");
+    let f = dm
+        .load_function(KERNEL_NAME_RMSNORM_QUANT_I8)
+        .expect("rmsnorm_quant_i8");
+    for &n in &[2560usize, 6912, 7200, 17, 1] {
+        let mut s = 0x5EED_1234_ABCD_0001u64 ^ (n as u64).wrapping_mul(0x9E37_79B9);
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 11) as f32 / (1u64 << 53) as f32) * 8.0 - 4.0
+        };
+        let x: Vec<f32> = (0..n).map(|_| next()).collect();
+        let w: Vec<f32> = (0..n).map(|_| next()).collect();
+        let eps = 1e-5f32;
+
+        let mut part = [0.0f32; 256];
+        for (i, &v) in x.iter().enumerate() {
+            part[i % 256] += v * v;
+        }
+        let mut off = 128;
+        while off > 0 {
+            for t in 0..off {
+                part[t] += part[t + off];
+            }
+            off >>= 1;
+        }
+        let inv = 1.0 / (part[0] / n as f32 + eps).sqrt();
+        let y: Vec<f32> = x.iter().zip(&w).map(|(&xi, &wi)| xi * inv * wi).collect();
+        let gamma = y.iter().fold(0.0f32, |g, v| g.max(v.abs()));
+        let scale = 127.0f32 / gamma;
+        let want: Vec<i8> = y
+            .iter()
+            .map(|&v| (v * scale).round_ties_even().clamp(-128.0, 127.0) as i8)
+            .collect();
+        let want_scale = gamma / 127.0;
+
+        let d_x = stream.clone_htod(&x).unwrap();
+        let d_w = stream.clone_htod(&w).unwrap();
+        let mut d_q = stream.alloc_zeros::<i8>(n).unwrap();
+        let mut d_scale = stream.alloc_zeros::<f32>(1).unwrap();
+        let n_i = n as i32;
+        let mut launch = stream.launch_builder(&f);
+        launch
+            .arg(&d_x)
+            .arg(&d_w)
+            .arg(&eps)
+            .arg(&n_i)
+            .arg(&mut d_q)
+            .arg(&mut d_scale);
+        // SAFETY: `rmsnorm_quant_i8(x, w, eps, n, q_out, act_scale)` with buffers
+        // of `n` elements and `n` floats of dynamic shared memory.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (RMSNORM_QUANT_THREADS, 1, 1),
+                    shared_mem_bytes: (n * 4) as u32,
+                })
+                .unwrap();
+        }
+        let got = stream.clone_dtoh(&d_q).unwrap();
+        let got_scale = stream.clone_dtoh(&d_scale).unwrap()[0];
+        assert_eq!(got_scale.to_bits(), want_scale.to_bits(), "n={n}: scale");
+        for (i, (g, h)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(g, h, "n={n} i={i}: q {g} vs {h}");
+        }
+    }
 }

@@ -10,6 +10,7 @@ use tritium_format::salt_v2_package::{
 };
 
 pub(super) mod deltanet;
+pub(super) mod qwen35_resident;
 mod salt_v2_reader_upload;
 mod salt_v2_runtime;
 pub use salt_v2_runtime::SaltV2GatherReceipt;
@@ -319,6 +320,10 @@ pub enum SaltV2ForwardMode {
     /// ordered replay. Reassociates the K-sum, so results are close to the CPU
     /// reference rather than equal to it.
     FastWarpReduce,
+    /// Row-streaming forward: a warp reads its row's plane-tile words coalesced
+    /// and reduces by shuffle. B3 at scale group 128 only. Close to the CPU
+    /// reference rather than equal to it.
+    FastRowStream,
 }
 
 /// Checked requested-`CudaSlice` ledger for one SALT V2 forward.
@@ -558,6 +563,11 @@ pub struct CudaBackend {
     /// Gated DeltaNet recurrent-step PTX kept alive for `func_deltanet_step`.
     pub(super) _deltanet_module: Arc<CudaModule>,
     pub(super) func_deltanet_step: CudaFunction,
+    /// Multi-token DeltaNet recurrence (`KERNEL_NAME_DELTANET_ROWS128`).
+    pub(super) func_deltanet_rows128: CudaFunction,
+    /// Qwen3.5/3.6 resident decode kernels; the executor resolves functions from
+    /// it when it is built, so backends that never serve Qwen pay nothing more.
+    pub(super) qwen35_decode_module: Arc<CudaModule>,
     /// Scalar-correct D2/B3/S34 forward. The first fast API aliases this handle.
     pub(super) func_salt_v2_exact: CudaFunction,
     /// Shared-activation D2/B3/S34 forward used for prefill-shaped launches.
@@ -566,8 +576,24 @@ pub struct CudaBackend {
     pub(super) func_salt_v2_warp: CudaFunction,
     /// Tolerance-gated warp forward (`KERNEL_NAME_SALT_V2_WARP_FAST`).
     pub(super) func_salt_v2_warp_fast: CudaFunction,
+    /// Row-streaming SALT V2 GEMV (`KERNEL_NAME_SALT_V2_STREAM`).
+    pub(super) func_salt_v2_stream: CudaFunction,
+    /// Fused multi-tensor row-stream GEMV (`KERNEL_NAME_SALT_V2_STREAM_MULTI`).
+    pub(super) func_salt_v2_stream_multi: CudaFunction,
+    /// Multi-row prefill row-stream GEMV (`KERNEL_NAME_SALT_V2_STREAM_ROWS`).
+    pub(super) func_salt_v2_stream_rows: CudaFunction,
+    /// Per-128-group int8 activation quantizer (`KERNEL_NAME_SALT_V2_QUANT_ACT`).
+    pub(super) func_salt_v2_quant_act: CudaFunction,
+    /// A8 row-stream GEMV (`KERNEL_NAME_SALT_V2_STREAM_I8`).
+    pub(super) func_salt_v2_stream_i8: CudaFunction,
+    /// Fused A8 row-stream GEMV (`KERNEL_NAME_SALT_V2_STREAM_I8_MULTI`).
+    pub(super) func_salt_v2_stream_i8_multi: CudaFunction,
     /// Exact selected-row reconstruction for SALT V2 token embeddings.
     pub(super) func_salt_v2_gather: CudaFunction,
+    /// Tensor-core SALT V2 GEMM (`salt_v2_mma.cu`).
+    pub(super) salt_v2_mma: SaltMmaKernels,
+    /// DFlash drafter kernels (`dflash.cu`).
+    pub(super) dflash_module: Arc<CudaModule>,
     /// Device trap used only by destructive release qualification.
     #[cfg(feature = "device-loss-qualification")]
     pub(super) func_qualification_poison: CudaFunction,
@@ -1164,6 +1190,24 @@ impl CudaBackend {
         let func_salt_v2_warp_fast = salt_v2_module
             .load_function(KERNEL_NAME_SALT_V2_WARP_FAST)
             .map_err(|error| driver_err("load SALT V2 fast warp forward kernel", &error))?;
+        let func_salt_v2_stream = salt_v2_module
+            .load_function(KERNEL_NAME_SALT_V2_STREAM)
+            .map_err(|error| driver_err("load SALT V2 row-stream kernel", &error))?;
+        let func_salt_v2_stream_multi = salt_v2_module
+            .load_function(KERNEL_NAME_SALT_V2_STREAM_MULTI)
+            .map_err(|error| driver_err("load SALT V2 fused row-stream kernel", &error))?;
+        let func_salt_v2_stream_rows = salt_v2_module
+            .load_function(KERNEL_NAME_SALT_V2_STREAM_ROWS)
+            .map_err(|error| driver_err("load SALT V2 multi-row row-stream kernel", &error))?;
+        let func_salt_v2_quant_act = salt_v2_module
+            .load_function(KERNEL_NAME_SALT_V2_QUANT_ACT)
+            .map_err(|error| driver_err("load SALT V2 activation quantizer", &error))?;
+        let func_salt_v2_stream_i8 = salt_v2_module
+            .load_function(KERNEL_NAME_SALT_V2_STREAM_I8)
+            .map_err(|error| driver_err("load SALT V2 A8 row-stream kernel", &error))?;
+        let func_salt_v2_stream_i8_multi = salt_v2_module
+            .load_function(KERNEL_NAME_SALT_V2_STREAM_I8_MULTI)
+            .map_err(|error| driver_err("load SALT V2 fused A8 row-stream kernel", &error))?;
         let func_salt_v2_gather = salt_v2_module
             .load_function(KERNEL_NAME_SALT_V2_GATHER)
             .map_err(|e| driver_err("resolve salt_v2_gather_rows kernel", &e))?;
@@ -1172,12 +1216,25 @@ impl CudaBackend {
             .load_function(KERNEL_NAME_QUALIFICATION_POISON)
             .map_err(|e| driver_err("resolve qualification context-poison kernel", &e))?;
 
+        // Same compute_80 floor as the IMMA module above.
+        let salt_v2_mma = SaltMmaKernels::load(&ctx)?;
+        let dflash_module = ctx
+            .load_module(Ptx::from_src(DFLASH_PTX))
+            .map_err(|e| driver_err("load dflash ptx", &e))?;
+
         let deltanet_module = ctx
             .load_module(Ptx::from_src(QWEN35_DELTANET_PTX))
             .map_err(|e| driver_err("load qwen35_deltanet ptx", &e))?;
+        let func_deltanet_rows128 = deltanet_module
+            .load_function(KERNEL_NAME_DELTANET_ROWS128)
+            .map_err(|e| driver_err("resolve qwen35_deltanet_recurrent_rows128 kernel", &e))?;
         let func_deltanet_step = deltanet_module
             .load_function(KERNEL_NAME_DELTANET_STEP)
             .map_err(|e| driver_err("resolve qwen35_deltanet_recurrent_step kernel", &e))?;
+
+        let qwen35_decode_module = ctx
+            .load_module(Ptx::from_src(QWEN35_DECODE_PTX))
+            .map_err(|e| driver_err("load qwen35_decode ptx", &e))?;
 
         let device_name = ctx
             .name()
@@ -1207,11 +1264,21 @@ impl CudaBackend {
             _salt_v2_module: salt_v2_module,
             _deltanet_module: deltanet_module,
             func_deltanet_step,
+            func_deltanet_rows128,
+            qwen35_decode_module,
             func_salt_v2_exact,
             func_salt_v2_tiled,
             func_salt_v2_warp,
             func_salt_v2_warp_fast,
+            func_salt_v2_stream,
+            func_salt_v2_stream_multi,
+            func_salt_v2_stream_rows,
+            func_salt_v2_quant_act,
+            func_salt_v2_stream_i8,
+            func_salt_v2_stream_i8_multi,
             func_salt_v2_gather,
+            salt_v2_mma,
+            dflash_module,
             #[cfg(feature = "device-loss-qualification")]
             func_qualification_poison,
             func_tiled_f32_sparse,
@@ -8757,6 +8824,66 @@ pub(super) fn format_cuda_physical_id(ordinal: usize, bytes: [u8; 16]) -> String
 /// Read the device compute capability and format it as an `sm_XY` tag for the
 /// autotune cache key. Falls back to the IMMA floor `sm_80` if the query fails (the
 /// kernel needs sm_80+ regardless, so this is the most conservative correct default).
+/// The tensor-core SALT V2 GEMM's entry points, with their module kept alive.
+#[derive(Clone, Debug)]
+pub(super) struct SaltMmaKernels {
+    _module: Arc<CudaModule>,
+    pub(super) split_act: CudaFunction,
+    pub(super) rows16: CudaFunction,
+    pub(super) rows64: CudaFunction,
+    pub(super) reduce: CudaFunction,
+}
+
+impl SaltMmaKernels {
+    fn load(ctx: &Arc<CudaContext>) -> Result<Self, BackendError> {
+        let module = ctx
+            .load_module(Ptx::from_src(SALT_V2_MMA_PTX))
+            .map_err(|e| driver_err("load salt_v2_mma ptx", &e))?;
+        let get = |name: &str| {
+            module
+                .load_function(name)
+                .map_err(|e| driver_err("resolve tensor-core SALT V2 kernel", &e))
+        };
+        let rows64 = get(KERNEL_NAME_SALT_V2_MMA_ROWS64)?;
+        // The 64-row variant stages its activation tile above the 48 KiB default.
+        rows64
+            .set_attribute(
+                sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                salt_v2_mma_shared_bytes(SALT_V2_MMA_ROWS_MAX) as i32,
+            )
+            .map_err(|e| driver_err("raise tensor-core SALT V2 shared memory", &e))?;
+        let rows16 = get(KERNEL_NAME_SALT_V2_MMA_ROWS16)?;
+        // Half the unified L1/shared array as shared memory: two blocks' staged
+        // activation tiles fit, and the rest caches payload words.
+        rows16
+            .set_attribute(
+                sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                50,
+            )
+            .map_err(|e| driver_err("set tensor-core SALT V2 carveout", &e))?;
+        Ok(Self {
+            split_act: get(KERNEL_NAME_SALT_V2_MMA_SPLIT_ACT)?,
+            rows16,
+            rows64,
+            reduce: get(KERNEL_NAME_SALT_V2_MMA_REDUCE)?,
+            _module: module,
+        })
+    }
+}
+
+/// Dynamic shared memory of the tensor-core GEMM variant that serves `rows`
+/// activation rows: one staged activation tile of 16 or 64 rows. Mirrors
+/// `mma_rows` in `salt_v2_mma.cu`.
+pub(super) const fn salt_v2_mma_shared_bytes(rows: u32) -> u32 {
+    // kActStride halves per staged row, hi and lo, two bytes each.
+    let row_bytes = (256 + 16) * 2 * 2;
+    if rows <= 16 {
+        16 * row_bytes
+    } else {
+        64 * row_bytes
+    }
+}
+
 fn query_sm_arch(ctx: &Arc<CudaContext>) -> String {
     match ctx.compute_capability() {
         Ok((major, minor)) => format!("sm_{major}{minor}"),

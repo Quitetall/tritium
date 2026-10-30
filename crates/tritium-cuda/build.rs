@@ -54,6 +54,12 @@ fn main() {
     // The Gated DeltaNet recurrent step. Same `--fmad=false` host-bit-match
     // discipline as the decode kernels: the host reduction is the reference.
     println!("cargo:rerun-if-changed=kernels/qwen35_deltanet.cu");
+    // Qwen3.5/3.6 resident decode kernels (fast tier; see the file header).
+    println!("cargo:rerun-if-changed=kernels/qwen35_decode.cu");
+    // SALT V2 B3 x f32 GEMM on the f16 tensor cores (prefill, verification).
+    println!("cargo:rerun-if-changed=kernels/salt_v2_mma.cu");
+    // The DFlash speculative drafter (int8 weights, f16 tensor cores).
+    println!("cargo:rerun-if-changed=kernels/dflash.cu");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
@@ -81,6 +87,9 @@ fn main() {
             "train_grad.ptx",
             "salt_v2.ptx",
             "qwen35_deltanet.ptx",
+            "qwen35_decode.ptx",
+            "salt_v2_mma.ptx",
+            "dflash.ptx",
         ] {
             std::fs::write(out_dir.join(ptx), "")
                 .expect("tritium-cuda: failed to write check-only placeholder PTX");
@@ -172,6 +181,39 @@ fn main() {
         &out_dir.join("qwen35_deltanet.ptx"),
         add_min_arch,
         &["--fmad=false"],
+    );
+
+    // The Qwen resident decode kernels are fast-tier by design: gated on relative
+    // error and greedy-token identity against the host path, so FMA contraction
+    // is allowed.
+    compile_ptx(
+        &nvcc,
+        Path::new("kernels/qwen35_decode.cu"),
+        &out_dir.join("qwen35_decode.ptx"),
+        add_min_arch,
+        &[],
+    );
+
+    // The tensor-core SALT V2 GEMM uses `mma.m16n8k16` with f32 accumulation and
+    // `cp.async`, both sm_80+: it shares the IMMA kernel's compute_80 floor. Fast
+    // tier (see the file header), so FMA contraction is allowed.
+    compile_ptx(
+        &nvcc,
+        Path::new("kernels/salt_v2_mma.cu"),
+        &out_dir.join("salt_v2_mma.ptx"),
+        IMMA_MIN_ARCH,
+        &[],
+    );
+
+    // The DFlash drafter: its numerics never reach the output (the target accepts
+    // only tokens it would choose itself), so it is free to use int8 weights and
+    // f16 tensor cores. compute_80 for `mma.m16n8k16`.
+    compile_ptx(
+        &nvcc,
+        Path::new("kernels/dflash.cu"),
+        &out_dir.join("dflash.ptx"),
+        IMMA_MIN_ARCH,
+        &[],
     );
 }
 

@@ -1,0 +1,2874 @@
+//! Device-resident Qwen3.5/Qwen3.6 decode executor (SALT decode campaign, Phase 2).
+//!
+//! The host-orchestrated path runs every projection as its own round trip: scan the
+//! activation, upload it, launch, block on the download, scan the result. For the
+//! Qwen3.6-27B bundle that is ~500 round trips per token, and after the row-stream
+//! GEMV cut the projections to 13 ms, 23 of the 37.6 ms per token were spent outside
+//! any kernel. This executor keeps the whole step on the device: activations,
+//! DeltaNet state, convolution state and the KV cache never leave it, and a step
+//! returns only the four bytes of the next greedy token.
+//!
+//! **Numerics.** Fast tier throughout: the row-stream GEMV reassociates the K-sum and
+//! the decode kernels use CUDA transcendentals. It is gated on relative error and
+//! greedy-token identity against the host forward, not on equality, and it is only
+//! offered where the caller has opted into the fast tier.
+//!
+//! **Shape.** Deliberately ADR 0044 D8's `Executor` surface -- `prefill`, `step`,
+//! `reset` over backend-owned state -- so the runner consolidation can move it behind
+//! `TernaryBackend::resident` once tensors have a backend-neutral handle, instead of
+//! rewriting it.
+
+use std::sync::Arc;
+
+use super::salt_v2_runtime::{
+    SALT_STREAM_DESCRIPTOR_WORDS, SaltMmaScratch, launch_salt_v2_mma_rows_on,
+    launch_salt_v2_quant_act_on, launch_salt_v2_stream_i8_multi_on, launch_salt_v2_stream_i8_on,
+    launch_salt_v2_stream_multi_on, launch_salt_v2_stream_on, launch_salt_v2_stream_rows_on,
+    salt_stream_descriptor, salt_v2_stream_dispatch,
+};
+use super::*;
+
+mod dflash;
+pub use dflash::{DFlashConfig, DFlashFetch};
+
+/// Largest context the executor's attention kernel keeps scores for in shared memory.
+///
+/// 8192 scores are 32 KiB, inside the default per-block shared budget. Longer contexts
+/// need a split-context attention kernel, which is later work.
+pub const QWEN35_RESIDENT_MAX_CONTEXT: usize = 8192;
+
+/// One token mixer's weights, borrowed from the host model for the build.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Qwen35ResidentMixerSpec<'a> {
+    /// A Gated DeltaNet (`linear_attention`) layer.
+    DeltaNet {
+        /// `[conv_width, hidden]`: query, key and value, concatenated.
+        qkv: Arc<SaltV2ResidentTensor>,
+        /// `[value_width, hidden]`: the output gate `z`.
+        z: Arc<SaltV2ResidentTensor>,
+        /// `[value_heads, hidden]`: beta logits.
+        b: Arc<SaltV2ResidentTensor>,
+        /// `[value_heads, hidden]`: decay logits.
+        a: Arc<SaltV2ResidentTensor>,
+        /// `[hidden, value_width]`: output projection.
+        out: Arc<SaltV2ResidentTensor>,
+        /// `[conv_width, conv_kernel]` depthwise taps.
+        conv_weight: &'a [f32],
+        /// `[value_head_dim]` gated-norm weight (applied directly, not `1 + w`).
+        norm_weight: &'a [f32],
+        /// `[value_heads]`.
+        dt_bias: &'a [f32],
+        /// `[value_heads]`.
+        a_log: &'a [f32],
+    },
+    /// A gated causal GQA (`full_attention`) layer.
+    Attention {
+        /// `[2 * heads * head_dim, hidden]`: query and gate interleaved per head.
+        q: Arc<SaltV2ResidentTensor>,
+        /// `[kv_heads * head_dim, hidden]`.
+        k: Arc<SaltV2ResidentTensor>,
+        /// `[kv_heads * head_dim, hidden]`.
+        v: Arc<SaltV2ResidentTensor>,
+        /// `[hidden, heads * head_dim]`.
+        o: Arc<SaltV2ResidentTensor>,
+        /// `[head_dim]` zero-centered query head norm.
+        q_norm: &'a [f32],
+        /// `[head_dim]` zero-centered key head norm.
+        k_norm: &'a [f32],
+    },
+}
+
+/// One decoder layer.
+#[derive(Debug)]
+pub struct Qwen35ResidentLayerSpec<'a> {
+    /// `[hidden]` zero-centered input norm.
+    pub input_norm: &'a [f32],
+    /// The token mixer.
+    pub mixer: Qwen35ResidentMixerSpec<'a>,
+    /// `[hidden]` zero-centered post-attention norm.
+    pub post_attention_norm: &'a [f32],
+    /// `[intermediate, hidden]`.
+    pub gate: Arc<SaltV2ResidentTensor>,
+    /// `[intermediate, hidden]`.
+    pub up: Arc<SaltV2ResidentTensor>,
+    /// `[hidden, intermediate]`.
+    pub down: Arc<SaltV2ResidentTensor>,
+}
+
+/// Everything the executor needs, borrowed from a loaded host model.
+#[derive(Debug)]
+pub struct Qwen35ResidentSpec<'a> {
+    /// `[vocab, hidden]` token table (must carry no rotation).
+    pub embedding: Arc<SaltV2ResidentTensor>,
+    /// Decoder layers in order.
+    pub layers: Vec<Qwen35ResidentLayerSpec<'a>>,
+    /// `[hidden]` zero-centered final norm.
+    pub final_norm: &'a [f32],
+    /// `[vocab, hidden]` untied language head.
+    pub lm_head: Arc<SaltV2ResidentTensor>,
+    /// RMSNorm epsilon shared by every norm in the model.
+    pub rms_norm_eps: f32,
+    /// DeltaNet query/key heads.
+    pub deltanet_key_heads: usize,
+    /// DeltaNet value (recurrent-state) heads.
+    pub deltanet_value_heads: usize,
+    /// DeltaNet per-head query/key width.
+    pub deltanet_key_head_dim: usize,
+    /// DeltaNet per-head value width.
+    pub deltanet_value_head_dim: usize,
+    /// DeltaNet depthwise conv taps.
+    pub deltanet_conv_kernel: usize,
+    /// Full-attention query heads.
+    pub attention_heads: usize,
+    /// Full-attention key/value heads.
+    pub attention_kv_heads: usize,
+    /// Full-attention head width.
+    pub attention_head_dim: usize,
+    /// Rotated prefix of each head (NeoX half-rotation).
+    pub attention_rotary_dim: usize,
+    /// RoPE base.
+    pub rope_theta: f32,
+    /// Context the executor allocates KV for; at most [`QWEN35_RESIDENT_MAX_CONTEXT`].
+    pub max_context: usize,
+}
+
+struct DeltaNetLayer {
+    qkv: Arc<SaltV2ResidentTensor>,
+    z: Arc<SaltV2ResidentTensor>,
+    b: Arc<SaltV2ResidentTensor>,
+    a: Arc<SaltV2ResidentTensor>,
+    out: Arc<SaltV2ResidentTensor>,
+    conv_weight: CudaSlice<f32>,
+    norm_weight: CudaSlice<f32>,
+    dt_bias: CudaSlice<f32>,
+    a_log: CudaSlice<f32>,
+    conv_state: CudaSlice<f32>,
+    recurrent_state: CudaSlice<f32>,
+}
+
+struct AttentionLayer {
+    q: Arc<SaltV2ResidentTensor>,
+    k: Arc<SaltV2ResidentTensor>,
+    v: Arc<SaltV2ResidentTensor>,
+    o: Arc<SaltV2ResidentTensor>,
+    q_norm: CudaSlice<f32>,
+    k_norm: CudaSlice<f32>,
+    key_cache: CudaSlice<f32>,
+    value_cache: CudaSlice<f32>,
+}
+
+enum Mixer {
+    DeltaNet(Box<DeltaNetLayer>),
+    Attention(Box<AttentionLayer>),
+}
+
+/// Several projections of one input, launched as one fused row-stream GEMV.
+struct FusedGroup {
+    descriptors: CudaSlice<u64>,
+    tensor_count: u32,
+    total_rows: u32,
+}
+
+/// A fused group run by the multi-row prefill GEMV over `k` input columns.
+struct PrefillGroup {
+    group: FusedGroup,
+    k: u32,
+    table_bytes: u32,
+    /// Every member's row count is a multiple of 16, so the tensor-core GEMM can
+    /// run the group.
+    mma_ok: bool,
+    /// Each member's output buffer and row count, for the drift probe.
+    outputs: Vec<(sys::CUdeviceptr, usize)>,
+}
+
+/// One layer's prefill projections, writing the [`Prefill`] buffers.
+struct PrefillLayer {
+    /// DeltaNet qkv|z|b|a or attention q|k|v.
+    input: PrefillGroup,
+    /// DeltaNet out or attention o.
+    out: PrefillGroup,
+    /// gate|up.
+    mlp: PrefillGroup,
+    down: PrefillGroup,
+}
+
+/// Prompt tokens fed per batched prefill chunk.
+const PREFILL_CHUNK: usize = 64;
+
+/// Most tokens one speculative verification ([`Qwen35Resident::verify`]) checks.
+pub const QWEN35_VERIFY_MAX: usize = 16;
+
+/// Speculative verification state: what a later commit replays, and the head.
+struct Verify {
+    /// Per DeltaNet layer, in layer order: the verified rows' conv input, `b` and
+    /// `a` logits, `[QWEN35_VERIFY_MAX, width]` each.
+    saved: Vec<(CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>)>,
+    /// The language head as a fused group writing `logits`.
+    head: PrefillGroup,
+    /// `[QWEN35_VERIFY_MAX, vocab]`.
+    logits: CudaSlice<f32>,
+    /// `[QWEN35_VERIFY_MAX, ARGMAX_BLOCKS]` stage-one argmax partials.
+    argmax_value: CudaSlice<f32>,
+    argmax_index: CudaSlice<i32>,
+    /// `[QWEN35_VERIFY_MAX]` greedy token after each verified row.
+    tokens: CudaSlice<u32>,
+    /// Rows of the latest verification not yet committed.
+    pending: Option<usize>,
+}
+
+/// Batched prefill: `[PREFILL_CHUNK, width]` activations. The projections run as
+/// multi-row GEMVs whose every output row is bit-identical to the decode GEMV on
+/// that row alone; everything sequential in the token (convolution, recurrence,
+/// RoPE position, causal attention) runs per token on row offsets with the
+/// decode kernels, so a chunk computes exactly what token-by-token steps do.
+struct Prefill {
+    layers: Vec<PrefillLayer>,
+    /// `[PREFILL_CHUNK, 4]`: row t is the decode ctrl of the chunk's token t.
+    ctrl: CudaSlice<i32>,
+    tokens: CudaSlice<u32>,
+    residual: CudaSlice<f32>,
+    normalized: CudaSlice<f32>,
+    branch: CudaSlice<f32>,
+    qkv: CudaSlice<f32>,
+    z: CudaSlice<f32>,
+    b: CudaSlice<f32>,
+    a: CudaSlice<f32>,
+    gated: CudaSlice<f32>,
+    fused_query: CudaSlice<f32>,
+    key: CudaSlice<f32>,
+    value: CudaSlice<f32>,
+    attention_gate: CudaSlice<f32>,
+    attended: CudaSlice<f32>,
+    /// Batched attention queries.
+    query: CudaSlice<f32>,
+    /// Per-token intermediates of the batched DeltaNet scan.
+    scan: ScanScratch,
+    mlp_gate: CudaSlice<f32>,
+    mlp_up: CudaSlice<f32>,
+    mlp_act: CudaSlice<f32>,
+    /// Tensor-core GEMM scratch, sized for the widest group.
+    mma: SaltMmaScratch,
+}
+
+struct Layer {
+    /// The mixer's input projections fused (DeltaNet qkv|z|b|a, attention q|k|v).
+    fused_in: Option<FusedGroup>,
+    /// The MLP's gate|up fused.
+    fused_mlp: Option<FusedGroup>,
+    input_norm: CudaSlice<f32>,
+    post_attention_norm: CudaSlice<f32>,
+    mixer: Mixer,
+    gate: Arc<SaltV2ResidentTensor>,
+    up: Arc<SaltV2ResidentTensor>,
+    down: Arc<SaltV2ResidentTensor>,
+}
+
+struct Kernels {
+    stream_gemv: CudaFunction,
+    stream_gemv_multi: CudaFunction,
+    stream_rows: CudaFunction,
+    mma: SaltMmaKernels,
+    quant_act: CudaFunction,
+    stream_i8: CudaFunction,
+    stream_i8_multi: CudaFunction,
+    gather: CudaFunction,
+    recurrent: CudaFunction,
+    recurrent_rows128: CudaFunction,
+    add_rmsnorm: CudaFunction,
+    attn_prep: CudaFunction,
+    attention: CudaFunction,
+    sigmoid_mul: CudaFunction,
+    swiglu: CudaFunction,
+    conv: CudaFunction,
+    prep: CudaFunction,
+    gated_rmsnorm: CudaFunction,
+    attn_prep_rows: CudaFunction,
+    attention_rows: CudaFunction,
+    conv_rows: CudaFunction,
+    prep_rows: CudaFunction,
+    gated_rmsnorm_rows: CudaFunction,
+    argmax_partial: CudaFunction,
+    argmax_final: CudaFunction,
+}
+
+/// Scratch activations, sized once at build.
+struct Scratch {
+    ctrl: CudaSlice<i32>,
+    token: CudaSlice<u32>,
+    residual: CudaSlice<f32>,
+    normalized: CudaSlice<f32>,
+    branch: CudaSlice<f32>,
+    qkv: CudaSlice<f32>,
+    z: CudaSlice<f32>,
+    b: CudaSlice<f32>,
+    a: CudaSlice<f32>,
+    convolved: CudaSlice<f32>,
+    kk: CudaSlice<f32>,
+    qq: CudaSlice<f32>,
+    beta: CudaSlice<f32>,
+    decay: CudaSlice<f32>,
+    core: CudaSlice<f32>,
+    gated: CudaSlice<f32>,
+    fused_query: CudaSlice<f32>,
+    key: CudaSlice<f32>,
+    value: CudaSlice<f32>,
+    query: CudaSlice<f32>,
+    attention_gate: CudaSlice<f32>,
+    attended: CudaSlice<f32>,
+    mlp_gate: CudaSlice<f32>,
+    mlp_up: CudaSlice<f32>,
+    mlp_act: CudaSlice<f32>,
+    logits: CudaSlice<f32>,
+    argmax_value: CudaSlice<f32>,
+    argmax_index: CudaSlice<i32>,
+    /// A8 mode: the current projection input as int8, one scale per 128 group.
+    act_quantized: CudaSlice<i8>,
+    act_scale: CudaSlice<f32>,
+}
+
+/// Argmax stage-one blocks and threads: enough blocks to spread a 248K vocabulary.
+const ARGMAX_BLOCKS: u32 = 128;
+const ARGMAX_THREADS: u32 = 1024;
+
+/// The residual stream after chosen layers, for the rows of the latest forward.
+struct FeatureCapture {
+    /// Decoder layer indices, in output order.
+    layers: Vec<usize>,
+    /// `[layers.len(), PREFILL_CHUNK, hidden]`, layer-major.
+    buffer: CudaSlice<f32>,
+    /// Rows the latest forward wrote.
+    rows: usize,
+}
+
+/// Copy the first `rows` rows of `residual` (the stream after layer `layer`) into
+/// `capture`'s slot for that layer, if it captures it.
+fn capture_rows(
+    stream: &Arc<CudaStream>,
+    capture: &mut Option<FeatureCapture>,
+    layer: usize,
+    residual: &CudaSlice<f32>,
+    rows: usize,
+    hidden: usize,
+) -> Result<(), BackendError> {
+    let Some(capture) = capture.as_mut() else {
+        return Ok(());
+    };
+    let Some(slot) = capture.layers.iter().position(|&wanted| wanted == layer) else {
+        return Ok(());
+    };
+    let start = slot * PREFILL_CHUNK * hidden;
+    let mut target = capture.buffer.slice_mut(start..start + rows * hidden);
+    stream
+        .memcpy_dtod(&residual.slice(..rows * hidden), &mut target)
+        .map_err(|error| driver_err("capture hidden state", &error))?;
+    capture.rows = rows;
+    Ok(())
+}
+
+/// A saved copy of a [`Qwen35Resident`]'s recurrent state at one position, for
+/// resuming a sequence whose prefix was already decoded (prompt reuse).
+pub struct Qwen35ResidentSnapshot {
+    position: usize,
+    /// Per DeltaNet layer: (convolution state, recurrent state).
+    states: Vec<(CudaSlice<f32>, CudaSlice<f32>)>,
+}
+
+impl std::fmt::Debug for Qwen35ResidentSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Qwen35ResidentSnapshot")
+            .field("position", &self.position)
+            .field("layers", &self.states.len())
+            .finish()
+    }
+}
+
+impl Qwen35ResidentSnapshot {
+    /// Tokens consumed when the snapshot was taken.
+    #[must_use]
+    pub const fn position(&self) -> usize {
+        self.position
+    }
+}
+
+/// A Qwen3.5/Qwen3.6 decoder resident on one CUDA device.
+///
+/// Built by [`CudaBackend::build_qwen35_resident`]. Holds its own KV cache and
+/// recurrent state; [`Self::reset`] starts a new sequence.
+pub struct Qwen35Resident {
+    /// The DFlash drafter, once attached.
+    drafter: Option<dflash::Drafter>,
+    dflash_module: Arc<CudaModule>,
+    verify: Verify,
+    /// Hidden states captured after selected layers, for a speculative drafter.
+    capture: Option<FeatureCapture>,
+    /// When set, batched prefill measures every tensor-core projection against the
+    /// GEMV on the same input and keeps the worst peak-relative error here, while
+    /// the forward itself continues on the GEMV's outputs.
+    tc_probe: Option<f32>,
+    /// `TRITIUM_QWEN35_FUSED`, read once per step (an environment read takes a
+    /// lock and allocates; per layer it was 128 reads a step).
+    fused_on: bool,
+    /// The token `scratch.token` holds on the device, when known: the last one
+    /// uploaded, or the greedy token `step` read back. Feeding that same token
+    /// next needs no upload.
+    device_token: Option<u32>,
+    /// Per-warp shared table bytes for fused launches over `hidden` columns.
+    fused_table_bytes: u32,
+    stream: Arc<CudaStream>,
+    kernels: Kernels,
+    embedding: Arc<SaltV2ResidentTensor>,
+    layers: Vec<Layer>,
+    final_norm: CudaSlice<f32>,
+    lm_head: Arc<SaltV2ResidentTensor>,
+    inv_freq: CudaSlice<f32>,
+    scratch: Scratch,
+    prefill: Prefill,
+    hidden: usize,
+    vocab: usize,
+    eps: f32,
+    key_heads: usize,
+    value_heads: usize,
+    key_head_dim: usize,
+    value_head_dim: usize,
+    conv_kernel: usize,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    max_context: usize,
+    position: usize,
+}
+
+impl core::fmt::Debug for Qwen35Resident {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("Qwen35Resident")
+            .field("layers", &self.layers.len())
+            .field("hidden", &self.hidden)
+            .field("vocab", &self.vocab)
+            .field("position", &self.position)
+            .field("max_context", &self.max_context)
+            .finish_non_exhaustive()
+    }
+}
+
+fn invalid(message: impl Into<String>) -> BackendError {
+    BackendError::InvalidInput(message.into())
+}
+
+fn to_i32(value: usize, name: &str) -> Result<i32, BackendError> {
+    i32::try_from(value).map_err(|_| invalid(format!("{name} exceeds the i32 kernel ABI")))
+}
+
+fn to_u32(value: usize, name: &str) -> Result<u32, BackendError> {
+    u32::try_from(value).map_err(|_| invalid(format!("{name} exceeds the u32 kernel ABI")))
+}
+
+impl CudaBackend {
+    /// Build a device-resident Qwen3.5/Qwen3.6 decoder from a loaded host model's
+    /// resident SALT V2 tensors and fp32 parameters.
+    ///
+    /// Every projection must be one the row-stream GEMV serves (B3, scale group 128,
+    /// 256-aligned width) and belong to this backend's context.
+    ///
+    /// # Errors
+    /// Rejects a tensor the executor cannot run, inconsistent geometry, a context
+    /// above [`QWEN35_RESIDENT_MAX_CONTEXT`], or a device allocation failure.
+    pub fn build_qwen35_resident(
+        &self,
+        spec: &Qwen35ResidentSpec<'_>,
+    ) -> Result<Qwen35Resident, BackendError> {
+        let hidden = spec.embedding.columns;
+        let vocab = spec.embedding.rows;
+        if spec.max_context == 0 || spec.max_context > QWEN35_RESIDENT_MAX_CONTEXT {
+            return Err(invalid(format!(
+                "resident Qwen context {} must be in 1..={QWEN35_RESIDENT_MAX_CONTEXT}",
+                spec.max_context
+            )));
+        }
+        let key_width = spec.deltanet_key_heads * spec.deltanet_key_head_dim;
+        let value_width = spec.deltanet_value_heads * spec.deltanet_value_head_dim;
+        let conv_width = 2 * key_width + value_width;
+        let query_width = spec.attention_heads * spec.attention_head_dim;
+        let kv_width = spec.attention_kv_heads * spec.attention_head_dim;
+        if spec.deltanet_key_heads == 0
+            || !spec
+                .deltanet_value_heads
+                .is_multiple_of(spec.deltanet_key_heads)
+            || spec.attention_kv_heads == 0
+            || !spec.attention_heads.is_multiple_of(spec.attention_kv_heads)
+            || !spec.attention_rotary_dim.is_multiple_of(2)
+            || spec.attention_rotary_dim > spec.attention_head_dim
+            || spec.attention_head_dim > 1024
+            || spec.deltanet_value_head_dim > 1024
+            || spec.deltanet_key_head_dim > 1024
+        {
+            return Err(invalid("resident Qwen head geometry is inconsistent"));
+        }
+
+        let check = |tensor: &SaltV2ResidentTensor,
+                     rows: usize,
+                     columns: usize,
+                     name: &str|
+         -> Result<(), BackendError> {
+            self.validate_salt_v2_resident_context(tensor)?;
+            if tensor.rows != rows || tensor.columns != columns {
+                return Err(invalid(format!(
+                    "resident Qwen {name} is {}x{}, expected {rows}x{columns}",
+                    tensor.rows, tensor.columns
+                )));
+            }
+            if salt_v2_stream_dispatch(tensor.columns, tensor.scale_group_size, tensor.codec_tag)
+                .is_none()
+            {
+                return Err(invalid(format!(
+                    "resident Qwen {name} is not a shape the row-stream GEMV serves"
+                )));
+            }
+            Ok(())
+        };
+        self.validate_salt_v2_resident_context(&spec.embedding)?;
+        check(&spec.lm_head, vocab, hidden, "lm_head")?;
+        let intermediate = spec
+            .layers
+            .first()
+            .map(|layer| layer.gate.rows)
+            .ok_or_else(|| invalid("resident Qwen needs at least one layer"))?;
+
+        let upload = |values: &[f32], expected: usize, name: &str| {
+            if values.len() != expected {
+                return Err(invalid(format!(
+                    "resident Qwen {name} has {} values, expected {expected}",
+                    values.len()
+                )));
+            }
+            self.stream
+                .clone_htod(values)
+                .map_err(|error| driver_err("upload resident Qwen parameter", &error))
+        };
+        let zeros = |len: usize, name: &str| {
+            self.stream
+                .alloc_zeros::<f32>(len)
+                .map_err(|error| alloc_or_backend(name, &error, len * core::mem::size_of::<f32>()))
+        };
+
+        let mut layers = Vec::with_capacity(spec.layers.len());
+        for (index, layer) in spec.layers.iter().enumerate() {
+            check(&layer.gate, intermediate, hidden, "gate")?;
+            check(&layer.up, intermediate, hidden, "up")?;
+            check(&layer.down, hidden, intermediate, "down")?;
+            let mixer = match &layer.mixer {
+                Qwen35ResidentMixerSpec::DeltaNet {
+                    qkv,
+                    z,
+                    b,
+                    a,
+                    out,
+                    conv_weight,
+                    norm_weight,
+                    dt_bias,
+                    a_log,
+                } => {
+                    check(qkv, conv_width, hidden, "DeltaNet qkv")?;
+                    check(z, value_width, hidden, "DeltaNet z")?;
+                    check(b, spec.deltanet_value_heads, hidden, "DeltaNet b")?;
+                    check(a, spec.deltanet_value_heads, hidden, "DeltaNet a")?;
+                    check(out, hidden, value_width, "DeltaNet out")?;
+                    Mixer::DeltaNet(Box::new(DeltaNetLayer {
+                        qkv: Arc::clone(qkv),
+                        z: Arc::clone(z),
+                        b: Arc::clone(b),
+                        a: Arc::clone(a),
+                        out: Arc::clone(out),
+                        conv_weight: upload(
+                            conv_weight,
+                            conv_width * spec.deltanet_conv_kernel,
+                            "conv weight",
+                        )?,
+                        norm_weight: upload(
+                            norm_weight,
+                            spec.deltanet_value_head_dim,
+                            "gated norm weight",
+                        )?,
+                        dt_bias: upload(dt_bias, spec.deltanet_value_heads, "dt bias")?,
+                        a_log: upload(a_log, spec.deltanet_value_heads, "a log")?,
+                        conv_state: zeros(
+                            conv_width * spec.deltanet_conv_kernel,
+                            "allocate DeltaNet conv state",
+                        )?,
+                        recurrent_state: zeros(
+                            spec.deltanet_value_heads
+                                * spec.deltanet_key_head_dim
+                                * spec.deltanet_value_head_dim,
+                            "allocate DeltaNet recurrent state",
+                        )?,
+                    }))
+                }
+                Qwen35ResidentMixerSpec::Attention {
+                    q,
+                    k,
+                    v,
+                    o,
+                    q_norm,
+                    k_norm,
+                } => {
+                    check(q, 2 * query_width, hidden, "attention q")?;
+                    check(k, kv_width, hidden, "attention k")?;
+                    check(v, kv_width, hidden, "attention v")?;
+                    check(o, hidden, query_width, "attention o")?;
+                    Mixer::Attention(Box::new(AttentionLayer {
+                        q: Arc::clone(q),
+                        k: Arc::clone(k),
+                        v: Arc::clone(v),
+                        o: Arc::clone(o),
+                        q_norm: upload(q_norm, spec.attention_head_dim, "q norm")?,
+                        k_norm: upload(k_norm, spec.attention_head_dim, "k norm")?,
+                        key_cache: zeros(spec.max_context * kv_width, "allocate key cache")?,
+                        value_cache: zeros(spec.max_context * kv_width, "allocate value cache")?,
+                    }))
+                }
+            };
+            let _ = index;
+            layers.push(Layer {
+                fused_in: None,
+                fused_mlp: None,
+                input_norm: upload(layer.input_norm, hidden, "input norm")?,
+                post_attention_norm: upload(layer.post_attention_norm, hidden, "post norm")?,
+                mixer,
+                gate: Arc::clone(&layer.gate),
+                up: Arc::clone(&layer.up),
+                down: Arc::clone(&layer.down),
+            });
+        }
+
+        // RoPE inverse frequencies, built exactly as the host builds them so the only
+        // difference left in the rotation is the device `sincosf`.
+        let half = spec.attention_rotary_dim / 2;
+        let inv_freq: Vec<f32> = (0..half)
+            .map(|lane| {
+                1.0 / spec
+                    .rope_theta
+                    .powf((2 * lane) as f32 / spec.attention_rotary_dim as f32)
+            })
+            .collect();
+
+        let module = &self.qwen35_decode_module;
+        let function = |name: &str| {
+            module
+                .load_function(name)
+                .map_err(|error| driver_err("resolve resident Qwen kernel", &error))
+        };
+        let kernels = Kernels {
+            stream_gemv: self.func_salt_v2_stream.clone(),
+            stream_gemv_multi: self.func_salt_v2_stream_multi.clone(),
+            stream_rows: self.func_salt_v2_stream_rows.clone(),
+            mma: self.salt_v2_mma.clone(),
+            quant_act: self.func_salt_v2_quant_act.clone(),
+            stream_i8: self.func_salt_v2_stream_i8.clone(),
+            stream_i8_multi: self.func_salt_v2_stream_i8_multi.clone(),
+            gather: self.func_salt_v2_gather.clone(),
+            recurrent: self.func_deltanet_step.clone(),
+            recurrent_rows128: self.func_deltanet_rows128.clone(),
+            add_rmsnorm: function("q35_add_rmsnorm")?,
+            attn_prep: function("q35_attn_prep")?,
+            attention: function("q35_attention")?,
+            sigmoid_mul: function("q35_sigmoid_mul")?,
+            swiglu: function("q35_swiglu")?,
+            conv: function("q35_deltanet_conv")?,
+            prep: function("q35_deltanet_prep")?,
+            gated_rmsnorm: function("q35_gated_rmsnorm")?,
+            attn_prep_rows: function("q35_attn_prep_rows")?,
+            attention_rows: function("q35_attention_rows")?,
+            conv_rows: function("q35_deltanet_conv_rows")?,
+            prep_rows: function("q35_deltanet_prep_rows")?,
+            gated_rmsnorm_rows: function("q35_gated_rmsnorm_rows")?,
+            argmax_partial: function("q35_argmax_partial")?,
+            argmax_final: function("q35_argmax_final")?,
+        };
+
+        let scratch = Scratch {
+            ctrl: self
+                .stream
+                .alloc_zeros::<i32>(4)
+                .map_err(|error| alloc_or_backend("allocate resident ctrl", &error, 16))?,
+            token: self
+                .stream
+                .alloc_zeros::<u32>(1)
+                .map_err(|error| alloc_or_backend("allocate resident token", &error, 4))?,
+            residual: zeros(hidden, "allocate residual")?,
+            normalized: zeros(hidden, "allocate normalized")?,
+            branch: zeros(hidden, "allocate branch")?,
+            qkv: zeros(conv_width, "allocate qkv")?,
+            z: zeros(value_width, "allocate z")?,
+            b: zeros(spec.deltanet_value_heads, "allocate b")?,
+            a: zeros(spec.deltanet_value_heads, "allocate a")?,
+            convolved: zeros(conv_width, "allocate convolved")?,
+            kk: zeros(key_width, "allocate kk")?,
+            qq: zeros(key_width, "allocate qq")?,
+            beta: zeros(spec.deltanet_value_heads, "allocate beta")?,
+            decay: zeros(spec.deltanet_value_heads, "allocate decay")?,
+            core: zeros(value_width, "allocate core")?,
+            gated: zeros(value_width, "allocate gated")?,
+            fused_query: zeros(2 * query_width, "allocate fused query")?,
+            key: zeros(kv_width, "allocate key")?,
+            value: zeros(kv_width, "allocate value")?,
+            query: zeros(query_width, "allocate query")?,
+            attention_gate: zeros(query_width, "allocate attention gate")?,
+            attended: zeros(query_width, "allocate attended")?,
+            mlp_gate: zeros(intermediate, "allocate mlp gate")?,
+            mlp_up: zeros(intermediate, "allocate mlp up")?,
+            mlp_act: zeros(intermediate, "allocate mlp act")?,
+            logits: zeros(vocab, "allocate logits")?,
+            argmax_value: zeros(ARGMAX_BLOCKS as usize, "allocate argmax values")?,
+            argmax_index: self
+                .stream
+                .alloc_zeros::<i32>(ARGMAX_BLOCKS as usize)
+                .map_err(|error| alloc_or_backend("allocate argmax indices", &error, 512))?,
+            act_quantized: self
+                .stream
+                .alloc_zeros::<i8>(hidden.max(value_width).max(query_width).max(intermediate))
+                .map_err(|error| {
+                    alloc_or_backend(
+                        "allocate A8 activations",
+                        &error,
+                        hidden.max(value_width).max(query_width).max(intermediate),
+                    )
+                })?,
+            act_scale: zeros(
+                hidden.max(value_width).max(query_width).max(intermediate) / 128,
+                "allocate A8 activation scales",
+            )?,
+        };
+
+        // Fused input groups. Each descriptor bakes in a scratch buffer's device
+        // address, which is stable for the executor's life because scratch is
+        // allocated once and never reallocated.
+        let fuse = |members: &[(&SaltV2ResidentTensor, &CudaSlice<f32>)]| {
+            let mut words = Vec::with_capacity(members.len() * SALT_STREAM_DESCRIPTOR_WORDS);
+            let mut first_row = 0u32;
+            for (tensor, output) in members {
+                let address = crate::cuda::graph_raw::dptr(*output, &self.stream);
+                words.extend(salt_stream_descriptor(
+                    tensor,
+                    &self.stream,
+                    address,
+                    first_row,
+                )?);
+                first_row = first_row
+                    .checked_add(to_u32(tensor.rows, "fused rows")?)
+                    .ok_or_else(|| invalid("fused row count overflows u32"))?;
+            }
+            let descriptors = self
+                .stream
+                .clone_htod(&words)
+                .map_err(|error| driver_err("upload fused GEMV descriptors", &error))?;
+            Ok::<_, BackendError>(FusedGroup {
+                descriptors,
+                tensor_count: to_u32(members.len(), "fused tensor count")?,
+                total_rows: first_row,
+            })
+        };
+        for layer in &mut layers {
+            layer.fused_mlp = Some(fuse(&[
+                (&layer.gate, &scratch.mlp_gate),
+                (&layer.up, &scratch.mlp_up),
+            ])?);
+            layer.fused_in = Some(match &layer.mixer {
+                Mixer::DeltaNet(mixer) => fuse(&[
+                    (&mixer.qkv, &scratch.qkv),
+                    (&mixer.z, &scratch.z),
+                    (&mixer.b, &scratch.b),
+                    (&mixer.a, &scratch.a),
+                ])?,
+                Mixer::Attention(mixer) => fuse(&[
+                    (&mixer.q, &scratch.fused_query),
+                    (&mixer.k, &scratch.key),
+                    (&mixer.v, &scratch.value),
+                ])?,
+            });
+        }
+        let fused_table_bytes = salt_v2_stream_dispatch(hidden, 128, 1)
+            .ok_or_else(|| invalid("hidden width is not one the row-stream GEMV serves"))?;
+
+        let rows = |width: usize, name: &str| zeros(PREFILL_CHUNK * width, name);
+        let mut prefill = Prefill {
+            layers: Vec::with_capacity(layers.len()),
+            ctrl: self
+                .stream
+                .alloc_zeros::<i32>(PREFILL_CHUNK * 4)
+                .map_err(|error| {
+                    alloc_or_backend("allocate prefill ctrl", &error, PREFILL_CHUNK * 16)
+                })?,
+            tokens: self
+                .stream
+                .alloc_zeros::<u32>(PREFILL_CHUNK)
+                .map_err(|error| {
+                    alloc_or_backend("allocate prefill tokens", &error, PREFILL_CHUNK * 4)
+                })?,
+            residual: rows(hidden, "allocate prefill residual")?,
+            normalized: rows(hidden, "allocate prefill normalized")?,
+            branch: rows(hidden, "allocate prefill branch")?,
+            qkv: rows(conv_width, "allocate prefill qkv")?,
+            z: rows(value_width, "allocate prefill z")?,
+            b: rows(spec.deltanet_value_heads, "allocate prefill b")?,
+            a: rows(spec.deltanet_value_heads, "allocate prefill a")?,
+            gated: rows(value_width, "allocate prefill gated")?,
+            fused_query: rows(2 * query_width, "allocate prefill fused query")?,
+            key: rows(kv_width, "allocate prefill key")?,
+            value: rows(kv_width, "allocate prefill value")?,
+            attention_gate: rows(query_width, "allocate prefill attention gate")?,
+            attended: rows(query_width, "allocate prefill attended")?,
+            query: rows(query_width, "allocate prefill query")?,
+            scan: ScanScratch {
+                convolved: rows(conv_width, "allocate prefill convolved")?,
+                kk: rows(key_width, "allocate prefill kk")?,
+                qq: rows(key_width, "allocate prefill qq")?,
+                beta: rows(spec.deltanet_value_heads, "allocate prefill beta")?,
+                decay: rows(spec.deltanet_value_heads, "allocate prefill decay")?,
+                core: rows(value_width, "allocate prefill core")?,
+            },
+            mlp_gate: rows(intermediate, "allocate prefill mlp gate")?,
+            mlp_up: rows(intermediate, "allocate prefill mlp up")?,
+            mlp_act: rows(intermediate, "allocate prefill mlp act")?,
+            // The widest input is the MLP's intermediate width, the most rows the
+            // fused gate|up group (or a DeltaNet's qkv|z|b|a).
+            // Every fused group's (rows, k): mixer inputs, mixer outputs, the MLP
+            // and the language head.
+            mma: SaltMmaScratch::new(
+                &self.stream,
+                &[
+                    (
+                        conv_width + value_width + 2 * spec.deltanet_value_heads,
+                        hidden,
+                    ),
+                    (2 * query_width + 2 * kv_width, hidden),
+                    (hidden, value_width),
+                    (hidden, query_width),
+                    (2 * intermediate, hidden),
+                    (hidden, intermediate),
+                    (vocab, hidden),
+                ],
+            )?,
+        };
+        let prefill_group = |members: &[(&SaltV2ResidentTensor, &CudaSlice<f32>)]| {
+            let k = members
+                .first()
+                .map(|(tensor, _)| tensor.columns)
+                .ok_or_else(|| invalid("empty prefill group"))?;
+            Ok::<_, BackendError>(PrefillGroup {
+                mma_ok: members
+                    .iter()
+                    .all(|(tensor, _)| tensor.rows.is_multiple_of(16)),
+                outputs: members
+                    .iter()
+                    .map(|(tensor, output)| {
+                        (
+                            crate::cuda::graph_raw::dptr(*output, &self.stream),
+                            tensor.rows,
+                        )
+                    })
+                    .collect(),
+                group: fuse(members)?,
+                k: to_u32(k, "prefill group width")?,
+                table_bytes: salt_v2_stream_dispatch(k, 128, 1)
+                    .ok_or_else(|| invalid("prefill group width is not row-stream"))?,
+            })
+        };
+        for layer in &layers {
+            let (input, out) = match &layer.mixer {
+                Mixer::DeltaNet(mixer) => (
+                    prefill_group(&[
+                        (&mixer.qkv, &prefill.qkv),
+                        (&mixer.z, &prefill.z),
+                        (&mixer.b, &prefill.b),
+                        (&mixer.a, &prefill.a),
+                    ])?,
+                    prefill_group(&[(&mixer.out, &prefill.branch)])?,
+                ),
+                Mixer::Attention(mixer) => (
+                    prefill_group(&[
+                        (&mixer.q, &prefill.fused_query),
+                        (&mixer.k, &prefill.key),
+                        (&mixer.v, &prefill.value),
+                    ])?,
+                    prefill_group(&[(&mixer.o, &prefill.branch)])?,
+                ),
+            };
+            let entry = PrefillLayer {
+                input,
+                out,
+                mlp: prefill_group(&[
+                    (&layer.gate, &prefill.mlp_gate),
+                    (&layer.up, &prefill.mlp_up),
+                ])?,
+                down: prefill_group(&[(&layer.down, &prefill.branch)])?,
+            };
+            prefill.layers.push(entry);
+        }
+        let logits = zeros(QWEN35_VERIFY_MAX * vocab, "allocate verification logits")?;
+        let head = prefill_group(&[(&spec.lm_head, &logits)])?;
+        let mut saved = Vec::new();
+        for layer in &layers {
+            if let Mixer::DeltaNet(mixer) = &layer.mixer {
+                let vh = spec.deltanet_value_heads;
+                saved.push((
+                    zeros(
+                        QWEN35_VERIFY_MAX * mixer.qkv.rows,
+                        "allocate verification conv input",
+                    )?,
+                    zeros(QWEN35_VERIFY_MAX * vh, "allocate verification b")?,
+                    zeros(QWEN35_VERIFY_MAX * vh, "allocate verification a")?,
+                ));
+            }
+        }
+        let partials = QWEN35_VERIFY_MAX * ARGMAX_BLOCKS as usize;
+        let verify = Verify {
+            saved,
+            head,
+            logits,
+            argmax_value: zeros(partials, "allocate verification argmax")?,
+            argmax_index: self.stream.alloc_zeros::<i32>(partials).map_err(|error| {
+                alloc_or_backend("allocate verification argmax", &error, partials * 4)
+            })?,
+            tokens: self
+                .stream
+                .alloc_zeros::<u32>(QWEN35_VERIFY_MAX)
+                .map_err(|error| alloc_or_backend("allocate verification tokens", &error, 64))?,
+            pending: None,
+        };
+
+        Ok(Qwen35Resident {
+            drafter: None,
+            dflash_module: Arc::clone(&self.dflash_module),
+            verify,
+            capture: None,
+            tc_probe: None,
+            fused_on: true,
+            device_token: None,
+            fused_table_bytes,
+            stream: Arc::clone(&self.stream),
+            kernels,
+            embedding: Arc::clone(&spec.embedding),
+            layers,
+            final_norm: upload(spec.final_norm, hidden, "final norm")?,
+            lm_head: Arc::clone(&spec.lm_head),
+            inv_freq: self
+                .stream
+                .clone_htod(&inv_freq)
+                .map_err(|error| driver_err("upload RoPE frequencies", &error))?,
+            scratch,
+            prefill,
+            hidden,
+            vocab,
+            eps: spec.rms_norm_eps,
+            key_heads: spec.deltanet_key_heads,
+            value_heads: spec.deltanet_value_heads,
+            key_head_dim: spec.deltanet_key_head_dim,
+            value_head_dim: spec.deltanet_value_head_dim,
+            conv_kernel: spec.deltanet_conv_kernel,
+            heads: spec.attention_heads,
+            kv_heads: spec.attention_kv_heads,
+            head_dim: spec.attention_head_dim,
+            rotary_dim: spec.attention_rotary_dim,
+            max_context: spec.max_context,
+            position: 0,
+        })
+    }
+}
+
+/// Launch a prepared kernel. Free-standing so a caller can hold disjoint mutable
+/// borrows of the executor's fields in the builder while calling it.
+fn run(
+    builder: &mut cudarc::driver::LaunchArgs<'_>,
+    cfg: LaunchConfig,
+    name: &str,
+) -> Result<(), BackendError> {
+    // SAFETY: every buffer handed to these kernels was sized from the validated
+    // geometry at build, and each kernel bounds-checks its lanes against the sizes
+    // it is given.
+    #[allow(unsafe_code)]
+    unsafe {
+        builder
+            .launch(cfg)
+            .map(|_| ())
+            .map_err(|error| driver_err(name, &error))
+    }
+}
+
+/// Whether fused input projections are enabled (default on; `TRITIUM_QWEN35_FUSED=0`
+/// launches each projection separately, for A/B).
+fn fused_enabled() -> bool {
+    std::env::var("TRITIUM_QWEN35_FUSED").as_deref() != Ok("0")
+}
+
+/// Which projections take int8 activations (the relaxed A8 tier).
+///
+/// Opt-in, because it changes numerics and is gated on output quality:
+/// `TRITIUM_QWEN35_A8=1` (or `all`) quantizes every projection input; `mlp`
+/// quantizes only the MLP's, which carry ~60% of the weight bytes and feed no
+/// recurrent state -- measured on near-lossless-v1, quantizing everything let the
+/// DeltaNet state accumulate error from 2.8% at the first token to ~50% within a
+/// few, and flipped 4 of 42 greedy tokens. `mlp` still flipped 3 of 42 (worst
+/// relative logit error 0.49), so neither scope passes RFC 0001's greedy-identity
+/// bar; they are +6.7% (`all`) and +4.6% (`mlp`) end-to-end, measured, not adopted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum A8Scope {
+    Off,
+    Mlp,
+    All,
+}
+
+fn a8_scope() -> A8Scope {
+    match std::env::var("TRITIUM_QWEN35_A8").as_deref() {
+        Ok("1") | Ok("all") => A8Scope::All,
+        Ok("mlp") => A8Scope::Mlp,
+        _ => A8Scope::Off,
+    }
+}
+
+/// One projection of a device vector, f32 or A8.
+#[allow(clippy::too_many_arguments)]
+fn project(
+    kernels: &Kernels,
+    stream: &CudaStream,
+    a8: bool,
+    tensor: &SaltV2ResidentTensor,
+    input: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    quantized: &mut CudaSlice<i8>,
+    scale: &mut CudaSlice<f32>,
+) -> Result<(), BackendError> {
+    if a8 {
+        let groups = to_u32(tensor.columns / 128, "activation groups")?;
+        launch_salt_v2_quant_act_on(stream, &kernels.quant_act, input, quantized, scale, groups)?;
+        launch_salt_v2_stream_i8_on(stream, &kernels.stream_i8, tensor, quantized, scale, output)
+    } else {
+        launch_salt_v2_stream_on(stream, &kernels.stream_gemv, tensor, input, 1, output)
+    }
+}
+
+/// A fused group of projections of one device vector, f32 or A8.
+#[allow(clippy::too_many_arguments)]
+fn project_fused(
+    kernels: &Kernels,
+    stream: &CudaStream,
+    a8: bool,
+    group: &FusedGroup,
+    k: u32,
+    table_bytes: u32,
+    input: &CudaSlice<f32>,
+    quantized: &mut CudaSlice<i8>,
+    scale: &mut CudaSlice<f32>,
+) -> Result<(), BackendError> {
+    if a8 {
+        launch_salt_v2_quant_act_on(stream, &kernels.quant_act, input, quantized, scale, k / 128)?;
+        launch_salt_v2_stream_i8_multi_on(
+            stream,
+            &kernels.stream_i8_multi,
+            &group.descriptors,
+            group.tensor_count,
+            group.total_rows,
+            k,
+            table_bytes,
+            quantized,
+            scale,
+        )
+    } else {
+        launch_salt_v2_stream_multi_on(
+            stream,
+            &kernels.stream_gemv_multi,
+            &group.descriptors,
+            group.tensor_count,
+            group.total_rows,
+            k,
+            table_bytes,
+            input,
+        )
+    }
+}
+
+fn elementwise(n: usize) -> LaunchConfig {
+    let threads = 256u32;
+    LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(threads), 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_rmsnorm(
+    stream: &CudaStream,
+    kernel: &CudaFunction,
+    residual: &mut CudaSlice<f32>,
+    branch: &CudaSlice<f32>,
+    weight: &CudaSlice<f32>,
+    normalized: &mut CudaSlice<f32>,
+    n: i32,
+    eps: f32,
+    add: bool,
+    rows: u32,
+) -> Result<(), BackendError> {
+    let add = i32::from(add);
+    // Every Qwen3.5 decoder norm is zero-centered, `x * (1 + w)`.
+    let one_plus = 1i32;
+    let mut builder = stream.launch_builder(kernel);
+    builder
+        .arg(residual)
+        .arg(branch)
+        .arg(weight)
+        .arg(normalized)
+        .arg(&n)
+        .arg(&eps)
+        .arg(&add)
+        .arg(&one_plus);
+    run(
+        &mut builder,
+        LaunchConfig {
+            // One block per row.
+            grid_dim: (rows, 1, 1),
+            block_dim: (1024, 1, 1),
+            shared_mem_bytes: 0,
+        },
+        "launch q35_add_rmsnorm",
+    )
+}
+
+/// Gather `selected` embedding rows, one per token in `tokens`, into the
+/// `[selected, hidden]` `output`.
+fn gather_rows(
+    stream: &CudaStream,
+    kernel: &CudaFunction,
+    embedding: &SaltV2ResidentTensor,
+    tokens: &CudaSlice<u32>,
+    output: &mut CudaSlice<f32>,
+    selected: u32,
+) -> Result<(), BackendError> {
+    let n = to_u32(embedding.rows, "vocab")?;
+    let k = to_u32(embedding.columns, "hidden")?;
+    let tile_count = to_u32(embedding.tile_count, "tile count")?;
+    let plane_count = to_u32(embedding.plane_count, "plane count")?;
+    let payload_bytes = embedding.receipt.payload_bytes();
+    let scale_count = embedding.receipt.scale_bytes() / core::mem::size_of::<u16>() as u64;
+    let index_metadata = embedding
+        .index_metadata
+        .as_ref()
+        .unwrap_or(&embedding.payload);
+    let mut builder = stream.launch_builder(kernel);
+    builder
+        .arg(&embedding.payload)
+        .arg(&embedding.scales)
+        .arg(index_metadata)
+        .arg(tokens)
+        .arg(output)
+        .arg(&selected)
+        .arg(&n)
+        .arg(&k)
+        .arg(&embedding.codec_tag)
+        .arg(&embedding.scale_group_size)
+        .arg(&tile_count)
+        .arg(&plane_count)
+        .arg(&payload_bytes)
+        .arg(&scale_count)
+        .arg(&embedding.allocation_map_bytes)
+        .arg(&embedding.rank_prefix_count)
+        .arg(&embedding.terminal_map_value);
+    run(
+        &mut builder,
+        LaunchConfig {
+            grid_dim: ((selected * k).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        },
+        "launch resident embedding gather",
+    )
+}
+
+/// Per-token intermediates of a batched DeltaNet scan, `[PREFILL_CHUNK, width]`.
+struct ScanScratch {
+    convolved: CudaSlice<f32>,
+    kk: CudaSlice<f32>,
+    qq: CudaSlice<f32>,
+    beta: CudaSlice<f32>,
+    decay: CudaSlice<f32>,
+    core: CudaSlice<f32>,
+}
+
+/// DeltaNet geometry in kernel ABI types.
+struct ScanDims {
+    key_width: usize,
+    value_width: usize,
+    value_heads: usize,
+    group: u32,
+    key_heads_i: i32,
+    value_heads_i: i32,
+    key_head_dim_i: i32,
+    kernel_taps: i32,
+    dk: u32,
+    dv: u32,
+    value_head_blocks: u32,
+    delta_prep_blocks: u32,
+    query_scale: f32,
+}
+
+/// The DeltaNet causal conv, gating scalars and recurrence over `count` tokens:
+/// `raw` (`[count, conv_width]`), `b` and `a` (`[count, value_heads]`) in, the
+/// recurrence's `core` rows out in `scan`. With `commit` the conv and recurrent
+/// states advance past the tokens, exactly as `count` decode steps; without it
+/// both stay as they were (speculative verification), which needs the 128-wide
+/// register-state recurrence.
+#[allow(clippy::too_many_arguments)]
+fn deltanet_scan(
+    stream: &CudaStream,
+    kernels: &Kernels,
+    mixer: &mut DeltaNetLayer,
+    raw: &CudaSlice<f32>,
+    b: &CudaSlice<f32>,
+    a: &CudaSlice<f32>,
+    scan: &mut ScanScratch,
+    dims: &ScanDims,
+    count: usize,
+    commit: bool,
+) -> Result<(), BackendError> {
+    let conv_width = mixer.qkv.rows;
+    let width = to_i32(conv_width, "conv width")?;
+    let tokens = to_i32(count, "scan tokens")?;
+    let m = to_u32(count, "scan tokens")?;
+    let commit_flag = i32::from(commit);
+    let mut builder = stream.launch_builder(&kernels.conv_rows);
+    builder
+        .arg(raw)
+        .arg(&mut mixer.conv_state)
+        .arg(&mixer.conv_weight)
+        .arg(&mut scan.convolved)
+        .arg(&width)
+        .arg(&dims.kernel_taps)
+        .arg(&tokens)
+        .arg(&commit_flag);
+    run(
+        &mut builder,
+        elementwise(conv_width),
+        "launch q35_deltanet_conv_rows",
+    )?;
+
+    let l2_epsilon = 1e-6f32;
+    let mut builder = stream.launch_builder(&kernels.prep_rows);
+    builder
+        .arg(&scan.convolved)
+        .arg(b)
+        .arg(a)
+        .arg(&mixer.a_log)
+        .arg(&mixer.dt_bias)
+        .arg(&mut scan.kk)
+        .arg(&mut scan.qq)
+        .arg(&mut scan.beta)
+        .arg(&mut scan.decay)
+        .arg(&dims.key_heads_i)
+        .arg(&dims.value_heads_i)
+        .arg(&dims.key_head_dim_i)
+        .arg(&dims.query_scale)
+        .arg(&l2_epsilon)
+        .arg(&width);
+    run(
+        &mut builder,
+        LaunchConfig {
+            grid_dim: (dims.delta_prep_blocks, m, 1),
+            block_dim: (dims.dk.max(64), 1, 1),
+            shared_mem_bytes: 0,
+        },
+        "launch q35_deltanet_prep_rows",
+    )?;
+
+    let key_width = dims.key_width;
+    let value = scan.convolved.slice(2 * key_width..);
+    if dims.dk == 128 && dims.dv.is_multiple_of(32) {
+        let key_width_u32 = to_u32(key_width, "key width")?;
+        let value_stride = to_u32(conv_width, "conv width")?;
+        let write_state = u32::from(commit);
+        let mut builder = stream.launch_builder(&kernels.recurrent_rows128);
+        builder
+            .arg(&mut mixer.recurrent_state)
+            .arg(&scan.kk)
+            .arg(&scan.qq)
+            .arg(&value)
+            .arg(&scan.beta)
+            .arg(&scan.decay)
+            .arg(&mut scan.core)
+            .arg(&dims.dv)
+            .arg(&dims.group)
+            .arg(&m)
+            .arg(&key_width_u32)
+            .arg(&value_stride)
+            .arg(&dims.value_head_blocks)
+            .arg(&write_state);
+        return run(
+            &mut builder,
+            LaunchConfig {
+                grid_dim: (dims.value_head_blocks, dims.dv / 32, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            "launch DeltaNet recurrence over a token chunk",
+        );
+    }
+    if !commit {
+        return Err(invalid(
+            "speculative verification needs the 128-wide DeltaNet recurrence",
+        ));
+    }
+    let heads_count = dims.value_heads;
+    let value_width = dims.value_width;
+    for t in 0..count {
+        let kk = scan.kk.slice(t * key_width..(t + 1) * key_width);
+        let qq = scan.qq.slice(t * key_width..(t + 1) * key_width);
+        let value = scan
+            .convolved
+            .slice(t * conv_width + 2 * key_width..(t + 1) * conv_width);
+        let beta = scan.beta.slice(t * heads_count..(t + 1) * heads_count);
+        let decay = scan.decay.slice(t * heads_count..(t + 1) * heads_count);
+        let mut core = scan.core.slice_mut(t * value_width..(t + 1) * value_width);
+        let mut builder = stream.launch_builder(&kernels.recurrent);
+        builder
+            .arg(&mut mixer.recurrent_state)
+            .arg(&kk)
+            .arg(&qq)
+            .arg(&value)
+            .arg(&beta)
+            .arg(&decay)
+            .arg(&mut core)
+            .arg(&dims.dk)
+            .arg(&dims.dv)
+            .arg(&dims.group);
+        let (lane_blocks, lane_threads) = if dims.dv.is_multiple_of(32) {
+            (dims.dv / 32, 32)
+        } else {
+            (1, dims.dv)
+        };
+        run(
+            &mut builder,
+            LaunchConfig {
+                grid_dim: (dims.value_head_blocks, lane_blocks, 1),
+                block_dim: (lane_threads, 1, 1),
+                shared_mem_bytes: 2 * dims.dk * core::mem::size_of::<f32>() as u32,
+            },
+            "launch DeltaNet recurrent step",
+        )?;
+    }
+    Ok(())
+}
+
+/// Greedy argmax of `count` logits rows of `verify` starting at `first`, into
+/// `verify.tokens` at the same rows. Same partial/final kernels and tie rule as a
+/// decode step's argmax.
+fn argmax_rows(
+    stream: &CudaStream,
+    kernels: &Kernels,
+    verify: &mut Verify,
+    first: usize,
+    count: usize,
+) -> Result<(), BackendError> {
+    let vocab = verify.logits.len() / QWEN35_VERIFY_MAX;
+    let n_vocab = to_i32(vocab, "vocab")?;
+    let partials = ARGMAX_BLOCKS as usize;
+    let partials_i = ARGMAX_BLOCKS as i32;
+    for t in first..first + count {
+        let logits = verify.logits.slice(t * vocab..(t + 1) * vocab);
+        let mut values = verify
+            .argmax_value
+            .slice_mut(t * partials..(t + 1) * partials);
+        let mut indices = verify
+            .argmax_index
+            .slice_mut(t * partials..(t + 1) * partials);
+        let mut builder = stream.launch_builder(&kernels.argmax_partial);
+        builder
+            .arg(&logits)
+            .arg(&n_vocab)
+            .arg(&mut values)
+            .arg(&mut indices);
+        run(
+            &mut builder,
+            LaunchConfig {
+                grid_dim: (ARGMAX_BLOCKS, 1, 1),
+                block_dim: (ARGMAX_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            "launch q35_argmax_partial",
+        )?;
+        let mut token = verify.tokens.slice_mut(t..t + 1);
+        let mut builder = stream.launch_builder(&kernels.argmax_final);
+        builder
+            .arg(&mut values)
+            .arg(&mut indices)
+            .arg(&partials_i)
+            .arg(&mut token);
+        run(
+            &mut builder,
+            LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            "launch q35_argmax_final",
+        )?;
+    }
+    Ok(())
+}
+
+/// One multi-row prefill projection group over `m` rows of `input`: on the
+/// tensor cores when `mma` is given and the group allows it, otherwise with the
+/// multi-row GEMV that matches decode bit for bit.
+fn project_rows(
+    kernels: &Kernels,
+    stream: &CudaStream,
+    group: &PrefillGroup,
+    input: &CudaSlice<f32>,
+    m: u32,
+    mma: Option<&mut SaltMmaScratch>,
+    probe: Option<&mut f32>,
+) -> Result<(), BackendError> {
+    let exact = || {
+        launch_salt_v2_stream_rows_on(
+            stream,
+            &kernels.stream_rows,
+            &group.group.descriptors,
+            group.group.tensor_count,
+            group.group.total_rows,
+            group.k,
+            group.table_bytes,
+            input,
+            m,
+        )
+    };
+    let Some(scratch) = mma.filter(|_| group.mma_ok) else {
+        return exact();
+    };
+    let total = group.group.total_rows;
+    if total as usize > scratch_rows(scratch) {
+        return exact();
+    }
+    let tensor_core = |scratch: &mut SaltMmaScratch| {
+        launch_salt_v2_mma_rows_on(
+            stream,
+            &kernels.mma,
+            scratch,
+            &group.group.descriptors,
+            group.group.tensor_count,
+            total,
+            group.k,
+            input,
+            m,
+        )
+    };
+    let Some(worst) = probe else {
+        return tensor_core(scratch);
+    };
+    // Drift probe: the tensor-core outputs against the GEMV's on this very input,
+    // then the GEMV's are restored so the forward continues on exact values.
+    exact()?;
+    let reference = read_outputs(stream, group, m)?;
+    tensor_core(scratch)?;
+    let candidate = read_outputs(stream, group, m)?;
+    for ((rows, a), b) in group
+        .outputs
+        .iter()
+        .map(|(_, rows)| *rows)
+        .zip(&reference)
+        .zip(&candidate)
+    {
+        for (row_a, row_b) in a.chunks(rows).zip(b.chunks(rows)) {
+            let peak = row_a
+                .iter()
+                .fold(0.0f32, |peak, value| peak.max(value.abs()));
+            let error = row_a
+                .iter()
+                .zip(row_b)
+                .fold(0.0f32, |max, (x, y)| max.max((x - y).abs()))
+                / peak.max(f32::MIN_POSITIVE);
+            *worst = worst.max(error);
+        }
+    }
+    exact()
+}
+
+/// Every member output of `group` for `m` activation rows, synchronously.
+fn read_outputs(
+    stream: &CudaStream,
+    group: &PrefillGroup,
+    m: u32,
+) -> Result<Vec<Vec<f32>>, BackendError> {
+    stream
+        .synchronize()
+        .map_err(|error| driver_err("synchronize drift probe", &error))?;
+    group
+        .outputs
+        .iter()
+        .map(|&(address, rows)| {
+            let mut host = vec![0.0f32; m as usize * rows];
+            // SAFETY: `address` is the member's live `[PREFILL_CHUNK, rows]` output
+            // buffer and `m <= PREFILL_CHUNK`; the stream is synchronized above.
+            #[allow(unsafe_code)]
+            unsafe {
+                cudarc::driver::result::memcpy_dtoh_sync(&mut host, address)
+                    .map_err(|error| driver_err("read drift probe output", &error))?;
+            }
+            Ok(host)
+        })
+        .collect()
+}
+
+fn scratch_rows(scratch: &SaltMmaScratch) -> usize {
+    scratch.max_total_rows()
+}
+
+/// Whether batched prefill projections run on the tensor cores (default on;
+/// `TRITIUM_QWEN35_TC_PREFILL=0` keeps the multi-row GEMV, which is bit-identical
+/// to token-by-token decode). The tensor-core GEMM is fast tier under RFC 0001:
+/// gated on relative error and greedy identity, not equality.
+fn tensor_core_prefill_enabled() -> bool {
+    std::env::var("TRITIUM_QWEN35_TC_PREFILL").as_deref() != Ok("0")
+}
+
+/// Whether prompts prefill in batched chunks (default on;
+/// `TRITIUM_QWEN35_BATCHED_PREFILL=0` feeds them one decode step at a time,
+/// the reference the batched path is gated bit-identical against).
+fn batched_prefill_enabled() -> bool {
+    std::env::var("TRITIUM_QWEN35_BATCHED_PREFILL").as_deref() != Ok("0")
+}
+
+impl Qwen35Resident {
+    /// Tokens consumed so far in the current sequence.
+    #[must_use]
+    pub const fn position(&self) -> usize {
+        self.position
+    }
+
+    /// Save every DeltaNet layer's convolution and recurrent state, and the
+    /// current position, into `snapshot` -- reusing its buffers when it already
+    /// holds a snapshot of this executor.
+    ///
+    /// Full-attention KV is not copied: a later [`Self::restore`] relies on the
+    /// cache still holding, below the snapshot's position, the same tokens it
+    /// held when the snapshot was taken. Positions at or past it are
+    /// overwritten as decoding resumes. The caller tracks that token identity.
+    ///
+    /// # Errors
+    /// Returns a driver failure.
+    pub fn save_snapshot(
+        &self,
+        snapshot: &mut Option<Qwen35ResidentSnapshot>,
+    ) -> Result<(), BackendError> {
+        let fresh = snapshot.is_none();
+        if fresh {
+            let mut states = Vec::new();
+            for layer in &self.layers {
+                if let Mixer::DeltaNet(state) = &layer.mixer {
+                    let alloc = |len: usize| {
+                        self.stream
+                            .alloc_zeros::<f32>(len)
+                            .map_err(|error| alloc_or_backend("allocate snapshot", &error, len * 4))
+                    };
+                    states.push((
+                        alloc(state.conv_state.len())?,
+                        alloc(state.recurrent_state.len())?,
+                    ));
+                }
+            }
+            *snapshot = Some(Qwen35ResidentSnapshot {
+                position: 0,
+                states,
+            });
+        }
+        let saved = snapshot.as_mut().expect("allocated above");
+        let mut index = 0;
+        for layer in &self.layers {
+            if let Mixer::DeltaNet(state) = &layer.mixer {
+                let (conv, recurrent) = saved
+                    .states
+                    .get_mut(index)
+                    .ok_or_else(|| invalid("snapshot belongs to a different executor"))?;
+                self.stream
+                    .memcpy_dtod(&state.conv_state, conv)
+                    .map_err(|error| driver_err("save conv state", &error))?;
+                self.stream
+                    .memcpy_dtod(&state.recurrent_state, recurrent)
+                    .map_err(|error| driver_err("save recurrent state", &error))?;
+                index += 1;
+            }
+        }
+        saved.position = self.position;
+        Ok(())
+    }
+
+    /// Return to a state saved by [`Self::save_snapshot`]: copy the DeltaNet
+    /// states back and rewind the position. Decoding from here is identical to
+    /// decoding after a fresh prefill of the snapshot's tokens, provided the KV
+    /// cache still holds those tokens below the snapshot's position (see
+    /// [`Self::save_snapshot`]).
+    ///
+    /// # Errors
+    /// Rejects a snapshot from a different executor, or returns a driver failure.
+    pub fn restore_snapshot(
+        &mut self,
+        snapshot: &Qwen35ResidentSnapshot,
+    ) -> Result<(), BackendError> {
+        let mut index = 0;
+        for layer in &mut self.layers {
+            if let Mixer::DeltaNet(state) = &mut layer.mixer {
+                let (conv, recurrent) = snapshot
+                    .states
+                    .get(index)
+                    .ok_or_else(|| invalid("snapshot belongs to a different executor"))?;
+                if conv.len() != state.conv_state.len()
+                    || recurrent.len() != state.recurrent_state.len()
+                {
+                    return Err(invalid("snapshot belongs to a different executor"));
+                }
+                self.stream
+                    .memcpy_dtod(conv, &mut state.conv_state)
+                    .map_err(|error| driver_err("restore conv state", &error))?;
+                self.stream
+                    .memcpy_dtod(recurrent, &mut state.recurrent_state)
+                    .map_err(|error| driver_err("restore recurrent state", &error))?;
+                index += 1;
+            }
+        }
+        if index != snapshot.states.len() {
+            return Err(invalid("snapshot belongs to a different executor"));
+        }
+        self.position = snapshot.position;
+        if let Some(drafter) = self.drafter.as_mut() {
+            drafter.truncate(snapshot.position);
+        }
+        Ok(())
+    }
+
+    /// Start a new sequence: zero every recurrent, convolution and KV buffer.
+    ///
+    /// # Errors
+    /// Returns a driver failure.
+    pub fn reset(&mut self) -> Result<(), BackendError> {
+        for layer in &mut self.layers {
+            match &mut layer.mixer {
+                Mixer::DeltaNet(state) => {
+                    self.stream
+                        .memset_zeros(&mut state.conv_state)
+                        .map_err(|error| driver_err("reset conv state", &error))?;
+                    self.stream
+                        .memset_zeros(&mut state.recurrent_state)
+                        .map_err(|error| driver_err("reset recurrent state", &error))?;
+                }
+                Mixer::Attention(state) => {
+                    self.stream
+                        .memset_zeros(&mut state.key_cache)
+                        .map_err(|error| driver_err("reset key cache", &error))?;
+                    self.stream
+                        .memset_zeros(&mut state.value_cache)
+                        .map_err(|error| driver_err("reset value cache", &error))?;
+                }
+            }
+        }
+        self.position = 0;
+        if let Some(drafter) = self.drafter.as_mut() {
+            drafter.truncate(0);
+        }
+        Ok(())
+    }
+
+    /// Capture the residual stream after each of `layers` (decoder layer indices,
+    /// at most the last) on every later forward; an empty slice stops capturing.
+    /// [`Self::captured_features`] reads the latest forward's rows.
+    ///
+    /// The last layer is captured only when the language head runs (a headless
+    /// prefill chunk stops before folding it into the residual).
+    ///
+    /// # Errors
+    /// Rejects a layer index past the model, or returns an allocation failure.
+    pub fn set_feature_capture(&mut self, layers: &[usize]) -> Result<(), BackendError> {
+        if layers.is_empty() {
+            self.capture = None;
+            return Ok(());
+        }
+        if let Some(&bad) = layers.iter().find(|&&layer| layer >= self.layers.len()) {
+            return Err(invalid(format!("capture layer {bad} past the model")));
+        }
+        let len = layers.len() * PREFILL_CHUNK * self.hidden;
+        let buffer = self
+            .stream
+            .alloc_zeros::<f32>(len)
+            .map_err(|error| alloc_or_backend("allocate feature capture", &error, len * 4))?;
+        self.capture = Some(FeatureCapture {
+            layers: layers.to_vec(),
+            buffer,
+            rows: 0,
+        });
+        Ok(())
+    }
+
+    /// The latest forward's captured hidden states: `(rows, data)` with `data`
+    /// laid out `[layers, rows, hidden]` in [`Self::set_feature_capture`]'s order.
+    ///
+    /// # Errors
+    /// Rejects a call with no capture configured, or returns a driver failure.
+    pub fn captured_features(&self) -> Result<(usize, Vec<f32>), BackendError> {
+        let capture = self
+            .capture
+            .as_ref()
+            .ok_or_else(|| invalid("no feature capture configured"))?;
+        let rows = capture.rows;
+        let mut out = vec![0.0f32; capture.layers.len() * rows * self.hidden];
+        for (slot, chunk) in out.chunks_mut(rows * self.hidden).enumerate() {
+            let start = slot * PREFILL_CHUNK * self.hidden;
+            self.stream
+                .memcpy_dtoh(
+                    &capture.buffer.slice(start..start + rows * self.hidden),
+                    chunk,
+                )
+                .map_err(|error| driver_err("read captured features", &error))?;
+        }
+        Ok((rows, out))
+    }
+
+    fn scan_dims(&self) -> Result<ScanDims, BackendError> {
+        Ok(ScanDims {
+            key_width: self.key_heads * self.key_head_dim,
+            value_width: self.value_heads * self.value_head_dim,
+            value_heads: self.value_heads,
+            group: to_u32(self.value_heads / self.key_heads, "group size")?,
+            key_heads_i: to_i32(self.key_heads, "key heads")?,
+            value_heads_i: to_i32(self.value_heads, "value heads")?,
+            key_head_dim_i: to_i32(self.key_head_dim, "key head dim")?,
+            kernel_taps: to_i32(self.conv_kernel, "conv kernel")?,
+            dk: to_u32(self.key_head_dim, "key head dim")?,
+            dv: to_u32(self.value_head_dim, "value head dim")?,
+            value_head_blocks: to_u32(self.value_heads, "value heads")?,
+            delta_prep_blocks: to_u32(self.key_heads + 1, "prep blocks")?,
+            query_scale: 1.0f32 / (self.key_head_dim as f32).sqrt(),
+        })
+    }
+
+    /// Start (`Some(0.0)`) or stop (`None`) the tensor-core drift probe, returning
+    /// the worst peak-relative projection error seen since it was started. Only
+    /// batched prefill chunks are probed; their forward stays exact.
+    pub fn set_tensor_core_probe(&mut self, probe: Option<f32>) -> Option<f32> {
+        std::mem::replace(&mut self.tc_probe, probe)
+    }
+
+    /// Feed `tokens` in order, returning the greedy token after the last one.
+    ///
+    /// Every token but the last runs headless (nobody reads its logits): in
+    /// batched chunks on the fused f32 path, otherwise one decode step each.
+    /// Both compute bit-identical state; the last token is a decode step.
+    ///
+    /// # Errors
+    /// As [`Self::step`]; rejects an empty prompt.
+    pub fn prefill(&mut self, tokens: &[u32]) -> Result<u32, BackendError> {
+        let (&last, rest) = tokens
+            .split_last()
+            .ok_or_else(|| invalid("resident Qwen prefill needs at least one token"))?;
+        // The multi-row GEMV matches the fused f32 decode GEMV; the unfused and
+        // A8 variants keep the token-by-token loop.
+        if batched_prefill_enabled() && fused_enabled() && a8_scope() == A8Scope::Off {
+            for chunk in rest.chunks(PREFILL_CHUNK) {
+                self.forward_rows(chunk, false)?;
+            }
+        } else {
+            for &token in rest {
+                self.forward(token, false)?;
+            }
+        }
+        self.step(last)
+    }
+
+    /// Run `tokens` (at most [`PREFILL_CHUNK`]) through every layer, as
+    /// [`Self::forward`] would one at a time.
+    ///
+    /// Prefill (`verify == false`) is headless and advances the position. A
+    /// verification runs the language head and greedy argmax on every row into
+    /// `self.verify`, saves what [`Self::commit`] replays, and leaves the DeltaNet
+    /// states and the position as they were; its KV rows past the position are
+    /// overwritten as decoding resumes.
+    fn forward_rows(&mut self, tokens: &[u32], verify: bool) -> Result<(), BackendError> {
+        let count = tokens.len();
+        let limit = if verify {
+            QWEN35_VERIFY_MAX
+        } else {
+            PREFILL_CHUNK
+        };
+        if count == 0 || count > limit {
+            return Err(invalid("token chunk size out of range"));
+        }
+        if let Some(&token) = tokens.iter().find(|&&token| token as usize >= self.vocab) {
+            return Err(invalid(format!(
+                "token {token} outside the {}-row vocabulary",
+                self.vocab
+            )));
+        }
+        if self.position + count > self.max_context {
+            return Err(invalid(format!(
+                "resident Qwen context of {} is full",
+                self.max_context
+            )));
+        }
+        let mut ctrl = Vec::with_capacity(count * 4);
+        for t in 0..count {
+            ctrl.extend([to_i32(self.position + t, "position")?, 0, 0, 0]);
+        }
+        let m = to_u32(count, "prefill chunk")?;
+        let n = to_i32(self.hidden, "hidden")?;
+        let query_width = self.heads * self.head_dim;
+        let value_head_dim = to_i32(self.value_head_dim, "value head dim")?;
+        let dv = to_u32(self.value_head_dim, "value head dim")?;
+        let value_head_blocks = to_u32(self.value_heads, "value heads")?;
+        let heads = to_i32(self.heads, "heads")?;
+        let kv_heads = to_i32(self.kv_heads, "kv heads")?;
+        let head_dim = to_i32(self.head_dim, "head dim")?;
+        let rotary_dim = to_i32(self.rotary_dim, "rotary dim")?;
+        let threads = to_u32(self.head_dim, "head dim")?;
+        let attn_prep_blocks = to_u32(self.heads + self.kv_heads, "prep blocks")?;
+        let head_blocks = to_u32(self.heads, "heads")?;
+        let score_bytes = to_u32(
+            self.max_context * core::mem::size_of::<f32>(),
+            "attention scores",
+        )?;
+        let attention_scale = 1.0f32 / (self.head_dim as f32).sqrt();
+        let eps = self.eps;
+        let gated_query = to_i32(count * query_width, "gated query")?;
+        let dims = self.scan_dims()?;
+        let tc = tensor_core_prefill_enabled();
+        let mut tc_probe = self.tc_probe;
+
+        let hidden = self.hidden;
+        let Self {
+            stream,
+            kernels,
+            embedding,
+            layers,
+            prefill,
+            inv_freq,
+            capture,
+            verify: verify_state,
+            final_norm,
+            ..
+        } = self;
+        let mut deltanet_index = 0usize;
+        stream
+            .memcpy_htod(&ctrl, &mut prefill.ctrl)
+            .map_err(|error| driver_err("upload prefill ctrl", &error))?;
+        stream
+            .memcpy_htod(tokens, &mut prefill.tokens)
+            .map_err(|error| driver_err("upload prefill tokens", &error))?;
+        gather_rows(
+            stream,
+            &kernels.gather,
+            embedding,
+            &prefill.tokens,
+            &mut prefill.residual,
+            m,
+        )?;
+
+        for (index, (layer, rows)) in layers.iter_mut().zip(&prefill.layers).enumerate() {
+            add_rmsnorm(
+                stream,
+                &kernels.add_rmsnorm,
+                &mut prefill.residual,
+                &prefill.branch,
+                &layer.input_norm,
+                &mut prefill.normalized,
+                n,
+                eps,
+                index != 0,
+                m,
+            )?;
+            if index != 0 {
+                capture_rows(stream, capture, index - 1, &prefill.residual, count, hidden)?;
+            }
+            project_rows(
+                kernels,
+                stream,
+                &rows.input,
+                &prefill.normalized,
+                m,
+                tc.then_some(&mut prefill.mma),
+                tc_probe.as_mut(),
+            )?;
+            match &mut layer.mixer {
+                Mixer::DeltaNet(mixer) => {
+                    if verify {
+                        let (raw, b, a) = verify_state
+                            .saved
+                            .get_mut(deltanet_index)
+                            .ok_or_else(|| invalid("verification buffers out of step"))?;
+                        let copy = |from: &CudaSlice<f32>, to: &mut CudaSlice<f32>, len: usize| {
+                            stream
+                                .memcpy_dtod(&from.slice(..len), &mut to.slice_mut(..len))
+                                .map_err(|error| driver_err("save verification rows", &error))
+                        };
+                        copy(&prefill.qkv, raw, count * mixer.qkv.rows)?;
+                        copy(&prefill.b, b, count * dims.value_heads)?;
+                        copy(&prefill.a, a, count * dims.value_heads)?;
+                    }
+                    deltanet_index += 1;
+                    deltanet_scan(
+                        stream,
+                        kernels,
+                        mixer,
+                        &prefill.qkv,
+                        &prefill.b,
+                        &prefill.a,
+                        &mut prefill.scan,
+                        &dims,
+                        count,
+                        !verify,
+                    )?;
+
+                    let mut builder = stream.launch_builder(&kernels.gated_rmsnorm_rows);
+                    builder
+                        .arg(&prefill.scan.core)
+                        .arg(&prefill.z)
+                        .arg(&mixer.norm_weight)
+                        .arg(&mut prefill.gated)
+                        .arg(&value_head_dim)
+                        .arg(&eps);
+                    run(
+                        &mut builder,
+                        LaunchConfig {
+                            grid_dim: (value_head_blocks, m, 1),
+                            block_dim: (dv.max(64), 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        "launch q35_gated_rmsnorm_rows",
+                    )?;
+                    project_rows(
+                        kernels,
+                        stream,
+                        &rows.out,
+                        &prefill.gated,
+                        m,
+                        tc.then_some(&mut prefill.mma),
+                        tc_probe.as_mut(),
+                    )?;
+                }
+                Mixer::Attention(mixer) => {
+                    // Every token's key and value reach the cache before any
+                    // token attends, and each attends only up to its own position.
+                    let mut builder = stream.launch_builder(&kernels.attn_prep_rows);
+                    builder
+                        .arg(&prefill.fused_query)
+                        .arg(&prefill.key)
+                        .arg(&prefill.value)
+                        .arg(&mixer.q_norm)
+                        .arg(&mixer.k_norm)
+                        .arg(&*inv_freq)
+                        .arg(&mut prefill.query)
+                        .arg(&mut prefill.attention_gate)
+                        .arg(&mut mixer.key_cache)
+                        .arg(&mut mixer.value_cache)
+                        .arg(&prefill.ctrl)
+                        .arg(&heads)
+                        .arg(&kv_heads)
+                        .arg(&head_dim)
+                        .arg(&rotary_dim)
+                        .arg(&eps);
+                    run(
+                        &mut builder,
+                        LaunchConfig {
+                            grid_dim: (attn_prep_blocks, m, 1),
+                            block_dim: (threads, 1, 1),
+                            shared_mem_bytes: threads * core::mem::size_of::<f32>() as u32,
+                        },
+                        "launch q35_attn_prep_rows",
+                    )?;
+
+                    let mut builder = stream.launch_builder(&kernels.attention_rows);
+                    builder
+                        .arg(&prefill.query)
+                        .arg(&mixer.key_cache)
+                        .arg(&mixer.value_cache)
+                        .arg(&mut prefill.attended)
+                        .arg(&prefill.ctrl)
+                        .arg(&heads)
+                        .arg(&kv_heads)
+                        .arg(&head_dim)
+                        .arg(&attention_scale);
+                    run(
+                        &mut builder,
+                        LaunchConfig {
+                            grid_dim: (head_blocks, m, 1),
+                            block_dim: (threads, 1, 1),
+                            shared_mem_bytes: score_bytes,
+                        },
+                        "launch q35_attention_rows",
+                    )?;
+                    let mut builder = stream.launch_builder(&kernels.sigmoid_mul);
+                    builder
+                        .arg(&mut prefill.attended)
+                        .arg(&prefill.attention_gate)
+                        .arg(&gated_query);
+                    run(
+                        &mut builder,
+                        elementwise(count * query_width),
+                        "launch q35_sigmoid_mul",
+                    )?;
+                    project_rows(
+                        kernels,
+                        stream,
+                        &rows.out,
+                        &prefill.attended,
+                        m,
+                        tc.then_some(&mut prefill.mma),
+                        tc_probe.as_mut(),
+                    )?;
+                }
+            }
+            add_rmsnorm(
+                stream,
+                &kernels.add_rmsnorm,
+                &mut prefill.residual,
+                &prefill.branch,
+                &layer.post_attention_norm,
+                &mut prefill.normalized,
+                n,
+                eps,
+                true,
+                m,
+            )?;
+            project_rows(
+                kernels,
+                stream,
+                &rows.mlp,
+                &prefill.normalized,
+                m,
+                tc.then_some(&mut prefill.mma),
+                tc_probe.as_mut(),
+            )?;
+            let intermediate = layer.gate.rows;
+            let act = to_i32(count * intermediate, "mlp activations")?;
+            let mut builder = stream.launch_builder(&kernels.swiglu);
+            builder
+                .arg(&prefill.mlp_gate)
+                .arg(&prefill.mlp_up)
+                .arg(&mut prefill.mlp_act)
+                .arg(&act);
+            run(
+                &mut builder,
+                elementwise(count * intermediate),
+                "launch q35_swiglu",
+            )?;
+            project_rows(
+                kernels,
+                stream,
+                &rows.down,
+                &prefill.mlp_act,
+                m,
+                tc.then_some(&mut prefill.mma),
+                tc_probe.as_mut(),
+            )?;
+        }
+        if verify {
+            add_rmsnorm(
+                stream,
+                &kernels.add_rmsnorm,
+                &mut prefill.residual,
+                &prefill.branch,
+                final_norm,
+                &mut prefill.normalized,
+                n,
+                eps,
+                true,
+                m,
+            )?;
+            capture_rows(
+                stream,
+                capture,
+                layers.len() - 1,
+                &prefill.residual,
+                count,
+                hidden,
+            )?;
+            project_rows(
+                kernels,
+                stream,
+                &verify_state.head,
+                &prefill.normalized,
+                m,
+                tc.then_some(&mut prefill.mma),
+                None,
+            )?;
+            argmax_rows(stream, kernels, verify_state, 0, count)?;
+            verify_state.pending = Some(count);
+            self.tc_probe = tc_probe;
+            return Ok(());
+        }
+        // The last layer's MLP branch would fold into the residual under the
+        // final norm, which only feeds the language head: a headless chunk
+        // stops here. Nothing below crosses tokens except the states and caches.
+        self.tc_probe = tc_probe;
+        self.position += count;
+        self.feed_drafter(count)
+    }
+
+    /// Hand the latest forward's first `rows` captured positions to the drafter.
+    fn feed_drafter(&mut self, rows: usize) -> Result<(), BackendError> {
+        let (Some(drafter), Some(capture)) = (self.drafter.as_mut(), self.capture.as_ref()) else {
+            return Ok(());
+        };
+        drafter.ingest(
+            &self.stream,
+            &self.kernels.add_rmsnorm,
+            &capture.buffer,
+            rows,
+        )
+    }
+
+    /// Attach a DFlash drafter (`config`, tensors from `fetch`), quantizing its
+    /// weights to int8 on the way up, and start capturing the target layers it
+    /// conditions on. Attach on a fresh sequence: positions already consumed are
+    /// not in the drafter's context, so [`Self::reset`] first.
+    ///
+    /// # Errors
+    /// Rejects a config the kernels do not serve or a tensor of the wrong shape,
+    /// or returns an allocation or driver failure.
+    pub fn attach_dflash(
+        &mut self,
+        config: DFlashConfig,
+        fetch: &mut DFlashFetch<'_>,
+    ) -> Result<(), BackendError> {
+        if config.hidden != self.hidden {
+            return Err(invalid("drafter hidden width differs from the target's"));
+        }
+        let capacity = self.max_context + QWEN35_VERIFY_MAX;
+        let layers = config.target_layers.clone();
+        self.drafter = None;
+        self.drafter = Some(dflash::Drafter::build(
+            &self.stream,
+            &self.dflash_module,
+            config,
+            capacity,
+            fetch,
+        )?);
+        self.set_feature_capture(&layers)
+    }
+
+    /// Draft the tokens after `anchor`, the next token to feed at the current
+    /// position: `block_size - 1` greedy tokens from the drafter, through the
+    /// target's own language head. Every consumed position must have reached the
+    /// drafter (it follows prefill, steps and commits automatically).
+    ///
+    /// # Errors
+    /// Rejects a call with no drafter attached or an out-of-step context, or
+    /// returns a driver failure.
+    pub fn draft(&mut self, anchor: u32) -> Result<Vec<u32>, BackendError> {
+        let tc = tensor_core_prefill_enabled();
+        let Self {
+            stream,
+            kernels,
+            embedding,
+            drafter,
+            verify,
+            prefill,
+            position,
+            ..
+        } = self;
+        let drafter = drafter
+            .as_mut()
+            .ok_or_else(|| invalid("no drafter attached"))?;
+        drafter.draft_hidden(
+            stream,
+            &kernels.add_rmsnorm,
+            &kernels.gather,
+            embedding,
+            anchor,
+            *position,
+        )?;
+        let block = drafter.block_size();
+        let m = to_u32(block, "block")?;
+        project_rows(
+            kernels,
+            stream,
+            &verify.head,
+            drafter.hidden(),
+            m,
+            tc.then_some(&mut prefill.mma),
+            None,
+        )?;
+        argmax_rows(stream, kernels, verify, 1, block - 1)?;
+        let mut out = vec![0u32; block - 1];
+        stream
+            .memcpy_dtoh(&verify.tokens.slice(1..block), &mut out)
+            .map_err(|error| driver_err("read drafted tokens", &error))?;
+        Ok(out)
+    }
+
+    /// Speculative verification: run `tokens` (the next input token, then drafted
+    /// continuations; at most [`QWEN35_VERIFY_MAX`]) through the model at the
+    /// current position and return the greedy token after each, without advancing
+    /// the sequence. Follow with [`Self::commit`] of the rows to keep.
+    ///
+    /// Projections run on the tensor cores (fast tier, RFC 0001; see
+    /// `TRITIUM_QWEN35_TC_PREFILL`), the rest as in a decode step.
+    ///
+    /// # Errors
+    /// Rejects an empty or oversized block, an out-of-vocabulary token or a full
+    /// context, or returns a driver failure.
+    pub fn verify(&mut self, tokens: &[u32]) -> Result<Vec<u32>, BackendError> {
+        self.forward_rows(tokens, true)?;
+        let mut out = vec![0u32; tokens.len()];
+        self.stream
+            .memcpy_dtoh(&self.verify.tokens.slice(..tokens.len()), &mut out)
+            .map_err(|error| driver_err("read verification tokens", &error))?;
+        Ok(out)
+    }
+
+    /// Keep the first `accepted` rows of the latest [`Self::verify`]: advance the
+    /// DeltaNet conv and recurrent states through exactly those tokens (replaying
+    /// the saved inputs through the same kernels, so the states equal a
+    /// verification of just those rows) and the position past them.
+    ///
+    /// # Errors
+    /// Rejects a commit with no pending verification or more rows than it had, or
+    /// returns a driver failure.
+    pub fn commit(&mut self, accepted: usize) -> Result<(), BackendError> {
+        let pending = self
+            .verify
+            .pending
+            .take()
+            .ok_or_else(|| invalid("commit without a pending verification"))?;
+        if accepted == 0 || accepted > pending {
+            return Err(invalid(format!(
+                "commit of {accepted} rows from a verification of {pending}"
+            )));
+        }
+        let dims = self.scan_dims()?;
+        let Self {
+            stream,
+            kernels,
+            layers,
+            prefill,
+            verify,
+            ..
+        } = self;
+        let mut index = 0usize;
+        for layer in layers.iter_mut() {
+            if let Mixer::DeltaNet(mixer) = &mut layer.mixer {
+                let (raw, b, a) = &verify.saved[index];
+                deltanet_scan(
+                    stream,
+                    kernels,
+                    mixer,
+                    raw,
+                    b,
+                    a,
+                    &mut prefill.scan,
+                    &dims,
+                    accepted,
+                    true,
+                )?;
+                index += 1;
+            }
+        }
+        self.position += accepted;
+        self.device_token = None;
+        self.feed_drafter(accepted)
+    }
+
+    /// Consume `token` and return the greedy next token. Four bytes cross the bus.
+    ///
+    /// # Errors
+    /// Rejects a token outside the vocabulary or a full context, or returns a
+    /// driver failure.
+    pub fn step(&mut self, token: u32) -> Result<u32, BackendError> {
+        self.forward(token, true)?;
+        self.argmax()?;
+        let mut next = [0u32; 1];
+        self.stream
+            .memcpy_dtoh(&self.scratch.token, &mut next)
+            .map_err(|error| driver_err("read resident Qwen token", &error))?;
+        // The argmax wrote this token into `scratch.token`: feeding it next is free.
+        self.device_token = Some(next[0]);
+        Ok(next[0])
+    }
+
+    /// Consume `token` and return the full logits row, for sampling other than
+    /// greedy and for parity checks. Downloads `vocab` floats.
+    ///
+    /// # Errors
+    /// As [`Self::step`].
+    pub fn step_logits(&mut self, token: u32) -> Result<Vec<f32>, BackendError> {
+        self.forward(token, true)?;
+        let mut logits = vec![0.0f32; self.vocab];
+        self.stream
+            .memcpy_dtoh(&self.scratch.logits, &mut logits)
+            .map_err(|error| driver_err("read resident Qwen logits", &error))?;
+        Ok(logits)
+    }
+
+    /// Run one token through every layer and, with `head`, the language head,
+    /// leaving the logits in scratch.
+    fn forward(&mut self, token: u32, head: bool) -> Result<(), BackendError> {
+        if token as usize >= self.vocab {
+            return Err(invalid(format!(
+                "token {token} outside the {}-row vocabulary",
+                self.vocab
+            )));
+        }
+        if self.position >= self.max_context {
+            return Err(invalid(format!(
+                "resident Qwen context of {} is full",
+                self.max_context
+            )));
+        }
+        let ctrl = [to_i32(self.position, "position")?, 0, 0, 0];
+        self.stream
+            .memcpy_htod(&ctrl, &mut self.scratch.ctrl)
+            .map_err(|error| driver_err("upload resident ctrl", &error))?;
+        if self.device_token != Some(token) {
+            self.stream
+                .memcpy_htod(&[token], &mut self.scratch.token)
+                .map_err(|error| driver_err("upload resident token", &error))?;
+            self.device_token = Some(token);
+        }
+
+        self.gather()?;
+        let scope = a8_scope();
+        self.fused_on = fused_enabled();
+        let a8 = scope == A8Scope::All;
+        let a8_mlp = scope != A8Scope::Off;
+        let n = to_i32(self.hidden, "hidden")?;
+        for index in 0..self.layers.len() {
+            // The previous layer's MLP output is folded into the residual here,
+            // fused with this layer's input norm; layer 0 starts from the embedding.
+            add_rmsnorm(
+                &self.stream,
+                &self.kernels.add_rmsnorm,
+                &mut self.scratch.residual,
+                &self.scratch.branch,
+                &self.layers[index].input_norm,
+                &mut self.scratch.normalized,
+                n,
+                self.eps,
+                index != 0,
+                1,
+            )?;
+            if index != 0 {
+                capture_rows(
+                    &self.stream,
+                    &mut self.capture,
+                    index - 1,
+                    &self.scratch.residual,
+                    1,
+                    self.hidden,
+                )?;
+            }
+            if matches!(self.layers[index].mixer, Mixer::DeltaNet(_)) {
+                self.deltanet(index, a8)?;
+            } else {
+                self.attention(index, a8)?;
+            }
+            add_rmsnorm(
+                &self.stream,
+                &self.kernels.add_rmsnorm,
+                &mut self.scratch.residual,
+                &self.scratch.branch,
+                &self.layers[index].post_attention_norm,
+                &mut self.scratch.normalized,
+                n,
+                self.eps,
+                true,
+                1,
+            )?;
+            self.mlp(index, a8_mlp)?;
+        }
+        add_rmsnorm(
+            &self.stream,
+            &self.kernels.add_rmsnorm,
+            &mut self.scratch.residual,
+            &self.scratch.branch,
+            &self.final_norm,
+            &mut self.scratch.normalized,
+            n,
+            self.eps,
+            true,
+            1,
+        )?;
+        capture_rows(
+            &self.stream,
+            &mut self.capture,
+            self.layers.len() - 1,
+            &self.scratch.residual,
+            1,
+            self.hidden,
+        )?;
+        if head {
+            project(
+                &self.kernels,
+                &self.stream,
+                a8,
+                &self.lm_head,
+                &self.scratch.normalized,
+                &mut self.scratch.logits,
+                &mut self.scratch.act_quantized,
+                &mut self.scratch.act_scale,
+            )?;
+        }
+        self.position += 1;
+        self.feed_drafter(1)
+    }
+
+    fn gather(&mut self) -> Result<(), BackendError> {
+        gather_rows(
+            &self.stream,
+            &self.kernels.gather,
+            &self.embedding,
+            &self.scratch.token,
+            &mut self.scratch.residual,
+            1,
+        )
+    }
+
+    fn deltanet(&mut self, index: usize, a8: bool) -> Result<(), BackendError> {
+        let key_width = self.key_heads * self.key_head_dim;
+        let group = to_u32(self.value_heads / self.key_heads, "group size")?;
+        let key_heads = to_i32(self.key_heads, "key heads")?;
+        let value_heads = to_i32(self.value_heads, "value heads")?;
+        let key_head_dim = to_i32(self.key_head_dim, "key head dim")?;
+        let value_head_dim = to_i32(self.value_head_dim, "value head dim")?;
+        let kernel_taps = to_i32(self.conv_kernel, "conv kernel")?;
+        let dk = to_u32(self.key_head_dim, "key head dim")?;
+        let dv = to_u32(self.value_head_dim, "value head dim")?;
+        let value_head_blocks = to_u32(self.value_heads, "value heads")?;
+        let prep_blocks = to_u32(self.key_heads + 1, "prep blocks")?;
+        let query_scale = 1.0f32 / (self.key_head_dim as f32).sqrt();
+        // The host reference's `QK_L2_EPSILON`.
+        let l2_epsilon = 1e-6f32;
+        let eps = self.eps;
+        let hidden_u32 = to_u32(self.hidden, "hidden")?;
+        let fused_table_bytes = self.fused_table_bytes;
+        let (stream, kernels, scratch) = (&self.stream, &self.kernels, &mut self.scratch);
+        let entry = &mut self.layers[index];
+        let fused = if self.fused_on {
+            entry.fused_in.as_ref()
+        } else {
+            None
+        };
+        let Mixer::DeltaNet(layer) = &mut entry.mixer else {
+            return Err(invalid("resident Qwen layer is not a DeltaNet layer"));
+        };
+        match fused {
+            Some(group) => project_fused(
+                kernels,
+                stream,
+                a8,
+                group,
+                hidden_u32,
+                fused_table_bytes,
+                &scratch.normalized,
+                &mut scratch.act_quantized,
+                &mut scratch.act_scale,
+            )?,
+            None => {
+                project(
+                    kernels,
+                    stream,
+                    a8,
+                    &layer.qkv,
+                    &scratch.normalized,
+                    &mut scratch.qkv,
+                    &mut scratch.act_quantized,
+                    &mut scratch.act_scale,
+                )?;
+                project(
+                    kernels,
+                    stream,
+                    a8,
+                    &layer.z,
+                    &scratch.normalized,
+                    &mut scratch.z,
+                    &mut scratch.act_quantized,
+                    &mut scratch.act_scale,
+                )?;
+                project(
+                    kernels,
+                    stream,
+                    a8,
+                    &layer.b,
+                    &scratch.normalized,
+                    &mut scratch.b,
+                    &mut scratch.act_quantized,
+                    &mut scratch.act_scale,
+                )?;
+                project(
+                    kernels,
+                    stream,
+                    a8,
+                    &layer.a,
+                    &scratch.normalized,
+                    &mut scratch.a,
+                    &mut scratch.act_quantized,
+                    &mut scratch.act_scale,
+                )?;
+            }
+        }
+
+        let conv_width = layer.qkv.rows;
+        let width = to_i32(conv_width, "conv width")?;
+        let mut builder = stream.launch_builder(&kernels.conv);
+        builder
+            .arg(&scratch.qkv)
+            .arg(&mut layer.conv_state)
+            .arg(&layer.conv_weight)
+            .arg(&mut scratch.convolved)
+            .arg(&width)
+            .arg(&kernel_taps);
+        run(
+            &mut builder,
+            elementwise(conv_width),
+            "launch q35_deltanet_conv",
+        )?;
+
+        let mut builder = stream.launch_builder(&kernels.prep);
+        builder
+            .arg(&scratch.convolved)
+            .arg(&scratch.b)
+            .arg(&scratch.a)
+            .arg(&layer.a_log)
+            .arg(&layer.dt_bias)
+            .arg(&mut scratch.kk)
+            .arg(&mut scratch.qq)
+            .arg(&mut scratch.beta)
+            .arg(&mut scratch.decay)
+            .arg(&key_heads)
+            .arg(&value_heads)
+            .arg(&key_head_dim)
+            .arg(&query_scale)
+            .arg(&l2_epsilon);
+        run(
+            &mut builder,
+            LaunchConfig {
+                grid_dim: (prep_blocks, 1, 1),
+                block_dim: (dk.max(64), 1, 1),
+                shared_mem_bytes: 0,
+            },
+            "launch q35_deltanet_prep",
+        )?;
+
+        let value = scratch.convolved.slice(2 * key_width..);
+        let mut builder = stream.launch_builder(&kernels.recurrent);
+        builder
+            .arg(&mut layer.recurrent_state)
+            .arg(&scratch.kk)
+            .arg(&scratch.qq)
+            .arg(&value)
+            .arg(&scratch.beta)
+            .arg(&scratch.decay)
+            .arg(&mut scratch.core)
+            .arg(&dk)
+            .arg(&dv)
+            .arg(&group);
+        // One thread per value lane, each writing only its own column of its own
+        // head's state -- updated in place, with no staging copy, because the
+        // executor never rolls a step back. The lanes of a head are split across
+        // warp-sized blocks: one block per head is only 48 blocks on a 128-SM part,
+        // and measured 2.17 ms/token that way.
+        let (lane_blocks, lane_threads) = if dv.is_multiple_of(32) {
+            (dv / 32, 32)
+        } else {
+            (1, dv)
+        };
+        run(
+            &mut builder,
+            LaunchConfig {
+                grid_dim: (value_head_blocks, lane_blocks, 1),
+                block_dim: (lane_threads, 1, 1),
+                shared_mem_bytes: 2 * dk * core::mem::size_of::<f32>() as u32,
+            },
+            "launch DeltaNet recurrent step",
+        )?;
+
+        let mut builder = stream.launch_builder(&kernels.gated_rmsnorm);
+        builder
+            .arg(&scratch.core)
+            .arg(&scratch.z)
+            .arg(&layer.norm_weight)
+            .arg(&mut scratch.gated)
+            .arg(&value_head_dim)
+            .arg(&eps);
+        run(
+            &mut builder,
+            LaunchConfig {
+                grid_dim: (value_head_blocks, 1, 1),
+                block_dim: (dv.max(64), 1, 1),
+                shared_mem_bytes: 0,
+            },
+            "launch q35_gated_rmsnorm",
+        )?;
+
+        project(
+            kernels,
+            stream,
+            a8,
+            &layer.out,
+            &scratch.gated,
+            &mut scratch.branch,
+            &mut scratch.act_quantized,
+            &mut scratch.act_scale,
+        )
+    }
+
+    fn attention(&mut self, index: usize, a8: bool) -> Result<(), BackendError> {
+        let heads = to_i32(self.heads, "heads")?;
+        let kv_heads = to_i32(self.kv_heads, "kv heads")?;
+        let head_dim = to_i32(self.head_dim, "head dim")?;
+        let rotary_dim = to_i32(self.rotary_dim, "rotary dim")?;
+        let threads = to_u32(self.head_dim, "head dim")?;
+        let prep_blocks = to_u32(self.heads + self.kv_heads, "prep blocks")?;
+        let head_blocks = to_u32(self.heads, "heads")?;
+        let score_bytes = to_u32(
+            self.max_context * core::mem::size_of::<f32>(),
+            "attention scores",
+        )?;
+        let query_width = self.heads * self.head_dim;
+        let query_width_i32 = to_i32(query_width, "query width")?;
+        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+        let eps = self.eps;
+        let hidden_u32 = to_u32(self.hidden, "hidden")?;
+        let fused_table_bytes = self.fused_table_bytes;
+        let (stream, kernels, scratch, inv_freq) = (
+            &self.stream,
+            &self.kernels,
+            &mut self.scratch,
+            &self.inv_freq,
+        );
+        let entry = &mut self.layers[index];
+        let fused = if self.fused_on {
+            entry.fused_in.as_ref()
+        } else {
+            None
+        };
+        let Mixer::Attention(layer) = &mut entry.mixer else {
+            return Err(invalid("resident Qwen layer is not an attention layer"));
+        };
+        match fused {
+            Some(group) => project_fused(
+                kernels,
+                stream,
+                a8,
+                group,
+                hidden_u32,
+                fused_table_bytes,
+                &scratch.normalized,
+                &mut scratch.act_quantized,
+                &mut scratch.act_scale,
+            )?,
+            None => {
+                project(
+                    kernels,
+                    stream,
+                    a8,
+                    &layer.q,
+                    &scratch.normalized,
+                    &mut scratch.fused_query,
+                    &mut scratch.act_quantized,
+                    &mut scratch.act_scale,
+                )?;
+                project(
+                    kernels,
+                    stream,
+                    a8,
+                    &layer.k,
+                    &scratch.normalized,
+                    &mut scratch.key,
+                    &mut scratch.act_quantized,
+                    &mut scratch.act_scale,
+                )?;
+                project(
+                    kernels,
+                    stream,
+                    a8,
+                    &layer.v,
+                    &scratch.normalized,
+                    &mut scratch.value,
+                    &mut scratch.act_quantized,
+                    &mut scratch.act_scale,
+                )?;
+            }
+        }
+
+        let mut builder = stream.launch_builder(&kernels.attn_prep);
+        builder
+            .arg(&scratch.fused_query)
+            .arg(&scratch.key)
+            .arg(&scratch.value)
+            .arg(&layer.q_norm)
+            .arg(&layer.k_norm)
+            .arg(inv_freq)
+            .arg(&mut scratch.query)
+            .arg(&mut scratch.attention_gate)
+            .arg(&mut layer.key_cache)
+            .arg(&mut layer.value_cache)
+            .arg(&scratch.ctrl)
+            .arg(&heads)
+            .arg(&kv_heads)
+            .arg(&head_dim)
+            .arg(&rotary_dim)
+            .arg(&eps);
+        // One block per query head plus one per KV head, one thread per head lane;
+        // the cache row written is `ctrl[0] < max_context`, checked in `forward`.
+        run(
+            &mut builder,
+            LaunchConfig {
+                grid_dim: (prep_blocks, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: threads * core::mem::size_of::<f32>() as u32,
+            },
+            "launch q35_attn_prep",
+        )?;
+
+        let mut builder = stream.launch_builder(&kernels.attention);
+        builder
+            .arg(&scratch.query)
+            .arg(&layer.key_cache)
+            .arg(&layer.value_cache)
+            .arg(&mut scratch.attended)
+            .arg(&scratch.ctrl)
+            .arg(&heads)
+            .arg(&kv_heads)
+            .arg(&head_dim)
+            .arg(&scale);
+        // The shared score buffer holds `max_context` floats and the kernel reads
+        // `ctrl[0] + 1 <= max_context` positions.
+        run(
+            &mut builder,
+            LaunchConfig {
+                grid_dim: (head_blocks, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: score_bytes,
+            },
+            "launch q35_attention",
+        )?;
+
+        let mut builder = stream.launch_builder(&kernels.sigmoid_mul);
+        builder
+            .arg(&mut scratch.attended)
+            .arg(&scratch.attention_gate)
+            .arg(&query_width_i32);
+        run(
+            &mut builder,
+            elementwise(query_width),
+            "launch q35_sigmoid_mul",
+        )?;
+
+        project(
+            kernels,
+            stream,
+            a8,
+            &layer.o,
+            &scratch.attended,
+            &mut scratch.branch,
+            &mut scratch.act_quantized,
+            &mut scratch.act_scale,
+        )
+    }
+
+    fn mlp(&mut self, index: usize, a8: bool) -> Result<(), BackendError> {
+        let hidden_u32 = to_u32(self.hidden, "hidden")?;
+        let fused_table_bytes = self.fused_table_bytes;
+        let (stream, kernels, scratch) = (&self.stream, &self.kernels, &mut self.scratch);
+        let layer = &self.layers[index];
+        let fused = if self.fused_on {
+            layer.fused_mlp.as_ref()
+        } else {
+            None
+        };
+        match fused {
+            Some(group) => project_fused(
+                kernels,
+                stream,
+                a8,
+                group,
+                hidden_u32,
+                fused_table_bytes,
+                &scratch.normalized,
+                &mut scratch.act_quantized,
+                &mut scratch.act_scale,
+            )?,
+            None => {
+                project(
+                    kernels,
+                    stream,
+                    a8,
+                    &layer.gate,
+                    &scratch.normalized,
+                    &mut scratch.mlp_gate,
+                    &mut scratch.act_quantized,
+                    &mut scratch.act_scale,
+                )?;
+                project(
+                    kernels,
+                    stream,
+                    a8,
+                    &layer.up,
+                    &scratch.normalized,
+                    &mut scratch.mlp_up,
+                    &mut scratch.act_quantized,
+                    &mut scratch.act_scale,
+                )?;
+            }
+        }
+        let n = layer.gate.rows;
+        let n_i32 = to_i32(n, "intermediate")?;
+        let mut builder = stream.launch_builder(&kernels.swiglu);
+        builder
+            .arg(&scratch.mlp_gate)
+            .arg(&scratch.mlp_up)
+            .arg(&mut scratch.mlp_act)
+            .arg(&n_i32);
+        run(&mut builder, elementwise(n), "launch q35_swiglu")?;
+        project(
+            kernels,
+            stream,
+            a8,
+            &layer.down,
+            &scratch.mlp_act,
+            &mut scratch.branch,
+            &mut scratch.act_quantized,
+            &mut scratch.act_scale,
+        )
+    }
+
+    fn argmax(&mut self) -> Result<(), BackendError> {
+        let n = to_i32(self.vocab, "vocab")?;
+        let mut builder = self.stream.launch_builder(&self.kernels.argmax_partial);
+        builder
+            .arg(&self.scratch.logits)
+            .arg(&n)
+            .arg(&mut self.scratch.argmax_value)
+            .arg(&mut self.scratch.argmax_index);
+        run(
+            &mut builder,
+            LaunchConfig {
+                grid_dim: (ARGMAX_BLOCKS, 1, 1),
+                block_dim: (ARGMAX_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            "launch q35_argmax_partial",
+        )?;
+        let partials = ARGMAX_BLOCKS as i32;
+        let mut builder = self.stream.launch_builder(&self.kernels.argmax_final);
+        builder
+            .arg(&self.scratch.argmax_value)
+            .arg(&self.scratch.argmax_index)
+            .arg(&partials)
+            .arg(&mut self.scratch.token);
+        run(
+            &mut builder,
+            LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            "launch q35_argmax_final",
+        )
+    }
+}

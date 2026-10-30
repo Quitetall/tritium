@@ -51,6 +51,28 @@ fn survey_scale_groups_and_plane_density() {
         total_tiles += info.tile_count() as u64;
     }
 
+    // Per role: payload and scale bytes actually read per decode token, and planes
+    // per tile. A GEMV's efficiency can only be judged against its real bytes, and
+    // the mean plane count hides that some roles carry more planes than others.
+    let mut roles: BTreeMap<String, (u64, u64, u64, usize)> = BTreeMap::new();
+    for name in &names {
+        let info = reader.tensor_info(name).expect("named tensor");
+        let role = name.rsplit('.').nth(1).unwrap_or(name.as_str()).to_owned();
+        let entry = roles.entry(role).or_default();
+        entry.0 += info.encoded_payload_bytes() + info.encoded_scale_bytes();
+        entry.1 += info.present_planes() as u64;
+        entry.2 += info.tile_count() as u64;
+        entry.3 += 1;
+    }
+    eprintln!("role                         tensors   planes/tile   MB (payload+scales)");
+    for (role, (bytes, planes, tiles, count)) in &roles {
+        eprintln!(
+            "  {role:26} {count:7}   {:11.3}   {:10.1}",
+            *planes as f64 / (*tiles).max(1) as f64,
+            *bytes as f64 / 1e6
+        );
+    }
+
     let mean_planes = total_planes as f64 / total_tiles.max(1) as f64;
     eprintln!("codec              {:?}", reader.codec());
     eprintln!("tensors            {}", names.len());
