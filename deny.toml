@@ -9,7 +9,15 @@ yanked = "deny"
 # `wgpu` → `wgpu-hal` → `metal` (the macOS/iOS HAL); it is never compiled on the
 # Linux/CUDA path. No maintained drop-in replacement exists upstream yet. Revisit
 # when a future wgpu drops it. Low risk: proc-macro, compile-time only.
-ignore = ["RUSTSEC-2024-0436"]
+#
+# RUSTSEC-2026-0367 / -0368 / -0369: `zip` < 9 extraction flaws (SUID/SGID bits
+# preserved, symlink targets and permissions applied outside the destination).
+# All three are in `ZipArchive::extract` / `ZipStreamReader::extract` only. `zip`
+# enters the graph solely through `candle-core` 0.11.0 (latest release, pins
+# zip 8) behind `tritium-candle`'s optional `candle` feature; candle reads npz/pth
+# entries in memory and never extracts to disk, and tritium-candle calls neither
+# loader. Not reachable. Remove these when candle-core moves to zip >= 9.
+ignore = ["RUSTSEC-2024-0436", "RUSTSEC-2026-0367", "RUSTSEC-2026-0368", "RUSTSEC-2026-0369"]
 
 [licenses]
 # Unicode-3.0 is the license of `unicode-ident` (a transitive dep of serde/syn etc.),
