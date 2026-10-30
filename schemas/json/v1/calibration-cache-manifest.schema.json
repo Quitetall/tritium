@@ -1,0 +1,293 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CalibrationCacheManifest",
+  "description": "Candidate typed manifest carried by the existing `.trit` cache transport.",
+  "type": "object",
+  "properties": {
+    "binding": {
+      "description": "Claimed binding; readers must reconstruct it from actual payload bytes.",
+      "$ref": "#/$defs/CalibrationCacheBinding"
+    },
+    "window_samples": {
+      "description": "Ordered declared model-context lengths, not physical replay chunks.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "binding",
+    "window_samples"
+  ],
+  "$defs": {
+    "BlobId": {
+      "description": "Content identity for stored tensor or asset bytes.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "CalibrationCacheBinding": {
+      "description": "Immutable finalized cache context, not a registered/audited observation.",
+      "type": "object",
+      "properties": {
+        "objective": {
+          "description": "BLAKE3 of exact supplied objective/teacher/recovery recipe bytes.\nByte identity does not independently establish that this recipe was executed.",
+          "$ref": "#/$defs/BlobId"
+        },
+        "payload_bytes": {
+          "description": "Actual retained payload bytes, excluding metadata/capacity overhead and full RSS.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "request": {
+          "description": "Context actually used, including declared logical limits.",
+          "$ref": "#/$defs/CalibrationCacheRequest"
+        },
+        "samples": {
+          "description": "Observed sample count, including masked samples.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "source": {
+          "description": "Actual finalized cache/token identities; model identity remains declared until engine admission.",
+          "$ref": "#/$defs/CalibrationSource"
+        },
+        "tokenizer": {
+          "description": "BLAKE3 of actual supplied tokenizer bytes, not a name.",
+          "$ref": "#/$defs/BlobId"
+        },
+        "windows": {
+          "description": "Declared context-window count, not the number of reduction chunks.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "request",
+        "source",
+        "tokenizer",
+        "objective",
+        "samples",
+        "windows",
+        "payload_bytes"
+      ]
+    },
+    "CalibrationCacheLimits": {
+      "description": "Logical retained cache bounds, separate from reducer workspace or process RSS.",
+      "type": "object",
+      "properties": {
+        "max_payload_bytes": {
+          "description": "Exact retained scalar/token/mask and recipe bytes; excludes metadata/capacity overhead.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_samples": {
+          "description": "Maximum observed samples, including masked samples.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_windows": {
+          "description": "Maximum declared model-context windows, not reduction replay chunks.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max_payload_bytes",
+        "max_samples",
+        "max_windows"
+      ]
+    },
+    "CalibrationCacheRequest": {
+      "description": "Context for collecting one tensor's actual original-basis paired cache.",
+      "type": "object",
+      "properties": {
+        "consumer": {
+          "description": "Actual operation/explicit approximation producing the inputs.",
+          "$ref": "#/$defs/CalibrationConsumer"
+        },
+        "limits": {
+          "description": "Logical cache admission, not numerical reduction admission.",
+          "$ref": "#/$defs/CalibrationCacheLimits"
+        },
+        "model": {
+          "description": "Declared original identity; the engine must verify actual byte equality.",
+          "$ref": "#/$defs/OriginalSourceId"
+        },
+        "output": {
+          "description": "Required actual gradient encoding; absent is explicitly input-only.",
+          "$ref": "#/$defs/CalibrationOutput"
+        },
+        "sample_start": {
+          "description": "First canonical sample ordinal, retained across replay/shards.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "tensor": {
+          "description": "Exact original interpretation, not fitted weights.",
+          "$ref": "#/$defs/QuantSourceTensor"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "tensor",
+        "model",
+        "consumer",
+        "output",
+        "sample_start",
+        "limits"
+      ]
+    },
+    "CalibrationConsumer": {
+      "description": "Consumer whose original-source values are being calibrated.",
+      "oneOf": [
+        {
+          "description": "Raw original-input activations of a linear projection.",
+          "type": "string",
+          "const": "Matmul"
+        },
+        {
+          "description": "Gather with the explicitly declared hidden-space identity approximation.\nRequires indexed output factors; does not materialize vocabulary one-hots.",
+          "type": "string",
+          "const": "GatherIdentity"
+        }
+      ]
+    },
+    "CalibrationOutput": {
+      "description": "Declared output factor encoding; no gradients are inferred from activations.",
+      "oneOf": [
+        {
+          "description": "Input Gram only, without a Fisher claim.",
+          "type": "string",
+          "const": "None"
+        },
+        {
+          "description": "One dense output-gradient vector per sample.",
+          "type": "string",
+          "const": "DenseFisher"
+        },
+        {
+          "description": "One named output-row factor per sample, zeros in other rows.",
+          "type": "string",
+          "const": "IndexedFisher"
+        }
+      ]
+    },
+    "CalibrationSource": {
+      "description": "Declared identities of the already finalized calibration source/cache.\nThe collector binds them; cache/source producers must independently verify them.",
+      "type": "object",
+      "properties": {
+        "cache": {
+          "description": "Finalized activation/gradient cache manifest and content identity.",
+          "$ref": "#/$defs/FitInputDigest"
+        },
+        "model": {
+          "description": "Original source content identity, not a fitted model/package identity.",
+          "$ref": "#/$defs/FitInputDigest"
+        },
+        "tokens": {
+          "description": "Ordered token stream and tokenizer provenance identity.",
+          "$ref": "#/$defs/FitInputDigest"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "model",
+        "cache",
+        "tokens"
+      ]
+    },
+    "FitInputDigest": {
+      "description": "Exact original fitting input bits under a named candidate digest domain.\nNot a stored blob, package, HF identity or calibration dataset identity.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "OriginalSourceId": {
+      "description": "Candidate identity of original named tensor/asset content, not fitted content or provenance.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "QuantSourceTensor": {
+      "description": "Original tensor interpretation, never an adapter-supplied content hash.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Exact logical tensor name.",
+          "type": "string"
+        },
+        "precision": {
+          "description": "Original stored float precision, before widening or fitting.",
+          "$ref": "#/$defs/ScalePrecision"
+        },
+        "shape": {
+          "description": "Positive row-major dimensions in the original source.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "shape",
+        "precision"
+      ]
+    },
+    "ScalePrecision": {
+      "description": "Precision used to store additive plane scales.",
+      "oneOf": [
+        {
+          "description": "IEEE binary16.",
+          "type": "string",
+          "const": "F16"
+        },
+        {
+          "description": "Brain floating-point 16-bit.",
+          "type": "string",
+          "const": "Bf16"
+        },
+        {
+          "description": "IEEE binary32.",
+          "type": "string",
+          "const": "F32"
+        }
+      ]
+    }
+  }
+}

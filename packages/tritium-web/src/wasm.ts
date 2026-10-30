@@ -14,10 +14,7 @@ import { WASM_GUEST_DIGEST_V1 } from "../.generated/wasm_identity.ts";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 
-import {
-  TRAINING_MANIFEST_DIGEST_V2,
-  TRAINING_VECTOR_DIGEST_V2,
-} from "./identity.ts";
+import { TRAINING_MANIFEST_DIGEST_V2, TRAINING_VECTOR_DIGEST_V2 } from "./identity.ts";
 import type {
   PortableBufferV1,
   PortableExecutionV1,
@@ -62,7 +59,7 @@ export async function snapshotPortableWasmSource(
   if (source instanceof ArrayBuffer) return new Uint8Array(source.slice(0));
   if (source instanceof URL && source.protocol === "file:") {
     const moduleName = "node:fs/promises";
-    const fileSystem = await import(moduleName) as { readFile(url: URL): Promise<Uint8Array> };
+    const fileSystem = (await import(moduleName)) as { readFile(url: URL): Promise<Uint8Array> };
     return Uint8Array.from(await fileSystem.readFile(source));
   }
   const response = await fetch(source);
@@ -140,22 +137,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function hasExactKeys(
-  value: Record<string, unknown>,
-  expected: readonly string[],
-): boolean {
+function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
   const actual = Object.keys(value).sort();
   const wanted = [...expected].sort();
-  return (
-    actual.length === wanted.length &&
-    actual.every((key, index) => key === wanted[index])
-  );
+  return actual.length === wanted.length && actual.every((key, index) => key === wanted[index]);
 }
 
-function isDenseNumericArray(
-  value: unknown,
-  maximum: number,
-): value is number[] {
+function isDenseNumericArray(value: unknown, maximum: number): value is number[] {
   if (!Array.isArray(value)) return false;
   for (let index = 0; index < value.length; index += 1) {
     const item = value[index];
@@ -210,34 +198,23 @@ function validOutputBuffer(value: unknown, expected: PortableBufferV1): boolean 
   );
 }
 
-function sameNumericArray(
-  value: readonly number[],
-  expected: readonly number[],
-): boolean {
-  return (
-    value.length === expected.length &&
-    value.every((item, index) => item === expected[index])
-  );
+function sameNumericArray(value: readonly number[], expected: readonly number[]): boolean {
+  return value.length === expected.length && value.every((item, index) => item === expected[index]);
 }
 
 function outputValuesMatch(value: unknown, expected: PortableBufferV1): boolean {
   if (!isRecord(value) || !isRecord(value.data)) return false;
   if (value.data.dtype === "f32" && expected.data.dtype === "f32") {
-    return (
-      Array.isArray(value.data.bits) &&
-      sameNumericArray(value.data.bits, expected.data.bits)
-    );
+    return Array.isArray(value.data.bits) && sameNumericArray(value.data.bits, expected.data.bits);
   }
   if (value.data.dtype === "u32" && expected.data.dtype === "u32") {
     return (
-      Array.isArray(value.data.values) &&
-      sameNumericArray(value.data.values, expected.data.values)
+      Array.isArray(value.data.values) && sameNumericArray(value.data.values, expected.data.values)
     );
   }
   if (value.data.dtype === "bytes" && expected.data.dtype === "bytes") {
     return (
-      Array.isArray(value.data.values) &&
-      sameNumericArray(value.data.values, expected.data.values)
+      Array.isArray(value.data.values) && sameNumericArray(value.data.values, expected.data.values)
     );
   }
   return false;
@@ -352,9 +329,7 @@ function outputDigest(outputs: readonly PortableBufferV1[]): string {
 }
 
 function expectedReceiptDtype(execution: PortableExecutionV1): "f32" | "bytes" {
-  return ["checkpoint", "resume", "export", "reload"].includes(execution)
-    ? "bytes"
-    : "f32";
+  return ["checkpoint", "resume", "export", "reload"].includes(execution) ? "bytes" : "f32";
 }
 
 function validateResponse(
@@ -385,9 +360,7 @@ function validateResponse(
   }
   if (value.status === "ok") {
     const expectedInputDigest = requestDigest(request);
-    const expectedOutputDigest = outputDigest(
-      value.outputs as PortableBufferV1[],
-    );
+    const expectedOutputDigest = outputDigest(value.outputs as PortableBufferV1[]);
     if (
       !isRecord(value.receipt) ||
       !hasExactKeys(value.receipt, [
@@ -430,8 +403,7 @@ function validateResponse(
       !Number.isSafeInteger(value.receipt.scratchBytes) ||
       value.receipt.scratchBytes < 0 ||
       value.receipt.scratchBytes > 128 * 1024 * 1024 ||
-      value.receipt.peakResidentBytes + value.receipt.scratchBytes >
-        MAX_LINEAR_MEMORY_BYTES ||
+      value.receipt.peakResidentBytes + value.receipt.scratchBytes > MAX_LINEAR_MEMORY_BYTES ||
       value.receipt.inputDigest !== expectedInputDigest ||
       value.receipt.outputDigest !== expectedOutputDigest
     ) {
@@ -510,17 +482,10 @@ function admitPortableRequest(
     if (requestJson === undefined) throw new Error("undefined JSON result");
     requestSnapshot = JSON.parse(requestJson) as PortableTrainingRequestV1;
   } catch {
-    return localError(
-      "invalid_json",
-      "portable WASM request is not JSON serializable",
-    );
+    return localError("invalid_json", "portable WASM request is not JSON serializable");
   }
   if (UTF8.encode(requestJson).byteLength > MAX_REQUEST_JSON_BYTES) {
-    return localError(
-      "request_bytes",
-      "portable WASM request JSON exceeds 8 MiB",
-      "capacity",
-    );
+    return localError("request_bytes", "portable WASM request JSON exceeds 8 MiB", "capacity");
   }
   return Object.freeze({ requestJson, requestSnapshot });
 }
@@ -547,17 +512,12 @@ async function executeInitializedRequest(
   backendBuild: string,
 ): Promise<PortableTrainingResponseV1> {
   const admitted = admitPortableRequest(request);
-  return "status" in admitted
-    ? admitted
-    : executeAdmittedRequest(admitted, backendBuild);
+  return "status" in admitted ? admitted : executeAdmittedRequest(admitted, backendBuild);
 }
 
 /** Snapshot, admit, and initialize one guest for repeated request execution. */
 export async function preparePortableWasmExecutor(
-  source: PortableWasmSourceV1 = new URL(
-    "./tritium_wasm_bg.wasm",
-    import.meta.url,
-  ),
+  source: PortableWasmSourceV1 = new URL("./tritium_wasm_bg.wasm", import.meta.url),
 ): Promise<PreparedPortableWasmExecutor> {
   const buildId = await initializeGuest(source);
   return Object.freeze({
@@ -579,10 +539,7 @@ export async function preparePortableWasmExecutor(
 /** Execute one strict request through Rust-owned WASM semantics. */
 export async function executePortableWasmRequest(
   request: PortableTrainingRequestV1,
-  source: PortableWasmSourceV1 = new URL(
-    "./tritium_wasm_bg.wasm",
-    import.meta.url,
-  ),
+  source: PortableWasmSourceV1 = new URL("./tritium_wasm_bg.wasm", import.meta.url),
 ): Promise<PortableTrainingResponseV1> {
   const admitted = admitPortableRequest(request);
   if ("status" in admitted) return admitted;
@@ -600,10 +557,7 @@ export async function executePortableWasmRequest(
 
 /** Execute the complete canonical vector corpus twice inside the bundled guest. */
 export async function runPortableWasmConformance(
-  source: PortableWasmSourceV1 = new URL(
-    "./tritium_wasm_bg.wasm",
-    import.meta.url,
-  ),
+  source: PortableWasmSourceV1 = new URL("./tritium_wasm_bg.wasm", import.meta.url),
 ): Promise<PortableWasmConformanceReceiptV1> {
   const buildId = await initializeGuest(source);
   let firstExecutionDigest: string;

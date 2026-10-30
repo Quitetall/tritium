@@ -1,18 +1,20 @@
 import assert from "node:assert/strict";
-import { resolve } from "node:path";
+import { execFileSync } from "node:child_process";
+import { dirname, resolve } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   canonicalSourceIdentity,
   resolveCargoTargetDirectory,
+  resolveEffectiveCargoTargetDirectory,
 } from "../scripts/build-wasm.mjs";
+
+const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
 test("WASM build reads guest from Cargo's effective target directory", () => {
   const repository = resolve("/tmp", "tritium-target-fixture");
-  assert.equal(
-    resolveCargoTargetDirectory({}, repository),
-    resolve(repository, "target"),
-  );
+  assert.equal(resolveCargoTargetDirectory({}, repository), resolve(repository, "target"));
   assert.equal(
     resolveCargoTargetDirectory({ CARGO_TARGET_DIR: "build/cargo" }, repository),
     resolve(repository, "build/cargo"),
@@ -27,17 +29,27 @@ test("WASM build reads guest from Cargo's effective target directory", () => {
   );
 });
 
-test("WASM build binds current clean Git identity", () => {
-  assert.equal(
-    canonicalSourceIdentity("a".repeat(40), ""),
-    `source-git:${"a".repeat(40)}`,
+test("effective WASM target directory honors Cargo configuration", async () => {
+  const environment = { ...process.env };
+  delete environment.CARGO_TARGET_DIR;
+  const metadata = JSON.parse(
+    execFileSync("cargo", ["metadata", "--no-deps", "--format-version", "1"], {
+      cwd: repositoryRoot,
+      env: environment,
+      encoding: "utf8",
+    }),
   );
+  assert.equal(
+    await resolveEffectiveCargoTargetDirectory(environment, repositoryRoot),
+    resolve(metadata.target_directory),
+  );
+});
+
+test("WASM build binds current clean Git identity", () => {
+  assert.equal(canonicalSourceIdentity("a".repeat(40), ""), `source-git:${"a".repeat(40)}`);
   assert.throws(
     () => canonicalSourceIdentity("a".repeat(40), " M packages/tritium-web/src/index.ts"),
     /clean Git worktree/,
   );
-  assert.throws(
-    () => canonicalSourceIdentity("not-a-revision", ""),
-    /full lowercase object ID/,
-  );
+  assert.throws(() => canonicalSourceIdentity("not-a-revision", ""), /full lowercase object ID/);
 });

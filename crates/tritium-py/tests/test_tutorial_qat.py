@@ -3,6 +3,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+import tritium
 
 from tritium.torch.tutorial_qat import (
     run_installed_qat_tutorial,
@@ -21,6 +24,13 @@ class InstalledQatTutorialReceiptTests(unittest.TestCase):
         wheel = root / "pytritium-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
         wheel.write_bytes(b"exact candidate wheel")
         output = root / "tutorial"
+        # Synthetic portable-tree tests are not installed-wheel qualification.
+        guard = patch(
+            "tritium.torch.tutorial_qat._installed_distribution",
+            return_value=("1.1.0rc0", Path(tritium.__file__).resolve()),
+        )
+        guard.start()
+        self.addCleanup(guard.stop)
         receipt = run_installed_qat_tutorial(
             output,
             device_name="cpu",

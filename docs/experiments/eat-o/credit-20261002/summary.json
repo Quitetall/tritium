@@ -1,0 +1,35 @@
+{
+  "methods": {
+    "backprop": {
+      "accuracy_percent": 73.3,
+      "accuracy_sd_pp": 4.896267711226584,
+      "mean_loss": 41007.3663,
+      "mean_work": 3204736267.4,
+      "mean_state_bytes": 1031008,
+      "mean_growth": 792.8,
+      "mean_rescalings": 0,
+      "mean_reversals": 93620.4,
+      "loss_difference_vs_backprop": 0.0,
+      "paired_t_95_ci": [
+        0.0,
+        0.0
+      ]
+    },
+    "probe": {
+      "accuracy_percent": 66.48,
+      "accuracy_sd_pp": 1.5945610681312892,
+      "mean_loss": 46447.41015,
+      "mean_work": 3218155488,
+      "mean_state_bytes": 1031174.4,
+      "mean_growth": 756.8,
+      "mean_rescalings": 0,
+      "mean_reversals": 43090.4,
+      "loss_difference_vs_backprop": 5440.04385,
+      "paired_t_95_ci": [
+        2180.128811998669,
+        8699.95888800133
+      ]
+    }
+  },
+  "advance_to_language_model": false
+}

@@ -13,13 +13,13 @@ categories.workspace = true
 
 [dependencies]
 tritium-spec = { workspace = true }
-linkme = { workspace = true }
-
-[dev-dependencies]
-# Used by the doctest example and the in-crate dummy backend tests to spell out
-# `GemmShape` / `TernaryFormat`. Not a runtime dependency: the registry itself
-# only speaks the `tritium-spec` contract.
+tritium-evidence = { workspace = true }
 tritium-core = { workspace = true }
+tritium-format = { workspace = true }
+tritium-schema = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+linkme = { workspace = true }
 
 [lints]
 workspace = true

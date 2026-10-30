@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OriginalSalienceCaptureProfile",
+  "description": "Fixed ordered legacy reducer; no loss, backward, weighting or averaging.",
+  "oneOf": [
+    {
+      "description": "Every input token, f32 activation widened to f64, ordered per-channel x*x sums.",
+      "type": "string",
+      "const": "AllTokenF64SecondMomentV1"
+    }
+  ]
+}

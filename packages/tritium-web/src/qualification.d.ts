@@ -9,10 +9,8 @@ import type {
 export interface WebGpuVectorConformanceInventoryV1 {
   readonly schemaId: "tritium.webgpu_vector_conformance_inventory";
   readonly schemaVersion: 1;
-  readonly manifestDigest:
-    "9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098";
-  readonly vectorDigest:
-    "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7";
+  readonly manifestDigest: "9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098";
+  readonly vectorDigest: "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7";
   readonly caseCounts: Readonly<{
     valid: 72;
     invalid: 45;
@@ -54,8 +52,7 @@ export interface WebGpuVectorConformanceOptionsV1 {
   readonly physicalDevice?: string;
 }
 
-export declare function webGpuVectorConformanceInventoryV1():
-  WebGpuVectorConformanceInventoryV1;
+export declare function webGpuVectorConformanceInventoryV1(): WebGpuVectorConformanceInventoryV1;
 
 /** Takes exclusive ownership of device and destroys it on success or failure. */
 export declare function runWebGpuVectorConformanceV1(
@@ -169,8 +166,7 @@ export interface PhysicalBrowserTrainingLaneOptionsV1 {
   readonly maxPeakBytes?: number;
 }
 
-export declare function physicalBrowserTrainingScenarioV1():
-  PhysicalBrowserTrainingScenarioV1;
+export declare function physicalBrowserTrainingScenarioV1(): PhysicalBrowserTrainingScenarioV1;
 
 /** Acquires and destroys every physical WebGPU device used by the lane. */
 export declare function runPhysicalBrowserTrainingLaneV1(

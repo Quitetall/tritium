@@ -30,7 +30,16 @@ class InstalledQatTutorialTests(unittest.TestCase):
         assert match is not None
         end = start + 3 + match.start()
         job = workflow[start:end]
-        self.assertIn("container: python:3.13-slim", job)
+        # A moving Docker Hub tag can fail before qualification starts due to
+        # anonymous shared-runner pull quotas. Admit the exact official Linux
+        # amd64 slim image through its public mirror, never a tag-only fallback.
+        self.assertIn(
+            "container: public.ecr.aws/docker/library/python@sha256:"
+            "8fb4cfa1a2616d7b8e0c2175cc6ad68f5729c34ea8488c0b360d2934b7be9024",
+            job,
+        )
+        self.assertNotIn("container: python:", job)
+        self.assertNotIn("container: public.ecr.aws/docker/library/python:", job)
         self.assertNotIn("actions/checkout", job)
         self.assertIn('test ! -e "$GITHUB_WORKSPACE/.git"', job)
         self.assertIn(
@@ -57,8 +66,14 @@ class InstalledQatTutorialTests(unittest.TestCase):
         self.assertIn("tritium.installed-qat-tutorial.v3", receipt_source)
         self.assertIn("--wheel-artifact", source)
         self.assertIn("--source-revision", source)
-        self.assertIn('distribution("pytritium")', source)
-        self.assertIn("not owned by pytritium", source)
+        self.assertIn("verify_installed_candidate", source)
+        candidate_source = (
+            ROOT / "crates/tritium-py/python/tritium/torch/_installed_candidate.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('distribution("pytritium")', candidate_source)
+        self.assertIn("not owned by pytritium", candidate_source)
+        self.assertNotIn("import transformers", candidate_source)
+        self.assertIn("test_tutorial_candidate_provenance.py", (ROOT / ".github/workflows/wheels.yml").read_text())
         self.assertIn("export_qat_hard", source)
         self.assertIn("load_qat_hard", source)
         wrapper = TUTORIAL.read_text(encoding="utf-8")

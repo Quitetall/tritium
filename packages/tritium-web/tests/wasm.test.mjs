@@ -42,15 +42,10 @@ const sgdRequest = {
 };
 
 test("bundled wasm32-unknown guest passes the complete corpus twice", async () => {
-  const guest = await readFile(
-    new URL("../dist/tritium_wasm_bg.wasm", import.meta.url),
-  );
+  const guest = await readFile(new URL("../dist/tritium_wasm_bg.wasm", import.meta.url));
   const corrupted = Uint8Array.from(guest);
   corrupted[corrupted.length - 1] ^= 1;
-  await assert.rejects(
-    runPortableWasmConformance(corrupted),
-    /guest digest mismatch/,
-  );
+  await assert.rejects(runPortableWasmConformance(corrupted), /guest digest mismatch/);
   const receipt = await runPortableWasmConformance(guest);
   const packageMetadata = JSON.parse(
     await readFile(new URL("../package.json", import.meta.url), "utf8"),
@@ -71,10 +66,7 @@ test("bundled wasm32-unknown guest passes the complete corpus twice", async () =
     maxLinearMemoryBytes: 192 * 1024 * 1024,
     repeatedExecutions: 2,
   });
-  assert.equal(
-    receipt.buildId.split("+")[0],
-    `tritium-wasm@${packageMetadata.version}`,
-  );
+  assert.equal(receipt.buildId.split("+")[0], `tritium-wasm@${packageMetadata.version}`);
   assert.match(receipt.buildId, /\+source-git:[0-9a-f]{40}(?:\+dirty-blake3:[0-9a-f]{64})?$/);
   assert.match(receipt.guestDigest, /^[0-9a-f]{64}$/);
   assert.match(receipt.executionDigest, /^[0-9a-f]{64}$/);
@@ -82,9 +74,7 @@ test("bundled wasm32-unknown guest passes the complete corpus twice", async () =
 });
 
 test("bundled guest executes strict portable requests", async () => {
-  const guest = await readFile(
-    new URL("../dist/tritium_wasm_bg.wasm", import.meta.url),
-  );
+  const guest = await readFile(new URL("../dist/tritium_wasm_bg.wasm", import.meta.url));
   const response = await executePortableWasmRequest(sgdRequest, guest);
   assert.equal(response.status, "ok");
   assert.deepEqual(response.outputs[0].data.bits, [1064514355, 3221015757]);

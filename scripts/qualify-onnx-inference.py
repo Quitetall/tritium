@@ -33,13 +33,11 @@ class QualificationError(ValueError):
     """Whole-model ONNX execution cannot satisfy frozen admission."""
 
 
+_run_git = runpy.run_path(Path(__file__).with_name("_qualification_git.py"))["run_git"]
+
+
 def git_output(repo: Path, *args: str) -> str:
-    result = subprocess.run(
-        ["git", *args], cwd=repo, text=True, capture_output=True, check=False
-    )
-    if result.returncode != 0:
-        raise QualificationError(result.stderr.strip() or "git command failed")
-    return result.stdout.strip()
+    return _run_git(repo, *args, error_type=QualificationError)
 
 
 def require_clean_revision(repo: Path, revision: str) -> None:
@@ -85,7 +83,18 @@ def ordinary(path: Path, label: str) -> Path:
 def directory(path: Path, label: str) -> Path:
     if path.is_symlink() or not path.is_dir():
         raise QualificationError(f"{label} must be an ordinary directory")
-    return path.resolve(strict=True)
+    # Preserve parent symlinks for the installed worker's no-follow traversal.
+    return Path(os.path.abspath(path))
+
+
+def candidate_archive(candidate: Path, artifact_id: str) -> Path:
+    document = json.loads(candidate.read_bytes())
+    for value in document["artifacts"]:
+        if value["id"] == artifact_id:
+            return VERIFIER["contained"](
+                candidate.parent, value["path"], "candidate bundle archive"
+            )
+    raise QualificationError("candidate bundle archive is absent")
 
 
 def executable(path: Path, label: str) -> Path:
@@ -178,6 +187,10 @@ def run_installed_worker(
             str(onnx_bundle),
             "--native-bundle",
             str(native_bundle),
+            "--onnx-archive",
+            str(candidate_archive(candidate, onnx_artifact_id)),
+            "--native-archive",
+            str(candidate_archive(candidate, model_artifact_id)),
             "--profile",
             profile,
             "--conversion-mode",

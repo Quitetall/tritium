@@ -24,9 +24,7 @@ const state = {
 };
 
 test("typed lifecycle compiler checkpoint/resume round-trips exact state", async () => {
-  const guest = await readFile(
-    new URL("../dist/tritium_wasm_bg.wasm", import.meta.url),
-  );
+  const guest = await readFile(new URL("../dist/tritium_wasm_bg.wasm", import.meta.url));
   const checkpointRequest = compilePortableCheckpointRequest(state, "node:lifecycle");
   assert.equal(checkpointRequest.outputs[0].data.values.length, 49);
   const checkpoint = await executePortableWasmRequest(checkpointRequest, guest);
@@ -34,12 +32,7 @@ test("typed lifecycle compiler checkpoint/resume round-trips exact state", async
   assert.equal(checkpoint.receipt.operation, "lifecycle.checkpoint");
 
   const bytes = Uint8Array.from(checkpoint.outputs[0].data.values);
-  const resumeRequest = compilePortableResumeRequest(
-    "adamw",
-    [2],
-    bytes,
-    "node:lifecycle",
-  );
+  const resumeRequest = compilePortableResumeRequest("adamw", [2], bytes, "node:lifecycle");
   const resumed = await executePortableWasmRequest(resumeRequest, guest);
   assert.equal(resumed.status, "ok");
   assert.deepEqual(resumed.outputs[0].data.values, [7, 0, 0, 0, 0, 0, 0, 0]);
@@ -49,9 +42,7 @@ test("typed lifecycle compiler checkpoint/resume round-trips exact state", async
 });
 
 test("every optimizer checkpoint round-trips exact planes", async () => {
-  const guest = await readFile(
-    new URL("../dist/tritium_wasm_bg.wasm", import.meta.url),
-  );
+  const guest = await readFile(new URL("../dist/tritium_wasm_bg.wasm", import.meta.url));
   const states = [
     { optimizer: "sgd", step: 1, leaves: [{ parameter: [0x3f800000] }] },
     {
@@ -94,29 +85,16 @@ test("every optimizer checkpoint round-trips exact planes", async () => {
     const resumed = await executePortableWasmRequest(resumeRequest, guest);
     assert.equal(resumed.status, "ok", optimizerState.optimizer);
     const stepBytes = new Uint8Array(8);
-    new DataView(stepBytes.buffer).setBigUint64(
-      0,
-      BigInt(optimizerState.step),
-      true,
-    );
+    new DataView(stepBytes.buffer).setBigUint64(0, BigInt(optimizerState.step), true);
     assert.deepEqual(resumed.outputs[0].data.values, [...stepBytes]);
-    assert.deepEqual(
-      resumed.outputs.slice(1),
-      checkpointRequest.inputs,
-      optimizerState.optimizer,
-    );
+    assert.deepEqual(resumed.outputs.slice(1), checkpointRequest.inputs, optimizerState.optimizer);
   }
 });
 
 test("typed lifecycle compiler validates SALT export and reload in Rust", async () => {
-  const guest = await readFile(
-    new URL("../dist/tritium_wasm_bg.wasm", import.meta.url),
-  );
+  const guest = await readFile(new URL("../dist/tritium_wasm_bg.wasm", import.meta.url));
   const vectors = JSON.parse(
-    await readFile(
-      new URL("../../../spec/training/v2/vectors/v2.json", import.meta.url),
-      "utf8",
-    ),
+    await readFile(new URL("../../../spec/training/v2/vectors/v2.json", import.meta.url), "utf8"),
   );
   const exportCase = vectors.cases.find(
     (candidate) => candidate.case_id === "lifecycle.export.salt_v2_package",
@@ -175,12 +153,7 @@ test("typed lifecycle compiler fails before guest allocation", () => {
     },
   );
   assert.throws(
-    () =>
-      compilePortableResumeRequest(
-        "sgd",
-        [2 * 1024 * 1024 + 1],
-        Uint8Array.of(1),
-      ),
+    () => compilePortableResumeRequest("sgd", [2 * 1024 * 1024 + 1], Uint8Array.of(1)),
     (error) => {
       assert.ok(error instanceof PortableLifecyclePlanError);
       assert.equal(error.code, "capacity");
@@ -235,22 +208,18 @@ test("typed lifecycle compiler derives every optimizer layout", () => {
       {
         optimizer: "int8_adamw",
         step: 0,
-        leaves: [{
-          parameter: [0],
-          moment1Q8: [0],
-          moment2Q8: [0],
-          moment1Scale: [0],
-          moment2Scale: [0],
-        }],
+        leaves: [
+          {
+            parameter: [0],
+            moment1Q8: [0],
+            moment2Q8: [0],
+            moment1Scale: [0],
+            moment2Scale: [0],
+          },
+        ],
       },
       39,
-      [
-        "parameter.0",
-        "moment1_q8.0",
-        "moment2_q8.0",
-        "moment1_scale.0",
-        "moment2_scale.0",
-      ],
+      ["parameter.0", "moment1_q8.0", "moment2_q8.0", "moment1_scale.0", "moment2_scale.0"],
     ],
     [
       {
@@ -265,7 +234,10 @@ test("typed lifecycle compiler derives every optimizer layout", () => {
   for (const [fixture, bytes, names] of fixtures) {
     const request = compilePortableCheckpointRequest(fixture);
     assert.equal(request.outputs[0].data.values.length, bytes);
-    assert.deepEqual(request.inputs.map((buffer) => buffer.name), names);
+    assert.deepEqual(
+      request.inputs.map((buffer) => buffer.name),
+      names,
+    );
   }
 
   const mutable = structuredClone(state);

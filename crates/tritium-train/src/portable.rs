@@ -8,8 +8,8 @@ use tritium_format::salt_v2_package::SaltV2PackageReader;
 use tritium_spec::{
     TrainAttributeValueV1, TrainBackendError, TrainBackendV1, TrainBufferDataMutV1,
     TrainBufferDataRefV1, TrainCapabilitiesV1, TrainDTypeV1, TrainExecutionV1, TrainLimitsV1,
-    TrainOperationErrorV1, TrainOutputV1, TrainReceiptV1, TrainRequestV1, TrainingOpManifestV3,
-    train_output_digest_v1, train_request_digest_v1,
+    TrainOperationErrorV1, TrainOutputV1, TrainReceiptV1, TrainRequestV1, TrainingOpManifestV2,
+    TrainingOpManifestV3, train_output_digest_v1, train_request_digest_v1,
 };
 
 use crate::{
@@ -858,6 +858,52 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
             host_transfers: 0,
             device_resident: true,
         })
+    }
+}
+
+/// CPU reference adapter for the frozen V2 portable-training manifest.
+///
+/// This adapter shares the V3 CPU implementation for operations whose V2
+/// semantics are unchanged, while constraining dispatch and receipts to the
+/// exact V2 manifest. It intentionally does not expose V3-only operations.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CpuTrainBackendV2;
+
+impl CpuTrainBackendV2 {
+    /// Construct the stateless V2 CPU reference adapter.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl TrainBackendV1 for CpuTrainBackendV2 {
+    fn capabilities(&self) -> TrainCapabilitiesV1 {
+        let mut capabilities = CpuTrainBackendV1::new().capabilities();
+        capabilities.manifest_digest = TrainingOpManifestV2::digest();
+        capabilities.supported_operations = TrainingOpManifestV2::operations()
+            .iter()
+            .map(|operation| operation.id.to_owned())
+            .collect();
+        capabilities
+    }
+
+    fn execute(
+        &self,
+        request: TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<TrainReceiptV1, TrainBackendError> {
+        if !TrainingOpManifestV2::operations()
+            .iter()
+            .any(|operation| operation.id == request.operation)
+        {
+            return Err(TrainBackendError::UnsupportedOperation(
+                request.operation.to_owned(),
+            ));
+        }
+        let mut receipt = CpuTrainBackendV1::new().execute(request, output)?;
+        receipt.manifest_digest = TrainingOpManifestV2::digest();
+        Ok(receipt)
     }
 }
 

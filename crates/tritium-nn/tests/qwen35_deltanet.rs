@@ -1,5 +1,8 @@
 //! Dense reference conformance for Qwen3.5-family Gated DeltaNet.
 
+#[path = "qwen35_deltanet/resident.rs"]
+mod resident;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tritium_core::Trit;

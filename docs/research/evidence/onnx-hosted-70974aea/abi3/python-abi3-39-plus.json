@@ -1,0 +1,172 @@
+{
+  "schema": "tritium.abi3-matrix-qualification.v1",
+  "target_id": "python-abi3-39-plus",
+  "source_revision": "70974aeaba2924d7d864f5f961dd91e421e97bc7",
+  "release": "1.1.0-rc.2",
+  "run_id": "github-37985901639-1-abi3-matrix",
+  "passed": true,
+  "matrix_schema": "tritium.wheel-smoke.v1",
+  "cells": [
+    {
+      "cell_id": "linux-x86_64-cpu-cp3.10",
+      "path": "linux-x86_64-cpu-cp3.10.json",
+      "sha256": "32aae06a20cc35b433533b0ebbcd333e9464418fd7ecaf2e5208f403d287da8b",
+      "python_version": "3.10.22",
+      "target_id": "linux-x86_64-cpu",
+      "wheel": "pytritium-1.1.0rc2-cp39-abi3-manylinux_2_28_x86_64.whl",
+      "wheel_sha256": "5ec84fcb7c7e03b522e23560871f09368ac084d6cca04be76160a824a5ac3ccc",
+      "wheel_bytes": 10560923
+    },
+    {
+      "cell_id": "linux-x86_64-cpu-cp3.11",
+      "path": "linux-x86_64-cpu-cp3.11.json",
+      "sha256": "05c9c711dcc67063d51cd0d706acddb78a8239492fd2cbad3985a07d8acbb307",
+      "python_version": "3.11.17",
+      "target_id": "linux-x86_64-cpu",
+      "wheel": "pytritium-1.1.0rc2-cp39-abi3-manylinux_2_28_x86_64.whl",
+      "wheel_sha256": "5ec84fcb7c7e03b522e23560871f09368ac084d6cca04be76160a824a5ac3ccc",
+      "wheel_bytes": 10560923
+    },
+    {
+      "cell_id": "linux-x86_64-cpu-cp3.12",
+      "path": "linux-x86_64-cpu-cp3.12.json",
+      "sha256": "fafff949bd4d89959ef3f262954e5e1979cece46efefe535d2a052e03b70e14c",
+      "python_version": "3.12.15",
+      "target_id": "linux-x86_64-cpu",
+      "wheel": "pytritium-1.1.0rc2-cp39-abi3-manylinux_2_28_x86_64.whl",
+      "wheel_sha256": "5ec84fcb7c7e03b522e23560871f09368ac084d6cca04be76160a824a5ac3ccc",
+      "wheel_bytes": 10560923
+    },
+    {
+      "cell_id": "linux-x86_64-cpu-cp3.13",
+      "path": "linux-x86_64-cpu-cp3.13.json",
+      "sha256": "1c4b60ec2c48f1c984f4450b1d85df24c1e9ce2470e015d520de478c06addfef",
+      "python_version": "3.13.16",
+      "target_id": "linux-x86_64-cpu",
+      "wheel": "pytritium-1.1.0rc2-cp39-abi3-manylinux_2_28_x86_64.whl",
+      "wheel_sha256": "5ec84fcb7c7e03b522e23560871f09368ac084d6cca04be76160a824a5ac3ccc",
+      "wheel_bytes": 10560923
+    },
+    {
+      "cell_id": "linux-x86_64-cpu-cp3.14",
+      "path": "linux-x86_64-cpu-cp3.14.json",
+      "sha256": "ffad2bf779e19d40a956bf3ab3e0c72978a1a2af27154817e1b3b24756e3b7b5",
+      "python_version": "3.14.8",
+      "target_id": "linux-x86_64-cpu",
+      "wheel": "pytritium-1.1.0rc2-cp39-abi3-manylinux_2_28_x86_64.whl",
+      "wheel_sha256": "5ec84fcb7c7e03b522e23560871f09368ac084d6cca04be76160a824a5ac3ccc",
+      "wheel_bytes": 10560923
+    },
+    {
+      "cell_id": "linux-x86_64-cpu-cp3.9",
+      "path": "linux-x86_64-cpu-cp3.9.json",
+      "sha256": "dff6f042984edb51ab6d90e71ea86eba171a65a5c5a800baa12010df8f5d5ff1",
+      "python_version": "3.9.25",
+      "target_id": "linux-x86_64-cpu",
+      "wheel": "pytritium-1.1.0rc2-cp39-abi3-manylinux_2_28_x86_64.whl",
+      "wheel_sha256": "5ec84fcb7c7e03b522e23560871f09368ac084d6cca04be76160a824a5ac3ccc",
+      "wheel_bytes": 10560923
+    },
+    {
+      "cell_id": "macos-arm64-cpu-cp3.11",
+      "path": "macos-arm64-cpu-cp3.11.json",
+      "sha256": "35cedc9200da56faace69c7fb2af1f594915b84e8a6ffc1409a39d8ec0bece52",
+      "python_version": "3.11.9",
+      "target_id": "macos-arm64-cpu",
+      "wheel": "pytritium-1.1.0rc2-cp39-abi3-macosx_11_0_arm64.whl",
+      "wheel_sha256": "4534d0834e790af92b974e5ab0313da711ddd225968de6a85ce5120af20bc97a",
+      "wheel_bytes": 9392228
+    },
+    {
+      "cell_id": "macos-arm64-cpu-cp3.12",
+      "path": "macos-arm64-cpu-cp3.12.json",
+      "sha256": "00244f4c4ce64d53e6030c326d18665668081fe0874a35ff4ff65cfb9915fd64",
+      "python_version": "3.12.10",
+      "target_id": "macos-arm64-cpu",
+      "wheel": "pytritium-1.1.0rc2-cp39-abi3-macosx_11_0_arm64.whl",
+      "wheel_sha256": "4534d0834e790af92b974e5ab0313da711ddd225968de6a85ce5120af20bc97a",
+      "wheel_bytes": 9392228
+    },
+    {
+      "cell_id": "macos-arm64-cpu-cp3.13",
+      "path": "macos-arm64-cpu-cp3.13.json",
+      "sha256": "4d22ed8b8b285be6b04cf1fd97fce2942ff5c53fe29b73fedb44d5bcb11c9823",
+      "python_version": "3.13.15",
+      "target_id": "macos-arm64-cpu",
+      "wheel": "pytritium-1.1.0rc2-cp39-abi3-macosx_11_0_arm64.whl",
+      "wheel_sha256": "4534d0834e790af92b974e5ab0313da711ddd225968de6a85ce5120af20bc97a",
+      "wheel_bytes": 9392228
+    },
+    {
+      "cell_id": "macos-arm64-cpu-cp3.14",
+      "path": "macos-arm64-cpu-cp3.14.json",
+      "sha256": "e06ea16b08f4ca5fe0c8b120f61480d7f308f84710cdc727462eb839d554bcc2",
+      "python_version": "3.14.7",
+      "target_id": "macos-arm64-cpu",
+      "wheel": "pytritium-1.1.0rc2-cp39-abi3-macosx_11_0_arm64.whl",
+      "wheel_sha256": "4534d0834e790af92b974e5ab0313da711ddd225968de6a85ce5120af20bc97a",
+      "wheel_bytes": 9392228
+    },
+    {
+      "cell_id": "windows-x86_64-cpu-cp3.10",
+      "path": "windows-x86_64-cpu-cp3.10.json",
+      "sha256": "fbda5c3a04950642de78066dcfa40d9065fd85a8d03ff0de2a1b38078db4e93a",
+      "python_version": "3.10.11",
+      "target_id": "windows-x86_64-cpu",
+      "wheel": "pytritium-1.1.0rc2-cp39-abi3-win_amd64.whl",
+      "wheel_sha256": "29be73aa804cacdbfa087c8fa4f5ef3928f84dc8d7ad421e3513c6ebfeb67eff",
+      "wheel_bytes": 8311853
+    },
+    {
+      "cell_id": "windows-x86_64-cpu-cp3.11",
+      "path": "windows-x86_64-cpu-cp3.11.json",
+      "sha256": "c8d878aaf87e82a0261e600e59fd9ff62039b0eae8f570a4e0c850586d4f6b89",
+      "python_version": "3.11.9",
+      "target_id": "windows-x86_64-cpu",
+      "wheel": "pytritium-1.1.0rc2-cp39-abi3-win_amd64.whl",
+      "wheel_sha256": "29be73aa804cacdbfa087c8fa4f5ef3928f84dc8d7ad421e3513c6ebfeb67eff",
+      "wheel_bytes": 8311853
+    },
+    {
+      "cell_id": "windows-x86_64-cpu-cp3.12",
+      "path": "windows-x86_64-cpu-cp3.12.json",
+      "sha256": "9a998beb1ca88f41d930967a9450edc0eda43b3de463bc73de07740d92c5d77a",
+      "python_version": "3.12.10",
+      "target_id": "windows-x86_64-cpu",
+      "wheel": "pytritium-1.1.0rc2-cp39-abi3-win_amd64.whl",
+      "wheel_sha256": "29be73aa804cacdbfa087c8fa4f5ef3928f84dc8d7ad421e3513c6ebfeb67eff",
+      "wheel_bytes": 8311853
+    },
+    {
+      "cell_id": "windows-x86_64-cpu-cp3.13",
+      "path": "windows-x86_64-cpu-cp3.13.json",
+      "sha256": "e348fdc0cccdb688f370de12d9dc874daa8a4e11e798f82723db568a45d1616d",
+      "python_version": "3.13.15",
+      "target_id": "windows-x86_64-cpu",
+      "wheel": "pytritium-1.1.0rc2-cp39-abi3-win_amd64.whl",
+      "wheel_sha256": "29be73aa804cacdbfa087c8fa4f5ef3928f84dc8d7ad421e3513c6ebfeb67eff",
+      "wheel_bytes": 8311853
+    },
+    {
+      "cell_id": "windows-x86_64-cpu-cp3.14",
+      "path": "windows-x86_64-cpu-cp3.14.json",
+      "sha256": "c272700af7073c97a69f66903326a8d637241d2c62d22c9f8d4e99a2569c060a",
+      "python_version": "3.14.7",
+      "target_id": "windows-x86_64-cpu",
+      "wheel": "pytritium-1.1.0rc2-cp39-abi3-win_amd64.whl",
+      "wheel_sha256": "29be73aa804cacdbfa087c8fa4f5ef3928f84dc8d7ad421e3513c6ebfeb67eff",
+      "wheel_bytes": 8311853
+    },
+    {
+      "cell_id": "windows-x86_64-cpu-cp3.9",
+      "path": "windows-x86_64-cpu-cp3.9.json",
+      "sha256": "57239257930712646414301bca15f78cf170cb4cc567f73d7b8c4dee473a50f8",
+      "python_version": "3.9.13",
+      "target_id": "windows-x86_64-cpu",
+      "wheel": "pytritium-1.1.0rc2-cp39-abi3-win_amd64.whl",
+      "wheel_sha256": "29be73aa804cacdbfa087c8fa4f5ef3928f84dc8d7ad421e3513c6ebfeb67eff",
+      "wheel_bytes": 8311853
+    }
+  ],
+  "receipt_id": "sha256:a5a6ce73e0a8e15e325bff0a3984b1bbcd79435d6730ded5e6b8c1d75e4ce6ef"
+}

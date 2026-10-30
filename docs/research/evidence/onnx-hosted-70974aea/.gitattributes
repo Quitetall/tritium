@@ -1,0 +1,3 @@
+# Preserve the original bytes of hosted receipts, including Windows CRLF.
+*.json -text
+abi3/windows*.json whitespace=cr-at-eol

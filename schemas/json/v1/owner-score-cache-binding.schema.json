@@ -1,0 +1,387 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OwnerScoreCacheBinding",
+  "description": "Actual immutable identity/counts; recomputed by the reader.",
+  "type": "object",
+  "properties": {
+    "cache": {
+      "description": "Derived actual content identity.",
+      "$ref": "#/$defs/OwnerScoreCacheId"
+    },
+    "content": {
+      "description": "Complete logical content preimage.",
+      "$ref": "#/$defs/OwnerScoreCacheContent"
+    },
+    "context_bytes": {
+      "description": "Derived context bytes.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "payload_bytes": {
+      "description": "Derived total payload bytes.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "samples": {
+      "description": "Derived sum of invocation samples.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "content",
+    "cache",
+    "payload_bytes",
+    "context_bytes",
+    "samples"
+  ],
+  "$defs": {
+    "BlobId": {
+      "description": "Content identity for stored tensor or asset bytes.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "OriginalSourceId": {
+      "description": "Candidate identity of original named tensor/asset content, not fitted content or provenance.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "OwnerContextBinding": {
+      "description": "Actual context-byte binding.",
+      "type": "object",
+      "properties": {
+        "content": {
+          "description": "Exact logical-value byte digest.",
+          "$ref": "#/$defs/BlobId"
+        },
+        "meta": {
+          "description": "Original context interpretation.",
+          "$ref": "#/$defs/OwnerContextMeta"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "meta",
+        "content"
+      ]
+    },
+    "OwnerContextDtype": {
+      "description": "Context scalar interpretation; payload bytes are contiguous logical values.",
+      "oneOf": [
+        {
+          "description": "IEEE binary16.",
+          "type": "string",
+          "const": "F16"
+        },
+        {
+          "description": "Brain float16.",
+          "type": "string",
+          "const": "Bf16"
+        },
+        {
+          "description": "IEEE binary32.",
+          "type": "string",
+          "const": "F32"
+        },
+        {
+          "description": "IEEE binary64.",
+          "type": "string",
+          "const": "F64"
+        },
+        {
+          "description": "Signed 8-bit integer.",
+          "type": "string",
+          "const": "I8"
+        },
+        {
+          "description": "Signed 16-bit integer.",
+          "type": "string",
+          "const": "I16"
+        },
+        {
+          "description": "Signed 32-bit integer.",
+          "type": "string",
+          "const": "I32"
+        },
+        {
+          "description": "Signed 64-bit integer.",
+          "type": "string",
+          "const": "I64"
+        },
+        {
+          "description": "Unsigned 8-bit integer.",
+          "type": "string",
+          "const": "U8"
+        },
+        {
+          "description": "Boolean bytes, exactly 0/1.",
+          "type": "string",
+          "const": "Bool"
+        },
+        {
+          "description": "Complex pair of binary32 components.",
+          "type": "string",
+          "const": "C64"
+        },
+        {
+          "description": "Complex pair of binary64 components.",
+          "type": "string",
+          "const": "C128"
+        }
+      ]
+    },
+    "OwnerContextMeta": {
+      "description": "Declared logical tensor context, not proof that a callback used it.",
+      "type": "object",
+      "properties": {
+        "conjugated": {
+          "description": "Original conjugate-view flag; stored values are resolved.",
+          "type": "boolean"
+        },
+        "dtype": {
+          "description": "Exact original scalar dtype.",
+          "$ref": "#/$defs/OwnerContextDtype"
+        },
+        "name": {
+          "description": "Unique nonempty context key.",
+          "type": "string"
+        },
+        "negated": {
+          "description": "Original negative-view flag; stored values are resolved.",
+          "type": "boolean"
+        },
+        "shape": {
+          "description": "Original logical dimensions; scalar rank zero is allowed.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "dtype",
+        "shape",
+        "conjugated",
+        "negated"
+      ]
+    },
+    "OwnerInvocationBinding": {
+      "description": "Actual invocation input/adjoint binding.",
+      "type": "object",
+      "properties": {
+        "adjoint": {
+          "description": "Exact f32 output-adjoint byte digest.",
+          "$ref": "#/$defs/BlobId"
+        },
+        "input": {
+          "description": "Exact f32 input or i64 index byte digest.",
+          "$ref": "#/$defs/BlobId"
+        },
+        "meta": {
+          "description": "Declared invocation interpretation.",
+          "$ref": "#/$defs/OwnerInvocationMeta"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "meta",
+        "input",
+        "adjoint"
+      ]
+    },
+    "OwnerInvocationMeta": {
+      "description": "One declared actual invocation; bytes/coverage are verified separately.",
+      "type": "object",
+      "properties": {
+        "ordinal": {
+          "description": "Global operator-entry ordinal, not renumbered per owner.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "paths": {
+          "description": "Sorted unique alias paths of one actual module; root path may be empty.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "role": {
+          "description": "Actual ordinary operation.",
+          "$ref": "#/$defs/OwnerScoreRole"
+        },
+        "samples": {
+          "description": "Positive flattened invocation sample count.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ordinal",
+        "paths",
+        "role",
+        "samples"
+      ]
+    },
+    "OwnerScoreCacheContent": {
+      "description": "Logical identity preimage; excludes physical package layout and ceilings.",
+      "type": "object",
+      "properties": {
+        "context": {
+          "description": "Sorted exact context descriptors and content.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/OwnerContextBinding"
+          }
+        },
+        "estimator": {
+          "description": "Explicit scalar-window unit; no Fisher/GGN fallback.",
+          "$ref": "#/$defs/OwnerScoreEstimator"
+        },
+        "invocations": {
+          "description": "Ordered exact invocation descriptors and numerical content.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/OwnerInvocationBinding"
+          }
+        },
+        "objective": {
+          "description": "Actual declared objective bytes, not independent execution proof.",
+          "$ref": "#/$defs/BlobId"
+        },
+        "source": {
+          "description": "Original complete source, not fitted model/package identity.",
+          "$ref": "#/$defs/OriginalSourceId"
+        },
+        "tensor": {
+          "description": "Exact original matrix interpretation.",
+          "$ref": "#/$defs/QuantSourceTensor"
+        },
+        "tokenizer": {
+          "description": "Actual tokenizer bytes.",
+          "$ref": "#/$defs/BlobId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "tensor",
+        "estimator",
+        "tokenizer",
+        "objective",
+        "context",
+        "invocations"
+      ]
+    },
+    "OwnerScoreCacheId": {
+      "description": "Candidate identity of one scalar-window owner snapshot, not a fit or qualification.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "OwnerScoreEstimator": {
+      "description": "Estimator unit; no Fisher/GGN interpretation is inferred from scalar adjoints.",
+      "oneOf": [
+        {
+          "description": "One declared scalar objective's complete owner-row gradient.",
+          "type": "string",
+          "const": "ScalarWindowGradient"
+        }
+      ]
+    },
+    "OwnerScoreRole": {
+      "description": "Ordinary owner operation, in canonical source coordinates.",
+      "oneOf": [
+        {
+          "description": "`z = x W^T`, without omitted source uses.",
+          "type": "string",
+          "const": "Matmul"
+        },
+        {
+          "description": "Ordinary lookup, without padding/frequency/custom backward rules.",
+          "type": "string",
+          "const": "Gather"
+        }
+      ]
+    },
+    "QuantSourceTensor": {
+      "description": "Original tensor interpretation, never an adapter-supplied content hash.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Exact logical tensor name.",
+          "type": "string"
+        },
+        "precision": {
+          "description": "Original stored float precision, before widening or fitting.",
+          "$ref": "#/$defs/ScalePrecision"
+        },
+        "shape": {
+          "description": "Positive row-major dimensions in the original source.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "shape",
+        "precision"
+      ]
+    },
+    "ScalePrecision": {
+      "description": "Precision used to store additive plane scales.",
+      "oneOf": [
+        {
+          "description": "IEEE binary16.",
+          "type": "string",
+          "const": "F16"
+        },
+        {
+          "description": "Brain floating-point 16-bit.",
+          "type": "string",
+          "const": "Bf16"
+        },
+        {
+          "description": "IEEE binary32.",
+          "type": "string",
+          "const": "F32"
+        }
+      ]
+    }
+  }
+}

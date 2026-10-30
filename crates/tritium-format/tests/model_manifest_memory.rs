@@ -1,0 +1,362 @@
+//! Measures encoder/envelope heap requests, not caller storage or process RSS.
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tritium_format::trit_model::{decode_model_manifest, encode_model_manifest, read_trit_model};
+use tritium_format::{
+    AdditivePayload, AdditiveTensor, PackageHasher, TritBlob, TritBlobKind, write_trit_package,
+    write_trit_package_to,
+};
+use tritium_schema::{
+    ADMITTED_LAWS, AdditiveLayout, Basis, BlobId, BlobReference, Level, LevelFit, ManifestAsset,
+    ModelManifest, PlaneAllocation, PlaneCodec, PlaneCounts, SchemaId, TensorMeta, TensorStorage,
+    Transport,
+};
+
+struct TrackingAllocator;
+static TRACK: AtomicBool = AtomicBool::new(false);
+static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+
+// SAFETY: delegates the supplied layouts and pointers to System.
+unsafe impl GlobalAlloc for TrackingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller supplies a valid allocation layout.
+        let result = unsafe { System.alloc(layout) };
+        if !result.is_null() && TRACK.load(Ordering::Relaxed) {
+            ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed);
+        }
+        result
+    }
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        // SAFETY: the caller supplies the original pointer and layout.
+        unsafe { System.dealloc(pointer, layout) };
+    }
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        // SAFETY: the caller supplies the original pointer/layout and valid size.
+        let result = unsafe { System.realloc(pointer, layout, size) };
+        if !result.is_null() && TRACK.load(Ordering::Relaxed) {
+            ALLOCATED.fetch_add(size, Ordering::Relaxed);
+        }
+        result
+    }
+}
+#[global_allocator]
+static ALLOCATOR: TrackingAllocator = TrackingAllocator;
+
+struct HashSink {
+    hash: PackageHasher,
+    bytes: usize,
+}
+impl Write for HashSink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.hash.update(bytes);
+        self.bytes += bytes.len();
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn reference(bytes: &[u8]) -> BlobReference {
+    BlobReference {
+        id: BlobId::from_bytes(*blake3::hash(bytes).as_bytes()),
+        shard: None,
+    }
+}
+
+fn manifest(tiles: usize) -> ModelManifest {
+    ModelManifest {
+        schema: SchemaId { major: 1, minor: 0 },
+        architecture: "fixture-only".into(),
+        assets: ["config.json", "tokenizer.json"]
+            .into_iter()
+            .map(|name| ManifestAsset {
+                name: name.into(),
+                blob: reference(b"{}"),
+            })
+            .collect(),
+        levels: vec![Level {
+            name: "imported".into(),
+            fit: LevelFit::Imported,
+            tensors: vec![TensorMeta {
+                name: "weight".into(),
+                blob: reference(&[]),
+                storage: TensorStorage::Additive {
+                    layout: AdditiveLayout {
+                        rows: tiles as u64,
+                        cols: 256,
+                        tile: 256,
+                        group: 128,
+                        max_planes: ADMITTED_LAWS[0].max_planes,
+                        allocation: PlaneAllocation::PerTile,
+                        codec: PlaneCodec::B3,
+                        law: ADMITTED_LAWS[0].law,
+                        basis: Basis::Identity,
+                        transport: Transport::Raw,
+                    },
+                    planes: PlaneCounts::PerTile(vec![0; tiles]),
+                },
+            }],
+        }],
+        shards: vec![],
+        legacy_ids: vec![],
+    }
+}
+
+#[test]
+fn sorted_manifest_encode_decode_and_envelope_do_not_allocate_value_per_tile() {
+    for tiles in [16 * 1024, 1024 * 1024] {
+        let manifest = manifest(tiles);
+        manifest.validate().unwrap();
+        ALLOCATED.store(0, Ordering::Relaxed);
+        TRACK.store(true, Ordering::SeqCst);
+        let result = encode_model_manifest(&manifest);
+        TRACK.store(false, Ordering::SeqCst);
+        let allocated = ALLOCATED.load(Ordering::Relaxed);
+        let bytes = result.unwrap();
+        println!(
+            "{tiles} tile counts: encoder requested {allocated} heap bytes for {} encoded bytes",
+            bytes.len()
+        );
+        assert!(bytes.len() > tiles);
+        assert!(
+            allocated < bytes.len() * 8 + 65536,
+            "encoder requested {allocated} heap bytes for {} encoded bytes",
+            bytes.len()
+        );
+
+        ALLOCATED.store(0, Ordering::Relaxed);
+        TRACK.store(true, Ordering::SeqCst);
+        let result = decode_model_manifest(&bytes);
+        TRACK.store(false, Ordering::SeqCst);
+        let allocated = ALLOCATED.load(Ordering::Relaxed);
+        println!("{tiles} tile counts: typed decoder requested {allocated} heap bytes");
+        let decoded = result.unwrap();
+        assert_eq!(decoded, manifest);
+        assert!(
+            allocated < bytes.len() * 10 + 65536,
+            "typed decoder requested {allocated} heap bytes for {} encoded bytes",
+            bytes.len()
+        );
+        drop(decoded);
+
+        let blobs = [
+            TritBlob {
+                kind: TritBlobKind::AdditiveTensor,
+                bytes: &[],
+            },
+            TritBlob {
+                kind: TritBlobKind::Asset("config.json".into()),
+                bytes: b"{}",
+            },
+            TritBlob {
+                kind: TritBlobKind::Asset("tokenizer.json".into()),
+                bytes: b"{}",
+            },
+        ];
+        let mut sink = HashSink {
+            hash: PackageHasher::new(),
+            bytes: 0,
+        };
+        ALLOCATED.store(0, Ordering::Relaxed);
+        TRACK.store(true, Ordering::SeqCst);
+        let result = write_trit_package_to(&bytes, &blobs, bytes.len() + 4096, &mut sink);
+        TRACK.store(false, Ordering::SeqCst);
+        let allocated = ALLOCATED.load(Ordering::Relaxed);
+        println!("{tiles} tile counts: envelope requested {allocated} heap bytes");
+        assert_eq!(result.unwrap(), sink.hash.finalize());
+        assert!(sink.bytes > bytes.len());
+        assert!(
+            allocated < 65536,
+            "envelope requested {allocated} heap bytes for {} encoded metadata bytes",
+            bytes.len()
+        );
+        let package = write_trit_package(&bytes, &blobs).unwrap();
+        ALLOCATED.store(0, Ordering::Relaxed);
+        TRACK.store(true, Ordering::SeqCst);
+        let result = read_trit_model(&package);
+        TRACK.store(false, Ordering::SeqCst);
+        let allocated = ALLOCATED.load(Ordering::Relaxed);
+        result.unwrap();
+        println!(
+            "{tiles} all-pruned counts: full typed model reader requested {allocated} heap bytes"
+        );
+        assert!(
+            allocated < bytes.len() * 20 + 65536,
+            "generic semantic count tree allocation: {allocated}"
+        );
+    }
+    for coefficients in [1024 * 1024, 16 * 1024 * 1024] {
+        let planes = PlaneCounts::Uniform(3);
+        let layout = AdditiveLayout {
+            rows: 1,
+            cols: coefficients as u64,
+            tile: 256,
+            group: 128,
+            max_planes: ADMITTED_LAWS[0].max_planes,
+            allocation: PlaneAllocation::Uniform,
+            codec: PlaneCodec::B3,
+            law: ADMITTED_LAWS[0].law,
+            basis: Basis::Identity,
+            transport: Transport::Raw,
+        };
+        let owned = AdditiveTensor::new(
+            layout,
+            3,
+            vec![tritium_core::Trit::ZERO; coefficients * 3],
+            vec![0.5; coefficients / 128 * 3],
+        )
+        .unwrap();
+        let payload = owned.encode_payload().unwrap();
+        drop(owned);
+        let mut manifest = manifest(1);
+        manifest.levels[0].tensors[0].blob = reference(&payload);
+        manifest.levels[0].tensors[0].storage = TensorStorage::Additive {
+            layout,
+            planes: planes.clone(),
+        };
+        let blobs = [
+            TritBlob {
+                kind: TritBlobKind::AdditiveTensor,
+                bytes: &payload,
+            },
+            TritBlob {
+                kind: TritBlobKind::Asset("config.json".into()),
+                bytes: b"{}",
+            },
+            TritBlob {
+                kind: TritBlobKind::Asset("tokenizer.json".into()),
+                bytes: b"{}",
+            },
+        ];
+        let package =
+            write_trit_package(&encode_model_manifest(&manifest).unwrap(), &blobs).unwrap();
+        ALLOCATED.store(0, Ordering::Relaxed);
+        TRACK.store(true, Ordering::SeqCst);
+        let result = AdditivePayload::new(layout, &planes, &payload);
+        TRACK.store(false, Ordering::SeqCst);
+        result.unwrap();
+        let allocated = ALLOCATED.load(Ordering::Relaxed);
+        println!(
+            "{coefficients} coefficients per plane: borrowed view requested {allocated} heap bytes"
+        );
+        assert!(
+            allocated < 4096,
+            "borrowed view retained master: {allocated}"
+        );
+        ALLOCATED.store(0, Ordering::Relaxed);
+        TRACK.store(true, Ordering::SeqCst);
+        let result = read_trit_model(&package);
+        TRACK.store(false, Ordering::SeqCst);
+        result.unwrap();
+        let allocated = ALLOCATED.load(Ordering::Relaxed);
+        println!(
+            "{coefficients} coefficients per plane: full typed model reader requested {allocated} heap bytes"
+        );
+        assert!(
+            allocated < 128 * 1024,
+            "model reader retained master: {allocated}"
+        );
+        // Group128 divides each256-column row, preserving the physical payload
+        // when reshaping these zero coefficients/exact scales to tall matrices.
+        let rows = coefficients / 256;
+        let child_layout = AdditiveLayout {
+            max_planes: 1,
+            rows: rows as u64,
+            cols: 256,
+            ..layout
+        };
+        let child = AdditiveTensor::new(
+            child_layout,
+            1,
+            vec![tritium_core::Trit::ZERO; coefficients],
+            vec![0.5; coefficients / 128],
+        )
+        .unwrap();
+        let child_payload = child.encode_payload().unwrap();
+        drop(child);
+        for child_compact in [false, true] {
+            for parent_compact in [false, true] {
+                let allocation = |compact| {
+                    if compact {
+                        PlaneAllocation::PerTile
+                    } else {
+                        PlaneAllocation::Uniform
+                    }
+                };
+                let counts = |compact, planes| {
+                    if compact {
+                        PlaneCounts::PerTile(vec![planes; rows])
+                    } else {
+                        PlaneCounts::Uniform(planes)
+                    }
+                };
+                let mut prefix_manifest = manifest.clone();
+                prefix_manifest.levels[0].name = "near".into();
+                prefix_manifest.levels[0].tensors[0].storage = TensorStorage::Additive {
+                    layout: AdditiveLayout {
+                        rows: rows as u64,
+                        cols: 256,
+                        allocation: allocation(parent_compact),
+                        ..layout
+                    },
+                    planes: counts(parent_compact, 3),
+                };
+                prefix_manifest.levels.insert(
+                    0,
+                    Level {
+                        name: "compact".into(),
+                        fit: LevelFit::ImportedPrefixOf {
+                            level: "near".into(),
+                        },
+                        tensors: vec![TensorMeta {
+                            name: "weight".into(),
+                            blob: reference(&child_payload),
+                            storage: TensorStorage::Additive {
+                                layout: AdditiveLayout {
+                                    allocation: allocation(child_compact),
+                                    ..child_layout
+                                },
+                                planes: counts(child_compact, 1),
+                            },
+                        }],
+                    },
+                );
+                let prefix_blobs = [
+                    blobs[0].clone(),
+                    TritBlob {
+                        kind: TritBlobKind::AdditiveTensor,
+                        bytes: &child_payload,
+                    },
+                    blobs[1].clone(),
+                    blobs[2].clone(),
+                ];
+                let prefix_package = write_trit_package(
+                    &encode_model_manifest(&prefix_manifest).unwrap(),
+                    &prefix_blobs,
+                )
+                .unwrap();
+                ALLOCATED.store(0, Ordering::Relaxed);
+                TRACK.store(true, Ordering::SeqCst);
+                let result = read_trit_model(&prefix_package);
+                TRACK.store(false, Ordering::SeqCst);
+                result.unwrap();
+                let allocated = ALLOCATED.load(Ordering::Relaxed);
+                // Explicit row indexes, returned metadata and hash allowance,
+                // not a claim of constant compact memory or physical RSS.
+                let slots = rows * (usize::from(child_compact) + 3 * usize::from(parent_compact));
+                let index_bytes = slots * core::mem::size_of::<tritium_core::PerTileRowSpan>();
+                let count_allowance =
+                    rows * 32 * (usize::from(child_compact) + usize::from(parent_compact));
+                println!(
+                    "{rows}x256 prefix child_compact={child_compact} parent_compact={parent_compact}: requested {allocated} heap bytes; row-index allowance {index_bytes}"
+                );
+                assert!(
+                    allocated < index_bytes + count_allowance + 256 * 1024,
+                    "prefix retained decoded master: {allocated}"
+                );
+            }
+        }
+    }
+}

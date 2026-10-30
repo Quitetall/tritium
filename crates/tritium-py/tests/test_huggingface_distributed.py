@@ -63,6 +63,7 @@ def test_two_rank_cpu_fsdp_step_and_sharded_state_resume(tmp_path: Path):
     output = completed.stdout + completed.stderr
     assert "TRITIUM_FSDP_OK rank=0" in output
     assert "TRITIUM_FSDP_OK rank=1" in output
+    assert "TRITIUM_FSDP_DCP_EXPORT_OK rank=0" in output
 
 
 def test_accelerate_cpu_bf16_in_fresh_runtime():

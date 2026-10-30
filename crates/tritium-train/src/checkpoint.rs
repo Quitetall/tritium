@@ -18,7 +18,7 @@
 //! per leaf: len u64 | param[len] f32 | <optimizer state bytes (e.g. AdamW = m[len] f32, v[len] f32)>
 //! ```
 //! `len` (an element count) is all the deserializer needs; shape is not a checkpoint
-//! concern because it is not an [`Optimizer`](crate::optim::Optimizer) concern.
+//! concern because it is not an [`Optimizer`] concern.
 
 use crate::optim::Optimizer;
 

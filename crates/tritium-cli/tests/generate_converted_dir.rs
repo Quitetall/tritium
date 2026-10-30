@@ -19,12 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn tritium_bin() -> PathBuf {
-    let mut p = std::env::current_exe().expect("test exe");
-    p.pop();
-    if p.ends_with("deps") {
-        p.pop();
-    }
-    p.join("tritium")
+    PathBuf::from(env!("CARGO_BIN_EXE_tritium"))
 }
 
 fn run(args: &[&str]) -> std::process::Output {

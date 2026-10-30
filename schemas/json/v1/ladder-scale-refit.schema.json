@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LadderScaleRefit",
+  "description": "Placement of the ladder scale refit, without changing its numerical policy.",
+  "oneOf": [
+    {
+      "description": "Do not refit ladder scales.",
+      "type": "string",
+      "const": "None"
+    },
+    {
+      "description": "Refit during the post-feedback coordinate search.",
+      "type": "string",
+      "const": "PostPass"
+    },
+    {
+      "description": "Refit completed groups before propagating to the remaining columns.",
+      "type": "string",
+      "const": "InLoop"
+    }
+  ]
+}
