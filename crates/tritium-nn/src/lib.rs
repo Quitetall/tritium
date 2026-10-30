@@ -15,6 +15,8 @@
 
 pub mod calibrate;
 mod config;
+#[cfg(feature = "cuda")]
+mod dflash;
 mod error;
 mod evaluation;
 mod kv_cache;
@@ -33,6 +35,8 @@ mod tensor;
 mod training;
 
 pub use config::{ArchSpec, MlpKind, ModelConfig};
+#[cfg(feature = "cuda")]
+pub use dflash::{attach_dflash_drafter, dflash_config};
 pub use error::NnError;
 #[cfg(feature = "cuda")]
 pub use error::ResidentOpError;
