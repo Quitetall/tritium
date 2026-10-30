@@ -164,7 +164,7 @@ fn readonly_view_rejects_missing_or_invalid_layout_without_creating_it() {
         Err(TensorWorkError::InvalidPath(_))
     ));
     assert!(matches!(
-        TensorWorkReader::open(&root.join("..").join("escape")),
+        TensorWorkReader::open(&std::path::Path::new("..").join("escape")),
         Err(TensorWorkError::InvalidPath(_))
     ));
     std::fs::create_dir(&root).unwrap();
