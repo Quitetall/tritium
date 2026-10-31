@@ -36,10 +36,20 @@
 
 mod hf_assets;
 mod kronecker;
+mod model_calibration;
+mod model_conversion;
+mod model_level;
+mod model_refinement;
 mod module_package;
+mod native_parent;
+mod native_publication;
+mod native_pv;
+mod native_scale;
+mod native_workspace;
 #[cfg(feature = "onnx")]
 mod onnx;
 mod ops;
+mod qtea_campaign;
 mod qwen;
 mod salt;
 mod stage7;
@@ -387,6 +397,54 @@ fn backend_for_device(device: &str) -> Result<Box<dyn TernaryBackend>, String> {
 /// the CPU backend visible to the runtime registry that [`Model::load`] / [`ternary_matmul`] consult.
 #[pymodule]
 fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<model_calibration::NativeSourceObservation>()?;
+    m.add_class::<model_calibration::NativeCalibrationBuilder>()?;
+    m.add_class::<model_calibration::NativeCalibrationCache>()?;
+    m.add_class::<model_calibration::NativeOwnerScoreWindow>()?;
+    m.add_class::<model_calibration::NativeOwnerScoreCache>()?;
+    m.add_function(wrap_pyfunction!(model_calibration::_owner_row_score, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        model_calibration::_observe_model_plan_source,
+        m
+    )?)?;
+    m.add_class::<model_conversion::NativeModelConversion>()?;
+    m.add_class::<model_level::NativeModelLevel>()?;
+    m.add_class::<model_level::NativePackedMatrix>()?;
+    m.add_class::<native_scale::NativeScaleTraining>()?;
+    m.add_class::<native_pv::NativePvTraining>()?;
+    m.add_class::<native_pv::paged::NativePvPagedTraining>()?;
+    m.add_class::<native_pv::paged::NativePvPagedTrainingLimits>()?;
+    m.add_class::<native_pv::paged::NativePvPagedGradientLimits>()?;
+    m.add_class::<native_pv::paged::NativePvPagedResumeBundle>()?;
+    m.add_function(wrap_pyfunction!(
+        native_pv::paged::_begin_paged_pv_training,
+        m
+    )?)?;
+    m.add_class::<native_pv::NativePvResumeBundle>()?;
+    m.add_function(wrap_pyfunction!(native_pv::_validate_native_pv_plan, m)?)?;
+    m.add_class::<native_scale::NativeScaleResumeBundle>()?;
+    m.add_class::<model_refinement::NativeModelRefinement>()?;
+    m.add_class::<model_refinement::NativePvPagedVerificationLimits>()?;
+    m.add_function(wrap_pyfunction!(model_refinement::_open_native_model, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        native_scale::_validate_native_scale_plan,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(model_conversion::convert_model_plan, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        qtea_campaign::_inspect_qtea_file_campaign,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(qtea_campaign::_run_qtea_file_campaign, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        qtea_campaign::_prepare_qtea_file_source,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        model_conversion::convert_owner_model_plan,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(model_conversion::_validate_model_plan, m)?)?;
     m.add_class::<Model>()?;
     m.add_class::<qwen::QwenModel>()?;
     m.add_class::<qwen::QwenLoadReceipt>()?;
@@ -433,6 +491,12 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ops::lsq_vjp, m)?)?;
     m.add_function(wrap_pyfunction!(ops::allocate_planes, m)?)?;
     m.add_function(wrap_pyfunction!(ops::fit_joint_ternary_dense, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::fit_joint_ternary_diagonal, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::fit_joint_ternary_diagonal_groups, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        ops::fit_joint_ternary_diagonal_groups_with_objective,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(
         torch_native::_ternary_linear_cpu_dlpack,
         m

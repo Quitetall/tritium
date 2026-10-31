@@ -4,10 +4,10 @@
 straight-through-estimator (STE) autograd, quantization-aware training (QAT),
 backward kernels for the ternary ops, an optimizer with bit-exact save/restore,
 and LoRA adapters on a frozen ternary base. It is specified in
-ADR 0007 (see the [research repository](https://github.com/Quitetall/tritium-research)). Distributed training — FSDP /
+ADR 0007 (see the [research-record access policy](./research-records.md)). Distributed training — FSDP /
 ZeRO-3 (via `FlatShardPlan`), a `ProcessGroup` (with `SimProcessGroup` and NCCL
 backends), and distributed checkpointing (`DistCheckpoint`) — shipped in
-v0.60 (see the [research repository](https://github.com/Quitetall/tritium-research)) and is re-exported from
+v0.60 (see the [research-record access policy](./research-records.md)) and is re-exported from
 `tritium-train`; the NCCL transport lives in `tritium-cuda`.
 
 ## Straight-through estimator
@@ -33,6 +33,189 @@ uninterrupted run, and the checkpoint round-trip is a golden test. The
 no-NaN/Inf-over-≥1k-steps and same-seed⇒same-loss-curve properties are the
 mixed-precision conformance gate.
 
+## Owner-paged native CPU P/V training
+
+`tritium.torch.native_pv_paged_training` is a distinct first-order eager controller
+over an actual `NativeModelConversion` or `NativeModelRefinement` parent. Select
+one explicit parent level and a complete `NativeRefinementPlan`; obtain its exact
+parent tuple with `parent.native_refinement_parent(level)`. It shares the packed
+CPU kernels, optimizer, TNPJ journal, TNPB resume transport and immutable child
+publisher with the resident path. It does not retain all decoded optimizer
+owners or materialize checkpoint bytes. The ordinary resident factories are
+unchanged; high-level teacher/data refinement selects paging explicitly below.
+
+Small-fixture example (these caps are **not** Qwen sizing):
+
+```python
+from tritium import NativePvPagedTrainingLimits
+from tritium.torch import native_pv_paged_training
+
+caps = NativePvPagedTrainingLimits(
+    max_owner_read_bytes=1_000_000,
+    max_owner_resident_bytes=1_000_000,
+    max_gradient_working_bytes=1_000_000,
+    max_workspace_bytes=16_000_000,
+    max_journal_bytes=2_000_000,
+    max_frame_bytes=2_000_000,
+    max_recording_working_bytes=16_384,
+)
+trainer = native_pv_paged_training(
+    shell, parent, level="full", plan=plan, load_run_id="paged-load",
+    workspace_dir="/path/to/new/private-work", limits=caps,
+    max_snapshot_bytes=1_000_000, max_saved_input_bytes=10_000_000,
+)
+trainer.zero_grad()
+loss = objective(trainer.model, batch)
+loss.backward()
+trainer.step(plan["training"][0]["content"])
+print(trainer.workspace_report)  # logical reservations, not physical memory
+```
+
+The workspace must be new and outside parent, resume and output artifacts.
+Anonymous current/next checkpoints, gradient frame, journal, replay and publication
+spools share aggregate byte admission and at most six live files. Initial and
+replayed checkpoints reserve the plan's checkpoint ceiling; subsequent updates
+reserve exact checkpoint lengths. Journal and publication spools reserve their
+declared ceilings. Allocation may refuse even when actual written files are
+smaller. Budget real filesystem free space and I/O separately.
+
+Use `save_resume(output_dir, limits=...)` with the same four positive bundle
+fields as resident recovery (`max_bundle_bytes`, `max_manifest_bytes`,
+`max_checkpoint_bytes`, `max_working_bytes`). The result is a
+`NativePvPagedResumeBundle`, not a trained model or replay/quality approval.
+Pass it as `resume=` to a fresh paged factory/workspace, omitting `plan` to use
+its frozen request. Actual original-parent numerical replay precedes continuation;
+pending gradients, Torch RNG and the external data iterator are not saved.
+`checkpoint()` intentionally refuses rather than allocating a full byte buffer.
+
+After completing every declared window, `publish` numerically replays and emits
+an ordinary unqualified `NativeModelRefinement`. Its `limits` mapping has exactly
+`max_spool_bytes`, `max_working_bytes`, `max_evidence_bytes`,
+`max_companion_bytes`, `max_package_bytes`, `max_manifest_bytes` and
+`max_directory_bytes`. Source-owner and replay/journal caps remain the frozen
+controller limits. Publication working bytes cover one encoded owner plus fixed
+publisher I/O, not a checkpoint buffer. Reload the child for frozen inference.
+
+Call `close()` when finished. It preserves complete current packed weights on
+the private shell, drops file leases and removes only the same empty owned
+workspace. Unexpected files/replacement directories are preserved with warnings;
+there is no recursive cleanup. If caller graph/state validation refuses close,
+the original error remains primary, owned resources still retire and the invalid
+graph stays closed rather than becoming an admitted inference model. Old graph
+handles remain immutable and budgeted.
+No concurrent backward/step, higher-order gradients, autocast, compile, vmap,
+dtype/device mutation or `torch.optim` updates are admitted. Private f64 leaves
+transport gradients; they are not latent weight values.
+
+One complete numerical owner, current/old packed models and caller Torch
+leaves/gradients still need memory. Source, numerical, gradient-transfer, recorded
+scratch, packed and saved-input caps are separate; metadata, allocator/OS caches,
+physical RSS/VRAM, source authenticity and objective/data/teacher attestation are
+not established by this interface. Within-owner/GPU state and real-model
+quality/performance qualification remain open.
+
+### Bounded pending-gradient capture
+
+Pass an explicit `gradient_capture=NativePvPagedGradientLimits(...)` to the paged
+factory to avoid full-size f64 leaf values and accumulated Torch `.grad` tensors
+across all selected owners. This mode uses one scalar private autograd token per
+active owner; actual packed Matmul/Embed adjoints are written to a single private
+pending gradient window. Resident and ordinary paged modes are unchanged.
+
+```python
+from tritium import NativePvPagedGradientLimits
+
+capture = NativePvPagedGradientLimits(
+    max_spool_bytes=1_000_000,
+    max_owner_working_bytes=1_000_000,
+    max_contributions=128,
+)
+# Include gradient_capture=capture in native_pv_paged_training(...).
+```
+
+These are small-fixture caps, not Qwen sizing. The logical spool extent is
+`8 + 8*sum(S+A)` bytes, where each owner has `S` stored scales and `A` present
+weight adjoints. Largest-owner working admission retains the conservative
+`16384 + 8*max(S+A)` bound; it is not silently redefined as a chunk budget.
+Capture-mode backward computes stored-coordinate spans directly in Rust, with
+at most16MiB of f64 contribution scratch (less when required by the existing
+native output cap after transfer/row/index scratch). No complete owner-gradient
+tensor is exported to Torch in this mode. Each coordinate's callback reduction
+finishes from zero before it is added once to the pending window, preserving
+the full operation's per-coordinate arithmetic order rather than reassociating
+per-batch fragments. Source/numerical/packed/saved-input caps and the step's f32
+transfer limit remain separate. One complete numerical optimizer owner and its
+returned f32 adjoints still require memory; this is not GPU or whole-model memory
+qualification. Every callback, including
+repeated/tied and empty contributions, consumes the contribution counter. The
+spool also consumes the existing aggregate anonymous-workspace budget/file cap.
+Sparse-file initialization avoids a whole-window zero buffer, not the eventual
+disk/OS-cache cost of writing observations.
+
+Call `zero_grad()` before each declared objective window. It retires previous
+pending observations and admits a fresh spool. First-order custom backward
+callbacks are serialized, sum in f64 in execution order and narrow once per
+owner before the common recorded updater applies window weight. Every supported
+callback execution contributes; these observations do not attest the objective.
+The scalar tokens are transport only: no `torch.optim`, external leaf edits or
+concurrent caller mutation is supported. Input-gradient and alias/version guards
+remain active. Failed backward poisons pending work; clear with `zero_grad()`.
+
+Only successful recorded `step()` consumes pending observations. Source-only
+refusal leaves committed state unchanged and retains valid pending work; uncertain
+spool reads require clearing it. Resume bundles omit pending observations and
+contain only committed checkpoint/history, just as ordinary mode omits pending
+Torch gradients. Child publication still performs actual-parent numerical replay
+through the common publisher. TNPJ, TNPB and artifact formats do not change.
+
+This removes one all-owner retention source, not every memory bottleneck. A full
+owner VJP and numerical owner, caller activations, packed current/old graphs,
+teacher state, raw checkpoints/journals/spools and their I/O remain. Physical
+memory, GPU/within-owner/compact-state and model-quality gates are still open.
+
+### Teacher/data refinement with paged storage
+
+Select `NativePvPagedRefinementConfig` for the existing public `refine` workflow.
+It accepts only `AlternatingPv`, requires both typed `paging_limits` and
+`gradient_capture`, and uses the same teacher/source checks, bounded data windows,
+masked KD, held-out predecessor retention and immutable child publisher. There
+is no resident fallback. `NativeRefinementConfig` retains its existing behavior.
+
+```python
+from tritium.torch import NativePvPagedRefinementConfig, refine
+
+config = NativePvPagedRefinementConfig(
+    plan, level="full", run_id="paged-kd", machine="local-fixture",
+    training_limits=load_snapshot_saved_limits,
+    paging_limits=caps, gradient_capture=capture,
+    publication_limits=publication_limits, data_limits=data_limits,
+)
+child = refine(
+    parent, teacher=teacher, training=training, validation=validation,
+    config=config, work_dir=existing_work_dir, output_dir=new_child_dir,
+)
+```
+
+Supply exact positive mappings explicitly. `training_limits` contains
+`max_snapshot_bytes`, `max_saved_input_bytes`, `max_package_bytes`,
+`max_payload_bytes`, `max_workspace_bytes`, `max_output_bytes` and
+`max_evidence_bytes`; these load/snapshot scopes are distinct from the typed
+paging workspace/owner scopes. It does not accept resident `max_parent_bytes`.
+`publication_limits` has exactly the seven paged fields listed above. `data_limits`
+contains `max_window_bytes`, `max_validation_bytes`, `max_nodes`, `max_depth` and
+`max_loss_bytes`. This is not a reinterpretation of resident aggregate limits.
+
+The existing work directory receives a new private anonymous-workspace child,
+retired on completion/refusal without recursive foreign-file cleanup. Optional
+`checkpoint_steps`/`checkpoint_limits`, `checkpoint_dir` and `on_checkpoint` retain
+the common orchestration semantics, but callbacks/resume use only
+`NativePvPagedResumeBundle`. Resume rechecks the declared input prefix and the
+original-parent baseline; it never bridges through resident checkpoint bytes.
+Teacher modes restore on success/refusal. Source/objective/quality qualification
+flags and immediate-parent lineage scope do not change. Dense teacher, retained
+validation, activations/logits, packed snapshots, one owner and disk/I/O costs
+remain; a successful local fixture is not whole-model or release qualification.
+
 ## LoRA on a frozen ternary base
 
 LoRA adapters train on top of a **frozen** ternary base. The contract, proptested:
@@ -50,10 +233,10 @@ a short STE fine-tune. The convergence gate — a real ternary fine-tune recover
 model, so it is a documented manual gate on borrowed hardware rather than a
 hosted-CI lane (gradient checks run CPU-only; the recovery gate cannot be
 validated without GPU + a real model — see the
-ADR (see the [research repository](https://github.com/Quitetall/tritium-research))).
+internal ADR (see the [research-record access policy](./research-records.md)).
 
 ## Ternary-specific training methods
 
 The training methods that are specific to the ternary regime (and the choices
 behind STE clipping, QAT scheduling, and the heal bridge) are written up in
-ADR 0016 (see the [research repository](https://github.com/Quitetall/tritium-research)).
+ADR 0016 (see the [research-record access policy](./research-records.md)).

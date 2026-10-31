@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SalienceInverseAxis",
+  "description": "Explicit axis of the graph partner divided by each stored scale.",
+  "oneOf": [
+    {
+      "description": "Rank-one preceding norm, one channel per projection input column.",
+      "type": "string",
+      "const": "NormChannels"
+    },
+    {
+      "description": "Rank-two linear partner, one output row per projection input column.",
+      "type": "string",
+      "const": "LinearOutputRows"
+    }
+  ]
+}

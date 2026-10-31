@@ -1,6 +1,10 @@
 import importlib.util
+import runpy
+import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).parents[1] / "check-release-version.py"
@@ -11,6 +15,12 @@ SPEC.loader.exec_module(MODULE)
 
 
 class ReleaseVersionTests(unittest.TestCase):
+    def test_parser_does_not_require_the_workspace_toml_dependency(self):
+        with mock.patch.dict(sys.modules, {"tomllib": None}):
+            policy = runpy.run_path(SCRIPT.with_name("_release_version.py"))
+            self.assertEqual(policy["candidate_version"]("1.1.0"), "1.1.0")
+            self.assertEqual(policy["pypi_version"]("0.1.0-rc.2"), "0.1.0rc2")
+
     def test_candidate_accepts_any_canonical_release_or_rc(self):
         """Format is the contract here, not one particular version.
 
@@ -25,7 +35,7 @@ class ReleaseVersionTests(unittest.TestCase):
         would have failed ci-required on the release commit itself. A gate that
         forbids shipping the next version is not protecting anything.
         """
-        for valid in ("1.1.0-rc.0", "1.1.0-rc.12", "1.1.0", "1.2.0-rc.0", "2.0.0"):
+        for valid in ("0.0.0", "0.1.0", "1.1.0-rc.0", "1.1.0-rc.12", "1.1.0", "1.2.0-rc.0", "2.0.0"):
             with self.subTest(valid=valid):
                 self.assertEqual(MODULE.candidate_version(valid), valid)
 
@@ -38,15 +48,70 @@ class ReleaseVersionTests(unittest.TestCase):
             "v1.1.0",       # tag spelling, not a version
             "1.1.0-rc",     # rc without an ordinal
             "1.1.0-alpha.1",
+            "0",
+            "00.1.0",
+            "1.01.0",
+            "1.1.00",
+            "1.1.0+build.1",
+            " 1.1.0",
+            "1.1.0\n",
             "",
             None,
+            True,
+            1,
         ):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 MODULE.candidate_version(invalid)
 
+    def test_pypi_version_matches_cargo_rc_and_stable_spellings(self):
+        self.assertEqual(MODULE.pypi_version("1.1.0-rc.2"), "1.1.0rc2")
+        self.assertEqual(MODULE.pypi_version("1.1.0"), "1.1.0")
+
     def test_mirror_mismatch_is_actionable(self):
         with self.assertRaisesRegex(ValueError, "npm package version"):
             MODULE.require_equal("1.0.0", "1.1.0-rc.0", "npm package version")
+
+    def test_user_facing_install_and_stage7_commands_follow_candidate_version(self):
+        version = "1.1.0-rc.2"
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            docs = root / "docs/book/src"
+            docs.mkdir(parents=True)
+            chart_dir = root / "deploy/helm/tritium"
+            chart_dir.mkdir(parents=True)
+            readme = root / "README.md"
+            quantization = docs / "quantization.md"
+            chart = chart_dir / "Chart.yaml"
+            readme.write_text(
+                f"cargo install tritium-cli --version {version}\n"
+                f"cargo install tritium-serve --version {version}\n",
+                encoding="utf-8",
+            )
+            quantization.write_text(f"--release {version}\n", encoding="utf-8")
+            chart.write_text(
+                f"version: {version}\nappVersion: {version}\n", encoding="utf-8"
+            )
+
+            MODULE.check_document_versions(root, version)
+
+            readme.write_text(
+                readme.read_text().replace(version, "1.1.0-rc.1"),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "README CLI installation command"):
+                MODULE.check_document_versions(root, version)
+
+            readme.write_text(
+                f"cargo install tritium-cli --version {version}\n"
+                f"cargo install tritium-serve --version {version}\n",
+                encoding="utf-8",
+            )
+            chart.write_text(
+                f"version: 1.1.0-rc.1\nappVersion: {version}\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "Helm chart version"):
+                MODULE.check_document_versions(root, version)
 
 
 if __name__ == "__main__":

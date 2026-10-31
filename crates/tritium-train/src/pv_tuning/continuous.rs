@@ -4,6 +4,23 @@ use crate::optim::{AdamState, Optimizer};
 
 use super::{PvTernaryWeight, PvTuningConfig, PvTuningError, PvTuningSession};
 
+pub(super) fn check_optimizer_moments(
+    state: &AdamState,
+    phase: &'static str,
+) -> Result<(), PvTuningError> {
+    if state
+        .m
+        .iter()
+        .chain(&state.v)
+        .any(|value| !value.is_finite())
+    {
+        return Err(PvTuningError::step(format!(
+            "{phase} optimizer moment update became non-finite"
+        )));
+    }
+    Ok(())
+}
+
 impl PvTuningSession {
     pub(super) fn p_step(
         &mut self,
@@ -106,6 +123,10 @@ pub(super) fn apply_accumulated_scale_gradient(
             flat_index += 1;
         }
     }
+    // Finite deployed scales alone do not establish valid optimizer state: an
+    // infinite squared moment can leave the adaptive update finite (even zero).
+    // The enclosing whole/blockwise transaction must not commit that state.
+    check_optimizer_moments(scale_state, "continuous")?;
     Ok(old_bits
         .iter()
         .zip(weight.planes.iter().flat_map(|plane| &plane.scales))

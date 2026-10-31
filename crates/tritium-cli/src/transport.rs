@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, bail};
 use clap::Subcommand;
 use tritium_format::{
-    EntropyTransportError, read_entropy_transport, read_entropy_transport_seekable,
-    write_entropy_transport_with_chunk_size,
+    EntropyTransportChunkCodec, EntropyTransportError, read_entropy_transport,
+    read_entropy_transport_seekable, write_entropy_transport_with_chunk_size,
 };
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -100,9 +100,16 @@ fn inspect(input: &Path) -> anyhow::Result<()> {
     let parsed = read_entropy_transport_seekable(source)
         .map_err(format_error)
         .context("parse TRNS transport")?;
-    let huffman_chunks = (0..parsed.chunk_count())
-        .filter(|&index| parsed.chunk_info(index).is_ok_and(|info| info.huffman))
-        .count();
+    let mut raw_chunks = 0;
+    let mut huffman_chunks = 0;
+    let mut rans_chunks = 0;
+    for index in 0..parsed.chunk_count() {
+        match parsed.chunk_codec(index).context("read TRNS chunk codec")? {
+            EntropyTransportChunkCodec::Raw => raw_chunks += 1,
+            EntropyTransportChunkCodec::Huffman => huffman_chunks += 1,
+            EntropyTransportChunkCodec::Rans => rans_chunks += 1,
+        }
+    }
     println!(
         "transport: TRNS v{}",
         tritium_format::ENTROPY_TRANSPORT_VERSION
@@ -111,7 +118,9 @@ fn inspect(input: &Path) -> anyhow::Result<()> {
     println!("transport_bytes: {transport_bytes}");
     println!("chunk_size: {}", parsed.chunk_size());
     println!("chunks: {}", parsed.chunk_count());
+    println!("raw_chunks: {raw_chunks}");
     println!("huffman_chunks: {huffman_chunks}");
+    println!("rans_chunks: {rans_chunks}");
     println!("resident_denominator: logical_bytes");
     Ok(())
 }

@@ -1,5 +1,16 @@
 # tritium-format
 
+The proposed `qtea::model` profile carries named residual-bearing models in the
+existing seek-backed `.trit` envelope using directory kind `QteaTensor` (3/null).
+It is distinct from typed additive-SALT `TensorStorage` and is rejected by that
+ordinary model reader. Canonical metadata binds config/assets, exact owner names,
+declared source and QTEA matrices or preserved floating-point vectors. Explicit
+source/metadata/per-owner limits, actual blob checks and terminal source recheck
+remain necessary; names/digest agreement is not source or quality qualification.
+The existing package/spool encoders accept the new kind without changing old
+kind bytes. `QteaModelReader` validates payload numerics lazily; complete model
+coverage/execution is the model loader's obligation, not a successful outer parse.
+
 Ternary weight formats: TQ1_0/TQ2_0/Q2_0 pack-unpack, GGUF and safetensors readers, SALT packages.
 
 Part of [Tritium](https://github.com/Quitetall/tritium) — Apache-2.0 infrastructure for
@@ -8,3 +19,28 @@ exact byte accounting and receipt-backed benchmarks.
 
 See the [repository README](https://github.com/Quitetall/tritium#readme) and the
 [book](https://github.com/Quitetall/tritium/tree/main/docs/book) for usage.
+
+`import_salt_rows` preserves legacy TQ2_0 logical trits and independent FP16
+plane/block scale bits in the shared `AdditiveTensor`. It uses an explicit
+verified-container basis, admitted free-F16 G32/G128 layout and logical limits.
+It does not refit or reinterpret a stored ladder as the tied-anchor law. This is
+a tensor migration prerequisite (proposed ADR0065), not a model migrator,
+legacy identity verifier, Direct-fit proof or empirical qualification. Complete
+model import/provenance, variable/pruned rows, higher plane/group admission,
+legacy rotation tails and both historical campaign migrations remain required.
+
+## Bounded additive owner decoding
+
+`AdditiveStreamDecoder` emits one owned tensor through the existing incremental
+canonical validator. It accepts arbitrary byte windows, shares codeword/padding/
+scale-law checks and poisoning, and never retains a complete encoded payload.
+`working_bytes` forecasts decoded coefficients, widened scales, compact index
+and fixed640-trit/640-byte scratch. `DecodeWorkingLimit` distinguishes an explicit
+logical cap refusal from actual allocator failure. Metadata, allocation slack
+and external source buffers are excluded; this is not process RSS or VRAM.
+
+For retained `.trit` models, `TritTensorStream::decode_additive` adds the source's
+64KiB visit window, preflights the cap, verifies actual blob bytes/length, and
+returns no owner on source or decode failure. The surrounding model still needs
+fresh terminal package verification before staged results become usable.
+Unsupported entropy/sharded payloads retain their current fail-closed behavior.

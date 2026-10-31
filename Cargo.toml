@@ -7,6 +7,8 @@ resolver = "3"
 members = [
     "crates/tritium-build-info", # source identity for receipt-producing build scripts
     "crates/tritium-core",
+    "crates/tritium-schema",   # accepted ADR 0044 cross-language schema vocabulary
+    "crates/tritium-evidence", # typed, deterministic, hash-chained evidence log (ADR 0044)
     "crates/tritium-spec",     # backend trait contract, no impls
     "crates/tritium-format",   # TQ1_0/TQ2_0 packing, GGUF + safetensors I/O
     "crates/tritium-testkit",  # reference vectors + conformance harness
@@ -62,6 +64,8 @@ categories = ["science", "hardware-support", "mathematics"]
 # deps) and lets cargo-deny keep `wildcards = "deny"` meaningful for *external* deps.
 tritium-build-info = { path = "crates/tritium-build-info", version = "1.1.0-rc.2" }
 tritium-core = { path = "crates/tritium-core", version = "1.1.0-rc.2" }
+tritium-schema = { path = "crates/tritium-schema", version = "1.1.0-rc.2", default-features = false }
+tritium-evidence = { path = "crates/tritium-evidence", version = "1.1.0-rc.2" }
 tritium-spec = { path = "crates/tritium-spec", version = "1.1.0-rc.2" }
 tritium-format = { path = "crates/tritium-format", version = "1.1.0-rc.2" }
 tritium-runtime = { path = "crates/tritium-runtime", version = "1.1.0-rc.2" }
@@ -83,8 +87,21 @@ tritium-onnx = { path = "crates/tritium-onnx", version = "1.1.0-rc.2", default-f
 # foundation
 bytemuck = "1"
 blake3 = "1"
+ciborium = "0.2.2"
+serde_json_canonicalizer = "=0.3.2"
+getrandom = "0.3.4"
 half = "2"
+# Unix retained-source admission uses safe std OpenOptions with platform flags.
+# Reuse the already locked version; no project-owned raw FFI is introduced.
+libc = "=0.2.189"
 linkme = "0.3"
+opentelemetry = { version = "=0.33.0", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "=0.33.0", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"] }
+opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = ["trace"] }
+tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
+tracing-futures = { version = "=0.2.5", default-features = false, features = ["futures-03", "std", "std-future"] }
+tracing-opentelemetry = { version = "=0.34.0", default-features = false }
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["registry", "std"] }
 # cpu
 rayon = "1"
 # cuda
@@ -132,10 +149,13 @@ anyhow = "1"
 # multi-GB (50GB+ sharded) model fully into RAM — pages fault in per touched tensor.
 memmap2 = "0.9"
 # serve (OpenAI HTTP/SSE server; all behind tritium-serve's `serve` feature)
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "macros", "signal", "time", "sync"] }
+# RUSTSEC-2026-0386: require the patched AsyncFd I/O-safety release for
+# downstream registry consumers too, not only this workspace's lockfile.
+tokio = { version = "1.53.3", default-features = false, features = ["rt-multi-thread", "net", "macros", "signal", "time", "sync"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 async-stream = "0.3"
 futures-core = "0.3"
+http-body = "1"
 http-body-util = "0.1"
 tower = { version = "0.5", default-features = false, features = ["util", "limit"] }
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
@@ -143,7 +163,9 @@ tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 proptest = "1"
 divan = "0.1"
 serde = { version = "1", features = ["derive"] }
+serde_nostd = { package = "serde", version = "1", features = ["derive"], default-features = false }
 serde_json = "1"
+schemars = { version = "=1.2.2", features = ["derive"] }
 sha2 = "0.11"
 
 # Lints applied workspace-wide; crates opt in with `[lints] workspace = true`.

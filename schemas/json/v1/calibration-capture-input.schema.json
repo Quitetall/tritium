@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CalibrationCaptureInput",
+  "description": "Exact ordered private calibration inputs, not an asserted input digest.",
+  "oneOf": [
+    {
+      "description": "Pretokenized windows, each including its final target.",
+      "type": "object",
+      "properties": {
+        "Tokens": {
+          "type": "object",
+          "properties": {
+            "windows": {
+              "description": "Ordered complete token-ID windows.",
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "uint32",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "windows"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Tokens"
+      ]
+    },
+    {
+      "description": "Actual runtime encoding: raw text, no special tokens/padding/truncation.",
+      "type": "object",
+      "properties": {
+        "RawText": {
+          "type": "object",
+          "properties": {
+            "windows": {
+              "description": "Exact UTF-8 windows; private evidence may contain private corpus text.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "windows"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "RawText"
+      ]
+    }
+  ]
+}

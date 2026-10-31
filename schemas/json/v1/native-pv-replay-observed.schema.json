@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NativePvReplayObserved",
+  "description": "Recorded P/V journal/checkpoint binding, not numerical or quality authority.",
+  "type": "object",
+  "properties": {
+    "checkpoint": {
+      "description": "Complete replayed TNPV byte identity.",
+      "$ref": "#/$defs/BlobId"
+    },
+    "checkpoint_bytes": {
+      "description": "Exact TNPV byte length.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "completed_updates": {
+      "description": "Complete declared training-window cursor.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "journal": {
+      "description": "Complete TNPJ byte identity, including trailer checksum.",
+      "$ref": "#/$defs/BlobId"
+    },
+    "journal_bytes": {
+      "description": "Complete TNPJ byte length.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "plan": {
+      "description": "Exact frozen AlternatingPv request.",
+      "$ref": "#/$defs/NativeRefinementPlanId"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "plan",
+    "journal",
+    "journal_bytes",
+    "checkpoint",
+    "checkpoint_bytes",
+    "completed_updates"
+  ],
+  "$defs": {
+    "BlobId": {
+      "description": "Content identity for stored tensor or asset bytes.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "NativeRefinementPlanId": {
+      "description": "Native recovery request identity in its own versioned domain, not a legacy PV recipe hash.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    }
+  }
+}

@@ -19,8 +19,25 @@ use serde::{Deserialize, Serialize};
 
 mod frontier_v3;
 mod pipeline;
+mod qtea_calibration;
+mod qtea_file_campaign;
+pub use qtea_file_campaign::{
+    QteaCallerEstimate, QteaCampaignCurvature, QteaCampaignFiles, QteaCampaignInspection,
+    QteaCampaignLimits, QteaCampaignModelProfile, QteaCampaignOwner, QteaCampaignOwnerInspection,
+    QteaFileCampaignRequest, QteaFileCampaignResult, QteaFileSourceRequest,
+    QteaOriginalSourceObservation, inspect_qtea_file_campaign, prepare_qtea_file_source,
+    run_qtea_file_campaign, run_qtea_file_campaign_to_directory,
+};
+mod qtea_model_build;
+mod qtea_tensor_work;
+pub use qtea_model_build::{
+    QteaModelBuildError, QteaModelBuildLimits, QteaModelBuildRecord, QteaModelBuildResult,
+    QteaModelBuilder, QteaOwnerCurvature, QteaOwnerFitObservation, QteaSelectedAdmission,
+    verify_qtea_model_build_record,
+};
 mod qwen36_preflight;
 mod qwen36_source_admission;
+mod qwen36_source_identity;
 mod qwen36_tensor_work;
 mod stage7_evidence;
 mod tensor_work_store;
@@ -28,7 +45,8 @@ mod tensor_work_store;
 pub use frontier_v3::{
     AdmittedSolverPlan, ArtifactByteLedger, ArtifactClaim, BuiltinSolverBlocker,
     BuiltinSolverCapability, BuiltinSolverStatus, ByteBreakdown, FRONTIER_ARTIFACT_SCHEMA_V1,
-    FRONTIER_PARETO_RECEIPT_SCHEMA_V1, FRONTIER_PROFILE_SCHEMA_V1, FRONTIER_RUN_RECEIPT_SCHEMA_V1,
+    FRONTIER_PARETO_RECEIPT_SCHEMA_V1, FRONTIER_PROFILE_SCHEMA_V1,
+    FRONTIER_QTEA_REFERENCE_SOLVER_ID, FRONTIER_RUN_RECEIPT_SCHEMA_V1,
     FRONTIER_SALT_V2_REFERENCE_SOLVER_ID, FRONTIER_SOLVER_ABI_V1, FRONTIER_STAGE_RECEIPT_SCHEMA_V1,
     FRONTIER_STAGE_REQUEST_SCHEMA_V1, FrontierArtifactError, FrontierArtifactManifest,
     FrontierCompatibilityError, FrontierObjectiveDirection, FrontierObjectiveSpec,
@@ -36,17 +54,23 @@ pub use frontier_v3::{
     FrontierPlanError, FrontierProfile, FrontierProfileCatalog, FrontierProfileId,
     FrontierResourceEstimate, FrontierResourceEstimator, FrontierRunReceipt, FrontierSelection,
     FrontierSolver, FrontierSolverError, FrontierStage, FrontierStageOutcome, FrontierStageReceipt,
-    FrontierStageRequest, FrontierTensorArtifact, ResourceDimension, ResourceVector,
-    ResourceViolation, SaltV2AdmittedTensorFitResult, SaltV2FrontierFitError, SaltV2FrontierSolver,
-    SaltV2ReferenceAdapter, SolverDescriptor, SolverFamily, SolverId, SolverRegistry,
-    SolverRequest, SolverTrust, TensorRepresentation, builtin_solver_capabilities,
-    read_salt_v2_frontier_artifact,
+    FrontierStageRequest, FrontierTensorArtifact, QteaAdmittedTensorFitResult,
+    QteaAdmittedTensorWork, QteaFrontierSolver, QteaFrontierWorkError, QteaReferenceAdapter,
+    ResourceDimension, ResourceVector, ResourceViolation, SaltV2AdmittedTensorFitResult,
+    SaltV2FrontierFitError, SaltV2FrontierSolver, SaltV2ReferenceAdapter, SolverDescriptor,
+    SolverFamily, SolverId, SolverRegistry, SolverRequest, SolverTrust, TensorRepresentation,
+    builtin_solver_capabilities, read_salt_v2_frontier_artifact,
 };
 pub use pipeline::{
     AdvanceOutcome, DriverFailure, FailureReceipt, HardwareReceipt, HardwareUsage, Metric,
     MetricReceipt, PhysicalLedger, PipelineStatus, ProvenanceReceipt, PublishedArtifact,
     QualityEvidence, SaltDriver, SaltPipeline, SaltReceipt, StageArtifact, StageOutput,
     StageReceiptRecord, StageRequest,
+};
+pub use qtea_calibration::{QteaCalibratedTensorInput, QteaCalibrationError};
+pub use qtea_tensor_work::{
+    QteaTensorOrigin, QteaTensorWorkError, QteaTensorWorkMemory, QteaTensorWorkPlan,
+    QteaTensorWorkResult,
 };
 pub use qwen36_preflight::{
     Qwen36CampaignPreflight, Qwen36CampaignPreflightError, Qwen36CampaignPreflightReceipt,
@@ -56,6 +80,7 @@ pub use qwen36_source_admission::{
     Qwen36AdmissionError, Qwen36AdmissionReceipt, Qwen36AdmittedSource, Qwen36LanguageCoverage,
     Qwen36SourceProof, Qwen36SourceProofError,
 };
+pub use qwen36_source_identity::{Qwen36SourceIdentityAuthorization, Qwen36SourceIdentityError};
 // Admission/execution symbols are unix-only (see qwen36_tensor_work).
 pub use qwen36_tensor_work::{
     Qwen36AdditiveCampaignSpec, Qwen36AdditiveCampaignStore, Qwen36AdditiveInstallError,
@@ -78,10 +103,11 @@ pub use qwen36_tensor_work::{
     Qwen36AdmittedExecutionReceipt, Qwen36AdmittedExecutionSession, Qwen36ExecutionBackend,
     Qwen36ExecutionReplayError, Qwen36ExecutionSessionOpenError, Qwen36ExecutionVisitError,
     Qwen36FinalLogitsOutputBindingError, Qwen36FinalLogitsOutputBindingReceipt,
-    Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt, Qwen36PackageAdmittedCampaignStore,
-    Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger, Qwen36PackageScaleOnlyCampaignStore,
-    Qwen36PackageVisitError, Qwen36PtqPackageError, Qwen36PtqPackagesReceipt,
-    Qwen36PvParentContext, reconcile_qwen36_ptq_packages,
+    Qwen36OutputScopeBindingReceipt, Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt,
+    Qwen36PackageAdmittedCampaignStore, Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger,
+    Qwen36PackageScaleOnlyCampaignStore, Qwen36PackageVisitError, Qwen36PtqPackageError,
+    Qwen36PtqPackagesReceipt, Qwen36PvParentContext, Qwen36RefinedCandidateExecutionReceipt,
+    Qwen36RefinedCandidateReplay, Qwen36ScaleRefitWindowError, reconcile_qwen36_ptq_packages,
 };
 #[cfg(all(unix, feature = "cuda"))]
 pub use qwen36_tensor_work::{
@@ -98,7 +124,7 @@ pub use stage7_evidence::{
 pub use tensor_work_store::{
     TensorPayloadValidator, TensorPayloadWriter, TensorPutError, TensorRecordInfo,
     TensorRecordReader, TensorRecordReceipt, TensorRecordSpec, TensorValidatedPutError,
-    TensorVisitError, TensorWorkError, TensorWorkStore,
+    TensorVisitError, TensorWorkError, TensorWorkReader, TensorWorkStore,
 };
 
 const CONTENT_ID_CONTEXT: &str = "tritium salt content id v1";

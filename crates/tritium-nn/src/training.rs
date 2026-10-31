@@ -1572,6 +1572,11 @@ fn extract_dense(
 ) -> Result<TrainingParameter, TrainingAdapterError> {
     let dense = match projection {
         Projection::Dense(dense) => dense,
+        Projection::Tensor(_) => {
+            return Err(unsupported(&format!(
+                "{name} is backend-owned; an inspectable latent fp32 master is required"
+            )));
+        }
         Projection::Salt(_) | Projection::Ternary(_) | Projection::Q2(_) => {
             return Err(unsupported(&format!(
                 "{name} is already ternary; a latent fp32 master is required"
@@ -1582,10 +1587,22 @@ fn extract_dense(
                 "{name} is already host SALT V2; a latent fp32 master is required"
             )));
         }
+        #[cfg(feature = "host-qtea")]
+        Projection::HostQtea(_) => {
+            return Err(unsupported(&format!(
+                "{name} is residual-bearing host QTEA; a latent fp32 master is required"
+            )));
+        }
         #[cfg(feature = "cuda")]
         Projection::SaltV2(_) => {
             return Err(unsupported(&format!(
                 "{name} is already resident SALT V2; a latent fp32 master is required"
+            )));
+        }
+        #[cfg(feature = "cuda")]
+        Projection::CudaQtea(_) => {
+            return Err(unsupported(&format!(
+                "{name} is residual-bearing CUDA QTEA; a latent fp32 master is required"
             )));
         }
     };

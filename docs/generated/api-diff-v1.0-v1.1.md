@@ -1,6 +1,6 @@
 # Generated v1.0 to v1.1 API diff
 
-Report identity: `sha256:a3b55fff69c85b0cd3d74dae99684771df16db039f2c942901241cce80a0c6dd`
+Report identity: `sha256:65cfbf8ca729e510111066fb62b07dde79729af3cd8bb8623a2a9269c503d118`
 
 This is a structural source report for candidate `1.1.0-rc.2`
 against `v1.0.0`. It is not a package-install or runtime receipt.
@@ -27,6 +27,14 @@ Added in v1.1:
 - `KroneckerResourceError`
 - `KroneckerSharedForwardGroup`
 - `KroneckerStateError`
+- `NativeModelConversion`
+- `NativeModelRefinement`
+- `NativePvPagedGradientLimits`
+- `NativePvPagedResumeBundle`
+- `NativePvPagedTrainingLimits`
+- `NativePvPagedVerificationLimits`
+- `NativePvResumeBundle`
+- `NativeScaleResumeBundle`
 - `Qwen36KroneckerCaptureReceipt`
 - `Qwen36KroneckerCaptureSession`
 - `Qwen36KroneckerCaptureTask`
@@ -43,6 +51,7 @@ Added in v1.1:
 - `compiled_backends`
 - `conv1d_forward`
 - `conv1d_vjp`
+- `convert_model_plan`
 - `fsq_forward`
 - `fsq_vjp`
 - `lsq_forward`
@@ -50,6 +59,7 @@ Added in v1.1:
 - `nn`
 - `onnx`
 - `portable`
+- `qtea`
 - `salt`
 - `ste_absmean_scale`
 - `ste_quantize_forward`

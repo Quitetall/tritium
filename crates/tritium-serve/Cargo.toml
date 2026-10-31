@@ -20,6 +20,14 @@ tritium-spec = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 blake3 = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tracing-futures = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
 
 # The HTTP/SSE server, behind the `serve` feature (mirrors tritium-cuda/wgpu's gate).
 tokio = { workspace = true, optional = true }
@@ -27,15 +35,19 @@ axum = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 async-stream = { workspace = true, optional = true }
 futures-core = { workspace = true, optional = true }
+http-body = { workspace = true, optional = true }
 # A backend must be linked for the binary to actually serve a model.
 tritium-cpu = { workspace = true, optional = true }
 tritium-cuda = { workspace = true, optional = true, features = ["cuda"] }
 tritium-runtime = { workspace = true, optional = true }
 tritium-format = { workspace = true, optional = true }
+tritium-evidence = { workspace = true, optional = true }
+tritium-schema = { workspace = true, optional = true }
 
 [features]
 default = []
-serve = ["dep:tokio", "dep:axum", "dep:tower", "dep:async-stream", "dep:futures-core", "dep:blake3", "dep:tritium-cpu", "dep:tritium-runtime", "dep:tritium-format", "tritium-nn/tokenizer"]
+host-qtea = ["serve", "tritium-nn/host-qtea"]
+serve = ["dep:tokio", "dep:axum", "dep:tower", "dep:async-stream", "dep:futures-core", "dep:http-body", "dep:blake3", "dep:getrandom", "dep:opentelemetry", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk", "dep:tracing", "dep:tracing-futures", "dep:tracing-opentelemetry", "dep:tracing-subscriber", "dep:tritium-cpu", "dep:tritium-runtime", "dep:tritium-format", "dep:tritium-evidence", "dep:tritium-schema", "tritium-nn/tokenizer"]
 # Link the CUDA backend so `--backend cuda` can resolve (needs nvcc at build time).
 cuda = ["serve", "dep:tritium-cuda", "tritium-nn/cuda"]
 # CUDA release-image-only fault gate; omitted from normal library/server builds.
@@ -48,6 +60,8 @@ name = "tritium-serve"
 required-features = ["serve"]
 
 [dev-dependencies]
+tokenizers = { workspace = true }
+tritium-core = { workspace = true }
 tower = { workspace = true }
 http-body-util = { workspace = true }
 tritium-runtime = { workspace = true }

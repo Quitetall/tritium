@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import runpy
 import secrets
 import shutil
 import subprocess
@@ -25,7 +26,7 @@ SCHEMA = "tritium.oci-security-qualification.v1"
 HEX = frozenset("0123456789abcdef")
 MAX_REPORT_BYTES = 128 * 1024 * 1024
 MAX_LAYOUT_MEMBER_BYTES = 512 * 1024 * 1024
-RC_PATTERN = re.compile(r"1\.1\.0-rc\.(0|[1-9][0-9]*)")
+RC_PATTERN = runpy.run_path(Path(__file__).with_name("_release_version.py"))["RELEASE_PATTERN"]
 RUN_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 VERSION_PATTERN = re.compile(r"v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?")
 MIN_TRIVY_VERSION = (0, 69, 0)
@@ -81,16 +82,26 @@ def trivy_version(value: Any) -> str:
 
 
 def run(command: list[str], *, timeout: float, output: Path | None = None) -> str:
+    if type(timeout) not in {int, float} or not math.isfinite(timeout) or timeout <= 0:
+        raise SecurityScanError("scanner timeout must be finite and positive")
     try:
         result = subprocess.run(
             command, text=True, stdout=subprocess.PIPE if output is None else subprocess.DEVNULL,
             stderr=subprocess.PIPE, timeout=timeout, check=False,
         )
     except (OSError, subprocess.SubprocessError) as error:
-        raise SecurityScanError(f"scanner command failed: {error}") from error
+        reason = (
+            "timeout" if isinstance(error, subprocess.TimeoutExpired)
+            else "launch failure" if isinstance(error, OSError)
+            else "subprocess failure"
+        )
+        # A scanner examining leaked secrets may echo sensitive image content.
+        # Timeout/launch exceptions also retain private argv and output; neither
+        # their messages nor their rendered exception chains are safe to publish.
+        raise SecurityScanError(f"scanner command failed: {reason}") from None
     if result.returncode != 0:
         raise SecurityScanError(
-            f"scanner command failed ({result.returncode}): {result.stderr.strip()[-2000:]}"
+            f"scanner command failed ({result.returncode}); subprocess diagnostics withheld"
         )
     if output is not None:
         ordinary(output, "scanner report")
@@ -186,8 +197,12 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
     if RC_PATTERN.fullmatch(args.release) is None or RUN_PATTERN.fullmatch(args.run_id) is None:
         raise SecurityScanError("release or run ID is malformed")
     revision = exact_hex(args.source_revision, 40, "source revision")
-    if args.max_db_age_hours <= 0 or args.max_db_age_hours > 24 or args.timeout <= 0:
-        raise SecurityScanError("scan limits must be positive")
+    if (type(args.max_db_age_hours) not in {int, float}
+            or not math.isfinite(args.max_db_age_hours)
+            or not 0 < args.max_db_age_hours <= 24
+            or type(args.timeout) not in {int, float}
+            or not math.isfinite(args.timeout) or args.timeout <= 0):
+        raise SecurityScanError("scan limits must be finite and positive; database age is at most 24 hours")
     archive = ordinary(args.archive, "OCI archive")
     cache = args.cache_dir.resolve(strict=True)
     if args.cache_dir.is_symlink() or not cache.is_dir():

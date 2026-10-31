@@ -32,35 +32,61 @@ mod teacher_cache;
 mod tensor;
 mod training;
 
+#[cfg(feature = "tokenizer")]
+pub use model::{
+    ModelLoadPlan, StreamedModelLoadPlan, TensorLoadPlan, inspect_trit_file,
+    inspect_trit_file_streamed, inspect_trit_file_streamed_resident,
+};
+
 pub use config::{ArchSpec, MlpKind, ModelConfig};
 pub use error::NnError;
 #[cfg(feature = "cuda")]
 pub use error::ResidentOpError;
 pub use evaluation::{TeacherForcedPerplexity, teacher_forced_perplexity_windows};
 pub use kv_cache::KvCache;
+#[cfg(feature = "cuda")]
+pub use layers::CudaQteaLinear;
+#[cfg(feature = "host-qtea")]
+pub use layers::HostQteaLinear;
 pub use layers::{
-    ActivationPrecision, BlockDump, BlockScratch, DenseLinear, HostSaltV2Linear, Mlp, Projection,
-    ProjectionActivationMode, Q2Linear, Qwen35DeltaNet, Qwen35DeltaNetCache, Qwen35DeltaNetWeights,
-    Qwen35FullAttention, Qwen35FullAttentionCache, Qwen35FullAttentionWeights, Relu2Mlp,
-    SaltLinear, SwiGluMlp, TernaryLinear, TokenEmbedding, TransformerBlock,
+    ActivationPrecision, BlockDump, BlockScratch, DenseLinear, HostSaltV2Linear, Linear, Mlp,
+    Projection, ProjectionActivationMode, Q2Linear, Qwen35DeltaNet, Qwen35DeltaNetCache,
+    Qwen35DeltaNetWeights, Qwen35FullAttention, Qwen35FullAttentionCache,
+    Qwen35FullAttentionWeights, Relu2Mlp, SaltLinear, SwiGluMlp, TensorLoader, TernaryLinear,
+    TokenEmbedding, TransformerBlock,
 };
+#[cfg(all(feature = "host-qtea", feature = "cuda"))]
+pub use model::CudaQteaModelLimits;
+#[cfg(all(feature = "host-qtea", feature = "tokenizer"))]
+pub use model::HostQteaHybridModelLimits;
+#[cfg(feature = "host-qtea")]
+pub use model::HostQteaModelLimits;
+#[cfg(all(feature = "host-qtea", feature = "tokenizer"))]
+pub use model::QteaLoadConfig;
+pub use model::{ArchitectureSpec, CacheAdmission, LayerKind, Runner, StreamLimits};
 pub use model::{
-    ForwardDump, LayerWeights, ModelRunner, ModelWeights, QWEN35_HF_SOURCE_ARCHITECTURE,
-    QWEN35_MTP_UNVERIFIED_REASON, QWEN35_MTP_VLLM_ORACLE_REVISION, QWEN35_MTP_VLLM_SOURCE_SHA256,
-    Qwen35ContentVerifiedHfSource, Qwen35ExecutionOutputBatch, Qwen35ExecutionVisitError,
+    ChatRenderOptions, ForwardDump, LayerWeights, ModelRunner, ModelSource, ModelWeights,
+    QWEN35_HF_SOURCE_ARCHITECTURE, QWEN35_MTP_UNVERIFIED_REASON, QWEN35_MTP_VLLM_ORACLE_REVISION,
+    QWEN35_MTP_VLLM_SOURCE_SHA256, QWEN35_REFERENCE_STATE_MAX_BYTES, Qwen35ContentVerifiedHfSource,
+    Qwen35ExecutionBlockOutputBatch, Qwen35ExecutionOutputBatch, Qwen35ExecutionVisitError,
     Qwen35HfLanguageModel, Qwen35HfLanguageMtpModel, Qwen35HfLanguageMtpReceipt,
     Qwen35HfLanguageReceipt, Qwen35HfSource, Qwen35HfSourceIdentity, Qwen35HfTensorMetadata,
     Qwen35MtpCache, Qwen35MtpInputPlan, Qwen35MtpLayerWeights, Qwen35MtpOracleCoverageProfile,
     Qwen35MtpOracleEvidenceClass, Qwen35MtpOutput, Qwen35MtpParityReceipt, Qwen35MtpPromotionError,
-    Qwen35MtpRunner, Qwen35MtpStatus, Qwen35MtpWeights, Qwen35SaltV2BundleAdmission,
-    Qwen35SaltV2LanguageMtpModel, Qwen35SaltV2LoadReceipt, Qwen35TensorSchemaEntry,
-    Qwen35TensorSchemaRole, Qwen35TensorStreamError, Qwen35TextCache, Qwen35TextLayerWeights,
-    Qwen35TextMixerWeights, Qwen35TextOutput, Qwen35TextRunner, Qwen35TextWeights,
+    Qwen35MtpRunner, Qwen35MtpStatus, Qwen35MtpWeights, Qwen35ReferenceState,
+    Qwen35SaltV2BundleAdmission, Qwen35SaltV2LanguageMtpModel, Qwen35SaltV2LoadReceipt,
+    Qwen35TensorSchemaEntry, Qwen35TensorSchemaRole, Qwen35TensorStreamError, Qwen35TextCache,
+    Qwen35TextLayerWeights, Qwen35TextMixerWeights, Qwen35TextOutput, Qwen35TextRunner,
+    Qwen35TextWeights, Qwen35TritReadLimits, Qwen35UntrustedOutputScopeTranscript,
     Qwen35UntrustedRuntimeTranscript, Qwen35VerifiedHfLanguageMtpModel, Tokenizer,
     UnverifiedQwen35Mtp, qwen35_language_mtp_tensor_schema, qwen36_27b_canonical_source_config,
 };
 #[cfg(feature = "tokenizer")]
-pub use model::{GgufBpeTokenizer, HfJsonTokenizer};
+pub use model::{
+    GgufBpeTokenizer, HfJsonTokenizer, LoadedModel, ModelLoadResources, ModelResourceAdmission,
+    TypedLoadConfig, load, load_streamed_with_resources, load_with_limits, load_with_resources,
+};
+pub use model::{QteaModelInventory, QteaModelProfile};
 #[cfg(feature = "cuda")]
 pub use model::{
     SaltV2LoadedTensorReceipt, SaltV2ModelAllocationReceipt, SaltV2PreservedTensorReceipt,

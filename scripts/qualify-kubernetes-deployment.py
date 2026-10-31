@@ -43,7 +43,7 @@ LABEL_KEY = re.compile(
     r"[A-Za-z0-9](?:[-._A-Za-z0-9]{0,61}[A-Za-z0-9])?"
 )
 RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-RELEASE = re.compile(r"1\.1\.0-rc\.(0|[1-9][0-9]*)")
+RELEASE = runpy.run_path(Path(__file__).with_name("_release_version.py"))["RELEASE_PATTERN"]
 GPU_UUID = re.compile(
     r"cuda:[0-9]+:GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 )

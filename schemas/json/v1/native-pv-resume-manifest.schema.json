@@ -1,0 +1,445 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NativePvResumeManifest",
+  "description": "Frozen native P/V recovery inputs, not numerical or quality qualification.",
+  "type": "object",
+  "properties": {
+    "plan": {
+      "description": "Exact full AlternatingPv request, including explicit parent level.",
+      "$ref": "#/$defs/NativeRefinementPlan"
+    },
+    "point": {
+      "description": "Untrusted emitted TNPJ prefix/TNPV binding; actual-parent replay required.",
+      "$ref": "#/$defs/NativePvResumePoint"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "plan",
+    "point"
+  ],
+  "$defs": {
+    "BlobId": {
+      "description": "Content identity for stored tensor or asset bytes.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "EvidenceReference": {
+      "description": "Evidence ancestry reference, not a self-approved quality/release verdict.",
+      "type": "object",
+      "properties": {
+        "root": {
+          "description": "BLAKE3 evidence root, not a blob id or package digest.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0
+          },
+          "maxItems": 32,
+          "minItems": 32
+        },
+        "run": {
+          "description": "Run identity of the evidence producer.",
+          "type": "string"
+        },
+        "span": {
+          "description": "Evidence span within that run.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "run",
+        "span",
+        "root"
+      ]
+    },
+    "ModelId": {
+      "description": "Content identity for one Tritium model level, not its package or provenance.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "NativeAdamWRecipe": {
+      "description": "Typed native AdamW settings; equations belong to the common training engine.",
+      "type": "object",
+      "properties": {
+        "beta1": {
+          "description": "First-moment decay in [0,1), excluding negative zero.",
+          "type": "number",
+          "format": "float"
+        },
+        "beta2": {
+          "description": "Second-moment decay in [0,1), excluding negative zero.",
+          "type": "number",
+          "format": "float"
+        },
+        "eps": {
+          "description": "Finite positive epsilon outside the square root.",
+          "type": "number",
+          "format": "float"
+        },
+        "lr": {
+          "description": "Finite positive learning rate.",
+          "type": "number",
+          "format": "float"
+        },
+        "weight_decay": {
+          "description": "Finite nonnegative decoupled decay with lr*decay <=1.",
+          "type": "number",
+          "format": "float"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "lr",
+        "beta1",
+        "beta2",
+        "eps",
+        "weight_decay"
+      ]
+    },
+    "NativePvResumePoint": {
+      "description": "Emitted P/V TNPV checkpoint and TNPJ prefix observations, not replay or durability.",
+      "type": "object",
+      "properties": {
+        "checkpoint": {
+          "description": "BLAKE3 of the exact saved TNPV checkpoint.",
+          "$ref": "#/$defs/BlobId"
+        },
+        "checkpoint_bytes": {
+          "description": "Exact saved TNPV length.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "completed_updates": {
+          "description": "Number of complete ordered P/V gradient frames.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "journal_prefix": {
+          "description": "BLAKE3 of the exact admitted TNPJ prefix, excluding any trailer/suffix.",
+          "$ref": "#/$defs/BlobId"
+        },
+        "journal_prefix_bytes": {
+          "description": "Exact header and complete frame byte count.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "plan": {
+          "description": "Exact frozen AlternatingPv request identity.",
+          "$ref": "#/$defs/NativeRefinementPlanId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "plan",
+        "completed_updates",
+        "journal_prefix",
+        "journal_prefix_bytes",
+        "checkpoint",
+        "checkpoint_bytes"
+      ]
+    },
+    "NativeRecoveryRecipe": {
+      "description": "Declared common recovery update, not the legacy Python diagonal refiner.",
+      "oneOf": [
+        {
+          "description": "Codes/allocation remain frozen; only actual scales are updated.",
+          "type": "object",
+          "properties": {
+            "ScaleOnly": {
+              "type": "object",
+              "properties": {
+                "optimizer": {
+                  "description": "Actual continuous update settings.",
+                  "$ref": "#/$defs/NativeAdamWRecipe"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "optimizer"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ScaleOnly"
+          ]
+        },
+        {
+          "description": "Alternating actual-scale and bounded logical-code updates.",
+          "type": "object",
+          "properties": {
+            "AlternatingPv": {
+              "type": "object",
+              "properties": {
+                "code_optimizer": {
+                  "description": "Code-proposal optimizer.",
+                  "$ref": "#/$defs/NativeAdamWRecipe"
+                },
+                "continuous_optimizer": {
+                  "description": "Continuous-scale optimizer.",
+                  "$ref": "#/$defs/NativeAdamWRecipe"
+                },
+                "max_code_change_fraction": {
+                  "description": "Positive fraction <=1 of logical units considered each code update.",
+                  "type": "number",
+                  "format": "float"
+                },
+                "max_relative_code_change": {
+                  "description": "Optional finite positive relative code movement bound.",
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "format": "float"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "continuous_optimizer",
+                "code_optimizer",
+                "max_code_change_fraction"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "AlternatingPv"
+          ]
+        }
+      ]
+    },
+    "NativeRefinementLimits": {
+      "description": "Logical limits, not complete process/device memory measurements.",
+      "type": "object",
+      "properties": {
+        "max_checkpoint_bytes": {
+          "description": "Physical bytes of one actual recovery checkpoint.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_package_bytes": {
+          "description": "Complete child package ceiling.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_state_bytes": {
+          "description": "Retained selected-owner state payload ceiling.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_workspace_bytes": {
+          "description": "Native update workspace ceiling.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max_state_bytes",
+        "max_workspace_bytes",
+        "max_checkpoint_bytes",
+        "max_package_bytes"
+      ]
+    },
+    "NativeRefinementParent": {
+      "description": "Exact recorded ancestry of the one explicitly selected parent level.",
+      "type": "object",
+      "properties": {
+        "evidence": {
+          "description": "Original admitted parent run/span/root, never a resealed projection.",
+          "$ref": "#/$defs/EvidenceReference"
+        },
+        "level": {
+          "description": "Explicit parent level; no default or prefix inference.",
+          "type": "string"
+        },
+        "model": {
+          "description": "Actual semantic identity of that selected level.",
+          "$ref": "#/$defs/ModelId"
+        },
+        "package": {
+          "description": "Exact parent file identity, not just its model values.",
+          "$ref": "#/$defs/PackageId"
+        },
+        "source": {
+          "description": "Parent's recorded original observation, not official source authentication.",
+          "$ref": "#/$defs/OriginalSourceId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "package",
+        "level",
+        "model",
+        "source",
+        "evidence"
+      ]
+    },
+    "NativeRefinementPlan": {
+      "description": "Complete native single-level recovery request; no implicit numerical defaults.",
+      "type": "object",
+      "properties": {
+        "child_level": {
+          "description": "Explicit name of the one complete child level.",
+          "type": "string"
+        },
+        "limits": {
+          "description": "Explicit logical resource bounds.",
+          "$ref": "#/$defs/NativeRefinementLimits"
+        },
+        "objective": {
+          "description": "Declared scalar objective content; not immutable callback authentication.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0
+          },
+          "maxItems": 32,
+          "minItems": 32
+        },
+        "owners": {
+          "description": "Sorted canonical selected owner names, not aliases or blob-dedup groups.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "parent": {
+          "description": "Actual parent binding.",
+          "$ref": "#/$defs/NativeRefinementParent"
+        },
+        "recipe": {
+          "description": "Declared exact native recovery parameters.",
+          "$ref": "#/$defs/NativeRecoveryRecipe"
+        },
+        "teacher_source": {
+          "description": "Optional declared teacher original source, never silently inferred.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OriginalSourceId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "training": {
+          "description": "One explicitly ordered window per requested update; repetitions are allowed.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/NativeRefinementWindow"
+          }
+        },
+        "validation": {
+          "description": "Ordered validation windows, disjoint from training content identities.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/NativeRefinementWindow"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "parent",
+        "child_level",
+        "owners",
+        "recipe",
+        "objective",
+        "training",
+        "validation",
+        "limits"
+      ]
+    },
+    "NativeRefinementPlanId": {
+      "description": "Native recovery request identity in its own versioned domain, not a legacy PV recipe hash.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "NativeRefinementWindow": {
+      "description": "Ordered declared raw-content window; its identity excludes role and weight.",
+      "type": "object",
+      "properties": {
+        "content": {
+          "description": "Canonical content identity; not proof of semantic dataset decontamination.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0
+          },
+          "maxItems": 32,
+          "minItems": 32
+        },
+        "weight": {
+          "description": "Finite positive declared objective weight.",
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "content",
+        "weight"
+      ]
+    },
+    "OriginalSourceId": {
+      "description": "Candidate identity of original named tensor/asset content, not fitted content or provenance.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "PackageId": {
+      "description": "Content identity for a Tritium package.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    }
+  }
+}

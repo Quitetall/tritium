@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NativeRecoveryRecipe",
+  "description": "Declared common recovery update, not the legacy Python diagonal refiner.",
+  "oneOf": [
+    {
+      "description": "Codes/allocation remain frozen; only actual scales are updated.",
+      "type": "object",
+      "properties": {
+        "ScaleOnly": {
+          "type": "object",
+          "properties": {
+            "optimizer": {
+              "description": "Actual continuous update settings.",
+              "$ref": "#/$defs/NativeAdamWRecipe"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "optimizer"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ScaleOnly"
+      ]
+    },
+    {
+      "description": "Alternating actual-scale and bounded logical-code updates.",
+      "type": "object",
+      "properties": {
+        "AlternatingPv": {
+          "type": "object",
+          "properties": {
+            "code_optimizer": {
+              "description": "Code-proposal optimizer.",
+              "$ref": "#/$defs/NativeAdamWRecipe"
+            },
+            "continuous_optimizer": {
+              "description": "Continuous-scale optimizer.",
+              "$ref": "#/$defs/NativeAdamWRecipe"
+            },
+            "max_code_change_fraction": {
+              "description": "Positive fraction <=1 of logical units considered each code update.",
+              "type": "number",
+              "format": "float"
+            },
+            "max_relative_code_change": {
+              "description": "Optional finite positive relative code movement bound.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "float"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "continuous_optimizer",
+            "code_optimizer",
+            "max_code_change_fraction"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "AlternatingPv"
+      ]
+    }
+  ],
+  "$defs": {
+    "NativeAdamWRecipe": {
+      "description": "Typed native AdamW settings; equations belong to the common training engine.",
+      "type": "object",
+      "properties": {
+        "beta1": {
+          "description": "First-moment decay in [0,1), excluding negative zero.",
+          "type": "number",
+          "format": "float"
+        },
+        "beta2": {
+          "description": "Second-moment decay in [0,1), excluding negative zero.",
+          "type": "number",
+          "format": "float"
+        },
+        "eps": {
+          "description": "Finite positive epsilon outside the square root.",
+          "type": "number",
+          "format": "float"
+        },
+        "lr": {
+          "description": "Finite positive learning rate.",
+          "type": "number",
+          "format": "float"
+        },
+        "weight_decay": {
+          "description": "Finite nonnegative decoupled decay with lr*decay <=1.",
+          "type": "number",
+          "format": "float"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "lr",
+        "beta1",
+        "beta2",
+        "eps",
+        "weight_decay"
+      ]
+    }
+  }
+}

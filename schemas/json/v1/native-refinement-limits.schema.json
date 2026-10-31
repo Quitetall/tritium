@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NativeRefinementLimits",
+  "description": "Logical limits, not complete process/device memory measurements.",
+  "type": "object",
+  "properties": {
+    "max_checkpoint_bytes": {
+      "description": "Physical bytes of one actual recovery checkpoint.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_package_bytes": {
+      "description": "Complete child package ceiling.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_state_bytes": {
+      "description": "Retained selected-owner state payload ceiling.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_workspace_bytes": {
+      "description": "Native update workspace ceiling.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "max_state_bytes",
+    "max_workspace_bytes",
+    "max_checkpoint_bytes",
+    "max_package_bytes"
+  ]
+}

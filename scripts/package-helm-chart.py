@@ -8,6 +8,7 @@ import gzip
 import io
 import os
 import re
+import runpy
 import stat
 import sys
 import tarfile
@@ -15,7 +16,7 @@ import tempfile
 from pathlib import Path, PurePosixPath
 
 
-RELEASE_PATTERN = re.compile(r"1\.1\.0-rc\.(0|[1-9][0-9]*)")
+RELEASE_PATTERN = runpy.run_path(Path(__file__).with_name("_release_version.py"))["RELEASE_PATTERN"]
 MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_CHART_BYTES = 64 * 1024 * 1024
 CANONICAL_GZIP_HEADER = bytes.fromhex("1f8b08000000000002ff")
@@ -218,7 +219,7 @@ def _publish(output: Path, payload: bytes) -> None:
 
 def package(source: Path, output: Path, release: str) -> None:
     if RELEASE_PATTERN.fullmatch(release) is None:
-        raise ChartPackageError("release must be canonical 1.1.0-rc.N")
+        raise ChartPackageError("release must be a canonical Cargo release or RC version")
     if output.name != f"tritium-{release}.tgz":
         raise ChartPackageError("chart output filename must bind release")
     source = source.absolute()

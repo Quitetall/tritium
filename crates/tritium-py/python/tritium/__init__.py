@@ -6,6 +6,15 @@ PyTorch is installed — the :mod:`tritium.torch` research facade, :mod:`tritium
 """
 
 from ._tritium import (
+    NativeModelConversion,
+    NativeModelRefinement,
+    NativePvPagedVerificationLimits,
+    NativePvPagedTrainingLimits,
+    NativePvPagedGradientLimits,
+    NativePvPagedResumeBundle,
+    NativeScaleResumeBundle,
+    NativePvResumeBundle,
+    convert_model_plan,
     KroneckerConflictError,
     KroneckerContractError,
     KroneckerEvidenceBuilder,
@@ -39,9 +48,18 @@ from ._tritium import (
     ste_quantize_vjp,
     ternary_matmul,
 )
-from . import onnx, portable, salt
+from . import onnx, portable, qtea, salt
 
 __all__ = [
+    "NativeModelConversion",
+    "NativeModelRefinement",
+    "NativePvPagedVerificationLimits",
+    "NativePvPagedTrainingLimits",
+    "NativePvPagedGradientLimits",
+    "NativePvPagedResumeBundle",
+    "NativeScaleResumeBundle",
+    "NativePvResumeBundle",
+    "convert_model_plan",
     "KroneckerConflictError",
     "KroneckerContractError",
     "KroneckerEvidenceBuilder",
@@ -77,18 +95,25 @@ __all__ = [
     "salt",
     "onnx",
     "portable",
+    "qtea",
 ]
 
 # The torch wrappers are optional: importing them requires PyTorch. Inference (Model/ternary_matmul)
-# and the raw op primitives work without torch.
-try:  # pragma: no cover - trivial import guard
+# and the raw op primitives work without torch. Once PyTorch is installed, do not
+# suppress ImportError from Tritium's facade: that would make a broken public
+# API look like a successful core-only import.
+import importlib.util as _importlib_util
+
+try:
     from . import autograd  # noqa: F401
     from . import torch  # noqa: F401
-    # ``tritium.nn`` imports estimator/ops modules from ``tritium.torch``.
-    # Load the facade first so the optional import guard cannot hide both
-    # packages behind a circular-import failure.
+    # ``tritium.nn`` imports estimator/ops modules from ``tritium.torch``;
+    # initialize that package before exposing the higher-level facade.
     from . import nn  # noqa: F401
 
     __all__.extend(["autograd", "nn", "torch"])
-except ImportError:
-    pass
+except ModuleNotFoundError as error:
+    # A missing optional dependency is allowed. If PyTorch is installed,
+    # preserve missing-module failures from its own or Tritium's imports.
+    if error.name != "torch" or _importlib_util.find_spec("torch") is not None:
+        raise

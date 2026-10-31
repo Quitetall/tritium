@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TensorCaps",
+  "description": "Declared execution and owned payload size for a specific semantic tensor.",
+  "type": "object",
+  "properties": {
+    "execution": {
+      "description": "Direct execution or dense emulation; never inferred from ISA flags.",
+      "$ref": "#/$defs/TensorExecution"
+    },
+    "payload_bytes": {
+      "description": "Bytes reported by the uploaded buffer, excluding allocator/handle\noverhead, scratch, KV, other tensors, and total model residency.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "execution",
+    "payload_bytes"
+  ],
+  "$defs": {
+    "TensorExecution": {
+      "description": "How a backend executes one semantic tensor combination (ADR 0044 D8/D9).",
+      "oneOf": [
+        {
+          "description": "Executes additive coefficients directly, or an originally dense tensor.\nThis does not assert SIMD, accelerator speed, or empirical qualification.",
+          "type": "string",
+          "const": "Native"
+        },
+        {
+          "description": "Materializes an additive tensor as dense weights for plain GEMM.\nRequires explicit evidence and memory admission before production use.",
+          "type": "string",
+          "const": "Emulated"
+        }
+      ]
+    }
+  }
+}

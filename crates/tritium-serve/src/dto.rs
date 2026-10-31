@@ -42,6 +42,46 @@ fn default_temperature() -> f32 {
     1.0
 }
 
+/// Tritium's typed source-template inputs, not arbitrary template keywords.
+/// A source template can ignore these inputs; they do not enforce output policy.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct ChatTemplateKwargs {
+    /// Exact source `enable_thinking` input; omission leaves it undefined.
+    /// A present null or nonboolean value is rejected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_thinking: Option<bool>,
+}
+
+impl<'de> Deserialize<'de> for ChatTemplateKwargs {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ObjectOnly;
+        impl<'de> serde::de::Visitor<'de> for ObjectOnly {
+            type Value = ChatTemplateKwargs;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an object with an optional boolean enable_thinking")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut enable_thinking = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key != "enable_thinking" {
+                        return Err(serde::de::Error::unknown_field(&key, &["enable_thinking"]));
+                    }
+                    if enable_thinking.is_some() {
+                        return Err(serde::de::Error::duplicate_field("enable_thinking"));
+                    }
+                    enable_thinking = Some(map.next_value::<bool>()?);
+                }
+                Ok(ChatTemplateKwargs { enable_thinking })
+            }
+        }
+        // Derived structs also accept sequences. The extension is object-only.
+        deserializer.deserialize_map(ObjectOnly)
+    }
+}
+
 /// `POST /v1/chat/completions` request body.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatRequest {
@@ -49,6 +89,10 @@ pub struct ChatRequest {
     pub model: String,
     /// Conversation messages.
     pub messages: Vec<ChatMessage>,
+    /// Optional Tritium source-template extension. Omission, null and an empty
+    /// object preserve source defaults. Explicit controls require source support.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
     /// Stream the response as SSE deltas.
     #[serde(default)]
     pub stream: bool,
@@ -261,6 +305,65 @@ impl ApiError {
                 param: param.map(str::to_owned),
                 code: None,
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod chat_controls_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn omitted_null_empty_and_boolean_controls_preserve_typed_meaning() {
+        for value in [
+            None,
+            Some(Value::Null),
+            Some(json!({})),
+            Some(json!({"enable_thinking":true})),
+            Some(json!({"enable_thinking":false})),
+        ] {
+            let mut body = json!({"model":"m","messages":[],"opaque_vendor_field":42});
+            if let Some(value) = value {
+                body["chat_template_kwargs"] = value;
+            }
+            let request: ChatRequest = serde_json::from_value(body.clone()).unwrap();
+            assert_eq!(
+                request.chat_template_kwargs.and_then(|v| v.enable_thinking),
+                body["chat_template_kwargs"]["enable_thinking"].as_bool()
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(ChatTemplateKwargs::default()).unwrap(),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn nested_controls_reject_unknown_duplicate_null_and_nonboolean_values() {
+        for value in [
+            json!(false),
+            json!([]),
+            json!({"enable_thinking":null}),
+            json!({"enable_thinking":"false"}),
+            json!({"enable_thinking":0}),
+            json!({"enable_thinking":[]}),
+            json!({"messages":[]}),
+            json!({"enable_thinking":false,"tools":[]}),
+        ] {
+            assert!(
+                serde_json::from_value::<ChatRequest>(
+                    json!({"model":"m","messages":[],"chat_template_kwargs":value.clone()})
+                )
+                .is_err(),
+                "accepted malformed controls: {value}"
+            );
+        }
+        for body in [
+            r#"{"model":"m","messages":[],"chat_template_kwargs":{"enable_thinking":false,"enable_thinking":true}}"#,
+            r#"{"model":"m","messages":[],"chat_template_kwargs":null,"chat_template_kwargs":{}}"#,
+        ] {
+            assert!(serde_json::from_str::<ChatRequest>(body).is_err());
         }
     }
 }

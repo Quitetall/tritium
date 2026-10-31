@@ -67,7 +67,7 @@ pub enum GgufError {
     UnsupportedVersion(u32),
     /// The buffer ended before a required field could be read.
     Truncated,
-    /// A declared string length exceeded the sane upper bound ([`MAX_STRING_LEN`]).
+    /// A declared string length exceeded the parser's string-length bound.
     StringTooLong,
     /// A tensor's dimension product, or a declared count, overflowed `u64`/`usize`.
     DimsOverflow,

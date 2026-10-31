@@ -35,6 +35,24 @@
 //! dispatch path — its production form is the per-ISA SIMD gather (deferred). The
 //! independent `M` rows are spread across `rayon`'s thread pool without changing
 //! per-row arithmetic, so results are deterministic regardless of thread count.
+//!
+//! ## Unified semantic tensors
+//!
+//! [`CpuBackend::upload_tensor`], [`CpuBackend::matmul`] and
+//! [`CpuBackend::embed_rows`] accept additive and dense semantic tensors. This
+//! path retains canonical D2/B3/S34 plane bytes and exact f16/f32 scales, or dense
+//! f32 values. Additive matmul executes add/subtract/skip directly over packed
+//! coefficients, with independent output rows parallelized. Basis transforms
+//! use the shared core; gather applies the inverse transform. Buffer byte counts
+//! include owned packed coefficients and stored-precision scales, not container bytes.
+//! The ISA flags above describe legacy packed kernel availability, not SIMD
+//! acceleration for these semantic operations; the packed arithmetic is scalar.
+//! [`CpuBackend::additive_matmul_input_vjp`] supplies the shared-reference input
+//! adjoint for additive handles with caller-owned row workspace. It is scalar,
+//! CPU-only and distinct from complete backend training or owner refinement.
+//! Packed stored-scale adjoints share the core geometry/gradient loop through
+//! [`CpuBackend::accumulate_additive_matmul_scale_vjp`] and
+//! [`CpuBackend::accumulate_additive_embed_scale_vjp`], without expanding weights.
 //
 // `linkme`'s `distributed_slice` expands to a static with a custom
 // `#[link_section]`, and the AVX2 kernel needs hand-written `unsafe` for its
@@ -45,13 +63,14 @@
 
 use core::any::Any;
 
-use tritium_core::{GemmShape, TernaryFormat, Trit};
+use tritium_core::{AdditiveAdjointSpan, GemmShape, TernaryFormat, Trit};
 use tritium_format::{
     TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row, unpack_tq2_0_row,
 };
 use tritium_runtime::BackendEntry;
 use tritium_spec::{
-    BackendError, DeviceBuffer, DeviceCaps, MpGemm, MpGemmProjectedVjp, TernaryBackend,
+    BackendError, DeviceBuffer, DeviceCaps, MpGemm, MpGemmProjectedVjp, TensorMatmul, TensorView,
+    TernaryBackend,
 };
 
 #[cfg(test)]
@@ -77,8 +96,12 @@ mod kernel;
 #[allow(unsafe_code)]
 mod simd;
 
+/// Scalar packed residual-bearing QTEA reference, independent of the offline fitter.
+pub mod qtea;
 /// Exact, allocation-accounted SALT V2 CPU semantic reference.
 pub mod salt_v2;
+mod semantic;
+pub use semantic::CpuScaleSnapshotBytes;
 
 /// Owned host-memory buffer of packed weight bytes.
 ///
@@ -172,6 +195,340 @@ impl CpuBackend {
         CpuBackend
     }
 
+    /// Create an immutable exact-scale version sharing an original packed root.
+    ///
+    /// Requires an owning Arc so the source handle and any original admission
+    /// lease survive old/new graphs. Snapshots of snapshots flatten to the
+    /// original root, retaining no obsolete overlay. Codes/geometry are not copied.
+    /// Scales must already be finite, nonnegative (not negative zero) and exactly
+    /// representable in their declared precision; no silent narrowing occurs.
+    ///
+    /// Validates before reserving/allocating new stored-scale bytes from `budget`.
+    /// This charges only the new scale buffer and retains, but does not create or
+    /// authenticate, parent admission. Independent budgets do not coordinate.
+    /// Returned byte fields distinguish shared root (including original scales),
+    /// owned scale bytes and reachable sum. `len_bytes()` reports the reachable
+    /// sum, not the incremental charge; summing snapshots double-counts roots.
+    /// Metadata/allocator capacity/RSS are excluded. No format/model identity,
+    /// optimizer action, complete refinement or Python training is produced.
+    ///
+    /// # Errors
+    /// Rejects dense/foreign/legacy or misreported handles, invalid scale values,
+    /// size overflow, allocation failure and insufficient budget without changing
+    /// the source or leaking a new reservation.
+    pub fn snapshot_additive_scales(
+        &self,
+        parent: &std::sync::Arc<dyn DeviceBuffer>,
+        scales: &[f32],
+        budget: &tritium_runtime::TensorPayloadBudget,
+    ) -> Result<(std::sync::Arc<dyn DeviceBuffer>, CpuScaleSnapshotBytes), BackendError> {
+        semantic::CpuTensor::snapshot_scales(parent, scales, budget)
+    }
+
+    /// Create a complete immutable packed version with new codes and scales.
+    ///
+    /// Candidate must retain the parent's exact layout, basis, law/precision,
+    /// codec, transport, plane count and per-tile counts. Full canonical symbols
+    /// and exact nonnegative stored scales are checked before allocating. Reuses
+    /// the packed uploader; no decoded or dense shadow is retained.
+    ///
+    /// Reserves the entire new packed payload, including compact auxiliary
+    /// buffers, from `budget` before allocation. The final owning handle releases
+    /// that reservation. `len_bytes()` is this exact owned charge, not shared
+    /// parent bytes or physical RSS. Caller candidate/optimizer/graph scratch and
+    /// allocator/metadata overhead are excluded; independent budgets do not
+    /// coordinate. Old graphs retain their old handles. The new handle retains
+    /// no parent or obsolete overlay, and supports ordinary inference/adjoints
+    /// and later scale/full snapshots. No optimizer, checkpoint, parent identity
+    /// authentication or complete-training qualification is produced.
+    ///
+    /// # Errors
+    /// Rejects foreign/dense/legacy/misreported or changed-root parents,
+    /// incompatible or noncanonical candidates, overflow, allocation failure or
+    /// exhausted budgets without changing old handles or leaking admission.
+    pub fn snapshot_additive_weights(
+        &self,
+        parent: &std::sync::Arc<dyn DeviceBuffer>,
+        candidate: tritium_core::AdditiveView<'_>,
+        budget: &tritium_runtime::TensorPayloadBudget,
+    ) -> Result<std::sync::Arc<dyn DeviceBuffer>, BackendError> {
+        semantic::CpuTensor::snapshot_weights(parent, candidate, budget)
+    }
+
+    /// Original-coordinate input adjoint for an uploaded CPU additive matrix.
+    ///
+    /// Matches [`tritium_core::reference_ternary_matmul_input_vjp`] using packed
+    /// symbols/scales directly. `output_gradients` has `batch * rows` elements,
+    /// `row_workspace` exactly `cols`, and `out` exactly `batch * cols`. Both
+    /// products and all lengths are checked before mutation. Zero batch leaves
+    /// the still-required row workspace untouched. No internal heap scratch or
+    /// dense matrix is allocated; finite-value policy remains the caller's.
+    /// This CPU-only input adjoint is not a weight/scale/code update or a claim
+    /// of complete backend training support. Existing inference caps are unchanged.
+    ///
+    /// # Errors
+    /// [`BackendError::InvalidInput`] for foreign/legacy handles, shape mismatch
+    /// or dimension overflow; [`BackendError::UnsupportedTensor`] for dense handles.
+    pub fn additive_matmul_input_vjp(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        output_gradients: &[f32],
+        batch: usize,
+        row_workspace: &mut [f32],
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        semantic::CpuTensor::additive_input_vjp(tensor, output_gradients, batch, row_workspace, out)
+    }
+
+    /// Actual stored-scale count of an admitted CPU additive handle.
+    ///
+    /// Metadata only, excluding derived tied scales; no payload decoding or
+    /// allocation. This is not a complete backend-training capability report.
+    /// # Errors
+    /// Foreign/legacy handles return InvalidInput; dense returns UnsupportedTensor.
+    pub fn additive_stored_scale_count(
+        &self,
+        tensor: &dyn DeviceBuffer,
+    ) -> Result<usize, BackendError> {
+        semantic::CpuTensor::additive_scale_count(tensor)
+    }
+
+    /// Compare actual immutable packed state with an exact decoded view.
+    ///
+    /// Checks layout/codec/basis/counts, stored scale bits and every coefficient
+    /// without allocating a decoded master. Linear in coefficient count; intended
+    /// for initial binding, not every optimizer step. This is numeric equality,
+    /// not package/source/model authentication or a qualification receipt.
+    /// # Errors
+    /// Invalid views/foreign/legacy/changed or misreported handles are refused;
+    /// dense handles return UnsupportedTensor.
+    pub fn additive_equals_view(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        view: tritium_core::AdditiveView<'_>,
+    ) -> Result<bool, BackendError> {
+        semantic::CpuTensor::additive_equals_view(tensor, view)
+    }
+
+    /// Accumulate packed matmul cotangents into actual stored-scale gradients.
+    ///
+    /// Matches [`tritium_core::accumulate_ternary_matmul_scale_vjp`] through its
+    /// shared checked plan, reading canonical symbols directly from this handle.
+    /// Inputs have batch*cols and batch*rows elements, row workspace exactly cols,
+    /// and f64 output exactly the stored-scale count. Adds in shared reference
+    /// order. No heap, dense or decoded-trit scratch; empty batch leaves buffers
+    /// untouched. Finite/overflow policy belongs to the caller. The immutable
+    /// handle may be shared with callers using independent buffers. No scale
+    /// update, code STE or full training/other-backend qualification is implied.
+    /// # Errors
+    /// InvalidInput for foreign/legacy handles, shapes or overflow;
+    /// UnsupportedTensor for dense handles. Refusal precedes buffer mutation.
+    pub fn accumulate_additive_matmul_scale_vjp(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        activations: &[f32],
+        output_gradients: &[f32],
+        batch: usize,
+        row_workspace: &mut [f32],
+        out: &mut [f64],
+    ) -> Result<(), BackendError> {
+        semantic::CpuTensor::additive_matmul_scale_vjp(
+            tensor,
+            activations,
+            output_gradients,
+            batch,
+            row_workspace,
+            out,
+        )
+    }
+
+    /// Accumulate packed embedding cotangents into actual stored-scale gradients.
+    ///
+    /// Matches [`tritium_core::accumulate_embed_scale_vjp`]: ids retain occurrence
+    /// order (including duplicates), cotangents are ids.len()*cols, workspace cols,
+    /// f64 output the stored-scale count. Uses forward basis on cotangents and
+    /// directly reads admitted packed symbols without allocation or mutation of
+    /// the handle. Every shape/index is checked before output/workspace mutation;
+    /// empty ids leave buffers untouched. Finite/overflow policy is the caller's.
+    /// # Errors
+    /// Same handle/shape refusals as the packed matmul scale adjoint, including
+    /// out-of-range ids. Existing inference capability reports remain unchanged.
+    pub fn accumulate_additive_embed_scale_vjp(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        ids: &[usize],
+        output_gradients: &[f32],
+        row_workspace: &mut [f32],
+        out: &mut [f64],
+    ) -> Result<(), BackendError> {
+        semantic::CpuTensor::additive_embed_scale_vjp(
+            tensor,
+            ids,
+            output_gradients,
+            row_workspace,
+            out,
+        )
+    }
+
+    /// Count present base-plane weight coordinates, including zero trits.
+    ///
+    /// Excludes pruned tiles and additional planes. No payload decode/allocation.
+    /// # Errors
+    /// Foreign, legacy, changed-root or misreported handles are InvalidInput;
+    /// dense handles are UnsupportedTensor.
+    pub fn additive_present_weight_count(
+        &self,
+        tensor: &dyn DeviceBuffer,
+    ) -> Result<usize, BackendError> {
+        semantic::CpuTensor::additive_weight_count(tensor)
+    }
+
+    /// Accumulate `dy * (B x)` into present stored-weight cotangents.
+    ///
+    /// Uses [`tritium_core::AdditiveWeightVjpPlan::matmul`] without reading codes
+    /// or scales. Output has additive_present_weight_count f64 values in compact
+    /// base-plane order; workspace is exactly columns f32. No heap or dense
+    /// master. This is not a per-trit STE or complete training qualification.
+    /// Finite/overflow policy belongs to the caller. Empty uses change nothing.
+    /// # Errors
+    /// Handle and complete shape/product preflight precede buffer mutation.
+    /// Handle refusals match additive_present_weight_count.
+    pub fn accumulate_additive_matmul_weight_vjp(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        activations: &[f32],
+        output_gradients: &[f32],
+        batch: usize,
+        row_workspace: &mut [f32],
+        out: &mut [f64],
+    ) -> Result<(), BackendError> {
+        semantic::CpuTensor::additive_matmul_weight_vjp(
+            tensor,
+            activations,
+            output_gradients,
+            batch,
+            row_workspace,
+            out,
+        )
+    }
+
+    /// Accumulate embedding `B dy` in occurrence order into present weights.
+    ///
+    /// Uses [`tritium_core::AdditiveWeightVjpPlan::embed`], including duplicate
+    /// indices and forward signed RHT. Scratch/output/count and numerical policy
+    /// match the matmul weight adjoint. No allocation or handle mutation.
+    /// # Errors
+    /// All indices/shapes and handle/root/claimed bytes are checked before
+    /// buffer mutation. Empty uses still require the exact workspace/output.
+    pub fn accumulate_additive_embed_weight_vjp(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        ids: &[usize],
+        output_gradients: &[f32],
+        row_workspace: &mut [f32],
+        out: &mut [f64],
+    ) -> Result<(), BackendError> {
+        semantic::CpuTensor::additive_embed_weight_vjp(
+            tensor,
+            ids,
+            output_gradients,
+            row_workspace,
+            out,
+        )
+    }
+
+    /// Accumulate one contiguous stored-scale span of a packed matmul VJP.
+    /// Per-coordinate order, basis and tied-plane factors match the full VJP;
+    /// only caller row/output buffers are used. No handle or payload mutation.
+    /// # Errors
+    /// InvalidInput for foreign/misreported handles, shapes or invalid spans;
+    /// UnsupportedTensor for dense handles. Refusal precedes buffer mutation.
+    pub fn accumulate_additive_matmul_scale_vjp_span(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        activations: &[f32],
+        output_gradients: &[f32],
+        batch: usize,
+        row_workspace: &mut [f32],
+        out: AdditiveAdjointSpan<'_>,
+    ) -> Result<(), BackendError> {
+        semantic::CpuTensor::additive_matmul_scale_vjp_span(
+            tensor,
+            activations,
+            output_gradients,
+            batch,
+            row_workspace,
+            out,
+        )
+    }
+
+    /// Accumulate one contiguous stored-scale span of a packed embedding VJP.
+    /// Duplicate ids retain occurrence order; forward basis matches the full VJP.
+    /// No allocation or handle mutation; this is not a new training operation.
+    /// # Errors
+    /// Same refusals as the matmul span, including all out-of-range indices.
+    pub fn accumulate_additive_embed_scale_vjp_span(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        ids: &[usize],
+        output_gradients: &[f32],
+        row_workspace: &mut [f32],
+        out: AdditiveAdjointSpan<'_>,
+    ) -> Result<(), BackendError> {
+        semantic::CpuTensor::additive_embed_scale_vjp_span(
+            tensor,
+            ids,
+            output_gradients,
+            row_workspace,
+            out,
+        )
+    }
+
+    /// Accumulate one contiguous present-weight span of a packed matmul VJP.
+    /// Uses the full VJP's compact base-plane coordinates and per-coordinate
+    /// accumulation order, without reading codes/scales or allocating a master.
+    /// # Errors
+    /// Handle/shape/span preflight precedes mutation, matching scale spans.
+    pub fn accumulate_additive_matmul_weight_vjp_span(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        activations: &[f32],
+        output_gradients: &[f32],
+        batch: usize,
+        row_workspace: &mut [f32],
+        out: AdditiveAdjointSpan<'_>,
+    ) -> Result<(), BackendError> {
+        semantic::CpuTensor::additive_matmul_weight_vjp_span(
+            tensor,
+            activations,
+            output_gradients,
+            batch,
+            row_workspace,
+            out,
+        )
+    }
+
+    /// Accumulate one contiguous present-weight span of a packed embedding VJP.
+    /// Repeated ids and signed forward basis match the full VJP. No allocation.
+    /// # Errors
+    /// Handle/shape/index/span preflight precedes output/workspace mutation.
+    pub fn accumulate_additive_embed_weight_vjp_span(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        ids: &[usize],
+        output_gradients: &[f32],
+        row_workspace: &mut [f32],
+        out: AdditiveAdjointSpan<'_>,
+    ) -> Result<(), BackendError> {
+        semantic::CpuTensor::additive_embed_weight_vjp_span(
+            tensor,
+            ids,
+            output_gradients,
+            row_workspace,
+            out,
+        )
+    }
+
     /// Unpack the `[N, K]` packed weights in `buf` to a flat `Vec<Trit>` (one
     /// `N·K` row-major buffer), validating the byte length against `shape`.
     ///
@@ -218,6 +575,51 @@ impl CpuBackend {
 }
 
 impl TernaryBackend for CpuBackend {
+    fn tensor_stream_plan(
+        &self,
+        metadata: tritium_spec::TensorMetadata<'_>,
+        encoding: tritium_spec::TensorStreamEncoding,
+    ) -> Result<Option<tritium_spec::TensorStreamPlan>, BackendError> {
+        semantic::CpuTensor::stream_plan(metadata, encoding)
+    }
+    fn upload_tensor_stream(
+        &self,
+        source: &dyn tritium_spec::TensorStreamSource,
+    ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        semantic::CpuTensor::upload_stream(source)
+    }
+    fn tensor_upload_plan(
+        &self,
+        metadata: tritium_spec::TensorMetadata<'_>,
+    ) -> Result<Option<tritium_spec::TensorUploadPlan>, BackendError> {
+        semantic::CpuTensor::plan(metadata)
+    }
+    fn tensor_caps(
+        &self,
+        tensor: TensorView<'_>,
+    ) -> Result<Option<tritium_spec::TensorCaps>, BackendError> {
+        semantic::CpuTensor::caps(tensor)
+    }
+
+    // Unified additive operations retain canonical packed planes; dense and
+    // shared basis arithmetic remain exact scalar f32. No SIMD claim follows.
+    fn upload_tensor(&self, tensor: TensorView<'_>) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        semantic::CpuTensor::upload(tensor)
+    }
+
+    fn matmul(&self, p: TensorMatmul<'_>) -> Result<(), BackendError> {
+        semantic::CpuTensor::matmul(p)
+    }
+
+    fn embed_rows(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        ids: &[usize],
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        semantic::CpuTensor::embed(tensor, ids, out)
+    }
+
     fn device_id(&self) -> &str {
         "cpu"
     }
@@ -316,9 +718,15 @@ impl TernaryBackend for CpuBackend {
 
         let GemmShape { m, n, k } = shape;
         // Validate operand lengths against the shape before any kernel runs.
-        if act.len() != m * k {
+        let act_len = m
+            .checked_mul(k)
+            .ok_or_else(|| BackendError::InvalidInput("M*K element count overflows".to_owned()))?;
+        let out_len = m
+            .checked_mul(n)
+            .ok_or_else(|| BackendError::InvalidInput("M*N element count overflows".to_owned()))?;
+        if act.len() != act_len {
             return Err(BackendError::ShapeMismatch {
-                expected: m * k,
+                expected: act_len,
                 got: act.len(),
             });
         }
@@ -328,9 +736,9 @@ impl TernaryBackend for CpuBackend {
                 got: scales.len(),
             });
         }
-        if out.len() != m * n {
+        if out.len() != out_len {
             return Err(BackendError::ShapeMismatch {
-                expected: m * n,
+                expected: out_len,
                 got: out.len(),
             });
         }
@@ -885,7 +1293,126 @@ mod tests {
         assert!(matches!(err, BackendError::ShapeMismatch { .. }), "{err:?}");
     }
 
+    #[test]
+    fn mpgemm_rejects_activation_count_overflow() {
+        let backend = CpuBackend::new();
+        let shape = GemmShape::new(usize::MAX / 2 + 1, 1, 2);
+        let packed = pack(&[Trit::ZERO; 2], shape, TernaryFormat::Tq2_0);
+        let weights = backend
+            .upload_weights(&packed, shape, TernaryFormat::Tq2_0)
+            .unwrap();
+        let mut out = [7.0];
+        let result = backend.mpgemm(MpGemm {
+            act: &[],
+            weights: weights.as_ref(),
+            scales: &[1.0],
+            shape,
+            format: TernaryFormat::Tq2_0,
+            out: &mut out,
+        });
+        assert!(matches!(result, Err(BackendError::InvalidInput(_))));
+        assert_eq!(out, [7.0]);
+    }
+
+    #[test]
+    fn mpgemm_rejects_output_count_overflow() {
+        let backend = CpuBackend::new();
+        let shape = GemmShape::new(usize::MAX / 2 + 1, 2, 0);
+        let weights = backend
+            .upload_weights(&[], shape, TernaryFormat::Tq2_0)
+            .unwrap();
+        let mut out = [7.0];
+        let result = backend.mpgemm(MpGemm {
+            act: &[],
+            weights: weights.as_ref(),
+            scales: &[1.0; 2],
+            shape,
+            format: TernaryFormat::Tq2_0,
+            out: &mut out,
+        });
+        assert!(matches!(result, Err(BackendError::InvalidInput(_))));
+        assert_eq!(out, [7.0]);
+    }
+
     // ---- boundary cases ------------------------------------------------------
+
+    fn assert_zero_geometry_matches_reference(shape: GemmShape, fused: bool) {
+        let backend = CpuBackend::new();
+        let trits = vec![Trit::ZERO; shape.n * shape.k];
+        let act = vec![0.0; shape.m * shape.k];
+        let scales: Vec<f32> = (0..shape.n)
+            .map(|index| if index % 2 == 0 { -2.0 } else { 1.5 })
+            .collect();
+        let mut expected = vec![17.0; shape.m * shape.n];
+        tritium_core::reference_mpgemm(&act, &trits, &scales, shape, &mut expected).unwrap();
+        for format in [TernaryFormat::Tq1_0, TernaryFormat::Tq2_0] {
+            let packed = pack(&trits, shape, format);
+            let weights = backend.upload_weights(&packed, shape, format).unwrap();
+            let mut out = vec![17.0; expected.len()];
+            let request = MpGemm {
+                act: &act,
+                weights: weights.as_ref(),
+                scales: &scales,
+                shape,
+                format,
+                out: &mut out,
+            };
+            if fused {
+                backend.mpgemm_with_act_quant(request).unwrap();
+            } else {
+                backend.mpgemm(request).unwrap();
+            }
+            assert_eq!(
+                out.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "{shape:?} {format:?} fused={fused}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_geometry_mpgemm_contraction_matches_reference() {
+        assert_zero_geometry_matches_reference(GemmShape::new(1, 1, 0), false);
+    }
+
+    #[test]
+    fn zero_geometry_fused_contraction_matches_reference() {
+        assert_zero_geometry_matches_reference(GemmShape::new(2, 3, 0), true);
+    }
+
+    #[test]
+    fn zero_geometry_fused_columns_matches_reference() {
+        assert_zero_geometry_matches_reference(GemmShape::new(1, 0, 1), true);
+    }
+
+    #[test]
+    fn zero_geometry_fused_batch_matches_reference() {
+        assert_zero_geometry_matches_reference(GemmShape::new(0, 3, 2), true);
+    }
+
+    #[test]
+    fn zero_geometry_retains_weight_identity_error() {
+        let backend = CpuBackend::new();
+        let weight_shape = GemmShape::new(1, 1, 3);
+        let packed = pack(&[Trit::ZERO; 3], weight_shape, TernaryFormat::Tq2_0);
+        let weights = backend
+            .upload_weights(&packed, weight_shape, TernaryFormat::Tq2_0)
+            .unwrap();
+        let error = backend
+            .mpgemm_with_act_quant(MpGemm {
+                act: &[0.0; 6],
+                weights: weights.as_ref(),
+                scales: &[],
+                shape: GemmShape::new(2, 0, 3),
+                format: TernaryFormat::Tq2_0,
+                out: &mut [],
+            })
+            .unwrap_err();
+        assert!(matches!(error, BackendError::InvalidInput(_)), "{error:?}");
+    }
 
     #[test]
     fn boundary_all_zero_weights_give_zero() {

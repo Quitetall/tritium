@@ -64,20 +64,33 @@ def _regular_files(root: Path) -> Iterable[Path]:
                 continue
 
 
-def _discover(root: Path) -> tuple[list[tuple[Path, int]], int, int]:
+def _discover(root: Path) -> tuple[list[tuple[Path, int]], int]:
     temps: list[tuple[Path, int]] = []
-    objects = 0
     seals = 0
     for path in _regular_files(root):
         name = path.name
         if name == "workspace.complete.tq36c":
             seals += 1
-        if path.parent.name == "objects" and path.suffix == ".s2kf":
-            objects += 1
         match = TEMP_RE.fullmatch(name)
         if match is not None:
             temps.append((path, int(match.group("pid"))))
-    return temps, objects, seals
+    return temps, seals
+
+
+def _campaign_progress(campaign: Path | None, fallback_seals: int) -> tuple[int, int]:
+    """Return (published additive slots, seals) for the selected campaign."""
+    if campaign is None:
+        return 0, fallback_seals
+    campaign_root = campaign.parent
+    slot_root = campaign_root / "additive-slots"
+    published = 0
+    if slot_root.is_dir() and not slot_root.is_symlink():
+        published = sum(
+            1 for path in _regular_files(slot_root) if path.suffix == ".tq36mref"
+        )
+    seal = campaign_root / "workspace.complete.tq36c"
+    sealed = int(seal.is_file() and not seal.is_symlink())
+    return published, sealed
 
 
 def _pid_alive(pid: int) -> bool:
@@ -210,11 +223,12 @@ def inspect(
     if target_bytes is not None and target_bytes < 0:
         raise StatusError("target bytes must be non-negative")
     root = _ordinary_dir(work_dir)
-    temps, objects, seals = _discover(root)
+    temps, fallback_seals = _discover(root)
     newest = max(temps, key=lambda item: item[0].stat().st_mtime_ns, default=None)
     staged = _record(root, *newest) if newest is not None else None
     campaign = _campaign_for(root, staged)
     campaign_totals = _campaign_totals(campaign) if campaign is not None else None
+    objects, seals = _campaign_progress(campaign, fallback_seals)
     rate: float | None = None
     eta: float | None = None
     campaign_eta: float | None = None
@@ -251,6 +265,10 @@ def inspect(
         "staged_record": staged,
         "staged_record_count": len(temps),
         "published_master_count": objects,
+        "expected_master_count": campaign_totals[2] if campaign_totals else None,
+        "remaining_master_count": (
+            max(campaign_totals[2] - objects, 0) if campaign_totals else None
+        ),
         "seal_count": seals,
         "bytes_per_second": rate,
         "target_bytes": target_bytes,
@@ -290,6 +308,13 @@ def main(argv: list[str] | None = None) -> int:
         staged = snapshot["staged_record"]
         print(f"status={snapshot['status']}")
         print(f"published_masters={snapshot['published_master_count']}")
+        expected = snapshot["expected_master_count"]
+        if expected is not None:
+            print(
+                "master_progress="
+                f"{snapshot['published_master_count']}/{expected}"
+            )
+            print(f"masters_remaining={snapshot['remaining_master_count']}")
         print(f"sealed={snapshot['seal_count']}")
         if staged is None:
             print("staged_record=none")

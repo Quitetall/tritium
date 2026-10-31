@@ -705,7 +705,7 @@ impl CurrentContextRestore {
         Ok(Self { previous })
     }
 
-    fn bind(ctx: &Arc<CudaContext>) -> Result<Self, BackendError> {
+    pub(super) fn bind(ctx: &Arc<CudaContext>) -> Result<Self, BackendError> {
         let restore = Self::capture()?;
         ctx.bind_to_thread()
             .map_err(|error| driver_err("bind external CUDA context", &error))?;

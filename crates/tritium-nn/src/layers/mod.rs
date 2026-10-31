@@ -11,25 +11,36 @@ mod mlp;
 mod packed_salt;
 mod projection;
 mod q2;
+#[cfg(feature = "host-qtea")]
+mod qtea;
+#[cfg(feature = "cuda")]
+mod qtea_cuda;
 mod qwen35_deltanet;
 mod qwen35_full_attention;
 mod salt;
 mod salt_v2_host;
+mod tensor;
 mod token_embedding;
 mod transformer_block;
 
 pub(crate) use packed_salt::{PackedSaltMatrix, PackedSaltMatrixBuilder};
+pub(crate) use qwen35_deltanet::RecurrentStateObserver;
 
 pub use dense::DenseLinear;
 pub use linear::TernaryLinear;
 pub use mlp::{Mlp, Relu2Mlp, SwiGluMlp};
 pub use projection::{Projection, ProjectionActivationMode};
 pub use q2::Q2Linear;
+#[cfg(feature = "host-qtea")]
+pub use qtea::HostQteaLinear;
+#[cfg(feature = "cuda")]
+pub use qtea_cuda::CudaQteaLinear;
 pub use qwen35_deltanet::{Qwen35DeltaNet, Qwen35DeltaNetCache, Qwen35DeltaNetWeights};
 pub use qwen35_full_attention::{
     Qwen35FullAttention, Qwen35FullAttentionCache, Qwen35FullAttentionWeights,
 };
 pub use salt::{ActivationPrecision, SaltLinear};
 pub use salt_v2_host::HostSaltV2Linear;
+pub use tensor::{Linear, TensorLoader};
 pub use token_embedding::TokenEmbedding;
 pub use transformer_block::{BlockDump, BlockScratch, TransformerBlock};

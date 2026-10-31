@@ -1020,13 +1020,16 @@ mod tests {
                     .as_slice()
             ),
             Projection::Salt(_)
+            | Projection::Tensor(_)
             | Projection::Ternary(_)
             | Projection::Q2(_)
             | Projection::HostSaltV2(_) => {
                 panic!("reference loader must dequantize to exact dense")
             }
+            #[cfg(feature = "host-qtea")]
+            Projection::HostQtea(_) => panic!("reference loader must dequantize to exact dense"),
             #[cfg(feature = "cuda")]
-            Projection::SaltV2(_) => {
+            Projection::SaltV2(_) | Projection::CudaQtea(_) => {
                 panic!("reference loader must not publish resident SALT V2")
             }
         }
@@ -1188,13 +1191,18 @@ mod tests {
                     .as_slice()
             ),
             Projection::Salt(_)
+            | Projection::Tensor(_)
             | Projection::Ternary(_)
             | Projection::Q2(_)
             | Projection::HostSaltV2(_) => {
                 panic!("reference loader must dequantize the head to exact dense")
             }
+            #[cfg(feature = "host-qtea")]
+            Projection::HostQtea(_) => {
+                panic!("reference loader must dequantize the head to exact dense")
+            }
             #[cfg(feature = "cuda")]
-            Projection::SaltV2(_) => {
+            Projection::SaltV2(_) | Projection::CudaQtea(_) => {
                 panic!("reference loader must not publish a resident SALT V2 head")
             }
         }

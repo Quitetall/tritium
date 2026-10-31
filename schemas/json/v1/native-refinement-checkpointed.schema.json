@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NativeRefinementCheckpointed",
+  "description": "Sparse durable-state observation; does not require a checkpoint every update.",
+  "type": "object",
+  "properties": {
+    "checkpoint": {
+      "description": "BLAKE3 of exact serialized checkpoint bytes.",
+      "$ref": "#/$defs/BlobId"
+    },
+    "checkpoint_bytes": {
+      "description": "Actual serialized checkpoint length.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "completed_updates": {
+      "description": "Strictly advancing update cursor into the declared ordered training list.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "owners": {
+      "description": "Complete sorted selected-owner stored-byte bindings. Layouts/count vectors\nare inherited from the parent, not copied into every checkpoint event.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/NativeRefinementTensorOutput"
+      }
+    },
+    "plan": {
+      "description": "Exact native request identity.",
+      "$ref": "#/$defs/NativeRefinementPlanId"
+    },
+    "state": {
+      "description": "Actual native state identity, not a legacy checkpoint digest.",
+      "$ref": "#/$defs/NativeRefinementStateId"
+    },
+    "state_payload_bytes": {
+      "description": "Logical retained selected-owner state payload bytes, not RSS.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "plan",
+    "completed_updates",
+    "state",
+    "checkpoint",
+    "checkpoint_bytes",
+    "state_payload_bytes",
+    "owners"
+  ],
+  "$defs": {
+    "BlobId": {
+      "description": "Content identity for stored tensor or asset bytes.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "NativeRefinementPlanId": {
+      "description": "Native recovery request identity in its own versioned domain, not a legacy PV recipe hash.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "NativeRefinementStateId": {
+      "description": "Scoped native checkpoint-content binding including request/cursor, not a model ID or legacy checkpoint digest.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "NativeRefinementTensorOutput": {
+      "description": "Compact output binding; exact storage interpretation is inherited from parent.",
+      "type": "object",
+      "properties": {
+        "content": {
+          "description": "Exact canonical stored-byte identity, not a semantic model ID.",
+          "$ref": "#/$defs/BlobId"
+        },
+        "name": {
+          "description": "Canonical tensor owner name.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "content"
+      ]
+    }
+  }
+}

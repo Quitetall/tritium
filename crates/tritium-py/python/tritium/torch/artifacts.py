@@ -378,17 +378,64 @@ def _load_profile(
 
 
 def load(
-    artifact: Union[os.PathLike[str], str],
+    artifact: Union[os.PathLike[str], str, "_tritium.NativeModelConversion"],
     *,
     device: Optional[str] = None,
     profile: str = "compact-v1",
+    model: Optional[Any] = None,
+    level: Optional[str] = None,
+    load_run_id: Optional[str] = None,
+    inplace: Optional[bool] = None,
+    format: Optional[str] = None,
+    max_package_bytes: Optional[int] = None,
+    max_evidence_bytes: Optional[int] = None,
+    input_gradients: Optional[bool] = None,
 ) -> Union[QuantizationResult, "RefinementResult", Any]:
     """Strictly reopen a two-profile Tritium PTQ bundle.
 
     Loading re-parses and hashes every package through the native seek-backed
     reader. Without ``device`` it returns artifact evidence. With ``device`` it
     additionally materializes the selected packed Qwen language runtime.
+    A typed NativeModelConversion or unqualified NativeModelRefinement is verified
+    at its declared admission scope. Explicit model, level,
+    load_run_id and inplace select the native packed CPU shell loader instead.
+    Explicit input_gradients=True enables input-only native CPU autograd with
+    immutable weights; it is not native refinement or parameter training.
     """
+    if input_gradients is not None and type(input_gradients) is not bool:
+        raise TypeError("input_gradients must be bool")
+    if input_gradients is not None and model is None:
+        raise TypeError("native input gradients require a model shell")
+    if format not in {None, "trit"}:
+        raise ValueError("explicit native format must be 'trit'")
+    native = isinstance(artifact, (_tritium.NativeModelConversion, _tritium.NativeModelRefinement))
+    if native or format == "trit" or model is not None or level is not None or load_run_id is not None or inplace is not None:
+        if device is not None or profile != "compact-v1":
+            raise TypeError("native load does not accept legacy device/profile selection")
+        if model is None and (level is not None or load_run_id is not None or inplace is not None):
+            raise TypeError("native execution requires a model shell, level, load_run_id and explicit inplace")
+        limits = {name: value for name, value in dict(
+            max_package_bytes=max_package_bytes, max_evidence_bytes=max_evidence_bytes,
+        ).items() if value is not None}
+        if native:
+            result = artifact
+            if model is None:
+                result.verify(**limits)
+        else:
+            requested = Path(artifact)
+            if requested.is_symlink() or not requested.is_dir():
+                raise ValueError("native artifact must be an ordinary directory")
+            result = _tritium._open_native_model(os.fspath(requested), **limits)
+        if model is None:
+            return result
+        if not isinstance(level, str) or not level or not isinstance(load_run_id, str) or not load_run_id:
+            raise TypeError("native execution requires level and load_run_id")
+        from .native_load import load_native_module
+
+        return load_native_module(model, result, level=level, load_run_id=load_run_id, inplace=inplace,
+                                  input_gradients=False if input_gradients is None else input_gradients, **limits)
+    if max_package_bytes is not None or max_evidence_bytes is not None:
+        raise TypeError("native byte limits require explicit native load selection")
     requested = Path(artifact)
     if requested.is_symlink():
         raise ValueError("artifact must be an ordinary Tritium bundle directory")
@@ -512,6 +559,13 @@ def _manifest_bytes(result: QuantizationResult) -> bytes:
 
 @overload
 def export(
+    result: "_tritium.NativeModelConversion", output_dir: Union[os.PathLike[str], str],
+    *, max_package_bytes: Optional[int] = None, max_evidence_bytes: Optional[int] = None,
+) -> "_tritium.NativeModelConversion": ...
+
+
+@overload
+def export(
     result: QuantizationResult, output_dir: Union[os.PathLike[str], str]
 ) -> ExportReceipt: ...
 
@@ -529,11 +583,17 @@ def export(
 
 
 def export(
-    result: Union[QuantizationResult, "QatHardResult", "RefinementResult"],
+    result: Union[QuantizationResult, "QatHardResult", "RefinementResult", "_tritium.NativeModelConversion"],
     output_dir: Union[os.PathLike[str], str],
-) -> Union[ExportReceipt, "QatHardArtifact", "RefinementResult"]:
+    *, max_package_bytes: Optional[int] = None, max_evidence_bytes: Optional[int] = None,
+) -> Union[ExportReceipt, "QatHardArtifact", "RefinementResult", "_tritium.NativeModelConversion"]:
     """Publish a typed PTQ or QAT-hard result without changing its claim."""
 
+    if isinstance(result, (_tritium.NativeModelConversion, _tritium.NativeModelRefinement)):
+        return result.export(os.fspath(output_dir), max_package_bytes=max_package_bytes,
+                             max_evidence_bytes=max_evidence_bytes)
+    if max_package_bytes is not None or max_evidence_bytes is not None:
+        raise TypeError("native export limits require a NativeModelConversion or NativeModelRefinement")
     from .qat import QatHardResult
 
     if isinstance(result, QatHardResult):

@@ -35,6 +35,7 @@ from .module_artifacts import (
 from .projection import TernaryPlane, expand_plane_scales
 from .ptq import _hash_value, _invoke_model, _source_model_digest
 from .refinement_core import RefinedWeight, refine_weight_diagonal
+from .native_refinement import NativeRefinementConfig, refine_native
 
 Pathish = Union[str, os.PathLike[str]]
 _MANIFEST = "refinement.json"
@@ -385,8 +386,11 @@ def _loss(
         return (
             F.kl_div(
                 F.log_softmax(student.float() / temperature, dim=-1),
-                F.softmax(teacher.float() / temperature, dim=-1),
+                # Avoid softmax -> log roundoff in the target branch: identical
+                # logits must have exact zero KL, not an invalid negative loss.
+                F.log_softmax(teacher.float() / temperature, dim=-1),
                 reduction="batchmean",
+                log_target=True,
             )
             * temperature**2
         )
@@ -496,7 +500,7 @@ def _build_scale_model(
             )
         store = _ScaleOnlyWeight(planes).to(source.weight.device)
         stores[reference.path] = store
-        for alias in reference.aliases:
+        for alias_index, alias in enumerate(reference.aliases):
             path = "" if alias == "weight" else alias.removesuffix(".weight")
             module = modules.get(path)
             replacement = replacement_by_module.get(id(module))
@@ -524,6 +528,10 @@ def _build_scale_model(
                         module=path,
                     )
                 replacement_by_module[id(module)] = replacement
+            if alias_index == 0:
+                # Own shared parameters once under a converted leaf. Registering
+                # bookkeeping on the root adds executable slots to Sequential.
+                replacement.add_module("_tritium_scale_store", store)
             replacements[path] = replacement
     root = model
     for path, replacement in replacements.items():
@@ -535,9 +543,6 @@ def _build_scale_model(
         for part in parts[:-1]:
             owner = owner._modules[part]
         owner._modules[parts[-1]] = replacement
-    # Register each shared scale store exactly once after graph replacement.
-    for index, store in enumerate(stores.values()):
-        root.add_module(f"_tritium_scale_store_{index}", store)
     if compute_dtype != torch.float32 and hasattr(
         root, "gradient_checkpointing_enable"
     ):
@@ -926,16 +931,26 @@ def load_refinement(artifact_dir: Pathish) -> RefinementResult:
 
 
 def refine(
-    parent: Union[ModuleQuantizationResult, RefinementResult],
+    parent: Union[ModuleQuantizationResult, RefinementResult, _tritium.NativeModelConversion],
     *,
     teacher: nn.Module,
     training: Iterable[Any],
     validation: Iterable[Any],
-    config: RefinementConfig,
+    config: Union[RefinementConfig, NativeRefinementConfig],
     work_dir: Pathish,
-) -> RefinementResult:
+    output_dir=None,
+    resume=None,
+    checkpoint_dir=None,
+    on_checkpoint=None,
+) -> Union[RefinementResult, _tritium.NativeModelRefinement]:
     """Refine a hard PTQ child while preserving explicit ancestry and claims."""
 
+    if isinstance(parent, (_tritium.NativeModelConversion, _tritium.NativeModelRefinement)):
+        return refine_native(parent, teacher=teacher, training=training, validation=validation,
+                             config=config, work_dir=work_dir, output_dir=output_dir, resume=resume,
+                             checkpoint_dir=checkpoint_dir, on_checkpoint=on_checkpoint)
+    if any(value is not None for value in (output_dir, resume, checkpoint_dir, on_checkpoint)):
+        raise TypeError("native-only refinement arguments cannot be used with legacy artifacts")
     if not isinstance(teacher, nn.Module):
         raise TypeError("refine teacher must be a torch.nn.Module")
     if not isinstance(config, RefinementConfig):
@@ -968,6 +983,11 @@ def refine(
     if requested.is_symlink():
         raise ValueError("refinement work_dir must not be a symlink")
     directory = requested.resolve()
+    if (
+        directory.is_relative_to(parent.artifact_dir)
+        or parent.artifact_dir.is_relative_to(directory)
+    ):
+        raise ValueError("refinement work_dir must not overlap its parent artifact")
     if (directory / _MANIFEST).exists():
         result = load_refinement(directory)
         expected = (
@@ -1016,23 +1036,35 @@ def refine(
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
     }[config.compute_dtype]
+    training_flags = tuple((module, module.training) for module in teacher.modules())
+    original_bindings = tuple(
+        (module, dict(module._parameters), dict(module._buffers))
+        for module, _ in training_flags
+    )
+    # Retain storage views, not cloned masters. Casting back to the old dtype
+    # cannot recover bits rounded by a lower-precision execution cast. Buffers
+    # and future-overwrite parameters may also be replaced by Module._apply.
     original_tensors = {
-        name: (tensor, tensor.dtype)
-        for name, tensor in (
+        id(tensor): (
+            tensor,
+            tensor.detach(),
+            tensor.grad if isinstance(tensor, nn.Parameter) else None,
+            tensor.grad.detach()
+            if isinstance(tensor, nn.Parameter) and tensor.grad is not None
+            else None,
+        )
+        for _, tensor in (
             *teacher.named_parameters(),
             *teacher.named_buffers(),
         )
         if tensor.is_floating_point() or tensor.is_complex()
     }
-    if compute_dtype != torch.float32:
-        # Exact source identity was admitted above. The recipe's lower-precision
-        # execution mode now applies to teacher and student alike, avoiding a
-        # resident FP32 teacher plus FP16 student duplicate on constrained GPUs.
-        teacher.to(dtype=compute_dtype)
-
-    teacher_was_training = teacher.training
-    teacher.eval()
     try:
+        if compute_dtype != torch.float32:
+            # Original storage must coexist with the execution cast until it is
+            # restored, including if a partially completed cast raises.
+            teacher.to(dtype=compute_dtype)
+        teacher.eval()
         parent_student, _ = _build_scale_model(
             teacher, conversion, compute_dtype=compute_dtype
         )
@@ -1159,13 +1191,18 @@ def refine(
         del initial_planes, best_planes
         gc.collect()
     finally:
-        teacher.train(teacher_was_training)
         if compute_dtype != torch.float32:
-            for tensor, dtype in original_tensors.values():
-                # `teacher.to` mutates tensor storage in place; restore the
-                # caller-owned module's exact floating/complex dtypes.
-                if tensor.dtype != dtype:
-                    tensor.data = tensor.data.to(dtype=dtype)
+            for tensor, data, gradient, gradient_data in original_tensors.values():
+                tensor.data = data
+                if isinstance(tensor, nn.Parameter):
+                    if gradient is not None:
+                        gradient.data = gradient_data
+                    tensor.grad = gradient
+            for module, parameters, buffers in original_bindings:
+                module._parameters.update(parameters)
+                module._buffers.update(buffers)
+        for module, training in training_flags:
+            module.training = training
     if after > before:
         raise TritiumError(
             "held-out predecessor retention failed",
@@ -1333,6 +1370,8 @@ def export_refinement(
     parent = target.parent.resolve(strict=True)
     if target.exists() or target.is_symlink():
         raise FileExistsError(f"output directory already exists: {target}")
+    if parent.is_relative_to(current.artifact_dir):
+        raise ValueError("refinement export must not be inside its source artifact")
     staging = Path(tempfile.mkdtemp(prefix=".tritium-refine-", dir=parent))
     published = False
     try:

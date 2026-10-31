@@ -1,0 +1,357 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NativeRefinementPlan",
+  "description": "Complete native single-level recovery request; no implicit numerical defaults.",
+  "type": "object",
+  "properties": {
+    "child_level": {
+      "description": "Explicit name of the one complete child level.",
+      "type": "string"
+    },
+    "limits": {
+      "description": "Explicit logical resource bounds.",
+      "$ref": "#/$defs/NativeRefinementLimits"
+    },
+    "objective": {
+      "description": "Declared scalar objective content; not immutable callback authentication.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "owners": {
+      "description": "Sorted canonical selected owner names, not aliases or blob-dedup groups.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "parent": {
+      "description": "Actual parent binding.",
+      "$ref": "#/$defs/NativeRefinementParent"
+    },
+    "recipe": {
+      "description": "Declared exact native recovery parameters.",
+      "$ref": "#/$defs/NativeRecoveryRecipe"
+    },
+    "teacher_source": {
+      "description": "Optional declared teacher original source, never silently inferred.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OriginalSourceId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "training": {
+      "description": "One explicitly ordered window per requested update; repetitions are allowed.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/NativeRefinementWindow"
+      }
+    },
+    "validation": {
+      "description": "Ordered validation windows, disjoint from training content identities.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/NativeRefinementWindow"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "parent",
+    "child_level",
+    "owners",
+    "recipe",
+    "objective",
+    "training",
+    "validation",
+    "limits"
+  ],
+  "$defs": {
+    "EvidenceReference": {
+      "description": "Evidence ancestry reference, not a self-approved quality/release verdict.",
+      "type": "object",
+      "properties": {
+        "root": {
+          "description": "BLAKE3 evidence root, not a blob id or package digest.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0
+          },
+          "maxItems": 32,
+          "minItems": 32
+        },
+        "run": {
+          "description": "Run identity of the evidence producer.",
+          "type": "string"
+        },
+        "span": {
+          "description": "Evidence span within that run.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "run",
+        "span",
+        "root"
+      ]
+    },
+    "ModelId": {
+      "description": "Content identity for one Tritium model level, not its package or provenance.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "NativeAdamWRecipe": {
+      "description": "Typed native AdamW settings; equations belong to the common training engine.",
+      "type": "object",
+      "properties": {
+        "beta1": {
+          "description": "First-moment decay in [0,1), excluding negative zero.",
+          "type": "number",
+          "format": "float"
+        },
+        "beta2": {
+          "description": "Second-moment decay in [0,1), excluding negative zero.",
+          "type": "number",
+          "format": "float"
+        },
+        "eps": {
+          "description": "Finite positive epsilon outside the square root.",
+          "type": "number",
+          "format": "float"
+        },
+        "lr": {
+          "description": "Finite positive learning rate.",
+          "type": "number",
+          "format": "float"
+        },
+        "weight_decay": {
+          "description": "Finite nonnegative decoupled decay with lr*decay <=1.",
+          "type": "number",
+          "format": "float"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "lr",
+        "beta1",
+        "beta2",
+        "eps",
+        "weight_decay"
+      ]
+    },
+    "NativeRecoveryRecipe": {
+      "description": "Declared common recovery update, not the legacy Python diagonal refiner.",
+      "oneOf": [
+        {
+          "description": "Codes/allocation remain frozen; only actual scales are updated.",
+          "type": "object",
+          "properties": {
+            "ScaleOnly": {
+              "type": "object",
+              "properties": {
+                "optimizer": {
+                  "description": "Actual continuous update settings.",
+                  "$ref": "#/$defs/NativeAdamWRecipe"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "optimizer"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ScaleOnly"
+          ]
+        },
+        {
+          "description": "Alternating actual-scale and bounded logical-code updates.",
+          "type": "object",
+          "properties": {
+            "AlternatingPv": {
+              "type": "object",
+              "properties": {
+                "code_optimizer": {
+                  "description": "Code-proposal optimizer.",
+                  "$ref": "#/$defs/NativeAdamWRecipe"
+                },
+                "continuous_optimizer": {
+                  "description": "Continuous-scale optimizer.",
+                  "$ref": "#/$defs/NativeAdamWRecipe"
+                },
+                "max_code_change_fraction": {
+                  "description": "Positive fraction <=1 of logical units considered each code update.",
+                  "type": "number",
+                  "format": "float"
+                },
+                "max_relative_code_change": {
+                  "description": "Optional finite positive relative code movement bound.",
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "format": "float"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "continuous_optimizer",
+                "code_optimizer",
+                "max_code_change_fraction"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "AlternatingPv"
+          ]
+        }
+      ]
+    },
+    "NativeRefinementLimits": {
+      "description": "Logical limits, not complete process/device memory measurements.",
+      "type": "object",
+      "properties": {
+        "max_checkpoint_bytes": {
+          "description": "Physical bytes of one actual recovery checkpoint.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_package_bytes": {
+          "description": "Complete child package ceiling.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_state_bytes": {
+          "description": "Retained selected-owner state payload ceiling.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_workspace_bytes": {
+          "description": "Native update workspace ceiling.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max_state_bytes",
+        "max_workspace_bytes",
+        "max_checkpoint_bytes",
+        "max_package_bytes"
+      ]
+    },
+    "NativeRefinementParent": {
+      "description": "Exact recorded ancestry of the one explicitly selected parent level.",
+      "type": "object",
+      "properties": {
+        "evidence": {
+          "description": "Original admitted parent run/span/root, never a resealed projection.",
+          "$ref": "#/$defs/EvidenceReference"
+        },
+        "level": {
+          "description": "Explicit parent level; no default or prefix inference.",
+          "type": "string"
+        },
+        "model": {
+          "description": "Actual semantic identity of that selected level.",
+          "$ref": "#/$defs/ModelId"
+        },
+        "package": {
+          "description": "Exact parent file identity, not just its model values.",
+          "$ref": "#/$defs/PackageId"
+        },
+        "source": {
+          "description": "Parent's recorded original observation, not official source authentication.",
+          "$ref": "#/$defs/OriginalSourceId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "package",
+        "level",
+        "model",
+        "source",
+        "evidence"
+      ]
+    },
+    "NativeRefinementWindow": {
+      "description": "Ordered declared raw-content window; its identity excludes role and weight.",
+      "type": "object",
+      "properties": {
+        "content": {
+          "description": "Canonical content identity; not proof of semantic dataset decontamination.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0
+          },
+          "maxItems": 32,
+          "minItems": 32
+        },
+        "weight": {
+          "description": "Finite positive declared objective weight.",
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "content",
+        "weight"
+      ]
+    },
+    "OriginalSourceId": {
+      "description": "Candidate identity of original named tensor/asset content, not fitted content or provenance.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "PackageId": {
+      "description": "Content identity for a Tritium package.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    }
+  }
+}

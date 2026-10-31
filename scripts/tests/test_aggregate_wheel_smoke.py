@@ -14,7 +14,8 @@ REVISION = "ab" * 20
 RELEASE = "1.1.0-rc.0"
 
 
-def write_matrix(root):
+def write_matrix(root, release=RELEASE):
+    version = release.replace("-rc.", "rc")
     for target, minors in MODULE.VERSIONS.items():
         for minor in minors:
             cell = f"{target}-cp3.{minor}"
@@ -34,16 +35,36 @@ def write_matrix(root):
                 "python_version": f"3.{minor}.7",
                 "host_os": host_os,
                 "host_arch": host_arch,
-                "wheel": f"pytritium-1.1.0rc0-cp39-abi3-{platform_tag}.whl",
+                "wheel": f"pytritium-{version}-cp39-abi3-{platform_tag}.whl",
                 "sha256": {"linux": "11", "win32": "22", "darwin": "33"}[host_os] * 32,
                 "bytes": 1234,
-                "version": "1.1.0rc0",
+                "version": version,
                 "platform_tag": platform_tag,
             }
             (root / f"{cell}.json").write_text(json.dumps(document), encoding="utf-8")
 
 
 class AggregateWheelSmokeTests(unittest.TestCase):
+    def test_final_and_rc_receipts_reload_only_for_their_exact_cohort(self):
+        for release in ("1.1.0", "1.2.3-rc.7", "0.1.0"):
+            with self.subTest(release=release), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                write_matrix(root, release)
+                receipt = MODULE.aggregate(root, REVISION, release, "format-fixture")
+                path = root / "receipt.json"
+                MODULE._atomic_write(path, receipt)
+                self.assertEqual(MODULE.validate_receipt(path, REVISION, release), receipt)
+                other = "1.1.0-rc.0" if release == "1.1.0" else "1.1.0"
+                with self.assertRaises(MODULE.AggregateError):
+                    MODULE.validate_receipt(path, REVISION, other)
+
+    def test_producer_rejects_rc_matrix_labeled_as_final_before_sealing(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            write_matrix(root)
+            with self.assertRaisesRegex(MODULE.AggregateError, "version differs from release cohort"):
+                MODULE.aggregate(root, REVISION, "1.1.0", "mismatch-fixture")
+
     def test_complete_exact_matrix_passes(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

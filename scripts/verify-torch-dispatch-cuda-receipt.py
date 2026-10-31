@@ -9,13 +9,14 @@ import json
 import math
 from pathlib import Path
 import re
-import subprocess
+import runpy
 import sys
 from typing import Any
 import xml.etree.ElementTree as ET
 
 
 SCHEMA = "tritium.torch-dispatch-cuda-qualification.v1"
+RELEASE_PATTERN = runpy.run_path(Path(__file__).with_name("_release_version.py"))["RELEASE_PATTERN"]
 SOURCE_PATH = "crates/tritium-py/tests/test_torch_dispatch.py"
 CUDA_TESTS = (
     "test_native_cuda_compiled_autocast_preserves_master_cache_and_backward",
@@ -165,14 +166,11 @@ def _git_blob(path: Path) -> str:
     return hashlib.sha1(f"blob {len(content)}\0".encode() + content).hexdigest()
 
 
+_git_result = runpy.run_path(Path(__file__).with_name("_qualification_git.py"))["git_result"]
+
+
 def git_blob_at(repo: Path, revision: str) -> str:
-    result = subprocess.run(
-        ["git", "rev-parse", f"{revision}:{SOURCE_PATH}"],
-        cwd=repo,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    result = _git_result(repo, "rev-parse", f"{revision}:{SOURCE_PATH}", error_type=ReceiptError)
     blob = result.stdout.strip()
     if result.returncode != 0 or re.fullmatch(r"[0-9a-f]{40}", blob) is None:
         raise ReceiptError("candidate revision lacks frozen dispatcher test source")
@@ -197,9 +195,7 @@ def validate(
         raise ReceiptError("receipt is not passed CUDA dispatcher evidence")
     if receipt["source_revision"] != revision:
         raise ReceiptError("receipt source revision differs from candidate")
-    if receipt["release"] != expected_release or re.fullmatch(
-        r"1\.1\.0-rc\.(0|[1-9][0-9]*)", expected_release
-    ) is None:
+    if receipt["release"] != expected_release or RELEASE_PATTERN.fullmatch(expected_release) is None:
         raise ReceiptError("receipt release differs from canonical v1.1 candidate")
     _string(receipt["run_id"], "receipt.run_id")
     _artifact(receipt["artifact"], expected_wheel)

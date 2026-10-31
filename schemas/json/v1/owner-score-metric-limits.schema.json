@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OwnerScoreMetricLimits",
+  "description": "Logical admission only, excluding source/tapes/metadata/solver/allocator/RSS.",
+  "type": "object",
+  "properties": {
+    "max_payload_bytes": {
+      "description": "Sum of logical cache payload bytes, counting each list position.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_reduction_entries": {
+      "description": "Conservative bound on reducer numerical f64 entries and row output.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_row_bytes": {
+      "description": "Maximum one reconstructed row's f64 output bytes.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_windows": {
+      "description": "Maximum ordered window count, including repeats and zero weights.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "max_windows",
+    "max_payload_bytes",
+    "max_row_bytes",
+    "max_reduction_entries"
+  ]
+}

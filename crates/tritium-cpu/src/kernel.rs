@@ -63,6 +63,11 @@ pub(crate) fn dispatch_mpgemm(
     if m == 0 || n == 0 {
         return Ok(());
     }
+    if k == 0 {
+        // Rayon chunks must be nonzero. The reference also preserves the
+        // empty-dot result's scaling, including signed zero and nonfinite scales.
+        return scalar_mpgemm(act, weights, scales, shape, out);
+    }
 
     // Split the M rows into chunks and run one kernel invocation per chunk in
     // parallel. `par_chunks_mut(k|n)` yields disjoint, non-overlapping slices, so
