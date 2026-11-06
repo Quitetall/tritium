@@ -149,11 +149,19 @@ class OciContractTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("schema_version: 1", startup)
-        self.assertIn("manifest.schema_version != 3", loader)
+        # The loader delegates to the shared descriptor; image labels must
+        # still match its actual admission rule, not a former inline spelling.
+        self.assertIn("LegacySaltV2BundleDescriptor as BundleManifest", loader)
+        validator = loader.split("fn validate_manifest(", 1)[1].split("\n}", 1)[0]
+        self.assertIn(".validate(QWEN36_27B_REVISION)", validator)
+        descriptor = (ROOT / "crates/tritium-schema/src/model_import.rs").read_text(encoding="utf-8")
+        admission = descriptor.split("impl LegacySaltV2BundleDescriptor", 1)[1]
+        schema = re.search(r"self\.schema_version\s*!=\s*(\d+)", admission).group(1)
+        self.assertEqual(schema, "3")
         for flavor in ("cpu", "cuda"):
             text = self.dockerfile(flavor)
             self.assertIn(f'org.opencontainers.image.version="{version}"', text)
-            self.assertIn('io.tritium.artifact.schema="3"', text)
+            self.assertIn(f'io.tritium.artifact.schema="{schema}"', text)
             self.assertIn('io.tritium.startup-receipt.schema="1"', text)
 
     def test_compose_enforces_runtime_controls(self):

@@ -11,7 +11,6 @@ from pathlib import Path
 import runpy
 import shutil
 import statistics
-import subprocess
 import tempfile
 from typing import Any
 
@@ -47,13 +46,11 @@ class QualificationError(ValueError):
     """Raw training performance traces cannot satisfy frozen admission."""
 
 
+_run_git = runpy.run_path(Path(__file__).with_name("_qualification_git.py"))["run_git"]
+
+
 def git_output(repo: Path, *args: str) -> str:
-    result = subprocess.run(
-        ["git", *args], cwd=repo, text=True, capture_output=True, check=False
-    )
-    if result.returncode != 0:
-        raise QualificationError(result.stderr.strip() or "git command failed")
-    return result.stdout.strip()
+    return _run_git(repo, *args, error_type=QualificationError)
 
 
 def require_clean_revision(repo: Path, revision: str) -> None:

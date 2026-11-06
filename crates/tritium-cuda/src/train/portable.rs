@@ -81,10 +81,11 @@ impl CudaTrainBackendV1 {
         let backend = CudaBackend::new(ordinal)?;
         let device_id = backend.device_id().to_owned();
         let device_name = backend.capabilities().device_name;
+        let physical_device = format!("{}:{device_name}", backend.physical_device_id());
         Ok(Self {
             backend,
             backend_id: format!("{BACKEND_FAMILY}:{device_id}"),
-            physical_device: format!("{device_id}:{device_name}"),
+            physical_device,
         })
     }
 

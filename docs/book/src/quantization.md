@@ -260,7 +260,7 @@ HESTIA Gate-C receipt on that same revision:
 ```sh
 cargo run --locked -p tritium-cli --features cuda -- \
   salt seal-hestia-gate-c \
-  --release 1.1.0-rc.1 \
+  --release 1.1.0-rc.2 \
   --source-revision "$(git rev-parse HEAD)" \
   --output /evidence/stage7/hestia-gate-c.json \
   --cuda-device 0

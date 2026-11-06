@@ -11,6 +11,8 @@ pub use selected_allocation::{
     Qwen36OutputScopeBindingReceipt, Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt,
     Qwen36PackageAdmittedCampaignStore, Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger,
     Qwen36PackageScaleOnlyCampaignStore, Qwen36PackageVisitError, Qwen36PvParentContext,
+    Qwen36RefinedCandidateExecutionReceipt, Qwen36RefinedCandidateReplay,
+    Qwen36ScaleRefitWindowError,
 };
 pub use selected_allocation::{
     Qwen36AllocatedCampaignStore, Qwen36PhysicalAllocationError, Qwen36SelectedAllocationBindError,
@@ -2654,24 +2656,29 @@ mod tests {
             SaltV2MasterTensorEncoder, SaltV2MasterTrack, SaltV2PrefixLoss,
         },
         salt_v2_package::{
-            SaltV2Package, SaltV2Plane, SaltV2StreamTensorSpec, SaltV2Tensor, SaltV2Tile,
-            SaltV2Transform, SaltV2UniformRateModel, write_salt_v2_package,
+            SaltV2Package, SaltV2PackageReader, SaltV2Plane, SaltV2StreamTensorSpec, SaltV2Tensor,
+            SaltV2Tile, SaltV2Transform, SaltV2UniformRateModel, write_salt_v2_package,
         },
     };
     #[cfg(feature = "cuda")]
     use tritium_nn::{
-        ArchSpec, DenseLinear, DevicePvRecoverySession, Mlp, MlpKind, ModelConfig, ModelWeights,
-        Projection, SwiGluMlp, TiedSwiGluTrainingModel, TokenEmbedding, TransformerBlock,
+        ArchSpec, DevicePvRecoverySession, Mlp, MlpKind, ModelConfig, ModelWeights, SwiGluMlp,
+        TiedSwiGluTrainingModel, TokenEmbedding, TransformerBlock,
     };
     use tritium_nn::{
-        NnError, QWEN36_27B_REVISION, Qwen35CheckpointConfig, Qwen35TensorSchemaRole,
-        Qwen35TensorStreamError, qwen35_language_mtp_tensor_schema,
+        DenseLinear, NnError, Projection, QWEN36_27B_REVISION, Qwen35CheckpointConfig,
+        Qwen35SaltV2LanguageMtpModel, Qwen35TensorSchemaRole, Qwen35TensorStreamError,
+        qwen35_language_mtp_tensor_schema,
     };
     use tritium_quantize::{
-        ByteDelta, NestedProfileBudgets, OutputObjectiveWeights, OutputReconstructionAccumulator,
-        OutputReconstructionSchedule, OutputReconstructionScope, OutputReconstructionSpec,
-        PhysicalBytes, ProfileBudget, Qwen35SourceDtype, Qwen35TensorRole, Qwen35TensorScope,
-        SaltV2Profile, select_output_reconstruction,
+        ActivationCache, ActivationCacheBuilder, ActivationCacheSpec, ActivationChunk,
+        ActivationDType, ActivationDigest, ByteDelta, FixedTritScaleUpdateCandidateBuilder,
+        NestedProfileBudgets, OutputCandidateReceipt, OutputObjectiveWeights,
+        OutputReconstructionAccumulator, OutputReconstructionError, OutputReconstructionReceipt,
+        OutputReconstructionScaleCandidate, OutputReconstructionSchedule,
+        OutputReconstructionScope, OutputReconstructionSpec, PhysicalBytes, ProfileBudget,
+        Qwen35SourceDtype, Qwen35TensorRole, Qwen35TensorScope, SaltV2Profile,
+        output_reconstruction_activation_digest, select_output_reconstruction,
     };
     #[cfg(feature = "cuda")]
     use tritium_train::{
@@ -3517,6 +3524,88 @@ mod tests {
         selected.canonical_bytes().expect("canonical TSV2OUT v3")
     }
 
+    fn qwen_refined_output_reconstruction_bytes(
+        model: &Qwen35SaltV2LanguageMtpModel,
+        spec: &OutputReconstructionSpec,
+        candidate: OutputReconstructionScaleCandidate<'_>,
+        scope_batches: &[(&[u32], &[bool])],
+    ) -> OutputCandidateReceipt {
+        let mut block_outputs = Vec::new();
+        model
+            .try_visit_untrusted_block_outputs(
+                scope_batches.iter().map(|(tokens, _)| *tokens),
+                |block| {
+                    block_outputs.push((
+                        block.batch_index(),
+                        block.block_index(),
+                        block.hidden_size(),
+                        block.hidden_states().to_vec(),
+                    ));
+                    Ok::<_, Infallible>(())
+                },
+            )
+            .expect("collect refined block outputs");
+        let mut final_logits = Vec::new();
+        model
+            .try_visit_untrusted_final_logits(
+                scope_batches.iter().map(|(tokens, _)| *tokens),
+                |batch| {
+                    final_logits.push(batch.logits().to_vec());
+                    Ok::<_, Infallible>(())
+                },
+            )
+            .expect("collect refined final logits");
+
+        let mut accumulator = OutputReconstructionAccumulator::new(
+            spec,
+            *candidate.candidate_id(),
+            candidate.initialization_seed(),
+        )
+        .expect("start refined output candidate");
+        for scope in spec.scopes() {
+            for (batch_index, (tokens, mask)) in scope_batches.iter().enumerate() {
+                let batch_index = u32::try_from(batch_index).expect("fixture batch index");
+                match scope {
+                    OutputReconstructionScope::Block { end, .. } => {
+                        let block_index = end.checked_sub(1).expect("nonempty block scope");
+                        let (_, _, hidden_size, values) = block_outputs
+                            .iter()
+                            .find(|(batch, block, _, _)| {
+                                *batch == u64::from(batch_index) && *block == block_index
+                            })
+                            .expect("scope endpoint output");
+                        accumulator
+                            .observe(
+                                *scope,
+                                batch_index,
+                                tokens.len(),
+                                *hidden_size,
+                                mask,
+                                values,
+                                values,
+                            )
+                            .expect("observe refined block output");
+                    }
+                    OutputReconstructionScope::FinalLogits => {
+                        let logits = &final_logits[usize::try_from(batch_index).unwrap()];
+                        accumulator
+                            .observe(
+                                *scope,
+                                batch_index,
+                                1,
+                                logits.len(),
+                                &[true],
+                                logits,
+                                logits,
+                            )
+                            .expect("observe refined final logits");
+                    }
+                }
+            }
+        }
+        accumulator.finish().unwrap()
+    }
+
     fn legacy_output_reconstruction_bytes(v3: &[u8]) -> Vec<u8> {
         const HEADER_BYTES: usize = 112;
         const V2_CANDIDATE_BYTES: usize = 272;
@@ -3631,6 +3720,8 @@ mod tests {
             .expect("open sealed CPU execution session");
         let first = [1_u32, 2];
         let second = [3_u32];
+        let first_mask = [true, true];
+        let second_mask = [true];
         let mut observed = 0_u64;
         let mut runtime_logits = Vec::new();
         let receipt = session
@@ -3659,9 +3750,41 @@ mod tests {
         assert_eq!(receipt.token_count(), 3);
         assert_eq!(receipt.logit_count(), 256);
 
+        let activation_caches = (0..2_u32)
+            .map(|layer_index| {
+                let cache_spec = ActivationCacheSpec::new(
+                    layer_index,
+                    format!("model.language_model.layers.{layer_index}.input"),
+                    3,
+                    128,
+                    ActivationDType::Float32,
+                    ActivationDigest::from_bytes(*receipt.token_stream_digest()),
+                    3,
+                )
+                .expect("valid admitted activation fixture spec");
+                let mut cache = ActivationCacheBuilder::new(cache_spec.clone());
+                cache
+                    .ingest(
+                        ActivationChunk::new(
+                            &cache_spec,
+                            0,
+                            3,
+                            vec![0.0; 3 * 128],
+                            vec![true; 3],
+                            vec![2, 3],
+                        )
+                        .expect("valid aligned activation fixture chunk"),
+                    )
+                    .expect("ingest activation fixture");
+                cache.finalize().expect("finalize activation fixture")
+            })
+            .collect::<Vec<ActivationCache>>();
+        let activation_digest =
+            output_reconstruction_activation_digest(activation_caches.as_slice()).unwrap();
+
         let output_spec = OutputReconstructionSpec::new(
             completion.source_model_id(),
-            [121; 32],
+            activation_digest,
             *receipt.token_stream_digest(),
             [122; 32],
             OutputReconstructionSchedule::SlidingWindows {
@@ -3674,9 +3797,182 @@ mod tests {
             1,
         )
         .expect("output reconstruction spec");
+        let refined_spec = OutputReconstructionSpec::new(
+            completion.source_model_id(),
+            activation_digest,
+            *receipt.token_stream_digest(),
+            [122; 32],
+            OutputReconstructionSchedule::SlidingWindows {
+                block_count: 2,
+                window_size: 2,
+                stride: 1,
+            },
+            OutputObjectiveWeights::new(1.0, 0.0, 1.0, 1.0).expect("output objective"),
+            2,
+            2,
+        )
+        .expect("two-restart refined output spec");
         let candidate_id = receipt
             .output_candidate_id(&output_spec)
             .expect("campaign-bound candidate identity");
+
+        let projection_name = "model.language_model.layers.0.mlp.gate_proj.weight";
+        let teacher =
+            Projection::Dense(DenseLinear::new_exact(vec![0.0; 128 * 128], 128, 128).unwrap());
+        let mut fitted_candidates = Vec::new();
+        for seed in [7, 11] {
+            let mut invalid_parent = SaltV2PackageReader::new_strict(
+                std::fs::File::open(bundle.join("compact.tsalt2")).unwrap(),
+            )
+            .expect("open parent for candidate-order rejection");
+            assert!(matches!(
+                session.fit_scale_refit_candidate(
+                    &receipt,
+                    &refined_spec,
+                    activation_caches.as_slice(),
+                    &[(0, 2), (2, 1)],
+                    1 << 20,
+                    &[
+                        (projection_name, 0, 0, &teacher),
+                        (projection_name, 0, 0, &teacher),
+                    ],
+                    seed,
+                    8,
+                    &mut invalid_parent,
+                ),
+                Err(Qwen36ScaleRefitWindowError::Fit(
+                    OutputReconstructionError::NonCanonicalScaleUpdateOrder
+                ))
+            ));
+            let mut fit_builder = FixedTritScaleUpdateCandidateBuilder::new(
+                &refined_spec,
+                receipt.package_id().as_bytes(),
+                seed,
+            );
+            assert!(fit_builder.is_bound_to(&refined_spec, receipt.package_id().as_bytes()));
+            let mut fit_parent = SaltV2PackageReader::new_strict(
+                std::fs::File::open(bundle.join("compact.tsalt2")).unwrap(),
+            )
+            .expect("open exact refit parent");
+            let tensor_index = fit_parent
+                .tensor_names_encoded_order()
+                .position(|name| name == projection_name)
+                .expect("projection in package tensor order");
+            let tensor_info = fit_parent
+                .tensor_info(projection_name)
+                .expect("projection metadata");
+            let output_width = usize::try_from(tensor_info.dims()[0]).unwrap();
+            let scale_group_size = tensor_info.scale_group_size();
+            let codec = fit_parent.codec();
+            let mut plane_started = false;
+            fit_parent
+                .visit_packed_tensor(projection_name, |plane| {
+                    if !plane_started {
+                        fit_builder
+                            .begin_packed_tile_plane(
+                                tensor_index,
+                                codec,
+                                plane,
+                                output_width,
+                                scale_group_size,
+                                8,
+                            )
+                            .unwrap();
+                        plane_started = true;
+                    }
+                })
+                .unwrap();
+            fit_parent.verify_unchanged().unwrap();
+            assert!(matches!(
+                session.observe_scale_refit_scheduled_windows(
+                    &receipt,
+                    &refined_spec,
+                    activation_caches.as_slice(),
+                    &[(0, 3)],
+                    1 << 20,
+                    projection_name,
+                    &teacher,
+                    &mut fit_builder,
+                ),
+                Err(Qwen36ScaleRefitWindowError::Fit(
+                    OutputReconstructionError::InvalidCount
+                ))
+            ));
+            assert!(matches!(
+                session.observe_scale_refit_scheduled_windows(
+                    &receipt,
+                    &refined_spec,
+                    activation_caches.as_slice(),
+                    &[(0, 2), (1, 2)],
+                    1 << 20,
+                    projection_name,
+                    &teacher,
+                    &mut fit_builder,
+                ),
+                Err(Qwen36ScaleRefitWindowError::Fit(
+                    OutputReconstructionError::InvalidGeometry
+                ))
+            ));
+            let mut candidate_parent = SaltV2PackageReader::new_strict(
+                std::fs::File::open(bundle.join("compact.tsalt2")).unwrap(),
+            )
+            .expect("reopen exact parent for production candidate fitter");
+            let candidate = session
+                .fit_scale_refit_candidate(
+                    &receipt,
+                    &refined_spec,
+                    activation_caches.as_slice(),
+                    &[(0, 2), (2, 1)],
+                    1 << 20,
+                    &[
+                        (projection_name, 0, 0, &teacher),
+                        (projection_name, 1, 0, &teacher),
+                    ],
+                    seed,
+                    8,
+                    &mut candidate_parent,
+                )
+                .expect("production B3 multi-plane candidate fitter");
+            fitted_candidates.push(candidate);
+        }
+        assert!(
+            fitted_candidates
+                .iter()
+                .all(|candidate| candidate.updates().len() == 2)
+        );
+        let first_scale_candidate = fitted_candidates[0]
+            .as_scale_candidate(&refined_spec)
+            .expect("fitted candidate retains its frozen spec identity");
+        assert_eq!(
+            first_scale_candidate.parent_package_digest(),
+            receipt.package_id().as_bytes()
+        );
+
+        // The scale-update candidate identity commits the actual fixed-trit
+        // updates, unlike the parent execution-derived label. Base-model output
+        // evidence must therefore be rejected for this child candidate.
+        assert_ne!(first_scale_candidate.candidate_id(), &candidate_id);
+        let mislabeled_candidate_bytes = qwen_output_reconstruction_bytes(
+            &output_spec,
+            *first_scale_candidate.candidate_id(),
+            &[first.as_slice(), second.as_slice()],
+            128,
+            &runtime_logits,
+        );
+        assert!(matches!(
+            session.bind_output_reconstruction_scopes(
+                &output_spec,
+                &mislabeled_candidate_bytes,
+                &receipt,
+                [
+                    (first.as_slice(), first_mask.as_slice()),
+                    (second.as_slice(), second_mask.as_slice()),
+                ],
+            ),
+            Err(Qwen36FinalLogitsOutputBindingError::Runtime(
+                NnError::Provenance(_)
+            ))
+        ));
         let output_bytes = qwen_output_reconstruction_bytes(
             &output_spec,
             candidate_id,
@@ -3684,12 +3980,118 @@ mod tests {
             128,
             &runtime_logits,
         );
-        let first_mask = [true, true];
-        let second_mask = [true];
         let scope_batches = [
             (first.as_slice(), first_mask.as_slice()),
             (second.as_slice(), second_mask.as_slice()),
         ];
+        let mut wrong_parent =
+            SaltV2PackageReader::new_strict(Cursor::new(fixture_selected_package(true)))
+                .expect("open unrelated valid package");
+        let wrong_parent_result = session.materialize_scale_update_candidate_child(
+            &receipt,
+            &refined_spec,
+            &fitted_candidates[0],
+            &mut wrong_parent,
+            Cursor::new(Vec::new()),
+        );
+        assert!(matches!(
+            wrong_parent_result,
+            Err(Qwen36ExecutionVisitError::Runtime(NnError::Provenance(_)))
+        ));
+
+        let mut output_candidates = Vec::new();
+        let mut child_artifacts = Vec::new();
+        for fitted in &fitted_candidates {
+            let scale_candidate = fitted
+                .as_scale_candidate(&refined_spec)
+                .expect("open exact fitted restart");
+            let mut parent_package = SaltV2PackageReader::new_strict(
+                std::fs::File::open(bundle.join("compact.tsalt2")).unwrap(),
+            )
+            .expect("open refined parent package");
+            let (child_output, child_lineage) = session
+                .materialize_scale_update_candidate_child(
+                    &receipt,
+                    &refined_spec,
+                    fitted,
+                    &mut parent_package,
+                    Cursor::new(Vec::new()),
+                )
+                .expect("admitted session writes immutable refined child");
+            let child_package_path = bundle.join(format!(
+                "compact.refined-{}.tsalt2",
+                scale_candidate.initialization_seed()
+            ));
+            fs::write(&child_package_path, child_output.into_inner())
+                .expect("persist immutable refined child");
+            let child_model =
+                Qwen35SaltV2LanguageMtpModel::load_bundle_scale_update_child_test_fixture(
+                    &bundle,
+                    "compact-v1",
+                    &child_package_path,
+                    child_lineage,
+                    Box::new(tritium_cpu::CpuBackend::new()),
+                )
+                .expect("load refined child fixture");
+            output_candidates.push(qwen_refined_output_reconstruction_bytes(
+                &child_model,
+                &refined_spec,
+                scale_candidate,
+                &scope_batches,
+            ));
+            child_artifacts.push((child_package_path, child_lineage));
+        }
+        let selected_output = select_output_reconstruction(&refined_spec, output_candidates)
+            .expect("select among actual child replays");
+        let selected_fit = selected_output
+            .selected_fitted_scale_update_candidate(
+                &refined_spec,
+                receipt.package_id().as_bytes(),
+                &fitted_candidates,
+            )
+            .expect("selected output receipt maps to exact parent-bound fit");
+        let selected_index = fitted_candidates
+            .iter()
+            .position(|candidate| candidate.candidate_id() == selected_fit.candidate_id())
+            .expect("selected fit belongs to materialized child set");
+        let (child_package_path, child_lineage) = &child_artifacts[selected_index];
+        let scale_candidate = selected_fit
+            .as_scale_candidate(&refined_spec)
+            .expect("reopen selected fitted child candidate");
+        let refined_output_bytes = selected_output
+            .canonical_bytes()
+            .expect("canonical selected output receipt");
+        let refined_receipt = session
+            .replay_refined_candidate_test_fixture(Qwen36RefinedCandidateReplay {
+                parent_execution: &receipt,
+                bundle_dir: &bundle,
+                child_package_path,
+                lineage: *child_lineage,
+                spec: &refined_spec,
+                output_bytes: &refined_output_bytes,
+                scale_candidate,
+                scope_batches: &scope_batches,
+            })
+            .expect("replay and admit exact refined child");
+        assert_eq!(
+            refined_receipt.parent_package_id(),
+            receipt.package_id().as_bytes()
+        );
+        assert_eq!(
+            refined_receipt.child_package_id(),
+            child_lineage.child_package_id().as_bytes()
+        );
+        assert_eq!(
+            refined_receipt.child_lineage_id(),
+            &child_lineage.lineage_id()
+        );
+        let parsed_refined_output =
+            OutputReconstructionReceipt::from_canonical_bytes(&refined_spec, &refined_output_bytes)
+                .expect("reopen refined output receipt");
+        assert_eq!(
+            refined_receipt.output_binding_ids().1,
+            parsed_refined_output.receipt_id()
+        );
         let scope_binding = session
             .bind_output_reconstruction_scopes(&output_spec, &output_bytes, &receipt, scope_batches)
             .expect("bind exact block scopes to campaign execution");

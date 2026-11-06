@@ -4,6 +4,9 @@ use tritium_nn::{
 };
 use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, MpGemm, TernaryBackend};
 
+#[path = "swiglu_mlp_contract/device_region.rs"]
+mod device_region;
+
 fn dense_exact(n_out: usize, k_in: usize) -> Projection {
     Projection::Dense(DenseLinear::new_exact(vec![0.25; n_out * k_in], n_out, k_in).unwrap())
 }

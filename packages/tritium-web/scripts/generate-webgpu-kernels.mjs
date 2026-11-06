@@ -73,13 +73,8 @@ const ENTRY_POINT_BINDINGS = Object.freeze({
   }),
 });
 
-const stage = (
-  moduleId,
-  dispatch,
-  selector = null,
-  entryPoint = "main",
-  repeat = "once",
-) => Object.freeze({ moduleId, entryPoint, selector, dispatch, repeat });
+const stage = (moduleId, dispatch, selector = null, entryPoint = "main", repeat = "once") =>
+  Object.freeze({ moduleId, entryPoint, selector, dispatch, repeat });
 const pw = (selector, dispatch = "linear_output_64", repeat = "once") =>
   stage("pointwise", dispatch, selector, "main", repeat);
 const one = (moduleId, dispatch) => stage(moduleId, dispatch);
@@ -177,14 +172,10 @@ function sha256(bytes) {
 }
 
 function shaderMetadata(source, id) {
-  const code = source
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/\/\/.*$/gm, "");
+  const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
   const bindings = [];
   const bindingKeys = new Set();
-  for (const match of code.matchAll(
-    /((?:@\w+(?:\s*\([^)]*\))?\s*)+)var<\s*([^>]+?)\s*>/g,
-  )) {
+  for (const match of code.matchAll(/((?:@\w+(?:\s*\([^)]*\))?\s*)+)var<\s*([^>]+?)\s*>/g)) {
     const group = /@group\s*\(\s*(\d+)\s*\)/.exec(match[1]);
     const binding = /@binding\s*\(\s*(\d+)\s*\)/.exec(match[1]);
     if (group === null && binding === null) continue;
@@ -192,30 +183,34 @@ function shaderMetadata(source, id) {
       throw new Error(`${id} has an incomplete resource binding declaration`);
     }
     const [addressSpace, access = null] = match[2].split(",").map((part) => part.trim());
-    if (!(["uniform", "storage"].includes(addressSpace)) ||
-        !(access === null || ["read", "read_write"].includes(access))) {
+    if (
+      !["uniform", "storage"].includes(addressSpace) ||
+      !(access === null || ["read", "read_write"].includes(access))
+    ) {
       throw new Error(`${id} has an unsupported resource binding address/access mode`);
     }
     const key = `${group[1]}|${binding[1]}`;
     if (bindingKeys.has(key)) throw new Error(`${id} duplicates binding ${key}`);
     bindingKeys.add(key);
-    bindings.push(Object.freeze({
-      group: Number(group[1]),
-      binding: Number(binding[1]),
-      addressSpace,
-      access,
-    }));
+    bindings.push(
+      Object.freeze({
+        group: Number(group[1]),
+        binding: Number(binding[1]),
+        addressSpace,
+        access,
+      }),
+    );
   }
   const entryPoints = {};
-  for (const match of code.matchAll(
-    /((?:@\w+(?:\s*\([^)]*\))?\s*)+)fn\s+(\w+)/g,
-  )) {
+  for (const match of code.matchAll(/((?:@\w+(?:\s*\([^)]*\))?\s*)+)fn\s+(\w+)/g)) {
     if (!/@compute(?:\s|$)/.test(match[1])) continue;
     const workgroup = /@workgroup_size\s*\(([^)]+)\)/.exec(match[1]);
     if (workgroup === null) throw new Error(`${id}.${match[2]} lacks @workgroup_size`);
     const dimensions = workgroup[1].split(",").map((part) => Number(part.trim()));
-    if (dimensions.length > 3 ||
-        dimensions.some((value) => !Number.isSafeInteger(value) || value < 1)) {
+    if (
+      dimensions.length > 3 ||
+      dimensions.some((value) => !Number.isSafeInteger(value) || value < 1)
+    ) {
       throw new Error(`${id} has a non-literal WebGPU workgroup size`);
     }
     if (Object.hasOwn(entryPoints, match[2])) {
@@ -227,48 +222,59 @@ function shaderMetadata(source, id) {
   const groupAttributeCount = [...code.matchAll(/@group\s*\(/g)].length;
   const bindingAttributeCount = [...code.matchAll(/@binding\s*\(/g)].length;
   const computeAttributeCount = [...code.matchAll(/@compute(?:\s|$)/g)].length;
-  if (bindings.length === 0 || Object.keys(entryPoints).length === 0 ||
-      groupAttributeCount !== bindings.length || bindingAttributeCount !== bindings.length ||
-      computeAttributeCount !== Object.keys(entryPoints).length) {
+  if (
+    bindings.length === 0 ||
+    Object.keys(entryPoints).length === 0 ||
+    groupAttributeCount !== bindings.length ||
+    bindingAttributeCount !== bindings.length ||
+    computeAttributeCount !== Object.keys(entryPoints).length
+  ) {
     throw new Error(`${id} lacks source-derived binding or entry-point metadata`);
   }
   return { bindings: Object.freeze(bindings), entryPoints: Object.freeze(entryPoints) };
 }
 
 function generatedSource(modules, operations, forms, bundleDigest, catalogDigest) {
-  const moduleEntries = modules.map(({
-    id, source, digest, bindings, entryPoints, entryPointBindings,
-  }) =>
-    `  ${JSON.stringify(id)}: Object.freeze({\n` +
+  const moduleEntries = modules.map(
+    ({ id, source, digest, bindings, entryPoints, entryPointBindings }) =>
+      `  ${JSON.stringify(id)}: Object.freeze({\n` +
       `    id: ${JSON.stringify(id)},\n` +
       `    sha256: ${JSON.stringify(digest)},\n` +
       `    source: ${JSON.stringify(source)},\n` +
-      `    bindings: Object.freeze([${bindings.map((binding) =>
-        `Object.freeze(${JSON.stringify(binding)})`,
-      ).join(",")}]),\n` +
-      `    entryPointBindings: Object.freeze({${Object.entries(entryPointBindings).map(
-        ([entryPoint, values]) => `${JSON.stringify(entryPoint)}: Object.freeze([${values.map(
-          (binding) => `Object.freeze(${JSON.stringify(binding)})`,
-        ).join(",")}])`,
-      ).join(",")}}),\n` +
-      `    entryPoints: Object.freeze({${Object.entries(entryPoints).map(
-        ([entryPoint, workgroupSize]) =>
-          `${JSON.stringify(entryPoint)}: Object.freeze(${JSON.stringify(workgroupSize)}) as ` +
-          "readonly [number, number, number]",
-      ).join(",")}}),\n` +
+      `    bindings: Object.freeze([${bindings
+        .map((binding) => `Object.freeze(${JSON.stringify(binding)})`)
+        .join(",")}]),\n` +
+      `    entryPointBindings: Object.freeze({${Object.entries(entryPointBindings)
+        .map(
+          ([entryPoint, values]) =>
+            `${JSON.stringify(entryPoint)}: Object.freeze([${values
+              .map((binding) => `Object.freeze(${JSON.stringify(binding)})`)
+              .join(",")}])`,
+        )
+        .join(",")}}),\n` +
+      `    entryPoints: Object.freeze({${Object.entries(entryPoints)
+        .map(
+          ([entryPoint, workgroupSize]) =>
+            `${JSON.stringify(entryPoint)}: Object.freeze(${JSON.stringify(workgroupSize)}) as ` +
+            "readonly [number, number, number]",
+        )
+        .join(",")}}),\n` +
       "  }),",
   );
-  const operationEntries = operations.map(({ operation, moduleIds }) =>
-    `  ${JSON.stringify(operation)}: Object.freeze(${JSON.stringify(moduleIds)}),`,
+  const operationEntries = operations.map(
+    ({ operation, moduleIds }) =>
+      `  ${JSON.stringify(operation)}: Object.freeze(${JSON.stringify(moduleIds)}),`,
   );
-  const formEntries = forms.map((form) =>
-    `  ${JSON.stringify(`${form.operation}|${form.execution}`)}: Object.freeze({` +
+  const formEntries = forms.map(
+    (form) =>
+      `  ${JSON.stringify(`${form.operation}|${form.execution}`)}: Object.freeze({` +
       ` operation: ${JSON.stringify(form.operation)}, execution: ${JSON.stringify(form.execution)},` +
-      ` stages: Object.freeze([${form.stages.map((value) =>
-        `Object.freeze(${JSON.stringify(value)})`,
-      ).join(",")}]) }),`,
+      ` stages: Object.freeze([${form.stages
+        .map((value) => `Object.freeze(${JSON.stringify(value)})`)
+        .join(",")}]) }),`,
   );
-  return `// @generated by scripts/generate-webgpu-kernels.mjs; do not edit.\n` +
+  return (
+    `// @generated by scripts/generate-webgpu-kernels.mjs; do not edit.\n` +
     `export const WEBGPU_KERNEL_BUNDLE_SHA256_V1 = ${JSON.stringify(bundleDigest)} as const;\n\n` +
     `export const WEBGPU_DISPATCH_CATALOG_SHA256_V1 = ${JSON.stringify(catalogDigest)} as const;\n\n` +
     "export const WEBGPU_KERNEL_MODULES_V1 = Object.freeze({\n" +
@@ -279,7 +285,8 @@ function generatedSource(modules, operations, forms, bundleDigest, catalogDigest
     "});\n\n" +
     "export const WEBGPU_DISPATCH_FORMS_V1 = Object.freeze({\n" +
     `${formEntries.join("\n")}\n` +
-    "});\n";
+    "});\n"
+  );
 }
 
 async function generate() {
@@ -294,21 +301,25 @@ async function generate() {
     tensorOperations.some((operation) => !mapped.includes(operation)) ||
     mapped.some((operation) => !tensorOperations.includes(operation))
   ) {
-    throw new Error(
-      "WebGPU candidate dependency index must key the 32 frozen tensor operations",
-    );
+    throw new Error("WebGPU candidate dependency index must key the 32 frozen tensor operations");
   }
 
-  const moduleIds = [...new Set(mapped.flatMap((operation) => OPERATION_MODULES[operation]))].sort();
+  const moduleIds = [
+    ...new Set(mapped.flatMap((operation) => OPERATION_MODULES[operation])),
+  ].sort();
   const modules = [];
   for (const id of moduleIds) {
     const path = resolve(shaderRoot, `${id}.wgsl`);
     const source = await readFile(path, "utf8");
     const metadata = shaderMetadata(source, id);
     const configured = ENTRY_POINT_BINDINGS[id];
-    if (configured !== undefined &&
-        (Object.keys(configured).length !== Object.keys(metadata.entryPoints).length ||
-          Object.keys(metadata.entryPoints).some((entryPoint) => configured[entryPoint] === undefined))) {
+    if (
+      configured !== undefined &&
+      (Object.keys(configured).length !== Object.keys(metadata.entryPoints).length ||
+        Object.keys(metadata.entryPoints).some(
+          (entryPoint) => configured[entryPoint] === undefined,
+        ))
+    ) {
       throw new Error(`${id} entry-point binding map drifted from source`);
     }
     const byId = new Map(metadata.bindings.map((binding) => [binding.binding, binding]));
@@ -322,7 +333,11 @@ async function generate() {
       }),
     );
     modules.push({
-      id, source, digest: sha256(source), ...metadata, entryPointBindings,
+      id,
+      source,
+      digest: sha256(source),
+      ...metadata,
+      entryPointBindings,
     });
   }
   const operations = tensorOperations.map((operation) => ({
@@ -332,11 +347,12 @@ async function generate() {
   const forms = [];
   for (const descriptor of manifest.operations) {
     if (descriptor.category === "lifecycle") continue;
-    const executions = descriptor.category === "optimizer"
-      ? ["step"]
-      : descriptor.vjp === "first_order"
-        ? ["forward", "vjp"]
-        : ["forward"];
+    const executions =
+      descriptor.category === "optimizer"
+        ? ["step"]
+        : descriptor.vjp === "first_order"
+          ? ["forward", "vjp"]
+          : ["forward"];
     for (const execution of executions) {
       const key = `${descriptor.id}|${execution}`;
       const stages = DISPATCH_FORMS[key];
@@ -357,16 +373,16 @@ async function generate() {
       if (module.entryPoints[value.entryPoint] === undefined) {
         throw new Error(
           `${form.operation}|${form.execution} references missing entry point ` +
-          `${value.moduleId}.${value.entryPoint}`,
+            `${value.moduleId}.${value.entryPoint}`,
         );
       }
     }
   }
   const bundleDigest = sha256(
     modules.map(({ id, digest }) => `module\0${id}\0${digest}\n`).join("") +
-      operations.map(({ operation, moduleIds }) =>
-        `operation\0${operation}\0${moduleIds.join("\0")}\n`,
-      ).join(""),
+      operations
+        .map(({ operation, moduleIds }) => `operation\0${operation}\0${moduleIds.join("\0")}\n`)
+        .join(""),
   );
   const catalog = {
     schema_id: "tritium.webgpu_dispatch_catalog",

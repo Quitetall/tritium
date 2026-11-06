@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DirectFitMetric",
+  "description": "Original metric supplied to the controller, before any basis transform.",
+  "oneOf": [
+    {
+      "description": "Explicit plan invocation without an input Gram.",
+      "type": "string",
+      "const": "Identity"
+    },
+    {
+      "description": "Exact row-major f64 Gram bits; not original calibration data identity.",
+      "type": "object",
+      "properties": {
+        "InputGramF64": {
+          "type": "object",
+          "properties": {
+            "content": {
+              "description": "Candidate `tritium.quantize.input-gram-f64.v1` digest.",
+              "$ref": "#/$defs/FitInputDigest"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "content"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "InputGramF64"
+      ]
+    }
+  ],
+  "$defs": {
+    "FitInputDigest": {
+      "description": "Exact original fitting input bits under a named candidate digest domain.\nNot a stored blob, package, HF identity or calibration dataset identity.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    }
+  }
+}

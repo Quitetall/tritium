@@ -9,7 +9,7 @@
 //! the two factors are continuous trainable weights, so the plain contraction is exactly
 //! the right primitive (the ternary path's sign/scale machinery would be wrong here).
 //!
-//! The forward and vjp are row-parallel (rayon) above [`PAR_THRESHOLD`] flops; each output row is
+//! The forward and vjp are row-parallel (rayon) above `PAR_THRESHOLD` flops; each output row is
 //! independent and its inner accumulation order is preserved, so the parallel result is
 //! **bit-identical** to the serial loop (the tape gradchecks + the ModelRunner conformance gate at
 //! rel 1.85e-6 both still hold). Below the threshold it runs serial to dodge rayon's fork overhead.

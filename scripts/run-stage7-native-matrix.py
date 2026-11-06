@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import subprocess
 import sys
 
@@ -18,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MODEL_REVISION = "effd688a12921b4cc83e3312b6feb579f70f9c71"
 RELEASE = "1.1.0-rc.1"
 QUALIFIER_PATH = ROOT / "scripts/qualify-stage7-recipe-freeze.py"
+_run_git = runpy.run_path(ROOT / "scripts/_qualification_git.py")["run_git"]
 
 
 def _load_qualifier():
@@ -30,10 +32,7 @@ def _load_qualifier():
 
 
 def _git(*args: str) -> str:
-    completed = subprocess.run(
-        ["git", *args], cwd=ROOT, check=True, text=True, capture_output=True
-    )
-    return completed.stdout.strip()
+    return _run_git(ROOT, *args, error_type=RuntimeError)
 
 
 def _sha256(path: Path) -> str:

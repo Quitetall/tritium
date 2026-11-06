@@ -13,7 +13,9 @@ class FakeBuffer {
     return this.bytes.slice(offset, offset + size).buffer;
   }
   unmap() {}
-  destroy() { this.destroyed = true; }
+  destroy() {
+    this.destroyed = true;
+  }
 }
 
 export class FakeDevice {
@@ -37,7 +39,9 @@ export class FakeDevice {
     this.destroyed = false;
     this.events = [];
     this.buffers = new Map();
-    this.lost = new Promise((resolve) => { this.lose = resolve; });
+    this.lost = new Promise((resolve) => {
+      this.lose = resolve;
+    });
     this.queue = {
       writeBuffer: (buffer, offset, data) => buffer.bytes.set(data, offset),
       submit: (commands) => {
@@ -47,7 +51,9 @@ export class FakeDevice {
       onSubmittedWorkDone: async () => {},
     };
   }
-  createShaderModule(descriptor) { return descriptor; }
+  createShaderModule(descriptor) {
+    return descriptor;
+  }
   async createComputePipelineAsync() {
     this.pipelines += 1;
     return { getBindGroupLayout: () => ({}) };
@@ -72,17 +78,24 @@ export class FakeDevice {
       }),
       copyBufferToBuffer: (source, sourceOffset, destination, destinationOffset, size) => {
         this.events.push(`copy:${source.label}>${destination.label}`);
-        copies.push(() => destination.bytes.set(
-          source.bytes.slice(sourceOffset, sourceOffset + size),
-          destinationOffset,
-        ));
+        copies.push(() =>
+          destination.bytes.set(
+            source.bytes.slice(sourceOffset, sourceOffset + size),
+            destinationOffset,
+          ),
+        );
       },
       clearBuffer: (buffer, offset = 0, size = buffer.size - offset) => {
         this.events.push(`clear:${buffer.label}`);
         copies.push(() => buffer.bytes.fill(0, offset, offset + size));
       },
-      finish: () => () => copies.forEach((copy) => copy()),
+      finish: () => () =>
+        copies.forEach((copy) => {
+          copy();
+        }),
     };
   }
-  destroy() { this.destroyed = true; }
+  destroy() {
+    this.destroyed = true;
+  }
 }

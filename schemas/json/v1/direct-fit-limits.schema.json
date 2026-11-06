@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DirectFitLimits",
+  "description": "Pre-allocation shape limits for one direct-level request.\n\nThese bound specified logical element counts, not total process RSS, solver\ntemporary storage, Rayon overhead, or complete production memory admission.",
+  "type": "object",
+  "properties": {
+    "max_metric_entries": {
+      "description": "Maximum dense input-Gram count (`cols * cols`), even when implicit identity is used.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_output_trits": {
+      "description": "Maximum sum of retained trits over all directly fitted levels.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_weights": {
+      "description": "Maximum source scalar count (`rows * cols`).",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "max_weights",
+    "max_metric_entries",
+    "max_output_trits"
+  ]
+}

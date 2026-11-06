@@ -11,6 +11,9 @@ use tritium_nn::{
     Qwen35TensorStreamError,
 };
 
+#[path = "qwen35_hf_adapter/typed.rs"]
+mod typed;
+
 const H: usize = 4;
 const I: usize = 6;
 const V: usize = 7;

@@ -16,12 +16,14 @@ tritium-core = { workspace = true }
 tritium-spec = { workspace = true }
 tritium-runtime = { workspace = true }
 tritium-format = { workspace = true }
+tritium-schema = { workspace = true }
 rayon = { workspace = true }
 half = { workspace = true }
 linkme = { workspace = true }
 
 [dev-dependencies]
 tritium-testkit = { workspace = true }
+tritium-evidence = { workspace = true }
 proptest = { workspace = true }
 
 [lints]

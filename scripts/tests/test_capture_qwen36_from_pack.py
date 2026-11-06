@@ -107,7 +107,6 @@ class CaptureQwenFromPackTests(unittest.TestCase):
                 runtime_checked.append((candidate_path, document, actual_revision))
                 return object()
 
-            completed = lambda stdout: type("Completed", (), {"stdout": stdout})()
             torch_fake = ModuleType("torch")
             torch_fake.cuda = SimpleNamespace(is_available=lambda: False)
             transformers_fake = ModuleType("transformers")
@@ -120,9 +119,9 @@ class CaptureQwenFromPackTests(unittest.TestCase):
                 }),
                 mock.patch.dict(MODULE.STAGE7, {"validate": validate}),
                 mock.patch.object(
-                    MODULE.subprocess,
-                    "run",
-                    side_effect=[completed(revision + "\n"), completed("")],
+                    MODULE,
+                    "_run_git",
+                    side_effect=[revision, ""],
                 ),
                 mock.patch.object(
                     MODULE, "_validate_capture_python_environment", validate_runtime
@@ -257,13 +256,12 @@ class CaptureQwenFromPackTests(unittest.TestCase):
                     "--stage7-qualification-receipt", str(root / "stage7.json"),
                 ]
             )
-            completed = lambda stdout: type("Completed", (), {"stdout": stdout})()
             validator = mock.Mock()
             with (
                 mock.patch.object(
-                    MODULE.subprocess,
-                    "run",
-                    side_effect=[completed(revision + "\n"), completed(" M local.py\n")],
+                    MODULE,
+                    "_run_git",
+                    side_effect=[revision, " M local.py"],
                 ),
                 mock.patch.dict(MODULE.STAGE7, {"validate": validator}),
             ):

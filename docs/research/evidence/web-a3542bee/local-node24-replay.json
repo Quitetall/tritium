@@ -1,0 +1,33 @@
+{
+  "result": "PASS",
+  "scope": "source-free Node 24 WASM conformance and lifecycle replay; not WebGPU or Node 22 qualification",
+  "source_revision": "a3542beebd2e8bc518544e0b795a448b94203b24",
+  "node": "v24.21.0",
+  "conformance": {
+    "schemaId": "tritium.portable_wasm_conformance_receipt",
+    "schemaVersion": 1,
+    "implementation": "wasm-fallback",
+    "engine": "wasm32-unknown-unknown",
+    "buildId": "tritium-wasm@1.1.0-rc.2+source-git:a3542beebd2e8bc518544e0b795a448b94203b24",
+    "guestDigest": "a5d242a06e6eb6d76dff95fc50af588450993c0cbb4a4e8b7eefc6eec6e26651",
+    "executionDigest": "20d4a9d4b14b4e2ee1afe13832c2c39d7c51fcc8e6723f12442d2764b7f6ecdd",
+    "manifestDigest": "9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098",
+    "vectorDigest": "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7",
+    "operationCount": 36,
+    "caseCount": 117,
+    "maxCallerBytes": 67108864,
+    "maxLinearMemoryBytes": 201326592,
+    "repeatedExecutions": 2
+  },
+  "lifecycle": {
+    "prepare": true,
+    "forward": true,
+    "backward": true,
+    "step": true,
+    "checkpoint_resume": true,
+    "exact_native_artifact_parity": true,
+    "export_bytes": 224,
+    "artifact_sha256": "6e889858c06a7eb91133f69a948ab8356a444c677eecd9e800ec689380a6e17e",
+    "checkpoint_sha256": "43fa2cf70f020ee94d5146cc08c3a9ae19367fb4c45d3c087c850b8e54d61189"
+  }
+}

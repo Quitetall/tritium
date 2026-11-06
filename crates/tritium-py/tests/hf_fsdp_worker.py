@@ -8,6 +8,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
 from torch.distributed.checkpoint.state_dict import (
     get_state_dict,
     set_state_dict,
@@ -94,6 +95,35 @@ def main() -> None:
     original_loss = wrapped(input_ids=tokens, labels=tokens).loss.detach()
     restored_loss = restored_wrapped(input_ids=tokens, labels=tokens).loss.detach()
     assert torch.equal(restored_loss, original_loss)
+
+    # PyTorch 2.11 CPU FSDP full-state gathering segfaults on rank 0, including
+    # for an ordinary dense module. Materialize the already-committed sharded
+    # checkpoint offline instead of calling FSDP.state_dict() on the live model.
+    dist.barrier()
+    if rank == 0:
+        merged_checkpoint = checkpoint.parent / "fsdp-merged-state.pt"
+        dcp_to_torch_save(checkpoint, merged_checkpoint)
+        merged = torch.load(
+            merged_checkpoint, map_location="cpu", weights_only=True
+        )
+        export_model = prepare_qat(_model(), _config())
+        incompatible = export_model.load_state_dict(merged["model"], strict=True)
+        assert not incompatible.missing_keys
+        assert not incompatible.unexpected_keys
+        export_model.eval()
+        with torch.no_grad():
+            exported_logits = export_model(input_ids=tokens, use_cache=False).logits
+            resumed_logits = restored_wrapped(
+                input_ids=tokens, use_cache=False
+            ).logits
+        assert torch.equal(exported_logits, resumed_logits)
+
+        export_dir = checkpoint.parent / "fsdp-export"
+        export_model.save_pretrained(export_dir, safe_serialization=True)
+        assert (export_dir / "model.safetensors").is_file()
+        assert not (export_dir / "pytorch_model.bin").exists()
+        print("TRITIUM_FSDP_DCP_EXPORT_OK rank=0", flush=True)
+    dist.barrier()
 
     print(f"TRITIUM_FSDP_OK rank={rank}", flush=True)
     dist.destroy_process_group()

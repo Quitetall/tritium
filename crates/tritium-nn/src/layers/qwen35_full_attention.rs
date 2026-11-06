@@ -307,6 +307,66 @@ pub struct Qwen35FullAttention {
 struct MixerIdentity;
 
 impl Qwen35FullAttention {
+    #[cfg(feature = "tokenizer")]
+    pub(crate) fn resident_binding(
+        &self,
+    ) -> Result<tritium_spec::DecoderFullAttention<'_>, NnError> {
+        use crate::model::resident::matrix;
+        Ok(tritium_spec::DecoderFullAttention {
+            query_gate: matrix(&self.weights.q_proj)?,
+            key: matrix(&self.weights.k_proj)?,
+            value: matrix(&self.weights.v_proj)?,
+            output: matrix(&self.weights.o_proj)?,
+            query_norm: &self.weights.q_norm,
+            key_norm: &self.weights.k_norm,
+        })
+    }
+    #[allow(dead_code)] // Consumed by the B3 bounded projection-window adapter.
+    pub(crate) fn projection(&self, name: &str) -> Result<&Projection, NnError> {
+        match name {
+            "self_attn.q_proj.weight" => Ok(&self.weights.q_proj),
+            "self_attn.k_proj.weight" => Ok(&self.weights.k_proj),
+            "self_attn.v_proj.weight" => Ok(&self.weights.v_proj),
+            "self_attn.o_proj.weight" => Ok(&self.weights.o_proj),
+            _ => Err(NnError::MissingTensor(format!(
+                "unknown Qwen full-attention projection `{name}`"
+            ))),
+        }
+    }
+
+    /// Replace one named projection without changing this mixer's validated geometry.
+    #[allow(dead_code)] // Used by the crate-internal paired Qwen measurement path.
+    pub(crate) fn replace_projection(
+        &mut self,
+        name: &str,
+        replacement: Projection,
+    ) -> Result<Projection, NnError> {
+        let slot = match name {
+            "self_attn.q_proj.weight" => &mut self.weights.q_proj,
+            "self_attn.k_proj.weight" => &mut self.weights.k_proj,
+            "self_attn.v_proj.weight" => &mut self.weights.v_proj,
+            "self_attn.o_proj.weight" => &mut self.weights.o_proj,
+            _ => {
+                return Err(NnError::MissingTensor(format!(
+                    "unknown Qwen full-attention projection `{name}`"
+                )));
+            }
+        };
+        if replacement.n_out() != slot.n_out() || replacement.k_in() != slot.k_in() {
+            return Err(NnError::Shape {
+                expected: slot.n_out().saturating_mul(slot.k_in()),
+                got: replacement.n_out().saturating_mul(replacement.k_in()),
+            });
+        }
+        if replacement.activation_mode() != slot.activation_mode() {
+            return Err(NnError::Backend(
+                "replacement projection changes Qwen full-attention activation arithmetic"
+                    .to_owned(),
+            ));
+        }
+        Ok(std::mem::replace(slot, replacement))
+    }
+
     /// Bind a typed Qwen3.5 text geometry to an exact full-attention weight set.
     ///
     /// # Errors

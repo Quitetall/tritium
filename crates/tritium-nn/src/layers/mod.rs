@@ -15,10 +15,12 @@ mod qwen35_deltanet;
 mod qwen35_full_attention;
 mod salt;
 mod salt_v2_host;
+mod tensor;
 mod token_embedding;
 mod transformer_block;
 
 pub(crate) use packed_salt::{PackedSaltMatrix, PackedSaltMatrixBuilder};
+pub(crate) use qwen35_deltanet::RecurrentStateObserver;
 
 pub use dense::DenseLinear;
 pub use linear::TernaryLinear;
@@ -31,5 +33,6 @@ pub use qwen35_full_attention::{
 };
 pub use salt::{ActivationPrecision, SaltLinear};
 pub use salt_v2_host::HostSaltV2Linear;
+pub use tensor::{Linear, TensorLoader};
 pub use token_embedding::TokenEmbedding;
 pub use transformer_block::{BlockDump, BlockScratch, TransformerBlock};
