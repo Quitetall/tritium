@@ -1309,6 +1309,32 @@ validator suites passed locally (22 tests and 10 subtests). They validate
 software behavior with fixtures; they do not provide a real native reopen or
 admit the recovered legacy captures.
 
+### Durable campaign workspace relocation (2026-10-03)
+
+The discovered PTQ work directory, legacy S2KF records, and token pack were
+moved out of `/mnt/4tb/tmp` to
+`/mnt/4tb/tritium-qwen36-campaign-20260813/{ptq-work,s2kf-evidence,token-pack}`.
+The pinned Qwen source snapshot remains at
+`/mnt/4tb/qwen36-27b-source-6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`.
+The move preserved the campaign descriptor and its incomplete temporary
+record; a fresh read-only status probe still reports `stalled`, zero of 506
+published additive masters, no seal, and a dead owner PID for the
+447,083,070-byte temporary record.
+
+The durable S2KF directory contains 506 records. A byte comparison against the
+remaining `/mnt/4tb/tmp/qwen36-evidence-a417374-1seq-clean-20260821` alias
+found no differing record files; the durable directory additionally retains
+`.staging` and `source-admission.json`. The two record-name sets share hardlinked
+files on the same filesystem, so moving one directory did not free the record
+payload blocks while the other alias remains.
+
+This relocation is preservation only. The legacy S2KF set still has the
+calibration token-stream mismatch documented above and is not admissible for
+master fitting. Do not resume fitting from it. The verified token pack and
+replay contract still need a real native capture, a persisted source-bound
+capture receipt, and a fresh reopen of all 506 records before fitting may
+start. No compute was started during the relocation.
+
 ### Hosted package evidence from PR #51 (2026-10-01)
 
 PR #51 (`bbbafd99cada6dab821cea63e5cdf971f1ce79fb`) has successful hosted
@@ -1678,6 +1704,32 @@ Verification requires:
 - digest-bound CycloneDX/SPDX SBOM tied to exact artifact ID;
 - digest-bound in-toto/SLSA v1 provenance tied to artifact SHA-256, source
   revision and builder identity.
+
+### Pre-tag candidate assembly (artifact-only)
+
+The `release-candidate` workflow builds the release package set from one exact
+commit and assembles the same candidate manifest before a release tag exists.
+Dispatch it from the default branch with a full commit SHA:
+
+```bash
+gh workflow run release-candidate.yml --ref main \
+  --field source_revision="$(git rev-parse HEAD)"
+```
+
+The workflow validates the checked-out commit and RC version, runs the reusable
+wheel matrix plus crate/npm qualification, and strictly reopens the assembled
+candidate with `scripts/release-status`. Download
+`tritium-candidate-<revision>` for the candidate directory and
+`tritium-candidate-evidence-<revision>` for the exact input document and
+qualification receipts. The evidence directory is intentionally separate from
+the candidate payload: release-status rejects unmanifested files inside that
+payload.
+
+This workflow has read-only repository permissions and does not publish to
+PyPI, crates.io, npm, or GitHub Releases, create or move tags, or claim whole-
+model, hardware, quality, independent-review, or release readiness. It makes
+exact-source packaging evidence available before a maintainer decides whether
+to proceed with a public release.
 
 For the browser package, build the exact npm archive first, then generate its
 closed CycloneDX inventory from archive bytes. The generator rejects path
