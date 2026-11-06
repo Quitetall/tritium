@@ -1,9 +1,9 @@
 //! Canonical, dependency-free schema vocabulary for Tritium artifacts.
 //!
 //! This crate deliberately separates semantic values from their wire
-//! encodings. Encodings, law admission limits, and generated projections are
-//! introduced by later ADR 0044 phases; callers must not infer wire tags from
-//! Rust discriminants.
+//! encodings. Generated schema projections define the shared metadata shape;
+//! format-specific byte layouts remain owned by `tritium-format`. Callers must
+//! not infer wire tags from Rust discriminants.
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -190,6 +190,7 @@ impl ScaleLaw {
 
 /// One admitted scale law and the largest plane stack supported for it.
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema-gen", serde(deny_unknown_fields))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct AdmittedLaw {
     /// The exact law tuple admitted by this schema version.
@@ -527,6 +528,7 @@ digest_id!(
 /// Standardized reason category for an unresolved claim.
 #[non_exhaustive]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema-gen", serde(deny_unknown_fields))]
 #[cfg_attr(
     feature = "serde",
     derive(serde_nostd::Serialize, serde_nostd::Deserialize)
