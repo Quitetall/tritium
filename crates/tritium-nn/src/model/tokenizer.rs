@@ -10,6 +10,23 @@ use crate::error::NnError;
 ///
 /// Implementations are model-specific (BitNet uses the LLaMA-3 BPE vocabulary).
 pub trait Tokenizer {
+    /// Render a generation prompt using this tokenizer's source-bound template.
+    ///
+    /// `None` means no source template exists; only that case permits an explicit
+    /// legacy formatter. A declared but invalid/unsupported template returns an
+    /// error, never `None`. Implementations must respect `max_output_bytes`.
+    /// Text-role messages only; this does not imply tools or multimodal support.
+    ///
+    /// # Errors
+    /// [`NnError::Tokenizer`] for invalid input, unsupported syntax or limits.
+    fn render_chat_prompt(
+        &self,
+        _messages: &[(&str, &str)],
+        _max_output_bytes: usize,
+    ) -> Result<Option<String>, NnError> {
+        Ok(None)
+    }
+
     /// Encode `text` to a sequence of token IDs.
     ///
     /// # Errors

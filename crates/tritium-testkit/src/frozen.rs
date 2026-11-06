@@ -19,7 +19,7 @@
 //! The set is deliberately immutable. To widen coverage (a new format, non-block
 //! `K`, more shapes) you re-freeze as a **new version**: regenerate via the
 //! `freeze_vectors` example, commit the new `vectors/<ver>.jsonl`, and bump
-//! [`VECTOR_SET_VERSION`]. The [`tests::frozen_set_matches_pinned_generator`] gate
+//! [`VECTOR_SET_VERSION`]. The `tests::frozen_set_matches_pinned_generator` gate
 //! makes any *accidental* drift (a changed generator, a changed reference kernel,
 //! a hand-edited file) a hard test failure.
 
@@ -40,7 +40,7 @@ pub const VECTOR_SET_VERSION: &str = "v070";
 pub const FROZEN_SEED: u64 = 0xC0FFEE;
 
 /// The pinned random-vector count. The fixed boundary set is appended
-/// unconditionally by [`generate_vectors`], so the frozen file holds more than
+/// unconditionally by [`crate::generate_vectors`], so the frozen file holds more than
 /// this many vectors.
 pub const FROZEN_COUNT: usize = 64;
 
@@ -60,7 +60,7 @@ pub fn frozen_vectors_path() -> PathBuf {
 ///
 /// # Panics
 /// Panics only if the committed artifact is missing or unparseable — a build-tree
-/// invariant enforced by [`tests::frozen_set_matches_pinned_generator`]. Callers
+/// invariant enforced by `tests::frozen_set_matches_pinned_generator`. Callers
 /// are test harnesses, for which a missing canonical reference is a hard error,
 /// not a recoverable condition.
 #[must_use]

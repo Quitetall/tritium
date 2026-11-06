@@ -1,9 +1,9 @@
 //! Ternary matmul forward + backward for the autograd tape.
 //!
-//! Forward:  Y[m,n] = s[n] · Σ_k A[m,k]·W[n,k]   (A:[M,K], W:[N,K], s:[N]).
-//! Backward: gA[m,k] = Σ_n gY[m,n]·s[n]·W[n,k]
-//!           gs[n]   = Σ_m gY[m,n]·(Σ_k A[m,k]·W[n,k])   (= gY·P, P the unscaled contraction)
-//!           gW[n,k] = s[n]·Σ_m gY[m,n]·A[m,k]           (straight-through-estimated to Wf upstream)
+//! Forward: `Y[m,n] = s[n] · Σ_k A[m,k]·W[n,k]` (`A:[M,K], W:[N,K], s:[N]`).
+//! Backward: `gA[m,k] = Σ_n gY[m,n]·s[n]·W[n,k]`
+//!           `gs[n] = Σ_m gY[m,n]·(Σ_k A[m,k]·W[n,k])` (= `gY·P`, P the unscaled contraction)
+//!           `gW[n,k] = s[n]·Σ_m gY[m,n]·A[m,k]` (straight-through-estimated to Wf upstream)
 //!
 //! `W` is a real `f32` weight matrix: ternary `{-1,0,1}` in the QAT value path, or the
 //! continuous STE *surrogate* in the gradient-checked autograd path. The forward is a

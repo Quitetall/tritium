@@ -9,10 +9,9 @@ import {
   WebTrainingError,
 } from "../dist/index.js";
 
-const corpus = JSON.parse(readFileSync(
-  new URL("../../../spec/training/v2/vectors/v2.json", import.meta.url),
-  "utf8",
-));
+const corpus = JSON.parse(
+  readFileSync(new URL("../../../spec/training/v2/vectors/v2.json", import.meta.url), "utf8"),
+);
 
 const tensor = (id, elements, index, role = "activation") => ({
   id,
@@ -67,20 +66,25 @@ function uniform(command) {
 
 test("forward add lowers catalog selector and resident roles without tensor values", () => {
   const buffers = ["left", "right", "result"].map((id, index) => tensor(id, 2, index));
-  const compiled = plan(buffers, [{
-    id: "add",
-    operation: "graph.add",
-    inputs: ["left", "right"],
-    outputs: ["result"],
-    attributes: [],
-  }]);
+  const compiled = plan(buffers, [
+    {
+      id: "add",
+      operation: "graph.add",
+      inputs: ["left", "right"],
+      outputs: ["result"],
+      attributes: [],
+    },
+  ]);
   const commands = lowerPointwiseWebGpuOperationV1(compiled, "forward", "add", 5);
   assert.equal(commands.length, 1);
   assert.equal(commands[0].uniformSlot, 5);
   assert.equal(uniform(commands[0]).getUint32(0, true), 2);
   assert.equal(uniform(commands[0]).getUint32(4, true), 3);
   assert.deepEqual(commands[0].storageBindings, {
-    1: "left", 2: "right", 3: "left", 4: "result",
+    1: "left",
+    2: "right",
+    3: "left",
+    4: "result",
   });
   assert.deepEqual(commands[0].workgroups, [1, 1, 1]);
 });
@@ -105,32 +109,53 @@ test("mul VJP lowers two ordered stages with exact gradient operands", () => {
     attributes: [],
   };
   const commands = lowerPointwiseWebGpuOperationV1(
-    plan(buffers, [], [backward]), "backward", "mul.vjp", 9,
+    plan(buffers, [], [backward]),
+    "backward",
+    "mul.vjp",
+    9,
   );
   assert.equal(commands.length, 2);
-  assert.deepEqual(commands.map((command) => uniform(command).getUint32(4, true)), [4, 4]);
-  assert.deepEqual(commands.map((command) => command.uniformSlot), [9, 10]);
-  assert.deepEqual(commands.map((command) => command.storageBindings[2]), ["right", "left"]);
-  assert.deepEqual(commands.map((command) => command.storageBindings[4]), [
-    "grad_left", "grad_right",
-  ]);
-  assert.deepEqual(commands.map((command) => command.workgroups), [[2, 1, 1], [2, 1, 1]]);
+  assert.deepEqual(
+    commands.map((command) => uniform(command).getUint32(4, true)),
+    [4, 4],
+  );
+  assert.deepEqual(
+    commands.map((command) => command.uniformSlot),
+    [9, 10],
+  );
+  assert.deepEqual(
+    commands.map((command) => command.storageBindings[2]),
+    ["right", "left"],
+  );
+  assert.deepEqual(
+    commands.map((command) => command.storageBindings[4]),
+    ["grad_left", "grad_right"],
+  );
+  assert.deepEqual(
+    commands.map((command) => command.workgroups),
+    [
+      [2, 1, 1],
+      [2, 1, 1],
+    ],
+  );
 });
 
 test("softmax lowering dispatches full input while carrying column geometry", () => {
   const buffers = [tensor("x", 4, 0), tensor("result", 4, 1)];
   buffers[0].shape = [2, 2];
   buffers[1].shape = [2, 2];
-  const compiled = plan(buffers, [{
-    id: "softmax",
-    operation: "graph.softmax",
-    inputs: ["x"],
-    outputs: ["result"],
-    attributes: [
-      { name: "rows", kind: "u64", value: 2 },
-      { name: "cols", kind: "u64", value: 2 },
-    ],
-  }]);
+  const compiled = plan(buffers, [
+    {
+      id: "softmax",
+      operation: "graph.softmax",
+      inputs: ["x"],
+      outputs: ["result"],
+      attributes: [
+        { name: "rows", kind: "u64", value: 2 },
+        { name: "cols", kind: "u64", value: 2 },
+      ],
+    },
+  ]);
   const [command] = lowerPointwiseWebGpuOperationV1(compiled, "forward", "softmax", 0);
   assert.equal(uniform(command).getUint32(0, true), 4);
   assert.equal(uniform(command).getUint32(4, true), 11);
@@ -139,21 +164,23 @@ test("softmax lowering dispatches full input while carrying column geometry", ()
 
 test("unlowered or malformed operations fail closed", () => {
   const buffers = [tensor("x", 2, 0), tensor("result", 2, 1)];
-  const compiled = plan(buffers, [{
-    id: "fsq",
-    operation: "graph.fsq",
-    inputs: ["x"],
-    outputs: ["result"],
-    attributes: [
-      { name: "channels", kind: "u64", value: 1 },
-      { name: "len", kind: "u64", value: 2 },
-      { name: "levels", kind: "u32-list", value: [3] },
-      { name: "bound", kind: "text", value: "tanh" },
-      { name: "ste", kind: "text", value: "identity" },
-      { name: "alpha", kind: "f32", value: 1 },
-      { name: "seed", kind: "u64", value: 0 },
-    ],
-  }]);
+  const compiled = plan(buffers, [
+    {
+      id: "fsq",
+      operation: "graph.fsq",
+      inputs: ["x"],
+      outputs: ["result"],
+      attributes: [
+        { name: "channels", kind: "u64", value: 1 },
+        { name: "len", kind: "u64", value: 2 },
+        { name: "levels", kind: "u32-list", value: [3] },
+        { name: "bound", kind: "text", value: "tanh" },
+        { name: "ste", kind: "text", value: "identity" },
+        { name: "alpha", kind: "f32", value: 1 },
+        { name: "seed", kind: "u64", value: 0 },
+      ],
+    },
+  ]);
   assert.throws(
     () => lowerPointwiseWebGpuOperationV1(compiled, "forward", "fsq", 0),
     (error) => error instanceof WebTrainingError && error.code === "capability_mismatch",
@@ -163,16 +190,15 @@ test("unlowered or malformed operations fail closed", () => {
     (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
   );
   assert.throws(
-    () => lowerPointwiseWebGpuOperationV1(
-      plan(buffers, [null]), "forward", "fsq", 0,
-    ),
+    () => lowerPointwiseWebGpuOperationV1(plan(buffers, [null]), "forward", "fsq", 0),
     (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
   );
 });
 
 test("phase selection disambiguates colliding compiled operation IDs", () => {
-  const buffers = ["left", "right", "result", "grad_output", "grad_x"]
-    .map((id, index) => tensor(id, 2, index));
+  const buffers = ["left", "right", "result", "grad_output", "grad_x"].map((id, index) =>
+    tensor(id, 2, index),
+  );
   const operation = {
     id: "backward.0",
     operation: "graph.add",
@@ -191,13 +217,11 @@ test("phase selection disambiguates colliding compiled operation IDs", () => {
   };
   const compiled = plan(buffers, [operation], [backward]);
   assert.equal(
-    lowerPointwiseWebGpuOperationV1(compiled, "forward", "backward.0", 0)[0]
-      .operation,
+    lowerPointwiseWebGpuOperationV1(compiled, "forward", "backward.0", 0)[0].operation,
     "graph.add",
   );
   assert.equal(
-    lowerPointwiseWebGpuOperationV1(compiled, "backward", "backward.0", 1)[0]
-      .operation,
+    lowerPointwiseWebGpuOperationV1(compiled, "backward", "backward.0", 1)[0].operation,
     "graph.detach",
   );
 });
@@ -227,9 +251,7 @@ test("multi-stage lowering rejects uniform slots outside the compiled arena", ()
     (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
   );
   assert.throws(
-    () => lowerPointwiseWebGpuOperationV1(
-      compiled, "backward", "mul.vjp", Number.MAX_SAFE_INTEGER,
-    ),
+    () => lowerPointwiseWebGpuOperationV1(compiled, "backward", "mul.vjp", Number.MAX_SAFE_INTEGER),
     (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
   );
 });
@@ -265,7 +287,11 @@ test("MSE VJP keeps scalar cotangent resident instead of reading it into a unifo
 
 test("dense VJP lowers shape scalars and stage-specific output lengths", () => {
   const definitions = [
-    ["x", 6], ["weight", 12], ["grad_output", 8], ["grad_x", 6], ["grad_weight", 12],
+    ["x", 6],
+    ["weight", 12],
+    ["grad_output", 8],
+    ["grad_x", 6],
+    ["grad_weight", 12],
   ];
   const buffers = definitions.map(([id, elements], index) => tensor(id, elements, index));
   Object.assign(buffers[0], { shape: [2, 3] });
@@ -299,19 +325,29 @@ test("dense VJP lowers shape scalars and stage-specific output lengths", () => {
     "dense.vjp",
     3,
   );
-  assert.deepEqual(commands.map((command) => uniform(command).getUint32(0, true)), [6, 12]);
+  assert.deepEqual(
+    commands.map((command) => uniform(command).getUint32(0, true)),
+    [6, 12],
+  );
   for (const command of commands) {
-    assert.deepEqual([
-      uniform(command).getUint32(12, true),
-      uniform(command).getUint32(16, true),
-      uniform(command).getUint32(20, true),
-    ], [2, 4, 3]);
+    assert.deepEqual(
+      [
+        uniform(command).getUint32(12, true),
+        uniform(command).getUint32(16, true),
+        uniform(command).getUint32(20, true),
+      ],
+      [2, 4, 3],
+    );
   }
 });
 
 test("RMSNorm weight VJP dispatches matrix length into vector output", () => {
   const definitions = [
-    ["x", 6], ["weight", 3], ["grad_output", 6], ["grad_x", 6], ["grad_weight", 3],
+    ["x", 6],
+    ["weight", 3],
+    ["grad_output", 6],
+    ["grad_x", 6],
+    ["grad_weight", 3],
   ];
   const buffers = definitions.map(([id, elements], index) => tensor(id, elements, index));
   Object.assign(buffers[0], { shape: [2, 3] });
@@ -351,18 +387,35 @@ test("RMSNorm weight VJP dispatches matrix length into vector output", () => {
 
 test("all 34 pointwise-backed canonical forms lower with catalog stage parity", () => {
   const supported = new Set([
-    "graph.detach", "graph.scale_const", "graph.add", "graph.mul", "graph.relu2",
-    "graph.silu", "graph.causal_mask", "graph.softmax", "graph.rmsnorm", "loss.mse",
-    "graph.bias", "graph.transpose", "graph.slice_cols", "graph.dense_matmul",
-    "graph.ternary_matmul", "graph.ste_surrogate", "graph.lsq_ste",
+    "graph.detach",
+    "graph.scale_const",
+    "graph.add",
+    "graph.mul",
+    "graph.relu2",
+    "graph.silu",
+    "graph.causal_mask",
+    "graph.softmax",
+    "graph.rmsnorm",
+    "loss.mse",
+    "graph.bias",
+    "graph.transpose",
+    "graph.slice_cols",
+    "graph.dense_matmul",
+    "graph.ternary_matmul",
+    "graph.ste_surrogate",
+    "graph.lsq_ste",
   ]);
   // Count is 17 operations x forward/VJP = 34; dense estimator families included above.
   assert.equal(supported.size, 17);
   const representatives = new Map();
   for (const item of corpus.cases) {
     const key = `${item.operation}|${item.execution}`;
-    if (supported.has(item.operation) && item.expected.kind === "success" &&
-        !representatives.has(key)) representatives.set(key, item);
+    if (
+      supported.has(item.operation) &&
+      item.expected.kind === "success" &&
+      !representatives.has(key)
+    )
+      representatives.set(key, item);
   }
   assert.equal(representatives.size, 34);
   for (const [key, item] of representatives) {
@@ -387,39 +440,47 @@ test("all 34 pointwise-backed canonical forms lower with catalog stage parity", 
     });
     const attributes = item.attributes.map((attribute) => ({
       name: attribute.name,
-      kind: attribute.type === "u32_list"
-        ? "u32-list"
-        : attribute.type === "u64_list"
-          ? "u64-list"
-          : attribute.type,
-      value: attribute.type === "f32"
-        ? f32FromBits(attribute.bits)
-        : "values" in attribute
-          ? [...attribute.values]
-          : attribute.value,
+      kind:
+        attribute.type === "u32_list"
+          ? "u32-list"
+          : attribute.type === "u64_list"
+            ? "u64-list"
+            : attribute.type,
+      value:
+        attribute.type === "f32"
+          ? f32FromBits(attribute.bits)
+          : "values" in attribute
+            ? [...attribute.values]
+            : attribute.value,
     }));
     const binding = (entry) => ({ role: entry.name, bufferId: entry.name });
     const operationId = `canonical.${key}`;
-    const operations = item.execution === "forward"
-      ? [{
-        id: operationId,
-        operation: item.operation,
-        inputs: item.inputs.map((entry) => entry.name),
-        outputs: item.expected.outputs.map((entry) => entry.name),
-        attributes,
-      }]
-      : [];
-    const backwards = item.execution === "vjp"
-      ? [{
-        id: operationId,
-        sourceOperationId: `source.${key}`,
-        operation: item.operation,
-        execution: "vjp",
-        inputs: item.inputs.map(binding),
-        outputs: item.expected.outputs.map(binding),
-        attributes,
-      }]
-      : [];
+    const operations =
+      item.execution === "forward"
+        ? [
+            {
+              id: operationId,
+              operation: item.operation,
+              inputs: item.inputs.map((entry) => entry.name),
+              outputs: item.expected.outputs.map((entry) => entry.name),
+              attributes,
+            },
+          ]
+        : [];
+    const backwards =
+      item.execution === "vjp"
+        ? [
+            {
+              id: operationId,
+              sourceOperationId: `source.${key}`,
+              operation: item.operation,
+              execution: "vjp",
+              inputs: item.inputs.map(binding),
+              outputs: item.expected.outputs.map(binding),
+              attributes,
+            },
+          ]
+        : [];
     const commands = lowerPointwiseWebGpuOperationV1(
       plan(buffers, operations, backwards),
       item.execution === "forward" ? "forward" : "backward",

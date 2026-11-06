@@ -46,13 +46,11 @@ def _publish_noreplace(stage: Path, output: Path) -> None:
     raise QualificationError(f"no-clobber publication failed: {os.strerror(error)}")
 
 
+_run_git = runpy.run_path(Path(__file__).with_name("_qualification_git.py"))["run_git"]
+
+
 def _git(repo: Path, *args: str) -> str:
-    result = subprocess.run(
-        ["git", *args], cwd=repo, text=True, capture_output=True, check=False
-    )
-    if result.returncode:
-        raise QualificationError(result.stderr.strip() or "git command failed")
-    return result.stdout.strip()
+    return _run_git(repo, *args, error_type=QualificationError)
 
 
 def _require_clean(repo: Path, revision: str) -> None:

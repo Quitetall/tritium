@@ -36,6 +36,33 @@ canonical owner, preserve exact f32 bits, return explicit destination buffer
 IDs and fail closed on binding, dtype, shape or compiled-plan drift. Generated
 binding freshness is part of `npm run check`.
 
+## Development checks
+
+```bash
+npm ci
+npm run format:check
+npm run lint
+npm run check
+```
+
+`npm run format` applies the exact pinned Biome formatter to authored files.
+Generated operation bindings and kernel bundles are excluded from formatting
+and linting; `check:generated` verifies them against their owning generators.
+The generated npm lockfile is likewise not hand-formatted.
+
+Lint uses Biome's recommended rules and treats warnings as errors. Its sole
+scoped rule exception permits non-null indexing assertions in the existing
+numeric, geometry and compiled-schedule modules named in `biome.json`. Those
+modules validate buffer roles, shapes and lengths before bounded indexing;
+adding redundant per-element guards is not a substitute for those admission
+checks. Strict TypeScript, including `noUncheckedIndexedAccess`, remains enabled.
+The exception does not cover other authored files or waive semantic vectors,
+failure injection, installed-archive checks or physical-browser qualification.
+
+The full `check` runs formatting and lint before the WASM build, TypeScript,
+session tests and installed-package verification. Neither formatting nor lint
+produces a release qualification receipt.
+
 `encodeWebTrainingPayload(...)` writes canonical `TRWEBP1` bytes containing
 root parameters and optimizer state. `decodeWebTrainingPayload(...)` verifies
 BLAKE3 integrity, canonical ordering, exact dtype/byte lengths and compiled
@@ -163,6 +190,12 @@ native CPU and npm receipts, then atomically
 publishes `lane.json` and canonical `trace.json`. It requires a clean revision
 and a clean-source npm receipt. Run separate current-stable endpoints for
 Chrome, Firefox and Safari; Safari lane additionally requires physical macOS.
+The producer enables WebGPU in its temporary Firefox profile and exposes the
+renderer identity needed by the hardware check. Firefox may deliberately
+replace the exact renderer with a representative value ending in `, or
+similar`; the receipt labels that value as browser-sanitized and the exact
+adapter model remains unknown. These settings do not modify the user's Firefox
+profile; fallback and software adapters remain rejected.
 
 This package is private while the local v1.1 release candidate is under
 construction. Registry publication requires explicit release authorization.
