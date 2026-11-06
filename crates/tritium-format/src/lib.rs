@@ -177,8 +177,9 @@ pub use trit_package::{
     TritBlob, TritBlobInfo, TritBlobKind, TritBlobSize, TritBlobVisitError, TritPackage,
     TritPackageError, TritPackageReadError, TritPackageReadLimits, TritPackageReader,
     TritPackageSizeBounds, TritPackageWriteError, TritSpoolBlob, read_trit_package,
-    read_trit_package_with_manifest_limit, trit_package_size_bounds, write_trit_package,
-    write_trit_package_bounded, write_trit_package_from_spool, write_trit_package_to,
+    read_trit_package_with_manifest_limit, trit_package_layout_spec, trit_package_size_bounds,
+    write_trit_package, write_trit_package_bounded, write_trit_package_from_spool,
+    write_trit_package_to,
 };
 
 /// Weights per quantization block (ggml `QK_K`).
