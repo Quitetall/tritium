@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import runpy
 import tempfile
@@ -79,6 +80,78 @@ class GenerateReleaseInputsTests(unittest.TestCase):
     def test_rejects_unbound_release_artifact(self):
         (self.staged / "orphan-1.1.0.tgz").write_bytes(b"orphan")
         with self.assertRaisesRegex(ReleaseInputsError, "lack unique SBOM bindings"):
+            build_inputs(self.staged, **self.args())
+
+    def test_binds_same_named_nested_wheels_to_colocated_sboms(self):
+        filename = "pytritium-1.1.0rc2-cp39-abi3-manylinux_2_28_x86_64.whl"
+        for directory, artifact_id in (("cpu", "wheel-cpu"), ("cuda", "wheel-cuda")):
+            target = self.staged / directory
+            target.mkdir()
+            (target / filename).write_bytes(directory.encode())
+            sbom(
+                target / f"{artifact_id}.cdx.json",
+                artifact_id=artifact_id,
+                filename=filename,
+            )
+
+        document = build_inputs(self.staged, **self.args())
+        wheels = {
+            item["id"]: item
+            for item in document["artifacts"]
+            if item["id"].startswith("wheel-")
+        }
+        self.assertEqual(wheels["wheel-cpu"]["path"], f"cpu/{filename}")
+        self.assertEqual(wheels["wheel-cpu"]["sbom"], "cpu/wheel-cpu.cdx.json")
+        self.assertEqual(wheels["wheel-cuda"]["path"], f"cuda/{filename}")
+        self.assertEqual(wheels["wheel-cuda"]["sbom"], "cuda/wheel-cuda.cdx.json")
+
+    def test_rejects_ambiguous_non_colocated_basename_binding(self):
+        filename = "same.whl"
+        for directory in ("cpu", "cuda"):
+            target = self.staged / directory
+            target.mkdir()
+            (target / filename).write_bytes(directory.encode())
+            sbom(
+                target / f"{directory}.cdx.json",
+                artifact_id=f"wheel-{directory}",
+                filename=filename,
+            )
+        sbom(
+            self.staged / "ambiguous.cdx.json",
+            artifact_id="wheel-ambiguous",
+            filename=filename,
+        )
+
+        with self.assertRaisesRegex(ReleaseInputsError, "ambiguously names artifact"):
+            build_inputs(self.staged, **self.args())
+
+    @unittest.skipIf(os.name == "nt", "Windows treats backslash as a path separator")
+    def test_rejects_backslash_in_artifact_directory_path(self):
+        directory = self.staged / "nested\\folder"
+        directory.mkdir()
+        (directory / "portable.whl").write_bytes(b"wheel")
+        sbom(
+            directory / "wheel.cdx.json",
+            artifact_id="nested-wheel",
+            filename="portable.whl",
+        )
+
+        with self.assertRaisesRegex(ReleaseInputsError, "portable POSIX separators"):
+            build_inputs(self.staged, **self.args())
+
+    @unittest.skipIf(os.name == "nt", "Windows treats backslash as a path separator")
+    def test_rejects_backslash_in_sbom_directory_path(self):
+        filename = "portable.whl"
+        (self.staged / filename).write_bytes(b"wheel")
+        directory = self.staged / "metadata\\folder"
+        directory.mkdir()
+        sbom(
+            directory / "wheel.cdx.json",
+            artifact_id="wheel",
+            filename=filename,
+        )
+
+        with self.assertRaisesRegex(ReleaseInputsError, "SBOM path.*portable POSIX"):
             build_inputs(self.staged, **self.args())
 
     def test_rejects_duplicate_artifact_binding(self):
