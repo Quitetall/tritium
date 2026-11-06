@@ -26,4 +26,7 @@ fn generated_language_types_are_current_and_cover_wide_integers_and_tagged_varia
     assert!(python.contains("rows: int"));
     assert!(python.contains("seq: int"));
     assert!(python.contains("SignedRht"));
+    // Wire names that are not Python identifiers need the functional TypedDict form.
+    assert!(python.contains("LegacySaltV2ProfileSet = TypedDict(\"LegacySaltV2ProfileSet\", {"));
+    assert!(python.contains("    \"compact-v1\": LegacySaltV2ProfileDescriptor,\n"));
 }

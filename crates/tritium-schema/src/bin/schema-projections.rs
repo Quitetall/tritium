@@ -644,28 +644,41 @@ fn render_python_object(
 ) -> Result<String, String> {
     let properties = object_properties(schema).ok_or_else(|| format!("{name} is not an object"))?;
     let required = required_properties(schema);
-    let mut output = format!("class {name}(TypedDict):\n");
-    if properties.is_empty() {
-        output.push_str("    pass\n");
-    }
+    let mut fields = Vec::with_capacity(properties.len() + 1);
     for (field, value) in properties {
-        if !is_python_identifier(field) {
-            return Err(format!(
-                "{name} has unsupported Python field name {field:?}"
-            ));
-        }
         let field_type = python_type(value, &format!("{name}{}", pascal_case(field)), helpers)?;
         let field_type = if required.contains(field.as_str()) {
             field_type
         } else {
             format!("NotRequired[{field_type}]")
         };
-        output.push_str(&format!("    {field}: {field_type}\n"));
+        fields.push((field.as_str(), field_type));
     }
     if schema.get("additionalProperties") == Some(&Value::Bool(true)) {
-        output.push_str("    __extra__: NotRequired[dict[str, Any]]\n");
+        fields.push(("__extra__", "NotRequired[dict[str, Any]]".to_owned()));
     }
+
+    // PEP 589: keys that are not identifiers cannot use the class syntax.
+    if fields.iter().all(|(field, _)| is_python_identifier(field)) {
+        let mut output = format!("class {name}(TypedDict):\n");
+        if fields.is_empty() {
+            output.push_str("    pass\n");
+        }
+        for (field, field_type) in fields {
+            output.push_str(&format!("    {field}: {field_type}\n"));
+        }
+        return Ok(output);
+    }
+    let mut output = format!("{name} = TypedDict({}, {{\n", python_string(name)?);
+    for (field, field_type) in fields {
+        output.push_str(&format!("    {}: {field_type},\n", python_string(field)?));
+    }
+    output.push_str("})\n");
     Ok(output)
+}
+
+fn python_string(value: &str) -> Result<String, String> {
+    python_literal(&Value::String(value.to_owned()))
 }
 
 fn python_type(
