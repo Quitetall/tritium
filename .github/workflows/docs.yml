@@ -31,7 +31,7 @@ jobs:
       # Prebuilt binaries via taiki-e/install-action (matches ci.yml's lane style).
       # Pinned versions keep the gate reproducible; mdbook-linkcheck is the backend
       # mdbook invokes during `build`.
-      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29
         with:
           tool: mdbook@0.4.43,mdbook-linkcheck@0.7.7
       - name: build the book + check links
