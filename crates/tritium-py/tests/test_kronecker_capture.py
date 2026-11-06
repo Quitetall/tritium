@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +23,13 @@ from tritium.torch import (
     fit_kronecker_group,
 )
 from tritium.torch import ptq
+
+
+def _token_stream_digest(batches):
+    digest = ptq.hashlib.sha256()
+    for index, batch in enumerate(batches):
+        ptq._hash_value(digest, f"batch[{index}]", batch)
+    return digest.hexdigest()
 
 
 class _TinyObjectiveModel(torch.nn.Module):
@@ -376,21 +384,22 @@ def test_qwen_capture_session_dispatches_embedding_and_output_head(tmp_path):
             return SimpleNamespace(records=2, produced=2, reused=0)
 
     model = TinyQwen()
+    calibration_batches = [
+        {
+            "input_ids": torch.tensor([[1, 3]]),
+            "attention_mask": torch.tensor([[1, 1]]),
+        }
+    ]
     receipt = capture_qwen36_kronecker_evidence(
         model,
-        lambda task: [
-            {
-                "input_ids": torch.tensor([[1, 3]]),
-                "attention_mask": torch.tensor([[1, 1]]),
-            }
-        ],
+        lambda task: calibration_batches,
         model_dir=tmp_path / "model",
         declared_revision="test-revision",
         work_dir=tmp_path / "work",
         evidence_dir=tmp_path / "evidence",
         curvature="guided-fisher",
         activation_cache_digest="02" * 32,
-        token_stream_digest="03" * 32,
+        token_stream_digest=_token_stream_digest(calibration_batches),
         damping=0.01,
         guided_loss_reduction="mean-attention-mask",
         _session_factory=FakeSession,
@@ -462,21 +471,22 @@ def test_qwen_mtp_task_executes_through_containing_oracle(tmp_path):
             return SimpleNamespace(records=1, produced=1, reused=0)
 
     mtp = Mtp()
+    calibration_batches = [
+        {
+            "values": torch.ones(1, 2, 128),
+            "attention_mask": torch.ones(1, 2, dtype=torch.int64),
+        }
+    ]
     receipt = capture_qwen36_kronecker_evidence(
         Language(),
-        lambda task: [
-            {
-                "values": torch.ones(1, 2, 128),
-                "attention_mask": torch.ones(1, 2, dtype=torch.int64),
-            }
-        ],
+        lambda task: calibration_batches,
         model_dir=tmp_path / "model",
         declared_revision="test-revision",
         work_dir=tmp_path / "work",
         evidence_dir=tmp_path / "evidence",
         curvature="guided-fisher",
         activation_cache_digest="02" * 32,
-        token_stream_digest="03" * 32,
+        token_stream_digest=_token_stream_digest(calibration_batches),
         damping=0.01,
         mtp_model=mtp,
         execution_model=Oracle(mtp),
@@ -515,6 +525,7 @@ def test_qwen_capture_groups_dense_tasks_into_one_calibration_replay(tmp_path):
             damping,
             **kwargs,
         ):
+            self.evidence_dir = Path(evidence_dir)
             common = dict(
                 columns=128,
                 scope="language",
@@ -543,7 +554,7 @@ def test_qwen_capture_groups_dense_tasks_into_one_calibration_replay(tmp_path):
 
         def next_request(self):
             while self.cursor < len(self.tasks) and (
-                tmp_path / "evidence" / f"{self.cursor:06d}.s2kf"
+                self.evidence_dir / f"{self.cursor:06d}.s2kf"
             ).is_file():
                 self.cursor += 1
             return self.tasks[self.cursor] if self.cursor < len(self.tasks) else None
@@ -562,17 +573,21 @@ def test_qwen_capture_groups_dense_tasks_into_one_calibration_replay(tmp_path):
 
     model = TinyQwen()
     factory_calls = 0
+    calibration_batches = [
+        {
+            "values": torch.ones(1, 2, 128),
+            "attention_mask": torch.ones(1, 2, dtype=torch.int64),
+        }
+    ]
+    token_digest = ptq.hashlib.sha256()
+    ptq._hash_value(token_digest, "batch[0]", calibration_batches[0])
+    token_stream_digest = token_digest.hexdigest()
 
     def data_factory(task):
         nonlocal factory_calls
         factory_calls += 1
         assert task.tensor_index == 0
-        return [
-            {
-                "values": torch.ones(1, 2, 128),
-                "attention_mask": torch.ones(1, 2, dtype=torch.int64),
-            }
-        ]
+        return calibration_batches
 
     receipt = capture_qwen36_kronecker_evidence(
         model,
@@ -583,7 +598,7 @@ def test_qwen_capture_groups_dense_tasks_into_one_calibration_replay(tmp_path):
         evidence_dir=tmp_path / "evidence",
         curvature="forward-kl-kronecker",
         activation_cache_digest="02" * 32,
-        token_stream_digest="03" * 32,
+        token_stream_digest=f"sha256:{token_stream_digest}",
         damping=0.01,
         max_shared_modules=2,
         _session_factory=FakeSession,
@@ -594,6 +609,24 @@ def test_qwen_capture_groups_dense_tasks_into_one_calibration_replay(tmp_path):
     assert model.forward_calls == 1
     assert (tmp_path / "evidence" / "000000.s2kf").is_file()
     assert (tmp_path / "evidence" / "000001.s2kf").is_file()
+
+    bad_evidence = tmp_path / "bad-evidence"
+    with pytest.raises(ValueError, match="batches differ from token_stream_digest"):
+        capture_qwen36_kronecker_evidence(
+            model,
+            lambda task: [{"values": torch.zeros(1, 2, 128)}],
+            model_dir=tmp_path / "model",
+            declared_revision="test-revision",
+            work_dir=tmp_path / "work",
+            evidence_dir=bad_evidence,
+            curvature="forward-kl-kronecker",
+            activation_cache_digest="02" * 32,
+            token_stream_digest=token_stream_digest,
+            damping=0.01,
+            max_shared_modules=2,
+            _session_factory=FakeSession,
+        )
+    assert not list(bad_evidence.glob("*.s2kf"))
 
 
 class _TwoLinearModel(torch.nn.Module):

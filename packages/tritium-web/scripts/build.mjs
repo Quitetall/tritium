@@ -30,20 +30,12 @@ await build({
   sourcesContent: false,
   target: ["es2022"],
   define: {
-    __TRITIUM_TRAINING_VECTORS_V2_JSON__: JSON.stringify(
-      canonicalVectors.toString("utf8"),
-    ),
+    __TRITIUM_TRAINING_VECTORS_V2_JSON__: JSON.stringify(canonicalVectors.toString("utf8")),
   },
 });
 await cp(resolve(root, "src/index.d.ts"), resolve(output, "index.d.ts"));
-await cp(
-  resolve(root, "src/qualification.d.ts"),
-  resolve(output, "qualification.d.ts"),
-);
-await cp(
-  resolve(root, "src/lifecycle-types.d.ts"),
-  resolve(output, "lifecycle-types.d.ts"),
-);
+await cp(resolve(root, "src/qualification.d.ts"), resolve(output, "qualification.d.ts"));
+await cp(resolve(root, "src/lifecycle-types.d.ts"), resolve(output, "lifecycle-types.d.ts"));
 await cp(
   resolve(root, "src/portable-state-types.d.ts"),
   resolve(output, "portable-state-types.d.ts"),

@@ -14,7 +14,66 @@ from .torch.ops import ternary_linear
 from .torch.projection import ProjectionContext, validate_projection
 from .torch.projection import expand_plane_scales
 
+_ADDITIVE_LINEAR_DECODE_CHUNK_ELEMENTS = 1 << 22
 _B3_MAX_VALID_BYTE = 3**5 - 1
+_ONNX_DTYPE_TO_TORCH = {
+    1: torch.float32,
+    10: torch.float16,
+    11: torch.float64,
+    16: torch.bfloat16,
+}
+_TORCH_DTYPE_TO_ONNX = {value: key for key, value in _ONNX_DTYPE_TO_TORCH.items()}
+
+
+def _decode_packed_ternary_plane(
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+    rows: int,
+    columns: int,
+    group_size: int,
+    dtype_code: int,
+) -> torch.Tensor:
+    dtype = _ONNX_DTYPE_TO_TORCH[dtype_code]
+    powers = packed.new_tensor((1, 3, 9, 27, 81), dtype=torch.int16)
+    digits = (packed.to(torch.int16).unsqueeze(1) // powers.unsqueeze(0)) % 3
+    trits = (digits.flatten()[: rows * columns] - 1).reshape(rows, columns)
+    trits = trits.to(dtype=dtype)
+    scales = scales.to(dtype=dtype)
+    scales = expand_plane_scales(
+        scales, rows=rows, columns=columns, group_size=group_size
+    )
+    return trits * scales
+
+
+@torch.library.custom_op("tritium::decode_packed_ternary_plane", mutates_args=())
+def _decode_packed_ternary_plane_op(
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+    rows: int,
+    columns: int,
+    group_size: int,
+    dtype_code: int,
+) -> torch.Tensor:
+    """Opaque-to-Dynamo packed plane decode with a portable eager implementation."""
+
+    return _decode_packed_ternary_plane(
+        packed, scales, rows, columns, group_size, dtype_code
+    )
+
+
+@_decode_packed_ternary_plane_op.register_fake
+def _decode_packed_ternary_plane_fake(
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+    rows: int,
+    columns: int,
+    group_size: int,
+    dtype_code: int,
+) -> torch.Tensor:
+    del packed, group_size
+    return scales.new_empty(
+        (rows, columns), dtype=_ONNX_DTYPE_TO_TORCH[dtype_code]
+    )
 
 
 def _estimator_extra_state(estimator: Estimator) -> torch.Tensor:
@@ -227,12 +286,30 @@ class AdditiveTernaryWeight(nn.Module):
         output = None
         for index in range(self.plane_count):
             packed = getattr(self, f"packed_trits_{index}")
+            scales = getattr(self, f"scales_{index}")
+            if torch.onnx.is_in_onnx_export():
+                try:
+                    dtype_code = _TORCH_DTYPE_TO_ONNX[dtype]
+                except KeyError as error:
+                    raise TypeError(
+                        f"unsupported ONNX ternary weight dtype {dtype}"
+                    ) from error
+                plane = _decode_packed_ternary_plane_op(
+                    packed,
+                    scales,
+                    self.out_features,
+                    self.in_features,
+                    self.group_size,
+                    dtype_code,
+                )
+                output = plane if output is None else output + plane
+                continue
             powers = packed.new_tensor((1, 3, 9, 27, 81), dtype=torch.int16)
             digits = (packed.to(torch.int16).unsqueeze(1) // powers.unsqueeze(0)) % 3
             trits = (digits.flatten()[: self.weight_elements] - 1).reshape(
                 self.out_features, self.in_features
             ).to(dtype=dtype)
-            scales = getattr(self, f"scales_{index}").to(dtype=dtype)
+            scales = scales.to(dtype=dtype)
             scales = expand_plane_scales(
                 scales,
                 rows=self.out_features,
@@ -242,6 +319,68 @@ class AdditiveTernaryWeight(nn.Module):
             plane = trits * scales
             output = plane if output is None else output + plane
         return output
+
+    def _dense_rows(self, indices: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
+        """Decode referenced rows in bounded chunks for embedding lookup."""
+        if not dtype.is_floating_point:
+            raise TypeError("additive ternary embedding output must be floating point")
+        if indices.dtype not in (torch.int32, torch.int64):
+            raise TypeError("additive ternary embedding indices must be int32 or int64")
+
+        flat_indices = indices.to(dtype=torch.int64).reshape(-1)
+        rows_per_chunk = max(1, (1 << 18) // self.in_features)
+        columns = torch.arange(self.in_features, device=indices.device)
+        group_ids = columns // self.group_size
+        powers = torch.tensor((1, 3, 9, 27, 81), device=indices.device)
+
+        def decode_rows(selected_rows: torch.Tensor) -> torch.Tensor:
+            positions = selected_rows.unsqueeze(1) * self.in_features + columns
+            chunk = None
+            for plane_index in range(self.plane_count):
+                packed = getattr(self, f"packed_trits_{plane_index}")
+                # `torch.div(..., rounding_mode="floor")` exports as float32
+                # Div+Floor. Large matrices cross 2^24 flattened elements, where
+                # float32 no longer represents every integer and packed-byte
+                # gathers silently select the wrong trit. Integer floor division
+                # preserves the exact byte offset through ONNX export.
+                byte_indices = torch.floor_divide(positions, 5)
+                digit_indices = torch.remainder(positions, 5)
+                packed_values = packed.index_select(
+                    0, byte_indices.reshape(-1)
+                ).reshape_as(positions)
+                digits = torch.div(
+                    packed_values.to(torch.int64),
+                    powers[digit_indices],
+                    rounding_mode="floor",
+                ).remainder(3)
+                trits = digits.to(dtype=dtype) - 1
+                scales = getattr(self, f"scales_{plane_index}").index_select(
+                    0, selected_rows
+                )
+                expanded_scales = scales.index_select(1, group_ids).to(dtype=dtype)
+                plane = trits * expanded_scales
+                chunk = plane if chunk is None else chunk + plane
+            assert chunk is not None
+            return chunk
+
+        # torch.export (used by the Dynamo ONNX exporter) cannot prove that a
+        # dynamically sliced output and its independently gathered chunk have
+        # identical symbolic lengths. Decode the requested rows as one
+        # functional tensor during graph capture; eager execution keeps the
+        # bounded-memory chunked path below.
+        if torch.compiler.is_compiling():
+            return decode_rows(flat_indices).reshape(*indices.shape, self.in_features)
+
+        output = torch.empty(
+            (flat_indices.numel(), self.in_features),
+            dtype=dtype,
+            device=indices.device,
+        )
+        for start in range(0, flat_indices.numel(), rows_per_chunk):
+            end = min(start + rows_per_chunk, flat_indices.numel())
+            selected_rows = flat_indices[start:end]
+            output[start:end].copy_(decode_rows(selected_rows))
+        return output.reshape(*indices.shape, self.in_features)
 
     def trit_counts(self) -> tuple[tuple[int, int, int], ...]:
         """Return per-plane ``(-1, 0, +1)`` counts without a dense float shadow."""
@@ -382,11 +521,28 @@ class AdditiveTernaryLinear(_AdditiveTernaryConsumer):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if not input.dtype.is_floating_point:
             raise TypeError("additive ternary linear input must be floating point")
-        return F.linear(
-            input,
-            self.packed_weight.dense(dtype=input.dtype),
-            self.bias.to(dtype=input.dtype) if self.bias is not None else None,
+        if input.shape[-1] != self.in_features:
+            raise RuntimeError(
+                f"input feature dimension {input.shape[-1]} does not match "
+                f"linear weight dimension {self.in_features}"
+            )
+        rows_per_chunk = max(
+            1, _ADDITIVE_LINEAR_DECODE_CHUNK_ELEMENTS // max(1, self.in_features)
         )
+        outputs = []
+        for start in range(0, self.out_features, rows_per_chunk):
+            end = min(start + rows_per_chunk, self.out_features)
+            rows = torch.arange(start, end, device=input.device)
+            weight = self.packed_weight._dense_rows(rows, dtype=input.dtype)
+            bias = (
+                self.bias[start:end].to(dtype=input.dtype)
+                if self.bias is not None
+                else None
+            )
+            outputs.append(F.linear(input, weight, bias))
+        if not outputs:
+            return input.new_empty((*input.shape[:-1], 0))
+        return torch.cat(outputs, dim=-1)
 
     def extra_repr(self) -> str:
         return (
@@ -467,15 +623,7 @@ class AdditiveTernaryEmbedding(_AdditiveTernaryConsumer):
         )
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return F.embedding(
-            input,
-            self.packed_weight.dense(dtype=self.output_dtype),
-            self.padding_idx,
-            self.max_norm,
-            self.norm_type,
-            self.scale_grad_by_freq,
-            self.sparse,
-        )
+        return self.packed_weight._dense_rows(input, dtype=self.output_dtype)
 
     def extra_repr(self) -> str:
         return (

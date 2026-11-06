@@ -16,6 +16,7 @@ blake3 = { workspace = true }
 half = { workspace = true }
 tritium-core = { workspace = true }
 tritium-format = { workspace = true }
+tritium-quantize = { workspace = true }
 tritium-spec = { workspace = true }
 tritium-testkit = { workspace = true }
 # Row-parallel dense matmul forward/vjp — the training hot path. Parallelizing over OUTPUT rows
@@ -29,10 +30,6 @@ rayon = { workspace = true }
 proptest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# Fisher-driven SALT plane allocation gate (plan 0039): the training-side diagonal Fisher feeds
-# the quantize allocator's Sensitivity::Custom. tritium-quantize does NOT depend on tritium-train,
-# so this dev-dep is acyclic. Also pulls the SALT dequant helper via tritium-format.
-tritium-quantize = { workspace = true }
 
 [build-dependencies]
 tritium-build-info = { workspace = true }

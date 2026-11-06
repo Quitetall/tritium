@@ -95,7 +95,9 @@ function findOne<T extends { readonly id: string }>(
   if (typeof id !== "string" || id.length === 0) {
     fail("invalid_schema", `${name} id must be nonempty`);
   }
-  if (items.some((item) => !isRecord(item) || typeof item.id !== "string" || item.id.length === 0)) {
+  if (
+    items.some((item) => !isRecord(item) || typeof item.id !== "string" || item.id.length === 0)
+  ) {
     fail("invalid_schema", `${name} entries are invalid`);
   }
   const matches = items.filter((item) => item.id === id);
@@ -105,9 +107,7 @@ function findOne<T extends { readonly id: string }>(
   return matches[0]!;
 }
 
-function bufferMap(
-  plan: CompiledTrainingPlanV1,
-): ReadonlyMap<string, CompiledTrainingBufferV1> {
+function bufferMap(plan: CompiledTrainingPlanV1): ReadonlyMap<string, CompiledTrainingBufferV1> {
   const buffers = new Map<string, CompiledTrainingBufferV1>();
   for (const buffer of plan.buffers) {
     if (
@@ -116,14 +116,17 @@ function bufferMap(
       buffer.id.length === 0 ||
       typeof buffer.ownerId !== "string" ||
       buffer.ownerId.length === 0 ||
-      !(buffer.aliasOf === null || (typeof buffer.aliasOf === "string" && buffer.aliasOf.length > 0)) ||
-      !(["batch", "parameter", "gradient", "optimizer-state", "activation", "result"] as const).includes(buffer.role) ||
+      !(
+        buffer.aliasOf === null ||
+        (typeof buffer.aliasOf === "string" && buffer.aliasOf.length > 0)
+      ) ||
+      !(
+        ["batch", "parameter", "gradient", "optimizer-state", "activation", "result"] as const
+      ).includes(buffer.role) ||
       !(["f32", "u32", "bytes"] as const).includes(buffer.dtype) ||
       !Array.isArray(buffer.shape) ||
       !isDenseArray(buffer.shape) ||
-      buffer.shape.some(
-        (dimension) => !Number.isSafeInteger(dimension) || dimension <= 0,
-      ) ||
+      buffer.shape.some((dimension) => !Number.isSafeInteger(dimension) || dimension <= 0) ||
       !Number.isSafeInteger(buffer.byteOffset) ||
       buffer.byteOffset < 0 ||
       !Number.isSafeInteger(buffer.byteLength) ||
@@ -302,12 +305,20 @@ function portableAttribute(attribute: TrainingAttributeSpecV1): PortableAttribut
       if (typeof attribute.value !== "boolean") {
         fail("invalid_schema", `${attribute.name} must be boolean`);
       }
-      return Object.freeze({ kind: "bool", name: attribute.name, value: attribute.value as boolean });
+      return Object.freeze({
+        kind: "bool",
+        name: attribute.name,
+        value: attribute.value as boolean,
+      });
     case "text":
       if (typeof attribute.value !== "string" || attribute.value.length === 0) {
         fail("invalid_schema", `${attribute.name} must be nonempty text`);
       }
-      return Object.freeze({ kind: "text", name: attribute.name, value: attribute.value as string });
+      return Object.freeze({
+        kind: "text",
+        name: attribute.name,
+        value: attribute.value as string,
+      });
     case "u64-list":
     case "u32-list":
       if (
@@ -522,7 +533,9 @@ function compile(
       outputIds.map((id, index) => portableOutput(roles.outputs[index]!, id, buffers)),
     ),
   });
-  if (new TextEncoder().encode(JSON.stringify(request)).byteLength > MAX_PORTABLE_REQUEST_JSON_BYTES) {
+  if (
+    new TextEncoder().encode(JSON.stringify(request)).byteLength > MAX_PORTABLE_REQUEST_JSON_BYTES
+  ) {
     fail("capacity", "compiled portable request JSON exceeds 8 MiB");
   }
   return Object.freeze({ request, outputBufferIds: Object.freeze([...outputIds]) });
@@ -586,10 +599,12 @@ export function compilePortableBackwardOperationRequest(
     !isDenseArray(operation.outputs) ||
     !Array.isArray(operation.attributes) ||
     operation.inputs.some(
-      (item) => !isRecord(item) || typeof item.role !== "string" || typeof item.bufferId !== "string",
+      (item) =>
+        !isRecord(item) || typeof item.role !== "string" || typeof item.bufferId !== "string",
     ) ||
     operation.outputs.some(
-      (item) => !isRecord(item) || typeof item.role !== "string" || typeof item.bufferId !== "string",
+      (item) =>
+        !isRecord(item) || typeof item.role !== "string" || typeof item.bufferId !== "string",
     )
   ) {
     fail("invalid_schema", `${operationId} compiled backward operation is invalid`);

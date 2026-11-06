@@ -7,9 +7,9 @@ compression claim is tied to the physical artifact that a runtime executes.
 
 This chapter explains Tritium's contracts and the reasoning behind them. It
 does not claim that the unfinished v1.1 flagship campaign has passed. Current
-research comparisons and unresolved hypotheses live in the
-mid-2026 survey (see the [research repository](https://github.com/Quitetall/tritium-research)) and the frozen
-SALT V2 campaign (see the [research repository](https://github.com/Quitetall/tritium-research)).
+research comparisons and unresolved hypotheses live in internal research
+records. Their public access and promotion policy is described in the
+[research-record guide](./research-records.md).
 
 ## 1. Start with the representation
 
@@ -62,8 +62,9 @@ boundary.
 The same distinction applies to PTQ refinement. Scale-only and hard-PV
 (PV-Tuning-style alternating continuous-scale and discrete-code optimization)
 results are children of a PTQ artifact with distinct ancestry and cost. They
-are not relabeled as ordinary PTQ. The research survey (see the [research repository](https://github.com/Quitetall/tritium-research))
-places this refinement family in the broader literature.
+are not relabeled as ordinary PTQ. Internal research records place this
+refinement family in the broader literature; see the
+[research-record guide](./research-records.md) for the public access policy.
 
 ## 3. Choose PTQ, QAT, or refinement intentionally
 

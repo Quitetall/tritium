@@ -1,7 +1,7 @@
 //! Grouped ternary 2-D convolution forward and VJP for portable training.
 //!
 //! Layout is NCHW. Forward lowers each `(batch, group)` to a canonical
-//! `im2col` matrix and reuses ternary [`matmul`](super::matmul). Backward uses
+//! `im2col` matrix and reuses ternary [`matmul`]. Backward uses
 //! matching matmul VJP plus ordered `col2im` scatter, keeping overlap sums
 //! deterministic across portable backends.
 

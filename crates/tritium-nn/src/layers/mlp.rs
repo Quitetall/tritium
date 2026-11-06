@@ -211,10 +211,25 @@ impl SwiGluMlp {
         }
         let hidden_len = checked_buffer_len(m, n_ff, x.len())?;
 
+        let mut staged_out = zeroed_scratch(output_len, "SwiGLU output")?;
+        if let (Projection::Tensor(gate), Projection::Tensor(up), Projection::Tensor(down)) =
+            (&self.gate, &self.up, &self.down)
+            && backend.try_tensor_swiglu(tritium_spec::TensorSwiGlu {
+                act: x,
+                gate: gate.device(),
+                up: up.device(),
+                down: down.device(),
+                batch: m,
+                out: &mut staged_out,
+            })?
+        {
+            out.copy_from_slice(&staged_out);
+            return Ok(());
+        }
+
         // gate(x) and up(x): both `[m, n_ff]`.
         let mut gate = zeroed_scratch(hidden_len, "SwiGLU gate")?;
         let mut up = zeroed_scratch(hidden_len, "SwiGLU up")?;
-        let mut staged_out = zeroed_scratch(output_len, "SwiGLU output")?;
         self.gate.forward(backend, x, m, &mut gate)?;
         self.up.forward(backend, x, m, &mut up)?;
 

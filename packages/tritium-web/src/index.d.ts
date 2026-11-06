@@ -19,10 +19,7 @@ import type {
   PortableSchedulePlanErrorCode,
   PortableScheduleTensorStoreV1,
 } from "./portable-schedule-types.js";
-import type {
-  WebTrainingInitialTensorsV1,
-  WebTrainingPayloadErrorCode,
-} from "./payload-types.js";
+import type { WebTrainingInitialTensorsV1, WebTrainingPayloadErrorCode } from "./payload-types.js";
 
 export type {
   PortableAdamLeafV1,
@@ -65,11 +62,7 @@ export type {
   WebTrainingPayloadErrorCode,
 } from "./payload-types.js";
 
-export type TrainingOpCategoryV1 =
-  | "graph"
-  | "loss"
-  | "optimizer"
-  | "lifecycle";
+export type TrainingOpCategoryV1 = "graph" | "loss" | "optimizer" | "lifecycle";
 export type TrainingVjpV1 = "none" | "first_order";
 
 export interface TrainingOpDescriptorV1 {
@@ -104,14 +97,10 @@ export declare function parseTrainingManifest(
   data: string | Uint8Array,
 ): TrainingOpManifestV1 | TrainingOpManifestV2;
 
-export declare const TRAINING_MANIFEST_DIGEST_V2:
-  "9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098";
-export declare const TRAINING_VECTOR_DIGEST_V2:
-  "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7";
-export declare const TRAINING_MANIFEST_DIGEST_V1:
-  "aefb352d04db145e48394b392a106ab0ad831e09e62d8c76ceddedb36a564083";
-export declare const TRAINING_VECTOR_DIGEST_V1:
-  "fcb250733b991aac165871f8c54b0b063337a3ed01bd1da02de220916887fbd6";
+export declare const TRAINING_MANIFEST_DIGEST_V2: "9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098";
+export declare const TRAINING_VECTOR_DIGEST_V2: "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7";
+export declare const TRAINING_MANIFEST_DIGEST_V1: "aefb352d04db145e48394b392a106ab0ad831e09e62d8c76ceddedb36a564083";
+export declare const TRAINING_VECTOR_DIGEST_V1: "fcb250733b991aac165871f8c54b0b063337a3ed01bd1da02de220916887fbd6";
 
 export declare function runPortableWasmConformance(
   source?: PortableWasmSourceV1,
@@ -159,9 +148,7 @@ export declare class PortableWasmLifecycleError extends Error {
 }
 
 export declare class PortableWasmLifecycleState {
-  static create(
-    options: PortableWasmLifecycleOptionsV1,
-  ): Promise<PortableWasmLifecycleState>;
+  static create(options: PortableWasmLifecycleOptionsV1): Promise<PortableWasmLifecycleState>;
   get state(): PortableCheckpointStateV1;
   checkpoint(): Promise<PortableWasmLifecycleBinaryV1>;
   commit(state: PortableCheckpointStateV1): Promise<PortableTrainingReceiptV1>;
@@ -194,9 +181,7 @@ export declare class WebTrainingPayloadError extends Error {
   constructor(code: WebTrainingPayloadErrorCode, message: string);
 }
 
-export declare function encodeWebTrainingPayload(
-  tensors: WebTrainingInitialTensorsV1,
-): Uint8Array;
+export declare function encodeWebTrainingPayload(tensors: WebTrainingInitialTensorsV1): Uint8Array;
 
 export declare function decodeWebTrainingPayload(
   plan: CompiledTrainingPlanV1,
@@ -293,13 +278,7 @@ export interface TrainingOperationSpecV1 {
   readonly attributes: readonly TrainingAttributeSpecV1[];
 }
 
-export type TrainingAttributeKindV1 =
-  | "f32"
-  | "u64"
-  | "bool"
-  | "text"
-  | "u64-list"
-  | "u32-list";
+export type TrainingAttributeKindV1 = "f32" | "u64" | "bool" | "text" | "u64-list" | "u32-list";
 
 export interface TrainingAttributeSpecV1 {
   readonly name: string;
@@ -355,9 +334,7 @@ export interface WebTrainingModelV1 {
 }
 
 export interface TrainingBatchV1 {
-  readonly inputs: Readonly<
-    Record<string, Float32Array | Uint32Array | Uint8Array>
-  >;
+  readonly inputs: Readonly<Record<string, Float32Array | Uint32Array | Uint8Array>>;
 }
 
 export interface WebTrainingConfigV1 {
@@ -442,11 +419,20 @@ export declare class WebTrainingSession {
     adapter: WebTrainingAdapterV1,
   ): Promise<WebTrainingSession>;
   get state(): WebTrainingState;
-  forward(batch: TrainingBatchV1, options?: WebTrainingOperationOptionsV1): Promise<TrainingResultV1>;
-  backward(result: TrainingResultV1, options?: WebTrainingOperationOptionsV1): Promise<WebTrainingReceiptV1>;
+  forward(
+    batch: TrainingBatchV1,
+    options?: WebTrainingOperationOptionsV1,
+  ): Promise<TrainingResultV1>;
+  backward(
+    result: TrainingResultV1,
+    options?: WebTrainingOperationOptionsV1,
+  ): Promise<WebTrainingReceiptV1>;
   step(options?: WebTrainingOperationOptionsV1): Promise<WebTrainingReceiptV1>;
   checkpoint(options?: WebTrainingOperationOptionsV1): Promise<WebBinaryResultV1>;
-  resume(checkpoint: Uint8Array, options?: WebTrainingOperationOptionsV1): Promise<WebTrainingReceiptV1>;
+  resume(
+    checkpoint: Uint8Array,
+    options?: WebTrainingOperationOptionsV1,
+  ): Promise<WebTrainingReceiptV1>;
   export(options?: WebTrainingOperationOptionsV1): Promise<WebBinaryResultV1>;
   dispose(): Promise<void>;
 }
@@ -483,9 +469,7 @@ export interface WebGpuKernelCandidateBundleV1 {
   readonly schemaVersion: 1;
   readonly bundleSha256: string;
   readonly modules: Readonly<Record<string, WebGpuKernelModuleV1>>;
-  readonly candidateOperationModuleDependencies: Readonly<
-    Record<string, readonly string[]>
-  >;
+  readonly candidateOperationModuleDependencies: Readonly<Record<string, readonly string[]>>;
 }
 
 export declare function webGpuKernelCandidateBundleV1(): WebGpuKernelCandidateBundleV1;
@@ -583,28 +567,34 @@ export interface WebGpuDevicePortV1 {
   }>;
   readonly lost: Promise<unknown>;
   createShaderModule(descriptor: Readonly<{ label: string; code: string }>): unknown;
-  createComputePipelineAsync(descriptor: Readonly<{
-    label: string;
-    layout: "auto";
-    compute: Readonly<{ module: unknown; entryPoint: string }>;
-  }>): Promise<WebGpuPipelinePortV1>;
-  createBuffer(descriptor: Readonly<{
-    label: string;
-    size: number;
-    usage: number;
-  }>): WebGpuBufferPortV1;
-  createBindGroup(descriptor: Readonly<{
-    label: string;
-    layout: unknown;
-    entries: readonly Readonly<{
-      binding: number;
-      resource: Readonly<{
-        buffer: WebGpuBufferPortV1;
-        offset?: number;
-        size?: number;
-      }>;
-    }>[];
-  }>): unknown;
+  createComputePipelineAsync(
+    descriptor: Readonly<{
+      label: string;
+      layout: "auto";
+      compute: Readonly<{ module: unknown; entryPoint: string }>;
+    }>,
+  ): Promise<WebGpuPipelinePortV1>;
+  createBuffer(
+    descriptor: Readonly<{
+      label: string;
+      size: number;
+      usage: number;
+    }>,
+  ): WebGpuBufferPortV1;
+  createBindGroup(
+    descriptor: Readonly<{
+      label: string;
+      layout: unknown;
+      entries: readonly Readonly<{
+        binding: number;
+        resource: Readonly<{
+          buffer: WebGpuBufferPortV1;
+          offset?: number;
+          size?: number;
+        }>;
+      }>[];
+    }>,
+  ): unknown;
   createCommandEncoder(descriptor: Readonly<{ label: string }>): WebGpuCommandEncoderPortV1;
   destroy(): void;
 }

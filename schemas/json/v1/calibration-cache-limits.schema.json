@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CalibrationCacheLimits",
+  "description": "Logical retained cache bounds, separate from reducer workspace or process RSS.",
+  "type": "object",
+  "properties": {
+    "max_payload_bytes": {
+      "description": "Exact retained scalar/token/mask and recipe bytes; excludes metadata/capacity overhead.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_samples": {
+      "description": "Maximum observed samples, including masked samples.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_windows": {
+      "description": "Maximum declared model-context windows, not reduction replay chunks.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "max_payload_bytes",
+    "max_samples",
+    "max_windows"
+  ]
+}

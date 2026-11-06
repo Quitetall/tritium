@@ -11,11 +11,17 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import re
+import runpy
 import stat
 import struct
-import subprocess
 import tempfile
 from typing import Any, Iterable
+
+
+_GIT_HELPER_PATH = Path(__file__).with_name("_qualification_git.py").resolve(strict=True)
+_GIT_HELPER = runpy.run_path(_GIT_HELPER_PATH)
+_run_git = _GIT_HELPER["run_git"]
+_git_result = _GIT_HELPER["git_result"]
 
 
 CAMPAIGN_SCHEMA = "tritium.stage7-campaign.v1"
@@ -411,50 +417,30 @@ def _tasks(value: Any, label: str) -> dict[str, float]:
 
 def _git_source(root: Path) -> str:
     script = Path(__file__).resolve(strict=True)
-    try:
-        top = subprocess.check_output(
-            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
-            text=True,
-            stderr=subprocess.PIPE,
-            timeout=30,
-        ).strip()
-        revision = subprocess.check_output(
-            ["git", "-C", str(root), "rev-parse", "HEAD"],
-            text=True,
-            stderr=subprocess.PIPE,
-            timeout=30,
-        ).strip()
-        status = subprocess.check_output(
-            ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=all"],
-            text=True,
-            stderr=subprocess.PIPE,
-            timeout=30,
-        )
-        executing_top = subprocess.check_output(
-            ["git", "-C", str(script.parent), "rev-parse", "--show-toplevel"],
-            text=True,
-            stderr=subprocess.PIPE,
-            timeout=30,
-        ).strip()
-    except (OSError, subprocess.SubprocessError) as error:
-        raise Stage7Error("source repository identity probe failed") from error
+    top = _run_git(root, "rev-parse", "--show-toplevel", error_type=Stage7Error)
+    revision = _run_git(root, "rev-parse", "HEAD", error_type=Stage7Error)
+    status = _run_git(root, "status", "--porcelain", "--untracked-files=all",
+                      error_type=Stage7Error)
+    executing_top = _run_git(script.parent, "rev-parse", "--show-toplevel",
+                             error_type=Stage7Error)
     _revision(revision, "source repository HEAD")
     resolved_root = root.resolve(strict=True)
     if Path(top).resolve(strict=True) != resolved_root:
         raise Stage7Error("source root must be the repository top level")
     if Path(executing_top).resolve(strict=True) != resolved_root:
         raise Stage7Error("source root differs from executing qualifier repository")
-    relative_script = "scripts/qualify-stage7-recipe-freeze.py"
-    try:
-        committed_script = subprocess.check_output(
-            ["git", "-C", str(resolved_root), "show", f"HEAD:{relative_script}"],
-            stderr=subprocess.PIPE,
-            timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        raise Stage7Error("executing qualifier is not tracked at source HEAD") from error
-    if committed_script != script.read_bytes():
-        raise Stage7Error("executing qualifier bytes differ from source HEAD")
+    for relative, executed, label in (
+        ("scripts/qualify-stage7-recipe-freeze.py", script, "qualifier"),
+        ("scripts/_qualification_git.py", _GIT_HELPER_PATH, "Git helper"),
+    ):
+        if executed != resolved_root / relative:
+            raise Stage7Error(f"executing {label} differs from source repository path")
+        committed = _git_result(resolved_root, "show", f"HEAD:{relative}",
+                                error_type=Stage7Error, text=False)
+        if committed.returncode:
+            raise Stage7Error(f"executing {label} is not tracked at source HEAD")
+        if committed.stdout != executed.read_bytes():
+            raise Stage7Error(f"executing {label} bytes differ from source HEAD")
     if status:
         raise Stage7Error("source repository must be clean for Stage-7 qualification")
     return revision

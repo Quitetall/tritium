@@ -415,16 +415,12 @@ def validate(candidate: Path, digest_tool: str) -> dict[str, Any]:
     return document
 
 
+_run_git = runpy.run_path(Path(__file__).with_name("_qualification_git.py"))["run_git"]
+
+
 def _git_gate(root: Path, revision: str) -> None:
-    try:
-        head = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=root, text=True, timeout=30
-        ).strip()
-        dirty = subprocess.check_output(
-            ["git", "status", "--porcelain=v1"], cwd=root, text=True, timeout=30
-        )
-    except subprocess.SubprocessError as error:
-        raise ReleaseError(f"Git candidate gate failed: {error}") from error
+    head = _run_git(root, "rev-parse", "HEAD", error_type=ReleaseError)
+    dirty = _run_git(root, "status", "--porcelain=v1", error_type=ReleaseError)
     if head != revision:
         raise ReleaseError("candidate source_revision is not the checked-out HEAD")
     if dirty:

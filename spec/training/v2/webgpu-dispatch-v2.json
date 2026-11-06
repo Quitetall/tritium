@@ -669,7 +669,7 @@
       "stages": [
         {
           "moduleId": "attention",
-          "entryPoint": "main",
+          "entryPoint": "attention_forward",
           "selector": null,
           "dispatch": "single",
           "repeat": "once"
@@ -682,7 +682,7 @@
       "stages": [
         {
           "moduleId": "attention",
-          "entryPoint": "main",
+          "entryPoint": "attention_vjp",
           "selector": null,
           "dispatch": "single",
           "repeat": "once"

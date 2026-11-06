@@ -44,7 +44,7 @@ use crate::cuda::{CudaBackend, EmbedSegments, TrainingSaltLinear};
 
 mod portable;
 
-pub use portable::CudaTrainBackendV1;
+pub use portable::{CudaTrainBackendV1, CudaTrainBackendV2};
 
 /// `(g_a[M,K], g_w[N,K], g_s[N])` — the three matmul gradients returned together by
 /// [`GemmEngine::backward`].
@@ -190,9 +190,11 @@ impl TensorCoreGemm {
     /// Build a cuBLASLt handle on the backend's stream. Fails closed if cuBLASLt cannot be
     /// loaded (e.g. `libcublasLt` absent), so callers can fall back to the f32 kernels.
     pub fn new(backend: &CudaBackend) -> Result<Self, BackendError> {
-        let blas = CudaBlasLT::new(backend.stream().clone()).map_err(|e| {
-            BackendError::InvalidInput(format!("cuBLASLt handle init failed: {e:?}"))
-        })?;
+        let blas = backend
+            .with_current_context(|| CudaBlasLT::new(backend.stream().clone()))?
+            .map_err(|e| {
+                BackendError::InvalidInput(format!("cuBLASLt handle init failed: {e:?}"))
+            })?;
         Ok(Self { blas })
     }
 
@@ -8323,7 +8325,10 @@ mod tests {
         // A second physical device, when present, must reject this device-0
         // packed handle before launch. Single-GPU developer machines skip only
         // this conditional branch; all other validation above remains active.
-        if let Ok(other) = CudaBackend::new(1) {
+        let device_count = cudarc::driver::CudaContext::device_count()
+            .expect("query CUDA device count for cross-device validation");
+        if device_count > 1 {
+            let other = CudaBackend::new(1).expect("open second CUDA device");
             packed.repack_from_host(&backend, &[0.25; 35]).unwrap();
             let mut tape = DeviceTape::new(&other, 5).unwrap();
             let master = tape.gradient_leaf(35).unwrap();
@@ -9485,7 +9490,10 @@ mod tests {
         assert_eq!(trainer.stats().peak_in_flight_parameters, 0);
         assert_eq!(trainer.stats().resident_input_gradient_elements, 0);
 
-        if let Ok(other_backend) = CudaBackend::new(1) {
+        let device_count = cudarc::driver::CudaContext::device_count()
+            .expect("query CUDA device count for cross-device validation");
+        if device_count > 1 {
+            let other_backend = CudaBackend::new(1).expect("open second CUDA device");
             let foreign = DeviceGradients {
                 bufs: vec![other_backend.dev_alloc_zeros(master.len()).unwrap()],
                 stats: DeviceBackwardStats::default(),
@@ -11694,12 +11702,14 @@ mod tests {
                 return;
             }
         };
-        let blas = match CudaBlasLT::new(backend.stream().clone()) {
-            Ok(b) => b,
-            Err(e) => {
+        let blas = match backend.with_current_context(|| CudaBlasLT::new(backend.stream().clone()))
+        {
+            Ok(Ok(blas)) => blas,
+            Ok(Err(e)) => {
                 eprintln!("skipping tf32_tensor_core_matmul_matches_f32: no cuBLASLt ({e:?})");
                 return;
             }
+            Err(e) => panic!("failed to bind CUDA context for cuBLASLt: {e}"),
         };
         // MLP-gate shape: Y[m,n] = X[m,k]·Wᵀ, X=[batch*seq, n_embd], W=[ff, n_embd].
         let (m, k, n) = (512usize, 576usize, 1536usize);
@@ -11805,6 +11815,38 @@ mod tests {
             tf32_s * 1e3,
             f32_s / tf32_s
         );
+    }
+
+    #[test]
+    fn tensor_core_gemm_creation_restores_callers_current_context() {
+        use cudarc::driver::result;
+
+        if result::init().is_err() {
+            eprintln!("skipping tensor-core context gate: CUDA driver unavailable");
+            return;
+        }
+        let before = result::ctx::get_current().expect("query caller CUDA context");
+        let backend = match CudaBackend::new(0) {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("skipping tensor-core context gate: no CUDA device ({error})");
+                return;
+            }
+        };
+        assert_eq!(
+            result::ctx::get_current().expect("query context after backend creation"),
+            before,
+            "backend creation must restore the caller context"
+        );
+
+        let tensor_core =
+            TensorCoreGemm::new(&backend).expect("create cuBLASLt handle for the backend context");
+        assert_eq!(
+            result::ctx::get_current().expect("query context after cuBLASLt creation"),
+            before,
+            "cuBLASLt creation must restore the caller context"
+        );
+        drop(tensor_core);
     }
 
     /// Tensor-core tier — all three training GEMMs. Validates `TensorCoreGemm`'s forward,

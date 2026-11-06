@@ -1,13 +1,8 @@
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 
-import {
-  TRAINING_MANIFEST_DIGEST_V2,
-  TRAINING_VECTOR_DIGEST_V2,
-} from "./identity.ts";
-import {
-  compilePortableReloadRequest,
-} from "./lifecycle.ts";
+import { TRAINING_MANIFEST_DIGEST_V2, TRAINING_VECTOR_DIGEST_V2 } from "./identity.ts";
+import { compilePortableReloadRequest } from "./lifecycle.ts";
 import { encodeWebTrainingPayload } from "./payload.ts";
 import {
   prepareTraining,
@@ -20,6 +15,7 @@ import {
 import { executePortableWasmRequest } from "./wasm.ts";
 import { createWebGpuTrainingAdapter } from "./webgpu-adapter.ts";
 import { webGpuKernelCandidateBundleV1 } from "./webgpu-kernels.ts";
+import { webGpuRequiredDeviceLimitsV1 } from "./webgpu-limits.ts";
 import type { WebGpuDevicePortV1 } from "./webgpu-runtime.ts";
 import {
   runWebGpuVectorConformanceV1,
@@ -149,7 +145,7 @@ export type PhysicalBrowserTrainingLaneOptionsV1 = Readonly<{
 type BrowserGpuAdapter = Readonly<Record<PropertyKey, unknown>> & {
   readonly info?: unknown;
   readonly limits?: unknown;
-  requestDevice(): Promise<unknown>;
+  requestDevice(descriptor?: unknown): Promise<unknown>;
 };
 
 type ReadbackLedger = {
@@ -163,10 +159,7 @@ type AcquiredDevice = Readonly<{
   device: WebGpuDevicePortV1;
 }>;
 
-function fail(
-  code: PhysicalBrowserQualificationErrorCode,
-  message: string,
-): never {
+function fail(code: PhysicalBrowserQualificationErrorCode, message: string): never {
   throw new PhysicalBrowserQualificationError(code, message);
 }
 
@@ -204,9 +197,10 @@ function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   if (value !== null && typeof value === "object") {
     const recordValue = value as Readonly<Record<string, unknown>>;
-    return `{${Object.keys(recordValue).sort().map((key) =>
-      `${JSON.stringify(key)}:${canonicalJson(recordValue[key])}`
-    ).join(",")}}`;
+    return `{${Object.keys(recordValue)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(recordValue[key])}`)
+      .join(",")}}`;
   }
   return JSON.stringify(value);
 }
@@ -225,11 +219,13 @@ function optionsSnapshot(
 ): Required<PhysicalBrowserTrainingLaneOptionsV1> {
   if (!record(options)) fail("invalid_options", "physical browser options are invalid");
   const keys = Reflect.ownKeys(options);
-  if (keys.some((key) => typeof key !== "string" || ![
-    "maxPeakBytes",
-    "nativeArtifact",
-    "nativeReferenceDigest",
-  ].includes(key))) {
+  if (
+    keys.some(
+      (key) =>
+        typeof key !== "string" ||
+        !["maxPeakBytes", "nativeArtifact", "nativeReferenceDigest"].includes(key),
+    )
+  ) {
     fail("invalid_options", "physical browser options contain unknown fields");
   }
   const artifact = member(options, "nativeArtifact");
@@ -255,16 +251,45 @@ function optionsSnapshot(
 }
 
 function physicalDeviceIdentity(identity: PhysicalBrowserAdapterIdentityV1): string {
-  return [identity.vendor, identity.architecture, identity.device, identity.description]
-    .join(":");
+  return [identity.vendor, identity.architecture, identity.device, identity.description].join(":");
 }
 
 const TENSORS = Object.freeze([
-  Object.freeze({ id: "target", dtype: "f32" as const, shape: Object.freeze([1, 256]), role: "batch" as const, aliasOf: null }),
-  Object.freeze({ id: "weight", dtype: "f32" as const, shape: Object.freeze([1, 256]), role: "parameter" as const, aliasOf: null }),
-  Object.freeze({ id: "gradient", dtype: "f32" as const, shape: Object.freeze([1, 256]), role: "gradient" as const, aliasOf: null }),
-  Object.freeze({ id: "quant", dtype: "f32" as const, shape: Object.freeze([1, 256]), role: "activation" as const, aliasOf: null }),
-  Object.freeze({ id: "loss", dtype: "f32" as const, shape: Object.freeze([]), role: "result" as const, aliasOf: null }),
+  Object.freeze({
+    id: "target",
+    dtype: "f32" as const,
+    shape: Object.freeze([1, 256]),
+    role: "batch" as const,
+    aliasOf: null,
+  }),
+  Object.freeze({
+    id: "weight",
+    dtype: "f32" as const,
+    shape: Object.freeze([1, 256]),
+    role: "parameter" as const,
+    aliasOf: null,
+  }),
+  Object.freeze({
+    id: "gradient",
+    dtype: "f32" as const,
+    shape: Object.freeze([1, 256]),
+    role: "gradient" as const,
+    aliasOf: null,
+  }),
+  Object.freeze({
+    id: "quant",
+    dtype: "f32" as const,
+    shape: Object.freeze([1, 256]),
+    role: "activation" as const,
+    aliasOf: null,
+  }),
+  Object.freeze({
+    id: "loss",
+    dtype: "f32" as const,
+    shape: Object.freeze([]),
+    role: "result" as const,
+    aliasOf: null,
+  }),
 ]);
 
 const OPERATIONS = Object.freeze([
@@ -322,10 +347,7 @@ const CONFIG = Object.freeze({
 });
 
 export function physicalBrowserTrainingScenarioV1(): PhysicalBrowserTrainingScenarioV1 {
-  const weights = Float32Array.from(
-    { length: 256 },
-    (_, index) => (index % 9 - 4) / 8,
-  );
+  const weights = Float32Array.from({ length: 256 }, (_, index) => ((index % 9) - 4) / 8);
   const model = Object.freeze({
     schemaId: "tritium.web_training_model" as const,
     schemaVersion: 1 as const,
@@ -346,10 +368,13 @@ export function physicalBrowserTrainingScenarioV1(): PhysicalBrowserTrainingScen
   });
 }
 
-async function webglHardwareIdentity(): Promise<Readonly<{
-  vendor: string;
-  renderer: string;
-}> | undefined> {
+async function webglHardwareIdentity(): Promise<
+  | Readonly<{
+      vendor: string;
+      renderer: string;
+    }>
+  | undefined
+> {
   const documentValue = member(globalThis, "document");
   const createElement = record(documentValue) ? member(documentValue, "createElement") : undefined;
   if (!record(documentValue) || typeof createElement !== "function") return undefined;
@@ -384,8 +409,13 @@ async function webglHardwareIdentity(): Promise<Readonly<{
   try {
     const vendor = Reflect.apply(getParameter, context, [vendorEnum]);
     const renderer = Reflect.apply(getParameter, context, [rendererEnum]);
-    if (typeof vendor !== "string" || vendor.trim().length === 0 ||
-        typeof renderer !== "string" || renderer.trim().length === 0) return undefined;
+    if (
+      typeof vendor !== "string" ||
+      vendor.trim().length === 0 ||
+      typeof renderer !== "string" ||
+      renderer.trim().length === 0
+    )
+      return undefined;
     return Object.freeze({ vendor: vendor.trim(), renderer: renderer.trim() });
   } catch {
     return undefined;
@@ -394,7 +424,9 @@ async function webglHardwareIdentity(): Promise<Readonly<{
 
 async function adapterInfo(adapter: BrowserGpuAdapter): Promise<PhysicalBrowserAdapterIdentityV1> {
   let info = member(adapter, "info");
-  const hasStandardIdentity = (candidate: unknown): candidate is Readonly<Record<PropertyKey, unknown>> =>
+  const hasStandardIdentity = (
+    candidate: unknown,
+  ): candidate is Readonly<Record<PropertyKey, unknown>> =>
     record(candidate) &&
     ["vendor", "architecture", "device", "description"].every((key) => {
       const value = member(candidate, key);
@@ -419,8 +451,11 @@ async function adapterInfo(adapter: BrowserGpuAdapter): Promise<PhysicalBrowserA
   const wgpuDeviceType = member(info, "wgpuDeviceType");
   const wgpuDriver = member(info, "wgpuDriver");
   const wgpuDriverInfo = member(info, "wgpuDriverInfo");
-  const firefoxPhysical = typeof wgpuName === "string" && wgpuName.trim().length > 0 &&
-    typeof wgpuBackend === "string" && wgpuBackend.trim().length > 0 &&
+  const firefoxPhysical =
+    typeof wgpuName === "string" &&
+    wgpuName.trim().length > 0 &&
+    typeof wgpuBackend === "string" &&
+    wgpuBackend.trim().length > 0 &&
     (wgpuDeviceType === "DiscreteGpu" || wgpuDeviceType === "IntegratedGpu");
   const webgl = firefoxPhysical ? undefined : await webglHardwareIdentity();
   const text = (value: unknown): string | undefined =>
@@ -429,18 +464,26 @@ async function adapterInfo(adapter: BrowserGpuAdapter): Promise<PhysicalBrowserA
   const standardArchitecture = text(member(info, "architecture"));
   const standardDevice = text(member(info, "device"));
   const standardDescription = text(member(info, "description"));
+  const rendererIsSanitized = webgl?.renderer.toLowerCase().includes(", or similar") ?? false;
   const vendor = standardVendor ?? (firefoxPhysical ? text(wgpuDriver) : webgl?.vendor);
-  const architecture = standardArchitecture ?? (
-    firefoxPhysical ? `${String(wgpuBackend).trim()}/${String(wgpuDeviceType).trim()}` : undefined
-  ) ?? (webgl === undefined ? undefined : "WebGL2/WebGPU");
+  const architecture =
+    standardArchitecture ??
+    (firefoxPhysical
+      ? `${String(wgpuBackend).trim()}/${String(wgpuDeviceType).trim()}`
+      : undefined) ??
+    (webgl === undefined ? undefined : "WebGL2/WebGPU");
   const device = standardDevice ?? (firefoxPhysical ? text(wgpuName) : webgl?.renderer);
-  const description = standardDescription ?? (
-    firefoxPhysical
+  const description =
+    standardDescription ??
+    (firefoxPhysical
       ? [text(wgpuName), text(wgpuBackend), text(wgpuDriver), text(wgpuDriverInfo)]
-        .filter((value): value is string => value !== undefined)
-        .join(" ")
-      : webgl === undefined ? undefined : `${webgl.renderer} (${webgl.vendor}); WebGPU non-fallback`
-  );
+          .filter((value): value is string => value !== undefined)
+          .join(" ")
+      : webgl === undefined
+        ? undefined
+        : `${webgl.renderer} (${webgl.vendor}); WebGPU non-fallback${
+            rendererIsSanitized ? "; browser-sanitized; exact adapter model unknown" : ""
+          }`);
   const identity = Object.freeze({
     vendor: nonEmpty(vendor, "adapter.vendor"),
     architecture: nonEmpty(architecture, "adapter.architecture"),
@@ -521,10 +564,12 @@ async function acquireDevice(ledger: ReadbackLedger): Promise<AcquiredDevice> {
   if (!record(gpu) || typeof requestAdapter !== "function") {
     fail("adapter_unavailable", "navigator.gpu.requestAdapter is unavailable");
   }
-  const candidate = await Reflect.apply(requestAdapter, gpu, [{
-    powerPreference: "high-performance",
-    forceFallbackAdapter: false,
-  }]);
+  const candidate = await Reflect.apply(requestAdapter, gpu, [
+    {
+      powerPreference: "high-performance",
+      forceFallbackAdapter: false,
+    },
+  ]);
   if (!record(candidate)) fail("adapter_unavailable", "WebGPU returned no adapter");
   const adapter = candidate as BrowserGpuAdapter;
   const identity = await adapterInfo(adapter);
@@ -532,7 +577,11 @@ async function acquireDevice(ledger: ReadbackLedger): Promise<AcquiredDevice> {
   if (typeof requestDevice !== "function") {
     fail("adapter_unavailable", "WebGPU adapter cannot request a device");
   }
-  const rawDevice = await Reflect.apply(requestDevice, adapter, []);
+  const rawDevice = await Reflect.apply(requestDevice, adapter, [
+    {
+      requiredLimits: webGpuRequiredDeviceLimitsV1(),
+    },
+  ]);
   if (!record(rawDevice)) fail("adapter_unavailable", "WebGPU returned no device");
   let device: WebGpuDevicePortV1;
   try {
@@ -542,21 +591,29 @@ async function acquireDevice(ledger: ReadbackLedger): Promise<AcquiredDevice> {
   } catch (error) {
     const destroy = member(rawDevice, "destroy");
     if (typeof destroy === "function") {
-      try { Reflect.apply(destroy, rawDevice, []); } catch { /* preserve primary */ }
+      try {
+        Reflect.apply(destroy, rawDevice, []);
+      } catch {
+        /* preserve primary */
+      }
     }
     throw error;
   }
 }
 
 function sameIdentity(expected: AcquiredDevice, actual: AcquiredDevice): void {
-  if (JSON.stringify(expected.identity) !== JSON.stringify(actual.identity) ||
-      JSON.stringify(expected.limits) !== JSON.stringify(actual.limits)) {
+  if (
+    JSON.stringify(expected.identity) !== JSON.stringify(actual.identity) ||
+    JSON.stringify(expected.limits) !== JSON.stringify(actual.limits)
+  ) {
     actual.device.destroy();
     fail("device_identity", "qualification devices changed adapter identity or limits");
   }
 }
 
-function receiptTrace(receipt: WebTrainingReceiptV1): PhysicalBrowserLifecycleTraceV1["receipts"][number] {
+function receiptTrace(
+  receipt: WebTrainingReceiptV1,
+): PhysicalBrowserLifecycleTraceV1["receipts"][number] {
   if (receipt.physicalDevice === null) {
     fail("lifecycle", `${receipt.operation} omitted physical device identity`);
   }
@@ -573,9 +630,12 @@ async function strictReload(bytes: Uint8Array, label: string): Promise<void> {
   const response = await executePortableWasmRequest(
     compilePortableReloadRequest(bytes, `browser-qualification:${label}`),
   );
-  if (response.status !== "ok" || response.outputs.length !== 1 ||
-      response.outputs[0]?.data.dtype !== "bytes" ||
-      !equalBytes(Uint8Array.from(response.outputs[0].data.values), bytes)) {
+  if (
+    response.status !== "ok" ||
+    response.outputs.length !== 1 ||
+    response.outputs[0]?.data.dtype !== "bytes" ||
+    !equalBytes(Uint8Array.from(response.outputs[0].data.values), bytes)
+  ) {
     fail("lifecycle", `${label} failed strict SALT reload`);
   }
 }
@@ -626,13 +686,18 @@ function submittedCancellationDevice(device: WebGpuDevicePortV1): SubmittedCance
   let resolveGate!: () => void;
   let submissionCount = 0;
   let released = false;
-  const submitted = new Promise<void>((resolve) => { resolveSubmitted = resolve; });
-  const gate = new Promise<void>((resolve) => { resolveGate = resolve; });
+  const submitted = new Promise<void>((resolve) => {
+    resolveSubmitted = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    resolveGate = resolve;
+  });
   const queue = new Proxy(device.queue as unknown as object, {
     get(target, property) {
       const value = Reflect.get(target, property, target);
       if (property === "submit") {
-        if (typeof value !== "function") fail("instrumentation", "WebGPU queue submit is unavailable");
+        if (typeof value !== "function")
+          fail("instrumentation", "WebGPU queue submit is unavailable");
         return (commands: readonly unknown[]) => {
           Reflect.apply(value, target, [commands]);
           submissionCount += 1;
@@ -701,11 +766,13 @@ async function runLifecycle(
   baseline: AcquiredDevice,
   options: Required<PhysicalBrowserTrainingLaneOptionsV1>,
   ledger: ReadbackLedger,
-): Promise<Readonly<{
-  lifecycle: PhysicalBrowserLifecycleTraceV1;
-  faults: PhysicalBrowserTrainingLaneTraceV1["faults"];
-  peakBufferBytes: number;
-}>> {
+): Promise<
+  Readonly<{
+    lifecycle: PhysicalBrowserLifecycleTraceV1;
+    faults: PhysicalBrowserTrainingLaneTraceV1["faults"];
+    peakBufferBytes: number;
+  }>
+> {
   await strictReload(options.nativeArtifact, "native-reference");
   const scenario = physicalBrowserTrainingScenarioV1();
   const physicalDevice = physicalDeviceIdentity(baseline.identity);
@@ -722,12 +789,14 @@ async function runLifecycle(
   const session = await prepareTraining(scenario.model, scenario.config, adapter);
   try {
     const outOfOrder = await expectWebError(
-      session.step(), ["invalid_state"], "out-of-order lifecycle",
+      session.step(),
+      ["invalid_state"],
+      "out-of-order lifecycle",
     );
     const cancellationController = new AbortController();
-    const cancellationOperation = session.forward(
-      scenario.batch, { signal: cancellationController.signal },
-    );
+    const cancellationOperation = session.forward(scenario.batch, {
+      signal: cancellationController.signal,
+    });
     let cancellation: PhysicalBrowserFaultTraceV1;
     try {
       const firstEvent = await Promise.race([
@@ -779,7 +848,10 @@ async function runLifecycle(
       createWebGpuTrainingAdapter(malformedCheckpointDevice.device, {
         buildId,
         physicalDevice,
-        maxResidentBytes: Math.min(options.maxPeakBytes, malformedCheckpointDevice.limits.maxBufferSize),
+        maxResidentBytes: Math.min(
+          options.maxPeakBytes,
+          malformedCheckpointDevice.limits.maxBufferSize,
+        ),
       }),
     );
     let malformedCheckpoint: PhysicalBrowserFaultTraceV1;
@@ -814,12 +886,16 @@ async function runLifecycle(
       if (unexpectedAllocationSession !== null) await unexpectedAllocationSession.dispose();
       allocationDevice.device.destroy();
     }
-    const allocationObserved = allocationError === allocationProbe.sentinel ||
+    const allocationObserved =
+      allocationError === allocationProbe.sentinel ||
       (allocationError instanceof WebTrainingError &&
-       allocationError.code === "capability_mismatch" &&
-       allocationError.message.includes(allocationProbe.sentinel.message));
+        allocationError.code === "capability_mismatch" &&
+        allocationError.message.includes(allocationProbe.sentinel.message));
     if (!allocationObserved || allocationProbe.hits() !== 1) {
-      fail("fault_injection", "allocation injection did not observe its unique sentinel exactly once");
+      fail(
+        "fault_injection",
+        "allocation injection did not observe its unique sentinel exactly once",
+      );
     }
     const allocationFailure = Object.freeze({
       passed: true as const,
@@ -842,15 +918,18 @@ async function runLifecycle(
     lossDevice.device.destroy();
     await lossDevice.device.lost;
     const deviceLoss = await expectWebError(
-      lossSession.forward(scenario.batch), ["device_lost"], "device loss",
+      lossSession.forward(scenario.batch),
+      ["device_lost"],
+      "device loss",
     );
     await lossSession.dispose();
 
     const admittedReceipts = Object.freeze(receipts.map(receiptTrace));
-    if (admittedReceipts.some((receipt) =>
-      receipt.physicalDevice !== physicalDevice ||
-      receipt.buildId !== buildId
-    )) {
+    if (
+      admittedReceipts.some(
+        (receipt) => receipt.physicalDevice !== physicalDevice || receipt.buildId !== buildId,
+      )
+    ) {
       fail("lifecycle", "lifecycle receipt identity drifted");
     }
     const peakBufferBytes = Math.max(

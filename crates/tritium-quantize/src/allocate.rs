@@ -43,7 +43,7 @@ pub struct GroupInput<'a> {
 /// greedy residual expansion [`GroupInput`] assumes.
 ///
 /// This exists because the allocation rule and the fitter are independent choices, and hardwiring
-/// [`error_curve`] to [`residual_expand`] conflated them. The balanced-ternary ladder, for one,
+/// `error_curve` to [`residual_expand`] conflated them. The balanced-ternary ladder, for one,
 /// produces a materially different `err(T)` — measured at ~9.5 dB per plane against the greedy
 /// expansion's ~2.8 — so allocating from greedy curves would spend the budget as if planes bought
 /// far less than they do.
