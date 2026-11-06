@@ -24,6 +24,28 @@ reopened and bound into a candidate-specific release receipt. The historical
 gate inventory below predates this completion and must not be read as the
 current campaign liveness status.
 
+### Latest same-revision CI and package evidence (2026-09-29, `7a4d1589`)
+
+CI run [`36523067787`](https://github.com/Quitetall/tritium/actions/runs/36523067787)
+completed successfully at source revision
+`7a4d15891ee77496ad4e54f691823a58b5d0452e`: 20 jobs passed and six were
+skipped (CUDA, ROCm, wgpu, real-model serving, fuzzing, and performance
+regression). CodeQL (`36523067788`) and the CPU capstone smoke
+(`36523067744`) also passed at that revision. Skipped hardware, real-model, and
+performance lanes remain unqualified; these workflow results do not close their
+release gates.
+
+The saved CI crate and npm archives were independently rechecked with the
+repository receipt validators. The crate archive receipt passes for all 23
+publishable crates (`sha256:1557bef43c69a60a5dbeafdcb145c4a9becba9d23bb1ff17dc29823d9f4e052d`);
+the npm archive receipt passes for `@tritium-ai/web@1.1.0-rc.2`
+(`sha256:36b7d0c914f36a1935fb6d382365bdef608b912a0f6598ce562dd414b90636bc`).
+Artifacts and receipts are retained locally under the ignored
+`release/v1.1/evidence/current-head-ci-36523067787/` directory. They are
+revision-bound validation evidence, but have not been assembled into a
+candidate manifest or admitted to a candidate-bound release registry; this
+does not satisfy the coherent `packages` gate or authorize publication.
+
 ### Latest local verification (2026-09-18, `570a8802`)
 
 `scripts/verify-gates.sh release` completed with exit status 0 after the
