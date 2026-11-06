@@ -1,0 +1,929 @@
+;; Generated from tritium-schema Rust types via JSON Schema; do not edit.
+;; CBOR manifests use RFC 8949 deterministic encoding; digest IDs are 32-element integer arrays.
+cbor_value = uint / nint / bstr / tstr / [* cbor_value] / {* tstr => cbor_value} / bool / nil / float
+
+additive_layout = {
+  "allocation": plane_allocation,
+  "basis": basis,
+  "codec": plane_codec,
+  "cols": uint,
+  "group": 0..65535,
+  "law": scale_law,
+  "max_planes": 0..255,
+  "rows": uint,
+  "tile": 0..65535,
+  "transport": transport
+}
+
+admitted_law = {
+  "law": scale_law,
+  "max_planes": 0..255
+}
+
+basis = "Identity" / {
+  "Hadamard": {
+    "block": 0..4294967295
+  }
+} / {
+  "SignedRht": {
+    "block": 0..4294967295,
+    "domain": uint,
+    "seed": uint
+  }
+}
+
+blob_id = [32*32 0..255]
+
+blob_reference = {
+  "id": blob_id,
+  ? "shard": tstr / nil
+}
+
+calibrated_fit_plan = {
+  "cache": calibration_cache_binding,
+  "damping": float,
+  "direct": direct_fit_plan,
+  "max_numeric_bytes": uint,
+  "partition": calibration_partition
+}
+
+calibrated_levels_fitted = {
+  "factors": calibration_factors,
+  "outputs": [* direct_fit_output],
+  "plan": calibrated_fit_plan,
+  "rayon_threads": 0..4294967295,
+  "source_f32": fit_input_digest
+}
+
+calibrated_quant_action = "KeepDense" / {
+  "Fit": {
+    "metric": direct_fit_metric,
+    "plan": direct_fit_plan
+  }
+} / {
+  "CalibratedFit": {
+    "plan": calibrated_fit_plan
+  }
+}
+
+calibrated_quant_plan = {
+  "architecture": tstr,
+  "assets": [* tstr],
+  "levels": [* tstr],
+  "limits": quant_limits,
+  "max_cache_package_bytes": uint,
+  "max_cache_payload_bytes": uint,
+  "original_source": original_source_id,
+  "tensors": [* calibrated_quant_tensor_plan]
+}
+
+calibrated_quant_tensor_plan = {
+  "action": calibrated_quant_action,
+  "source": quant_source_tensor
+}
+
+calibrated_quantization_completed = {
+  "original_source": original_source_id,
+  "output": quantization_completed
+}
+
+calibrated_quantization_started = {
+  "plan": calibrated_quant_plan
+}
+
+calibration_cache_binding = {
+  "objective": blob_id,
+  "payload_bytes": uint,
+  "request": calibration_cache_request,
+  "samples": uint,
+  "source": calibration_source,
+  "tokenizer": blob_id,
+  "windows": uint
+}
+
+calibration_cache_id = [32*32 0..255]
+
+calibration_cache_limits = {
+  "max_payload_bytes": uint,
+  "max_samples": uint,
+  "max_windows": uint
+}
+
+calibration_cache_manifest = {
+  "binding": calibration_cache_binding,
+  "window_samples": [* uint]
+}
+
+calibration_cache_request = {
+  "consumer": calibration_consumer,
+  "limits": calibration_cache_limits,
+  "model": original_source_id,
+  "output": calibration_output,
+  "sample_start": uint,
+  "tensor": quant_source_tensor
+}
+
+calibration_capture_completed = {
+  "caches": [* calibration_cache_binding],
+  "windows": [* [* 0..4294967295]]
+}
+
+calibration_capture_input = {
+  "Tokens": {
+    "windows": [* [* 0..4294967295]]
+  }
+} / {
+  "RawText": {
+    "windows": [* tstr]
+  }
+}
+
+calibration_capture_limits = {
+  "max_config_bytes": uint,
+  "max_dense_bytes": uint,
+  "max_text_bytes": uint,
+  "max_tokenizer_config_bytes": uint,
+  "max_total_payload_bytes": uint,
+  "max_window_tokens": uint,
+  "per_cache": calibration_cache_limits
+}
+
+calibration_capture_plan = {
+  "input": calibration_capture_input,
+  "limits": calibration_capture_limits,
+  "profile": calibration_capture_profile,
+  "source": original_source_id,
+  "stage_package": package_id,
+  "tensors": [* quant_source_tensor],
+  "tokenizer": blob_id,
+  ? "tokenizer_config": blob_id / nil,
+  "transform": evidence_reference
+}
+
+calibration_capture_profile = "NextTokenWindowMeanK1F32V1"
+
+calibration_capture_started = {
+  "plan": calibration_capture_plan
+}
+
+calibration_consumer = "Matmul" / "GatherIdentity"
+
+calibration_factor = {
+  "content": fit_input_digest,
+  "dimension": uint,
+  "samples": uint,
+  "selected": uint,
+  "selection": fit_input_digest,
+  "total_weight": float
+}
+
+calibration_factors = {
+  "inputs": [* calibration_factor],
+  ? "output": calibration_factor / nil,
+  "plan": calibration_plan
+}
+
+calibration_output = "None" / "DenseFisher" / "IndexedFisher"
+
+calibration_partition = "Full" / {
+  "Groups": {
+    "columns": 0..4294967295
+  }
+}
+
+calibration_plan = {
+  "consumer": calibration_consumer,
+  "damping": float,
+  "max_numeric_bytes": uint,
+  "output": calibration_output,
+  "partition": calibration_partition,
+  "sample_start": uint,
+  "source": calibration_source,
+  "tensor": quant_source_tensor
+}
+
+calibration_source = {
+  "cache": fit_input_digest,
+  "model": fit_input_digest,
+  "tokens": fit_input_digest
+}
+
+captured_salience_conversion_manifest = {
+  "capture": evidence_reference,
+  "lineage": salience_conversion_manifest
+}
+
+direct_fit_level = {
+  "name": tstr,
+  "planes": 0..255
+}
+
+direct_fit_limits = {
+  "max_metric_entries": uint,
+  "max_output_trits": uint,
+  "max_weights": uint
+}
+
+direct_fit_metric = "Identity" / {
+  "InputGramF64": {
+    "content": fit_input_digest
+  }
+}
+
+direct_fit_output = {
+  "content": semantic_tensor_digest,
+  "level": tstr,
+  "planes": 0..255
+}
+
+direct_fit_plan = {
+  "layout": additive_layout,
+  "levels": [* direct_fit_level],
+  "limits": direct_fit_limits,
+  "profile": direct_fit_profile
+}
+
+direct_fit_profile = {
+  "ActivationAwareLadder": ladder_fit_options
+} / {
+  "JointIndependentGroups": joint_group_fit_options
+} / {
+  "JointFeedbackGroups": joint_feedback_fit_options
+}
+
+direct_levels_fitted = {
+  "metric": direct_fit_metric,
+  "outputs": [* direct_fit_output],
+  "plan": direct_fit_plan,
+  "rayon_threads": 0..4294967295,
+  "source_f32": fit_input_digest,
+  "tensor": tstr
+}
+
+evidence_envelope = {
+  "digest": tstr,
+  ? "parent": tstr / nil,
+  "payload": cbor_value,
+  "run": tstr,
+  "schema": tstr,
+  "seq": uint,
+  "span": tstr,
+  "t": uint,
+  "v": 0..65535
+}
+
+evidence_reference = {
+  "root": [32*32 0..255],
+  "run": tstr,
+  "span": tstr
+}
+
+fit_input_digest = [32*32 0..255]
+
+joint_feedback_fit_options = {
+  "damp": float,
+  "decay": float,
+  "decay_ramp": bool,
+  "fitter": joint_group_fit_options,
+  "precision": work_precision
+}
+
+joint_group_fit_options = {
+  "em_restarts": 0..4294967295,
+  "max_iterations": 0..4294967295,
+  "modulated_relay": bool,
+  "ridge": float,
+  "ridge_condition_limit": float,
+  "softened_relay": bool
+}
+
+ladder_fit_options = {
+  "damp": float,
+  "decay": float,
+  "decay_ramp": bool,
+  "grid": 0..4294967295,
+  "scale_refit": ladder_scale_refit,
+  "search_sweeps": 0..4294967295
+}
+
+ladder_scale_refit = "None" / "PostPass" / "InLoop"
+
+layout_error = "EmptyDimensions" / "UnsupportedGroup" / "UnsupportedTileSize" / "EmptyPlaneStack" / "InvalidScaleRatio" / "UnsupportedLaw" / "PlaneCountExceedsLaw" / "InvalidBasisBlock" / "BasisBlockDoesNotDivideColumns" / "EmptyTransportBlock"
+
+legacy_model_identity = {
+  "id": tstr,
+  "level": tstr
+}
+
+legacy_model_import_bound_prepared = {
+  "companion_assets": [* named_asset_digest],
+  "companion_source": original_source_id,
+  "companion_tensors": [* quant_source_binding],
+  "legacy_id": tstr,
+  "manifest_bytes": uint,
+  "manifest_digest": [32*32 0..255]
+}
+
+legacy_model_import_prepared = {
+  "companion_assets": [* named_asset_digest],
+  "companion_source": original_source_id,
+  "companion_tensors": [* quant_source_binding],
+  "legacy_id": tstr,
+  "manifest": model_manifest
+}
+
+legacy_salt_v2_bundle_descriptor = {
+  "admission_id": tstr,
+  "artifact_kind": tstr,
+  "campaign_id": tstr,
+  "complete_model": bool,
+  "completion_id": tstr,
+  "hf_assets": [* legacy_salt_v2_asset_descriptor],
+  "official_payload_authenticated": bool,
+  "packing": tstr,
+  "preserved": legacy_salt_v2_preserved_descriptor,
+  "profiles": legacy_salt_v2_profile_set,
+  "schema_version": 0..255,
+  "selection_id": tstr,
+  "source_identity_status": tstr,
+  "source_model_id": tstr,
+  "source_revision": tstr
+}
+
+level = {
+  "fit": level_fit,
+  "name": tstr,
+  "tensors": [* tensor_meta]
+}
+
+level_fit = {
+  "Direct": {
+    "evidence": [* evidence_reference]
+  }
+} / {
+  "ImportedPrefixOf": {
+    "level": tstr
+  }
+} / "Imported"
+
+loaded_source_identity = {
+  "Trit": {
+    "level": tstr,
+    "model_id": model_id,
+    "package_id": package_id
+  }
+} / {
+  "HuggingFace": {
+    "reason": unknown_reason
+  }
+}
+
+manifest_asset = {
+  "blob": blob_reference,
+  "name": tstr
+}
+
+model_id = [32*32 0..255]
+
+model_loaded = {
+  "architecture": tstr,
+  "backend": tstr,
+  "layer_count": uint,
+  "physical_device": tstr,
+  "source": loaded_source_identity,
+  "vocab_size": uint
+}
+
+model_manifest = {
+  "architecture": tstr,
+  "assets": [* manifest_asset],
+  "legacy_ids": [* legacy_model_identity],
+  "levels": [* level],
+  "schema": schema_id,
+  "shards": [* model_shard]
+}
+
+model_semantic_meta = {
+  "architecture": tstr,
+  "assets": [* named_asset_digest],
+  "tensors": [* named_tensor_digest]
+}
+
+model_shard = {
+  "name": tstr,
+  "package": package_id
+}
+
+named_asset_digest = {
+  "content": blob_id,
+  "name": tstr
+}
+
+named_tensor_digest = {
+  "content": semantic_tensor_digest,
+  "name": tstr
+}
+
+original_captured_salience_conversion_manifest = {
+  "lineage": captured_salience_conversion_manifest,
+  "original_capture": evidence_reference
+}
+
+original_captured_salience_source_stage_manifest = {
+  "lineage": salience_source_stage_manifest,
+  "original_capture": evidence_reference
+}
+
+original_salience_capture_completed = {
+  "outputs": [* original_salience_capture_output],
+  "windows": [* [* 0..4294967295]]
+}
+
+original_salience_capture_input = {
+  "Tokens": {
+    "windows": [* [* 0..4294967295]]
+  }
+} / {
+  "RawText": {
+    "windows": [* tstr]
+  }
+}
+
+original_salience_capture_limits = {
+  "max_asset_bytes": uint,
+  "max_config_bytes": uint,
+  "max_dense_bytes": uint,
+  "max_moment_bytes": uint,
+  "max_source_bytes": uint,
+  "max_text_bytes": uint,
+  "max_tokenizer_config_bytes": uint,
+  "max_total_tokens": uint,
+  "max_window_tokens": uint,
+  "max_windows": uint
+}
+
+original_salience_capture_output = {
+  "moments": salience_moment_binding,
+  "operation": tstr
+}
+
+original_salience_capture_pair = {
+  "channels": uint,
+  "inverse": tstr,
+  "inverse_axis": salience_inverse_axis,
+  "name": tstr,
+  "projections": [* tstr]
+}
+
+original_salience_capture_plan = {
+  "architecture": tstr,
+  "assets": [* named_asset_digest],
+  "input": original_salience_capture_input,
+  "limits": original_salience_capture_limits,
+  "pairs": [* original_salience_capture_pair],
+  "profile": original_salience_capture_profile,
+  "source": original_source_id,
+  "tensors": [* quant_source_binding]
+}
+
+original_salience_capture_profile = "AllTokenF64SecondMomentV1"
+
+original_salience_capture_started = {
+  "plan": original_salience_capture_plan
+}
+
+original_source_id = [32*32 0..255]
+
+owner_context_dtype = "F16" / "Bf16" / "F32" / "F64" / "I8" / "I16" / "I32" / "I64" / "U8" / "Bool" / "C64" / "C128"
+
+owner_metric_rows_id = [32*32 0..255]
+
+owner_metric_stream_id = [32*32 0..255]
+
+owner_quant_action = "KeepDense" / {
+  "Fit": {
+    "metric": direct_fit_metric,
+    "plan": direct_fit_plan
+  }
+} / {
+  "CalibratedFit": {
+    "plan": calibrated_fit_plan
+  }
+} / {
+  "OwnerFit": {
+    "plan": owner_score_fit_plan
+  }
+}
+
+owner_quant_plan = {
+  "architecture": tstr,
+  "assets": [* tstr],
+  "levels": [* tstr],
+  "limits": quant_limits,
+  "max_cache_package_bytes": uint,
+  "max_cache_payload_bytes": uint,
+  "original_source": original_source_id,
+  "tensors": [* owner_quant_tensor_plan]
+}
+
+owner_quant_tensor_plan = {
+  "action": owner_quant_action,
+  "source": quant_source_tensor
+}
+
+owner_quantization_completed = {
+  "original_source": original_source_id,
+  "output": quantization_completed
+}
+
+owner_quantization_started = {
+  "plan": owner_quant_plan
+}
+
+owner_row_metric_binding = {
+  "content": owner_row_metric_id,
+  "row": uint
+}
+
+owner_row_metric_id = [32*32 0..255]
+
+owner_score_cache_binding = {
+  "cache": owner_score_cache_id,
+  "content": owner_score_cache_content,
+  "context_bytes": uint,
+  "payload_bytes": uint,
+  "samples": uint
+}
+
+owner_score_cache_content = {
+  "context": [* owner_context_binding],
+  "estimator": owner_score_estimator,
+  "invocations": [* owner_invocation_binding],
+  "objective": blob_id,
+  "source": original_source_id,
+  "tensor": quant_source_tensor,
+  "tokenizer": blob_id
+}
+
+owner_score_cache_id = [32*32 0..255]
+
+owner_score_cache_limits = {
+  "max_context_bytes": uint,
+  "max_context_tensors": uint,
+  "max_invocations": uint,
+  "max_payload_bytes": uint,
+  "max_samples": uint
+}
+
+owner_score_cache_manifest = {
+  "binding": owner_score_cache_binding,
+  "limits": owner_score_cache_limits
+}
+
+owner_score_estimator = "ScalarWindowGradient"
+
+owner_score_fit_plan = {
+  "damping": float,
+  "direct": direct_fit_plan,
+  "limits": owner_score_metric_limits,
+  "max_row_bindings": uint,
+  "windows": [* weighted_owner_cache]
+}
+
+owner_score_levels_fitted = {
+  "outputs": [* direct_fit_output],
+  "plan": owner_score_fit_plan,
+  "rayon_threads": 0..4294967295,
+  "rows": [* owner_row_metric_binding],
+  "rows_content": owner_metric_rows_id,
+  "source_f32": fit_input_digest,
+  "stream": owner_metric_stream_id
+}
+
+owner_score_metric_limits = {
+  "max_payload_bytes": uint,
+  "max_reduction_entries": uint,
+  "max_row_bytes": uint,
+  "max_windows": uint
+}
+
+owner_score_role = "Matmul" / "Gather"
+
+owner_score_window_meta = {
+  "context": [* owner_context_meta],
+  "invocations": [* owner_invocation_meta]
+}
+
+package_id = [32*32 0..255]
+
+plane_allocation = "Uniform" / "PerTile"
+
+plane_codec = "D2" / "B3" / "S34"
+
+plane_counts = {
+  "Uniform": 0..255
+} / {
+  "PerTile": [* 0..255]
+}
+
+plane_relation = "Free" / {
+  "Tied": {
+    "den": 0..4294967295,
+    "num": 0..4294967295
+  }
+}
+
+quant_action = "KeepDense" / {
+  "Fit": {
+    "metric": direct_fit_metric,
+    "plan": direct_fit_plan
+  }
+}
+
+quant_limits = {
+  "max_asset_bytes": uint,
+  "max_package_bytes": uint,
+  "max_retained_blob_bytes": uint,
+  "max_source_bytes": uint
+}
+
+quant_output_level = {
+  "name": tstr,
+  "tensors": [* tensor_meta]
+}
+
+quant_plan = {
+  "architecture": tstr,
+  "assets": [* tstr],
+  "levels": [* tstr],
+  "limits": quant_limits,
+  "tensors": [* quant_tensor_plan]
+}
+
+quant_source_binding = {
+  "content": blob_id,
+  "source": quant_source_tensor
+}
+
+quant_source_tensor = {
+  "name": tstr,
+  "precision": scale_precision,
+  "shape": [* uint]
+}
+
+quant_tensor_plan = {
+  "action": quant_action,
+  "source": quant_source_tensor
+}
+
+quantization_completed = {
+  "assets": [* named_asset_digest],
+  "levels": [* quant_output_level],
+  "sources": [* quant_source_binding]
+}
+
+quantization_started = {
+  "plan": quant_plan
+}
+
+salience_conversion_limits = {
+  "max_manifest_bytes": uint,
+  "max_package_bytes": uint
+}
+
+salience_conversion_manifest = {
+  "conversion": evidence_reference,
+  "derived_source": original_source_id,
+  "model": model_manifest,
+  "original_source": original_source_id,
+  "schema": schema_id,
+  "stage_package": package_id,
+  "transform": evidence_reference
+}
+
+salience_inverse_axis = "NormChannels" / "LinearOutputRows"
+
+salience_moment_binding = {
+  "channels": uint,
+  "content": blob_id,
+  "rows": uint
+}
+
+salience_numerics = "LegacyF64ScaleF32V1"
+
+salience_operation_output = {
+  "operation": tstr,
+  "scale_bits": [* [4*4 0..255]]
+}
+
+salience_source_stage_manifest = {
+  "observation": salience_transform_observation,
+  "schema": schema_id,
+  "transform": evidence_reference
+}
+
+salience_stage_limits = {
+  "max_asset_bytes": uint,
+  "max_manifest_bytes": uint,
+  "max_package_bytes": uint,
+  "max_statistics_bytes": uint,
+  "max_tensor_bytes": uint
+}
+
+salience_statistics_kind = "Declared"
+
+salience_transform_completed = {
+  "observation": salience_transform_observation
+}
+
+salience_transform_limits = {
+  "max_asset_bytes": uint,
+  "max_derived_bytes": uint,
+  "max_pair_working_bytes": uint,
+  "max_source_bytes": uint,
+  "max_statistics_bytes": uint
+}
+
+salience_transform_observation = {
+  "assets": [* named_asset_digest],
+  "derived_source": original_source_id,
+  "derived_tensors": [* quant_source_binding],
+  "operations": [* salience_operation_output],
+  "original_source": original_source_id,
+  "original_tensors": [* quant_source_binding],
+  "plan": salience_transform_plan
+}
+
+salience_transform_operation = {
+  "alpha_bits": [8*8 0..255],
+  "inverse": tstr,
+  "inverse_axis": salience_inverse_axis,
+  "moments": salience_moment_binding,
+  "name": tstr,
+  "projections": [* tstr]
+}
+
+salience_transform_plan = {
+  "architecture": tstr,
+  "assets": [* tstr],
+  "limits": salience_transform_limits,
+  "numerics": salience_numerics,
+  "operations": [* salience_transform_operation],
+  "original_source": original_source_id,
+  "statistics_kind": salience_statistics_kind,
+  "tensors": [* quant_source_tensor]
+}
+
+salience_transform_started = {
+  "plan": salience_transform_plan
+}
+
+scale_anchor = "Group" / "Row" / "Tensor" / "Channel"
+
+scale_law = {
+  "anchor": scale_anchor,
+  "precision": scale_precision,
+  "relation": plane_relation
+}
+
+scale_precision = "F16" / "Bf16" / "F32"
+
+schema_id = {
+  "major": 0..65535,
+  "minor": 0..65535
+}
+
+semantic_tensor_digest = [32*32 0..255]
+
+tensor_caps = {
+  "execution": tensor_execution,
+  "payload_bytes": uint
+}
+
+tensor_execution = "Native" / "Emulated"
+
+tensor_meta = {
+  "blob": blob_reference,
+  "name": tstr,
+  "storage": tensor_storage
+}
+
+tensor_semantic_meta = {
+  "Dense": {
+    "precision": scale_precision,
+    "shape": [* uint]
+  }
+} / {
+  "Additive": {
+    "basis": basis,
+    "cols": uint,
+    "group": 0..65535,
+    "law": scale_law,
+    "planes": plane_counts,
+    "rows": uint,
+    "tile": 0..65535
+  }
+}
+
+tensor_storage = {
+  "Dense": {
+    "precision": scale_precision,
+    "shape": [* uint]
+  }
+} / {
+  "Additive": {
+    "layout": additive_layout,
+    "planes": plane_counts
+  }
+}
+
+tensor_upload_policy = {
+  ? "max_payload_bytes": uint / nil,
+  "native_only": bool
+}
+
+tensor_uploaded = {
+  "backend": tstr,
+  "caps": tensor_caps,
+  "decoded_source_bytes": uint,
+  "physical_device": tstr,
+  "tensor": tstr
+}
+
+transport = "Raw" / {
+  "JointHuffman": {
+    "block": 0..4294967295
+  }
+}
+
+unknown_reason = "NotEvaluated" / "MissingEvidence" / "MissingCapability" / "AwaitingIndependentReview" / "Other"
+
+verdict = "Pass" / "Fail" / {
+  "Unknown": {
+    "reason": unknown_reason
+  }
+}
+
+weighted_owner_cache = {
+  "binding": owner_score_cache_binding,
+  "weight": float
+}
+
+weighted_owner_window = {
+  "cache": owner_score_cache_id,
+  "weight": float
+}
+
+work_precision = "F32Accum64" / "F64"
+
+legacy_salt_v2_asset_descriptor = {
+  "bytes": uint,
+  "file": tstr,
+  "package_id": tstr
+}
+
+legacy_salt_v2_preserved_descriptor = {
+  "file": tstr,
+  "package_id": tstr,
+  "payload_bytes": uint,
+  "serialized_bytes": uint,
+  "tensors": uint
+}
+
+legacy_salt_v2_profile_descriptor = {
+  "file": tstr,
+  "package_id": tstr,
+  "resident_bytes": uint,
+  "serialized_bytes": uint
+}
+
+legacy_salt_v2_profile_set = {
+  "compact-v1": legacy_salt_v2_profile_descriptor,
+  "near-lossless-v1": legacy_salt_v2_profile_descriptor
+}
+
+owner_context_binding = {
+  "content": blob_id,
+  "meta": owner_context_meta
+}
+
+owner_context_meta = {
+  "conjugated": bool,
+  "dtype": owner_context_dtype,
+  "name": tstr,
+  "negated": bool,
+  "shape": [* uint]
+}
+
+owner_invocation_binding = {
+  "adjoint": blob_id,
+  "input": blob_id,
+  "meta": owner_invocation_meta
+}
+
+owner_invocation_meta = {
+  "ordinal": uint,
+  "paths": [* tstr],
+  "role": owner_score_role,
+  "samples": uint
+}
