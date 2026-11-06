@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import shutil
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +29,11 @@ from .errors import TritiumError
 Pathish = Union[str, os.PathLike[str]]
 _MANIFEST = "tritium-module-onnx.json"
 _GRAPH = "model.onnx"
+_MAX_TERMINAL_PARITY_CAPTURE_BYTES = 64 * 1024 * 1024
+_PARITY_DIAGNOSTIC_LAYER_INDEX = 11
+_ORT_DEFAULT_INTRA_OP_THREADS = 2
+_ORT_INTRA_OP_THREADS_ENV = "TRITIUM_ONNX_INTRA_OP_THREADS"
+_ORT_INTER_OP_THREADS = 0
 _TOP_FIELDS_V1 = {
     "schema_version",
     "artifact_kind",
@@ -219,6 +226,935 @@ def _runtime_dependencies():
     return onnx, onnxruntime
 
 
+def _ort_intra_op_threads() -> int:
+    """Resolve a bounded explicit ORT thread policy (0 restores ORT auto)."""
+
+    configured = os.environ.get(_ORT_INTRA_OP_THREADS_ENV)
+    if configured is None:
+        return _ORT_DEFAULT_INTRA_OP_THREADS
+    try:
+        thread_count = int(configured, 10)
+    except ValueError as error:
+        raise ValueError(
+            f"{_ORT_INTRA_OP_THREADS_ENV} must be an integer from 0 to 256"
+        ) from error
+    if not 0 <= thread_count <= 256:
+        raise ValueError(
+            f"{_ORT_INTRA_OP_THREADS_ENV} must be an integer from 0 to 256"
+        )
+    return thread_count
+
+
+def _session_options(ort):
+    """Keep packed decode graphs compact instead of constant-folding weights."""
+
+    options = ort.SessionOptions()
+    # ORT's default graph optimizer evaluates the standard-ONNX trit decoder
+    # during session creation, materializing every full-precision target
+    # matrix. That defeats packed residency and can require tens of GiB.
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    # ORT auto thread-pool selection changed FP32 accumulation on two exact
+    # hosted artifacts. A bounded explicit default stabilizes that reduction;
+    # callers can override it with TRITIUM_ONNX_INTRA_OP_THREADS (0..256).
+    options.intra_op_num_threads = _ort_intra_op_threads()
+    options.inter_op_num_threads = _ORT_INTER_OP_THREADS
+    return options
+
+
+def _cpu_model_name(cpuinfo_path: Path = Path("/proc/cpuinfo")) -> Optional[str]:
+    """Read only the first CPU model label, with portable platform fallbacks."""
+
+    try:
+        with cpuinfo_path.open(encoding="utf-8", errors="replace") as source:
+            for line in source:
+                key, separator, value = line.partition(":")
+                if separator and key.strip().lower() in {"model name", "hardware"}:
+                    model_name = value.strip()
+                    if model_name:
+                        return model_name[:256]
+                if not line.strip():
+                    break
+    except OSError:
+        pass
+    fallback = os.environ.get("PROCESSOR_IDENTIFIER") or platform.processor()
+    return fallback[:256] if fallback else None
+
+
+def _parity_runtime_info(onnx, ort, session) -> dict[str, Any]:
+    """Return bounded, secret-free runtime context for opt-in failure artifacts."""
+
+    affinity_count = None
+    get_affinity = getattr(os, "sched_getaffinity", None)
+    if callable(get_affinity):
+        try:
+            affinity_count = len(get_affinity(0))
+        except OSError:
+            pass
+    get_providers = getattr(session, "get_providers", None)
+    providers = list(get_providers()) if callable(get_providers) else []
+    thread_environment = {
+        name: os.environ[name]
+        for name in (
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "OMP_PROC_BIND",
+            "KMP_AFFINITY",
+            _ORT_INTRA_OP_THREADS_ENV,
+        )
+        if name in os.environ
+    }
+    return {
+        "versions": {
+            "python": platform.python_version(),
+            "torch": str(torch.__version__),
+            "onnx": str(getattr(onnx, "__version__", "unknown")),
+            "onnxruntime": str(getattr(ort, "__version__", "unknown")),
+        },
+        "cpu": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+            "processor": platform.processor() or None,
+            "model_name": _cpu_model_name(),
+            "logical_count": os.cpu_count(),
+            "affinity_count": affinity_count,
+        },
+        "providers": providers,
+        "session": {
+            "graph_optimization_level": "ORT_DISABLE_ALL",
+            "intra_op_num_threads": _ort_intra_op_threads(),
+            "inter_op_num_threads": _ORT_INTER_OP_THREADS,
+        },
+        "thread_environment": thread_environment,
+    }
+
+
+def _terminal_intermediate_names(graph, output_names: Sequence[str]) -> Tuple[str, ...]:
+    """Find bounded concat shards and their shared MatMul/Gemm activation."""
+
+    producers = {
+        output: node for node in graph.node for output in node.output if output
+    }
+    initializers = {value.name for value in graph.initializer}
+    graph_inputs = {value.name for value in graph.input}
+    for output_name in output_names:
+        concat = producers.get(output_name)
+        if concat is None or concat.op_type != "Concat":
+            continue
+        shards = tuple(name for name in concat.input if name)
+        if not 2 <= len(shards) <= 16:
+            continue
+        shard_producers = tuple(producers.get(name) for name in shards)
+        if any(
+            node is None or node.op_type not in {"MatMul", "Gemm"}
+            for node in shard_producers
+        ):
+            return shards
+        common_inputs = None
+        for node in shard_producers:
+            activation_inputs = {
+                name for name in node.input if name and name not in initializers
+            }
+            common_inputs = (
+                activation_inputs
+                if common_inputs is None
+                else common_inputs.intersection(activation_inputs)
+            )
+        shared = sorted((common_inputs or set()) - graph_inputs)
+        if len(shared) == 1:
+            return (*shards, shared[0])
+        return shards
+    return ()
+
+
+def _decoder_layer_residual_add_names(
+    graph, hidden_size: Optional[int], layer_count: Optional[int]
+) -> Tuple[str, ...]:
+    """Select ordered Llama-style residual Adds when geometry is explicit."""
+
+    if (
+        type(hidden_size) is not int
+        or hidden_size <= 0
+        or type(layer_count) is not int
+        or layer_count <= 0
+    ):
+        return ()
+    available = {
+        value.name: value
+        for value in (*graph.input, *graph.output, *graph.value_info)
+    }
+    residual_adds = []
+    for node in graph.node:
+        if node.op_type != "Add" or len(node.output) != 1:
+            continue
+        value = available.get(node.output[0])
+        if value is None or not value.type.HasField("tensor_type"):
+            continue
+        tensor_type = value.type.tensor_type
+        if (
+            tensor_type.elem_type != 1  # TensorProto.FLOAT
+            or not tensor_type.HasField("shape")
+            or len(tensor_type.shape.dim) != 3
+            or tensor_type.shape.dim[-1].dim_value != hidden_size
+        ):
+            continue
+        residual_adds.append(node.output[0])
+    # Llama-family decoder blocks have two residual Add outputs apiece. Refuse
+    # to guess layer boundaries if export structure differs from that contract.
+    if len(residual_adds) != layer_count * 2:
+        return ()
+    return tuple(residual_adds)
+
+
+def _decoder_layer_residual_names(
+    graph, hidden_size: Optional[int], layer_count: Optional[int]
+) -> Tuple[str, ...]:
+    """Select Llama-style block outputs (the second residual Add per layer)."""
+
+    residual_adds = _decoder_layer_residual_add_names(
+        graph, hidden_size, layer_count
+    )
+    return tuple(residual_adds[1::2])
+
+
+def _first_decoder_attention_residual_name(
+    graph, hidden_size: Optional[int], layer_count: Optional[int]
+) -> Optional[str]:
+    """Return the first block's attention residual under the Llama Add contract."""
+
+    residual_adds = _decoder_layer_residual_add_names(
+        graph, hidden_size, layer_count
+    )
+    return residual_adds[0] if residual_adds else None
+
+
+def _decoder_layer_attention_residual_name(
+    graph, hidden_size: Optional[int], layer_count: Optional[int], layer_index: int
+) -> Optional[str]:
+    """Return one block's attention residual under the Llama Add contract."""
+
+    residual_adds = _decoder_layer_residual_add_names(
+        graph, hidden_size, layer_count
+    )
+    if (
+        type(layer_index) is not int
+        or layer_index < 0
+        or layer_index >= (len(residual_adds) // 2)
+    ):
+        return None
+    return residual_adds[2 * layer_index]
+
+
+def _first_decoder_block_internal_names(
+    graph,
+    hidden_size: Optional[int],
+    layer_count: Optional[int],
+    intermediate_size: Optional[int] = None,
+) -> Tuple[str, ...]:
+    """Select hidden/MLP-width values inside block zero, excluding its residuals."""
+
+    return _decoder_block_internal_names(
+        graph, hidden_size, layer_count, intermediate_size, layer_index=0
+    )
+
+
+def _decoder_block_internal_names(
+    graph,
+    hidden_size: Optional[int],
+    layer_count: Optional[int],
+    intermediate_size: Optional[int],
+    *,
+    layer_index: int,
+) -> Tuple[str, ...]:
+    """Select hidden/MLP-width values inside one Llama-style block."""
+
+    residual_adds = _decoder_layer_residual_add_names(
+        graph, hidden_size, layer_count
+    )
+    if (
+        not residual_adds
+        or type(layer_index) is not int
+        or layer_index < 0
+        or layer_index >= (len(residual_adds) // 2)
+    ):
+        return ()
+    first_add, block_output = residual_adds[2 * layer_index : 2 * layer_index + 2]
+    node_indices = {
+        output: index
+        for index, node in enumerate(graph.node)
+        for output in node.output
+    }
+    first_index = node_indices.get(first_add)
+    output_index = node_indices.get(block_output)
+    if first_index is None or output_index is None or output_index <= first_index:
+        return ()
+    available = {
+        value.name: value
+        for value in (*graph.input, *graph.output, *graph.value_info)
+    }
+    internal = []
+    for node in graph.node[first_index + 1 : output_index]:
+        for name in node.output:
+            value = available.get(name)
+            if value is None or not value.type.HasField("tensor_type"):
+                continue
+            tensor_type = value.type.tensor_type
+            if (
+                tensor_type.elem_type == 1
+                and tensor_type.HasField("shape")
+                and len(tensor_type.shape.dim) == 3
+                and tensor_type.shape.dim[-1].dim_value
+                in {hidden_size, intermediate_size}
+            ):
+                internal.append(name)
+    return tuple(internal)
+
+
+def _terminal_capture_size_bytes(
+    graph,
+    names: Sequence[str],
+    input_names: Sequence[str],
+    inputs: Sequence[Tensor],
+    onnx,
+) -> Optional[int]:
+    """Return a conservative byte bound, or None when graph geometry is unknown."""
+
+    import numpy as np
+
+    available = {
+        value.name: value
+        for value in (*graph.input, *graph.output, *graph.value_info)
+    }
+    symbols = {}
+    for input_name, input_value in zip(input_names, inputs, strict=True):
+        info = available.get(input_name)
+        if info is None or not info.type.HasField("tensor_type"):
+            continue
+        dimensions = info.type.tensor_type.shape.dim
+        if len(dimensions) != input_value.ndim:
+            continue
+        for dimension, size in zip(dimensions, input_value.shape, strict=True):
+            if dimension.dim_param:
+                symbols[dimension.dim_param] = int(size)
+
+    total_bytes = 0
+    for name in dict.fromkeys(names):
+        info = available.get(name)
+        if info is None or not info.type.HasField("tensor_type"):
+            return None
+        tensor_type = info.type.tensor_type
+        if not tensor_type.HasField("shape"):
+            return None
+        elements = 1
+        for dimension in tensor_type.shape.dim:
+            if dimension.HasField("dim_value"):
+                size = dimension.dim_value
+            elif dimension.dim_param in symbols:
+                size = symbols[dimension.dim_param]
+            else:
+                return None
+            if size < 0:
+                return None
+            elements *= size
+        try:
+            item_size = np.dtype(
+                onnx.helper.tensor_dtype_to_np_dtype(tensor_type.elem_type)
+            ).itemsize
+        except (KeyError, TypeError, ValueError):
+            return None
+        total_bytes += elements * item_size
+        if total_bytes > _MAX_TERMINAL_PARITY_CAPTURE_BYTES:
+            return total_bytes
+    return total_bytes
+
+
+def _capture_terminal_intermediates(
+    staging: Path,
+    input_names: Sequence[str],
+    inputs: Sequence[Tensor],
+    output_names: Sequence[str],
+    onnx,
+    ort,
+    *,
+    hidden_size: Optional[int] = None,
+    layer_count: Optional[int] = None,
+    intermediate_size: Optional[int] = None,
+) -> Tuple[Tuple[str, str, Any], ...]:
+    """Replay bounded terminal ONNX values without changing the original graph."""
+
+    graph_path = staging / _GRAPH
+    graph = onnx.load(graph_path, load_external_data=False)
+    candidates = _terminal_intermediate_names(graph.graph, output_names)
+    residual_names = _decoder_layer_residual_names(
+        graph.graph, hidden_size, layer_count
+    )
+    attention_residual_name = _first_decoder_attention_residual_name(
+        graph.graph, hidden_size, layer_count
+    )
+    first_block_internal_names = _first_decoder_block_internal_names(
+        graph.graph, hidden_size, layer_count, intermediate_size
+    )
+    diagnostic_layer_index = (
+        min(_PARITY_DIAGNOSTIC_LAYER_INDEX, layer_count - 1)
+        if type(layer_count) is int and layer_count > 0
+        else 0
+    )
+    diagnostic_attention_residual_name = _decoder_layer_attention_residual_name(
+        graph.graph, hidden_size, layer_count, diagnostic_layer_index
+    )
+    diagnostic_block_internal_names = _decoder_block_internal_names(
+        graph.graph,
+        hidden_size,
+        layer_count,
+        intermediate_size,
+        layer_index=diagnostic_layer_index,
+    )
+    available = {
+        value.name: value
+        for value in (*graph.graph.input, *graph.graph.output, *graph.graph.value_info)
+    }
+    captured_names = tuple(
+        name
+        for name in dict.fromkeys(
+            (
+                *candidates,
+                *residual_names,
+                attention_residual_name,
+                *first_block_internal_names,
+                diagnostic_attention_residual_name,
+                *diagnostic_block_internal_names,
+            )
+        )
+        if name is not None
+        if name in available
+    )
+    if not captured_names:
+        return ()
+    capture_names = (*output_names, *captured_names)
+    capture_bytes = _terminal_capture_size_bytes(
+        graph.graph,
+        capture_names,
+        input_names,
+        inputs,
+        onnx,
+    )
+    if capture_bytes is None or capture_bytes > _MAX_TERMINAL_PARITY_CAPTURE_BYTES:
+        return ()
+    for name in captured_names:
+        graph.graph.output.add().CopyFrom(available[name])
+    diagnostic_graph = staging / ".terminal-diagnostic.onnx"
+    try:
+        onnx.save(graph, diagnostic_graph)
+        session = ort.InferenceSession(
+            str(diagnostic_graph),
+            sess_options=_session_options(ort),
+            providers=["CPUExecutionProvider"],
+        )
+        feed = {
+            name: value.detach().contiguous().numpy()
+            for name, value in zip(input_names, inputs, strict=True)
+        }
+        values = session.run(list(capture_names), feed)
+        output_values = values[: len(output_names)]
+        intermediate_values = values[len(output_names) :]
+        return (
+            *(
+                ("terminal-output-replay", name, value)
+                for name, value in zip(output_names, output_values, strict=True)
+            ),
+            *(
+                (
+                    (
+                        "terminal-attention-residual"
+                        if name == attention_residual_name
+                        or name == diagnostic_attention_residual_name
+                        else "terminal-layer-residual"
+                        if name in residual_names
+                        else "terminal-first-block-internal"
+                        if name in first_block_internal_names
+                        else "terminal-diagnostic-block-internal"
+                        if name in diagnostic_block_internal_names
+                        else "terminal-intermediate"
+                    ),
+                    name,
+                    value,
+                )
+                for name, value in zip(
+                    captured_names, intermediate_values, strict=True
+                )
+            ),
+        )
+    finally:
+        diagnostic_graph.unlink(missing_ok=True)
+
+
+def _capture_reference_terminal_outputs(
+    model: nn.Module,
+    input_names: Sequence[str],
+    inputs: Sequence[Tensor],
+) -> Tuple[Tuple[str, str, Tensor], ...]:
+    """Best-effort capture of a HF model's final hidden state on the reference path."""
+
+    config = getattr(model, "config", None)
+    config = getattr(config, "text_config", config)
+    layer_count = getattr(config, "num_hidden_layers", None)
+    hidden_size = getattr(config, "hidden_size", None)
+    intermediate_size = getattr(config, "intermediate_size", None)
+    vocab_size = getattr(config, "vocab_size", None)
+    if any(type(value) is not int or value <= 0 for value in (layer_count, hidden_size, vocab_size)):
+        return ()
+    token_input = next(
+        (
+            value
+            for name, value in zip(input_names, inputs, strict=True)
+            if "input_ids" in name
+            and value.ndim >= 2
+            and value.dtype in {torch.int8, torch.int16, torch.int32, torch.int64}
+        ),
+        None,
+    )
+    if token_input is None:
+        return ()
+    batch = 1
+    for size in token_input.shape[:-1]:
+        batch *= int(size)
+    sequence = int(token_input.shape[-1])
+    backbone = getattr(model, "model", None)
+    decoder_layers = getattr(backbone, "layers", None)
+    first_layer = decoder_layers[0] if decoder_layers else None
+    diagnostic_layer_index = min(_PARITY_DIAGNOSTIC_LAYER_INDEX, layer_count - 1)
+    diagnostic_layer = (
+        decoder_layers[diagnostic_layer_index]
+        if decoder_layers and diagnostic_layer_index < len(decoder_layers)
+        else None
+    )
+    post_attention_layernorm = getattr(
+        first_layer, "post_attention_layernorm", None
+    )
+    first_mlp = getattr(first_layer, "mlp", None)
+    gate_projection = getattr(first_mlp, "gate_proj", None)
+    up_projection = getattr(first_mlp, "up_proj", None)
+    mlp_activation = getattr(first_mlp, "act_fn", None)
+    can_capture_attention_residual = isinstance(post_attention_layernorm, nn.Module)
+    can_capture_mlp_input = can_capture_attention_residual
+    can_capture_mlp_output = isinstance(first_mlp, nn.Module)
+    can_capture_mlp_projections = (
+        type(intermediate_size) is int
+        and intermediate_size > 0
+        and isinstance(gate_projection, nn.Module)
+        and isinstance(up_projection, nn.Module)
+        and isinstance(mlp_activation, nn.Module)
+    )
+    diagnostic_post_attention_layernorm = getattr(
+        diagnostic_layer, "post_attention_layernorm", None
+    )
+    diagnostic_mlp = getattr(diagnostic_layer, "mlp", None)
+    diagnostic_gate_projection = getattr(diagnostic_mlp, "gate_proj", None)
+    diagnostic_up_projection = getattr(diagnostic_mlp, "up_proj", None)
+    diagnostic_mlp_activation = getattr(diagnostic_mlp, "act_fn", None)
+    capture_diagnostic_block = diagnostic_layer_index != 0
+    can_capture_diagnostic_boundaries = (
+        capture_diagnostic_block
+        and isinstance(diagnostic_post_attention_layernorm, nn.Module)
+        and isinstance(diagnostic_mlp, nn.Module)
+    )
+    can_capture_diagnostic_projections = (
+        can_capture_diagnostic_boundaries
+        and type(intermediate_size) is int
+        and intermediate_size > 0
+        and isinstance(diagnostic_gate_projection, nn.Module)
+        and isinstance(diagnostic_up_projection, nn.Module)
+        and isinstance(diagnostic_mlp_activation, nn.Module)
+    )
+    estimated_bytes = (
+        (
+            layer_count
+            + 1
+            + int(can_capture_attention_residual)
+            + int(can_capture_mlp_input)
+            + int(can_capture_mlp_output)
+            + int(can_capture_diagnostic_boundaries) * 3
+        )
+        * batch
+        * sequence
+        * hidden_size
+        * 4
+        + 3
+        * (
+            int(can_capture_mlp_projections)
+            + int(can_capture_diagnostic_projections)
+        )
+        * batch
+        * sequence
+        * (
+            intermediate_size
+            if type(intermediate_size) is int and intermediate_size > 0
+            else 0
+        )
+        * 4
+        + batch * sequence * vocab_size * 4
+    )
+    if estimated_bytes > _MAX_TERMINAL_PARITY_CAPTURE_BYTES:
+        return ()
+    attention_residuals = []
+    mlp_inputs = []
+    mlp_outputs = []
+    gate_projection_outputs = []
+    up_projection_outputs = []
+    mlp_activation_outputs = []
+    diagnostic_attention_residuals = []
+    diagnostic_mlp_inputs = []
+    diagnostic_mlp_outputs = []
+    diagnostic_gate_projection_outputs = []
+    diagnostic_up_projection_outputs = []
+    diagnostic_mlp_activation_outputs = []
+
+    def capture_attention_residual(target, _module, args):
+        if args and isinstance(args[0], Tensor):
+            target.append(args[0])
+
+    def capture_module_output(target, _module, _args, output):
+        value = output[0] if isinstance(output, (tuple, list)) and output else output
+        if isinstance(value, Tensor):
+            target.append(value)
+
+    hooks = []
+    if can_capture_attention_residual:
+        hooks.append(
+            post_attention_layernorm.register_forward_pre_hook(
+                lambda module, args: capture_attention_residual(
+                    attention_residuals, module, args
+                )
+            )
+        )
+        hooks.append(
+            post_attention_layernorm.register_forward_hook(
+                lambda module, args, output: capture_module_output(
+                    mlp_inputs, module, args, output
+                )
+            )
+        )
+    if can_capture_mlp_output:
+        hooks.append(
+            first_mlp.register_forward_hook(
+                lambda module, args, output: capture_module_output(
+                    mlp_outputs, module, args, output
+                )
+            )
+        )
+    if can_capture_mlp_projections:
+        hooks.extend(
+            (
+                gate_projection.register_forward_hook(
+                    lambda module, args, output: capture_module_output(
+                        gate_projection_outputs, module, args, output
+                    )
+                ),
+                up_projection.register_forward_hook(
+                    lambda module, args, output: capture_module_output(
+                        up_projection_outputs, module, args, output
+                    )
+                ),
+                mlp_activation.register_forward_hook(
+                    lambda module, args, output: capture_module_output(
+                        mlp_activation_outputs, module, args, output
+                    )
+                ),
+            )
+        )
+    if can_capture_diagnostic_boundaries:
+        hooks.extend(
+            (
+                diagnostic_post_attention_layernorm.register_forward_pre_hook(
+                    lambda module, args: capture_attention_residual(
+                        diagnostic_attention_residuals, module, args
+                    )
+                ),
+                diagnostic_post_attention_layernorm.register_forward_hook(
+                    lambda module, args, output: capture_module_output(
+                        diagnostic_mlp_inputs, module, args, output
+                    )
+                ),
+                diagnostic_mlp.register_forward_hook(
+                    lambda module, args, output: capture_module_output(
+                        diagnostic_mlp_outputs, module, args, output
+                    )
+                ),
+            )
+        )
+    if can_capture_diagnostic_projections:
+        hooks.extend(
+            (
+                diagnostic_gate_projection.register_forward_hook(
+                    lambda module, args, output: capture_module_output(
+                        diagnostic_gate_projection_outputs, module, args, output
+                    )
+                ),
+                diagnostic_up_projection.register_forward_hook(
+                    lambda module, args, output: capture_module_output(
+                        diagnostic_up_projection_outputs, module, args, output
+                    )
+                ),
+                diagnostic_mlp_activation.register_forward_hook(
+                    lambda module, args, output: capture_module_output(
+                        diagnostic_mlp_activation_outputs, module, args, output
+                    )
+                ),
+            )
+        )
+    try:
+        with torch.no_grad():
+            result = model(*inputs, output_hidden_states=True, use_cache=False)
+    except TypeError:
+        return ()
+    finally:
+        for hook in hooks:
+            hook.remove()
+    if isinstance(result, Mapping):
+        hidden_states = result.get("hidden_states")
+        logits = result.get("logits")
+    else:
+        hidden_states = getattr(result, "hidden_states", None)
+        logits = getattr(result, "logits", None)
+    if (
+        not isinstance(hidden_states, (tuple, list))
+        or len(hidden_states) not in {layer_count, layer_count + 1}
+        or any(not isinstance(value, Tensor) for value in hidden_states)
+    ):
+        return ()
+    capture_tensors = list(hidden_states)
+    if isinstance(logits, Tensor):
+        capture_tensors.append(logits)
+    if attention_residuals:
+        capture_tensors.append(attention_residuals[0])
+    if mlp_inputs:
+        capture_tensors.append(mlp_inputs[0])
+    if mlp_outputs:
+        capture_tensors.append(mlp_outputs[0])
+    if gate_projection_outputs:
+        capture_tensors.append(gate_projection_outputs[0])
+    if up_projection_outputs:
+        capture_tensors.append(up_projection_outputs[0])
+    if mlp_activation_outputs:
+        capture_tensors.append(mlp_activation_outputs[0])
+    for values in (
+        diagnostic_attention_residuals,
+        diagnostic_mlp_inputs,
+        diagnostic_mlp_outputs,
+        diagnostic_gate_projection_outputs,
+        diagnostic_up_projection_outputs,
+        diagnostic_mlp_activation_outputs,
+    ):
+        if values:
+            capture_tensors.append(values[0])
+    if sum(value.numel() * value.element_size() for value in capture_tensors) > (
+        _MAX_TERMINAL_PARITY_CAPTURE_BYTES
+    ):
+        return ()
+    arrays = []
+    if isinstance(logits, Tensor):
+        arrays.append(
+            ("reference-output-replay", "logits", logits.detach().cpu().contiguous())
+        )
+    if attention_residuals:
+        arrays.append(
+            (
+                "reference-attention-residual",
+                "layers[0].attention_residual",
+                attention_residuals[0].detach().cpu().contiguous(),
+            )
+        )
+    if mlp_inputs:
+        arrays.append(
+            (
+                "reference-mlp-input",
+                "layers[0].post_attention_layernorm.output",
+                mlp_inputs[0].detach().cpu().contiguous(),
+            )
+        )
+    if gate_projection_outputs:
+        arrays.append(
+            (
+                "reference-mlp-gate-projection",
+                "layers[0].mlp.gate_proj.output",
+                gate_projection_outputs[0].detach().cpu().contiguous(),
+            )
+        )
+    if up_projection_outputs:
+        arrays.append(
+            (
+                "reference-mlp-up-projection",
+                "layers[0].mlp.up_proj.output",
+                up_projection_outputs[0].detach().cpu().contiguous(),
+            )
+        )
+    if mlp_activation_outputs:
+        arrays.append(
+            (
+                "reference-mlp-activation",
+                "layers[0].mlp.act_fn.output",
+                mlp_activation_outputs[0].detach().cpu().contiguous(),
+            )
+        )
+    if mlp_outputs:
+        arrays.append(
+            (
+                "reference-mlp-output",
+                "layers[0].mlp.output",
+                mlp_outputs[0].detach().cpu().contiguous(),
+            )
+        )
+    if diagnostic_attention_residuals:
+        arrays.append(
+            (
+                "reference-attention-residual",
+                f"layers[{diagnostic_layer_index}].attention_residual",
+                diagnostic_attention_residuals[0].detach().cpu().contiguous(),
+            )
+        )
+    if diagnostic_mlp_inputs:
+        arrays.append(
+            (
+                "reference-mlp-input",
+                f"layers[{diagnostic_layer_index}].post_attention_layernorm.output",
+                diagnostic_mlp_inputs[0].detach().cpu().contiguous(),
+            )
+        )
+    if diagnostic_gate_projection_outputs:
+        arrays.append(
+            (
+                "reference-mlp-gate-projection",
+                f"layers[{diagnostic_layer_index}].mlp.gate_proj.output",
+                diagnostic_gate_projection_outputs[0].detach().cpu().contiguous(),
+            )
+        )
+    if diagnostic_up_projection_outputs:
+        arrays.append(
+            (
+                "reference-mlp-up-projection",
+                f"layers[{diagnostic_layer_index}].mlp.up_proj.output",
+                diagnostic_up_projection_outputs[0].detach().cpu().contiguous(),
+            )
+        )
+    if diagnostic_mlp_activation_outputs:
+        arrays.append(
+            (
+                "reference-mlp-activation",
+                f"layers[{diagnostic_layer_index}].mlp.act_fn.output",
+                diagnostic_mlp_activation_outputs[0].detach().cpu().contiguous(),
+            )
+        )
+    if diagnostic_mlp_outputs:
+        arrays.append(
+            (
+                "reference-mlp-output",
+                f"layers[{diagnostic_layer_index}].mlp.output",
+                diagnostic_mlp_outputs[0].detach().cpu().contiguous(),
+            )
+        )
+    arrays.extend(
+        (
+            "reference-terminal-hidden"
+            if index == len(hidden_states) - 1
+            else "reference-hidden-state",
+            "hidden_states[-1]"
+            if index == len(hidden_states) - 1
+            else f"hidden_states[{index}]",
+            value.detach().cpu().contiguous(),
+        )
+        for index, value in enumerate(hidden_states)
+    )
+    return tuple(arrays)
+
+
+def _retain_parity_failure(
+    staging: Path,
+    diagnostic_root: Path,
+    artifact_name: str,
+    checkpoint_digest: str,
+    rtol: float,
+    atol: float,
+    error: AssertionError,
+    input_names: Sequence[str],
+    inputs: Sequence[Tensor],
+    observed: Sequence[Any],
+    expected: Sequence[Tensor],
+    runtime: Mapping[str, Any],
+    additional_arrays: Sequence[Tuple[str, str, Any]] = (),
+) -> None:
+    """Retain a digest-ledgered graph and replay tensors when opted in."""
+
+    diagnostic_root.mkdir(parents=True, exist_ok=True)
+    destination = diagnostic_root / artifact_name
+    destination.mkdir(exist_ok=False)
+    try:
+        files = []
+        for source in sorted(staging.iterdir()):
+            if source.is_symlink() or not source.is_file():
+                raise ValueError("parity diagnostic staging contains a non-file")
+            target = destination / source.name
+            shutil.copy2(source, target)
+            digest, byte_count = _digest_file(target)
+            files.append(
+                {"file": target.name, "sha256": digest, "bytes": byte_count}
+            )
+        arrays = []
+        diagnostic_values = [
+            ("input", name, value)
+            for name, value in zip(input_names, inputs)
+        ]
+        diagnostic_values.extend(
+            ("expected-output", str(index), value)
+            for index, value in enumerate(expected)
+        )
+        diagnostic_values.extend(
+            ("observed-output", str(index), value)
+            for index, value in enumerate(observed)
+        )
+        diagnostic_values.extend(additional_arrays)
+        for index, (role, name, value) in enumerate(diagnostic_values):
+            if isinstance(value, Tensor):
+                tensor = value.detach().cpu().contiguous()
+                payload = tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
+                dtype = str(tensor.dtype)
+                shape = list(tensor.shape)
+            else:
+                payload = value.tobytes(order="C")
+                dtype = str(value.dtype)
+                shape = list(value.shape)
+            filename = f"replay-{index:03d}.bin"
+            array_path = destination / filename
+            array_path.write_bytes(payload)
+            digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+            arrays.append(
+                {
+                    "role": role,
+                    "name": name,
+                    "file": filename,
+                    "dtype": dtype,
+                    "shape": shape,
+                    "sha256": digest,
+                    "bytes": len(payload),
+                }
+            )
+        diagnostic = {
+            "schema_version": 1,
+            "artifact_kind": "tritium.onnx-parity-failure-diagnostic.v1",
+            "checkpoint_digest": checkpoint_digest,
+            "rtol": rtol,
+            "atol": atol,
+            "failure_type": type(error).__name__,
+            "runtime": dict(runtime),
+            "files": files,
+            "replay_arrays": arrays,
+        }
+        (destination / "diagnostic.json").write_bytes(_canonical(diagnostic))
+    except Exception:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
+
+
 def _export_dependencies():
     dependencies = _runtime_dependencies()
     try:
@@ -230,6 +1166,48 @@ def _export_dependencies():
             stage="module_onnx",
         ) from error
     return dependencies
+
+
+def _translate_packed_ternary_plane(
+    packed,
+    scales,
+    rows: int,
+    columns: int,
+    group_size: int,
+    dtype_code: int,
+):
+    """Translate opaque packed decode to a compact standard-ONNX subgraph."""
+
+    from onnxscript import opset18 as op
+
+    packed = op.Cast(packed, to=7)  # int64
+    packed = op.Unsqueeze(packed, op.Constant(value_ints=[1]))
+    digits = []
+    for position in range(5):
+        quotient = op.Div(packed, op.Constant(value_int=3**position))
+        digits.append(
+            op.Mod(quotient, op.Constant(value_int=3), fmod=0)
+        )
+    decoded = op.Concat(*digits, axis=1)
+    decoded = op.Reshape(decoded, op.Constant(value_ints=[-1]))
+    decoded = op.Slice(
+        decoded,
+        op.Constant(value_ints=[0]),
+        op.Constant(value_ints=[rows * columns]),
+        op.Constant(value_ints=[0]),
+    )
+    decoded = op.Sub(decoded, op.Constant(value_int=1))
+    decoded = op.Reshape(decoded, op.Constant(value_ints=[rows, columns]))
+    decoded = op.Cast(decoded, to=dtype_code)
+    scales = op.Cast(scales, to=dtype_code)
+    columns_index = op.Range(
+        op.Constant(value_int=0),
+        op.Constant(value_int=columns),
+        op.Constant(value_int=1),
+    )
+    group_index = op.Div(columns_index, op.Constant(value_int=group_size))
+    expanded_scales = op.Gather(scales, group_index, axis=1)
+    return op.Mul(decoded, expanded_scales)
 
 
 def _packed_specs(model: nn.Module):
@@ -370,9 +1348,11 @@ def _audit_graph(graph, specs, onnx) -> None:
                 raise ValueError("module ONNX packed initializer geometry is invalid")
         for name in spec["scale_initializers"]:
             value = initializers[name]
-            if value.data_type != onnx.TensorProto.FLOAT16 or tuple(value.dims) != (
-                spec["rows"],
-                1,
+            if (
+                value.data_type != onnx.TensorProto.FLOAT16
+                or len(value.dims) != 2
+                or value.dims[0] != spec["rows"]
+                or not 1 <= value.dims[1] <= spec["columns"]
             ):
                 raise ValueError("module ONNX scale initializer geometry is invalid")
     float_types = {
@@ -415,6 +1395,172 @@ def _tensor_outputs(value: Any) -> Tuple[Tensor, ...]:
             stage="export_module_onnx",
         )
     return tuple(values)
+
+
+def _promote_float32_matmuls_to_fp64(graph, onnx) -> int:
+    """Accumulate every typed float32 MatMul/Gemm in FP64, then restore FP32."""
+
+    value_types = {}
+    for value in (*graph.input, *graph.value_info, *graph.output):
+        if value.type.WhichOneof("value") == "tensor_type":
+            value_types[value.name] = value.type.tensor_type.elem_type
+    value_types.update(
+        (initializer.name, initializer.data_type)
+        for initializer in graph.initializer
+    )
+    # Dynamo commonly exports model weights as Constant -> Transpose chains,
+    # rather than initializers or declared value_info. Recover the element type
+    # through those type-preserving nodes so eligible projections are not
+    # silently omitted from the precision rewrite.
+    unary_type_preserving_ops = {"Flatten", "Identity", "Transpose"}
+    data_type_preserving_ops = {
+        "Expand",
+        "Gather",
+        "Reshape",
+        "Slice",
+        "Squeeze",
+        "Tile",
+        "Unsqueeze",
+    }
+    for node in graph.node:
+        if not node.output or not node.output[0]:
+            continue
+        output_type = None
+        if node.op_type == "Constant":
+            for attribute in node.attribute:
+                if attribute.name == "value" and attribute.HasField("t"):
+                    output_type = attribute.t.data_type
+                    break
+                if (
+                    attribute.name == "sparse_value"
+                    and attribute.HasField("sparse_tensor")
+                ):
+                    output_type = attribute.sparse_tensor.values.data_type
+                    break
+        elif node.op_type == "Cast":
+            output_type = next(
+                (
+                    attribute.i
+                    for attribute in node.attribute
+                    if attribute.name == "to"
+                ),
+                None,
+            )
+        elif node.op_type in unary_type_preserving_ops and node.input:
+            output_type = value_types.get(node.input[0])
+        elif node.op_type in data_type_preserving_ops and node.input:
+            # These operators' auxiliary shape/index inputs are commonly
+            # INT64; the output still has the first (data) input's element type.
+            output_type = value_types.get(node.input[0])
+        elif node.op_type == "Concat" and node.input:
+            input_types = [value_types.get(name) for name in node.input if name]
+            if input_types and input_types[0] is not None and all(
+                value_type == input_types[0] for value_type in input_types
+            ):
+                output_type = input_types[0]
+        elif node.op_type in {"MatMul", "Gemm"}:
+            input_types = [value_types.get(name) for name in node.input if name]
+            if len(input_types) >= 2 and input_types[0] is not None and all(
+                value_type == input_types[0] for value_type in input_types
+            ):
+                output_type = input_types[0]
+        if output_type is not None:
+            value_types.setdefault(node.output[0], output_type)
+        if node.op_type == "Split" and node.input:
+            input_type = value_types.get(node.input[0])
+            if input_type is not None:
+                for output in node.output:
+                    if output:
+                        value_types.setdefault(output, input_type)
+    promoted_outputs: set[str] = set()
+    for node in graph.node:
+        if (
+            node.op_type not in {"MatMul", "Gemm"}
+            or len(node.output) != 1
+            or not node.output[0]
+        ):
+            continue
+        output_type = value_types.get(node.output[0])
+        input_names = [name for name in node.input if name]
+        input_types = [value_types.get(name) for name in input_names]
+        inputs_are_float32 = len(input_types) >= 2 and all(
+            value_type == onnx.TensorProto.FLOAT for value_type in input_types
+        )
+        if output_type is None and input_types and all(
+            value_type == onnx.TensorProto.FLOAT for value_type in input_types
+        ) and inputs_are_float32:
+            output_type = onnx.TensorProto.FLOAT
+        if output_type == onnx.TensorProto.FLOAT and inputs_are_float32:
+            promoted_outputs.add(node.output[0])
+    if not promoted_outputs:
+        return 0
+
+    used_names = {
+        name
+        for node in graph.node
+        for name in (*node.input, *node.output, node.name)
+        if name
+    }
+    used_names.update(
+        value.name
+        for value in (*graph.input, *graph.output, *graph.value_info, *graph.initializer)
+    )
+
+    def fresh_name(stem: str) -> str:
+        candidate = f"{stem}__tritium_fp64"
+        ordinal = 0
+        while candidate in used_names:
+            ordinal += 1
+            candidate = f"{stem}__tritium_fp64_{ordinal}"
+        used_names.add(candidate)
+        return candidate
+
+    rewritten = []
+    promoted = 0
+    for node in graph.node:
+        if not node.output or node.output[0] not in promoted_outputs:
+            rewritten.append(node)
+            continue
+        original_output = node.output[0]
+        double_inputs = []
+        casts = []
+        for index, input_name in enumerate(node.input):
+            if not input_name:
+                double_inputs.append(input_name)
+                continue
+            double_input = fresh_name(f"{original_output}_input_{index}")
+            casts.append(
+                onnx.helper.make_node(
+                    "Cast",
+                    [input_name],
+                    [double_input],
+                    name=fresh_name(f"{original_output}_cast_in_{index}"),
+                    to=onnx.TensorProto.DOUBLE,
+                )
+            )
+            double_inputs.append(double_input)
+        double_output = fresh_name(original_output)
+        double_matmul = onnx.NodeProto()
+        double_matmul.CopyFrom(node)
+        del double_matmul.input[:]
+        double_matmul.input.extend(double_inputs)
+        del double_matmul.output[:]
+        double_matmul.output.append(double_output)
+        rewritten.extend(casts)
+        rewritten.append(double_matmul)
+        rewritten.append(
+            onnx.helper.make_node(
+                "Cast",
+                [double_output],
+                [original_output],
+                name=fresh_name(f"{original_output}_cast_out"),
+                to=onnx.TensorProto.FLOAT,
+            )
+        )
+        promoted += 1
+    del graph.node[:]
+    graph.node.extend(rewritten)
+    return promoted
 
 
 def export_module_onnx(
@@ -532,11 +1678,20 @@ def export_module_onnx(
             output_names=names_out,
             opset_version=opset,
             dynamo=True,
+            # On PyTorch 2.11, optimize=True removes required packed ternary
+            # initializers; the strict graph audit must continue to see them.
             optimize=False,
             do_constant_folding=False,
             external_data=True,
             dynamic_shapes=dynamic_shapes,
+            custom_translation_table={
+                torch.ops.tritium.decode_packed_ternary_plane.default:
+                    _translate_packed_ternary_plane,
+            },
         )
+        graph = onnx.load(graph_path, load_external_data=False)
+        if _promote_float32_matmuls_to_fp64(graph.graph, onnx):
+            onnx.save_model(graph, graph_path, save_as_external_data=False)
         # Path-based checking supplies ONNX with the external-data base directory.
         # Checking an in-memory ModelProto makes valid large graphs look missing.
         onnx.checker.check_model(str(graph_path))
@@ -551,15 +1706,91 @@ def export_module_onnx(
         for path in staging.iterdir():
             if path.stat().st_size == 0 and path.name not in external_locations:
                 path.unlink()
-        session = ort.InferenceSession(str(graph_path), providers=["CPUExecutionProvider"])
+        session = ort.InferenceSession(
+            str(graph_path),
+            sess_options=_session_options(ort),
+            providers=["CPUExecutionProvider"],
+        )
         observed = session.run(
             list(names_out),
             {name: value.detach().contiguous().numpy() for name, value in zip(names_in, inputs)},
         )
         for actual, wanted in zip(observed, expected):
-            torch.testing.assert_close(
-                torch.from_numpy(actual), wanted.detach().cpu(), rtol=rtol, atol=atol
-            )
+            try:
+                torch.testing.assert_close(
+                    torch.from_numpy(actual), wanted.detach().cpu(),
+                    rtol=rtol, atol=atol,
+                )
+            except AssertionError as error:
+                diagnostic_root = os.environ.get(
+                    "TRITIUM_ONNX_PARITY_FAILURE_DIR"
+                )
+                if diagnostic_root:
+                    additional_arrays = ()
+                    if os.environ.get("TRITIUM_ONNX_PARITY_CAPTURE_TERMINAL") == "1":
+                        try:
+                            reference_config = getattr(model, "config", None)
+                            reference_config = getattr(
+                                reference_config, "text_config", reference_config
+                            )
+                            additional_arrays = _capture_terminal_intermediates(
+                                staging,
+                                names_in,
+                                inputs,
+                                names_out,
+                                onnx,
+                                ort,
+                                hidden_size=getattr(
+                                    reference_config, "hidden_size", None
+                                ),
+                                layer_count=getattr(
+                                    reference_config, "num_hidden_layers", None
+                                ),
+                                intermediate_size=getattr(
+                                    reference_config, "intermediate_size", None
+                                ),
+                            )
+                        except Exception as diagnostic_error:
+                            print(
+                                "could not capture terminal ONNX intermediates: "
+                                f"{type(diagnostic_error).__name__}",
+                                file=sys.stderr,
+                            )
+                        try:
+                            additional_arrays += _capture_reference_terminal_outputs(
+                                model,
+                                names_in,
+                                inputs,
+                            )
+                        except Exception as diagnostic_error:
+                            print(
+                                "could not capture reference terminal outputs: "
+                                f"{type(diagnostic_error).__name__}",
+                                file=sys.stderr,
+                            )
+                    try:
+                        _retain_parity_failure(
+                            staging,
+                            Path(diagnostic_root),
+                            target.name,
+                            checkpoint_digest,
+                            rtol,
+                            atol,
+                            error,
+                            names_in,
+                            inputs,
+                            observed,
+                            expected,
+                            _parity_runtime_info(onnx, ort, session),
+                            additional_arrays,
+                        )
+                    except Exception as diagnostic_error:
+                        print(
+                            "could not retain ONNX parity diagnostic: "
+                            f"{type(diagnostic_error).__name__}",
+                            file=sys.stderr,
+                        )
+                raise
         files = []
         for path in sorted(staging.iterdir()):
             if path.name == _MANIFEST:
@@ -724,7 +1955,11 @@ def load_module_onnx(
     )
     if not create_session:
         return artifact
-    session = ort.InferenceSession(str(graph_path), providers=["CPUExecutionProvider"])
+    session = ort.InferenceSession(
+        str(graph_path),
+        sess_options=_session_options(ort),
+        providers=["CPUExecutionProvider"],
+    )
     if tuple(item.name for item in session.get_inputs()) != artifact.input_names:
         raise ValueError("ORT module inputs differ from manifest")
     if tuple(item.name for item in session.get_outputs()) != artifact.output_names:

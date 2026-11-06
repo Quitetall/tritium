@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OwnerRowMetricId",
+  "description": "Identity of one completed owner row metric, not a qualification.",
+  "type": "array",
+  "items": {
+    "type": "integer",
+    "format": "uint8",
+    "maximum": 255,
+    "minimum": 0
+  },
+  "maxItems": 32,
+  "minItems": 32
+}

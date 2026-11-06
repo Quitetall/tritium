@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SalienceNumerics",
+  "description": "Ordered numerical semantics, never an implicit recipe fallback.",
+  "oneOf": [
+    {
+      "description": "Legacy ordered f64 RMS/log-mean/powf, f32 cast and multiply/divide.",
+      "type": "string",
+      "const": "LegacyF64ScaleF32V1"
+    }
+  ]
+}

@@ -25,16 +25,33 @@
 extern crate alloc;
 
 mod additive;
+mod dense;
 mod dtype;
 mod error;
+mod feedback;
+mod per_tile;
 mod reference;
 mod scale;
 mod shape;
 mod trit;
 
-pub use additive::{AdditiveError, AdditiveView, apply_basis, reference_ternary_matmul};
+pub use additive::{
+    AdditiveError, AdditiveView, BasisBound, Gather, Matmul, UniformPlan, UniformTiles,
+    apply_basis, apply_basis_f64, apply_inverse_basis, fast_hadamard, fast_hadamard_f64,
+    group_is_rotatable, reference_embed, reference_ternary_matmul,
+};
+pub use dense::{DenseError, DenseView};
 pub use dtype::{DType, TernaryFormat};
 pub use error::TritError;
+#[cfg(feature = "std")]
+pub use feedback::auto_feedback_decay;
+pub use feedback::{FeedbackDecay, FeedbackDecayError};
+#[cfg(feature = "alloc")]
+pub use per_tile::OwnedPerTileIndex;
+pub use per_tile::{
+    ActiveTile as PerTileActiveTile, ActiveTiles as PerTileActiveTiles, PerTileIndex, PerTilePlan,
+    PerTileRowSpan,
+};
 pub use reference::{reference_conv1d, reference_fsq, reference_mpgemm};
 pub use scale::{ScaleGranularity, absmean};
 pub use shape::{ConvShape, GemmShape};

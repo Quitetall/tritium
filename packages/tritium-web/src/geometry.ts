@@ -68,7 +68,9 @@ function checkedProduct(
   return product;
 }
 
-function attributes(operation: TrainingOperationSpecV1): ReadonlyMap<string, TrainingAttributeSpecV1> {
+function attributes(
+  operation: TrainingOperationSpecV1,
+): ReadonlyMap<string, TrainingAttributeSpecV1> {
   const execution = operation.operation.startsWith("optimizer.") ? "step" : "forward";
   const expected = BINDINGS[operation.operation]?.[execution]?.attributes;
   if (
@@ -253,7 +255,8 @@ export function validateTrainingOperationGeometry(
       const nHead = requirePositiveU32(operation, values, "n_head");
       const headDim = requirePositiveU32(operation, values, "head_dim");
       if (headDim % 2 !== 0) fail(operation, "head_dim must be even");
-      if (numberAttribute(operation, values, "theta") <= 0) fail(operation, "theta must be positive");
+      if (numberAttribute(operation, values, "theta") <= 0)
+        fail(operation, "theta must be positive");
       checkedProduct(operation, [positions.length, nHead, headDim], MAX_U32);
       const shape = [positions.length, nHead, headDim];
       requireShape(operation, inputs[0]!, shape, "x");
@@ -344,12 +347,18 @@ export function validateTrainingOperationGeometry(
     case "graph.concat_cols": {
       const rows = requirePositiveU32(operation, values, "rows");
       const lens = listAttribute(operation, values, "lens");
-      if (lens.length !== inputs.length || lens.length === 0 || lens.some((length) => length <= 0)) {
+      if (
+        lens.length !== inputs.length ||
+        lens.length === 0 ||
+        lens.some((length) => length <= 0)
+      ) {
         fail(operation, "lens must match nonempty input parts");
       }
       const total = checkedAdd(operation, ...lens);
       if (total > MAX_U32) fail(operation, "concatenated columns exceed u32");
-      inputs.forEach((tensor, index) => requireShape(operation, tensor, [rows, lens[index]!], `part.${index}`));
+      inputs.forEach((tensor, index) => {
+        requireShape(operation, tensor, [rows, lens[index]!], `part.${index}`);
+      });
       requireShape(operation, outputs[0]!, [rows, total], "result");
       return;
     }
@@ -367,7 +376,12 @@ export function validateTrainingOperationGeometry(
       const rows = requirePositiveU32(operation, values, "rows");
       const cols = requirePositiveU32(operation, values, "cols");
       requireShape(operation, inputs[0]!, [rows, cols], "weight");
-      requireShape(operation, inputs[1]!, [rows], operation.operation === "graph.lsq_ste" ? "alpha" : "scale");
+      requireShape(
+        operation,
+        inputs[1]!,
+        [rows],
+        operation.operation === "graph.lsq_ste" ? "alpha" : "scale",
+      );
       requireShape(operation, outputs[0]!, [rows, cols], "result");
       return;
     }
@@ -403,7 +417,15 @@ export function validateTrainingOperationGeometry(
       const padRight = requireNonnegativeU32(operation, values, "pad_right");
       const groups = requirePositiveU32(operation, values, "groups");
       if (cIn % groups !== 0 || cOut % groups !== 0) fail(operation, "groups must divide channels");
-      const outputLen = convOutputAxis(operation, inputLen, kernel, stride, dilation, padLeft, padRight);
+      const outputLen = convOutputAxis(
+        operation,
+        inputLen,
+        kernel,
+        stride,
+        dilation,
+        padLeft,
+        padRight,
+      );
       const maximumPosition = checkedAdd(
         operation,
         checkedProduct(operation, [outputLen - 1, stride]),
@@ -448,8 +470,18 @@ export function validateTrainingOperationGeometry(
     }
     case "graph.conv2d": {
       const names = [
-        "batch", "c_in", "c_out", "input_h", "input_w", "kernel_h", "kernel_w",
-        "stride_h", "stride_w", "dilation_h", "dilation_w", "groups",
+        "batch",
+        "c_in",
+        "c_out",
+        "input_h",
+        "input_w",
+        "kernel_h",
+        "kernel_w",
+        "stride_h",
+        "stride_w",
+        "dilation_h",
+        "dilation_w",
+        "groups",
       ] as const;
       const dimensions = Object.fromEntries(
         names.map((name) => [name, requirePositiveU32(operation, values, name)]),
@@ -461,20 +493,52 @@ export function validateTrainingOperationGeometry(
       if (dimensions.c_in % dimensions.groups !== 0 || dimensions.c_out % dimensions.groups !== 0) {
         fail(operation, "groups must divide channels");
       }
-      const outputH = convOutputAxis(operation, dimensions.input_h, dimensions.kernel_h, dimensions.stride_h, dimensions.dilation_h, padTop, padBottom);
-      const outputW = convOutputAxis(operation, dimensions.input_w, dimensions.kernel_w, dimensions.stride_w, dimensions.dilation_w, padLeft, padRight);
-      checkedProduct(operation, [dimensions.batch, dimensions.c_in, dimensions.input_h, dimensions.input_w], MAX_U32);
-      checkedProduct(operation, [dimensions.c_out, dimensions.c_in / dimensions.groups, dimensions.kernel_h, dimensions.kernel_w], MAX_U32);
+      const outputH = convOutputAxis(
+        operation,
+        dimensions.input_h,
+        dimensions.kernel_h,
+        dimensions.stride_h,
+        dimensions.dilation_h,
+        padTop,
+        padBottom,
+      );
+      const outputW = convOutputAxis(
+        operation,
+        dimensions.input_w,
+        dimensions.kernel_w,
+        dimensions.stride_w,
+        dimensions.dilation_w,
+        padLeft,
+        padRight,
+      );
+      checkedProduct(
+        operation,
+        [dimensions.batch, dimensions.c_in, dimensions.input_h, dimensions.input_w],
+        MAX_U32,
+      );
+      checkedProduct(
+        operation,
+        [
+          dimensions.c_out,
+          dimensions.c_in / dimensions.groups,
+          dimensions.kernel_h,
+          dimensions.kernel_w,
+        ],
+        MAX_U32,
+      );
       checkedProduct(operation, [dimensions.batch, dimensions.c_out, outputH, outputW], MAX_U32);
       const tileRows = Math.min(outputH * outputW, 32);
-      const patch = (dimensions.c_in / dimensions.groups) * dimensions.kernel_h * dimensions.kernel_w;
+      const patch =
+        (dimensions.c_in / dimensions.groups) * dimensions.kernel_h * dimensions.kernel_w;
       const groupChannels = dimensions.c_out / dimensions.groups;
       const columns = tileRows * patch;
       const groupOutput = tileRows * groupChannels;
-      const outputElements = checkedProduct(
-        operation,
-        [dimensions.batch, dimensions.c_out, outputH, outputW],
-      );
+      const outputElements = checkedProduct(operation, [
+        dimensions.batch,
+        dimensions.c_out,
+        outputH,
+        outputW,
+      ]);
       const forwardScratch = checkedAdd(operation, outputElements, columns, groupOutput);
       const vjpScratch = checkedAdd(
         operation,
@@ -490,14 +554,35 @@ export function validateTrainingOperationGeometry(
       if (Math.max(forwardScratch, vjpScratch) * 4 > MAX_SCRATCH_BYTES) {
         fail(operation, "conv2d scratch exceeds 64 MiB");
       }
-      requireShape(operation, inputs[0]!, [dimensions.batch, dimensions.c_in, dimensions.input_h, dimensions.input_w], "x");
-      requireShape(operation, inputs[1]!, [dimensions.c_out, dimensions.c_in / dimensions.groups, dimensions.kernel_h, dimensions.kernel_w], "weight");
+      requireShape(
+        operation,
+        inputs[0]!,
+        [dimensions.batch, dimensions.c_in, dimensions.input_h, dimensions.input_w],
+        "x",
+      );
+      requireShape(
+        operation,
+        inputs[1]!,
+        [
+          dimensions.c_out,
+          dimensions.c_in / dimensions.groups,
+          dimensions.kernel_h,
+          dimensions.kernel_w,
+        ],
+        "weight",
+      );
       requireShape(operation, inputs[2]!, [dimensions.c_out], "scale");
-      requireShape(operation, outputs[0]!, [dimensions.batch, dimensions.c_out, outputH, outputW], "result");
+      requireShape(
+        operation,
+        outputs[0]!,
+        [dimensions.batch, dimensions.c_out, outputH, outputW],
+        "result",
+      );
       return;
     }
     case "optimizer.sgd":
-      if (numberAttribute(operation, values, "step") !== 0) fail(operation, "recipe step must start at zero");
+      if (numberAttribute(operation, values, "step") !== 0)
+        fail(operation, "recipe step must start at zero");
       if (numberAttribute(operation, values, "lr") < 0) fail(operation, "lr must be nonnegative");
       requireSame(operation, [inputs[0]!, inputs[1]!, outputs[0]!]);
       return;
@@ -520,11 +605,13 @@ export function validateTrainingOperationGeometry(
       return;
     }
     case "optimizer.muon": {
-      if (numberAttribute(operation, values, "step") !== 0) fail(operation, "recipe step must start at zero");
+      if (numberAttribute(operation, values, "step") !== 0)
+        fail(operation, "recipe step must start at zero");
       if (numberAttribute(operation, values, "lr") < 0) fail(operation, "lr must be nonnegative");
       const momentum = numberAttribute(operation, values, "momentum");
       if (momentum < 0 || momentum >= 1) fail(operation, "momentum must be in [0,1)");
-      if (numberAttribute(operation, values, "weight_decay") < 0) fail(operation, "weight_decay must be nonnegative");
+      if (numberAttribute(operation, values, "weight_decay") < 0)
+        fail(operation, "weight_decay must be nonnegative");
       const rows = requirePositiveU32(operation, values, "rows");
       const cols = requirePositiveU32(operation, values, "cols");
       const steps = requirePositiveU32(operation, values, "ns_steps");

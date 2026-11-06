@@ -3,7 +3,7 @@ use std::io::Cursor;
 use half::f16;
 use tritium_format::salt_v2::SaltV2Codec;
 use tritium_format::salt_v2_package::{
-    SaltV2Package, SaltV2PackageError, SaltV2PackageReader, SaltV2Plane,
+    SaltV2Package, SaltV2PackageError, SaltV2PackageReader, SaltV2Plane, SaltV2ScaleUpdate,
     SaltV2SemanticTensorStream, SaltV2Tensor, SaltV2Tile, SaltV2Transform, write_salt_v2_package,
 };
 
@@ -39,6 +39,67 @@ fn seek_identity(package: &SaltV2Package, name: &str) -> tritium_format::Semanti
     let encoded = write_salt_v2_package(package).unwrap();
     let reader = SaltV2PackageReader::new_strict(Cursor::new(encoded.bytes)).unwrap();
     reader.semantic_tensor(name).unwrap()
+}
+
+#[test]
+fn scale_updates_change_only_named_f16_scales_and_round_trip() {
+    let mut refined = SaltV2Package::new(
+        SaltV2Codec::D2,
+        vec![semantic_tensor("layer.weight", SaltV2Transform::None)],
+    )
+    .unwrap();
+    let original_trits = refined.tensors()[0].tiles()[0].planes()[0].trits().to_vec();
+    let update =
+        SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::from_f32(2.0), f16::from_f32(3.0)]).unwrap();
+
+    refined.apply_scale_updates(&[update]).unwrap();
+    let refined_plane = &refined.tensors()[0].tiles()[0].planes()[0];
+    assert_eq!(refined_plane.trits(), original_trits);
+    assert_eq!(
+        refined_plane.scales(),
+        &[f16::from_f32(2.0), f16::from_f32(3.0)]
+    );
+
+    let encoded = write_salt_v2_package(&refined).unwrap();
+    let reopened = SaltV2PackageReader::new_strict(Cursor::new(encoded.bytes)).unwrap();
+    let semantic = reopened.semantic_tensor("layer.weight").unwrap();
+    assert_eq!(semantic, refined.tensors()[0].semantic_tensor());
+}
+
+#[test]
+fn scale_update_set_rejects_duplicates_and_invalid_values_without_partial_changes() {
+    let mut package = SaltV2Package::new(
+        SaltV2Codec::D2,
+        vec![semantic_tensor("layer.weight", SaltV2Transform::None)],
+    )
+    .unwrap();
+    let original_scales = package.tensors()[0].tiles()[0].planes()[0]
+        .scales()
+        .to_vec();
+    let valid =
+        SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::from_f32(2.0), f16::from_f32(3.0)]).unwrap();
+    let invalid = SaltV2ScaleUpdate::new(0, 0, 1, vec![f16::ZERO, f16::ZERO]).unwrap();
+    assert_eq!(
+        package.apply_scale_updates(&[valid.clone(), invalid]),
+        Err(SaltV2PackageError::ZeroScaleForNonzeroGroup { group_index: 0 })
+    );
+    assert_eq!(
+        package.tensors()[0].tiles()[0].planes()[0].scales(),
+        original_scales
+    );
+
+    assert_eq!(
+        package.apply_scale_updates(&[valid.clone(), valid]),
+        Err(SaltV2PackageError::DuplicateScaleUpdate)
+    );
+
+    let later = SaltV2ScaleUpdate::new(0, 1, 0, vec![f16::from_f32(2.0)]).unwrap();
+    let earlier =
+        SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::from_f32(2.0), f16::from_f32(3.0)]).unwrap();
+    assert_eq!(
+        package.apply_scale_updates(&[later, earlier]),
+        Err(SaltV2PackageError::NonCanonicalScaleUpdateOrder)
+    );
 }
 
 #[test]

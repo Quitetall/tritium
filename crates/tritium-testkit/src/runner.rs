@@ -231,7 +231,7 @@ fn run_one<B: TernaryBackend>(
 ///
 /// For each vector the runner converts its `i8` weights to [`Trit`]s, packs each
 /// `[N, K]` row with the format's host-side packer (block scale fixed to `1.0` —
-/// see [`pack_weights`]), uploads the bytes via
+/// see the internal `pack_weights` helper), uploads the bytes via
 /// [`TernaryBackend::upload_weights`], runs [`TernaryBackend::mpgemm`] with the
 /// vector's per-channel `scales`, and compares the result to
 /// [`ConformanceVector::expected`] under `tol`. A backend is conformant iff the

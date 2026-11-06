@@ -9,7 +9,7 @@
       "const": "D2"
     },
     {
-      "description": "Three-bit ternary packing.",
+      "description": "Base-3 packing of five ternary coefficients per byte.",
       "type": "string",
       "const": "B3"
     },

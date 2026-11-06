@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ModelId",
-  "description": "Content identity for a Tritium model manifest.",
+  "description": "Content identity for one Tritium model level, not its package or provenance.",
   "type": "array",
   "items": {
     "type": "integer",

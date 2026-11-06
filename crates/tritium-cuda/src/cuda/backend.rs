@@ -6,12 +6,19 @@ use super::*;
 use cudarc::driver::{HostSlice, PinnedHostSlice, SyncOnDrop};
 use tritium_format::salt_v2::SaltV2Codec;
 use tritium_format::salt_v2_package::{
-    SaltV2IndexedRuntimeLedger, SaltV2Tensor, SaltV2Transform, pack_salt_v2_plane,
+    SALT_V2_ALLOCATION_TILE_SIZE, SALT_V2_INDEXED_RUNTIME_RANK_STRIDE_TILES,
+    SaltV2IndexedRuntimeLedger, SaltV2ScaleUpdate, SaltV2Tensor, SaltV2Transform,
+    pack_salt_v2_plane, unpack_salt_v2_plane_into,
 };
 
+mod attention;
+mod decoder;
+mod decoder_plan;
+mod delta_mixer;
 pub(super) mod deltanet;
 mod salt_v2_reader_upload;
 mod salt_v2_runtime;
+mod semantic;
 pub use salt_v2_runtime::SaltV2GatherReceipt;
 
 /// A logical prefix of cudarc page-locked memory.
@@ -269,14 +276,18 @@ impl SaltV2ResidentAllocationReceipt {
 /// allocation map, and bounded-scan rank prefixes without a dense shadow.
 #[derive(Debug)]
 pub struct SaltV2ResidentTensor {
+    stream: Arc<CudaStream>,
     payload: CudaSlice<u8>,
     scales: CudaSlice<u16>,
     index_metadata: Option<CudaSlice<u8>>,
+    index_metadata_host: Vec<u8>,
+    tensor_index: Option<usize>,
     rows: usize,
     columns: usize,
     tile_count: usize,
     plane_count: usize,
     codec_tag: u32,
+    codec: SaltV2Codec,
     scale_group_size: u32,
     allocation_map_bytes: u32,
     rank_prefix_count: u32,
@@ -301,6 +312,245 @@ impl SaltV2ResidentTensor {
     #[must_use]
     pub fn columns(&self) -> usize {
         self.columns
+    }
+
+    /// Physical record index in the source package, if loaded through its reader.
+    #[must_use]
+    pub fn tensor_index(&self) -> Option<usize> {
+        self.tensor_index
+    }
+
+    /// Replace scales for one package tensor without rebuilding its packed arenas.
+    ///
+    /// Every target is validated against the resident packed trits before mutation.
+    /// Only each target plane (at most one allocation tile) is copied back for the
+    /// zero-scale safety check. Updates are written to a cloned scale arena and the
+    /// arena is swapped only after all writes enqueue successfully. The returned
+    /// byte count is the exact temporary device scale-arena allocation required by
+    /// this transactional update; callers must include it in peak-memory evidence.
+    ///
+    /// # Errors
+    /// Rejects non-package residents, mismatched or non-canonical targets, malformed
+    /// scales, scale ranges outside the resident arena, codec errors, or CUDA errors.
+    pub fn apply_scale_updates<'a>(
+        &mut self,
+        tensor_index: usize,
+        updates: &'a [SaltV2ScaleUpdate],
+    ) -> Result<u64, BackendError> {
+        let fail = |message: &str| BackendError::InvalidInput(message.to_owned());
+        if self.tensor_index != Some(tensor_index) {
+            return Err(fail(
+                "SALT V2 update tensor index does not match package resident",
+            ));
+        }
+        if updates.is_empty() {
+            return Err(fail("SALT V2 scale update set is empty"));
+        }
+
+        let scale_group_size = usize::try_from(self.scale_group_size)
+            .map_err(|_| fail("SALT V2 scale-group size exceeds host usize"))?;
+        let mut decoded = Vec::new();
+        let mut previous = None;
+        let mut staged: Vec<(core::ops::Range<usize>, &'a [half::f16])> = Vec::new();
+        staged
+            .try_reserve_exact(updates.len())
+            .map_err(|_| BackendError::OutOfMemory {
+                requested: updates
+                    .len()
+                    .saturating_mul(
+                        core::mem::size_of::<(core::ops::Range<usize>, &[half::f16])>(),
+                    ),
+            })?;
+
+        for update in updates {
+            let target = (
+                update.tensor_index(),
+                update.tile_index(),
+                update.plane_index(),
+            );
+            if target.0 != tensor_index || previous.is_some_and(|old| target <= old) {
+                return Err(fail(
+                    "SALT V2 targets must match this tensor and be unique canonical order",
+                ));
+            }
+            previous = Some(target);
+            let (logical_len, plane_count, plane_rank) = self.update_tile_metadata(target.1)?;
+            if target.2 >= plane_count {
+                return Err(fail("SALT V2 update plane index is out of range"));
+            }
+            let scale_count = logical_len.div_ceil(scale_group_size);
+            if update.scales().len() != scale_count
+                || update
+                    .scales()
+                    .iter()
+                    .any(|scale| !scale.is_finite() || scale.to_f32() < 0.0)
+            {
+                return Err(fail("SALT V2 replacement scales are malformed"));
+            }
+
+            if update.scales().contains(&half::f16::ZERO) {
+                let payload_start =
+                    self.update_payload_offset(plane_rank, target.2, logical_len)?;
+                let payload_len = Self::packed_plane_bytes(self.codec, logical_len)?;
+                let payload_end = payload_start
+                    .checked_add(payload_len)
+                    .ok_or_else(|| fail("SALT V2 update payload range overflows"))?;
+                if payload_end > self.payload.len() {
+                    return Err(fail("SALT V2 update payload range is absent"));
+                }
+                let packed = self
+                    .stream
+                    .clone_dtoh(&self.payload.slice(payload_start..payload_end))
+                    .map_err(|error| driver_err("read SALT V2 update plane", &error))?;
+                unpack_salt_v2_plane_into(self.codec, &packed, logical_len, &mut decoded)
+                    .map_err(|error| fail(&format!("decode SALT V2 update plane: {error}")))?;
+                for (group, scale) in decoded.chunks(scale_group_size).zip(update.scales()) {
+                    if *scale == half::f16::ZERO && group.iter().any(|trit| trit.get() != 0) {
+                        return Err(fail("zero replacement scale would erase nonzero trits"));
+                    }
+                }
+            }
+
+            let scale_start = plane_rank
+                .checked_mul(SALT_V2_ALLOCATION_TILE_SIZE / scale_group_size)
+                .and_then(|offset| offset.checked_add(target.2.checked_mul(scale_count)?))
+                .ok_or_else(|| fail("SALT V2 update scale offset overflows"))?;
+            let scale_end = scale_start
+                .checked_add(scale_count)
+                .ok_or_else(|| fail("SALT V2 update scale range overflows"))?;
+            if scale_end > self.scales.len() {
+                return Err(fail("SALT V2 update scale range is absent"));
+            }
+            staged.push((scale_start..scale_end, update.scales()));
+        }
+
+        let scratch_bytes_usize = self
+            .scales
+            .len()
+            .checked_mul(core::mem::size_of::<u16>())
+            .ok_or_else(|| fail("SALT V2 scale scratch byte count overflows usize"))?;
+        let scratch_bytes = u64::try_from(scratch_bytes_usize)
+            .map_err(|_| fail("SALT V2 scale scratch byte count overflows u64"))?;
+        let mut replacement = self.stream.clone_dtod(&self.scales).map_err(|error| {
+            alloc_or_backend("clone SALT V2 scale arena", &error, scratch_bytes_usize)
+        })?;
+        for (range, scales) in staged {
+            let mut bits = Vec::new();
+            bits.try_reserve_exact(scales.len())
+                .map_err(|_| BackendError::OutOfMemory {
+                    requested: scales.len().saturating_mul(core::mem::size_of::<u16>()),
+                })?;
+            bits.extend(scales.iter().map(|scale| scale.to_bits()));
+            self.stream
+                .memcpy_htod(&bits, &mut replacement.slice_mut(range))
+                .map_err(|error| driver_err("write candidate SALT V2 scales", &error))?;
+        }
+        self.scales = replacement;
+        Ok(scratch_bytes)
+    }
+
+    fn update_tile_metadata(
+        &self,
+        tile_index: usize,
+    ) -> Result<(usize, usize, usize), BackendError> {
+        let fail = |message: &str| BackendError::InvalidInput(message.to_owned());
+        if tile_index >= self.tile_count {
+            return Err(fail("SALT V2 update tile index is out of range"));
+        }
+        let tile_start = tile_index
+            .checked_mul(SALT_V2_ALLOCATION_TILE_SIZE)
+            .ok_or_else(|| fail("SALT V2 update tile offset overflows"))?;
+        let logical_len = self
+            .rows
+            .checked_mul(self.columns)
+            .and_then(|coefficients| coefficients.checked_sub(tile_start))
+            .ok_or_else(|| fail("SALT V2 update tile starts past tensor end"))?
+            .min(SALT_V2_ALLOCATION_TILE_SIZE);
+        let map_bytes = usize::try_from(self.allocation_map_bytes)
+            .map_err(|_| fail("SALT V2 map length exceeds host usize"))?;
+        let map_bits = map_bytes
+            .checked_mul(u8::BITS as usize)
+            .ok_or_else(|| fail("SALT V2 map bit length overflows"))?;
+        let bit = tile_index
+            .checked_mul(2)
+            .ok_or_else(|| fail("SALT V2 map bit index overflows"))?;
+        let code = if bit < map_bits {
+            let byte = *self
+                .index_metadata_host
+                .get(bit / 8)
+                .ok_or_else(|| fail("SALT V2 host allocation map is truncated"))?;
+            (byte >> (bit % 8)) & 0b11
+        } else {
+            ((self.terminal_map_value >> (bit - map_bits)) & 0b11) as u8
+        };
+        let plane_count = usize::from(code) + 1;
+        let block = tile_index / SALT_V2_INDEXED_RUNTIME_RANK_STRIDE_TILES;
+        let block_start = block * SALT_V2_INDEXED_RUNTIME_RANK_STRIDE_TILES;
+        let mut plane_rank = if block == 0 {
+            0usize
+        } else {
+            let prefix_offset = map_bytes
+                .checked_add(
+                    (block - 1)
+                        .checked_mul(core::mem::size_of::<u32>())
+                        .ok_or_else(|| fail("SALT V2 rank-prefix offset overflows"))?,
+                )
+                .ok_or_else(|| fail("SALT V2 rank-prefix offset overflows"))?;
+            let end = prefix_offset + core::mem::size_of::<u32>();
+            let bytes: [u8; 4] = self
+                .index_metadata_host
+                .get(prefix_offset..end)
+                .ok_or_else(|| fail("SALT V2 host rank-prefix is truncated"))?
+                .try_into()
+                .map_err(|_| fail("SALT V2 host rank-prefix has invalid width"))?;
+            usize::try_from(u32::from_le_bytes(bytes))
+                .map_err(|_| fail("SALT V2 rank prefix exceeds host usize"))?
+        };
+        for current in block_start..tile_index {
+            let current_bit = current * 2;
+            let current_code = if current_bit < map_bits {
+                let byte = *self
+                    .index_metadata_host
+                    .get(current_bit / 8)
+                    .ok_or_else(|| fail("SALT V2 host allocation map is truncated"))?;
+                (byte >> (current_bit % 8)) & 0b11
+            } else {
+                ((self.terminal_map_value >> (current_bit - map_bits)) & 0b11) as u8
+            };
+            plane_rank = plane_rank
+                .checked_add(usize::from(current_code) + 1)
+                .ok_or_else(|| fail("SALT V2 plane rank overflows"))?;
+        }
+        Ok((logical_len, plane_count, plane_rank))
+    }
+
+    fn update_payload_offset(
+        &self,
+        plane_rank: usize,
+        plane_index: usize,
+        logical_len: usize,
+    ) -> Result<usize, BackendError> {
+        let full_bytes = Self::packed_plane_bytes(self.codec, SALT_V2_ALLOCATION_TILE_SIZE)?;
+        let plane_bytes = Self::packed_plane_bytes(self.codec, logical_len)?;
+        plane_rank
+            .checked_mul(full_bytes)
+            .and_then(|offset| offset.checked_add(plane_index.checked_mul(plane_bytes)?))
+            .ok_or_else(|| BackendError::InvalidInput("SALT V2 payload offset overflows".into()))
+    }
+
+    fn packed_plane_bytes(codec: SaltV2Codec, logical_len: usize) -> Result<usize, BackendError> {
+        let stored_len = if codec == SaltV2Codec::S34 {
+            logical_len.div_ceil(4).checked_mul(4).ok_or_else(|| {
+                BackendError::InvalidInput("SALT V2 stored trit count overflows".into())
+            })?
+        } else {
+            logical_len
+        };
+        let bytes = codec
+            .ledger(stored_len)
+            .map_err(|error| BackendError::InvalidInput(format!("SALT V2 codec length: {error}")))?
+            .physical_bytes;
+        Ok(bytes)
     }
 }
 
@@ -533,7 +783,7 @@ pub(crate) struct EmbedSegments {
 /// reference-counted (`Arc`) by `cudarc`.
 #[derive(Debug)]
 pub struct CudaBackend {
-    /// The context's default stream — all memory ops and launches go through it.
+    /// The backend's owned nonblocking working stream for internal memory/launches.
     /// The stream holds its own `Arc<CudaContext>`, so the context stays alive for
     /// as long as the backend does without a separate field.
     pub(super) stream: Arc<CudaStream>,
@@ -558,6 +808,25 @@ pub struct CudaBackend {
     /// Gated DeltaNet recurrent-step PTX kept alive for `func_deltanet_step`.
     pub(super) _deltanet_module: Arc<CudaModule>,
     pub(super) func_deltanet_step: CudaFunction,
+    pub(super) func_semantic_additive_matmul: CudaFunction,
+    pub(super) func_semantic_additive_matmul_ordered_warp: CudaFunction,
+    pub(super) func_semantic_additive_gather: CudaFunction,
+    pub(super) func_semantic_additive_validate_finite: CudaFunction,
+    pub(super) func_semantic_basis_sign: CudaFunction,
+    pub(super) func_semantic_basis_butterfly: CudaFunction,
+    pub(super) func_semantic_basis_finish: CudaFunction,
+    pub(super) func_semantic_swiglu: CudaFunction,
+    pub(super) func_semantic_attention: CudaFunction,
+    pub(super) func_decoder_dense_gather: CudaFunction,
+    pub(super) func_decoder_norm: CudaFunction,
+    pub(super) func_decoder_bias: CudaFunction,
+    pub(super) func_decoder_add: CudaFunction,
+    pub(super) func_decoder_relu2: CudaFunction,
+    pub(super) func_decoder_rope: CudaFunction,
+    pub(super) func_qwen_query_gate: CudaFunction,
+    pub(super) func_qwen_attention_gate: CudaFunction,
+    pub(super) func_delta_convolution: CudaFunction,
+    pub(super) func_delta_mixer: CudaFunction,
     /// Scalar-correct D2/B3/S34 forward. The first fast API aliases this handle.
     pub(super) func_salt_v2_exact: CudaFunction,
     /// Shared-activation D2/B3/S34 forward used for prefill-shaped launches.
@@ -776,6 +1045,9 @@ pub struct CudaBackend {
     /// projection path. Qwen prompt/decode invokes hundreds of projections;
     /// retaining these buffers removes a cuMemAlloc/cuMemFree pair per call.
     pub(super) salt_v2_workspace: Mutex<SaltV2Workspace>,
+    pub(super) semantic_swiglu_enabled: bool,
+    pub(super) resident_decoder_budget: Option<usize>,
+    pub(super) semantic_swiglu_workspace: Mutex<Option<semantic::SwigluWorkspace>>,
 }
 
 /// Process-local pool for transient SALT V2 activation/output buffers.
@@ -816,6 +1088,40 @@ impl SaltV2Workspace {
 }
 
 impl CudaBackend {
+    /// Explicitly request a whole standard device-f32 decoder before loading.
+    /// The budget covers unique weights/vectors/KV/workspace payload, not driver
+    /// overhead. Unsupported graphs or insufficient budgets fail closed.
+    /// Existing host dispatch is unchanged without this selection.
+    pub fn with_resident_decoder(mut self, max_device_payload_bytes: usize) -> Self {
+        if self.resident_decoder_budget.is_none() {
+            self.device_id.push_str(":decoder-device-f32");
+        }
+        self.resident_decoder_budget = Some(max_device_payload_bytes);
+        self
+    }
+
+    /// Plan structural resident device payload without initializing a CUDA context.
+    /// This excludes host/allocator/driver costs and does not certify weight values,
+    /// ownership, physical fit, source authentication or model quality.
+    /// # Errors
+    /// Unsupported geometry/semantics, coefficient lengths or checked extent overflow.
+    pub fn plan_decoder_metadata(
+        metadata: tritium_spec::DecoderAllocationMetadata<'_>,
+        limits: tritium_spec::DecoderLimits,
+    ) -> Result<tritium_spec::DecoderPayloadPlan, BackendError> {
+        decoder_plan::plan(metadata, limits).map(|plan| plan.payload)
+    }
+    /// Explicitly opt into device-f32 SwiGLU regions before loading a model.
+    /// Device expf may differ from host exp. Default arithmetic is unchanged;
+    /// this does not qualify model quality/performance. The backend identity
+    /// records the selected mode. No runtime/environment toggle is introduced.
+    pub fn with_device_swiglu(mut self) -> Self {
+        if !self.semantic_swiglu_enabled {
+            self.semantic_swiglu_enabled = true;
+            self.device_id.push_str(":swiglu-device-f32");
+        }
+        self
+    }
     /// Open CUDA device `ordinal`, load the TQ2_0 add kernel, and return a backend.
     ///
     /// # Errors
@@ -826,7 +1132,14 @@ impl CudaBackend {
         result::init().map_err(|e| driver_err("initialize CUDA driver", &e))?;
         let _context = CurrentContextRestore::capture()?;
         let ctx = CudaContext::new(ordinal).map_err(|e| driver_err("open cuda device", &e))?;
-        let stream = ctx.default_stream();
+        // A fresh wrapper has no owned allocations/work to migrate. Fork joins
+        // prior legacy-stream work by event and establishes multistream tracking
+        // without new_stream's first-stream context-wide synchronization, which
+        // would conflict with another backend's active graph capture (ADR 0052).
+        let stream = ctx
+            .default_stream()
+            .fork()
+            .map_err(|e| driver_err("create backend working stream", &e))?;
 
         let module = ctx
             .load_module(Ptx::from_src(TQ2_0_ADD_PTX))
@@ -1178,6 +1491,54 @@ impl CudaBackend {
         let func_deltanet_step = deltanet_module
             .load_function(KERNEL_NAME_DELTANET_STEP)
             .map_err(|e| driver_err("resolve qwen35_deltanet_recurrent_step kernel", &e))?;
+        let semantic_module = ctx
+            .load_module(Ptx::from_src(include_str!(concat!(
+                env!("OUT_DIR"),
+                "/semantic_additive.ptx"
+            ))))
+            .map_err(|e| driver_err("load semantic additive ptx", &e))?;
+        let func_semantic_additive_matmul = semantic_module
+            .load_function("semantic_additive_matmul")
+            .map_err(|e| driver_err("resolve semantic additive matmul", &e))?;
+        let func_semantic_additive_matmul_ordered_warp = semantic_module
+            .load_function("semantic_additive_matmul_ordered_warp")
+            .map_err(|e| driver_err("resolve ordered packed matmul", &e))?;
+        let func_semantic_additive_gather = semantic_module
+            .load_function("semantic_additive_gather")
+            .map_err(|e| driver_err("resolve semantic additive gather", &e))?;
+        let func_semantic_additive_validate_finite = semantic_module
+            .load_function("semantic_additive_validate_finite")
+            .map_err(|e| driver_err("resolve semantic additive finite validation", &e))?;
+        let func_semantic_basis_sign = semantic_module
+            .load_function("semantic_basis_sign")
+            .map_err(|e| driver_err("resolve semantic basis signs", &e))?;
+        let func_semantic_basis_butterfly = semantic_module
+            .load_function("semantic_basis_butterfly")
+            .map_err(|e| driver_err("resolve semantic basis butterfly", &e))?;
+        let func_semantic_basis_finish = semantic_module
+            .load_function("semantic_basis_finish")
+            .map_err(|e| driver_err("resolve semantic basis normalization", &e))?;
+        let func_semantic_swiglu = semantic_module
+            .load_function("semantic_swiglu")
+            .map_err(|e| driver_err("resolve semantic SwiGLU", &e))?;
+        let func_semantic_attention = semantic_module
+            .load_function("semantic_causal_attention")
+            .map_err(|e| driver_err("resolve semantic causal attention", &e))?;
+        let decoder_function = |name| {
+            semantic_module
+                .load_function(name)
+                .map_err(|e| driver_err("resolve resident decoder function", &e))
+        };
+        let func_decoder_dense_gather = decoder_function("semantic_decoder_dense_gather")?;
+        let func_decoder_norm = decoder_function("semantic_decoder_norm")?;
+        let func_decoder_bias = decoder_function("semantic_decoder_bias")?;
+        let func_decoder_add = decoder_function("semantic_decoder_add")?;
+        let func_decoder_relu2 = decoder_function("semantic_decoder_relu2")?;
+        let func_decoder_rope = decoder_function("semantic_decoder_rope")?;
+        let func_qwen_query_gate = decoder_function("semantic_qwen_query_gate")?;
+        let func_qwen_attention_gate = decoder_function("semantic_qwen_attention_gate")?;
+        let func_delta_convolution = decoder_function("semantic_delta_convolution")?;
+        let func_delta_mixer = decoder_function("semantic_delta_mixer")?;
 
         let device_name = ctx
             .name()
@@ -1207,6 +1568,25 @@ impl CudaBackend {
             _salt_v2_module: salt_v2_module,
             _deltanet_module: deltanet_module,
             func_deltanet_step,
+            func_semantic_additive_matmul,
+            func_semantic_additive_matmul_ordered_warp,
+            func_semantic_additive_gather,
+            func_semantic_additive_validate_finite,
+            func_semantic_basis_sign,
+            func_semantic_basis_butterfly,
+            func_semantic_basis_finish,
+            func_semantic_swiglu,
+            func_semantic_attention,
+            func_decoder_dense_gather,
+            func_decoder_norm,
+            func_decoder_bias,
+            func_decoder_add,
+            func_decoder_relu2,
+            func_decoder_rope,
+            func_qwen_query_gate,
+            func_qwen_attention_gate,
+            func_delta_convolution,
+            func_delta_mixer,
             func_salt_v2_exact,
             func_salt_v2_tiled,
             func_salt_v2_warp,
@@ -1320,6 +1700,9 @@ impl CudaBackend {
             imma_jit: Mutex::new(HashMap::new()),
             tuned_tiles: Mutex::new(HashMap::new()),
             salt_v2_workspace: Mutex::new(SaltV2Workspace::default()),
+            semantic_swiglu_enabled: false,
+            resident_decoder_budget: None,
+            semantic_swiglu_workspace: Mutex::new(None),
         })
     }
 
@@ -3725,11 +4108,24 @@ impl CudaBackend {
         Ok(())
     }
 
-    /// The backend's default CUDA stream. Exposed so the tensor-core training tier in
+    /// The backend's owned nonblocking CUDA stream. Exposed so the tensor-core training tier in
     /// `crate::train` can build a cuBLASLt handle on the same stream — that module lives
     /// outside `crate::cuda` and cannot reach the `pub(super)` field directly.
     pub(crate) fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
+    }
+
+    /// Run synchronous host-side handle construction with this backend's context current.
+    ///
+    /// Some CUDA libraries (including cudarc's cuBLASLt handle constructor) require a
+    /// current context before they create a handle. The guard restores the caller's
+    /// prior context even when the operation returns an error or unwinds.
+    pub(crate) fn with_current_context<T>(
+        &self,
+        operation: impl FnOnce() -> T,
+    ) -> Result<T, BackendError> {
+        let _context = CurrentContextRestore::bind(self.stream.context())?;
+        Ok(operation())
     }
 
     /// `Y[m,n] = s[n]·Σ_k A[m,k]·W[n,k]` on ALREADY-RESIDENT buffers — the device-resident companion
@@ -7865,14 +8261,18 @@ impl CudaBackend {
             })?)
         };
         Ok(SaltV2ResidentTensor {
+            stream: Arc::clone(&self.stream),
             payload: d_payload,
             scales: d_scales,
             index_metadata: d_index_metadata,
+            index_metadata_host: index_metadata,
+            tensor_index: None,
             rows,
             columns,
             tile_count: tensor.tiles().len(),
             plane_count,
             codec_tag,
+            codec,
             scale_group_size,
             allocation_map_bytes: to_u32(map_bytes, "allocation map bytes")?,
             rank_prefix_count: to_u32(rank_prefixes.len(), "rank prefix count")?,
@@ -8814,7 +9214,184 @@ pub(super) enum AddKernel {
     Tiled,
 }
 
+impl CudaBackend {
+    /// Pure structural payload/workspace planning without creating a GPU context.
+    /// Numerical validation, actual driver/device support and physical-memory
+    /// qualification remain required at initialization/upload/execution.
+    pub fn plan_tensor_metadata(
+        metadata: tritium_spec::TensorMetadata<'_>,
+    ) -> Result<Option<tritium_spec::TensorUploadPlan>, BackendError> {
+        semantic::CudaTensor::plan(metadata)
+    }
+    /// Pure encoded-source/native-envelope planning; no device initialization.
+    /// Host staging and bounded explicit scratch are declared; allocator/driver/
+    /// pinned transfer overhead and execution resources remain excluded/unknown.
+    pub fn plan_tensor_stream(
+        metadata: tritium_spec::TensorMetadata<'_>,
+        encoding: tritium_spec::TensorStreamEncoding,
+    ) -> Result<Option<tritium_spec::TensorStreamPlan>, BackendError> {
+        semantic::CudaTensor::stream_plan(metadata, encoding)
+    }
+}
+
 impl TernaryBackend for CudaBackend {
+    fn resident_delta_mixer(
+        &self,
+        geometry: tritium_spec::DeltaMixerGeometry,
+        weights: tritium_spec::DeltaMixerWeights<'_>,
+        limits: tritium_spec::DecoderLimits,
+        max_device_payload_bytes: usize,
+    ) -> Result<Option<Box<dyn tritium_spec::ResidentDeltaMixer>>, BackendError> {
+        delta_mixer::create(self, geometry, weights, limits, max_device_payload_bytes)
+    }
+    fn request_resident_decoder(
+        &mut self,
+        max_device_payload_bytes: usize,
+    ) -> Result<(), BackendError> {
+        if max_device_payload_bytes == 0 {
+            return Err(BackendError::InvalidInput(
+                "resident decoder payload ceiling must be positive".into(),
+            ));
+        }
+        self.resident_decoder_budget = Some(max_device_payload_bytes);
+        Ok(())
+    }
+    fn resident_decoder_requested(&self) -> bool {
+        self.resident_decoder_budget.is_some()
+    }
+    fn resident_decoder_payload_limit(&self) -> Option<usize> {
+        self.resident_decoder_budget
+    }
+
+    fn decoder_payload_plan(
+        &self,
+        metadata: tritium_spec::DecoderAllocationMetadata<'_>,
+        limits: tritium_spec::DecoderLimits,
+    ) -> Result<Option<tritium_spec::DecoderPayloadPlan>, BackendError> {
+        Self::plan_decoder_metadata(metadata, limits).map(Some)
+    }
+    fn resident_decoder(
+        self: Arc<Self>,
+        graph: tritium_spec::DecoderGraph<'_>,
+        limits: tritium_spec::DecoderLimits,
+    ) -> Result<Option<Box<dyn tritium_spec::ResidentDecoder>>, BackendError> {
+        decoder::create(self, graph, limits)
+    }
+    fn resident_deltanet(
+        &self,
+        geometry: tritium_spec::DeltaNetGeometry,
+    ) -> Result<Option<Box<dyn tritium_spec::ResidentDeltaNet>>, BackendError> {
+        geometry.elements()?;
+        // Unsupported valid geometry differs from allocation/driver failures.
+        if geometry.value_head_dim > 1024
+            || [
+                geometry.value_heads,
+                geometry.key_head_dim,
+                geometry.group_size,
+            ]
+            .into_iter()
+            .any(|n| u32::try_from(n).is_err())
+            || geometry.key_head_dim > u32::MAX as usize / (2 * core::mem::size_of::<f32>())
+        {
+            return Ok(None);
+        }
+        let threads = self
+            .func_deltanet_step
+            .max_threads_per_block()
+            .map_err(|error| driver_err("query DeltaNet block limit", &error))?;
+        let shared = self
+            .stream
+            .context()
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)
+            .map_err(|error| driver_err("query DeltaNet shared memory limit", &error))?;
+        let static_shared = self
+            .func_deltanet_step
+            .shared_size_bytes()
+            .map_err(|error| driver_err("query DeltaNet static shared memory", &error))?;
+        let grid = self
+            .stream
+            .context()
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X)
+            .map_err(|error| driver_err("query DeltaNet grid limit", &error))?;
+        if threads <= 0 || shared < 0 || static_shared < 0 || grid <= 0 {
+            return Err(BackendError::Backend(
+                "invalid DeltaNet kernel/device limits".into(),
+            ));
+        }
+        if geometry.value_head_dim > threads as usize
+            || geometry.value_heads > grid as usize
+            || 2 * geometry.key_head_dim * core::mem::size_of::<f32>() + static_shared as usize
+                > shared as usize
+        {
+            return Ok(None);
+        }
+        self.new_deltanet_state(
+            geometry.value_heads,
+            geometry.key_head_dim,
+            geometry.value_head_dim,
+            geometry.group_size,
+        )
+        .map(|state| Some(Box::new(state) as Box<dyn tritium_spec::ResidentDeltaNet>))
+    }
+
+    fn tensor_caps(
+        &self,
+        tensor: tritium_spec::TensorView<'_>,
+    ) -> Result<Option<tritium_spec::TensorCaps>, BackendError> {
+        semantic::CudaTensor::caps(tensor)
+    }
+
+    fn tensor_upload_plan(
+        &self,
+        metadata: tritium_spec::TensorMetadata<'_>,
+    ) -> Result<Option<tritium_spec::TensorUploadPlan>, BackendError> {
+        Self::plan_tensor_metadata(metadata)
+    }
+
+    fn upload_tensor(
+        &self,
+        tensor: tritium_spec::TensorView<'_>,
+    ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        semantic::CudaTensor::upload(self, tensor)
+    }
+    fn tensor_stream_plan(
+        &self,
+        metadata: tritium_spec::TensorMetadata<'_>,
+        encoding: tritium_spec::TensorStreamEncoding,
+    ) -> Result<Option<tritium_spec::TensorStreamPlan>, BackendError> {
+        Self::plan_tensor_stream(metadata, encoding)
+    }
+    fn upload_tensor_stream(
+        &self,
+        source: &dyn tritium_spec::TensorStreamSource,
+    ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        semantic::CudaTensor::upload_stream(self, source)
+    }
+
+    fn matmul(&self, p: tritium_spec::TensorMatmul<'_>) -> Result<(), BackendError> {
+        semantic::CudaTensor::matmul(self, p)
+    }
+    fn try_tensor_swiglu(&self, p: tritium_spec::TensorSwiGlu<'_>) -> Result<bool, BackendError> {
+        semantic::swiglu::forward(self, p)
+    }
+
+    fn resident_attention(
+        &self,
+        geometry: tritium_spec::AttentionGeometry,
+        limits: tritium_spec::AttentionLimits,
+    ) -> Result<Option<Box<dyn tritium_spec::ResidentAttention>>, BackendError> {
+        attention::create(self, geometry, limits)
+    }
+
+    fn embed_rows(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        ids: &[usize],
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        semantic::CudaTensor::embed(self, tensor, ids, out)
+    }
+
     fn device_id(&self) -> &str {
         &self.device_id
     }

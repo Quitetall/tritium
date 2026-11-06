@@ -12,6 +12,7 @@
 //! device-to-device transfer, and commit becomes a pointer swap.
 
 use super::*;
+use tritium_spec::{DeltaNetGeometry, DeltaNetStep, ResidentDeltaNet};
 
 /// Narrow a geometry value to the kernel ABI's `u32`.
 fn to_u32(value: usize, field: &str) -> Result<u32, BackendError> {
@@ -25,6 +26,8 @@ fn to_u32(value: usize, field: &str) -> Result<u32, BackendError> {
 /// the step mutates, so an aborted transaction leaves the committed state
 /// untouched and a commit is a swap rather than a copy.
 pub struct DeltaNetResidentState {
+    stream: Arc<CudaStream>,
+    function: CudaFunction,
     current: CudaSlice<f32>,
     staging: CudaSlice<f32>,
     value_heads: u32,
@@ -51,7 +54,7 @@ impl DeltaNetResidentState {
     /// Elements in one state buffer.
     #[must_use]
     pub const fn elements(&self) -> usize {
-        (self.value_heads * self.key_head_dim * self.value_head_dim) as usize
+        self.value_heads as usize * self.key_head_dim as usize * self.value_head_dim as usize
     }
 
     /// Value heads carried by this state.
@@ -80,28 +83,29 @@ impl CudaBackend {
         value_head_dim: usize,
         group_size: usize,
     ) -> Result<DeltaNetResidentState, BackendError> {
-        if value_heads == 0 || key_head_dim == 0 || value_head_dim == 0 || group_size == 0 {
-            return Err(BackendError::InvalidInput(
-                "DeltaNet state geometry must be non-zero".into(),
-            ));
+        let elements = DeltaNetGeometry {
+            value_heads,
+            key_head_dim,
+            value_head_dim,
+            group_size,
         }
-        if !value_heads.is_multiple_of(group_size) {
-            return Err(BackendError::InvalidInput(
-                "DeltaNet value heads must be a whole number of key-head groups".into(),
-            ));
-        }
+        .elements()?;
         // One thread owns one value lane, so the lane count is the block size.
         if value_head_dim > 1024 {
             return Err(BackendError::InvalidInput(
                 "DeltaNet value head dim exceeds the one-lane-per-thread block limit".into(),
             ));
         }
-        let elements = value_heads
-            .checked_mul(key_head_dim)
-            .and_then(|value| value.checked_mul(value_head_dim))
-            .ok_or_else(|| {
-                BackendError::InvalidInput("DeltaNet state element count overflows".into())
-            })?;
+        // Validate ABI narrowing before device allocation, including the shared
+        // memory launch field. The function handle retains its owning module.
+        let value_heads = to_u32(value_heads, "DeltaNet value heads")?;
+        let key_head_dim = to_u32(key_head_dim, "DeltaNet key head dim")?;
+        let value_head_dim = to_u32(value_head_dim, "DeltaNet value head dim")?;
+        let group_size = to_u32(group_size, "DeltaNet group size")?;
+        to_u32(
+            2 * key_head_dim as usize * core::mem::size_of::<f32>(),
+            "DeltaNet shared bytes",
+        )?;
         let bytes = elements * core::mem::size_of::<f32>();
         let current = self
             .stream
@@ -112,12 +116,14 @@ impl CudaBackend {
             .alloc_zeros::<f32>(elements)
             .map_err(|error| alloc_or_backend("allocate DeltaNet staging state", &error, bytes))?;
         Ok(DeltaNetResidentState {
+            stream: Arc::clone(&self.stream),
+            function: self.func_deltanet_step.clone(),
             current,
             staging,
-            value_heads: to_u32(value_heads, "DeltaNet value heads")?,
-            key_head_dim: to_u32(key_head_dim, "DeltaNet key head dim")?,
-            value_head_dim: to_u32(value_head_dim, "DeltaNet value head dim")?,
-            group_size: to_u32(group_size, "DeltaNet group size")?,
+            value_heads,
+            key_head_dim,
+            value_head_dim,
+            group_size,
         })
     }
 
@@ -126,11 +132,8 @@ impl CudaBackend {
     /// # Errors
     /// Returns [`BackendError::Backend`] on a driver failure.
     pub fn deltanet_stage(&self, state: &mut DeltaNetResidentState) -> Result<(), BackendError> {
-        let elements = state.elements();
-        let source = state.current.slice(..elements);
-        self.stream
-            .memcpy_dtod(&source, &mut state.staging)
-            .map_err(|error| driver_err("stage DeltaNet state", &error))
+        state.validate_owner(self)?;
+        state.stage()
     }
 
     /// Clear the committed and staged state without releasing capacity.
@@ -138,6 +141,7 @@ impl CudaBackend {
     /// # Errors
     /// Returns [`BackendError::Backend`] on a driver failure.
     pub fn deltanet_reset(&self, state: &mut DeltaNetResidentState) -> Result<(), BackendError> {
+        state.validate_owner(self)?;
         self.stream
             .memset_zeros(&mut state.current)
             .map_err(|error| driver_err("reset DeltaNet state", &error))?;
@@ -155,17 +159,8 @@ impl CudaBackend {
         state: &DeltaNetResidentState,
         output: &mut [f32],
     ) -> Result<(), BackendError> {
-        let elements = state.elements();
-        if output.len() != elements {
-            return Err(BackendError::ShapeMismatch {
-                expected: elements,
-                got: output.len(),
-            });
-        }
-        let view = state.staging.slice(..elements);
-        self.stream
-            .memcpy_dtoh(&view, output)
-            .map_err(|error| driver_err("read staged DeltaNet state", &error))
+        state.validate_owner(self)?;
+        state.read_staged(output)
     }
 
     /// Overwrite the staged state from the host, for parity checks and diagnostics.
@@ -177,16 +172,8 @@ impl CudaBackend {
         state: &mut DeltaNetResidentState,
         values: &[f32],
     ) -> Result<(), BackendError> {
-        let elements = state.elements();
-        if values.len() != elements {
-            return Err(BackendError::ShapeMismatch {
-                expected: elements,
-                got: values.len(),
-            });
-        }
-        self.stream
-            .memcpy_htod(values, &mut state.staging)
-            .map_err(|error| driver_err("write staged DeltaNet state", &error))
+        state.validate_owner(self)?;
+        state.write_staged(values)
     }
 
     /// Advance the staged state by one token, for every head at once.
@@ -212,10 +199,93 @@ impl CudaBackend {
         decay: &[f32],
         core_out: &mut [f32],
     ) -> Result<(), BackendError> {
-        let value_heads = state.value_heads as usize;
-        let key_head_dim = state.key_head_dim as usize;
-        let value_head_dim = state.value_head_dim as usize;
-        let key_heads = value_heads / state.group_size as usize;
+        state.validate_owner(self)?;
+        state.step(DeltaNetStep {
+            key: kk,
+            query: qq,
+            value,
+            beta,
+            decay,
+            output: core_out,
+        })
+    }
+}
+
+impl ResidentDeltaNet for DeltaNetResidentState {
+    fn geometry(&self) -> DeltaNetGeometry {
+        DeltaNetGeometry {
+            value_heads: self.value_heads as usize,
+            key_head_dim: self.key_head_dim as usize,
+            value_head_dim: self.value_head_dim as usize,
+            group_size: self.group_size as usize,
+        }
+    }
+
+    fn validate_owner(&self, backend: &dyn TernaryBackend) -> Result<(), BackendError> {
+        if backend
+            .as_concrete()
+            .and_then(|any| any.downcast_ref::<CudaBackend>())
+            .is_some_and(|cuda| Arc::ptr_eq(&self.stream, &cuda.stream))
+        {
+            Ok(())
+        } else {
+            Err(BackendError::InvalidInput(
+                "DeltaNet state belongs to a different backend stream".into(),
+            ))
+        }
+    }
+
+    fn stage(&mut self) -> Result<(), BackendError> {
+        let source = self.current.slice(..self.elements());
+        self.stream
+            .memcpy_dtod(&source, &mut self.staging)
+            .map_err(|error| driver_err("stage DeltaNet state", &error))
+    }
+
+    fn read_staged(&self, output: &mut [f32]) -> Result<(), BackendError> {
+        let elements = self.elements();
+        if output.len() != elements {
+            return Err(BackendError::ShapeMismatch {
+                expected: elements,
+                got: output.len(),
+            });
+        }
+        let view = self.staging.slice(..elements);
+        self.stream
+            .memcpy_dtoh(&view, output)
+            .map_err(|error| driver_err("read staged DeltaNet state", &error))
+    }
+
+    fn write_staged(&mut self, values: &[f32]) -> Result<(), BackendError> {
+        let elements = self.elements();
+        if values.len() != elements {
+            return Err(BackendError::ShapeMismatch {
+                expected: elements,
+                got: values.len(),
+            });
+        }
+        self.stream
+            .memcpy_htod(values, &mut self.staging)
+            .map_err(|error| driver_err("write staged DeltaNet state", &error))
+    }
+
+    fn commit(&mut self) {
+        DeltaNetResidentState::commit(self);
+    }
+
+    fn step(&mut self, operands: DeltaNetStep<'_>) -> Result<(), BackendError> {
+        let DeltaNetStep {
+            key: kk,
+            query: qq,
+            value,
+            beta,
+            decay,
+            output: core_out,
+        } = operands;
+        let value_heads = self.value_heads as usize;
+        let key_head_dim = self.key_head_dim as usize;
+        let value_head_dim = self.value_head_dim as usize;
+        let key_heads = value_heads / self.group_size as usize;
         let projected_len = key_heads * key_head_dim;
         let lane_len = value_heads * value_head_dim;
         for (name, got, expected) in [
@@ -265,22 +335,22 @@ impl CudaBackend {
             "DeltaNet shared bytes",
         )?;
         let cfg = LaunchConfig {
-            grid_dim: (state.value_heads, 1, 1),
-            block_dim: (state.value_head_dim, 1, 1),
+            grid_dim: (self.value_heads, 1, 1),
+            block_dim: (self.value_head_dim, 1, 1),
             shared_mem_bytes,
         };
-        let mut launch = self.stream.launch_builder(&self.func_deltanet_step);
+        let mut launch = self.stream.launch_builder(&self.function);
         launch
-            .arg(&mut state.staging)
+            .arg(&mut self.staging)
             .arg(&d_kk)
             .arg(&d_qq)
             .arg(&d_value)
             .arg(&d_beta)
             .arg(&d_decay)
             .arg(&mut d_core)
-            .arg(&state.key_head_dim)
-            .arg(&state.value_head_dim)
-            .arg(&state.group_size);
+            .arg(&self.key_head_dim)
+            .arg(&self.value_head_dim)
+            .arg(&self.group_size);
         // SAFETY: every operand length is checked against the state geometry
         // above, the grid is one block per head and one thread per value lane,
         // and each thread writes only its own column of its own head.

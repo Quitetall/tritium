@@ -4,10 +4,10 @@
 straight-through-estimator (STE) autograd, quantization-aware training (QAT),
 backward kernels for the ternary ops, an optimizer with bit-exact save/restore,
 and LoRA adapters on a frozen ternary base. It is specified in
-ADR 0007 (see the [research repository](https://github.com/Quitetall/tritium-research)). Distributed training — FSDP /
+ADR 0007 (see the [research-record access policy](./research-records.md)). Distributed training — FSDP /
 ZeRO-3 (via `FlatShardPlan`), a `ProcessGroup` (with `SimProcessGroup` and NCCL
 backends), and distributed checkpointing (`DistCheckpoint`) — shipped in
-v0.60 (see the [research repository](https://github.com/Quitetall/tritium-research)) and is re-exported from
+v0.60 (see the [research-record access policy](./research-records.md)) and is re-exported from
 `tritium-train`; the NCCL transport lives in `tritium-cuda`.
 
 ## Straight-through estimator
@@ -50,10 +50,10 @@ a short STE fine-tune. The convergence gate — a real ternary fine-tune recover
 model, so it is a documented manual gate on borrowed hardware rather than a
 hosted-CI lane (gradient checks run CPU-only; the recovery gate cannot be
 validated without GPU + a real model — see the
-ADR (see the [research repository](https://github.com/Quitetall/tritium-research))).
+internal ADR (see the [research-record access policy](./research-records.md)).
 
 ## Ternary-specific training methods
 
 The training methods that are specific to the ternary regime (and the choices
 behind STE clipping, QAT scheduling, and the heal bridge) are written up in
-ADR 0016 (see the [research repository](https://github.com/Quitetall/tritium-research)).
+ADR 0016 (see the [research-record access policy](./research-records.md)).

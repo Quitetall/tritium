@@ -96,8 +96,14 @@ test("schedule compiler binds forward, VJP, and step roles exactly", () => {
   const { plan, store } = fixture();
   const add = compilePortablePlanOperationRequest(plan, "add", store, "node:schedule");
   assert.equal(add.request.execution, "forward");
-  assert.deepEqual(add.request.inputs.map((buffer) => buffer.name), ["left", "right"]);
-  assert.deepEqual(add.request.outputs.map((buffer) => buffer.name), ["result"]);
+  assert.deepEqual(
+    add.request.inputs.map((buffer) => buffer.name),
+    ["left", "right"],
+  );
+  assert.deepEqual(
+    add.request.outputs.map((buffer) => buffer.name),
+    ["result"],
+  );
   assert.deepEqual(add.request.inputs[0].data.bits, [0x3f800000]);
   assert.deepEqual(
     add.request.inputs[1].data.bits,
@@ -107,8 +113,14 @@ test("schedule compiler binds forward, VJP, and step roles exactly", () => {
   assert.deepEqual(add.outputBufferIds, ["sum"]);
 
   const mse = compilePortablePlanOperationRequest(plan, "mse", store);
-  assert.deepEqual(mse.request.inputs.map((buffer) => buffer.name), ["prediction", "target"]);
-  assert.deepEqual(mse.request.outputs.map((buffer) => buffer.name), ["result"]);
+  assert.deepEqual(
+    mse.request.inputs.map((buffer) => buffer.name),
+    ["prediction", "target"],
+  );
+  assert.deepEqual(
+    mse.request.outputs.map((buffer) => buffer.name),
+    ["result"],
+  );
 
   for (const operation of plan.backwardOperations) {
     const dispatch = compilePortableBackwardOperationRequest(plan, operation.id, store);
@@ -124,8 +136,14 @@ test("schedule compiler binds forward, VJP, and step roles exactly", () => {
 
   const step = compilePortablePlanOperationRequest(plan, "sgd", store);
   assert.equal(step.request.execution, "step");
-  assert.deepEqual(step.request.inputs.map((buffer) => buffer.name), ["parameter", "gradient"]);
-  assert.deepEqual(step.request.outputs.map((buffer) => buffer.name), ["parameter"]);
+  assert.deepEqual(
+    step.request.inputs.map((buffer) => buffer.name),
+    ["parameter", "gradient"],
+  );
+  assert.deepEqual(
+    step.request.outputs.map((buffer) => buffer.name),
+    ["parameter"],
+  );
   assert.deepEqual(step.outputBufferIds, ["weight"]);
 });
 
@@ -160,11 +178,13 @@ test("schedule compiler rejects malformed plans, stores, and role drift", () => 
     "missing_buffer",
   );
   throwsCode(
-    () => compilePortablePlanOperationRequest(plan, "add", { ...store, weight: new Uint32Array(1) }),
+    () =>
+      compilePortablePlanOperationRequest(plan, "add", { ...store, weight: new Uint32Array(1) }),
     "buffer_mismatch",
   );
   throwsCode(
-    () => compilePortablePlanOperationRequest(plan, "add", { ...store, weight: new Float32Array(2) }),
+    () =>
+      compilePortablePlanOperationRequest(plan, "add", { ...store, weight: new Float32Array(2) }),
     "buffer_mismatch",
   );
   const aliasLocalStore = { ...store, "tied-weight": new Float32Array([5]) };
@@ -183,7 +203,8 @@ test("schedule compiler rejects malformed plans, stores, and role drift", () => 
       : buffer,
   );
   throwsCode(
-    () => compilePortablePlanOperationRequest({ ...plan, buffers: redirectedBuffers }, "add", store),
+    () =>
+      compilePortablePlanOperationRequest({ ...plan, buffers: redirectedBuffers }, "add", store),
     "invalid_schema",
   );
   const coherentRedirect = plan.buffers.map((buffer) =>
@@ -213,10 +234,7 @@ test("schedule compiler rejects malformed plans, stores, and role drift", () => 
       operation.id === "sgd" ? { ...operation, attributes: [] } : operation,
     ),
   };
-  throwsCode(
-    () => compilePortablePlanOperationRequest(forgedSgd, "sgd", store),
-    "invalid_schema",
-  );
+  throwsCode(() => compilePortablePlanOperationRequest(forgedSgd, "sgd", store), "invalid_schema");
   const oversizedBuffers = plan.buffers.map((buffer) =>
     buffer.id === "x"
       ? {
@@ -231,7 +249,12 @@ test("schedule compiler rejects malformed plans, stores, and role drift", () => 
     "capacity",
   );
   throwsCode(
-    () => compilePortablePlanOperationRequest({ ...plan, buffers: [null, ...plan.buffers] }, "add", store),
+    () =>
+      compilePortablePlanOperationRequest(
+        { ...plan, buffers: [null, ...plan.buffers] },
+        "add",
+        store,
+      ),
     "invalid_schema",
   );
   const sparseInputs = new Array(2);
@@ -291,8 +314,5 @@ test("schedule compiler rejects aggregate JSON transport overflow", () => {
   }
   new Uint32Array(store.x.buffer).fill(0xffff_ffff);
   new Uint32Array(store.weight.buffer).fill(0xffff_ffff);
-  throwsCode(
-    () => compilePortablePlanOperationRequest(plan, "add", store),
-    "capacity",
-  );
+  throwsCode(() => compilePortablePlanOperationRequest(plan, "add", store), "capacity");
 });

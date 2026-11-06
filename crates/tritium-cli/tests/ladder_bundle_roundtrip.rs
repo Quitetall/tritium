@@ -163,12 +163,7 @@ fn ladder_bundle_reconstructs_the_fit() {
 }
 
 fn tritium_bin() -> std::path::PathBuf {
-    let mut p = std::env::current_exe().expect("test exe");
-    p.pop();
-    if p.ends_with("deps") {
-        p.pop();
-    }
-    p.join("tritium")
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_tritium"))
 }
 
 /// Minimal single-tensor f32 safetensors writer.

@@ -7,7 +7,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Subcommand, ValueEnum};
 use serde::Serialize;
-use tritium_evidence::{EventRegistration, EvidenceEvent, EvidenceRecorder, verify_jsonl};
+use tritium_evidence::{
+    CalibratedFitReceiptView, CalibratedQuantizationReceiptView, CalibrationCaptureView,
+    DirectFitReceiptView, EventRegistration, EvidenceEvent, EvidenceRecorder, ModelLoadReceiptView,
+    OriginalSalienceCaptureView, OwnerQuantizationReceiptView, OwnerScoreFitReceiptView,
+    QuantizationReceiptView, SalienceTransformView, verify_jsonl,
+};
 
 /// Evidence detail level for a CLI invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -185,6 +190,40 @@ pub(crate) fn run(command: EvidenceCommand) -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!("read evidence log {}: {error}", path.display()))?;
     let verified = verify_jsonl(&input)
         .map_err(|error| anyhow::anyhow!("verify evidence log {}: {error}", path.display()))?;
+    // Known load observations use the shared typed fold, not a CLI schema copy.
+    // Generic integrity is still not qualification or a registry for all events.
+    ModelLoadReceiptView::fold(&verified)
+        .map_err(|error| anyhow::anyhow!("verify model-load view {}: {error}", path.display()))?;
+    DirectFitReceiptView::fold(&verified)
+        .map_err(|error| anyhow::anyhow!("verify direct-fit view {}: {error}", path.display()))?;
+    CalibratedFitReceiptView::fold(&verified).map_err(|error| {
+        anyhow::anyhow!("verify calibrated-fit view {}: {error}", path.display())
+    })?;
+    OwnerScoreFitReceiptView::fold(&verified).map_err(|error| {
+        anyhow::anyhow!("verify owner-score fit view {}: {error}", path.display())
+    })?;
+    OwnerQuantizationReceiptView::fold(&verified)
+        .map_err(|error| anyhow::anyhow!("verify owner model view {}: {error}", path.display()))?;
+    QuantizationReceiptView::fold(&verified)
+        .map_err(|error| anyhow::anyhow!("verify quantization view {}: {error}", path.display()))?;
+    CalibratedQuantizationReceiptView::fold(&verified).map_err(|error| {
+        anyhow::anyhow!("verify calibrated model view {}: {error}", path.display())
+    })?;
+    SalienceTransformView::fold(&verified).map_err(|error| {
+        anyhow::anyhow!("verify salience transform view {}: {error}", path.display())
+    })?;
+    CalibrationCaptureView::fold(&verified).map_err(|error| {
+        anyhow::anyhow!(
+            "verify calibration capture view {}: {error}",
+            path.display()
+        )
+    })?;
+    OriginalSalienceCaptureView::fold(&verified).map_err(|error| {
+        anyhow::anyhow!(
+            "verify original salience capture view {}: {error}",
+            path.display()
+        )
+    })?;
     if view {
         println!("{}", serde_json::to_string_pretty(&verified.events)?);
     } else {
@@ -233,6 +272,352 @@ mod tests {
         const VERSION: u16 = 1;
     }
 
+    fn actual_transform() -> tritium_quantize::engine::RecordedSalienceSource {
+        use std::collections::BTreeMap;
+        use tritium_quantize::engine::{
+            DeclaredSalienceStatistics, Engine, InMemoryWeightSource, RawTensor, SourceTransform,
+            WeightSource,
+        };
+        use tritium_schema::*;
+        let raw = |shape: Vec<u64>, values: &[f32]| RawTensor {
+            shape,
+            precision: ScalePrecision::F32,
+            bytes: values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+        };
+        let mut source = InMemoryWeightSource {
+            tensors: BTreeMap::from([
+                ("norm".into(), raw(vec![2], &[1.0, 1.0])),
+                ("q".into(), raw(vec![1, 2], &[2.0, -2.0])),
+            ]),
+            assets: BTreeMap::from([
+                ("config.json".into(), b"{}".to_vec()),
+                ("tokenizer.json".into(), b"{}".to_vec()),
+            ]),
+            ..Default::default()
+        };
+        let observe = QuantPlan {
+            architecture: "fixture".into(),
+            tensors: source
+                .inventory()
+                .unwrap()
+                .into_iter()
+                .map(|source| QuantTensorPlan {
+                    source,
+                    action: QuantAction::KeepDense,
+                })
+                .collect(),
+            assets: source.asset_names(),
+            levels: vec!["dense".into()],
+            limits: QuantLimits {
+                max_source_bytes: 128,
+                max_asset_bytes: 128,
+                max_retained_blob_bytes: 128,
+                max_package_bytes: 10_000,
+            },
+        };
+        let stats = DeclaredSalienceStatistics {
+            moments: vec![1.0, 16.0],
+            rows: 1,
+        };
+        let plan = SalienceTransformPlan {
+            architecture: "fixture".into(),
+            original_source: Engine::observe_source(&observe, &mut source).unwrap(),
+            tensors: source.inventory().unwrap(),
+            assets: source.asset_names(),
+            operations: vec![SalienceTransformOperation {
+                name: "attn".into(),
+                projections: vec!["q".into()],
+                inverse: "norm".into(),
+                inverse_axis: SalienceInverseAxis::NormChannels,
+                moments: stats.binding().unwrap(),
+                alpha_bits: 0.75f64.to_le_bytes(),
+            }],
+            numerics: SalienceNumerics::LegacyF64ScaleF32V1,
+            statistics_kind: SalienceStatisticsKind::Declared,
+            limits: SalienceTransformLimits {
+                max_source_bytes: 128,
+                max_asset_bytes: 128,
+                max_derived_bytes: 128,
+                max_statistics_bytes: 16,
+                max_pair_working_bytes: 128,
+            },
+        };
+        let recorder = EvidenceRecorder::new(
+            "cli-transform",
+            [
+                tritium_evidence::SALIENCE_TRANSFORM_STARTED_REGISTRATION,
+                tritium_evidence::SALIENCE_TRANSFORM_COMPLETED_REGISTRATION,
+            ],
+        )
+        .unwrap();
+        SourceTransform::run_recorded(
+            &plan,
+            &mut source,
+            &BTreeMap::from([("attn".into(), stats)]),
+            recorder,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn verify_and_view_accept_actual_declared_transform_observations() {
+        let recorded = actual_transform();
+        let path = temp_log();
+        std::fs::write(&path, recorded.evidence.jsonl()).unwrap();
+        run(EvidenceCommand::Verify { path: path.clone() }).unwrap();
+        run(EvidenceCommand::View { path: path.clone() }).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn original_salience_cli_checks_structural_context_not_numerical_truth() {
+        use tritium_schema::*;
+        // Actual original content observation, but synthetic capture claims:
+        // this tests CLI structural inspection, never a numerical producer.
+        let transformed = actual_transform();
+        let observation = transformed.source.observation();
+        let operation = &observation.plan.operations[0];
+        let plan = OriginalSalienceCapturePlan {
+            architecture: observation.plan.architecture.clone(),
+            source: observation.original_source,
+            tensors: observation.original_tensors.clone(),
+            assets: observation.assets.clone(),
+            profile: OriginalSalienceCaptureProfile::AllTokenF64SecondMomentV1,
+            pairs: vec![OriginalSalienceCapturePair {
+                name: operation.name.clone(),
+                projections: operation.projections.clone(),
+                inverse: operation.inverse.clone(),
+                inverse_axis: operation.inverse_axis,
+                channels: operation.moments.channels,
+            }],
+            input: OriginalSalienceCaptureInput::Tokens {
+                windows: vec![vec![0]],
+            },
+            limits: OriginalSalienceCaptureLimits {
+                max_source_bytes: 128,
+                max_asset_bytes: 128,
+                max_config_bytes: 128,
+                max_dense_bytes: 128,
+                max_window_tokens: 1,
+                max_windows: 1,
+                max_total_tokens: 1,
+                max_moment_bytes: 16,
+                max_text_bytes: 0,
+                max_tokenizer_config_bytes: 0,
+            },
+        };
+        let mut completion = OriginalSalienceCaptureCompleted {
+            windows: vec![vec![0]],
+            outputs: vec![OriginalSalienceCaptureOutput {
+                operation: operation.name.clone(),
+                moments: operation.moments.clone(),
+            }],
+        };
+        let seal = |completion: &OriginalSalienceCaptureCompleted| {
+            let mut recorder = EvidenceRecorder::new(
+                "cli-original-structural",
+                [
+                    tritium_evidence::ORIGINAL_SALIENCE_CAPTURE_STARTED_REGISTRATION,
+                    tritium_evidence::ORIGINAL_SALIENCE_CAPTURE_COMPLETED_REGISTRATION,
+                ],
+            )
+            .unwrap();
+            recorder
+                .emit(
+                    "salience",
+                    None,
+                    0,
+                    &OriginalSalienceCaptureStarted { plan: plan.clone() },
+                )
+                .unwrap();
+            recorder.emit("salience", None, 1, completion).unwrap();
+            recorder.seal().unwrap()
+        };
+        let path = temp_log();
+        std::fs::write(&path, seal(&completion).jsonl()).unwrap();
+        run(EvidenceCommand::Verify { path: path.clone() }).unwrap();
+        run(EvidenceCommand::View { path: path.clone() }).unwrap();
+        // A different moment digest with a valid chain is still only a claim.
+        completion.outputs[0].moments.content = BlobId::from_bytes([7; 32]);
+        std::fs::write(&path, seal(&completion).jsonl()).unwrap();
+        run(EvidenceCommand::Verify { path: path.clone() }).unwrap();
+        completion.outputs[0].moments.rows = 2;
+        std::fs::write(&path, seal(&completion).jsonl()).unwrap();
+        assert!(run(EvidenceCommand::Verify { path: path.clone() }).is_err());
+        assert!(run(EvidenceCommand::View { path: path.clone() }).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn verify_and_view_reject_known_capture_payload_with_unknown_fields() {
+        #[derive(Serialize)]
+        struct BadCapture {
+            windows: Vec<Vec<u32>>,
+            caches: Vec<serde_json::Value>,
+            claimed_quality: bool,
+        }
+        impl EvidenceEvent for BadCapture {
+            const SCHEMA_ID: &'static str = "tritium.calibration.capture_completed";
+            const VERSION: u16 = 1;
+        }
+        let mut recorder = EvidenceRecorder::new(
+            "bad-capture",
+            [tritium_evidence::CALIBRATION_CAPTURE_COMPLETED_REGISTRATION],
+        )
+        .unwrap();
+        recorder
+            .emit(
+                "capture",
+                None,
+                0,
+                &BadCapture {
+                    windows: vec![vec![1, 2]],
+                    caches: vec![],
+                    claimed_quality: true,
+                },
+            )
+            .unwrap();
+        let sealed = recorder.seal().unwrap();
+        verify_jsonl(sealed.jsonl()).unwrap();
+        let path = temp_log();
+        std::fs::write(&path, sealed.jsonl()).unwrap();
+        for command in [
+            EvidenceCommand::Verify { path: path.clone() },
+            EvidenceCommand::View { path: path.clone() },
+        ] {
+            assert!(
+                run(command)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("calibration capture")
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn verify_and_view_reject_invalid_transform_payloads_with_valid_hashes() {
+        use tritium_schema::SalienceTransformStarted;
+        #[derive(Serialize)]
+        struct BadCompletion {
+            observation: serde_json::Value,
+        }
+        impl EvidenceEvent for BadCompletion {
+            const SCHEMA_ID: &'static str = "tritium.quantize.salience_transform_completed";
+            const VERSION: u16 = 1;
+        }
+        let actual = actual_transform();
+        let observation = actual.source.observation();
+        let mut value = serde_json::to_value(observation).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("claimed_capture".into(), serde_json::json!(true));
+        let mut recorder = EvidenceRecorder::new(
+            "bad-transform",
+            [
+                tritium_evidence::SALIENCE_TRANSFORM_STARTED_REGISTRATION,
+                tritium_evidence::SALIENCE_TRANSFORM_COMPLETED_REGISTRATION,
+            ],
+        )
+        .unwrap();
+        recorder
+            .emit(
+                "transform",
+                None,
+                0,
+                &SalienceTransformStarted {
+                    plan: observation.plan.clone(),
+                },
+            )
+            .unwrap();
+        recorder
+            .emit("transform", None, 1, &BadCompletion { observation: value })
+            .unwrap();
+        let sealed = recorder.seal().unwrap();
+        verify_jsonl(sealed.jsonl()).unwrap();
+        let path = temp_log();
+        std::fs::write(&path, sealed.jsonl()).unwrap();
+        assert!(
+            run(EvidenceCommand::Verify { path: path.clone() })
+                .unwrap_err()
+                .to_string()
+                .contains("salience transform")
+        );
+        assert!(
+            run(EvidenceCommand::View { path: path.clone() })
+                .unwrap_err()
+                .to_string()
+                .contains("salience transform")
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn verify_and_view_accept_registered_load_observations() {
+        use tritium_evidence::{MODEL_LOADED_REGISTRATION, ModelLoaded};
+        let mut recorder = EvidenceRecorder::new("load-view", [MODEL_LOADED_REGISTRATION]).unwrap();
+        recorder
+            .emit_model_loaded(
+                "load",
+                None,
+                0,
+                &ModelLoaded {
+                    source: tritium_evidence::LoadedSourceIdentity::HuggingFace {
+                        reason: tritium_evidence::UnknownReason::MissingCapability,
+                    },
+                    architecture: "llama".into(),
+                    backend: "controlled-test".into(),
+                    physical_device: "unknown".into(),
+                    vocab_size: 10,
+                    layer_count: 2,
+                },
+            )
+            .unwrap();
+        let path = temp_log();
+        std::fs::write(&path, recorder.to_jsonl().unwrap()).unwrap();
+        let verify = run(EvidenceCommand::Verify { path: path.clone() });
+        let view = run(EvidenceCommand::View { path: path.clone() });
+        std::fs::remove_file(path).unwrap();
+        verify.unwrap();
+        view.unwrap();
+    }
+
+    #[test]
+    fn verify_and_view_reject_load_payloads_with_valid_hashes_but_wrong_schema() {
+        use tritium_evidence::{MODEL_LOADED_REGISTRATION, ModelLoaded};
+        #[derive(Serialize)]
+        struct InvalidLoad {
+            unauthorized_release_verdict: bool,
+        }
+        impl EvidenceEvent for InvalidLoad {
+            const SCHEMA_ID: &'static str = ModelLoaded::SCHEMA_ID;
+            const VERSION: u16 = 1;
+        }
+        let mut recorder =
+            EvidenceRecorder::new("wrong-load", [MODEL_LOADED_REGISTRATION]).unwrap();
+        recorder
+            .emit(
+                "load",
+                None,
+                0,
+                &InvalidLoad {
+                    unauthorized_release_verdict: true,
+                },
+            )
+            .unwrap();
+        let path = temp_log();
+        std::fs::write(&path, recorder.to_jsonl().unwrap()).unwrap();
+        let verify = run(EvidenceCommand::Verify { path: path.clone() });
+        let view = run(EvidenceCommand::View { path: path.clone() });
+        std::fs::remove_file(path).unwrap();
+        assert!(verify.unwrap_err().to_string().contains("InvalidPayload"));
+        assert!(view.unwrap_err().to_string().contains("InvalidPayload"));
+    }
+
     #[test]
     fn verify_command_accepts_a_valid_recorded_log() {
         let mut recorder = EvidenceRecorder::new(
@@ -253,6 +638,223 @@ mod tests {
         let cleanup = std::fs::remove_file(path);
         cleanup.expect("remove temporary log");
         result.expect("CLI verification succeeds");
+    }
+
+    #[test]
+    fn verify_and_view_reject_invalid_owner_model_payloads_with_valid_hashes() {
+        #[derive(Serialize)]
+        struct InvalidStart {
+            release_approved: bool,
+        }
+        impl EvidenceEvent for InvalidStart {
+            const SCHEMA_ID: &'static str = "tritium.quantize.owner_model_started";
+            const VERSION: u16 = 1;
+        }
+        #[derive(Serialize)]
+        struct InvalidCompleted {
+            release_approved: bool,
+        }
+        impl EvidenceEvent for InvalidCompleted {
+            const SCHEMA_ID: &'static str = "tritium.quantize.owner_model_completed";
+            const VERSION: u16 = 1;
+        }
+        fn reject<E: EvidenceEvent>(event: &E) {
+            let mut recorder = EvidenceRecorder::new(
+                "invalid-owner-model",
+                [EventRegistration {
+                    schema: E::SCHEMA_ID,
+                    version: E::VERSION,
+                }],
+            )
+            .unwrap();
+            recorder.emit("quantize", None, 0, event).unwrap();
+            let text = recorder.to_jsonl().unwrap();
+            verify_jsonl(&text).unwrap();
+            let path = temp_log();
+            std::fs::write(&path, text).unwrap();
+            let verify = run(EvidenceCommand::Verify { path: path.clone() });
+            let view = run(EvidenceCommand::View { path: path.clone() });
+            std::fs::remove_file(path).unwrap();
+            assert!(verify.unwrap_err().to_string().contains("owner model view"));
+            assert!(view.unwrap_err().to_string().contains("owner model view"));
+        }
+        reject(&InvalidStart {
+            release_approved: true,
+        });
+        reject(&InvalidCompleted {
+            release_approved: true,
+        });
+    }
+
+    #[test]
+    fn verify_and_view_reject_invalid_calibrated_model_payloads_with_valid_hashes() {
+        #[derive(Serialize)]
+        struct InvalidStart {
+            release_approved: bool,
+        }
+        impl EvidenceEvent for InvalidStart {
+            const SCHEMA_ID: &'static str = "tritium.quantize.calibrated_model_started";
+            const VERSION: u16 = 1;
+        }
+        #[derive(Serialize)]
+        struct InvalidCompletion {
+            release_approved: bool,
+        }
+        impl EvidenceEvent for InvalidCompletion {
+            const SCHEMA_ID: &'static str = "tritium.quantize.calibrated_model_completed";
+            const VERSION: u16 = 1;
+        }
+        fn reject<E: EvidenceEvent>(event: &E) {
+            let mut recorder = EvidenceRecorder::new(
+                "invalid-calibrated-model",
+                [EventRegistration {
+                    schema: E::SCHEMA_ID,
+                    version: E::VERSION,
+                }],
+            )
+            .unwrap();
+            recorder.emit("quantize", None, 0, event).unwrap();
+            let path = temp_log();
+            std::fs::write(&path, recorder.to_jsonl().unwrap()).unwrap();
+            let verify = run(EvidenceCommand::Verify { path: path.clone() });
+            let view = run(EvidenceCommand::View { path: path.clone() });
+            std::fs::remove_file(path).unwrap();
+            assert!(
+                verify
+                    .unwrap_err()
+                    .to_string()
+                    .contains("calibrated model view")
+            );
+            assert!(
+                view.unwrap_err()
+                    .to_string()
+                    .contains("calibrated model view")
+            );
+        }
+        reject(&InvalidStart {
+            release_approved: true,
+        });
+        reject(&InvalidCompletion {
+            release_approved: true,
+        });
+    }
+
+    #[test]
+    fn verify_and_view_reject_invalid_calibrated_payload_with_valid_hashes() {
+        #[derive(Serialize)]
+        struct InvalidCalibratedFit {
+            release_approved: bool,
+        }
+        impl EvidenceEvent for InvalidCalibratedFit {
+            const SCHEMA_ID: &'static str = "tritium.quantize.calibrated_levels_fitted";
+            const VERSION: u16 = 1;
+        }
+        let mut recorder = EvidenceRecorder::new(
+            "invalid-calibrated-fit",
+            [tritium_evidence::CALIBRATED_LEVELS_FITTED_REGISTRATION],
+        )
+        .unwrap();
+        recorder
+            .emit(
+                "fit",
+                None,
+                0,
+                &InvalidCalibratedFit {
+                    release_approved: true,
+                },
+            )
+            .unwrap();
+        let path = temp_log();
+        std::fs::write(&path, recorder.to_jsonl().unwrap()).unwrap();
+        let verify = run(EvidenceCommand::Verify { path: path.clone() });
+        let view = run(EvidenceCommand::View { path: path.clone() });
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            verify
+                .unwrap_err()
+                .to_string()
+                .contains("calibrated-fit view")
+        );
+        assert!(
+            view.unwrap_err()
+                .to_string()
+                .contains("calibrated-fit view")
+        );
+    }
+
+    #[test]
+    fn verify_and_view_reject_invalid_owner_score_payload_with_valid_hashes() {
+        #[derive(Serialize)]
+        struct InvalidOwnerFit {
+            release_approved: bool,
+        }
+        impl EvidenceEvent for InvalidOwnerFit {
+            const SCHEMA_ID: &'static str = "tritium.quantize.owner_score_levels_fitted";
+            const VERSION: u16 = 1;
+        }
+        let mut recorder = EvidenceRecorder::new(
+            "invalid-owner-fit",
+            [tritium_evidence::OWNER_SCORE_LEVELS_FITTED_REGISTRATION],
+        )
+        .unwrap();
+        recorder
+            .emit(
+                "fit",
+                None,
+                0,
+                &InvalidOwnerFit {
+                    release_approved: true,
+                },
+            )
+            .unwrap();
+        let path = temp_log();
+        std::fs::write(&path, recorder.to_jsonl().unwrap()).unwrap();
+        let verify = run(EvidenceCommand::Verify { path: path.clone() });
+        let view = run(EvidenceCommand::View { path: path.clone() });
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            verify
+                .unwrap_err()
+                .to_string()
+                .contains("owner-score fit view")
+        );
+        assert!(
+            view.unwrap_err()
+                .to_string()
+                .contains("owner-score fit view")
+        );
+    }
+
+    #[test]
+    fn verify_and_view_reject_invalid_fit_payload_even_with_valid_hashes() {
+        use tritium_evidence::DIRECT_LEVELS_FITTED_REGISTRATION;
+        #[derive(Serialize)]
+        struct InvalidFit {
+            release_approved: bool,
+        }
+        impl EvidenceEvent for InvalidFit {
+            const SCHEMA_ID: &'static str = "tritium.quantize.direct_levels_fitted";
+            const VERSION: u16 = 1;
+        }
+        let mut recorder =
+            EvidenceRecorder::new("invalid-fit", [DIRECT_LEVELS_FITTED_REGISTRATION]).unwrap();
+        recorder
+            .emit(
+                "fit",
+                None,
+                0,
+                &InvalidFit {
+                    release_approved: true,
+                },
+            )
+            .unwrap();
+        let path = temp_log();
+        std::fs::write(&path, recorder.to_jsonl().unwrap()).unwrap();
+        let verify = run(EvidenceCommand::Verify { path: path.clone() });
+        let view = run(EvidenceCommand::View { path: path.clone() });
+        std::fs::remove_file(path).unwrap();
+        assert!(verify.unwrap_err().to_string().contains("InvalidPayload"));
+        assert!(view.unwrap_err().to_string().contains("InvalidPayload"));
     }
 
     #[test]
@@ -325,5 +927,34 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(std::fs::read(&path).expect("read sentinel"), b"preserve me");
         std::fs::remove_file(path).expect("remove sentinel");
+    }
+
+    #[test]
+    fn recognized_malformed_quantization_payload_is_not_integrity_success() {
+        #[derive(serde::Serialize)]
+        struct Malformed {
+            unexpected: bool,
+        }
+        impl tritium_evidence::EvidenceEvent for Malformed {
+            const SCHEMA_ID: &'static str = "tritium.quantize.quantization_completed";
+            const VERSION: u16 = 1;
+        }
+        let path = temp_log();
+        let mut recorder = EvidenceRecorder::new(
+            "malformed-model-fit",
+            [tritium_evidence::QUANTIZATION_COMPLETED_REGISTRATION],
+        )
+        .unwrap();
+        recorder
+            .emit("fit", None, 0, &Malformed { unexpected: true })
+            .unwrap();
+        std::fs::write(&path, recorder.to_jsonl().unwrap()).unwrap();
+        for command in [
+            EvidenceCommand::Verify { path: path.clone() },
+            EvidenceCommand::View { path: path.clone() },
+        ] {
+            assert!(run(command).is_err());
+        }
+        std::fs::remove_file(path).unwrap();
     }
 }

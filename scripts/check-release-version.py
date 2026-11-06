@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import argparse
 import re
 import subprocess
 import sys
@@ -28,6 +29,11 @@ def require_equal(actual: Any, expected: str, label: str) -> None:
         raise ValueError(f"{label} is {actual!r}, expected {expected!r}")
 
 
+def require_contains(text: str, expected: str, label: str) -> None:
+    if expected not in text:
+        raise ValueError(f"{label} is missing current release text {expected!r}")
+
+
 def candidate_version(value: Any) -> str:
     if not isinstance(value, str) or RELEASE_PATTERN.fullmatch(value) is None:
         raise ValueError(
@@ -36,11 +42,44 @@ def candidate_version(value: Any) -> str:
     return value
 
 
+def pypi_version(value: str) -> str:
+    """Convert the accepted Cargo prerelease spelling to the wheel spelling."""
+
+    return re.sub(r"-rc\.(\d+)$", r"rc\1", value)
+
+
 def read_json(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise ValueError(f"{path} must contain a JSON object")
     return value
+
+
+def check_document_versions(root: Path, version: str) -> None:
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    require_contains(
+        readme,
+        f"cargo install tritium-cli --version {version}",
+        "README CLI installation command",
+    )
+    require_contains(
+        readme,
+        f"cargo install tritium-serve --version {version}",
+        "README serving installation command",
+    )
+    quantization = (root / "docs/book/src/quantization.md").read_text(
+        encoding="utf-8"
+    )
+    require_contains(
+        quantization,
+        f"--release {version}",
+        "Stage-7 quantization command release version",
+    )
+    chart = (root / "deploy/helm/tritium/Chart.yaml").read_text(
+        encoding="utf-8"
+    )
+    require_contains(chart, f"version: {version}", "Helm chart version")
+    require_contains(chart, f"appVersion: {version}", "Helm chart appVersion")
 
 
 def check(root: Path) -> str:
@@ -100,10 +139,34 @@ def check(root: Path) -> str:
 
     compatibility = read_json(root / "release/compatibility-v1.1.json")
     require_equal(compatibility.get("release"), version, "compatibility release")
+
+    wheel_version = pypi_version(version)
+    tutorial = (root / "docs/book/src/tutorial-pytorch-qat.md").read_text(
+        encoding="utf-8"
+    )
+    require_equal(
+        f"TRITIUM_WHEEL=./dist/pytritium-{wheel_version}-cp39-abi3-PLATFORM.whl"
+        in tutorial,
+        True,
+        "installed-artifact QAT tutorial wheel version",
+    )
+    candidate_guide = (root / "docs/release-candidate.md").read_text(
+        encoding="utf-8"
+    )
+    require_equal(
+        f'"path": "pytritium-{wheel_version}-cp39-abi3-manylinux_2_28_x86_64.whl"'
+        in candidate_guide,
+        True,
+        "release-candidate example wheel version",
+    )
+    check_document_versions(root, version)
     return version
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--json", action="store_true", help="emit the checked version as JSON")
+    args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     try:
         version = check(root)
@@ -117,7 +180,10 @@ def main() -> int:
     ) as error:
         print(f"release-version: FAIL: {error}", file=sys.stderr)
         return 1
-    print(f"release-version: OK: {version}")
+    if args.json:
+        print(json.dumps({"version": version}, sort_keys=True))
+    else:
+        print(f"release-version: OK: {version}")
     return 0
 
 

@@ -7,7 +7,20 @@ use ciborium::value::{CanonicalValue, Value};
 use tritium_core::DType;
 use tritium_schema::BlobId;
 
-use crate::artifact::PackageId;
+use crate::artifact::{PackageHasher, PackageId};
+
+mod cbor;
+#[cfg(test)]
+mod directory_tests;
+mod seek_reader;
+mod sizing;
+pub use sizing::{
+    EncodedSizeBounds, TritBlobSize, TritPackageSizeBounds, trit_package_size_bounds,
+};
+
+pub use seek_reader::{
+    TritBlobVisitError, TritPackageReadError, TritPackageReadLimits, TritPackageReader,
+};
 
 /// `.trit` file magic.
 pub const TRIT_MAGIC: [u8; 8] = *b"TRITIUM\0";
@@ -46,6 +59,22 @@ pub struct TritBlob<'a> {
     pub bytes: &'a [u8],
 }
 
+/// A content-addressed blob range in a caller-owned seekable staging spool.
+/// The writer checks the declared identity against actual bytes; metadata alone
+/// is not trusted. Offsets are relative to the start of the source, not its
+/// current cursor. Bytes outside referenced ranges are not package inputs.
+#[derive(Clone, Debug)]
+pub struct TritSpoolBlob {
+    /// Semantic kind recorded in the package directory.
+    pub kind: TritBlobKind,
+    /// Expected BLAKE3 identity of the exact range.
+    pub id: BlobId,
+    /// Source byte offset.
+    pub offset: u64,
+    /// Exact source byte length.
+    pub length: u64,
+}
+
 /// Indexed package entry for one blob kind.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TritBlobInfo {
@@ -68,6 +97,22 @@ pub struct TritPackage<'a> {
 }
 
 impl<'a> TritPackage<'a> {
+    // Only original immutable directory entries reach this index-based seam.
+    // read_trit_package already checked ranges and hashes; do not rehash every
+    // shared tensor reference in every level.
+    pub(crate) fn indexed_blob(&self, index: usize) -> Result<&'a [u8], TritPackageError> {
+        let info = self
+            .blobs
+            .get(index)
+            .ok_or(TritPackageError::InvalidDirectory)?;
+        let start = as_usize(info.offset)?;
+        let end = start
+            .checked_add(as_usize(info.length)?)
+            .ok_or(TritPackageError::LengthOverflow)?;
+        self.bytes
+            .get(start..end)
+            .ok_or(TritPackageError::InvalidDirectory)
+    }
     /// Borrow the canonical CBOR manifest bytes.
     #[must_use]
     pub const fn manifest(&self) -> &'a [u8] {
@@ -127,6 +172,13 @@ pub enum TritPackageError {
     LengthOverflow,
     /// Manifest or directory exceeds its explicit parser bound.
     MetadataLimitExceeded,
+    /// Complete output exceeds the caller's bound before output allocation.
+    PackageLimitExceeded {
+        /// Computed complete package size, including alignment and metadata.
+        requested: usize,
+        /// Caller-admitted maximum bytes.
+        limit: usize,
+    },
     /// Manifest is not deterministic, definite-length CBOR in the supported profile.
     NonCanonicalManifest,
     /// Directory bytes are malformed or not in canonical form.
@@ -160,6 +212,9 @@ impl fmt::Display for TritPackageError {
             Self::NonZeroReserved => f.write_str("trit package reserved bytes are nonzero"),
             Self::LengthOverflow => f.write_str("trit package length arithmetic overflowed"),
             Self::MetadataLimitExceeded => f.write_str("trit package metadata exceeds its limit"),
+            Self::PackageLimitExceeded { requested, limit } => {
+                write!(f, "trit package needs {requested} bytes, limit is {limit}")
+            }
             Self::NonCanonicalManifest => {
                 f.write_str("trit package manifest is not canonical CBOR")
             }
@@ -190,42 +245,373 @@ pub fn write_trit_package(
     manifest_cbor: &[u8],
     blobs: &[TritBlob<'_>],
 ) -> Result<Vec<u8>, TritPackageError> {
-    if manifest_cbor.len() > MAX_MANIFEST_BYTES || blobs.len() > MAX_BLOBS {
+    write_trit_package_bounded(manifest_cbor, blobs, usize::MAX)
+}
+
+/// Build the same deterministic package with a complete output byte bound.
+/// Metadata/index allocations retain their existing independent limits.
+/// # Errors
+/// Invalid input, overflow, allocation failure, or complete size above `max_bytes`.
+pub fn write_trit_package_bounded(
+    manifest_cbor: &[u8],
+    blobs: &[TritBlob<'_>],
+    max_bytes: usize,
+) -> Result<Vec<u8>, TritPackageError> {
+    let plan = prepare_write(manifest_cbor, blobs, max_bytes)?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(plan.size)
+        .map_err(|_| TritPackageError::AllocationFailed {
+            requested: plan.size,
+        })?;
+    let result: Result<(), core::convert::Infallible> = plan.emit(
+        &mut (),
+        |bytes| {
+            output.extend_from_slice(bytes);
+            Ok(())
+        },
+        |index, _, chunk| chunk(blobs[index].bytes),
+        |_| Ok(()),
+    );
+    match result {
+        Ok(()) => Ok(output),
+        Err(never) => match never {},
+    }
+}
+
+/// Failure admitting or emitting a package to a caller-owned writer.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum TritPackageWriteError {
+    /// Invalid package input or bound; spool mutation may be detected after writes.
+    Package(TritPackageError),
+    /// Destination failed after zero or more bytes; no success identity is returned.
+    Io(std::io::Error),
+    /// Seekable staging source failed; pending destination bytes may remain.
+    Source(std::io::Error),
+}
+impl fmt::Display for TritPackageWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Package(e) => e.fmt(f),
+            Self::Io(e) => write!(f, "trit package destination failed: {e}"),
+            Self::Source(e) => write!(f, "trit package staging source failed: {e}"),
+        }
+    }
+}
+impl std::error::Error for TritPackageWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Package(e) => Some(e),
+            Self::Io(e) => Some(e),
+            Self::Source(e) => Some(e),
+        }
+    }
+}
+
+/// Emit the identical admitted package without retaining a complete output buffer.
+///
+/// Uses the same layout, canonical directory and chunk emitter as the Vec adapter,
+/// and the existing incremental package hasher. All input/complete-size checks
+/// finish before the first destination write. Borrowed inputs and metadata are
+/// retained; this is not full RSS admission or an out-of-core source reader.
+/// Writes at the current destination position, without seeking, flushing, syncing
+/// or publishing. The caller must use an owned pending destination and handle
+/// partial I/O failure before its no-clobber commit point.
+/// # Errors
+/// Package admission leaves the destination untouched. I/O failure may leave
+/// partial output and never returns a successful PackageId.
+pub fn write_trit_package_to(
+    manifest_cbor: &[u8],
+    blobs: &[TritBlob<'_>],
+    max_bytes: usize,
+    destination: &mut impl std::io::Write,
+) -> Result<PackageId, TritPackageWriteError> {
+    let plan =
+        prepare_write(manifest_cbor, blobs, max_bytes).map_err(TritPackageWriteError::Package)?;
+    let mut hash = PackageHasher::new();
+    plan.emit(
+        &mut (),
+        |bytes| {
+            destination.write_all(bytes)?;
+            hash.update(bytes);
+            Ok(())
+        },
+        |index, _, chunk| chunk(blobs[index].bytes),
+        |_| Ok(()),
+    )
+    .map_err(TritPackageWriteError::Io)?;
+    Ok(hash.finalize())
+}
+
+const SPOOL_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Write the identical canonical package from bounded seekable spool ranges.
+///
+/// Complete size/metadata/range admission and every source digest and duplicate
+/// byte comparison finish before destination writes. Unique payloads are hashed
+/// again while emitting, and all ranges are re-verified before the footer. Source
+/// payload reads use at most two fixed 64 KiB buffers, independent of model size;
+/// directory/manifest metadata is still retained under its existing limits.
+///
+/// The caller owns spool immutability, aggregate memory/disk admission and an
+/// unpublished destination. This does not create an atomic source snapshot,
+/// seek/flush/sync the destination or publish it. Source cursor position changes.
+/// # Errors
+/// Admission errors leave the destination untouched. Later source mutation or
+/// source/destination I/O may leave partial bytes, never a success PackageId.
+pub fn write_trit_package_from_spool(
+    manifest_cbor: &[u8],
+    blobs: &[TritSpoolBlob],
+    source: &mut (impl std::io::Read + std::io::Seek),
+    max_bytes: usize,
+    destination: &mut impl std::io::Write,
+) -> Result<PackageId, TritPackageWriteError> {
+    let entries = blob_metadata(manifest_cbor, blobs.len(), |index| {
+        let blob = &blobs[index];
+        Ok(BlobMetadata {
+            id: blob.id,
+            kind: blob.kind.clone(),
+            length: as_usize(blob.length)?,
+        })
+    })
+    .map_err(TritPackageWriteError::Package)?;
+    let plan = prepare_layout(manifest_cbor, &entries, max_bytes)
+        .map_err(TritPackageWriteError::Package)?;
+    let source_len = source
+        .seek(std::io::SeekFrom::End(0))
+        .map_err(TritPackageWriteError::Source)?;
+    for blob in blobs {
+        let end = blob
+            .offset
+            .checked_add(blob.length)
+            .ok_or(TritPackageWriteError::Package(
+                TritPackageError::LengthOverflow,
+            ))?;
+        if end > source_len {
+            return Err(TritPackageWriteError::Package(TritPackageError::Truncated));
+        }
+    }
+    // Allocate no blob-size buffer. Both buffers also serve collision comparisons.
+    let mut state = (source, ([0u8; SPOOL_CHUNK_BYTES], [0u8; SPOOL_CHUNK_BYTES]));
+    verify_spool(state.0, blobs, &mut state.1)?;
+    let mut hash = PackageHasher::new();
+    plan.emit(
+        &mut state,
+        |bytes| {
+            destination
+                .write_all(bytes)
+                .map_err(TritPackageWriteError::Io)?;
+            hash.update(bytes);
+            Ok(())
+        },
+        |index, state, chunk| visit_spool_blob(state.0, &blobs[index], &mut state.1.0, chunk),
+        |state| {
+            // Include non-emitted aliases. A mutation there must not be hidden by dedup.
+            verify_spool(state.0, blobs, &mut state.1)
+        },
+    )?;
+    Ok(hash.finalize())
+}
+
+fn seek_spool(source: &mut impl std::io::Seek, offset: u64) -> Result<(), TritPackageWriteError> {
+    let actual = source
+        .seek(std::io::SeekFrom::Start(offset))
+        .map_err(TritPackageWriteError::Source)?;
+    if actual != offset {
+        return Err(TritPackageWriteError::Package(
+            TritPackageError::InvalidDirectory,
+        ));
+    }
+    Ok(())
+}
+
+fn visit_spool_blob(
+    source: &mut (impl std::io::Read + std::io::Seek),
+    blob: &TritSpoolBlob,
+    scratch: &mut [u8; SPOOL_CHUNK_BYTES],
+    mut chunk: impl FnMut(&[u8]) -> Result<(), TritPackageWriteError>,
+) -> Result<(), TritPackageWriteError> {
+    seek_spool(source, blob.offset)?;
+    let mut remaining = blob.length;
+    let mut hash = blake3::Hasher::new();
+    while remaining != 0 {
+        let count = remaining.min(SPOOL_CHUNK_BYTES as u64) as usize;
+        let bytes = &mut scratch[..count];
+        source
+            .read_exact(bytes)
+            .map_err(TritPackageWriteError::Source)?;
+        hash.update(bytes);
+        chunk(bytes)?;
+        remaining -= count as u64;
+    }
+    if hash.finalize().as_bytes() != blob.id.as_bytes() {
+        return Err(TritPackageWriteError::Package(
+            TritPackageError::BlobDigestMismatch(blob.id),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_spool(
+    source: &mut (impl std::io::Read + std::io::Seek),
+    blobs: &[TritSpoolBlob],
+    scratch: &mut ([u8; SPOOL_CHUNK_BYTES], [u8; SPOOL_CHUNK_BYTES]),
+) -> Result<(), TritPackageWriteError> {
+    let mut unique = BTreeMap::<[u8; 32], usize>::new();
+    for (index, blob) in blobs.iter().enumerate() {
+        visit_spool_blob(source, blob, &mut scratch.0, |_| Ok(()))?;
+        if let Some(&other) = unique.get(blob.id.as_bytes()) {
+            let other = &blobs[other];
+            if other.length != blob.length {
+                return Err(TritPackageWriteError::Package(
+                    TritPackageError::BlobIdentityCollision,
+                ));
+            }
+            if other.offset == blob.offset {
+                continue;
+            }
+            let mut position = 0;
+            while position < blob.length {
+                let count = (blob.length - position).min(SPOOL_CHUNK_BYTES as u64) as usize;
+                seek_spool(source, other.offset + position)?;
+                source
+                    .read_exact(&mut scratch.0[..count])
+                    .map_err(TritPackageWriteError::Source)?;
+                seek_spool(source, blob.offset + position)?;
+                source
+                    .read_exact(&mut scratch.1[..count])
+                    .map_err(TritPackageWriteError::Source)?;
+                if scratch.0[..count] != scratch.1[..count] {
+                    return Err(TritPackageWriteError::Package(
+                        TritPackageError::BlobIdentityCollision,
+                    ));
+                }
+                position += count as u64;
+            }
+        } else {
+            unique.insert(*blob.id.as_bytes(), index);
+        }
+    }
+    Ok(())
+}
+
+struct BlobMetadata {
+    id: BlobId,
+    kind: TritBlobKind,
+    length: usize,
+}
+
+struct PayloadPlan {
+    padding: usize,
+    index: usize,
+}
+
+struct PackageWritePlan<'a> {
+    header: [u8; TRIT_HEADER_BYTES],
+    payloads: Vec<PayloadPlan>,
+    manifest: &'a [u8],
+    directory: Vec<u8>,
+    footer: [u8; FOOTER_BYTES],
+    size: usize,
+}
+impl PackageWritePlan<'_> {
+    fn emit<S, E, C: FnMut(&[u8]) -> Result<(), E>>(
+        &self,
+        source: &mut S,
+        mut chunk: C,
+        mut payload: impl FnMut(usize, &mut S, &mut C) -> Result<(), E>,
+        finish: impl FnOnce(&mut S) -> Result<(), E>,
+    ) -> Result<(), E> {
+        chunk(&self.header)?;
+        let padding = [0u8; TRIT_BLOB_ALIGNMENT];
+        for entry in &self.payloads {
+            chunk(&padding[..entry.padding])?;
+            payload(entry.index, source, &mut chunk)?;
+        }
+        chunk(self.manifest)?;
+        chunk(&self.directory)?;
+        finish(source)?;
+        chunk(&self.footer)
+    }
+}
+
+fn prepare_write<'a>(
+    manifest_cbor: &'a [u8],
+    blobs: &[TritBlob<'a>],
+    max_bytes: usize,
+) -> Result<PackageWritePlan<'a>, TritPackageError> {
+    let entries = blob_metadata(manifest_cbor, blobs.len(), |index| {
+        let blob = &blobs[index];
+        Ok(BlobMetadata {
+            id: BlobId::from_bytes(*blake3::hash(blob.bytes).as_bytes()),
+            kind: blob.kind.clone(),
+            length: blob.bytes.len(),
+        })
+    })?;
+    let mut unique = BTreeMap::<[u8; 32], &[u8]>::new();
+    for (entry, blob) in entries.iter().zip(blobs) {
+        if let Some(existing) = unique.insert(*entry.id.as_bytes(), blob.bytes)
+            && existing != blob.bytes
+        {
+            return Err(TritPackageError::BlobIdentityCollision);
+        }
+    }
+    prepare_layout(manifest_cbor, &entries, max_bytes)
+}
+
+fn blob_metadata(
+    manifest_cbor: &[u8],
+    count: usize,
+    mut entry: impl FnMut(usize) -> Result<BlobMetadata, TritPackageError>,
+) -> Result<Vec<BlobMetadata>, TritPackageError> {
+    if manifest_cbor.len() > MAX_MANIFEST_BYTES || count > MAX_BLOBS {
         return Err(TritPackageError::MetadataLimitExceeded);
     }
     validate_canonical_manifest(manifest_cbor)?;
-    for blob in blobs {
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(count)
+        .map_err(|_| TritPackageError::AllocationFailed { requested: count })?;
+    for index in 0..count {
+        let blob = entry(index)?;
         if let TritBlobKind::Asset(name) = &blob.kind
             && name.is_empty()
         {
             return Err(TritPackageError::EmptyAssetName);
         }
+        entries.push(blob);
     }
+    Ok(entries)
+}
 
-    let mut unique = BTreeMap::<[u8; 32], (&[u8], u64)>::new();
-    for blob in blobs {
-        let digest = *blake3::hash(blob.bytes).as_bytes();
-        let length =
-            u64::try_from(blob.bytes.len()).map_err(|_| TritPackageError::LengthOverflow)?;
-        if let Some((existing, _)) = unique.get(&digest) {
-            if *existing != blob.bytes {
+fn prepare_layout<'a>(
+    manifest_cbor: &'a [u8],
+    blobs: &[BlobMetadata],
+    max_bytes: usize,
+) -> Result<PackageWritePlan<'a>, TritPackageError> {
+    let mut unique = BTreeMap::<[u8; 32], (usize, usize)>::new();
+    for (index, blob) in blobs.iter().enumerate() {
+        let digest = *blob.id.as_bytes();
+        if let Some((_, length)) = unique.get(&digest) {
+            if *length != blob.length {
                 return Err(TritPackageError::BlobIdentityCollision);
             }
         } else {
-            unique.insert(digest, (blob.bytes, length));
+            unique.insert(digest, (index, blob.length));
         }
     }
 
     let mut offsets = BTreeMap::<[u8; 32], u64>::new();
     let mut cursor = TRIT_HEADER_BYTES;
-    for (digest, (payload, _)) in &unique {
+    for (digest, (_, length)) in &unique {
         cursor = align_up(cursor)?;
         offsets.insert(
             *digest,
             u64::try_from(cursor).map_err(|_| TritPackageError::LengthOverflow)?,
         );
         cursor = cursor
-            .checked_add(payload.len())
+            .checked_add(*length)
             .ok_or(TritPackageError::LengthOverflow)?;
     }
     let manifest_offset = cursor;
@@ -240,13 +626,12 @@ pub fn write_trit_package(
             requested: blobs.len(),
         })?;
     for blob in blobs {
-        let id = *blake3::hash(blob.bytes).as_bytes();
+        let id = *blob.id.as_bytes();
         directory_entries.push(TritBlobInfo {
             id: BlobId::from_bytes(id),
             kind: blob.kind.clone(),
             offset: offsets[&id],
-            length: u64::try_from(blob.bytes.len())
-                .map_err(|_| TritPackageError::LengthOverflow)?,
+            length: u64::try_from(blob.length).map_err(|_| TritPackageError::LengthOverflow)?,
         });
     }
     directory_entries.sort_by(|left, right| {
@@ -265,67 +650,150 @@ pub fn write_trit_package(
         .and_then(|value| value.checked_add(FOOTER_BYTES))
         .ok_or(TritPackageError::LengthOverflow)?;
 
-    let mut output = Vec::new();
-    output
-        .try_reserve_exact(cursor)
-        .map_err(|_| TritPackageError::AllocationFailed { requested: cursor })?;
-    output.resize(TRIT_HEADER_BYTES, 0);
-    for (digest, (payload, _)) in unique {
+    if cursor > max_bytes {
+        return Err(TritPackageError::PackageLimitExceeded {
+            requested: cursor,
+            limit: max_bytes,
+        });
+    }
+    let mut payloads = Vec::new();
+    payloads
+        .try_reserve_exact(unique.len())
+        .map_err(|_| TritPackageError::AllocationFailed {
+            requested: unique.len(),
+        })?;
+    let mut position = TRIT_HEADER_BYTES;
+    for (digest, (index, length)) in unique {
         let expected_offset =
             usize::try_from(offsets[&digest]).map_err(|_| TritPackageError::LengthOverflow)?;
-        output.resize(expected_offset, 0);
-        output.extend_from_slice(payload);
+        let pad = expected_offset
+            .checked_sub(position)
+            .ok_or(TritPackageError::InvalidDirectory)?;
+        if pad >= TRIT_BLOB_ALIGNMENT {
+            return Err(TritPackageError::InvalidDirectory);
+        }
+        payloads.push(PayloadPlan {
+            padding: pad,
+            index,
+        });
+        position = expected_offset
+            .checked_add(length)
+            .ok_or(TritPackageError::LengthOverflow)?;
     }
-    if output.len() != manifest_offset {
+    if position != manifest_offset {
         return Err(TritPackageError::InvalidDirectory);
     }
-    output.extend_from_slice(manifest_cbor);
-    if output.len() != directory_offset {
+    position = position
+        .checked_add(manifest_cbor.len())
+        .ok_or(TritPackageError::LengthOverflow)?;
+    if position != directory_offset {
         return Err(TritPackageError::InvalidDirectory);
     }
-    output.extend_from_slice(&directory);
-    output.extend_from_slice(&TRIT_FOOTER_MAGIC);
-    output.extend_from_slice(blake3::hash(manifest_cbor).as_bytes());
-    output.extend_from_slice(blake3::hash(&directory).as_bytes());
-
-    output[..8].copy_from_slice(&TRIT_MAGIC);
-    output[8..10].copy_from_slice(&TRIT_PACKAGE_MAJOR.to_le_bytes());
-    output[10..12].copy_from_slice(&TRIT_PACKAGE_MINOR.to_le_bytes());
-    output[12..16].copy_from_slice(&0u32.to_le_bytes());
-    write_u64(&mut output, 16, manifest_offset)?;
-    write_u64(&mut output, 24, manifest_cbor.len())?;
-    write_u64(&mut output, 32, directory_offset)?;
-    write_u64(&mut output, 40, directory.len())?;
-    Ok(output)
+    let mut header = [0u8; TRIT_HEADER_BYTES];
+    header[..8].copy_from_slice(&TRIT_MAGIC);
+    header[8..10].copy_from_slice(&TRIT_PACKAGE_MAJOR.to_le_bytes());
+    header[10..12].copy_from_slice(&TRIT_PACKAGE_MINOR.to_le_bytes());
+    write_u64(&mut header, 16, manifest_offset)?;
+    write_u64(&mut header, 24, manifest_cbor.len())?;
+    write_u64(&mut header, 32, directory_offset)?;
+    write_u64(&mut header, 40, directory.len())?;
+    let mut footer = [0u8; FOOTER_BYTES];
+    footer[..8].copy_from_slice(&TRIT_FOOTER_MAGIC);
+    footer[8..40].copy_from_slice(blake3::hash(manifest_cbor).as_bytes());
+    footer[40..].copy_from_slice(blake3::hash(&directory).as_bytes());
+    Ok(PackageWritePlan {
+        header,
+        payloads,
+        manifest: manifest_cbor,
+        directory,
+        footer,
+        size: cursor,
+    })
 }
 
 /// Parse and fully validate a `.trit` package held in memory.
 pub fn read_trit_package(bytes: &[u8]) -> Result<TritPackage<'_>, TritPackageError> {
+    read_trit_package_with_manifest_limit(bytes, MAX_MANIFEST_BYTES)
+}
+
+/// Parse through the common validator with a receiving manifest byte ceiling.
+/// Rejects the header's declared manifest size before canonical CBOR allocation.
+/// The directory retains its global ceiling; this is not a full RSS bound.
+/// # Errors
+/// The same format/integrity errors as the default reader, or exceeded metadata caps.
+pub fn read_trit_package_with_manifest_limit(
+    bytes: &[u8],
+    max_manifest_bytes: usize,
+) -> Result<TritPackage<'_>, TritPackageError> {
     if bytes.len() < TRIT_HEADER_BYTES + FOOTER_BYTES {
         return Err(TritPackageError::Truncated);
     }
-    if bytes[..8] != TRIT_MAGIC
-        || bytes[bytes.len() - FOOTER_BYTES..bytes.len() - FOOTER_BYTES + 8] != TRIT_FOOTER_MAGIC
+    let footer = &bytes[bytes.len() - FOOTER_BYTES..];
+    let layout = read_layout(
+        bytes.len(),
+        &bytes[..TRIT_HEADER_BYTES],
+        footer,
+        max_manifest_bytes,
+        MAX_DIRECTORY_BYTES,
+    )?;
+    let manifest = bytes
+        .get(layout.manifest.clone())
+        .ok_or(TritPackageError::Truncated)?;
+    let directory = bytes
+        .get(layout.directory.clone())
+        .ok_or(TritPackageError::Truncated)?;
+    validate_metadata_digests(manifest, directory, footer)?;
+    validate_canonical_manifest(manifest)?;
+    let blobs = decode_directory(directory)?;
+    let mut ranges = bytes;
+    validate_blob_ranges(&mut ranges, layout.manifest.start, &blobs)?;
+    Ok(TritPackage {
+        bytes,
+        manifest,
+        blobs,
+    })
+}
+
+struct PackageReadLayout {
+    manifest: core::ops::Range<usize>,
+    directory: core::ops::Range<usize>,
+}
+
+fn read_layout(
+    length: usize,
+    header: &[u8],
+    footer: &[u8],
+    max_manifest_bytes: usize,
+    max_directory_bytes: usize,
+) -> Result<PackageReadLayout, TritPackageError> {
+    if length < TRIT_HEADER_BYTES + FOOTER_BYTES
+        || header.len() != TRIT_HEADER_BYTES
+        || footer.len() != FOOTER_BYTES
     {
+        return Err(TritPackageError::Truncated);
+    }
+    if header[..8] != TRIT_MAGIC || footer[..8] != TRIT_FOOTER_MAGIC {
         return Err(TritPackageError::BadMagic);
     }
-    let major = read_u16(bytes, 8)?;
-    let minor = read_u16(bytes, 10)?;
+    let major = read_u16(header, 8)?;
+    let minor = read_u16(header, 10)?;
     if major != TRIT_PACKAGE_MAJOR || minor != TRIT_PACKAGE_MINOR {
         return Err(TritPackageError::UnsupportedVersion { major, minor });
     }
-    let features = read_u32(bytes, 12)?;
+    let features = read_u32(header, 12)?;
     if features != 0 {
         return Err(TritPackageError::UnknownRequiredFeatures(features));
     }
-    if bytes[48..TRIT_HEADER_BYTES].iter().any(|byte| *byte != 0) {
+    if header[48..TRIT_HEADER_BYTES].iter().any(|byte| *byte != 0) {
         return Err(TritPackageError::NonZeroReserved);
     }
-    let manifest_offset = as_usize(read_u64(bytes, 16)?)?;
-    let manifest_len = as_usize(read_u64(bytes, 24)?)?;
-    let directory_offset = as_usize(read_u64(bytes, 32)?)?;
-    let directory_len = as_usize(read_u64(bytes, 40)?)?;
-    if manifest_len > MAX_MANIFEST_BYTES || directory_len > MAX_DIRECTORY_BYTES {
+    let manifest_offset = as_usize(read_u64(header, 16)?)?;
+    let manifest_len = as_usize(read_u64(header, 24)?)?;
+    let directory_offset = as_usize(read_u64(header, 32)?)?;
+    let directory_len = as_usize(read_u64(header, 40)?)?;
+    if manifest_len > MAX_MANIFEST_BYTES.min(max_manifest_bytes)
+        || directory_len > MAX_DIRECTORY_BYTES.min(max_directory_bytes)
+    {
         return Err(TritPackageError::MetadataLimitExceeded);
     }
     let manifest_end = manifest_offset
@@ -334,40 +802,59 @@ pub fn read_trit_package(bytes: &[u8]) -> Result<TritPackage<'_>, TritPackageErr
     let directory_end = directory_offset
         .checked_add(directory_len)
         .ok_or(TritPackageError::LengthOverflow)?;
-    let footer_offset = bytes.len() - FOOTER_BYTES;
+    let footer_offset = length - FOOTER_BYTES;
     if manifest_offset < TRIT_HEADER_BYTES
         || manifest_end != directory_offset
         || directory_end != footer_offset
     {
         return Err(TritPackageError::InvalidDirectory);
     }
-    let manifest = bytes
-        .get(manifest_offset..manifest_end)
-        .ok_or(TritPackageError::Truncated)?;
-    let directory = bytes
-        .get(directory_offset..directory_end)
-        .ok_or(TritPackageError::Truncated)?;
-    let footer = &bytes[footer_offset + 8..];
-    if blake3::hash(manifest).as_bytes() != &footer[..32]
-        || blake3::hash(directory).as_bytes() != &footer[32..]
-    {
-        return Err(TritPackageError::DigestMismatch);
-    }
-    validate_canonical_manifest(manifest)?;
-    let blobs = decode_directory(directory)?;
-    validate_blob_ranges(bytes, manifest_offset, &blobs)?;
-    Ok(TritPackage {
-        bytes,
-        manifest,
-        blobs,
+    Ok(PackageReadLayout {
+        manifest: manifest_offset..manifest_end,
+        directory: directory_offset..directory_end,
     })
 }
 
-fn validate_blob_ranges(
-    package: &[u8],
+fn validate_metadata_digests(
+    manifest: &[u8],
+    directory: &[u8],
+    footer: &[u8],
+) -> Result<(), TritPackageError> {
+    if blake3::hash(manifest).as_bytes() != &footer[8..40]
+        || blake3::hash(directory).as_bytes() != &footer[40..]
+    {
+        return Err(TritPackageError::DigestMismatch);
+    }
+    Ok(())
+}
+
+// One invariant owner, with borrowed and seek-backed range adapters. Neither
+// adapter defines independent directory, geometry or identity semantics.
+trait PackageRanges {
+    type Error: From<TritPackageError>;
+    fn digest(&mut self, range: core::ops::Range<usize>) -> Result<[u8; 32], Self::Error>;
+    fn is_zero(&mut self, range: core::ops::Range<usize>) -> Result<bool, Self::Error>;
+}
+
+impl PackageRanges for &[u8] {
+    type Error = TritPackageError;
+
+    fn digest(&mut self, range: core::ops::Range<usize>) -> Result<[u8; 32], Self::Error> {
+        let payload = self.get(range).ok_or(TritPackageError::InvalidDirectory)?;
+        Ok(*blake3::hash(payload).as_bytes())
+    }
+
+    fn is_zero(&mut self, range: core::ops::Range<usize>) -> Result<bool, Self::Error> {
+        let padding = self.get(range).ok_or(TritPackageError::InvalidDirectory)?;
+        Ok(padding.iter().all(|byte| *byte == 0))
+    }
+}
+
+fn validate_blob_ranges<S: PackageRanges>(
+    package: &mut S,
     manifest_offset: usize,
     blobs: &[TritBlobInfo],
-) -> Result<(), TritPackageError> {
+) -> Result<(), S::Error> {
     let mut unique = BTreeMap::<[u8; 32], (usize, usize)>::new();
     for blob in blobs {
         let offset = as_usize(blob.offset)?;
@@ -377,34 +864,28 @@ fn validate_blob_ranges(
             .ok_or(TritPackageError::LengthOverflow)?;
         if offset < TRIT_HEADER_BYTES || offset % TRIT_BLOB_ALIGNMENT != 0 || end > manifest_offset
         {
-            return Err(TritPackageError::InvalidDirectory);
+            return Err(TritPackageError::InvalidDirectory.into());
         }
         if let Some(previous) = unique.insert(*blob.id.as_bytes(), (offset, end))
             && previous != (offset, end)
         {
-            return Err(TritPackageError::InvalidDirectory);
+            return Err(TritPackageError::InvalidDirectory.into());
         }
-        let payload = package
-            .get(offset..end)
-            .ok_or(TritPackageError::InvalidDirectory)?;
-        if blake3::hash(payload).as_bytes() != blob.id.as_bytes() {
-            return Err(TritPackageError::BlobDigestMismatch(blob.id));
+        if &package.digest(offset..end)? != blob.id.as_bytes() {
+            return Err(TritPackageError::BlobDigestMismatch(blob.id).into());
         }
     }
     let mut ranges: Vec<(usize, usize)> = unique.values().copied().collect();
     ranges.sort_unstable();
     let mut previous_end = TRIT_HEADER_BYTES;
     for (start, end) in ranges {
-        if start < previous_end || package[previous_end..start].iter().any(|byte| *byte != 0) {
-            return Err(TritPackageError::InvalidDirectory);
+        if start < previous_end || !package.is_zero(previous_end..start)? {
+            return Err(TritPackageError::InvalidDirectory.into());
         }
         previous_end = end;
     }
-    if package[previous_end..manifest_offset]
-        .iter()
-        .any(|byte| *byte != 0)
-    {
-        return Err(TritPackageError::InvalidDirectory);
+    if !package.is_zero(previous_end..manifest_offset)? {
+        return Err(TritPackageError::InvalidDirectory.into());
     }
     Ok(())
 }
@@ -413,23 +894,87 @@ fn encode_directory(blobs: &[TritBlobInfo]) -> Result<Vec<u8>, TritPackageError>
     let entries = blobs
         .iter()
         .map(|blob| {
-            let (kind, aux) = encode_kind(&blob.kind);
-            Value::Array(vec![
-                Value::Bytes(blob.id.as_bytes().to_vec()),
-                Value::Integer(kind.into()),
-                aux,
-                Value::Integer(blob.offset.into()),
-                Value::Integer(blob.length.into()),
-            ])
+            let mut fields = directory_fields(&blob.kind, blob.offset, blob.length);
+            fields.insert(0, Value::Bytes(blob.id.as_bytes().to_vec()));
+            Value::Array(fields)
         })
         .collect();
-    encode_cbor_value(&Value::Array(vec![
+    encode_cbor_value(&directory_value(entries))
+}
+
+fn directory_fields(kind: &TritBlobKind, offset: u64, length: u64) -> Vec<Value> {
+    let (kind, aux) = encode_kind(kind);
+    vec![
+        Value::Integer(kind.into()),
+        aux,
+        Value::Integer(offset.into()),
+        Value::Integer(length.into()),
+    ]
+}
+fn directory_value(entries: Vec<Value>) -> Value {
+    Value::Array(vec![
         Value::Integer(DIRECTORY_VERSION.into()),
         Value::Array(entries),
-    ]))
+    ])
 }
 
 fn decode_directory(bytes: &[u8]) -> Result<Vec<TritBlobInfo>, TritPackageError> {
+    if let Some(blobs) = decode_borrowed_directory(bytes)? {
+        return Ok(blobs);
+    }
+    // Preserve the reference codec's original diagnostic precedence for
+    // oversized, malformed or outside-fast-profile inputs. This optimization
+    // does not claim complete adversarial metadata allocation admission.
+    decode_reference_directory(bytes)
+}
+
+fn decode_borrowed_directory(bytes: &[u8]) -> Result<Option<Vec<TritBlobInfo>>, TritPackageError> {
+    let Ok(mut entries) = cbor::Directory::new(bytes) else {
+        return Ok(None);
+    };
+    if entries.len() > MAX_BLOBS {
+        return Ok(None);
+    }
+    let mut blobs = Vec::new();
+    blobs
+        .try_reserve_exact(entries.len())
+        .map_err(|_| TritPackageError::AllocationFailed {
+            requested: entries.len(),
+        })?;
+    loop {
+        let entry = match entries.next() {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(_) => return Ok(None),
+        };
+        let kind = match (entry.kind, entry.aux) {
+            (0, None) => TritBlobKind::AdditiveTensor,
+            (1, Some(name)) => match dtype_from_str(name) {
+                Ok(dtype) => TritBlobKind::DenseTensor(dtype),
+                Err(_) => return Ok(None),
+            },
+            (2, Some(name)) if !name.is_empty() => TritBlobKind::Asset(name.into()),
+            _ => return Ok(None),
+        };
+        blobs.push(TritBlobInfo {
+            id: BlobId::from_bytes(*entry.id),
+            kind,
+            offset: entry.offset,
+            length: entry.length,
+        });
+    }
+    if blobs
+        .windows(2)
+        .any(|pair| compare_blob_entries(&pair[0], &pair[1]).is_ge())
+    {
+        return Ok(None);
+    }
+    // Complete canonical preflight and the exact directory tuple/kind grammar
+    // establish the reference re-encoding, without allocating those bytes.
+    Ok(Some(blobs))
+}
+
+fn decode_reference_directory(bytes: &[u8]) -> Result<Vec<TritBlobInfo>, TritPackageError> {
     let value: Value =
         ciborium::de::from_reader(bytes).map_err(|_| TritPackageError::InvalidDirectory)?;
     if encode_cbor_value(&value)? != bytes {
@@ -521,7 +1066,55 @@ fn dtype_from_str(name: &str) -> Result<DType, TritPackageError> {
     }
 }
 
-fn validate_canonical_manifest(bytes: &[u8]) -> Result<(), TritPackageError> {
+pub(crate) fn validate_canonical_manifest(bytes: &[u8]) -> Result<(), TritPackageError> {
+    match cbor::validate(bytes) {
+        Ok(()) => Ok(()),
+        // Preserve the reference codec's tag and compound-key semantics. Typed
+        // model metadata has neither; its count arrays take the borrowed path.
+        Err(cbor::ScanError::Reference) => parse_canonical_manifest(bytes).map(|_| ()),
+        Err(cbor::ScanError::Invalid) => Err(TritPackageError::NonCanonicalManifest),
+    }
+}
+
+/// Serialize through the schema's derived serializer, without a Value per item.
+/// Only checked map spans are retained during in-place canonical ordering.
+pub(crate) fn encode_borrowed_manifest<T: serde::Serialize>(
+    manifest: &T,
+) -> Result<Option<Vec<u8>>, TritPackageError> {
+    encode_borrowed_metadata(manifest, MAX_MANIFEST_BYTES)
+}
+
+// Semantic metadata historically has no manifest-size ceiling. Callers select
+// the existing limit, without widening package or typed-manifest admission.
+pub(crate) fn encode_borrowed_metadata<T: serde::Serialize>(
+    metadata: &T,
+    limit: usize,
+) -> Result<Option<Vec<u8>>, TritPackageError> {
+    let mut output = cbor::CappedOutput::with_limit(limit);
+    if ciborium::ser::into_writer(metadata, &mut output).is_err() {
+        return Err(if output.exceeded {
+            TritPackageError::NonCanonicalManifest
+        } else {
+            TritPackageError::InvalidDirectory
+        });
+    }
+    let canonical = if limit == MAX_MANIFEST_BYTES {
+        cbor::canonicalize(&mut output.bytes)
+    } else {
+        cbor::canonicalize_with_limit(&mut output.bytes, limit)
+    };
+    match canonical {
+        Ok(()) => {
+            cbor::validate_with_limit(&output.bytes, limit)
+                .map_err(|_| TritPackageError::NonCanonicalManifest)?;
+            Ok(Some(output.bytes))
+        }
+        Err(cbor::ScanError::Reference) => Ok(None),
+        Err(cbor::ScanError::Invalid) => Err(TritPackageError::NonCanonicalManifest),
+    }
+}
+
+pub(crate) fn parse_canonical_manifest(bytes: &[u8]) -> Result<Value, TritPackageError> {
     if bytes.is_empty() || bytes.len() > MAX_MANIFEST_BYTES {
         return Err(TritPackageError::NonCanonicalManifest);
     }
@@ -531,10 +1124,10 @@ fn validate_canonical_manifest(bytes: &[u8]) -> Result<(), TritPackageError> {
     if encode_cbor_value(&value)? != bytes {
         return Err(TritPackageError::NonCanonicalManifest);
     }
-    Ok(())
+    Ok(value)
 }
 
-fn canonicalize_value(value: &mut Value, depth: usize) -> Result<(), TritPackageError> {
+pub(crate) fn canonicalize_value(value: &mut Value, depth: usize) -> Result<(), TritPackageError> {
     if depth > 64 {
         return Err(TritPackageError::NonCanonicalManifest);
     }
@@ -561,7 +1154,7 @@ fn canonicalize_value(value: &mut Value, depth: usize) -> Result<(), TritPackage
     Ok(())
 }
 
-fn encode_cbor_value(value: &Value) -> Result<Vec<u8>, TritPackageError> {
+pub(crate) fn encode_cbor_value(value: &Value) -> Result<Vec<u8>, TritPackageError> {
     let mut bytes = Vec::new();
     ciborium::ser::into_writer(value, &mut bytes)
         .map_err(|_| TritPackageError::InvalidDirectory)?;

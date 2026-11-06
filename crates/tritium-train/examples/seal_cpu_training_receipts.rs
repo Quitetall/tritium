@@ -1,28 +1,61 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 
-use tritium_spec::TrainingVectorSetV3;
-use tritium_testkit::seal_training_receipts;
-use tritium_train::CpuTrainBackendV1;
+use tritium_spec::{TrainBackendV1, TrainingVectorSetV2, TrainingVectorSetV3};
+use tritium_testkit::{TrainingVectorCorpus, seal_training_receipts};
+use tritium_train::{CpuTrainBackendV1, CpuTrainBackendV2};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let vectors = TrainingVectorSetV3::parse_json(include_bytes!(
-        "../../../spec/training/v3/vectors/v3.json"
-    ))?;
-    let output_dir = std::env::args_os()
-        .nth(1)
-        .ok_or("usage: seal_cpu_training_receipts OUTPUT_DIR")?;
-    let backend = CpuTrainBackendV1::new();
-    let sealed = seal_training_receipts(&backend, &vectors)?;
-    fs::create_dir_all(&output_dir)?;
-    let destination =
-        std::path::Path::new(&output_dir).join(format!("{}.json", sealed.digest_hex()));
+    let mut arguments = std::env::args_os().skip(1);
+    let first = arguments
+        .next()
+        .ok_or("usage: seal_cpu_training_receipts [--schema v2|v3] OUTPUT_DIR")?;
+    let (schema, output_dir) = if first == "--schema" {
+        let schema = arguments
+            .next()
+            .ok_or("--schema requires v2 or v3")?
+            .into_string()
+            .map_err(|_| "schema must be UTF-8")?;
+        let output_dir = arguments.next().ok_or("--schema requires an OUTPUT_DIR")?;
+        (schema, output_dir)
+    } else {
+        ("v3".to_owned(), first)
+    };
+    if arguments.next().is_some() {
+        return Err("unexpected arguments".into());
+    }
+    match schema.as_str() {
+        "v2" => {
+            let vectors = TrainingVectorSetV2::parse_json(include_bytes!(
+                "../../../spec/training/v2/vectors/v2.json"
+            ))?;
+            seal_and_write(&CpuTrainBackendV2::new(), &vectors, &output_dir)
+        }
+        "v3" => {
+            let vectors = TrainingVectorSetV3::parse_json(include_bytes!(
+                "../../../spec/training/v3/vectors/v3.json"
+            ))?;
+            seal_and_write(&CpuTrainBackendV1::new(), &vectors, &output_dir)
+        }
+        _ => Err("schema must be v2 or v3".into()),
+    }
+}
+
+fn seal_and_write(
+    backend: &impl TrainBackendV1,
+    vectors: &impl TrainingVectorCorpus,
+    output_dir: &std::ffi::OsStr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let sealed = seal_training_receipts(backend, vectors)?;
+    fs::create_dir_all(output_dir)?;
+    let output_dir = std::path::Path::new(output_dir);
+    let destination = output_dir.join(format!("{}.json", sealed.digest_hex()));
     if destination.exists() {
         if fs::read(&destination)? != sealed.bytes() {
             return Err("content-addressed receipt path contains different bytes".into());
         }
     } else {
-        let temporary = std::path::Path::new(&output_dir).join(format!(
+        let temporary = output_dir.join(format!(
             ".{}.{}.{}.tmp",
             sealed.digest_hex(),
             std::process::id(),

@@ -2,7 +2,8 @@
 //!
 //! # Why a second entropy coder, when [`crate::write_entropy_transport`] exists
 //!
-//! The transport Huffman-codes **bytes** of an already-packed artifact. A TQ2_0 byte holds four
+//! The outer transport selects raw, Huffman, or rANS over **bytes** of an
+//! already-packed artifact. A TQ2_0 byte holds four
 //! trits of *one plane* for four *different* weights, so a byte coder sees the wrong symbol
 //! boundaries: it can learn that a plane is mostly zero, and it collapses block padding, but it
 //! cannot see how one weight's digits relate across planes.

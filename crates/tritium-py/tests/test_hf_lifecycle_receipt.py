@@ -2,6 +2,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+import tritium
 
 from tritium.torch.hf_lifecycle import (
     run_hf_lifecycle,
@@ -14,12 +17,17 @@ class HuggingFaceLifecycleReceiptTests(unittest.TestCase):
         wheel = root / "pytritium-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
         wheel.write_bytes(b"exact candidate wheel")
         output = root / "hf-lifecycle"
+        # These are portable receipt/tree tests with synthetic wheel bytes,
+        # not installed-candidate qualification. Exercise provenance separately.
+        self.guard = patch(
+            "tritium.torch.hf_lifecycle._installed_distribution",
+            return_value=("1.1.0rc0", Path(tritium.__file__).resolve()),
+        )
+        self.guard.start()
+        self.addCleanup(self.guard.stop)
         receipt = run_hf_lifecycle(
-            output,
-            wheel_artifact=wheel,
-            source_revision="a" * 40,
-            release="1.1.0-rc.0",
-            run_id="hf-lifecycle-run-1",
+            output, wheel_artifact=wheel, source_revision="a" * 40,
+            release="1.1.0-rc.0", run_id="hf-lifecycle-run-1",
         )
         path = output / "receipt.json"
         path.write_text(json.dumps(receipt), encoding="utf-8")

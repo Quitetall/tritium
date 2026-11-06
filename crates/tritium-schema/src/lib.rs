@@ -11,10 +11,105 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+#[cfg(feature = "alloc")]
+mod model;
+#[cfg(feature = "alloc")]
+pub use model::*;
+
+#[cfg(feature = "alloc")]
+mod model_import;
+#[cfg(feature = "alloc")]
+pub use model_import::*;
+
+#[cfg(feature = "alloc")]
+mod semantic;
+#[cfg(feature = "alloc")]
+pub use semantic::*;
+
+#[cfg(feature = "alloc")]
+mod load;
+#[cfg(feature = "alloc")]
+pub use load::*;
+
+#[cfg(feature = "alloc")]
+mod fit;
+#[cfg(feature = "alloc")]
+pub use fit::*;
+
+#[cfg(feature = "alloc")]
+mod fit_observation;
+#[cfg(feature = "alloc")]
+pub use fit_observation::*;
+
+#[cfg(feature = "alloc")]
+mod quant_plan;
+#[cfg(feature = "alloc")]
+pub use quant_plan::*;
+
+#[cfg(feature = "alloc")]
+mod salience_transform;
+#[cfg(feature = "alloc")]
+pub use salience_transform::*;
+
+#[cfg(feature = "alloc")]
+mod salience_stage;
+#[cfg(feature = "alloc")]
+pub use salience_stage::*;
+
+#[cfg(feature = "alloc")]
+mod salience_conversion;
+#[cfg(feature = "alloc")]
+pub use salience_conversion::*;
+
+#[cfg(feature = "alloc")]
+mod calibration;
+#[cfg(feature = "alloc")]
+pub use calibration::*;
+
+#[cfg(feature = "alloc")]
+mod owner_score_cache;
+#[cfg(feature = "alloc")]
+pub use owner_score_cache::*;
+
+#[cfg(feature = "alloc")]
+mod owner_score_fit;
+#[cfg(feature = "alloc")]
+pub use owner_score_fit::*;
+
+#[cfg(feature = "alloc")]
+mod owner_quant_plan;
+#[cfg(feature = "alloc")]
+pub use owner_quant_plan::*;
+
+#[cfg(feature = "alloc")]
+mod calibration_capture;
+#[cfg(feature = "alloc")]
+pub use calibration_capture::*;
+
+#[cfg(feature = "alloc")]
+mod original_salience_capture;
+#[cfg(feature = "alloc")]
+pub use original_salience_capture::*;
+
+#[cfg(feature = "alloc")]
+mod calibrated_fit_observation;
+#[cfg(feature = "alloc")]
+pub use calibrated_fit_observation::*;
+
+#[cfg(feature = "alloc")]
+mod calibrated_quant_plan;
+#[cfg(feature = "alloc")]
+pub use calibrated_quant_plan::*;
+
 /// Precision used to store additive plane scales.
 #[non_exhaustive]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd"))]
 pub enum ScalePrecision {
     /// IEEE binary16.
     F16,
@@ -28,6 +123,11 @@ pub enum ScalePrecision {
 #[non_exhaustive]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd"))]
 pub enum ScaleAnchor {
     /// One scale per declared group.
     Group,
@@ -43,6 +143,11 @@ pub enum ScaleAnchor {
 #[non_exhaustive]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
 pub enum PlaneRelation {
     /// Every plane has an independently fitted scale.
     Free,
@@ -58,6 +163,11 @@ pub enum PlaneRelation {
 /// Scale law represented as orthogonal anchor, relation, and storage precision.
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
 pub struct ScaleLaw {
     /// Scale grouping axis.
     pub anchor: ScaleAnchor,
@@ -136,10 +246,97 @@ pub fn admitted_law(law: ScaleLaw) -> Option<&'static AdmittedLaw> {
     ADMITTED_LAWS.iter().find(|admitted| admitted.law == law)
 }
 
+/// Execution groups supported by the initial admitted laws.
+///
+/// G64/G256 remain serializable geometry, not execution admission. Adding a
+/// group requires frozen vectors and backend parity under ADR 0044 D4/D9.
+#[must_use]
+pub fn admitted_execution_group(law: ScaleLaw, group: u16) -> bool {
+    admitted_law(law).is_some() && matches!(group, 32 | 128)
+}
+
+/// How a backend executes one semantic tensor combination (ADR 0044 D8/D9).
+#[non_exhaustive]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum TensorExecution {
+    /// Executes additive coefficients directly, or an originally dense tensor.
+    /// This does not assert SIMD, accelerator speed, or empirical qualification.
+    Native,
+    /// Materializes an additive tensor as dense weights for plain GEMM.
+    /// Requires explicit evidence and memory admission before production use.
+    Emulated,
+}
+
+/// Declared execution and owned payload size for a specific semantic tensor.
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(
+    any(feature = "serde", feature = "schema-gen"),
+    serde(crate = "serde_nostd", deny_unknown_fields)
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct TensorCaps {
+    /// Direct execution or dense emulation; never inferred from ISA flags.
+    pub execution: TensorExecution,
+    /// Bytes reported by the uploaded buffer, excluding allocator/handle
+    /// overhead, scratch, KV, other tensors, and total model residency.
+    pub payload_bytes: u64,
+}
+
+/// Successful checked upload observation, not a physical-memory verdict.
+#[cfg(feature = "alloc")]
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(
+    any(feature = "serde", feature = "schema-gen"),
+    serde(crate = "serde_nostd", deny_unknown_fields)
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TensorUploaded {
+    /// Caller-selected tensor name within the model or run.
+    pub tensor: alloc::string::String,
+    /// Logical execution adapter identity.
+    pub backend: alloc::string::String,
+    /// Backend-reported physical device identity, which may be unknown.
+    pub physical_device: alloc::string::String,
+    /// Explicit execution tier and actual checked owned payload bytes.
+    pub caps: TensorCaps,
+    /// Decoded scalar input bytes; never packed disk bytes or a savings claim.
+    pub decoded_source_bytes: u64,
+}
+
+/// Pre-upload policy for a single semantic tensor payload.
+#[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub struct TensorUploadPolicy {
+    /// Reject dense emulation before any upload takes place.
+    pub native_only: bool,
+    /// Maximum owned payload bytes; `None` leaves this per-tensor limit unset.
+    /// This is not complete physical/model-memory admission.
+    pub max_payload_bytes: Option<u64>,
+}
+
 /// Input-axis transform associated with an additive tensor.
 #[non_exhaustive]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
 pub enum Basis {
     /// No transform.
     Identity,
@@ -163,10 +360,15 @@ pub enum Basis {
 #[non_exhaustive]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd"))]
 pub enum PlaneCodec {
     /// Two-bit ternary packing.
     D2,
-    /// Three-bit ternary packing.
+    /// Base-3 packing of five ternary coefficients per byte.
     B3,
     /// Structured sparse 3-of-4 encoding.
     S34,
@@ -176,6 +378,11 @@ pub enum PlaneCodec {
 #[non_exhaustive]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
 pub enum Transport {
     /// Store codec bytes directly.
     Raw,
@@ -190,6 +397,11 @@ pub enum Transport {
 #[non_exhaustive]
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd"))]
 pub enum PlaneAllocation {
     /// Every tile uses the tensor's maximum plane count.
     Uniform,
@@ -203,6 +415,11 @@ pub const ADDITIVE_TILE_SIZE: u16 = 256;
 /// Semantic layout parameters for an additive tensor.
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
 pub struct AdditiveLayout {
     /// Number of matrix rows.
     pub rows: u64,
@@ -229,6 +446,11 @@ pub struct AdditiveLayout {
 /// Stable identifier for a schema family and its version.
 #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd", deny_unknown_fields))]
 pub struct SchemaId {
     /// Major version; incompatible schemas require a new major version.
     pub major: u16,
@@ -236,32 +458,67 @@ pub struct SchemaId {
     pub minor: u16,
 }
 
+/// Primitive digest encoding shared by identity types and nonidentity size views.
+pub type DigestBytes = [u8; 32];
+
 macro_rules! digest_id {
     ($name:ident, $doc:literal) => {
         #[doc = $doc]
         #[cfg_attr(feature = "schema-gen", derive(schemars::JsonSchema))]
         #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-        pub struct $name([u8; 32]);
+        #[cfg_attr(
+            feature = "serde",
+            derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+        )]
+        #[cfg_attr(feature = "serde", serde(crate = "serde_nostd"))]
+        pub struct $name(DigestBytes);
 
         impl $name {
             /// Construct from a BLAKE3-sized digest byte array.
             #[must_use]
-            pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+            pub const fn from_bytes(bytes: DigestBytes) -> Self {
                 Self(bytes)
             }
 
             /// Borrow the digest bytes.
             #[must_use]
-            pub const fn as_bytes(&self) -> &[u8; 32] {
+            pub const fn as_bytes(&self) -> &DigestBytes {
                 &self.0
             }
         }
     };
 }
 
-digest_id!(ModelId, "Content identity for a Tritium model manifest.");
+digest_id!(
+    ModelId,
+    "Content identity for one Tritium model level, not its package or provenance."
+);
 digest_id!(PackageId, "Content identity for a Tritium package.");
 digest_id!(BlobId, "Content identity for stored tensor or asset bytes.");
+digest_id!(
+    OriginalSourceId,
+    "Candidate identity of original named tensor/asset content, not fitted content or provenance."
+);
+digest_id!(
+    CalibrationCacheId,
+    "Candidate identity of finalized calibration payloads and context, not independent model provenance."
+);
+digest_id!(
+    OwnerScoreCacheId,
+    "Candidate identity of one scalar-window owner snapshot, not a fit or qualification."
+);
+digest_id!(
+    OwnerMetricStreamId,
+    "Identity of ordered owner windows, weights and damping."
+);
+digest_id!(
+    OwnerRowMetricId,
+    "Identity of one completed owner row metric, not a qualification."
+);
+digest_id!(
+    OwnerMetricRowsId,
+    "Identity of a complete ordered owner row metric inventory."
+);
 digest_id!(
     SemanticTensorDigest,
     "Identity for a tensor's semantic values independent of its container."
@@ -371,12 +628,11 @@ pub enum LayoutError {
 }
 
 impl AdditiveLayout {
-    /// Validate geometry and local invariants that do not depend on law admission.
+    /// Validate geometry, basis, transport and the exact admitted scale law.
     ///
-    /// This intentionally does not decide whether `law` is admitted or whether
-    /// `max_planes` is within that law's cap; those checks require the
-    /// evidence-backed `ADMITTED_LAWS` registry introduced in the next schema
-    /// step.
+    /// The plane count is checked against this law's own admission record, not
+    /// a shared global cap. Structural validation is not backend conformance
+    /// or empirical model-quality qualification.
     pub fn validate(&self) -> Result<(), LayoutError> {
         if self.rows == 0 || self.cols == 0 {
             return Err(LayoutError::EmptyDimensions);
@@ -424,6 +680,21 @@ mod tests {
         ADDITIVE_TILE_SIZE, ADMITTED_LAWS, AdditiveLayout, Basis, LayoutError, PlaneAllocation,
         PlaneCodec, PlaneRelation, ScaleAnchor, ScaleLaw, ScalePrecision, Transport, admitted_law,
     };
+
+    #[test]
+    fn execution_group_admission_is_not_serializable_geometry() {
+        for admitted in ADMITTED_LAWS {
+            for group in [32, 128] {
+                assert!(super::admitted_execution_group(admitted.law, group));
+            }
+            for group in [0, 64, 256, 512] {
+                assert!(!super::admitted_execution_group(admitted.law, group));
+            }
+        }
+        let mut unadmitted = ADMITTED_LAWS[0].law;
+        unadmitted.anchor = ScaleAnchor::Row;
+        assert!(!super::admitted_execution_group(unadmitted, 32));
+    }
 
     fn valid_layout() -> AdditiveLayout {
         AdditiveLayout {

@@ -6,22 +6,47 @@
 
 #[cfg(feature = "tokenizer")]
 mod bpe_tokenizer;
+#[cfg(feature = "tokenizer")]
+mod chat_renderer;
 mod hf;
 #[cfg(feature = "tokenizer")]
 mod hf_json_tokenizer;
 mod hf_shards;
+#[cfg(feature = "tokenizer")]
+mod host;
+mod limits;
+#[cfg(feature = "tokenizer")]
+mod load_config;
 mod qwen35;
 mod qwen35_execution;
 mod qwen35_hf;
 mod qwen35_hf_source;
 mod qwen35_mtp;
 mod qwen35_mtp_oracle;
+mod qwen35_reference;
 mod qwen35_salt_v2;
+mod qwen35_trit;
+#[cfg(feature = "tokenizer")]
+pub(crate) mod resident;
+#[cfg(feature = "tokenizer")]
+mod resident_metadata;
+#[cfg(feature = "tokenizer")]
+mod resources;
+#[cfg(feature = "tokenizer")]
+mod retained;
+#[cfg(feature = "tokenizer")]
+mod retained_plan;
 mod runner;
 #[cfg(feature = "cuda")]
 mod salt_v2;
+mod source;
+mod staged_calibration;
+mod standard;
+#[cfg(feature = "tokenizer")]
+mod tensor_stream;
 mod tokenizer;
 mod training_salt;
+mod unified;
 mod weights;
 
 #[cfg(feature = "tokenizer")]
@@ -33,12 +58,16 @@ pub use bpe_tokenizer::GgufBpeTokenizer;
 pub(crate) use hf::NameSchema;
 #[cfg(feature = "tokenizer")]
 pub use hf_json_tokenizer::HfJsonTokenizer;
+pub use limits::{CacheAdmission, StreamLimits};
+#[cfg(feature = "tokenizer")]
+pub use load_config::TypedLoadConfig;
 pub use qwen35::{
     Qwen35TextCache, Qwen35TextLayerWeights, Qwen35TextMixerWeights, Qwen35TextOutput,
     Qwen35TextRunner, Qwen35TextWeights,
 };
 pub use qwen35_execution::{
-    Qwen35ExecutionOutputBatch, Qwen35ExecutionVisitError, Qwen35UntrustedRuntimeTranscript,
+    Qwen35ExecutionBlockOutputBatch, Qwen35ExecutionOutputBatch, Qwen35ExecutionVisitError,
+    Qwen35UntrustedOutputScopeTranscript, Qwen35UntrustedRuntimeTranscript,
 };
 pub use qwen35_hf::{
     Qwen35HfLanguageModel, Qwen35HfLanguageMtpModel, Qwen35HfLanguageMtpReceipt,
@@ -56,14 +85,29 @@ pub use qwen35_mtp::{
     Qwen35MtpOracleEvidenceClass, Qwen35MtpOutput, Qwen35MtpParityReceipt, Qwen35MtpRunner,
     Qwen35MtpStatus, Qwen35MtpWeights, UnverifiedQwen35Mtp,
 };
+pub use qwen35_reference::{QWEN35_REFERENCE_STATE_MAX_BYTES, Qwen35ReferenceState};
 pub use qwen35_salt_v2::{
     Qwen35SaltV2BundleAdmission, Qwen35SaltV2LanguageMtpModel, Qwen35SaltV2LoadReceipt,
+};
+pub use qwen35_trit::Qwen35TritReadLimits;
+#[cfg(feature = "tokenizer")]
+pub use resources::{ModelLoadResources, ModelResourceAdmission};
+#[cfg(feature = "tokenizer")]
+pub use retained_plan::{
+    ModelLoadPlan, StreamedModelLoadPlan, TensorLoadPlan, inspect_trit_file,
+    inspect_trit_file_streamed, inspect_trit_file_streamed_resident,
 };
 pub use runner::{ForwardDump, ModelRunner};
 #[cfg(feature = "cuda")]
 pub use salt_v2::{
     SaltV2LoadedTensorReceipt, SaltV2ModelAllocationReceipt, SaltV2PreservedTensorReceipt,
 };
+pub use source::ModelSource;
+#[cfg(feature = "tokenizer")]
+pub use source::{
+    LoadedModel, load, load_streamed_with_resources, load_with_limits, load_with_resources,
+};
+pub(crate) use staged_calibration::{dense_source_weights, dense_stage_weights};
 pub use tokenizer::Tokenizer;
 pub use training_salt::{
     TRAINING_SALT_COMPLETED_STEP_KEY, TRAINING_SALT_FORMAT_KEY, TRAINING_SALT_FORMAT_VALUE,
@@ -73,4 +117,5 @@ pub use training_salt::{
     TRAINING_SALT_UNTIED_FORMAT_VALUE, TrainingSaltArtifactMetadata, TrainingSaltGrowthReceipt,
     parse_training_salt_artifact_metadata,
 };
+pub use unified::{ArchitectureSpec, LayerKind, Runner};
 pub use weights::{LayerWeights, ModelWeights};

@@ -6,6 +6,7 @@
 //! order are deliberately excluded from identity.
 
 use super::salt_v2::DensePsdMetric;
+use core::ops::Range;
 
 const INPUT_GRAM_MAGIC: [u8; 4] = *b"SIG2";
 const OUTPUT_FISHER_MAGIC: [u8; 4] = *b"SOF2";
@@ -674,6 +675,35 @@ fn canonicalize_indexed_fisher_segments(
     Ok(canonical)
 }
 
+// Scalar adaptation only; finite outer products, normalization and deterministic
+// segment folding have one implementation for activations and owner scores.
+trait GramScalar: Copy {
+    fn widen(self) -> f64;
+    fn sample_digest(dimension: usize, values: &[Self], selection: [u8; 32]) -> [u8; 32];
+}
+impl GramScalar for f32 {
+    fn widen(self) -> f64 {
+        f64::from(self)
+    }
+    fn sample_digest(dimension: usize, values: &[Self], selection: [u8; 32]) -> [u8; 32] {
+        input_sample_digest(dimension, values, selection)
+    }
+}
+impl GramScalar for f64 {
+    fn widen(self) -> f64 {
+        self
+    }
+    fn sample_digest(dimension: usize, values: &[Self], selection: [u8; 32]) -> [u8; 32] {
+        let mut hash = blake3::Hasher::new_derive_key("tritium.owner-window.score-sample.v1");
+        hash.update(&u64::try_from(dimension).unwrap_or(u64::MAX).to_le_bytes());
+        hash.update(&selection);
+        for &value in values {
+            hash.update(&canonical_f64_bits(value).to_le_bytes());
+        }
+        *hash.finalize().as_bytes()
+    }
+}
+
 /// Streaming accumulator for `E[x x^T]` over row-major activation samples.
 ///
 /// Batch updates are atomic: malformed input does not change sums or content traces. Each sample
@@ -682,6 +712,7 @@ fn canonicalize_indexed_fisher_segments(
 #[derive(Clone, Debug)]
 pub struct InputGramAccumulator {
     dimension: usize,
+    rows: Range<usize>,
     source_id: Option<CurvatureSourceId>,
     sample_start: u64,
     next_sample_ordinal: u64,
@@ -730,6 +761,7 @@ impl InputGramAccumulator {
             .ok_or(CurvatureError::DimensionTooLarge)?;
         Ok(Self {
             dimension,
+            rows: 0..dimension,
             source_id,
             sample_start,
             next_sample_ordinal: sample_start,
@@ -742,6 +774,7 @@ impl InputGramAccumulator {
     pub(crate) fn try_clone_transactional(&self) -> Result<Self, CurvatureError> {
         Ok(Self {
             dimension: self.dimension,
+            rows: self.rows.clone(),
             source_id: self.source_id,
             sample_start: self.sample_start,
             next_sample_ordinal: self.next_sample_ordinal,
@@ -770,6 +803,27 @@ impl InputGramAccumulator {
         token_weights: Option<&[f64]>,
         token_mask: Option<&[bool]>,
     ) -> Result<(), CurvatureError> {
+        self.accumulate_scalar_batch(activations, samples, token_weights, token_mask)
+    }
+
+    // Owner gradients have already accumulated products in f64. Keep that
+    // precision and a distinct data domain; this unbound intermediate is not
+    // published as old K-FAC evidence by the owner metric consumer.
+    pub(crate) fn accumulate_owner_row(
+        &mut self,
+        values: &[f64],
+        weight: f64,
+    ) -> Result<(), CurvatureError> {
+        self.accumulate_scalar_batch(values, 1, Some(&[weight]), None)
+    }
+
+    fn accumulate_scalar_batch<T: GramScalar>(
+        &mut self,
+        activations: &[T],
+        samples: usize,
+        token_weights: Option<&[f64]>,
+        token_mask: Option<&[bool]>,
+    ) -> Result<(), CurvatureError> {
         validate_batch_shape(
             "activations",
             activations.len(),
@@ -778,7 +832,12 @@ impl InputGramAccumulator {
             token_weights,
             token_mask,
         )?;
-        validate_activations(activations, samples, self.dimension)?;
+        if let Some(index) = activations.iter().position(|v| !v.widen().is_finite()) {
+            return Err(CurvatureError::NonFiniteActivation {
+                sample: index / self.dimension,
+                feature: index % self.dimension,
+            });
+        }
 
         let added_samples =
             u64::try_from(samples).map_err(|_| CurvatureError::SampleOrdinalOverflow)?;
@@ -799,7 +858,8 @@ impl InputGramAccumulator {
         }
 
         let entries = self
-            .dimension
+            .rows
+            .len()
             .checked_mul(self.dimension)
             .ok_or(CurvatureError::DimensionTooLarge)?;
         let mut next_segments = try_clone_input_segments(&self.local_segments)?;
@@ -815,26 +875,20 @@ impl InputGramAccumulator {
             let is_selected = selected(token_mask, sample);
             let selection_leaf =
                 selection_sample_digest(self.source_id, ordinal, weight, is_selected);
-            let data_trace = input_sample_digest(
+            let data_trace = T::sample_digest(
                 self.dimension,
                 &activations[base..base + self.dimension],
                 selection_leaf,
             );
             let mut sums = zeroed_f64_values(entries)?;
             if is_selected {
-                for row in 0..self.dimension {
-                    let left = f64::from(activations[base + row]);
-                    for col in row..self.dimension {
-                        let right = f64::from(activations[base + col]);
-                        let contribution = finite_product3(weight, left, right)?;
-                        let index = row * self.dimension + col;
-                        sums[index] = contribution;
-                        if row != col {
-                            let symmetric = col * self.dimension + row;
-                            sums[symmetric] = contribution;
-                        }
-                    }
-                }
+                fill_input_products(
+                    &mut sums,
+                    self.dimension,
+                    self.rows.clone(),
+                    &activations[base..base + self.dimension],
+                    weight,
+                )?;
             }
             push_input_segment(
                 &mut next_segments,
@@ -876,6 +930,7 @@ impl InputGramAccumulator {
         token_weights: Option<&[f64]>,
         token_mask: Option<&[bool]>,
     ) -> Result<(), CurvatureError> {
+        self.require_full()?;
         validate_batch_shape(
             "indexed identity samples",
             samples,
@@ -964,7 +1019,7 @@ impl InputGramAccumulator {
             shard.sample_start,
             declared_order,
         )?;
-        if self.source_id != shard.source_id {
+        if self.source_id != shard.source_id || self.rows != shard.rows {
             return Err(CurvatureError::SourceMismatch);
         }
         let segments = shard.canonical_segments()?;
@@ -994,43 +1049,35 @@ impl InputGramAccumulator {
     /// # Errors
     /// Rejects evidence whose total selected weight is zero.
     pub fn finish(&self) -> Result<InputGram, CurvatureError> {
-        let segments = self.canonical_segments()?;
-        let entries = self
-            .dimension
-            .checked_mul(self.dimension)
-            .ok_or(CurvatureError::DimensionTooLarge)?;
-        let mut sums = zeroed_f64_values(entries)?;
-        let mut total_weight = 0.0;
-        let mut sample_count = 0_u64;
-        let mut selected_count = 0_u64;
-        let mut selection_trace = [0; 32];
-        let mut data_trace = [0; 32];
-        for segment in segments {
-            add_slice_finite(&mut sums, &segment.sums)?;
-            total_weight = finite_add(total_weight, segment.total_weight)?;
-            sample_count = sample_count
-                .checked_add(segment.range.end - segment.range.start)
-                .ok_or(CurvatureError::DimensionTooLarge)?;
-            selected_count = selected_count
-                .checked_add(segment.selected_count)
-                .ok_or(CurvatureError::DimensionTooLarge)?;
-            xor_digest(&mut selection_trace, segment.selection_trace);
-            xor_digest(&mut data_trace, segment.data_trace);
+        self.require_full()?;
+        finish_input_gram(self.dimension, self.source_id, self.canonical_segments()?)
+    }
+
+    // One-shot consumers transfer canonical segment storage rather than clone it.
+    // The public reusable finish path and wire identities keep the same arithmetic.
+    pub(crate) fn finish_owned(self) -> Result<InputGram, CurvatureError> {
+        self.require_full()?;
+        finish_input_gram(
+            self.dimension,
+            self.source_id,
+            self.into_canonical_segments()?,
+        )
+    }
+
+    fn require_full(&self) -> Result<(), CurvatureError> {
+        if self.rows != (0..self.dimension) {
+            return Err(CurvatureError::InvalidDimension);
         }
-        if total_weight == 0.0 {
-            return Err(CurvatureError::ZeroTotalWeight);
-        }
-        let values = normalized_values(&sums, total_weight)?;
-        Ok(InputGram {
-            dimension: self.dimension,
-            values,
-            total_weight,
-            sample_count,
-            selected_count,
-            source_id: self.source_id,
-            selection_trace,
-            data_trace,
-        })
+        Ok(())
+    }
+
+    fn into_canonical_segments(self) -> Result<Vec<InputSegment>, CurvatureError> {
+        let mut segments = self.merged_segments;
+        segments
+            .try_reserve_exact(self.local_segments.len())
+            .map_err(|_| CurvatureError::DimensionTooLarge)?;
+        segments.extend(self.local_segments);
+        canonicalize_input_segments(segments, self.sample_start)
     }
 
     fn canonical_segments(&self) -> Result<Vec<InputSegment>, CurvatureError> {
@@ -1041,6 +1088,134 @@ impl InputGramAccumulator {
         segments.extend(try_clone_input_segments(&self.local_segments)?);
         canonicalize_input_segments(segments, self.sample_start)
     }
+}
+
+// This wrapper never exposes a partial matrix as public InputGram evidence.
+pub(crate) struct OwnerGramStrip {
+    inner: InputGramAccumulator,
+}
+impl OwnerGramStrip {
+    pub(crate) fn new(dimension: usize, rows: Range<usize>) -> Result<Self, CurvatureError> {
+        if rows.start >= rows.end || rows.end > dimension {
+            return Err(CurvatureError::InvalidDimension);
+        }
+        let mut inner = InputGramAccumulator::new(dimension)?;
+        inner.rows = rows;
+        Ok(Self { inner })
+    }
+
+    pub(crate) fn accumulate(&mut self, values: &[f64], weight: f64) -> Result<(), CurvatureError> {
+        self.inner.accumulate_owner_row(values, weight)
+    }
+
+    pub(crate) fn finish(self) -> Result<Vec<f64>, CurvatureError> {
+        let entries = self
+            .inner
+            .rows
+            .len()
+            .checked_mul(self.inner.dimension)
+            .ok_or(CurvatureError::DimensionTooLarge)?;
+        Ok(finish_input_values(entries, self.inner.into_canonical_segments()?)?.values)
+    }
+}
+
+// Full and strip adapters share the same upper-triangle multiplication order.
+// A lower-triangle strip entry must not exchange the last two products.
+fn fill_input_products<T: GramScalar>(
+    sums: &mut [f64],
+    dimension: usize,
+    rows: Range<usize>,
+    values: &[T],
+    weight: f64,
+) -> Result<(), CurvatureError> {
+    let full = rows == (0..dimension);
+    for row in rows.clone() {
+        for col in if full { row } else { 0 }..dimension {
+            let contribution = finite_product3(
+                weight,
+                values[row.min(col)].widen(),
+                values[row.max(col)].widen(),
+            )?;
+            sums[(row - rows.start) * dimension + col] = contribution;
+            if full && row != col {
+                sums[col * dimension + row] = contribution;
+            }
+        }
+    }
+    Ok(())
+}
+
+struct ReducedInput {
+    values: Vec<f64>,
+    total_weight: f64,
+    sample_count: u64,
+    selected_count: u64,
+    selection_trace: [u8; 32],
+    data_trace: [u8; 32],
+}
+
+fn finish_input_gram(
+    dimension: usize,
+    source_id: Option<CurvatureSourceId>,
+    segments: Vec<InputSegment>,
+) -> Result<InputGram, CurvatureError> {
+    let entries = dimension
+        .checked_mul(dimension)
+        .ok_or(CurvatureError::DimensionTooLarge)?;
+    let reduced = finish_input_values(entries, segments)?;
+    Ok(InputGram {
+        dimension,
+        values: reduced.values,
+        total_weight: reduced.total_weight,
+        sample_count: reduced.sample_count,
+        selected_count: reduced.selected_count,
+        source_id,
+        selection_trace: reduced.selection_trace,
+        data_trace: reduced.data_trace,
+    })
+}
+
+fn finish_input_values(
+    entries: usize,
+    segments: Vec<InputSegment>,
+) -> Result<ReducedInput, CurvatureError> {
+    let mut segments = segments.into_iter();
+    let first = segments.next().ok_or(CurvatureError::ZeroTotalWeight)?;
+    let mut sums = first.sums;
+    debug_assert_eq!(sums.len(), entries);
+    // Preserve the original leading +0 operation, including signed-zero behavior.
+    for value in &mut sums {
+        *value = finite_add(0.0, *value)?;
+    }
+    let mut total_weight = finite_add(0.0, first.total_weight)?;
+    let mut sample_count = first.range.end - first.range.start;
+    let mut selected_count = first.selected_count;
+    let mut selection_trace = first.selection_trace;
+    let mut data_trace = first.data_trace;
+    for segment in segments {
+        add_slice_finite(&mut sums, &segment.sums)?;
+        total_weight = finite_add(total_weight, segment.total_weight)?;
+        sample_count = sample_count
+            .checked_add(segment.range.end - segment.range.start)
+            .ok_or(CurvatureError::DimensionTooLarge)?;
+        selected_count = selected_count
+            .checked_add(segment.selected_count)
+            .ok_or(CurvatureError::DimensionTooLarge)?;
+        xor_digest(&mut selection_trace, segment.selection_trace);
+        xor_digest(&mut data_trace, segment.data_trace);
+    }
+    if total_weight == 0.0 {
+        return Err(CurvatureError::ZeroTotalWeight);
+    }
+    normalize_values_in_place(&mut sums, total_weight)?;
+    Ok(ReducedInput {
+        values: sums,
+        total_weight,
+        sample_count,
+        selected_count,
+        selection_trace,
+        data_trace,
+    })
 }
 
 /// Normalized input Gram evidence compatible with row-major [`DensePsdMetric`] storage.
@@ -1057,6 +1232,9 @@ pub struct InputGram {
 }
 
 impl InputGram {
+    pub(crate) fn into_values(self) -> Vec<f64> {
+        self.values
+    }
     /// Number of input features.
     #[must_use]
     pub fn dimension(&self) -> usize {
@@ -1738,6 +1916,10 @@ pub struct KfacMetric {
 }
 
 impl KfacMetric {
+    pub(crate) fn into_values(self) -> Vec<f64> {
+        self.metric.into_values()
+    }
+
     /// Dense PSD matrix consumed by the SALT V2 joint fitter.
     #[must_use]
     pub fn metric(&self) -> &DensePsdMetric {
@@ -1909,21 +2091,6 @@ fn validate_batch_shape(
     Ok(())
 }
 
-fn validate_activations(
-    activations: &[f32],
-    samples: usize,
-    dimension: usize,
-) -> Result<(), CurvatureError> {
-    if let Some(index) = activations.iter().position(|value| !value.is_finite()) {
-        return Err(CurvatureError::NonFiniteActivation {
-            sample: index / dimension,
-            feature: index % dimension,
-        });
-    }
-    debug_assert_eq!(activations.len(), samples * dimension);
-    Ok(())
-}
-
 fn validate_gradients(
     gradients: &[f32],
     samples: usize,
@@ -2000,15 +2167,20 @@ fn checked_sample_add(current: u64, added: usize) -> Result<u64, CurvatureError>
 }
 
 fn normalized_values(sums: &[f64], total_weight: f64) -> Result<Vec<f64>, CurvatureError> {
-    let mut values = zeroed_f64_values(sums.len())?;
-    for (value, sum) in values.iter_mut().zip(sums) {
-        let normalized = *sum / total_weight;
+    let mut values = try_clone_f64_values(sums)?;
+    normalize_values_in_place(&mut values, total_weight)?;
+    Ok(values)
+}
+
+fn normalize_values_in_place(values: &mut [f64], total_weight: f64) -> Result<(), CurvatureError> {
+    for value in values {
+        let normalized = *value / total_weight;
         *value = normalized
             .is_finite()
             .then_some(canonicalize_zero(normalized))
             .ok_or(CurvatureError::NonFiniteAccumulation)?;
     }
-    Ok(values)
+    Ok(())
 }
 
 fn selection_sample_digest(
@@ -2146,6 +2318,135 @@ fn canonical_f32_bits(value: f32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_strips_preserve_all_canonical_dense_bits_and_transactional_rejection() {
+        let cols = 35;
+        for count in [1, 3, 5, 13] {
+            let samples: Vec<_> = (0..count)
+                .map(|sample| {
+                    let values: Vec<f64> = (0..cols)
+                        .map(|col| match (sample, col) {
+                            (0, 0) if count > 1 => 1e200,
+                            (0, 1) if count > 1 => 1e-100,
+                            (_, col) if col % 7 == 0 => -0.,
+                            (_, col) if col % 11 == 0 => 1e-200,
+                            _ => (((sample + 1) * (col + 3) % 23) as f64 - 11.) / 19.,
+                        })
+                        .collect();
+                    let weight = if sample == 0 && count > 1 {
+                        1e-200
+                    } else if sample % 4 == 1 {
+                        0.
+                    } else {
+                        1. / (sample + 1) as f64
+                    };
+                    (values, weight)
+                })
+                .collect();
+            let mut dense = InputGramAccumulator::new(cols).unwrap();
+            for (values, weight) in &samples {
+                dense.accumulate_owner_row(values, *weight).unwrap();
+            }
+            let expected = dense.finish().unwrap();
+            for width in [1, 3, 13, 32, cols] {
+                let mut actual = Vec::new();
+                for start in (0..cols).step_by(width) {
+                    let end = (start + width).min(cols);
+                    let mut strip = OwnerGramStrip::new(cols, start..end).unwrap();
+                    for (values, weight) in &samples {
+                        strip.accumulate(values, *weight).unwrap();
+                    }
+                    if start != 0 || end != cols {
+                        assert_eq!(strip.inner.finish(), Err(CurvatureError::InvalidDimension));
+                    }
+                    actual.extend(strip.finish().unwrap());
+                }
+                assert_eq!(
+                    actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    expected
+                        .as_slice()
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        for rows in [0..0, Range { start: 3, end: 2 }, 0..4] {
+            assert!(OwnerGramStrip::new(3, rows).is_err());
+        }
+        let mut strip = OwnerGramStrip::new(3, 1..3).unwrap();
+        strip.accumulate(&[0.5, -0., 2.], 1.).unwrap();
+        let before = OwnerGramStrip {
+            inner: strip.inner.clone(),
+        }
+        .finish()
+        .unwrap();
+        for (values, weight) in [
+            ([f64::NAN, 1., 2.], 0.),
+            ([1., 1e308, 2.], 1.),
+            ([1., 2., 3.], -1.),
+        ] {
+            assert!(strip.accumulate(&values, weight).is_err());
+            assert_eq!(
+                OwnerGramStrip {
+                    inner: strip.inner.clone()
+                }
+                .finish()
+                .unwrap(),
+                before
+            );
+        }
+        assert!(OwnerGramStrip::new(3, 0..2).unwrap().finish().is_err());
+        let mut zero = OwnerGramStrip::new(3, 0..2).unwrap();
+        zero.accumulate(&[1., 2., 3.], 0.).unwrap();
+        assert_eq!(zero.finish(), Err(CurvatureError::ZeroTotalWeight));
+    }
+
+    #[test]
+    fn consuming_gram_finish_preserves_reusable_bytes_traces_and_errors() {
+        for start in [0, 5] {
+            let mut accumulator = InputGramAccumulator::new_bound(3, source(1), start).unwrap();
+            for sample in 0..13 {
+                accumulator
+                    .accumulate_batch(
+                        &[sample as f32 / 7. - 0.5, -0.0, (sample % 5) as f32 - 2.],
+                        1,
+                        Some(&[if sample % 3 == 0 {
+                            0.
+                        } else {
+                            sample as f64 / 11.
+                        }]),
+                        Some(&[sample % 4 != 0]),
+                    )
+                    .unwrap();
+            }
+            let before = accumulator.finish().unwrap();
+            let owned = accumulator.clone().finish_owned().unwrap();
+            assert_eq!(before.canonical_bytes(), owned.canonical_bytes());
+            assert_eq!(before.digest(), owned.digest());
+            assert_eq!(accumulator.finish().unwrap(), before);
+        }
+        let mut owner = InputGramAccumulator::new(3).unwrap();
+        for (score, weight) in [
+            ([1e70, -1e-200, -0.0], 1.),
+            ([-3e69, 0.5, 2.], 0.),
+            ([1e69, -0.25, 1.], 0.3),
+        ] {
+            owner.accumulate_owner_row(&score, weight).unwrap();
+        }
+        assert_eq!(
+            owner.finish().unwrap().canonical_bytes(),
+            owner.finish_owned().unwrap().canonical_bytes()
+        );
+        for populated in [false, true] {
+            let mut empty = InputGramAccumulator::new(3).unwrap();
+            if populated {
+                empty.accumulate_owner_row(&[1., 2., 3.], 0.).unwrap();
+            }
+            assert_eq!(empty.finish(), empty.finish_owned());
+        }
+    }
 
     fn source(seed: u8) -> CurvatureSourceId {
         CurvatureSourceId::new(

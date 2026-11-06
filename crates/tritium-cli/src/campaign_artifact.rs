@@ -1277,7 +1277,7 @@ mod tests {
             "num_hidden_layers": 1,
             "num_key_value_heads": 1,
             "num_attention_heads": 1,
-            "model_type": "test",
+            "model_type": "llama",
             "max_position_embeddings": 8,
             "intermediate_size": 2,
             "hidden_size": 2,
@@ -1423,7 +1423,7 @@ mod tests {
         );
         assert_eq!(
             plan.metadata.get("general.architecture"),
-            Some(&GgufValue::String("test".to_owned()))
+            Some(&GgufValue::String("llama".to_owned()))
         );
         let config = plan
             .metadata
@@ -1562,6 +1562,17 @@ mod tests {
         let (_, weights) = tritium_nn::ModelWeights::load_training_salt_gguf(&written.writer)
             .expect("load untied artifact");
         assert!(weights.lm_head.is_some(), "untied head must round trip");
+    }
+
+    #[test]
+    fn unsupported_hf_architecture_is_rejected_before_export_plan() {
+        let unsupported = config().replace("\"model_type\": \"llama\"", "\"model_type\": \"test\"");
+        let error = ArtifactExportPlan::build(&unsupported, layout(), 2, provenance(), &growth())
+            .expect_err("unsupported model type must not create a plan");
+        assert!(
+            error.to_string().contains("unsupported model_type `test`"),
+            "{error}"
+        );
     }
 
     #[test]

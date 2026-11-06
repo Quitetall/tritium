@@ -13,7 +13,63 @@ use std::fmt;
 
 use serde::Serialize;
 use serde_json::Value;
-pub use tritium_schema::{UnknownReason, Verdict};
+pub use tritium_schema::{
+    LoadedSourceIdentity, ModelLoaded, TensorUploaded, UnknownReason, Verdict,
+};
+
+mod model_load;
+pub use model_load::{MODEL_LOADED_REGISTRATION, ModelLoadReceiptView};
+
+mod model_import;
+pub use model_import::{
+    LEGACY_MODEL_IMPORT_BOUND_PREPARED_REGISTRATION, LEGACY_MODEL_IMPORT_PREPARED_REGISTRATION,
+    LegacyModelImportBoundView, LegacyModelImportView,
+};
+
+mod direct_fit;
+pub use direct_fit::{DIRECT_LEVELS_FITTED_REGISTRATION, DirectFitReceiptView};
+
+mod calibrated_fit;
+pub use calibrated_fit::{CALIBRATED_LEVELS_FITTED_REGISTRATION, CalibratedFitReceiptView};
+
+mod owner_quantization;
+mod owner_score_fit;
+pub use owner_quantization::{
+    OWNER_QUANTIZATION_COMPLETED_REGISTRATION, OWNER_QUANTIZATION_STARTED_REGISTRATION,
+    OwnerQuantizationReceiptView,
+};
+pub use owner_score_fit::{
+    OWNER_SCORE_LEVELS_FITTED_REGISTRATION, OwnerScoreFitReceiptView, owner_metric_rows_id,
+    owner_metric_stream_id,
+};
+
+mod calibration_capture;
+mod original_salience_capture;
+mod original_source;
+pub use calibration_capture::{
+    CALIBRATION_CAPTURE_COMPLETED_REGISTRATION, CALIBRATION_CAPTURE_STARTED_REGISTRATION,
+    CalibrationCaptureView,
+};
+pub use original_salience_capture::{
+    ORIGINAL_SALIENCE_CAPTURE_COMPLETED_REGISTRATION,
+    ORIGINAL_SALIENCE_CAPTURE_STARTED_REGISTRATION, OriginalSalienceCaptureView,
+};
+mod salience_transform;
+pub use salience_transform::{
+    SALIENCE_TRANSFORM_COMPLETED_REGISTRATION, SALIENCE_TRANSFORM_STARTED_REGISTRATION,
+    SalienceTransformView,
+};
+mod quantization;
+pub use original_source::original_source_id;
+pub use quantization::{
+    QUANTIZATION_COMPLETED_REGISTRATION, QUANTIZATION_STARTED_REGISTRATION, QuantizationReceiptView,
+};
+
+mod calibrated_quantization;
+pub use calibrated_quantization::{
+    CALIBRATED_QUANTIZATION_COMPLETED_REGISTRATION, CALIBRATED_QUANTIZATION_STARTED_REGISTRATION,
+    CalibratedQuantizationReceiptView,
+};
 
 const EVENT_DOMAIN: &[u8] = b"tritium.evidence.event.v1\0";
 const ROOT_DOMAIN: &[u8] = b"tritium.evidence.run-root.v1\0";
@@ -51,6 +107,17 @@ pub struct EventRegistration {
     /// Accepted nonzero version.
     pub version: u16,
 }
+
+impl EvidenceEvent for TensorUploaded {
+    const SCHEMA_ID: &'static str = "tritium.runtime.tensor_uploaded";
+    const VERSION: u16 = 1;
+}
+
+/// Registry entry for successful checked tensor uploads (ADR 0044 D9/D12).
+pub const TENSOR_UPLOADED_REGISTRATION: EventRegistration = EventRegistration {
+    schema: TensorUploaded::SCHEMA_ID,
+    version: TensorUploaded::VERSION,
+};
 
 /// A recorder for one run and a fixed registry of typed event schemas.
 #[derive(Debug)]
@@ -100,14 +167,21 @@ impl EvidenceRecorder {
         })
     }
 
-    /// Emit one registered event and append it to this run's in-memory log.
-    pub fn emit<E: EvidenceEvent>(
-        &mut self,
+    /// Check registration and span/time/sequence admission without recording.
+    ///
+    /// This checks the current recorder state only. It does not reserve a
+    /// sequence, serialize a payload, establish ancestry or guarantee a later
+    /// emission. `emit` repeats the checks and validates the actual payload.
+    ///
+    /// # Errors
+    /// Unregistered schema/version, invalid span/parent, changed parent,
+    /// nonmonotonic/unsafe logical time or unsafe/overflowing current sequence.
+    pub fn check_emit<E: EvidenceEvent>(
+        &self,
         span: &str,
         parent: Option<&str>,
         logical_time: u64,
-        event: &E,
-    ) -> Result<&EvidenceEnvelope, EvidenceError> {
+    ) -> Result<(), EvidenceError> {
         if self.registered.get(E::SCHEMA_ID) != Some(&E::VERSION) {
             return Err(EvidenceError::UnregisteredSchema(format!(
                 "{}@{}",
@@ -121,9 +195,8 @@ impl EvidenceRecorder {
         if parent == Some(span) {
             return Err(EvidenceError::InvalidParent(span.to_owned()));
         }
-        let parent = parent.map(str::to_owned);
         if let Some(previous_parent) = self.span_parent.get(span)
-            && previous_parent != &parent
+            && previous_parent.as_deref() != parent
         {
             return Err(EvidenceError::ParentMismatch(span.to_owned()));
         }
@@ -140,13 +213,28 @@ impl EvidenceRecorder {
         {
             return Err(EvidenceError::NonMonotonicTime(span.to_owned()));
         }
-        let payload = serde_json::to_value(event)
-            .map_err(|error| EvidenceError::Serialization(error.to_string()))?;
-        validate_json_numbers(&payload)?;
         let seq = *self.next_seq.get(span).unwrap_or(&0);
         if seq > MAX_SAFE_JSON_INTEGER {
             return Err(EvidenceError::UnsafeInteger("seq"));
         }
+        seq.checked_add(1).ok_or(EvidenceError::SequenceOverflow)?;
+        Ok(())
+    }
+
+    /// Emit one registered event and append it to this run's in-memory log.
+    pub fn emit<E: EvidenceEvent>(
+        &mut self,
+        span: &str,
+        parent: Option<&str>,
+        logical_time: u64,
+        event: &E,
+    ) -> Result<&EvidenceEnvelope, EvidenceError> {
+        self.check_emit::<E>(span, parent, logical_time)?;
+        let parent = parent.map(str::to_owned);
+        let payload = serde_json::to_value(event)
+            .map_err(|error| EvidenceError::Serialization(error.to_string()))?;
+        validate_json_numbers(&payload)?;
+        let seq = *self.next_seq.get(span).unwrap_or(&0);
         let next_seq = seq.checked_add(1).ok_or(EvidenceError::SequenceOverflow)?;
         let body = DigestBody {
             schema: E::SCHEMA_ID,
@@ -183,6 +271,38 @@ impl EvidenceRecorder {
     #[must_use]
     pub fn events(&self) -> &[EvidenceEnvelope] {
         &self.events
+    }
+
+    /// Actual recorder run identity, not an artifact identity.
+    #[must_use]
+    pub fn run(&self) -> &str {
+        &self.run
+    }
+
+    /// Consume the recorder and retain the actual canonical, verified log.
+    /// Sealing proves integrity, not completion or independent qualification.
+    /// # Errors
+    /// Serialization, chain/root or registry consistency failure.
+    pub fn seal(self) -> Result<SealedEvidence, EvidenceError> {
+        let jsonl = self.to_jsonl()?;
+        let run = self.run;
+        let registered = self.registered;
+        // Parsing cold JSONL still verifies the actual wire representation.
+        // Release the old tree first; two large Value arrays need not coexist.
+        drop(self.events);
+        let log = verify_jsonl(&jsonl)?;
+        for event in &log.events {
+            if registered.get(&event.schema) != Some(&event.v) {
+                return Err(EvidenceError::UnregisteredSchema(event.schema.clone()));
+            }
+        }
+        let root = decode_hex(&log.root_digest)?;
+        Ok(SealedEvidence {
+            run,
+            jsonl,
+            log,
+            root,
+        })
     }
 
     /// Serialize the log as canonical JSON Lines.
@@ -270,6 +390,46 @@ pub struct VerifiedLog {
     pub root_digest: String,
 }
 
+/// Immutable owned seal of one actual recorder, without a qualification verdict.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SealedEvidence {
+    run: String,
+    jsonl: String,
+    log: VerifiedLog,
+    root: [u8; 32],
+}
+
+impl SealedEvidence {
+    /// Actual recorder identity, retained even for an empty sealed log.
+    #[must_use]
+    pub fn run(&self) -> &str {
+        &self.run
+    }
+    /// Canonical JSONL bytes actually reverified at sealing.
+    #[must_use]
+    pub fn jsonl(&self) -> &str {
+        &self.jsonl
+    }
+    /// Read-only verified view. Cloned mutable logs must be checked again.
+    #[must_use]
+    pub fn log(&self) -> &VerifiedLog {
+        &self.log
+    }
+    /// Actual run root in the schema's evidence-reference representation.
+    #[must_use]
+    pub fn root(&self) -> [u8; 32] {
+        self.root
+    }
+}
+
+fn verify_log(log: &VerifiedLog) -> Result<(), EvidenceError> {
+    verify_events(&log.events)?;
+    if root_digest(&final_digests(&log.events)?)? != log.root_digest {
+        return Err(EvidenceError::RootMismatch);
+    }
+    Ok(())
+}
+
 /// One claim and the review obligation attached to it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClaimVerdict {
@@ -312,6 +472,15 @@ pub fn aggregate_required(claims: &[ClaimVerdict]) -> Verdict {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum EvidenceError {
+    /// A replay's supplied run root differs from its verified event chains.
+    RootMismatch,
+    /// A recognized event does not have its versioned strict typed payload.
+    InvalidPayload {
+        /// Event schema whose payload cannot be decoded.
+        schema: String,
+        /// Decoder category only, without echoing untrusted payload contents.
+        detail: String,
+    },
     /// Run identifier is empty.
     InvalidRunId,
     /// Event schema identifier is malformed.

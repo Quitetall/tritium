@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CalibrationOutput",
+  "description": "Declared output factor encoding; no gradients are inferred from activations.",
+  "oneOf": [
+    {
+      "description": "Input Gram only, without a Fisher claim.",
+      "type": "string",
+      "const": "None"
+    },
+    {
+      "description": "One dense output-gradient vector per sample.",
+      "type": "string",
+      "const": "DenseFisher"
+    },
+    {
+      "description": "One named output-row factor per sample, zeros in other rows.",
+      "type": "string",
+      "const": "IndexedFisher"
+    }
+  ]
+}

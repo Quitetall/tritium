@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OriginalSalienceCapturePair",
+  "description": "Ordered actual graph pair interpretation, without fabricated moment bindings.",
+  "type": "object",
+  "properties": {
+    "channels": {
+      "description": "Actual input columns/partner output channels.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "inverse": {
+      "description": "Actual preceding norm or linear output-row partner.",
+      "type": "string"
+    },
+    "inverse_axis": {
+      "description": "Explicit partner axis.",
+      "$ref": "#/$defs/SalienceInverseAxis"
+    },
+    "name": {
+      "description": "Unique logical operation name, in graph execution order.",
+      "type": "string"
+    },
+    "projections": {
+      "description": "Exact raw matrices sharing one observed input, without duplicate accumulation.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "projections",
+    "inverse",
+    "inverse_axis",
+    "channels"
+  ],
+  "$defs": {
+    "SalienceInverseAxis": {
+      "description": "Explicit axis of the graph partner divided by each stored scale.",
+      "oneOf": [
+        {
+          "description": "Rank-one preceding norm, one channel per projection input column.",
+          "type": "string",
+          "const": "NormChannels"
+        },
+        {
+          "description": "Rank-two linear partner, one output row per projection input column.",
+          "type": "string",
+          "const": "LinearOutputRows"
+        }
+      ]
+    }
+  }
+}
