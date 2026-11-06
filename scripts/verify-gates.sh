@@ -226,6 +226,7 @@ case "$tier" in
         run cargo fmt --all --check
         run python scripts/generate-api-diff.py --check
         run cargo run --locked -p tritium-schema --features schema-gen --bin tritium-schema-projections -- --check
+        run cargo run --locked -p tritium-format --bin tritium-format-projections -- --check
         verify_no_std_foundations
         run cargo clippy --locked --workspace --all-targets -- -D warnings
         # Default features are NOT the shipped surface. Optional deps and cfg-gated modules do not
@@ -248,6 +249,7 @@ case "$tier" in
         run cargo fmt --all --check
         run python scripts/generate-api-diff.py --check
         run cargo run --locked -p tritium-schema --features schema-gen --bin tritium-schema-projections -- --check
+        run cargo run --locked -p tritium-format --bin tritium-format-projections -- --check
         verify_no_std_foundations
         run cargo clippy --locked --workspace --all-targets -- -D warnings
         # tritium-py is a PyO3 cdylib; standalone cargo-test binaries cannot
@@ -264,6 +266,7 @@ case "$tier" in
         run cargo fmt --all --check
         run python scripts/generate-api-diff.py --check
         run cargo run --locked -p tritium-schema --features schema-gen --bin tritium-schema-projections -- --check
+        run cargo run --locked -p tritium-format --bin tritium-format-projections -- --check
         verify_no_std_foundations
         # Type-check every feature-gated surface without requiring GPU toolkits.
         run env TRITIUM_CHECK_ONLY=1 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
