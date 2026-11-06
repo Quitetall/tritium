@@ -277,6 +277,11 @@ def refine_weight_diagonal(
     rows, columns = master.shape
     plane_count = len(planes)
     bytes_per_row = max(1, columns * (24 + 8 * plane_count))
+    if bytes_per_row > max_working_bytes:
+        raise ValueError(
+            "max_working_bytes cannot fit one refinement row "
+            f"(requires at least {bytes_per_row} bytes)"
+        )
     chunk_rows = max(1, min(rows, max_working_bytes // bytes_per_row))
     output_trits = [torch.empty_like(plane.trits) for plane in planes]
     output_scales = [

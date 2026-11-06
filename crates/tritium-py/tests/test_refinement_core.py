@@ -52,6 +52,20 @@ def test_scale_only_freezes_trits_and_never_worsens_stored_f16_objective():
     assert all(plane.scales.dtype == torch.float16 for plane in result.planes)
 
 
+def test_refinement_rejects_workspace_smaller_than_one_output_row():
+    master = torch.randn(3, 40)
+    parent = _planes(master, count=1)
+
+    with pytest.raises(ValueError, match="cannot fit one refinement row"):
+        refine_weight_diagonal(
+            master,
+            parent,
+            torch.ones(40),
+            RefinementConfig.scale_only(),
+            max_working_bytes=1024,
+        )
+
+
 def test_dense_hard_pv_alternates_assignments_and_scales_without_regression():
     torch.manual_seed(223)
     master = torch.randn(9, 16)
