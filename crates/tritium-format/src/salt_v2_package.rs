@@ -24,6 +24,7 @@ use crate::{SemanticTensor, SemanticTensorHasher};
 
 mod q2_0_gguf;
 mod reader;
+mod scale_update_child;
 mod stream_writer;
 
 pub use q2_0_gguf::{
@@ -33,6 +34,9 @@ pub use q2_0_gguf::{
 pub use reader::{
     CompactQ2ExportError, PackedSaltV2PlaneRef, SaltV2PackageReadError, SaltV2PackageReader,
     SaltV2TensorInfo, export_compact_q2_0_tensor,
+};
+pub use scale_update_child::{
+    SaltV2ScaleUpdateChild, SaltV2ScaleUpdateChildError, write_salt_v2_scale_update_child,
 };
 pub use stream_writer::{
     SaltV2PackageStreamError, SaltV2PackageStreamPlan, SaltV2PackageStreamPlanError,

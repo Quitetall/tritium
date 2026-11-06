@@ -36,6 +36,33 @@ canonical owner, preserve exact f32 bits, return explicit destination buffer
 IDs and fail closed on binding, dtype, shape or compiled-plan drift. Generated
 binding freshness is part of `npm run check`.
 
+## Development checks
+
+```bash
+npm ci
+npm run format:check
+npm run lint
+npm run check
+```
+
+`npm run format` applies the exact pinned Biome formatter to authored files.
+Generated operation bindings and kernel bundles are excluded from formatting
+and linting; `check:generated` verifies them against their owning generators.
+The generated npm lockfile is likewise not hand-formatted.
+
+Lint uses Biome's recommended rules and treats warnings as errors. Its sole
+scoped rule exception permits non-null indexing assertions in the existing
+numeric, geometry and compiled-schedule modules named in `biome.json`. Those
+modules validate buffer roles, shapes and lengths before bounded indexing;
+adding redundant per-element guards is not a substitute for those admission
+checks. Strict TypeScript, including `noUncheckedIndexedAccess`, remains enabled.
+The exception does not cover other authored files or waive semantic vectors,
+failure injection, installed-archive checks or physical-browser qualification.
+
+The full `check` runs formatting and lint before the WASM build, TypeScript,
+session tests and installed-package verification. Neither formatting nor lint
+produces a release qualification receipt.
+
 `encodeWebTrainingPayload(...)` writes canonical `TRWEBP1` bytes containing
 root parameters and optimizer state. `decodeWebTrainingPayload(...)` verifies
 BLAKE3 integrity, canonical ordering, exact dtype/byte lengths and compiled

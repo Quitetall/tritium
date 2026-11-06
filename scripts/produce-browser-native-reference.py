@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import shutil
 import subprocess
 import tempfile
@@ -184,16 +185,11 @@ def parse_metadata(output: str) -> dict[str, str]:
     return values
 
 
+_run_git = runpy.run_path(Path(__file__).with_name("_qualification_git.py"))["run_git"]
+
+
 def git_output(root: Path, *args: str) -> str:
-    completed = subprocess.run(
-        ["git", *args],
-        cwd=root,
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    return completed.stdout.strip()
+    return _run_git(root, *args, error_type=NativeReferenceError)
 
 
 def source_admission(revision: str, root: Path = ROOT) -> None:

@@ -1,21 +1,25 @@
 //! Public-seam tests for streamed SALT V2 block/sliding output reconstruction.
 
+use std::io::Cursor;
+
 use half::f16;
 use tritium_core::Trit;
 use tritium_format::{
     ModelId,
     salt_v2::SaltV2Codec,
     salt_v2_package::{SaltV2Package, SaltV2Plane, SaltV2ScaleUpdate, SaltV2Tensor, SaltV2Tile},
+    salt_v2_package::{SaltV2PackageReader, write_salt_v2_package},
 };
 use tritium_quantize::{
     ActivationCache, ActivationCacheBuilder, ActivationCacheSpec, ActivationChunk, ActivationDType,
     ActivationDigest, ActivationWindow, FixedTritScaleRefitAccumulator,
-    FixedTritTileScaleRefitAccumulator, OutputObjectiveWeights, OutputReconstructionAccumulator,
-    OutputReconstructionActivationLayer, OutputReconstructionActivationSet,
-    OutputReconstructionActivationSource, OutputReconstructionError, OutputReconstructionSchedule,
-    OutputReconstructionScope, OutputReconstructionSpec, RuntimeFinalLogitsAccumulator,
-    fit_fixed_trit_tile_scale_refit, fit_fixed_trit_tile_scale_update,
-    output_reconstruction_activation_digest, select_output_reconstruction,
+    FixedTritScaleUpdateCandidateBuilder, FixedTritTileScaleRefitAccumulator,
+    OutputObjectiveWeights, OutputReconstructionAccumulator, OutputReconstructionActivationLayer,
+    OutputReconstructionActivationSet, OutputReconstructionActivationSource,
+    OutputReconstructionError, OutputReconstructionSchedule, OutputReconstructionScope,
+    OutputReconstructionSpec, RuntimeFinalLogitsAccumulator, fit_fixed_trit_tile_scale_refit,
+    fit_fixed_trit_tile_scale_update, output_reconstruction_activation_digest,
+    select_output_reconstruction,
 };
 
 const CANDIDATE_HASH_CONTEXT: &str = "tritium salt v2 output reconstruction candidate v1";
@@ -1103,6 +1107,339 @@ fn fixed_trit_tile_refit_recovers_shared_scales_from_residual_outputs() {
             16,
         ),
         Err(OutputReconstructionError::InvalidGeometry)
+    ));
+}
+
+#[test]
+fn scale_update_candidate_builder_streams_windows_and_binds_the_owned_candidate() {
+    let activation_spec = ActivationCacheSpec::new(
+        0,
+        "model.layers.0.attn.q_proj.input",
+        3,
+        64,
+        ActivationDType::Float16,
+        ActivationDigest::from_bytes([9; 32]),
+        3,
+    )
+    .unwrap();
+    let mut cache_builder = ActivationCacheBuilder::new(activation_spec.clone());
+    cache_builder
+        .ingest(
+            ActivationChunk::new(
+                &activation_spec,
+                0,
+                3,
+                {
+                    let mut values = vec![0.0; 3 * 64];
+                    values[0] = 1.0;
+                    values[1] = 2.0;
+                    values[64] = 2.0;
+                    values[65] = 1.0;
+                    values[128] = 1.0;
+                    values[129] = -1.0;
+                    values
+                },
+                vec![true; 3],
+                vec![3],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let cache = cache_builder.finalize().unwrap();
+    let first_window = cache.read_window(0, 1, 4096).unwrap();
+    let second_window = cache.read_window(1, 2, 4096).unwrap();
+    let mut trits = vec![Trit::ZERO; 128];
+    trits[0] = Trit::from_i8(1).unwrap();
+    trits[1] = Trit::from_i8(-1).unwrap();
+    trits[64] = Trit::from_i8(1).unwrap();
+    trits[65] = Trit::from_i8(1).unwrap();
+    let spec = spec(
+        OutputReconstructionSchedule::SlidingWindows {
+            block_count: 2,
+            window_size: 2,
+            stride: 1,
+        },
+        1,
+    );
+    let parent = [55; 32];
+    let mut candidate_builder = FixedTritScaleUpdateCandidateBuilder::new(&spec, &parent, 17);
+    candidate_builder
+        .begin_tile_plane(7, 0, 1, 2, &trits, &[f16::ONE, f16::ONE], 64, 16)
+        .unwrap();
+    drop(trits);
+    assert!(matches!(
+        candidate_builder.observe_window_from_current_projection(
+            &first_window,
+            &[10.0],
+            &[11.0, 21.5],
+        ),
+        Err(OutputReconstructionError::InvalidGeometry)
+    ));
+    assert!(matches!(
+        candidate_builder.observe_window_from_current_projection(
+            &first_window,
+            &[10.0, 20.0],
+            &[f32::INFINITY, 21.5],
+        ),
+        Err(OutputReconstructionError::NonFiniteOutput { teacher: false })
+    ));
+    candidate_builder
+        .observe_window_from_current_projection(&first_window, &[10.0, 20.0], &[11.0, 21.5])
+        .unwrap();
+    candidate_builder
+        .observe_window_from_current_projection(
+            &second_window,
+            &[30.0, 40.0, 50.0, 60.0],
+            &[29.0, 41.5, 48.0, 60.0],
+        )
+        .unwrap();
+
+    let candidate = candidate_builder.finish().unwrap();
+    assert_eq!(candidate.updates().len(), 1);
+    assert_eq!(candidate.updates()[0].tensor_index(), 7);
+    assert_eq!(candidate.updates()[0].tile_index(), 0);
+    assert_eq!(candidate.updates()[0].plane_index(), 1);
+    assert_eq!(
+        candidate.updates()[0]
+            .scales()
+            .iter()
+            .map(|scale| scale.to_f32())
+            .collect::<Vec<_>>(),
+        vec![2.0, 0.5]
+    );
+    let borrowed = candidate.as_scale_candidate(&spec).unwrap();
+    assert_eq!(borrowed.parent_package_digest(), &parent);
+    assert_eq!(borrowed.initialization_seed(), 17);
+    assert_eq!(borrowed.candidate_id(), candidate.candidate_id());
+}
+
+#[test]
+fn four_fitted_scale_restarts_select_by_frozen_output_objective() {
+    let spec = spec(OutputReconstructionSchedule::Blocks { block_count: 2 }, 4);
+    let parent = [77; 32];
+    let activation_spec = ActivationCacheSpec::new(
+        0,
+        "model.layers.0.residual.input".to_owned(),
+        5,
+        128,
+        ActivationDType::Float32,
+        ActivationDigest::from_bytes([9; 32]),
+        2,
+    )
+    .unwrap();
+    let mut activation_builder = ActivationCacheBuilder::new(activation_spec.clone());
+    let mut values = vec![0.0; 5 * 128];
+    values[0] = 1.0;
+    values[64] = 1.0;
+    activation_builder
+        .ingest(
+            ActivationChunk::new(&activation_spec, 0, 5, values, vec![true; 5], vec![5]).unwrap(),
+        )
+        .unwrap();
+    let cache = activation_builder.finalize().unwrap();
+    let activation = cache.read_window(0, 1, 4096).unwrap();
+    let mut trits = [Trit::ZERO; 128];
+    trits[0] = Trit::from_i8(1).unwrap();
+    trits[64] = Trit::from_i8(1).unwrap();
+    let mut fitted = Vec::new();
+    for seed in [11, 22, 33, 44] {
+        let mut builder = FixedTritScaleUpdateCandidateBuilder::new(&spec, &parent, seed);
+        builder
+            .begin_tile_plane(3, 0, 0, 1, &trits, &[f16::ONE, f16::ONE], 64, 8)
+            .unwrap();
+        builder
+            .observe_window_from_current_projection(&activation, &[1.0], &[2.0])
+            .unwrap();
+        fitted.push(builder.finish().unwrap());
+    }
+
+    let selected_seed = 33;
+    let mut repeated_builder =
+        FixedTritScaleUpdateCandidateBuilder::new(&spec, &parent, selected_seed);
+    repeated_builder
+        .begin_tile_plane(3, 0, 0, 1, &trits, &[f16::ONE, f16::ONE], 64, 8)
+        .unwrap();
+    repeated_builder
+        .observe_window_from_current_projection(&activation, &[1.0], &[2.0])
+        .unwrap();
+    let repeated = repeated_builder.finish().unwrap();
+    let original = fitted
+        .iter()
+        .find(|candidate| {
+            candidate
+                .as_scale_candidate(&spec)
+                .unwrap()
+                .initialization_seed()
+                == selected_seed
+        })
+        .unwrap();
+    assert_eq!(repeated.candidate_id(), original.candidate_id());
+    assert_eq!(repeated.updates(), original.updates());
+    assert!(
+        fitted
+            .iter()
+            .skip(1)
+            .any(|candidate| candidate.updates() != original.updates())
+    );
+
+    let selected_id = *fitted
+        .iter()
+        .find(|candidate| {
+            candidate.updates().len() == 1 && {
+                candidate
+                    .as_scale_candidate(&spec)
+                    .unwrap()
+                    .initialization_seed()
+                    == selected_seed
+            }
+        })
+        .expect("expected restart candidate")
+        .candidate_id();
+    let mut receipts = Vec::new();
+    for candidate in &fitted {
+        let scale_candidate = candidate.as_scale_candidate(&spec).unwrap();
+        let is_selected = scale_candidate.initialization_seed() == selected_seed;
+        let mut score =
+            OutputReconstructionAccumulator::for_scale_candidate(&spec, &scale_candidate).unwrap();
+        for scope in spec.scopes() {
+            let (teacher, student): (&[f32], &[f32]) = match scope {
+                OutputReconstructionScope::Block { .. } if is_selected => {
+                    (&[0.0, 0.0], &[0.0, 0.0])
+                }
+                OutputReconstructionScope::Block { .. } => (&[0.0, 0.0], &[2.0, -2.0]),
+                OutputReconstructionScope::FinalLogits if is_selected => (&[1.0, 0.0], &[1.0, 0.0]),
+                OutputReconstructionScope::FinalLogits => (&[1.0, 0.0], &[0.0, 1.0]),
+            };
+            score
+                .observe(*scope, 0, 1, teacher.len(), &[true], teacher, student)
+                .unwrap();
+        }
+        receipts.push(score.finish().unwrap());
+    }
+
+    let selected = select_output_reconstruction(&spec, receipts).unwrap();
+    assert_eq!(selected.selected_candidate_id(), &selected_id);
+    assert_eq!(selected.selected().initialization_seed(), selected_seed);
+    let selected_fit = selected
+        .selected_fitted_scale_update_candidate(&spec, &parent, &fitted)
+        .expect("selected output receipt maps to the exact fitted update set");
+    assert_eq!(
+        selected_fit
+            .as_scale_candidate(&spec)
+            .unwrap()
+            .candidate_id(),
+        selected.selected_candidate_id()
+    );
+    assert!(matches!(
+        selected.selected_fitted_scale_update_candidate(&spec, &[78; 32], &fitted),
+        Err(tritium_quantize::OutputReconstructionError::CandidateParentMismatch)
+    ));
+    assert!(matches!(
+        selected.selected_fitted_scale_update_candidate(&spec, &parent, &fitted[..3]),
+        Err(tritium_quantize::OutputReconstructionError::RestartCount {
+            expected: 4,
+            got: 3
+        })
+    ));
+    let mut reordered = fitted.clone();
+    reordered.reverse();
+    assert_eq!(
+        selected
+            .selected_fitted_scale_update_candidate(&spec, &parent, &reordered)
+            .unwrap()
+            .candidate_id(),
+        selected.selected_candidate_id(),
+        "fitted candidate order does not affect exact selection mapping"
+    );
+    let mut alternate_builder = FixedTritScaleUpdateCandidateBuilder::new(&spec, &parent, 55);
+    alternate_builder
+        .begin_tile_plane(3, 0, 0, 1, &trits, &[f16::ONE, f16::ONE], 64, 8)
+        .unwrap();
+    alternate_builder
+        .observe_window_from_current_projection(&activation, &[1.0], &[2.0])
+        .unwrap();
+    let alternate = alternate_builder.finish().unwrap();
+    let mut mismatched = fitted.clone();
+    mismatched[0] = alternate;
+    assert!(matches!(
+        selected.selected_fitted_scale_update_candidate(&spec, &parent, &mismatched),
+        Err(tritium_quantize::OutputReconstructionError::FittedCandidateSetMismatch)
+    ));
+    assert_eq!(selected.candidates().len(), spec.restarts());
+}
+
+#[test]
+fn packed_parent_plane_starts_owned_candidate_fit() {
+    let plane = SaltV2Plane::new(vec![1i8; 256], vec![f16::ONE; 2]).unwrap();
+    let tensor = SaltV2Tensor::new(
+        "projection.weight",
+        vec![2, 128],
+        vec![SaltV2Tile::new(vec![plane]).unwrap()],
+    )
+    .unwrap();
+    let package = SaltV2Package::new(SaltV2Codec::B3, vec![tensor]).unwrap();
+    let encoded = write_salt_v2_package(&package).unwrap();
+    let mut reader = SaltV2PackageReader::new_strict(Cursor::new(encoded.bytes)).unwrap();
+    let codec = reader.codec();
+    let spec = spec(
+        OutputReconstructionSchedule::SlidingWindows {
+            block_count: 2,
+            window_size: 2,
+            stride: 1,
+        },
+        1,
+    );
+    let mut builder = FixedTritScaleUpdateCandidateBuilder::new(&spec, &[44; 32], 5);
+    reader
+        .visit_packed_tensor("projection.weight", |plane| {
+            builder
+                .begin_packed_tile_plane(3, codec, plane, 2, 128, 8)
+                .unwrap();
+        })
+        .unwrap();
+    reader.verify_unchanged().unwrap();
+    assert!(matches!(
+        builder.begin_tile_plane(3, 1, 0, 2, &[Trit::ZERO], &[f16::ONE], 128, 8),
+        Err(OutputReconstructionError::ScaleFitAlreadyActive)
+    ));
+}
+
+#[test]
+fn scale_refit_accepts_zero_scale_only_for_all_zero_trit_groups() {
+    let spec = spec(
+        OutputReconstructionSchedule::SlidingWindows {
+            block_count: 2,
+            window_size: 2,
+            stride: 1,
+        },
+        1,
+    );
+    let mut valid = FixedTritScaleUpdateCandidateBuilder::new(&spec, &[55; 32], 1);
+    valid
+        .begin_tile_plane(0, 0, 0, 2, &[Trit::ZERO; 256], &[f16::ZERO; 2], 128, 1)
+        .unwrap();
+
+    let mut negative_zero = FixedTritScaleUpdateCandidateBuilder::new(&spec, &[55; 32], 2);
+    assert!(matches!(
+        negative_zero.begin_tile_plane(
+            0,
+            0,
+            0,
+            2,
+            &[Trit::ZERO; 256],
+            &[f16::from_bits(0x8000); 2],
+            128,
+            1,
+        ),
+        Err(OutputReconstructionError::InvalidScaleUpdate)
+    ));
+
+    let mut nonzero_trit = FixedTritScaleUpdateCandidateBuilder::new(&spec, &[55; 32], 3);
+    let mut trits = [Trit::ZERO; 256];
+    trits[0] = Trit::from_i8(1).unwrap();
+    assert!(matches!(
+        nonzero_trit.begin_tile_plane(0, 0, 0, 2, &trits, &[f16::ZERO; 2], 128, 1,),
+        Err(OutputReconstructionError::InvalidScaleUpdate)
     ));
 }
 

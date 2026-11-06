@@ -14,6 +14,7 @@ categories.workspace = true
 [dependencies]
 tritium-core = { workspace = true }
 tritium-spec = { workspace = true }
+tritium-schema = { workspace = true }
 tritium-runtime = { workspace = true }
 # `tritium-format` is only needed by the GPU host path (packed-row byte sizing),
 # so it is pulled in solely by the `cuda` feature to keep the default build lean.
@@ -98,6 +99,7 @@ nccl = ["cuda", "cudarc/nccl"]
 [dev-dependencies]
 anyhow = { workspace = true }
 tritium-testkit = { workspace = true }
+tritium-evidence = { workspace = true }
 tritium-format = { workspace = true }
 tritium-cpu = { workspace = true }
 # `half::f16` is the block-scale type the TQ2_0 packer takes; used only by the

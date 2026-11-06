@@ -11,9 +11,14 @@ use tritium_format::salt_v2_package::{
     pack_salt_v2_plane, unpack_salt_v2_plane_into,
 };
 
+mod attention;
+mod decoder;
+mod decoder_plan;
+mod delta_mixer;
 pub(super) mod deltanet;
 mod salt_v2_reader_upload;
 mod salt_v2_runtime;
+mod semantic;
 pub use salt_v2_runtime::SaltV2GatherReceipt;
 
 /// A logical prefix of cudarc page-locked memory.
@@ -778,7 +783,7 @@ pub(crate) struct EmbedSegments {
 /// reference-counted (`Arc`) by `cudarc`.
 #[derive(Debug)]
 pub struct CudaBackend {
-    /// The context's default stream — all memory ops and launches go through it.
+    /// The backend's owned nonblocking working stream for internal memory/launches.
     /// The stream holds its own `Arc<CudaContext>`, so the context stays alive for
     /// as long as the backend does without a separate field.
     pub(super) stream: Arc<CudaStream>,
@@ -803,6 +808,25 @@ pub struct CudaBackend {
     /// Gated DeltaNet recurrent-step PTX kept alive for `func_deltanet_step`.
     pub(super) _deltanet_module: Arc<CudaModule>,
     pub(super) func_deltanet_step: CudaFunction,
+    pub(super) func_semantic_additive_matmul: CudaFunction,
+    pub(super) func_semantic_additive_matmul_ordered_warp: CudaFunction,
+    pub(super) func_semantic_additive_gather: CudaFunction,
+    pub(super) func_semantic_additive_validate_finite: CudaFunction,
+    pub(super) func_semantic_basis_sign: CudaFunction,
+    pub(super) func_semantic_basis_butterfly: CudaFunction,
+    pub(super) func_semantic_basis_finish: CudaFunction,
+    pub(super) func_semantic_swiglu: CudaFunction,
+    pub(super) func_semantic_attention: CudaFunction,
+    pub(super) func_decoder_dense_gather: CudaFunction,
+    pub(super) func_decoder_norm: CudaFunction,
+    pub(super) func_decoder_bias: CudaFunction,
+    pub(super) func_decoder_add: CudaFunction,
+    pub(super) func_decoder_relu2: CudaFunction,
+    pub(super) func_decoder_rope: CudaFunction,
+    pub(super) func_qwen_query_gate: CudaFunction,
+    pub(super) func_qwen_attention_gate: CudaFunction,
+    pub(super) func_delta_convolution: CudaFunction,
+    pub(super) func_delta_mixer: CudaFunction,
     /// Scalar-correct D2/B3/S34 forward. The first fast API aliases this handle.
     pub(super) func_salt_v2_exact: CudaFunction,
     /// Shared-activation D2/B3/S34 forward used for prefill-shaped launches.
@@ -1021,6 +1045,9 @@ pub struct CudaBackend {
     /// projection path. Qwen prompt/decode invokes hundreds of projections;
     /// retaining these buffers removes a cuMemAlloc/cuMemFree pair per call.
     pub(super) salt_v2_workspace: Mutex<SaltV2Workspace>,
+    pub(super) semantic_swiglu_enabled: bool,
+    pub(super) resident_decoder_budget: Option<usize>,
+    pub(super) semantic_swiglu_workspace: Mutex<Option<semantic::SwigluWorkspace>>,
 }
 
 /// Process-local pool for transient SALT V2 activation/output buffers.
@@ -1061,6 +1088,40 @@ impl SaltV2Workspace {
 }
 
 impl CudaBackend {
+    /// Explicitly request a whole standard device-f32 decoder before loading.
+    /// The budget covers unique weights/vectors/KV/workspace payload, not driver
+    /// overhead. Unsupported graphs or insufficient budgets fail closed.
+    /// Existing host dispatch is unchanged without this selection.
+    pub fn with_resident_decoder(mut self, max_device_payload_bytes: usize) -> Self {
+        if self.resident_decoder_budget.is_none() {
+            self.device_id.push_str(":decoder-device-f32");
+        }
+        self.resident_decoder_budget = Some(max_device_payload_bytes);
+        self
+    }
+
+    /// Plan structural resident device payload without initializing a CUDA context.
+    /// This excludes host/allocator/driver costs and does not certify weight values,
+    /// ownership, physical fit, source authentication or model quality.
+    /// # Errors
+    /// Unsupported geometry/semantics, coefficient lengths or checked extent overflow.
+    pub fn plan_decoder_metadata(
+        metadata: tritium_spec::DecoderAllocationMetadata<'_>,
+        limits: tritium_spec::DecoderLimits,
+    ) -> Result<tritium_spec::DecoderPayloadPlan, BackendError> {
+        decoder_plan::plan(metadata, limits).map(|plan| plan.payload)
+    }
+    /// Explicitly opt into device-f32 SwiGLU regions before loading a model.
+    /// Device expf may differ from host exp. Default arithmetic is unchanged;
+    /// this does not qualify model quality/performance. The backend identity
+    /// records the selected mode. No runtime/environment toggle is introduced.
+    pub fn with_device_swiglu(mut self) -> Self {
+        if !self.semantic_swiglu_enabled {
+            self.semantic_swiglu_enabled = true;
+            self.device_id.push_str(":swiglu-device-f32");
+        }
+        self
+    }
     /// Open CUDA device `ordinal`, load the TQ2_0 add kernel, and return a backend.
     ///
     /// # Errors
@@ -1071,7 +1132,14 @@ impl CudaBackend {
         result::init().map_err(|e| driver_err("initialize CUDA driver", &e))?;
         let _context = CurrentContextRestore::capture()?;
         let ctx = CudaContext::new(ordinal).map_err(|e| driver_err("open cuda device", &e))?;
-        let stream = ctx.default_stream();
+        // A fresh wrapper has no owned allocations/work to migrate. Fork joins
+        // prior legacy-stream work by event and establishes multistream tracking
+        // without new_stream's first-stream context-wide synchronization, which
+        // would conflict with another backend's active graph capture (ADR 0052).
+        let stream = ctx
+            .default_stream()
+            .fork()
+            .map_err(|e| driver_err("create backend working stream", &e))?;
 
         let module = ctx
             .load_module(Ptx::from_src(TQ2_0_ADD_PTX))
@@ -1423,6 +1491,54 @@ impl CudaBackend {
         let func_deltanet_step = deltanet_module
             .load_function(KERNEL_NAME_DELTANET_STEP)
             .map_err(|e| driver_err("resolve qwen35_deltanet_recurrent_step kernel", &e))?;
+        let semantic_module = ctx
+            .load_module(Ptx::from_src(include_str!(concat!(
+                env!("OUT_DIR"),
+                "/semantic_additive.ptx"
+            ))))
+            .map_err(|e| driver_err("load semantic additive ptx", &e))?;
+        let func_semantic_additive_matmul = semantic_module
+            .load_function("semantic_additive_matmul")
+            .map_err(|e| driver_err("resolve semantic additive matmul", &e))?;
+        let func_semantic_additive_matmul_ordered_warp = semantic_module
+            .load_function("semantic_additive_matmul_ordered_warp")
+            .map_err(|e| driver_err("resolve ordered packed matmul", &e))?;
+        let func_semantic_additive_gather = semantic_module
+            .load_function("semantic_additive_gather")
+            .map_err(|e| driver_err("resolve semantic additive gather", &e))?;
+        let func_semantic_additive_validate_finite = semantic_module
+            .load_function("semantic_additive_validate_finite")
+            .map_err(|e| driver_err("resolve semantic additive finite validation", &e))?;
+        let func_semantic_basis_sign = semantic_module
+            .load_function("semantic_basis_sign")
+            .map_err(|e| driver_err("resolve semantic basis signs", &e))?;
+        let func_semantic_basis_butterfly = semantic_module
+            .load_function("semantic_basis_butterfly")
+            .map_err(|e| driver_err("resolve semantic basis butterfly", &e))?;
+        let func_semantic_basis_finish = semantic_module
+            .load_function("semantic_basis_finish")
+            .map_err(|e| driver_err("resolve semantic basis normalization", &e))?;
+        let func_semantic_swiglu = semantic_module
+            .load_function("semantic_swiglu")
+            .map_err(|e| driver_err("resolve semantic SwiGLU", &e))?;
+        let func_semantic_attention = semantic_module
+            .load_function("semantic_causal_attention")
+            .map_err(|e| driver_err("resolve semantic causal attention", &e))?;
+        let decoder_function = |name| {
+            semantic_module
+                .load_function(name)
+                .map_err(|e| driver_err("resolve resident decoder function", &e))
+        };
+        let func_decoder_dense_gather = decoder_function("semantic_decoder_dense_gather")?;
+        let func_decoder_norm = decoder_function("semantic_decoder_norm")?;
+        let func_decoder_bias = decoder_function("semantic_decoder_bias")?;
+        let func_decoder_add = decoder_function("semantic_decoder_add")?;
+        let func_decoder_relu2 = decoder_function("semantic_decoder_relu2")?;
+        let func_decoder_rope = decoder_function("semantic_decoder_rope")?;
+        let func_qwen_query_gate = decoder_function("semantic_qwen_query_gate")?;
+        let func_qwen_attention_gate = decoder_function("semantic_qwen_attention_gate")?;
+        let func_delta_convolution = decoder_function("semantic_delta_convolution")?;
+        let func_delta_mixer = decoder_function("semantic_delta_mixer")?;
 
         let device_name = ctx
             .name()
@@ -1452,6 +1568,25 @@ impl CudaBackend {
             _salt_v2_module: salt_v2_module,
             _deltanet_module: deltanet_module,
             func_deltanet_step,
+            func_semantic_additive_matmul,
+            func_semantic_additive_matmul_ordered_warp,
+            func_semantic_additive_gather,
+            func_semantic_additive_validate_finite,
+            func_semantic_basis_sign,
+            func_semantic_basis_butterfly,
+            func_semantic_basis_finish,
+            func_semantic_swiglu,
+            func_semantic_attention,
+            func_decoder_dense_gather,
+            func_decoder_norm,
+            func_decoder_bias,
+            func_decoder_add,
+            func_decoder_relu2,
+            func_decoder_rope,
+            func_qwen_query_gate,
+            func_qwen_attention_gate,
+            func_delta_convolution,
+            func_delta_mixer,
             func_salt_v2_exact,
             func_salt_v2_tiled,
             func_salt_v2_warp,
@@ -1565,6 +1700,9 @@ impl CudaBackend {
             imma_jit: Mutex::new(HashMap::new()),
             tuned_tiles: Mutex::new(HashMap::new()),
             salt_v2_workspace: Mutex::new(SaltV2Workspace::default()),
+            semantic_swiglu_enabled: false,
+            resident_decoder_budget: None,
+            semantic_swiglu_workspace: Mutex::new(None),
         })
     }
 
@@ -3970,7 +4108,7 @@ impl CudaBackend {
         Ok(())
     }
 
-    /// The backend's default CUDA stream. Exposed so the tensor-core training tier in
+    /// The backend's owned nonblocking CUDA stream. Exposed so the tensor-core training tier in
     /// `crate::train` can build a cuBLASLt handle on the same stream — that module lives
     /// outside `crate::cuda` and cannot reach the `pub(super)` field directly.
     pub(crate) fn stream(&self) -> &Arc<CudaStream> {
@@ -9076,7 +9214,184 @@ pub(super) enum AddKernel {
     Tiled,
 }
 
+impl CudaBackend {
+    /// Pure structural payload/workspace planning without creating a GPU context.
+    /// Numerical validation, actual driver/device support and physical-memory
+    /// qualification remain required at initialization/upload/execution.
+    pub fn plan_tensor_metadata(
+        metadata: tritium_spec::TensorMetadata<'_>,
+    ) -> Result<Option<tritium_spec::TensorUploadPlan>, BackendError> {
+        semantic::CudaTensor::plan(metadata)
+    }
+    /// Pure encoded-source/native-envelope planning; no device initialization.
+    /// Host staging and bounded explicit scratch are declared; allocator/driver/
+    /// pinned transfer overhead and execution resources remain excluded/unknown.
+    pub fn plan_tensor_stream(
+        metadata: tritium_spec::TensorMetadata<'_>,
+        encoding: tritium_spec::TensorStreamEncoding,
+    ) -> Result<Option<tritium_spec::TensorStreamPlan>, BackendError> {
+        semantic::CudaTensor::stream_plan(metadata, encoding)
+    }
+}
+
 impl TernaryBackend for CudaBackend {
+    fn resident_delta_mixer(
+        &self,
+        geometry: tritium_spec::DeltaMixerGeometry,
+        weights: tritium_spec::DeltaMixerWeights<'_>,
+        limits: tritium_spec::DecoderLimits,
+        max_device_payload_bytes: usize,
+    ) -> Result<Option<Box<dyn tritium_spec::ResidentDeltaMixer>>, BackendError> {
+        delta_mixer::create(self, geometry, weights, limits, max_device_payload_bytes)
+    }
+    fn request_resident_decoder(
+        &mut self,
+        max_device_payload_bytes: usize,
+    ) -> Result<(), BackendError> {
+        if max_device_payload_bytes == 0 {
+            return Err(BackendError::InvalidInput(
+                "resident decoder payload ceiling must be positive".into(),
+            ));
+        }
+        self.resident_decoder_budget = Some(max_device_payload_bytes);
+        Ok(())
+    }
+    fn resident_decoder_requested(&self) -> bool {
+        self.resident_decoder_budget.is_some()
+    }
+    fn resident_decoder_payload_limit(&self) -> Option<usize> {
+        self.resident_decoder_budget
+    }
+
+    fn decoder_payload_plan(
+        &self,
+        metadata: tritium_spec::DecoderAllocationMetadata<'_>,
+        limits: tritium_spec::DecoderLimits,
+    ) -> Result<Option<tritium_spec::DecoderPayloadPlan>, BackendError> {
+        Self::plan_decoder_metadata(metadata, limits).map(Some)
+    }
+    fn resident_decoder(
+        self: Arc<Self>,
+        graph: tritium_spec::DecoderGraph<'_>,
+        limits: tritium_spec::DecoderLimits,
+    ) -> Result<Option<Box<dyn tritium_spec::ResidentDecoder>>, BackendError> {
+        decoder::create(self, graph, limits)
+    }
+    fn resident_deltanet(
+        &self,
+        geometry: tritium_spec::DeltaNetGeometry,
+    ) -> Result<Option<Box<dyn tritium_spec::ResidentDeltaNet>>, BackendError> {
+        geometry.elements()?;
+        // Unsupported valid geometry differs from allocation/driver failures.
+        if geometry.value_head_dim > 1024
+            || [
+                geometry.value_heads,
+                geometry.key_head_dim,
+                geometry.group_size,
+            ]
+            .into_iter()
+            .any(|n| u32::try_from(n).is_err())
+            || geometry.key_head_dim > u32::MAX as usize / (2 * core::mem::size_of::<f32>())
+        {
+            return Ok(None);
+        }
+        let threads = self
+            .func_deltanet_step
+            .max_threads_per_block()
+            .map_err(|error| driver_err("query DeltaNet block limit", &error))?;
+        let shared = self
+            .stream
+            .context()
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)
+            .map_err(|error| driver_err("query DeltaNet shared memory limit", &error))?;
+        let static_shared = self
+            .func_deltanet_step
+            .shared_size_bytes()
+            .map_err(|error| driver_err("query DeltaNet static shared memory", &error))?;
+        let grid = self
+            .stream
+            .context()
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X)
+            .map_err(|error| driver_err("query DeltaNet grid limit", &error))?;
+        if threads <= 0 || shared < 0 || static_shared < 0 || grid <= 0 {
+            return Err(BackendError::Backend(
+                "invalid DeltaNet kernel/device limits".into(),
+            ));
+        }
+        if geometry.value_head_dim > threads as usize
+            || geometry.value_heads > grid as usize
+            || 2 * geometry.key_head_dim * core::mem::size_of::<f32>() + static_shared as usize
+                > shared as usize
+        {
+            return Ok(None);
+        }
+        self.new_deltanet_state(
+            geometry.value_heads,
+            geometry.key_head_dim,
+            geometry.value_head_dim,
+            geometry.group_size,
+        )
+        .map(|state| Some(Box::new(state) as Box<dyn tritium_spec::ResidentDeltaNet>))
+    }
+
+    fn tensor_caps(
+        &self,
+        tensor: tritium_spec::TensorView<'_>,
+    ) -> Result<Option<tritium_spec::TensorCaps>, BackendError> {
+        semantic::CudaTensor::caps(tensor)
+    }
+
+    fn tensor_upload_plan(
+        &self,
+        metadata: tritium_spec::TensorMetadata<'_>,
+    ) -> Result<Option<tritium_spec::TensorUploadPlan>, BackendError> {
+        Self::plan_tensor_metadata(metadata)
+    }
+
+    fn upload_tensor(
+        &self,
+        tensor: tritium_spec::TensorView<'_>,
+    ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        semantic::CudaTensor::upload(self, tensor)
+    }
+    fn tensor_stream_plan(
+        &self,
+        metadata: tritium_spec::TensorMetadata<'_>,
+        encoding: tritium_spec::TensorStreamEncoding,
+    ) -> Result<Option<tritium_spec::TensorStreamPlan>, BackendError> {
+        Self::plan_tensor_stream(metadata, encoding)
+    }
+    fn upload_tensor_stream(
+        &self,
+        source: &dyn tritium_spec::TensorStreamSource,
+    ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        semantic::CudaTensor::upload_stream(self, source)
+    }
+
+    fn matmul(&self, p: tritium_spec::TensorMatmul<'_>) -> Result<(), BackendError> {
+        semantic::CudaTensor::matmul(self, p)
+    }
+    fn try_tensor_swiglu(&self, p: tritium_spec::TensorSwiGlu<'_>) -> Result<bool, BackendError> {
+        semantic::swiglu::forward(self, p)
+    }
+
+    fn resident_attention(
+        &self,
+        geometry: tritium_spec::AttentionGeometry,
+        limits: tritium_spec::AttentionLimits,
+    ) -> Result<Option<Box<dyn tritium_spec::ResidentAttention>>, BackendError> {
+        attention::create(self, geometry, limits)
+    }
+
+    fn embed_rows(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        ids: &[usize],
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        semantic::CudaTensor::embed(self, tensor, ids, out)
+    }
+
     fn device_id(&self) -> &str {
         &self.device_id
     }

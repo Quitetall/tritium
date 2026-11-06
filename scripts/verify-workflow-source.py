@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import argparse
 import re
-import subprocess
+from pathlib import Path
+import runpy
 import sys
 
 
 REVISION = re.compile(r"^[0-9a-f]{40}$")
+_run_git = runpy.run_path(Path(__file__).with_name("_qualification_git.py"))["run_git"]
 
 
 def main() -> int:
@@ -22,13 +24,8 @@ def main() -> int:
         parser.error("expected revision must be a full 40-character Git object ID")
 
     try:
-        actual = subprocess.run(
-            ["git", "rev-parse", "--verify", "HEAD^{commit}"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip().lower()
-    except (OSError, subprocess.CalledProcessError) as error:
+        actual = _run_git(Path.cwd(), "rev-parse", "--verify", "HEAD^{commit}").lower()
+    except ValueError as error:
         print(f"cannot resolve checked-out Git commit: {error}", file=sys.stderr)
         return 1
 

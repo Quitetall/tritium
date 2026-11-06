@@ -34,6 +34,12 @@ npm --prefix packages/tritium-web run check
 git diff --check
 ```
 
+The API comparison requires the external `cargo-semver-checks` contributor
+tool (`cargo install cargo-semver-checks --locked`); it is not a runtime
+dependency. Check availability with `cargo semver-checks --version` before
+starting the full comparison. A missing checker is an unavailable gate, not
+evidence of API compatibility: `check-semver.sh` fails even in report mode.
+
 Run only the applicable subset while iterating, then report every gate you ran,
 every skipped optional dependency or hardware lane, and every remaining blocker.
 GPU, browser, model, package, and deployment claims require receipts from the
@@ -55,6 +61,13 @@ release checks that require a clean Git tree. It never touches the caller's
 index or branch, never inspects unrelated working-tree WIP, and fails closed
 when a required checker is unavailable. For explicit local tiers, run
 `./scripts/verify-gates.sh prepush`, `ci`, or `release`.
+
+These explicit tiers also run strict workspace Clippy for Windows GNU when the
+target and MinGW compiler are installed (excluding the Python extension). This
+checks non-Unix code and Windows-specific layout lints without linking or running
+Windows executables. Missing prerequisites are explicitly skipped; native Windows
+CI still proves the platform test/lint result. A plain cross-target `cargo check`
+does not catch those lints.
 
 It checks the commit being pushed, not your working tree, so uncommitted work
 never affects the verdict. `TRITIUM_PREPUSH_FMT_ONLY=1 git push` runs just the

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlaneAllocation",
+  "description": "Uniform or per-tile plane-count allocation policy.",
+  "oneOf": [
+    {
+      "description": "Every tile uses the tensor's maximum plane count.",
+      "type": "string",
+      "const": "Uniform"
+    },
+    {
+      "description": "Each tile records its own plane count.",
+      "type": "string",
+      "const": "PerTile"
+    }
+  ]
+}

@@ -15,7 +15,7 @@ use tritium_format::salt_v2_package::SaltV2ScaleUpdate;
 use tritium_spec::TernaryBackend;
 
 use crate::error::NnError;
-use crate::layers::{DenseLinear, HostSaltV2Linear, Q2Linear, SaltLinear, TernaryLinear};
+use crate::layers::{DenseLinear, HostSaltV2Linear, Linear, Q2Linear, SaltLinear, TernaryLinear};
 
 /// Activation arithmetic performed before a projection's weight contraction.
 ///
@@ -52,9 +52,23 @@ pub enum Projection {
     SaltV2(Arc<tritium_cuda::SaltV2ResidentTensor>),
     /// A dense fp32 weight (normally the fp master/reference path).
     Dense(DenseLinear),
+    /// Unified checked tensor, executed only through the shared backend contract.
+    Tensor(Linear),
 }
 
 impl Projection {
+    /// Share the immutable resident storage for one SALT V2 projection.
+    /// Other projection families are intentionally not cloneable through this
+    /// measurement-only helper.
+    pub(crate) fn clone_salt_v2_resident(&self) -> Option<Self> {
+        match self {
+            Projection::HostSaltV2(matrix) => Some(Projection::HostSaltV2(Arc::clone(matrix))),
+            #[cfg(feature = "cuda")]
+            Projection::SaltV2(matrix) => Some(Projection::SaltV2(Arc::clone(matrix))),
+            _ => None,
+        }
+    }
+
     /// Physical SALT V2 tensor index retained by this resident projection.
     #[must_use]
     pub fn salt_v2_tensor_index(&self) -> Option<usize> {
@@ -124,7 +138,7 @@ impl Projection {
             Projection::Ternary(_) | Projection::Q2(_) | Projection::Salt(_) => {
                 ProjectionActivationMode::A8
             }
-            Projection::HostSaltV2(_) => ProjectionActivationMode::F32,
+            Projection::HostSaltV2(_) | Projection::Tensor(_) => ProjectionActivationMode::F32,
             #[cfg(feature = "cuda")]
             Projection::SaltV2(_) => ProjectionActivationMode::F32,
             Projection::Dense(linear) => {
@@ -143,7 +157,7 @@ impl Projection {
             Projection::Ternary(linear) => linear.validate_retained_geometry(),
             Projection::Q2(linear) => linear.validate_retained_geometry(),
             Projection::Dense(linear) => linear.validate_retained_geometry(),
-            Projection::Salt(_) | Projection::HostSaltV2(_) => Ok(()),
+            Projection::Salt(_) | Projection::HostSaltV2(_) | Projection::Tensor(_) => Ok(()),
             #[cfg(feature = "cuda")]
             Projection::SaltV2(_) => Ok(()),
         }
@@ -181,6 +195,9 @@ impl Projection {
             Projection::HostSaltV2(_) => {
                 // Strict package decode validates payload and scales before construction.
             }
+            Projection::Tensor(_) => {
+                // Private loader construction validates immutable geometry and parameters.
+            }
             #[cfg(feature = "cuda")]
             Projection::SaltV2(_) => {
                 // Upload validates the immutable resident allocation.
@@ -190,7 +207,8 @@ impl Projection {
     }
 
     /// Forward through whichever projection this is. Deployed ternary and resident
-    /// SALT V2 weights use `backend`; host-packed SALT and dense weights run on the host.
+    /// SALT V2 and shared tensor weights use `backend`; legacy host-packed SALT
+    /// and inspectable dense masters run on the host.
     ///
     /// # Errors
     /// Propagates the underlying projection's [`NnError`]. Resident SALT V2 returns
@@ -210,6 +228,7 @@ impl Projection {
             #[cfg(feature = "cuda")]
             Projection::SaltV2(tensor) => salt_v2_forward_exact(backend, tensor, act, m, out),
             Projection::Dense(l) => l.forward(act, m, out),
+            Projection::Tensor(l) => l.forward(backend, act, m, out),
         }
     }
 
@@ -223,6 +242,7 @@ impl Projection {
             #[cfg(feature = "cuda")]
             Projection::SaltV2(tensor) => tensor.rows(),
             Projection::Dense(l) => l.n_out,
+            Projection::Tensor(l) => l.n_out(),
         }
     }
 
@@ -236,6 +256,7 @@ impl Projection {
             #[cfg(feature = "cuda")]
             Projection::SaltV2(tensor) => tensor.columns(),
             Projection::Dense(l) => l.k_in,
+            Projection::Tensor(l) => l.k_in(),
         }
     }
 
@@ -247,7 +268,8 @@ impl Projection {
             Projection::Q2(_)
             | Projection::Salt(_)
             | Projection::HostSaltV2(_)
-            | Projection::Dense(_) => None,
+            | Projection::Dense(_)
+            | Projection::Tensor(_) => None,
             #[cfg(feature = "cuda")]
             Projection::SaltV2(_) => None,
         }
@@ -261,7 +283,8 @@ impl Projection {
             Projection::Q2(_)
             | Projection::Salt(_)
             | Projection::HostSaltV2(_)
-            | Projection::Dense(_) => None,
+            | Projection::Dense(_)
+            | Projection::Tensor(_) => None,
             #[cfg(feature = "cuda")]
             Projection::SaltV2(_) => None,
         }

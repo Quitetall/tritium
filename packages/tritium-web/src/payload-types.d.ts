@@ -7,6 +7,4 @@ export type WebTrainingPayloadErrorCode =
   | "invalid_schema"
   | "missing_buffer";
 
-export type WebTrainingInitialTensorsV1 = Readonly<
-  Record<string, PortableScheduleTensorV1>
->;
+export type WebTrainingInitialTensorsV1 = Readonly<Record<string, PortableScheduleTensorV1>>;

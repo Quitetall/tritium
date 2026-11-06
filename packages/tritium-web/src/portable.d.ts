@@ -42,9 +42,7 @@ export interface PortableTrainingRequestV1 {
   readonly physicalDevice: string;
   readonly operation: string;
   readonly execution: PortableExecutionV1;
-  readonly vectorDigest:
-    | "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7"
-    | null;
+  readonly vectorDigest: "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7" | null;
   readonly inputs: readonly PortableBufferV1[];
   readonly attributes: readonly PortableAttributeV1[];
   readonly outputs: readonly PortableBufferV1[];
@@ -54,11 +52,8 @@ export interface PortableTrainingReceiptV1 {
   readonly backendId: "wasm.portable.v1";
   readonly backendBuild: string;
   readonly physicalDevice: string;
-  readonly manifestDigest:
-    "9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098";
-  readonly vectorDigest:
-    | "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7"
-    | null;
+  readonly manifestDigest: "9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098";
+  readonly vectorDigest: "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7" | null;
   readonly operation: string;
   readonly execution: PortableExecutionV1;
   readonly dtype: "f32" | "u32" | "bytes";
@@ -103,10 +98,8 @@ export interface PortableWasmConformanceReceiptV1 {
   readonly buildId: string;
   readonly guestDigest: string;
   readonly executionDigest: string;
-  readonly manifestDigest:
-    "9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098";
-  readonly vectorDigest:
-    "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7";
+  readonly manifestDigest: "9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098";
+  readonly vectorDigest: "38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7";
   readonly operationCount: number;
   readonly caseCount: number;
   readonly maxCallerBytes: number;
@@ -114,8 +107,4 @@ export interface PortableWasmConformanceReceiptV1 {
   readonly repeatedExecutions: 2;
 }
 
-export type PortableWasmSourceV1 =
-  | RequestInfo
-  | URL
-  | Response
-  | BufferSource;
+export type PortableWasmSourceV1 = RequestInfo | URL | Response | BufferSource;

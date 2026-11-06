@@ -1,7 +1,7 @@
 //! Seekable entropy-coded transport for already-packed ternary artifacts.
 //!
 //! This layer is deliberately separate from resident/runtime formats. Each chunk is either
-//! stored verbatim or encoded with a deterministic canonical byte Huffman table, and the index
+//! stored verbatim or encoded with a deterministic canonical byte Huffman or rANS table, and the index
 //! keeps every logical range independently addressable. The expanded fixed-codec bytes therefore
 //! remain the resident-byte denominator; this module only reduces bytes at rest or in transit.
 
@@ -15,7 +15,7 @@ use blake3::Hasher;
 /// File magic for the seekable entropy transport.
 pub const ENTROPY_TRANSPORT_MAGIC: [u8; 4] = *b"TRNS";
 /// Current transport version.
-pub const ENTROPY_TRANSPORT_VERSION: u8 = 1;
+pub const ENTROPY_TRANSPORT_VERSION: u8 = 2;
 /// Default independently seekable chunk size.
 pub const ENTROPY_TRANSPORT_DEFAULT_CHUNK_BYTES: usize = 64 * 1024;
 /// Minimum accepted chunk size.
@@ -26,6 +26,22 @@ const HEADER_BYTES: usize = 36;
 const INDEX_ENTRY_BYTES: usize = 60;
 const MODE_RAW: u8 = 0;
 const MODE_HUFFMAN: u8 = 1;
+const MODE_RANS: u8 = 2;
+const RANS_SCALE_BITS: u32 = 12;
+const RANS_TOTAL: u32 = 1 << RANS_SCALE_BITS;
+const RANS_LOWER_BOUND: u32 = 1 << 23;
+const RANS_MODEL_BYTES: usize = 256 * 2;
+
+/// Encoding used by one independently addressable transport chunk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntropyTransportChunkCodec {
+    /// Payload is stored verbatim.
+    Raw,
+    /// Payload uses a canonical byte-Huffman table.
+    Huffman,
+    /// Payload uses a normalized byte-rANS table.
+    Rans,
+}
 
 /// A single independently addressable transport chunk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,7 +54,7 @@ pub struct EntropyChunkInfo {
     pub logical_len: u32,
     /// Number of physical payload bytes.
     pub payload_len: u32,
-    /// Whether payload is raw (`false`) or canonical Huffman (`true`).
+    /// Whether this chunk uses canonical Huffman; use the container's `chunk_codec` for exact mode.
     pub huffman: bool,
     /// BLAKE3 digest of decoded logical bytes.
     pub digest: [u8; 32],
@@ -51,6 +67,7 @@ pub struct EntropyTransport<'a> {
     logical_len: usize,
     chunk_size: usize,
     chunks: Vec<EntropyChunkInfo>,
+    codecs: Vec<EntropyTransportChunkCodec>,
 }
 
 /// File-backed parsed view over an entropy transport.
@@ -64,6 +81,7 @@ pub struct SeekableEntropyTransport<R> {
     logical_len: usize,
     chunk_size: usize,
     chunks: Vec<EntropyChunkInfo>,
+    codecs: Vec<EntropyTransportChunkCodec>,
 }
 
 /// Errors emitted while encoding or parsing entropy transport.
@@ -90,6 +108,10 @@ pub enum EntropyTransportError {
     InvalidHuffmanTable,
     /// Huffman bitstream is malformed.
     InvalidHuffmanStream,
+    /// rANS frequency table is malformed or not normalized.
+    InvalidRansTable,
+    /// rANS state or renormalization stream is malformed.
+    InvalidRansStream,
     /// Decoded chunk length differs from its index declaration.
     DecodedLengthMismatch,
     /// Decoded bytes failed their content digest.
@@ -113,6 +135,8 @@ impl fmt::Display for EntropyTransportError {
             Self::UnknownMode(m) => write!(f, "entropy transport: unknown chunk mode {m}"),
             Self::InvalidHuffmanTable => write!(f, "entropy transport: invalid Huffman table"),
             Self::InvalidHuffmanStream => write!(f, "entropy transport: invalid Huffman stream"),
+            Self::InvalidRansTable => write!(f, "entropy transport: invalid rANS table"),
+            Self::InvalidRansStream => write!(f, "entropy transport: invalid rANS stream"),
             Self::DecodedLengthMismatch => write!(f, "entropy transport: decoded length mismatch"),
             Self::DigestMismatch => write!(f, "entropy transport: chunk digest mismatch"),
             Self::ChunkOutOfRange(i) => write!(f, "entropy transport: chunk {i} out of range"),
@@ -143,9 +167,10 @@ pub fn write_entropy_transport_with_chunk_size(
         .ok_or(EntropyTransportError::LengthOverflow)?;
     let mut encoded_chunks = Vec::with_capacity(chunk_count);
     let mut infos = Vec::with_capacity(chunk_count);
+    let mut codecs = Vec::with_capacity(chunk_count);
     let mut payload_len = 0usize;
     for (index, logical) in bytes.chunks(chunk_size).enumerate() {
-        let (huffman, payload) = encode_chunk(logical)?;
+        let (codec, payload) = encode_chunk(logical)?;
         let payload_offset = payload_start
             .checked_add(payload_len)
             .ok_or(EntropyTransportError::LengthOverflow)?;
@@ -165,10 +190,11 @@ pub fn write_entropy_transport_with_chunk_size(
                 .map_err(|_| EntropyTransportError::LengthOverflow)?,
             payload_len: u32::try_from(payload.len())
                 .map_err(|_| EntropyTransportError::LengthOverflow)?,
-            huffman,
+            huffman: codec == EntropyTransportChunkCodec::Huffman,
             digest: digest(logical),
         });
         encoded_chunks.push(payload);
+        codecs.push(codec);
     }
     let mut out = Vec::with_capacity(payload_start + payload_len);
     out.extend_from_slice(&ENTROPY_TRANSPORT_MAGIC);
@@ -192,12 +218,16 @@ pub fn write_entropy_transport_with_chunk_size(
             .map_err(|_| EntropyTransportError::LengthOverflow)?
             .to_le_bytes(),
     );
-    for info in &infos {
+    for (info, codec) in infos.iter().zip(codecs) {
         out.extend_from_slice(&info.logical_offset.to_le_bytes());
         out.extend_from_slice(&info.payload_offset.to_le_bytes());
         out.extend_from_slice(&info.logical_len.to_le_bytes());
         out.extend_from_slice(&info.payload_len.to_le_bytes());
-        out.push(if info.huffman { MODE_HUFFMAN } else { MODE_RAW });
+        out.push(match codec {
+            EntropyTransportChunkCodec::Raw => MODE_RAW,
+            EntropyTransportChunkCodec::Huffman => MODE_HUFFMAN,
+            EntropyTransportChunkCodec::Rans => MODE_RANS,
+        });
         out.extend_from_slice(&[0u8; 3]);
         out.extend_from_slice(&info.digest);
     }
@@ -209,7 +239,7 @@ pub fn write_entropy_transport_with_chunk_size(
 
 /// Parse a transport without eagerly decoding all chunks.
 pub fn read_entropy_transport(bytes: &[u8]) -> Result<EntropyTransport<'_>, EntropyTransportError> {
-    let (logical_len, chunk_size, chunks) = parse_transport_metadata(
+    let (logical_len, chunk_size, chunks, codecs) = parse_transport_metadata(
         bytes,
         u64::try_from(bytes.len()).map_err(|_| EntropyTransportError::LengthOverflow)?,
     )?;
@@ -218,6 +248,7 @@ pub fn read_entropy_transport(bytes: &[u8]) -> Result<EntropyTransport<'_>, Entr
         logical_len,
         chunk_size,
         chunks,
+        codecs,
     })
 }
 
@@ -248,23 +279,33 @@ pub fn read_entropy_transport_seekable<R: Read + Seek>(
     source
         .read_exact(&mut metadata[HEADER_BYTES..])
         .map_err(|_| EntropyTransportError::Truncated)?;
-    let (logical_len, chunk_size, chunks) = parse_transport_metadata(&metadata, source_len)?;
+    let (logical_len, chunk_size, chunks, codecs) =
+        parse_transport_metadata(&metadata, source_len)?;
     Ok(SeekableEntropyTransport {
         source,
         logical_len,
         chunk_size,
         chunks,
+        codecs,
     })
 }
 
 fn parse_transport_metadata(
     bytes: &[u8],
     source_len: u64,
-) -> Result<(usize, usize, Vec<EntropyChunkInfo>), EntropyTransportError> {
+) -> Result<
+    (
+        usize,
+        usize,
+        Vec<EntropyChunkInfo>,
+        Vec<EntropyTransportChunkCodec>,
+    ),
+    EntropyTransportError,
+> {
     if bytes.len() < HEADER_BYTES || bytes[..4] != ENTROPY_TRANSPORT_MAGIC {
         return Err(EntropyTransportError::BadMagic);
     }
-    if bytes[4] != ENTROPY_TRANSPORT_VERSION {
+    if !(1..=ENTROPY_TRANSPORT_VERSION).contains(&bytes[4]) {
         return Err(EntropyTransportError::UnsupportedVersion(bytes[4]));
     }
     if bytes[5] != 0 || bytes[7] != 0 {
@@ -302,6 +343,7 @@ fn parse_transport_metadata(
         return Err(EntropyTransportError::NonCanonicalIndex);
     }
     let mut chunks = Vec::with_capacity(chunk_count);
+    let mut codecs = Vec::with_capacity(chunk_count);
     let mut logical_cursor = 0u64;
     let mut payload_cursor =
         u64::try_from(payload_start).map_err(|_| EntropyTransportError::LengthOverflow)?;
@@ -333,13 +375,16 @@ fn parse_transport_metadata(
         if logical_offset != logical_cursor
             || u64::from(logical_chunk_len) != u64::try_from(expected_logical_len).unwrap()
             || payload_offset != payload_cursor
-            || mode > MODE_HUFFMAN
+            || mode > MODE_RANS
+            || (bytes[4] == 1 && mode == MODE_RANS)
         {
-            return Err(if mode > MODE_HUFFMAN {
-                EntropyTransportError::UnknownMode(mode)
-            } else {
-                EntropyTransportError::NonCanonicalIndex
-            });
+            return Err(
+                if mode > MODE_RANS || (bytes[4] == 1 && mode == MODE_RANS) {
+                    EntropyTransportError::UnknownMode(mode)
+                } else {
+                    EntropyTransportError::NonCanonicalIndex
+                },
+            );
         }
         let payload_end = payload_offset
             .checked_add(u64::from(payload_len))
@@ -359,11 +404,17 @@ fn parse_transport_metadata(
             huffman: mode == MODE_HUFFMAN,
             digest,
         });
+        codecs.push(match mode {
+            MODE_RAW => EntropyTransportChunkCodec::Raw,
+            MODE_HUFFMAN => EntropyTransportChunkCodec::Huffman,
+            MODE_RANS => EntropyTransportChunkCodec::Rans,
+            _ => return Err(EntropyTransportError::UnknownMode(mode)),
+        });
     }
     if logical_cursor != u64::try_from(logical_len).unwrap() || payload_cursor != source_len {
         return Err(EntropyTransportError::NonCanonicalIndex);
     }
-    Ok((logical_len, chunk_size, chunks))
+    Ok((logical_len, chunk_size, chunks, codecs))
 }
 
 impl<'a> EntropyTransport<'a> {
@@ -393,6 +444,17 @@ impl<'a> EntropyTransport<'a> {
             .ok_or(EntropyTransportError::ChunkOutOfRange(index))
     }
 
+    /// Return the exact codec used by one chunk.
+    pub fn chunk_codec(
+        &self,
+        index: usize,
+    ) -> Result<EntropyTransportChunkCodec, EntropyTransportError> {
+        self.codecs
+            .get(index)
+            .copied()
+            .ok_or(EntropyTransportError::ChunkOutOfRange(index))
+    }
+
     /// Decode and integrity-check one independently seekable chunk.
     pub fn read_chunk(&self, index: usize) -> Result<Vec<u8>, EntropyTransportError> {
         let info = self.chunk_info(index)?;
@@ -405,7 +467,7 @@ impl<'a> EntropyTransport<'a> {
             .bytes
             .get(start..end)
             .ok_or(EntropyTransportError::Truncated)?;
-        decode_chunk(info, payload)
+        decode_chunk(info, self.codecs[index], payload)
     }
 
     /// Decode and integrity-check an arbitrary logical byte range.
@@ -471,6 +533,17 @@ impl<R: Read + Seek> SeekableEntropyTransport<R> {
             .ok_or(EntropyTransportError::ChunkOutOfRange(index))
     }
 
+    /// Return the exact codec used by one chunk.
+    pub fn chunk_codec(
+        &self,
+        index: usize,
+    ) -> Result<EntropyTransportChunkCodec, EntropyTransportError> {
+        self.codecs
+            .get(index)
+            .copied()
+            .ok_or(EntropyTransportError::ChunkOutOfRange(index))
+    }
+
     /// Seek to and decode one independently addressable chunk.
     pub fn read_chunk(&mut self, index: usize) -> Result<Vec<u8>, EntropyTransportError> {
         let info = self.chunk_info(index)?;
@@ -483,7 +556,7 @@ impl<R: Read + Seek> SeekableEntropyTransport<R> {
         self.source
             .read_exact(&mut payload)
             .map_err(|_| EntropyTransportError::Truncated)?;
-        decode_chunk(info, &payload)
+        decode_chunk(info, self.codecs[index], &payload)
     }
 
     /// Seek to and decode an arbitrary logical byte range.
@@ -520,14 +593,20 @@ impl<R: Read + Seek> SeekableEntropyTransport<R> {
     }
 }
 
-fn decode_chunk(info: EntropyChunkInfo, payload: &[u8]) -> Result<Vec<u8>, EntropyTransportError> {
-    let decoded = if info.huffman {
-        decode_huffman(payload, info.logical_len as usize)?
-    } else {
-        if payload.len() != info.logical_len as usize {
-            return Err(EntropyTransportError::DecodedLengthMismatch);
+fn decode_chunk(
+    info: EntropyChunkInfo,
+    codec: EntropyTransportChunkCodec,
+    payload: &[u8],
+) -> Result<Vec<u8>, EntropyTransportError> {
+    let decoded = match codec {
+        EntropyTransportChunkCodec::Raw => {
+            if payload.len() != info.logical_len as usize {
+                return Err(EntropyTransportError::DecodedLengthMismatch);
+            }
+            payload.to_vec()
         }
-        payload.to_vec()
+        EntropyTransportChunkCodec::Huffman => decode_huffman(payload, info.logical_len as usize)?,
+        EntropyTransportChunkCodec::Rans => decode_rans(payload, info.logical_len as usize)?,
     };
     if digest(&decoded) != info.digest {
         return Err(EntropyTransportError::DigestMismatch);
@@ -551,7 +630,28 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-fn encode_chunk(bytes: &[u8]) -> Result<(bool, Vec<u8>), EntropyTransportError> {
+fn encode_chunk(
+    bytes: &[u8],
+) -> Result<(EntropyTransportChunkCodec, Vec<u8>), EntropyTransportError> {
+    if bytes.is_empty() {
+        return Err(EntropyTransportError::InvalidChunkSize(0));
+    }
+    let mut best_codec = EntropyTransportChunkCodec::Raw;
+    let mut best_payload = bytes.to_vec();
+    let huffman = encode_huffman(bytes)?;
+    if huffman.len() < best_payload.len() {
+        best_codec = EntropyTransportChunkCodec::Huffman;
+        best_payload = huffman;
+    }
+    let rans = encode_rans(bytes)?;
+    if rans.len() < best_payload.len() {
+        best_codec = EntropyTransportChunkCodec::Rans;
+        best_payload = rans;
+    }
+    Ok((best_codec, best_payload))
+}
+
+fn encode_huffman(bytes: &[u8]) -> Result<Vec<u8>, EntropyTransportError> {
     let lengths = huffman_lengths(bytes)?;
     let codes = canonical_codes(&lengths)?;
     let mut stream = BitWriter::default();
@@ -562,11 +662,148 @@ fn encode_chunk(bytes: &[u8]) -> Result<(bool, Vec<u8>), EntropyTransportError> 
     encoded.extend(lengths);
     encoded.extend_from_slice(&stream.bits.to_le_bytes());
     encoded.extend(stream.bytes);
-    if encoded.len() < bytes.len() {
-        Ok((true, encoded))
-    } else {
-        Ok((false, bytes.to_vec()))
+    Ok(encoded)
+}
+
+fn encode_rans(bytes: &[u8]) -> Result<Vec<u8>, EntropyTransportError> {
+    let frequencies = normalized_frequencies(bytes)?;
+    let mut cumulative = [0u32; 256];
+    let mut total = 0u32;
+    for (symbol, frequency) in frequencies.iter().copied().enumerate() {
+        cumulative[symbol] = total;
+        total = total
+            .checked_add(u32::from(frequency))
+            .ok_or(EntropyTransportError::LengthOverflow)?;
     }
+    if total != RANS_TOTAL {
+        return Err(EntropyTransportError::InvalidRansTable);
+    }
+
+    let mut state = RANS_LOWER_BOUND;
+    let mut renormalized = Vec::new();
+    for &byte in bytes.iter().rev() {
+        let symbol = byte as usize;
+        let frequency = u32::from(frequencies[symbol]);
+        let maximum = ((RANS_LOWER_BOUND >> RANS_SCALE_BITS) << 8)
+            .checked_mul(frequency)
+            .ok_or(EntropyTransportError::LengthOverflow)?;
+        while state >= maximum {
+            renormalized.push(state as u8);
+            state >>= 8;
+        }
+        state = ((state / frequency) << RANS_SCALE_BITS) + state % frequency + cumulative[symbol];
+    }
+    let mut encoded = Vec::with_capacity(RANS_MODEL_BYTES + 4 + renormalized.len());
+    for frequency in frequencies {
+        encoded.extend_from_slice(&frequency.to_le_bytes());
+    }
+    encoded.extend_from_slice(&state.to_le_bytes());
+    encoded.extend(renormalized.into_iter().rev());
+    Ok(encoded)
+}
+
+fn normalized_frequencies(bytes: &[u8]) -> Result<[u16; 256], EntropyTransportError> {
+    let mut counts = [0u64; 256];
+    for &byte in bytes {
+        counts[byte as usize] = counts[byte as usize]
+            .checked_add(1)
+            .ok_or(EntropyTransportError::LengthOverflow)?;
+    }
+    let present = counts.iter().filter(|&&count| count != 0).count();
+    if present == 0 || present > RANS_TOTAL as usize {
+        return Err(EntropyTransportError::InvalidRansTable);
+    }
+    let available = u64::from(RANS_TOTAL) - present as u64;
+    let length = u64::try_from(bytes.len()).map_err(|_| EntropyTransportError::LengthOverflow)?;
+    let mut frequencies = [0u16; 256];
+    let mut remainders = Vec::with_capacity(present);
+    let mut assigned = present as u64;
+    for (symbol, &count) in counts.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let scaled = available
+            .checked_mul(count)
+            .ok_or(EntropyTransportError::LengthOverflow)?;
+        let share = scaled / length;
+        let remainder = scaled % length;
+        frequencies[symbol] =
+            u16::try_from(1 + share).map_err(|_| EntropyTransportError::InvalidRansTable)?;
+        assigned += share;
+        remainders.push((remainder, symbol));
+    }
+    remainders
+        .sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let remaining = usize::try_from(u64::from(RANS_TOTAL) - assigned)
+        .map_err(|_| EntropyTransportError::InvalidRansTable)?;
+    for &(_, symbol) in remainders.iter().take(remaining) {
+        frequencies[symbol] = frequencies[symbol]
+            .checked_add(1)
+            .ok_or(EntropyTransportError::InvalidRansTable)?;
+    }
+    Ok(frequencies)
+}
+
+fn decode_rans(payload: &[u8], expected_len: usize) -> Result<Vec<u8>, EntropyTransportError> {
+    let state_offset = RANS_MODEL_BYTES;
+    let stream_offset = state_offset + 4;
+    if payload.len() < stream_offset {
+        return Err(EntropyTransportError::InvalidRansStream);
+    }
+    let mut frequencies = [0u16; 256];
+    let mut cumulative = [0u32; 256];
+    let mut lookup = vec![u16::MAX; RANS_TOTAL as usize];
+    let mut total = 0u32;
+    for symbol in 0..256 {
+        let offset = symbol * 2;
+        let frequency = u16::from_le_bytes([payload[offset], payload[offset + 1]]);
+        frequencies[symbol] = frequency;
+        cumulative[symbol] = total;
+        let end = total
+            .checked_add(u32::from(frequency))
+            .ok_or(EntropyTransportError::InvalidRansTable)?;
+        if end > RANS_TOTAL {
+            return Err(EntropyTransportError::InvalidRansTable);
+        }
+        for slot in total..end {
+            lookup[slot as usize] = symbol as u16;
+        }
+        total = end;
+    }
+    if total != RANS_TOTAL || lookup.contains(&u16::MAX) {
+        return Err(EntropyTransportError::InvalidRansTable);
+    }
+    let mut state = u32::from_le_bytes(payload[state_offset..stream_offset].try_into().unwrap());
+    if state < RANS_LOWER_BOUND {
+        return Err(EntropyTransportError::InvalidRansStream);
+    }
+    let stream = &payload[stream_offset..];
+    let mut cursor = 0usize;
+    let mut decoded = Vec::with_capacity(expected_len);
+    for _ in 0..expected_len {
+        let slot = state & (RANS_TOTAL - 1);
+        let symbol = usize::from(lookup[slot as usize]);
+        let frequency = u32::from(frequencies[symbol]);
+        if frequency == 0 {
+            return Err(EntropyTransportError::InvalidRansStream);
+        }
+        state = frequency * (state >> RANS_SCALE_BITS) + slot - cumulative[symbol];
+        while state < RANS_LOWER_BOUND {
+            let byte = *stream
+                .get(cursor)
+                .ok_or(EntropyTransportError::InvalidRansStream)?;
+            cursor += 1;
+            state = state
+                .checked_shl(8)
+                .ok_or(EntropyTransportError::InvalidRansStream)?
+                | u32::from(byte);
+        }
+        decoded.push(symbol as u8);
+    }
+    if cursor != stream.len() || state != RANS_LOWER_BOUND {
+        return Err(EntropyTransportError::InvalidRansStream);
+    }
+    Ok(decoded)
 }
 
 fn decode_huffman(payload: &[u8], expected_len: usize) -> Result<Vec<u8>, EntropyTransportError> {
@@ -906,7 +1143,88 @@ mod tests {
         let encoded = write_entropy_transport_with_chunk_size(&source, 256).unwrap();
         let reader = read_entropy_transport(&encoded).unwrap();
         assert!(!reader.chunk_info(0).unwrap().huffman);
+        assert_eq!(
+            reader.chunk_codec(0).unwrap(),
+            EntropyTransportChunkCodec::Raw
+        );
         assert_eq!(reader.read_all().unwrap(), source);
+    }
+
+    #[test]
+    fn rans_is_selected_when_it_beats_huffman_and_is_seekable() {
+        let source = [7u8; 4096];
+        let encoded = write_entropy_transport_with_chunk_size(&source, 4096).unwrap();
+        let reader = read_entropy_transport(&encoded).unwrap();
+        assert_eq!(
+            reader.chunk_codec(0).unwrap(),
+            EntropyTransportChunkCodec::Rans
+        );
+        assert!(encoded.len() < source.len());
+        assert_eq!(reader.read_range(1021, 2057).unwrap(), source[1021..3078]);
+        assert_eq!(reader.read_all().unwrap(), source);
+
+        let mut seekable = read_entropy_transport_seekable(Cursor::new(encoded)).unwrap();
+        assert_eq!(
+            seekable.chunk_codec(0).unwrap(),
+            EntropyTransportChunkCodec::Rans
+        );
+        assert_eq!(seekable.read_chunk(0).unwrap(), source);
+    }
+
+    #[test]
+    fn rans_roundtrips_sparse_skew_and_full_byte_alphabets() {
+        let mut skewed = Vec::with_capacity(8192);
+        for index in 0..8192 {
+            skewed.push(if index % 97 == 0 { u8::MAX } else { 7 });
+        }
+        let mut full_alphabet = Vec::with_capacity(8192);
+        let mut state = 0x6d2b_79f5_u32;
+        for _ in 0..8192 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            full_alphabet.push((state >> 24) as u8);
+        }
+        for source in [skewed, full_alphabet] {
+            let encoded = encode_rans(&source).unwrap();
+            assert_eq!(decode_rans(&encoded, source.len()).unwrap(), source);
+        }
+    }
+
+    #[test]
+    fn v1_raw_container_remains_readable() {
+        let mut encoded = write_entropy_transport_with_chunk_size(&[1, 2, 3, 4], 64).unwrap();
+        encoded[4] = 1;
+        let reader = read_entropy_transport(&encoded).unwrap();
+        assert_eq!(
+            reader.chunk_codec(0).unwrap(),
+            EntropyTransportChunkCodec::Raw
+        );
+        assert_eq!(reader.read_all().unwrap(), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn malformed_rans_table_and_payload_fail_closed() {
+        let mut encoded = write_entropy_transport_with_chunk_size(&[7; 4096], 4096).unwrap();
+        let payload = read_entropy_transport(&encoded)
+            .unwrap()
+            .chunk_info(0)
+            .unwrap()
+            .payload_offset as usize;
+
+        let mut bad_table = encoded.clone();
+        bad_table[payload + 7 * 2] = 0;
+        bad_table[payload + 7 * 2 + 1] = 0;
+        let reader = read_entropy_transport(&bad_table).unwrap();
+        assert_eq!(
+            reader.read_chunk(0),
+            Err(EntropyTransportError::InvalidRansTable)
+        );
+
+        encoded[payload + RANS_MODEL_BYTES + 2] = 0;
+        let reader = read_entropy_transport(&encoded).unwrap();
+        assert!(matches!(
+            reader.read_chunk(0),
+            Err(EntropyTransportError::InvalidRansStream | EntropyTransportError::DigestMismatch)
+        ));
     }
 
     #[test]
