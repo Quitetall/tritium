@@ -88,13 +88,13 @@ tritium-onnx = { path = "crates/tritium-onnx", version = "1.1.0-rc.2", default-f
 bytemuck = "1"
 blake3 = "1"
 ciborium = "0.2.2"
-serde_json_canonicalizer = "=0.3.2"
-getrandom = "0.3.4"
+serde_json_canonicalizer = "=0.4.1"
+getrandom = "0.4.3"
 half = "2"
 linkme = "0.3"
-opentelemetry = { version = "=0.33.0", default-features = false, features = ["trace"] }
+opentelemetry = { version = "=0.33.1", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "=0.33.0", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"] }
-opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "=0.33.1", default-features = false, features = ["trace"] }
 tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
 tracing-futures = { version = "=0.2.5", default-features = false, features = ["futures-03", "std", "std-future"] }
 tracing-opentelemetry = { version = "=0.34.0", default-features = false }
@@ -111,7 +111,7 @@ cbindgen = "0.29"
 # behind a DEFAULT feature, which `default-features = false` turns off, so a
 # Vulkan-only mask yields zero adapters on every Mac. The feature is a no-op on
 # non-Apple targets (wgpu-hal cfgs the backend out), so it costs Linux nothing.
-wgpu = { version = "=23.0.1", default-features = false, features = ["wgsl", "metal"] }
+wgpu = { version = "=29.0.4", default-features = false, features = ["wgsl", "metal"] }
 pollster = "1.0"
 # metal backend (MSL mpGEMM over Apple Metal, tritium-metal). metal-rs is declared under
 # tritium-metal's [target.'cfg(target_os = "macos")'] table, so it is NEVER resolved on a
@@ -125,20 +125,20 @@ pyo3 = "0.29"
 # DLPack ownership bridge for zero-copy PyTorch CPU tensors. Exact pins keep
 # wheel ABI/source review deterministic; `dlpark` 0.8 is the first release on
 # PyO3 0.29 and keeps all capsule unsafe inside the audited dependency.
-dlpark = { version = "=0.8.0", features = ["ndarray", "pyo3"] }
+dlpark = { version = "=0.9.0", features = ["ndarray", "pyo3"] }
 ndarray = { version = "=0.17.2", default-features = false, features = ["std"] }
 # onnx interop (tritium-onnx, behind its `onnx` feature). default-features off so the crate opts
 # into exactly download-binaries + tls-rustls (fetch a prebuilt onnxruntime at build — no system
 # lib). Exact pin keeps cargo-deny wildcards=deny meaningful. rc.12 wraps ONNX Runtime 1.24.
-ort = { version = "=2.0.0-rc.12", default-features = false }
+ort = { version = "=2.0.0-rc.15", default-features = false }
 prost = "0.14"
 # candle interop (tritium-candle, behind its `candle` feature; CPU-only — no cuda/mkl/accelerate)
 candle-core = { version = "0.11", default-features = false }
 # burn interop (tritium-burn, behind its `burn` feature; CPU-only NdArray backend in the test).
 # burn-tensor gives Tensor/Backend/TensorData; burn-ndarray is the concrete CPU backend. `std`
 # (needed for NdArray + TensorData::to_vec) pulls the MPL-2.0 `colored` crate (allow-listed in deny.toml).
-burn-tensor = { version = "=0.21.0", default-features = false, features = ["std"] }
-burn-ndarray = { version = "=0.21.0", default-features = false, features = ["std"] }
+burn-tensor = { version = "=0.22.1", default-features = false, features = ["std"] }
+burn-ndarray = { version = "=0.22.1", default-features = false, features = ["std"] }
 # cli
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
@@ -160,7 +160,7 @@ divan = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_nostd = { package = "serde", version = "1", features = ["derive"], default-features = false }
 serde_json = "1"
-schemars = { version = "=1.2.2", features = ["derive"] }
+schemars = { version = "=1.2.3", features = ["derive"] }
 sha2 = "0.11"
 
 # Lints applied workspace-wide; crates opt in with `[lints] workspace = true`.
