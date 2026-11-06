@@ -1020,6 +1020,7 @@ mod tests {
                     .as_slice()
             ),
             Projection::Salt(_)
+            | Projection::Tensor(_)
             | Projection::Ternary(_)
             | Projection::Q2(_)
             | Projection::HostSaltV2(_) => {
@@ -1188,6 +1189,7 @@ mod tests {
                     .as_slice()
             ),
             Projection::Salt(_)
+            | Projection::Tensor(_)
             | Projection::Ternary(_)
             | Projection::Q2(_)
             | Projection::HostSaltV2(_) => {

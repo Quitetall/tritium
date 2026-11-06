@@ -77,7 +77,7 @@ fn run() -> Result<(), String> {
                 "EAT-O — Evidence-Accumulating Ternary Optimizer\n\nternary_lab [--data UNCOMPRESSED_MNIST_IDX_DIR] [--steps 1000] [--seed 1]\n\
                 [--route backprop|probe] [--history statistics|replay|both]\n\
                 [--precision adaptive|fixed8|fixed24|integer32] [--hysteresis yes|no] [--simple yes|no]\n\
-                [--threshold 4] [--coordinates 128] [--budget BYTES] [--replay 256]\n\
+                [--threshold 4] [--coordinates 128] [--incremental yes|no] [--raw-cache yes|no] [--budget BYTES] [--replay 256]\n\
                 [--eval-limit N] [--split validation|test] [--resume FILE] [--checkpoint NEW_FILE]\n\
                 [--report NEW_FILE] [--verify CHECKPOINT]\n\
                 Default is the tiny synthetic diagnostic; --data selects 784x128x10 MNIST.\n\
@@ -104,6 +104,8 @@ fn run() -> Result<(), String> {
         "--simple",
         "--threshold",
         "--coordinates",
+        "--incremental",
+        "--raw-cache",
         "--budget",
         "--replay",
         "--eval-limit",
@@ -174,6 +176,8 @@ fn run() -> Result<(), String> {
             "--simple",
             "--threshold",
             "--coordinates",
+            "--incremental",
+            "--raw-cache",
             "--budget",
             "--replay",
         ] {
@@ -240,6 +244,16 @@ fn run() -> Result<(), String> {
             )?,
             replay_limit: number("--replay", 256)?,
             coordinates: number("--coordinates", 128)?,
+            raw_cache: match get("--raw-cache", "no").as_str() {
+                "yes" => true,
+                "no" => false,
+                _ => return Err("invalid raw-cache".into()),
+            },
+            incremental: match get("--incremental", "no").as_str() {
+                "yes" => true,
+                "no" => false,
+                _ => return Err("invalid incremental".into()),
+            },
         };
         Checkpoint {
             schema: 1,

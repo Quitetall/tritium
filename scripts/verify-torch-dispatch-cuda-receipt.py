@@ -9,7 +9,7 @@ import json
 import math
 from pathlib import Path
 import re
-import subprocess
+import runpy
 import sys
 from typing import Any
 import xml.etree.ElementTree as ET
@@ -165,14 +165,11 @@ def _git_blob(path: Path) -> str:
     return hashlib.sha1(f"blob {len(content)}\0".encode() + content).hexdigest()
 
 
+_git_result = runpy.run_path(Path(__file__).with_name("_qualification_git.py"))["git_result"]
+
+
 def git_blob_at(repo: Path, revision: str) -> str:
-    result = subprocess.run(
-        ["git", "rev-parse", f"{revision}:{SOURCE_PATH}"],
-        cwd=repo,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    result = _git_result(repo, "rev-parse", f"{revision}:{SOURCE_PATH}", error_type=ReceiptError)
     blob = result.stdout.strip()
     if result.returncode != 0 or re.fullmatch(r"[0-9a-f]{40}", blob) is None:
         raise ReceiptError("candidate revision lacks frozen dispatcher test source")

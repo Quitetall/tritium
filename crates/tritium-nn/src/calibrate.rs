@@ -22,20 +22,41 @@
 //! weight SSE and 12% worse perplexity at identical bits — so it is a research artifact, not a
 //! shipping path.
 //!
-//! `o_proj` is not calibrated. Its input is the attention concat, which under GQA has query heads
-//! sharing kv dims — exactly the case the salience fold also skips.
+//! [`forward_observed`] exposes all actual projection inputs and pre-transform
+//! outputs for a caller-owned backward phase. The legacy salience fold still
+//! skips `o_proj` and the tied head for its unchanged structural reasons.
 
 use tritium_train::Tape;
-use tritium_train::nn::{attention, attention_heads};
+use tritium_train::nn::{AttentionQkNorm, attention_heads_traced_with_qk_norm};
 use tritium_train::tape::ValueId;
 
+mod staged;
+#[cfg(feature = "tokenizer")]
+pub use staged::StagedTextCaptureLimits;
+pub use staged::{
+    RecordedOriginalCapturedStage, RecordedOriginalSalienceCapture, RecordedStagedCapture,
+    SourceCalibrationModel, StagedCalibrationLimits, StagedCalibrationModel, StagedCaptureLimits,
+    replay_original_salience_capture, replay_staged_capture, verify_original_captured_stage,
+};
+
 use crate::{Mlp, ModelRunner, Projection};
+use tritium_quantize::engine::SaliencePair;
+pub use tritium_quantize::engine::{SalienceFoldError, divide_rows, scale_cols, smooth_scales};
+
+/// Learned per-head query/key RMSNorm weights, held fp in the calibration graph.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QkNorm {
+    pub query: Vec<f32>,
+    pub key: Vec<f32>,
+}
 
 /// Dims + fp 1D norms for the tape forward (the parts held fp, not quantized/trained).
 #[derive(Debug, Clone)]
 pub struct Arch {
     pub attn_norms: Vec<Vec<f32>>,
     pub ffn_norms: Vec<Vec<f32>>,
+    /// Exactly one optional pair per layer; weights each have `head_dim` entries.
+    pub qk_norms: Vec<Option<QkNorm>>,
     pub out_norm: Vec<f32>,
     pub n_embd: usize,
     pub n_head: usize,
@@ -48,12 +69,13 @@ pub struct Arch {
     pub n_layers: usize,
 }
 
-/// Unwrap a `Dense` projection to `(weights, n_out, k_in)`. Panics on any compact projection:
+/// Unwrap a `Dense` projection to `(weights, n_out, k_in)`. Panics on compact or backend-owned weights:
 /// calibration reads the fp master, so a quantized model is a caller error, not a runtime case.
 pub fn dense(p: &Projection) -> (Vec<f32>, usize, usize) {
     match p {
         Projection::Dense(d) => (d.weights.clone(), d.n_out, d.k_in),
         Projection::Salt(_)
+        | Projection::Tensor(_)
         | Projection::HostSaltV2(_)
         | Projection::Ternary(_)
         | Projection::Q2(_) => {
@@ -73,6 +95,22 @@ pub fn extract(runner: &ModelRunner) -> (Arch, Vec<Vec<f32>>, Vec<(usize, usize)
     let arch = Arch {
         attn_norms: w.layers.iter().map(|b| b.attn_norm.clone()).collect(),
         ffn_norms: w.layers.iter().map(|b| b.ffn_norm.clone()).collect(),
+        qk_norms: w
+            .layers
+            .iter()
+            .map(|b| {
+                if b.q_norm.is_empty() && b.k_norm.is_empty() {
+                    None
+                } else {
+                    assert_eq!(b.q_norm.len(), cfg.head_dim() as usize);
+                    assert_eq!(b.k_norm.len(), cfg.head_dim() as usize);
+                    Some(QkNorm {
+                        query: b.q_norm.clone(),
+                        key: b.k_norm.clone(),
+                    })
+                }
+            })
+            .collect(),
         out_norm: w.output_norm.clone(),
         n_embd: cfg.n_embd as usize,
         n_head: cfg.n_head as usize,
@@ -142,6 +180,10 @@ pub fn norm_tensors(a: &Arch) -> Vec<(String, &[f32])> {
     for li in 0..a.n_layers {
         out.push((schema.layer(li, "attn_norm"), a.attn_norms[li].as_slice()));
         out.push((schema.layer(li, "ffn_norm"), a.ffn_norms[li].as_slice()));
+        if let Some(norm) = &a.qk_norms[li] {
+            out.push((schema.layer(li, "q_norm"), norm.query.as_slice()));
+            out.push((schema.layer(li, "k_norm"), norm.key.as_slice()));
+        }
     }
     out.push((schema.top("output_norm").to_owned(), a.out_norm.as_slice()));
     out
@@ -151,39 +193,7 @@ pub fn norm_tensors(a: &Arch) -> Vec<(String, &[f32])> {
 /// `tape_model_conformance`): embed_gather → N GQA blocks → SwiGLU → tied head. `wids[0]` is the
 /// tied embed/head; then per layer `q,k,v,o,gate,up,down`. Returns `[tokens.len(), vocab]` logits.
 pub fn forward(t: &mut Tape, wids: &[ValueId], a: &Arch, tokens: &[u32]) -> ValueId {
-    let seq = tokens.len();
-    let mut hidden = t.embed_gather(wids[0], tokens, a.vocab, a.n_embd);
-    for li in 0..a.n_layers {
-        let base = 1 + 7 * li;
-        let an = t.leaf(a.attn_norms[li].clone());
-        let xn = t.rmsnorm(hidden, an, seq, a.n_embd, a.eps);
-        let attn = attention(
-            t,
-            xn,
-            wids[base],
-            wids[base + 1],
-            wids[base + 2],
-            wids[base + 3],
-            seq,
-            a.n_embd,
-            a.n_head,
-            a.n_head_kv,
-            a.head_dim,
-            a.theta,
-        );
-        hidden = t.add(hidden, attn);
-        let fnw = t.leaf(a.ffn_norms[li].clone());
-        let hn = t.rmsnorm(hidden, fnw, seq, a.n_embd, a.eps);
-        let g = t.dense_matmul(hn, wids[base + 4], seq, a.ff, a.n_embd);
-        let u = t.dense_matmul(hn, wids[base + 5], seq, a.ff, a.n_embd);
-        let ga = t.silu(g);
-        let gated = t.mul(ga, u);
-        let down = t.dense_matmul(gated, wids[base + 6], seq, a.n_embd, a.ff);
-        hidden = t.add(hidden, down);
-    }
-    let onw = t.leaf(a.out_norm.clone());
-    let fnorm = t.rmsnorm(hidden, onw, seq, a.n_embd, a.eps);
-    t.dense_matmul(fnorm, wids[0], seq, a.vocab, a.n_embd) // tied head
+    forward_observed(t, wids, a, tokens, &mut |_, _| {})
 }
 
 /// An activation transform applied at a projection input: `(which projection, layer, values, seq, cols)`.
@@ -200,8 +210,8 @@ pub type ActFn<'a> = dyn FnMut(Tap, usize, &mut [f32], usize, usize) + 'a;
 /// meant a second forward pass nobody had written.
 ///
 /// **Every projection input is covered**, `o_proj`'s included: it used to live inside
-/// [`attention`], where nothing could reach it, so results carried an upper-bound caveat with one
-/// of seven projections per layer unpenalised. [`attention_heads`] splits the output projection off
+/// [`tritium_train::nn::attention`], where nothing could reach it, so results carried an upper-bound caveat with one
+/// of seven projections per layer unpenalised. [`tritium_train::nn::attention_heads`] splits the output projection off
 /// so this pass can tap and quantize it like any other.
 pub fn forward_aq(
     t: &mut Tape,
@@ -210,62 +220,18 @@ pub fn forward_aq(
     tokens: &[u32],
     aq: &mut ActFn<'_>,
 ) -> ValueId {
-    fn requant(
-        t: &mut Tape,
-        id: ValueId,
-        kind: Tap,
-        li: usize,
-        seq: usize,
-        cols: usize,
-        aq: &mut ActFn<'_>,
-    ) -> ValueId {
-        let mut v = t.value(id).to_vec();
-        aq(kind, li, &mut v, seq, cols);
-        t.leaf(v)
-    }
-
-    let seq = tokens.len();
-    let mut hidden = t.embed_gather(wids[0], tokens, a.vocab, a.n_embd);
-    for li in 0..a.n_layers {
-        let base = 1 + 7 * li;
-        let an = t.leaf(a.attn_norms[li].clone());
-        let xn = t.rmsnorm(hidden, an, seq, a.n_embd, a.eps);
-        let xn = requant(t, xn, Tap::AttnIn, li, seq, a.n_embd, aq);
-        // Split so `o_proj`'s input is reachable. Running `attention` whole would leave one
-        // projection per layer at fp32 and make every number here an upper bound.
-        let qd = a.n_head * a.head_dim;
-        let heads = attention_heads(
-            t,
-            xn,
-            wids[base],
-            wids[base + 1],
-            wids[base + 2],
-            seq,
-            a.n_embd,
-            a.n_head,
-            a.n_head_kv,
-            a.head_dim,
-            a.theta,
-        );
-        let heads = requant(t, heads, Tap::OProjIn, li, seq, qd, aq);
-        let attn = t.dense_matmul(heads, wids[base + 3], seq, a.n_embd, qd);
-        hidden = t.add(hidden, attn);
-        let fnw = t.leaf(a.ffn_norms[li].clone());
-        let hn = t.rmsnorm(hidden, fnw, seq, a.n_embd, a.eps);
-        let hn = requant(t, hn, Tap::FfnIn, li, seq, a.n_embd, aq);
-        let g = t.dense_matmul(hn, wids[base + 4], seq, a.ff, a.n_embd);
-        let u = t.dense_matmul(hn, wids[base + 5], seq, a.ff, a.n_embd);
-        let ga = t.silu(g);
-        let gated = t.mul(ga, u);
-        let gated = requant(t, gated, Tap::DownIn, li, seq, a.ff, aq);
-        let down = t.dense_matmul(gated, wids[base + 6], seq, a.n_embd, a.ff);
-        hidden = t.add(hidden, down);
-    }
-    let onw = t.leaf(a.out_norm.clone());
-    let fnorm = t.rmsnorm(hidden, onw, seq, a.n_embd, a.eps);
-    // The tied head is a projection too, and skipping it would understate a full-precision sweep.
-    let fnorm = requant(t, fnorm, Tap::Head, a.n_layers, seq, a.n_embd, aq);
-    t.dense_matmul(fnorm, wids[0], seq, a.vocab, a.n_embd)
+    forward_impl(
+        t,
+        wids,
+        a,
+        tokens,
+        &mut ForwardHooks {
+            head: true,
+            transform: Some(aq),
+            input: &mut |_, _, _, _, _, _| {},
+            projection: &mut |_, _| {},
+        },
+    )
 }
 
 /// Per-input-channel second moments for the projections whose scale is foldable.
@@ -333,6 +299,278 @@ pub enum Tap {
 /// materialises a copy — [`accumulate`] reads straight out of the tape.
 pub type TapFn<'a> = dyn FnMut(Tap, usize, &Tape, ValueId, usize, usize) + 'a;
 
+/// Actual consumer of a weight in the supported tied-head GQA/SwiGLU graph.
+/// These are runtime observations, not registered calibration evidence.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProjectionRole {
+    /// Token gather; its output has hidden width, not vocabulary width.
+    Embedding,
+    /// Query projection before RoPE.
+    Query,
+    /// Key projection before RoPE.
+    Key,
+    /// Value projection.
+    Value,
+    /// Concatenated attention heads to the residual stream.
+    Output,
+    /// SwiGLU gate projection before SiLU.
+    Gate,
+    /// SwiGLU up projection before multiplication.
+    Up,
+    /// Gated intermediate to the residual stream.
+    Down,
+    /// Final normalized hidden to the tied language head.
+    Head,
+}
+
+/// Actual original projection input/output IDs on the caller-owned tape.
+/// IDs are valid only on that tape. Callbacks borrow it only for their invocation;
+/// callers may retain this metadata and inspect values/gradients after backward.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProjectionTap {
+    /// Actual graph consumer, distinguishing tied embedding and head uses.
+    pub role: ProjectionRole,
+    /// Transformer layer, absent for embedding/head.
+    pub layer: Option<usize>,
+    /// Index in [`extract`] / [`weight_names`], not a generated display name.
+    pub weight_index: usize,
+    /// Actual weight value ID; tied consumers share this ID.
+    pub weight: ValueId,
+    /// Original activation ID. Only token gather has no dense input ID;
+    /// its actual token indices are the caller's `tokens` argument.
+    pub input: Option<ValueId>,
+    /// Actual projection output ID, before RoPE/SiLU or later graph operations.
+    pub output: ValueId,
+    /// Observed token count.
+    pub samples: usize,
+    /// Original weight matrix row count (vocabulary for token gather/head).
+    pub rows: usize,
+    /// Original weight matrix column count.
+    pub columns: usize,
+}
+
+/// Observation callback at actual projection seams. It produces no gradients,
+/// hashes or evidence itself. `Tape::backward` for a declared caller objective
+/// supplies gradients of these exact output IDs; activations are not Fisher.
+pub type ProjectionTapFn<'a> = dyn FnMut(&Tape, ProjectionTap) + 'a;
+
+/// The real differentiable forward with all original projection observations.
+/// Caller ownership permits post-objective backward inspection without retaining
+/// a borrowed internal tape or running a second neural forward. Legacy forward,
+/// activation transform and fold calibration are adapters over this implementation.
+///
+/// Scope/shape/ValueId contracts are the same as [`forward`] and [`Arch`]: tied
+/// head, full-RoPE GQA, SwiGLU, original dense reference weights. This is not a
+/// Qwen hybrid/MTP tap implementation, cache verifier, RSS bound or receipt.
+pub fn forward_observed(
+    t: &mut Tape,
+    wids: &[ValueId],
+    a: &Arch,
+    tokens: &[u32],
+    observe: &mut ProjectionTapFn<'_>,
+) -> ValueId {
+    forward_impl(
+        t,
+        wids,
+        a,
+        tokens,
+        &mut ForwardHooks {
+            head: true,
+            transform: None,
+            input: &mut |_, _, _, _, _, _| {},
+            projection: observe,
+        },
+    )
+}
+
+struct ForwardHooks<'call, 'callback> {
+    // Legacy fold calibration deliberately stops before vocabulary-sized logits.
+    // Full/observed/AQ forwards always include the head; no requested tap fallback.
+    head: bool,
+    transform: Option<&'call mut ActFn<'callback>>,
+    input: &'call mut TapFn<'callback>,
+    projection: &'call mut ProjectionTapFn<'callback>,
+}
+impl ForwardHooks<'_, '_> {
+    fn input(
+        &mut self,
+        t: &mut Tape,
+        id: ValueId,
+        kind: Tap,
+        li: usize,
+        seq: usize,
+        cols: usize,
+    ) -> ValueId {
+        (self.input)(kind, li, t, id, seq, cols);
+        if let Some(transform) = &mut self.transform {
+            let mut values = t.value(id).to_vec();
+            transform(kind, li, &mut values, seq, cols);
+            t.leaf(values) // Preserve forward_aq's existing graph-detaching transform semantics.
+        } else {
+            id
+        }
+    }
+}
+
+fn forward_impl(
+    t: &mut Tape,
+    wids: &[ValueId],
+    a: &Arch,
+    tokens: &[u32],
+    hooks: &mut ForwardHooks<'_, '_>,
+) -> ValueId {
+    let seq = tokens.len();
+    assert_eq!(a.qk_norms.len(), a.n_layers);
+    for norm in a.qk_norms.iter().flatten() {
+        assert_eq!(norm.query.len(), a.head_dim);
+        assert_eq!(norm.key.len(), a.head_dim);
+        assert!(norm.query.iter().chain(&norm.key).all(|v| v.is_finite()));
+        assert!(a.eps.is_finite() && a.eps > 0.0);
+    }
+    let mut hidden = t.embed_gather(wids[0], tokens, a.vocab, a.n_embd);
+    (hooks.projection)(
+        t,
+        ProjectionTap {
+            role: ProjectionRole::Embedding,
+            layer: None,
+            weight_index: 0,
+            weight: wids[0],
+            input: None,
+            output: hidden,
+            samples: seq,
+            rows: a.vocab,
+            columns: a.n_embd,
+        },
+    );
+    let qd = a.n_head * a.head_dim;
+    let kvd = a.n_head_kv * a.head_dim;
+    for li in 0..a.n_layers {
+        let base = 1 + 7 * li;
+        let an = t.leaf(a.attn_norms[li].clone());
+        let xn = t.rmsnorm(hidden, an, seq, a.n_embd, a.eps);
+        let xn = hooks.input(t, xn, Tap::AttnIn, li, seq, a.n_embd);
+        let qk_norm = a.qk_norms[li].as_ref().map(|norm| AttentionQkNorm {
+            query: t.leaf(norm.query.clone()),
+            key: t.leaf(norm.key.clone()),
+            eps: a.eps,
+        });
+        let trace = attention_heads_traced_with_qk_norm(
+            t,
+            xn,
+            wids[base],
+            wids[base + 1],
+            wids[base + 2],
+            seq,
+            a.n_embd,
+            a.n_head,
+            a.n_head_kv,
+            a.head_dim,
+            a.theta,
+            qk_norm,
+        );
+        for (offset, role, output, rows) in [
+            (0, ProjectionRole::Query, trace.query, qd),
+            (1, ProjectionRole::Key, trace.key, kvd),
+            (2, ProjectionRole::Value, trace.value, kvd),
+        ] {
+            (hooks.projection)(
+                t,
+                ProjectionTap {
+                    role,
+                    layer: Some(li),
+                    weight_index: base + offset,
+                    weight: wids[base + offset],
+                    input: Some(xn),
+                    output,
+                    samples: seq,
+                    rows,
+                    columns: a.n_embd,
+                },
+            );
+        }
+        let heads = hooks.input(t, trace.heads, Tap::OProjIn, li, seq, qd);
+        let attn = t.dense_matmul(heads, wids[base + 3], seq, a.n_embd, qd);
+        (hooks.projection)(
+            t,
+            ProjectionTap {
+                role: ProjectionRole::Output,
+                layer: Some(li),
+                weight_index: base + 3,
+                weight: wids[base + 3],
+                input: Some(heads),
+                output: attn,
+                samples: seq,
+                rows: a.n_embd,
+                columns: qd,
+            },
+        );
+        hidden = t.add(hidden, attn);
+        let fnw = t.leaf(a.ffn_norms[li].clone());
+        let hn = t.rmsnorm(hidden, fnw, seq, a.n_embd, a.eps);
+        let hn = hooks.input(t, hn, Tap::FfnIn, li, seq, a.n_embd);
+        let g = t.dense_matmul(hn, wids[base + 4], seq, a.ff, a.n_embd);
+        let u = t.dense_matmul(hn, wids[base + 5], seq, a.ff, a.n_embd);
+        for (offset, role, output) in [(4, ProjectionRole::Gate, g), (5, ProjectionRole::Up, u)] {
+            (hooks.projection)(
+                t,
+                ProjectionTap {
+                    role,
+                    layer: Some(li),
+                    weight_index: base + offset,
+                    weight: wids[base + offset],
+                    input: Some(hn),
+                    output,
+                    samples: seq,
+                    rows: a.ff,
+                    columns: a.n_embd,
+                },
+            );
+        }
+        let ga = t.silu(g);
+        let gated = t.mul(ga, u);
+        let gated = hooks.input(t, gated, Tap::DownIn, li, seq, a.ff);
+        let down = t.dense_matmul(gated, wids[base + 6], seq, a.n_embd, a.ff);
+        (hooks.projection)(
+            t,
+            ProjectionTap {
+                role: ProjectionRole::Down,
+                layer: Some(li),
+                weight_index: base + 6,
+                weight: wids[base + 6],
+                input: Some(gated),
+                output: down,
+                samples: seq,
+                rows: a.n_embd,
+                columns: a.ff,
+            },
+        );
+        hidden = t.add(hidden, down);
+    }
+    if !hooks.head {
+        return hidden;
+    }
+    let onw = t.leaf(a.out_norm.clone());
+    let fnorm = t.rmsnorm(hidden, onw, seq, a.n_embd, a.eps);
+    let fnorm = hooks.input(t, fnorm, Tap::Head, a.n_layers, seq, a.n_embd);
+    let logits = t.dense_matmul(fnorm, wids[0], seq, a.vocab, a.n_embd);
+    (hooks.projection)(
+        t,
+        ProjectionTap {
+            role: ProjectionRole::Head,
+            layer: None,
+            weight_index: 0,
+            weight: wids[0],
+            input: Some(fnorm),
+            output: logits,
+            samples: seq,
+            rows: a.vocab,
+            columns: a.n_embd,
+        },
+    );
+    logits
+}
+
 /// Run the calibration forward pass and hand each tap's raw activations to `tap`.
 ///
 /// [`calibrate`] is this with a closure that reduces to second moments. Anything wanting the
@@ -341,39 +579,22 @@ pub type TapFn<'a> = dyn FnMut(Tap, usize, &Tape, ValueId, usize, usize) + 'a;
 pub fn calibrate_tapped(weights: &[Vec<f32>], a: &Arch, tokens: &[u32], tap: &mut TapFn<'_>) {
     let mut t = Tape::new();
     let wids: Vec<ValueId> = weights.iter().map(|w| t.leaf(w.clone())).collect();
-    let seq = tokens.len();
-    let mut hidden = t.embed_gather(wids[0], tokens, a.vocab, a.n_embd);
-    for li in 0..a.n_layers {
-        let base = 1 + 7 * li;
-        let an = t.leaf(a.attn_norms[li].clone());
-        let xn = t.rmsnorm(hidden, an, seq, a.n_embd, a.eps);
-        tap(Tap::AttnIn, li, &t, xn, seq, a.n_embd);
-        let attn = attention(
-            &mut t,
-            xn,
-            wids[base],
-            wids[base + 1],
-            wids[base + 2],
-            wids[base + 3],
-            seq,
-            a.n_embd,
-            a.n_head,
-            a.n_head_kv,
-            a.head_dim,
-            a.theta,
-        );
-        hidden = t.add(hidden, attn);
-        let fnw = t.leaf(a.ffn_norms[li].clone());
-        let hn = t.rmsnorm(hidden, fnw, seq, a.n_embd, a.eps);
-        tap(Tap::FfnIn, li, &t, hn, seq, a.n_embd);
-        let g = t.dense_matmul(hn, wids[base + 4], seq, a.ff, a.n_embd);
-        let u = t.dense_matmul(hn, wids[base + 5], seq, a.ff, a.n_embd);
-        let ga = t.silu(g);
-        let gated = t.mul(ga, u);
-        tap(Tap::DownIn, li, &t, gated, seq, a.ff);
-        let down = t.dense_matmul(gated, wids[base + 6], seq, a.n_embd, a.ff);
-        hidden = t.add(hidden, down);
-    }
+    forward_impl(
+        &mut t,
+        &wids,
+        a,
+        tokens,
+        &mut ForwardHooks {
+            head: false,
+            transform: None,
+            input: &mut |kind, li, t, id, seq, cols| {
+                if matches!(kind, Tap::AttnIn | Tap::FfnIn | Tap::DownIn) {
+                    tap(kind, li, t, id, seq, cols);
+                }
+            },
+            projection: &mut |_, _| {},
+        },
+    );
 }
 
 pub fn calibrate(weights: &[Vec<f32>], a: &Arch, tokens: &[u32], c: &mut Calib) {
@@ -393,79 +614,9 @@ pub fn calibrate(weights: &[Vec<f32>], a: &Arch, tokens: &[u32], c: &mut Calib) 
     c.rows += seq;
 }
 
-#[allow(dead_code)]
-fn calibrate_old(weights: &[Vec<f32>], a: &Arch, tokens: &[u32], c: &mut Calib) {
-    let mut t = Tape::new();
-    let wids: Vec<ValueId> = weights.iter().map(|w| t.leaf(w.clone())).collect();
-    let seq = tokens.len();
-    let mut hidden = t.embed_gather(wids[0], tokens, a.vocab, a.n_embd);
-    for li in 0..a.n_layers {
-        let base = 1 + 7 * li;
-        let an = t.leaf(a.attn_norms[li].clone());
-        let xn = t.rmsnorm(hidden, an, seq, a.n_embd, a.eps);
-        accumulate(&t, xn, seq, a.n_embd, &mut c.attn_in[li]);
-        let attn = attention(
-            &mut t,
-            xn,
-            wids[base],
-            wids[base + 1],
-            wids[base + 2],
-            wids[base + 3],
-            seq,
-            a.n_embd,
-            a.n_head,
-            a.n_head_kv,
-            a.head_dim,
-            a.theta,
-        );
-        hidden = t.add(hidden, attn);
-        let fnw = t.leaf(a.ffn_norms[li].clone());
-        let hn = t.rmsnorm(hidden, fnw, seq, a.n_embd, a.eps);
-        accumulate(&t, hn, seq, a.n_embd, &mut c.ffn_in[li]);
-        let g = t.dense_matmul(hn, wids[base + 4], seq, a.ff, a.n_embd);
-        let u = t.dense_matmul(hn, wids[base + 5], seq, a.ff, a.n_embd);
-        let ga = t.silu(g);
-        let gated = t.mul(ga, u);
-        accumulate(&t, gated, seq, a.ff, &mut c.down_in[li]);
-        let down = t.dense_matmul(gated, wids[base + 6], seq, a.n_embd, a.ff);
-        hidden = t.add(hidden, down);
-    }
-    c.rows += seq;
-}
-
-/// AWQ's salience scale: `s_j = (rms_j / geomean(rms))^α`, normalised by the geometric mean so the
-/// fold neither inflates nor shrinks the matrix overall (α=0 ⇒ all ones ⇒ exactly today's fitter).
-pub fn smooth_scales(acc: &[f64], rows: usize, alpha: f64) -> Vec<f32> {
-    let rms: Vec<f64> = acc
-        .iter()
-        .map(|&s| (s / rows as f64).sqrt().max(1e-8))
-        .collect();
-    let gm = (rms.iter().map(|r| r.ln()).sum::<f64>() / rms.len() as f64).exp();
-    rms.iter().map(|&r| (r / gm).powf(alpha) as f32).collect()
-}
-
-/// Multiply every column `j` of a row-major `[rows, cols]` matrix by `s[j]` — the weight half of
-/// the fold.
-pub fn scale_cols(w: &mut [f32], cols: usize, s: &[f32]) {
-    for row in w.chunks_mut(cols) {
-        for (v, &sj) in row.iter_mut().zip(s) {
-            *v *= sj;
-        }
-    }
-}
-
-/// Divide every row `r` by `s[r]` — the norm half of the fold, applied to the *preceding* norm so
-/// the product with [`scale_cols`] is the identity.
-pub fn divide_rows(w: &mut [f32], cols: usize, s: &[f32]) {
-    for (r, row) in w.chunks_mut(cols).enumerate() {
-        for v in row {
-            *v /= s[r];
-        }
-    }
-}
-
 /// Apply the salience fold. Returns the rebalanced weights plus the `Arch` whose fp norms absorb
-/// the inverse — together an exact reparameterisation of the same function.
+/// the inverse. Cancellation is algebraic, not a bit-identical finite-precision logit claim.
+/// Panics on invalid input; use [`try_fold`] for fallible conversion.
 ///
 /// # The two projections this deliberately does not fold
 ///
@@ -494,35 +645,102 @@ pub fn fold(
     c: &Calib,
     alpha: f64,
 ) -> (Vec<Vec<f32>>, Arch) {
+    try_fold(fp, shapes, a, c, alpha).expect("invalid model-aware paired salience fold")
+}
+
+/// Checked graph adapter to the shared paired salience numerical module.
+///
+/// Valid legacy results keep their exact ordered f32 operations. The caller's
+/// weights/architecture remain unchanged on any error. This currently clones
+/// the dense model, as the legacy path did; it is not out-of-core/RSS admission.
+/// # Errors
+/// Malformed tied-head SwiGLU inventory, statistics, alpha or nonfinite values.
+pub fn try_fold(
+    fp: &[Vec<f32>],
+    shapes: &[(usize, usize)],
+    a: &Arch,
+    c: &Calib,
+    alpha: f64,
+) -> Result<(Vec<Vec<f32>>, Arch), SalienceFoldError> {
+    if c.rows == 0 {
+        return Err(SalienceFoldError::EmptyStatistics);
+    }
+    if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
+        return Err(SalienceFoldError::Alpha);
+    }
+    let count = a.n_layers.checked_mul(7).and_then(|n| n.checked_add(1));
+    let q_rows = a.n_head.checked_mul(a.head_dim);
+    let kv_rows = a.n_head_kv.checked_mul(a.head_dim);
+    if count != Some(fp.len())
+        || shapes.len() != fp.len()
+        || a.attn_norms.len() != a.n_layers
+        || a.ffn_norms.len() != a.n_layers
+        || c.attn_in.len() != a.n_layers
+        || c.ffn_in.len() != a.n_layers
+        || c.down_in.len() != a.n_layers
+        || a.n_embd == 0
+        || a.ff == 0
+        || a.n_layers == 0
+        || a.vocab == 0
+        || q_rows.is_none_or(|n| n == 0)
+        || kv_rows.is_none_or(|n| n == 0)
+        || shapes.first() != Some(&(a.vocab, a.n_embd))
+        || a.out_norm.len() != a.n_embd
+        || shapes.iter().zip(fp).any(|(&(rows, cols), values)| {
+            rows == 0 || cols == 0 || rows.checked_mul(cols) != Some(values.len())
+        })
+    {
+        return Err(SalienceFoldError::Geometry);
+    }
     let mut w = fp.to_vec();
     let mut arch = a.clone();
     for li in 0..a.n_layers {
         let base = 1 + 7 * li;
-
-        // q, k, v — inverse into attn_norm.
-        let sa = smooth_scales(&c.attn_in[li], c.rows, alpha);
-        for k in 0..3 {
-            scale_cols(&mut w[base + k], shapes[base + k].1, &sa);
+        if c.attn_in[li].len() != a.n_embd
+            || c.ffn_in[li].len() != a.n_embd
+            || c.down_in[li].len() != a.ff
+            || Some(shapes[base].0) != q_rows
+            || Some(shapes[base + 1].0) != kv_rows
+            || Some(shapes[base + 2].0) != kv_rows
+            || (0..3).any(|k| shapes[base + k].1 != a.n_embd)
+            || shapes[base + 3].0 != a.n_embd
+            || Some(shapes[base + 3].1) != q_rows
+            || shapes[base + 4] != (a.ff, a.n_embd)
+            || shapes[base + 5] != (a.ff, a.n_embd)
+            || shapes[base + 6] != (a.n_embd, a.ff)
+        {
+            return Err(SalienceFoldError::Geometry);
         }
-        for (n, &s) in arch.attn_norms[li].iter_mut().zip(&sa) {
-            *n /= s;
+        let [q, k, v, _o, gate, up, down] = &mut w[base..base + 7] else {
+            unreachable!("validated layer inventory")
+        };
+        {
+            let mut projections = [q.as_mut_slice(), k.as_mut_slice(), v.as_mut_slice()];
+            SaliencePair {
+                projections: &mut projections,
+                inverse: &mut arch.attn_norms[li],
+                inverse_columns: 1,
+            }
+            .apply(&c.attn_in[li], c.rows, alpha)?;
         }
-
-        // gate, up — inverse into ffn_norm.
-        let sf = smooth_scales(&c.ffn_in[li], c.rows, alpha);
-        for k in 4..6 {
-            scale_cols(&mut w[base + k], shapes[base + k].1, &sf);
+        {
+            let mut projections = [gate.as_mut_slice(), up.as_mut_slice()];
+            SaliencePair {
+                projections: &mut projections,
+                inverse: &mut arch.ffn_norms[li],
+                inverse_columns: 1,
+            }
+            .apply(&c.ffn_in[li], c.rows, alpha)?;
         }
-        for (n, &s) in arch.ffn_norms[li].iter_mut().zip(&sf) {
-            *n /= s;
+        let mut projections = [down.as_mut_slice()];
+        SaliencePair {
+            projections: &mut projections,
+            inverse: up,
+            inverse_columns: a.n_embd,
         }
-
-        // down — inverse into up's output rows (`gated = silu(gate) ⊙ up` is linear in up).
-        let sd = smooth_scales(&c.down_in[li], c.rows, alpha);
-        scale_cols(&mut w[base + 6], shapes[base + 6].1, &sd);
-        divide_rows(&mut w[base + 5], shapes[base + 5].1, &sd);
+        .apply(&c.down_in[li], c.rows, alpha)?;
     }
-    (w, arch)
+    Ok((w, arch))
 }
 
 #[cfg(test)]
@@ -533,6 +751,7 @@ mod tests {
         Arch {
             attn_norms: vec![vec![1.0; 4]; n_layers],
             ffn_norms: vec![vec![1.0; 4]; n_layers],
+            qk_norms: vec![None; n_layers],
             out_norm: vec![1.0; 4],
             n_embd: 4,
             n_head: 2,

@@ -21,87 +21,16 @@
 //! - **A Gram narrower than the input width is rank-deficient by construction.** `down_proj` is 1536
 //!   wide; a Gram from 1,024 tokens made GPTQ *lose* by 2.98%.
 
-use half::f16;
 use rayon::prelude::*;
 use tritium_train::Tape;
-use tritium_train::ops::ste::{fast_hadamard, group_is_rotatable, ladder_quantize_at, ladder_step};
 use tritium_train::tape::ValueId;
 
+pub use tritium_quantize::engine::{
+    ActivationAwareConfig, ScaleRefitMode, auto_decay, fit_tensor,
+    fit_tensor_with_scale_refit_mode, fit_to_dense,
+};
+
 use crate::calibrate::{Arch, Tap, forward_aq};
-
-/// How to fit one tensor in the activation metric.
-#[derive(Clone, Copy, Debug)]
-pub struct ActivationAwareConfig {
-    /// Ternary planes per weight.
-    pub planes: usize,
-    /// Weights sharing one ladder anchor.
-    pub group: usize,
-    /// Step candidates the ladder searches per group.
-    pub grid: usize,
-    /// Tikhonov damping as a fraction of `mean(diag H)`. A calibration Gram is routinely singular;
-    /// 0.01 is the GPTQ paper's value and needs raising when tokens are scarce.
-    pub damp: f64,
-    /// Coordinate-descent sweeps over the trit moves. `0` is plain GPTQ.
-    pub search_sweeps: usize,
-    /// Alternate the search with closed-form refits of each group's step. Without this the search
-    /// overfits the calibration Gram and loses to plain GPTQ.
-    pub refit_scale: bool,
-    /// Fit in the Hadamard-rotated basis, which is what the shipping artifact stores.
-    pub rotate: bool,
-    /// Fraction of each column's rounding error that GPTQ pushes into the columns after it.
-    /// `1.0` is plain GPTQ. See [`auto_decay`] for why anything less can be better.
-    pub decay: f64,
-    /// Ramp the decay over the column order: the first column propagates in full and `decay` is
-    /// reached only at the last, where a short remaining suffix has to absorb everything pushed
-    /// into it (ADR 0043 L-B, after QTEA). Off, the same `decay` applies to every column.
-    pub decay_ramp: bool,
-}
-
-impl Default for ActivationAwareConfig {
-    fn default() -> Self {
-        Self {
-            planes: 3,
-            group: 256,
-            grid: 16,
-            damp: 0.01,
-            search_sweeps: 8,
-            refit_scale: true,
-            rotate: true,
-            decay: 1.0,
-            decay_ramp: false,
-        }
-    }
-}
-
-/// Propagation decay for a Gram estimated from `calibration_tokens` samples of a `cols`-wide input.
-///
-/// GPTQ trusts `H⁻¹` completely: every column's rounding error is pushed in full into the columns
-/// after it. A Gram from few samples relative to its width is rank-deficient, and then what gets
-/// pushed is mostly the damping's guess, so trusting it less helps. Measured on SmolLM2-135M over
-/// WikiText-2 (folded, T=2/T=3, held-out perplexity against the plain fit), the best fraction
-/// falls as tokens fall:
-///
-/// ```text
-/// tokens   width   tokens/width   best λ    plain GPTQ → decayed
-/// 16,384   1,536      10.7        0.75      −13.1% → −13.8%   (T=2)
-///  4,096   1,536       2.7        ≤0.5       −2.5% →  −9.8%
-///  2,048   1,536       1.3        ≤0.5       +4.6% →  −7.4%
-/// ```
-///
-/// This interpolates `λ` linearly in `log(tokens/width)` between those two measured ends, `0.5` at
-/// a ratio of 2.7 and `0.75` at 10.7, and clamps outside them. It is a rule fitted to three points
-/// on one model, not a derivation; a wider sweep should replace the constants, not the shape.
-#[must_use]
-pub fn auto_decay(calibration_tokens: usize, cols: usize) -> f64 {
-    const LOW: (f64, f64) = (2.7, 0.5);
-    const HIGH: (f64, f64) = (10.7, 0.75);
-    if calibration_tokens == 0 || cols == 0 {
-        return LOW.1;
-    }
-    let ratio = calibration_tokens as f64 / cols as f64;
-    let t = ((ratio.ln() - LOW.0.ln()) / (HIGH.0.ln() - LOW.0.ln())).clamp(0.0, 1.0);
-    LOW.1 + t * (HIGH.1 - LOW.1)
-}
 
 /// Input Gram `E[x·xᵀ]` at each of the four projection inputs, per layer.
 ///
@@ -202,384 +131,6 @@ impl TapGrams {
             _ => &self.down[li],
         }
     }
-}
-
-fn rotate_row(row: &mut [f32], group: usize) {
-    for slice in row.chunks_mut(group) {
-        if group_is_rotatable(slice.len()) {
-            fast_hadamard(slice);
-        }
-    }
-}
-
-/// `fast_hadamard` in f64. The Gram is a metric and its inverse is Cholesky-factored, so rounding it
-/// to f32 to reuse the f32 transform would throw away half the digits of the very matrix being
-/// factorized.
-fn hadamard_f64(v: &mut [f64]) {
-    let n = v.len();
-    let mut len = 1;
-    while len < n {
-        for start in (0..n).step_by(len * 2) {
-            for i in start..start + len {
-                let (a, b) = (v[i], v[i + len]);
-                v[i] = a + b;
-                v[i + len] = a - b;
-            }
-        }
-        len *= 2;
-    }
-    let scale = 1.0 / (n as f64).sqrt();
-    for x in v.iter_mut() {
-        *x *= scale;
-    }
-}
-
-fn rotate_row_f64(row: &mut [f64], group: usize) {
-    for slice in row.chunks_mut(group) {
-        if group_is_rotatable(slice.len()) {
-            hadamard_f64(slice);
-        }
-    }
-}
-
-/// `H ← R·H·Rᵀ`, `R` block-diagonal Hadamard over scale groups, so the metric is expressed in the
-/// basis the codes are stored in.
-fn rotate_gram(h: &mut [f64], k: usize, group: usize) {
-    h.par_chunks_mut(k)
-        .for_each(|row| rotate_row_f64(row, group));
-    let mut col = vec![0.0f64; k];
-    for c in 0..k {
-        for (r, v) in col.iter_mut().enumerate() {
-            *v = h[r * k + c];
-        }
-        rotate_row_f64(&mut col, group);
-        for (r, &v) in col.iter().enumerate() {
-            h[r * k + c] = v;
-        }
-    }
-}
-
-/// Lower Cholesky `A = L·Lᵀ` of `H + λI`, `λ = damp·mean(diag H)`.
-fn damped_cholesky(h: &[f64], k: usize, damp: f64) -> Option<Vec<f64>> {
-    let mean: f64 = (0..k).map(|i| h[i * k + i]).sum::<f64>() / k as f64;
-    let lambda = damp * mean.max(1e-12);
-    let mut l = vec![0.0f64; k * k];
-    for i in 0..k {
-        for j in 0..=i {
-            let mut sum = h[i * k + j] + if i == j { lambda } else { 0.0 };
-            for p in 0..j {
-                sum -= l[i * k + p] * l[j * k + p];
-            }
-            if i == j {
-                if sum <= 0.0 || sum.is_nan() {
-                    return None;
-                }
-                l[i * k + i] = sum.sqrt();
-            } else {
-                l[i * k + j] = sum / l[j * k + j];
-            }
-        }
-    }
-    Some(l)
-}
-
-/// `H⁻¹` from `H + λI`, and the lower Cholesky of that inverse. GPTQ's compensation reads the second.
-fn damped_inverse_cholesky(h: &[f64], k: usize, damp: f64) -> Option<(Vec<f64>, Vec<f64>)> {
-    let l = damped_cholesky(h, k, damp)?;
-    let mut inv_l = vec![0.0f64; k * k];
-    for i in 0..k {
-        inv_l[i * k + i] = 1.0 / l[i * k + i];
-        for j in 0..i {
-            let mut sum = 0.0;
-            for p in j..i {
-                sum += l[i * k + p] * inv_l[p * k + j];
-            }
-            inv_l[i * k + j] = -sum / l[i * k + i];
-        }
-    }
-    let mut hinv = vec![0.0f64; k * k];
-    for i in 0..k {
-        for j in 0..=i {
-            let mut sum = 0.0;
-            for p in i.max(j)..k {
-                sum += inv_l[p * k + i] * inv_l[p * k + j];
-            }
-            hinv[i * k + j] = sum;
-            hinv[j * k + i] = sum;
-        }
-    }
-    let chol = damped_cholesky(&hinv, k, 0.0)?;
-    Some((hinv, chol))
-}
-
-/// Balanced-ternary digits of `k`, most significant plane first — the ladder's own encoding.
-fn digits_of(mut value: i64, planes: usize) -> Vec<i8> {
-    let mut out = vec![0i8; planes];
-    for p in (0..planes).rev() {
-        let d = (value + 1).rem_euclid(3) - 1;
-        out[p] = d as i8;
-        value = (value - d) / 3;
-    }
-    out
-}
-
-/// Fit one tensor in the activation metric, returning `(s₀, plane-major trits)` per group in
-/// row-major group order — the shape the ladder packer already consumes.
-///
-/// `gram` is the tensor's input Gram in the model's basis, `cols × cols`.
-///
-/// Returns `None` if the Gram stays singular after damping, so a caller can fall back to the plain
-/// ladder rather than propagate a bad fit.
-#[must_use]
-pub fn fit_tensor(
-    w: &[f32],
-    rows: usize,
-    cols: usize,
-    gram: &[f64],
-    cfg: &ActivationAwareConfig,
-) -> Option<Vec<(f32, Vec<Vec<i8>>)>> {
-    let group = cfg.group.max(1);
-    let per_row = cols.div_ceil(group);
-    let kmax = (3i64.pow(cfg.planes as u32) - 1) / 2;
-
-    let mut work: Vec<f32> = w.to_vec();
-    if cfg.rotate {
-        for row in work.chunks_mut(cols) {
-            rotate_row(row, group);
-        }
-    }
-    let mut h = gram.to_vec();
-    if cfg.rotate {
-        rotate_gram(&mut h, cols, group);
-    }
-    let mean: f64 = (0..cols).map(|a| h[a * cols + a]).sum::<f64>() / cols as f64;
-    let mut h_damped = h.clone();
-    for a in 0..cols {
-        h_damped[a * cols + a] += cfg.damp * mean.max(1e-12);
-    }
-    let (_, chol) = damped_inverse_cholesky(&h, cols, cfg.damp)?;
-
-    // ── GPTQ: quantize each column, push its residual into the columns still to come.
-    let mut quantized = vec![0.0f32; rows * cols];
-    let mut steps = vec![0.0f32; rows * per_row];
-    for j in 0..cols {
-        let block = j / group;
-        if j % group == 0 {
-            let end = ((block + 1) * group).min(cols);
-            steps
-                .par_chunks_mut(per_row)
-                .zip(work.par_chunks(cols))
-                .for_each(|(d, wr)| d[block] = ladder_step(&wr[j..end], cfg.planes, cfg.grid));
-        }
-        let d_jj = chol[j * cols + j];
-        if d_jj <= 0.0 || !d_jj.is_finite() {
-            return None;
-        }
-        // Decay on the propagated error: a multiplier on `err`, so `lambda == 1.0` is plain GPTQ
-        // to the bit. Under the ramp it runs from 1 at the first column to `cfg.decay` at the last.
-        let lambda = if cfg.decay_ramp && cols > 1 {
-            1.0 - (1.0 - cfg.decay) * j as f64 / (cols - 1) as f64
-        } else {
-            cfg.decay
-        };
-        quantized
-            .par_chunks_mut(cols)
-            .zip(work.par_chunks_mut(cols))
-            .zip(steps.par_chunks(per_row))
-            .for_each(|((q, wr), d)| {
-                let value = ladder_quantize_at(wr[j], cfg.planes, d[block]);
-                q[j] = value;
-                let err = lambda * f64::from(wr[j] - value) / d_jj;
-                for j2 in (j + 1)..cols {
-                    wr[j2] -= (err * chol[j2 * cols + j]) as f32;
-                }
-            });
-    }
-
-    // ── Codes, and the optional discrete search over them.
-    let moves: Vec<i64> = (0..cfg.planes)
-        .flat_map(|p| {
-            let m = 3i64.pow(p as u32);
-            [m, -m]
-        })
-        .collect();
-    let mut w_rot: Vec<f32> = w.to_vec();
-    if cfg.rotate {
-        for row in w_rot.chunks_mut(cols) {
-            rotate_row(row, group);
-        }
-    }
-    let planes = cfg.planes;
-    let sweeps = cfg.search_sweeps;
-    let refit = cfg.refit_scale;
-    let out: Vec<Vec<(f32, Vec<Vec<i8>>)>> = w_rot
-        .par_chunks(cols)
-        .zip(quantized.par_chunks(cols))
-        .zip(steps.par_chunks(per_row))
-        .map(|((wr, qr), dr)| {
-            let mut d: Vec<f64> = dr.iter().map(|&v| f64::from(v)).collect();
-            let mut codes: Vec<i64> = (0..cols)
-                .map(|j| {
-                    let dj = d[j / group];
-                    if dj > 0.0 {
-                        (f64::from(qr[j]) / dj).round() as i64
-                    } else {
-                        0
-                    }
-                })
-                .collect();
-            if sweeps > 0 {
-                search_row(
-                    wr, &mut codes, &mut d, cols, group, &h_damped, &moves, kmax, sweeps, refit,
-                );
-            }
-            (0..per_row)
-                .map(|b| {
-                    let (lo, hi) = (b * group, ((b + 1) * group).min(cols));
-                    let mut trits = vec![vec![0i8; hi - lo]; planes];
-                    for (i, j) in (lo..hi).enumerate() {
-                        for (p, digit) in digits_of(codes[j], planes).into_iter().enumerate() {
-                            trits[p][i] = digit;
-                        }
-                    }
-                    // s₀ = Δ·3^(T−1): plane 0 carries the most significant digit.
-                    let mut s0 = d[b];
-                    for _ in 0..planes.saturating_sub(1) {
-                        s0 *= 3.0;
-                    }
-                    (s0 as f32, trits)
-                })
-                .collect()
-        })
-        .collect();
-    Some(out.into_iter().flatten().collect())
-}
-
-/// Coordinate descent over one row's codes, priced exactly from `g = H·r`.
-#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
-fn search_row(
-    w: &[f32],
-    codes: &mut [i64],
-    d: &mut [f64],
-    cols: usize,
-    group: usize,
-    h: &[f64],
-    moves: &[i64],
-    kmax: i64,
-    sweeps: usize,
-    refit: bool,
-) {
-    let per_row = cols.div_ceil(group);
-    let mut r: Vec<f64> = (0..cols)
-        .map(|j| f64::from(w[j]) - d[j / group] * codes[j] as f64)
-        .collect();
-    let mut g: Vec<f64> = (0..cols)
-        .map(|a| {
-            h[a * cols..(a + 1) * cols]
-                .iter()
-                .zip(&r)
-                .map(|(x, y)| x * y)
-                .sum()
-        })
-        .collect();
-    for _ in 0..sweeps {
-        let mut improved = false;
-        for j in 0..cols {
-            let dj = d[j / group];
-            if dj <= 0.0 {
-                continue;
-            }
-            let hjj = h[j * cols + j];
-            let mut best = (0.0f64, 0i64);
-            for &m in moves {
-                if (codes[j] + m).abs() > kmax {
-                    continue;
-                }
-                let delta = -dj * m as f64;
-                let change = 2.0 * delta * g[j] + delta * delta * hjj;
-                if change < best.0 {
-                    best = (change, m);
-                }
-            }
-            if best.1 != 0 && best.0 < -1e-15 {
-                let delta = -dj * best.1 as f64;
-                codes[j] += best.1;
-                r[j] += delta;
-                for (a, ga) in g.iter_mut().enumerate() {
-                    *ga += delta * h[a * cols + j];
-                }
-                improved = true;
-            }
-        }
-        if refit {
-            for b in 0..per_row {
-                let (lo, hi) = (b * group, ((b + 1) * group).min(cols));
-                let num: f64 = (lo..hi).map(|j| codes[j] as f64 * g[j]).sum();
-                let mut den = 0.0f64;
-                for a in lo..hi {
-                    if codes[a] == 0 {
-                        continue;
-                    }
-                    for c in lo..hi {
-                        den += codes[a] as f64 * h[a * cols + c] * codes[c] as f64;
-                    }
-                }
-                if den <= 0.0 {
-                    continue;
-                }
-                let eps = num / den;
-                if d[b] + eps <= 0.0 {
-                    continue;
-                }
-                d[b] += eps;
-                for j in lo..hi {
-                    r[j] -= eps * codes[j] as f64;
-                }
-                for (a, ga) in g.iter_mut().enumerate() {
-                    let hrow = &h[a * cols..(a + 1) * cols];
-                    let s: f64 = (lo..hi).map(|c| hrow[c] * codes[c] as f64).sum();
-                    *ga -= eps * s;
-                }
-                improved = true;
-            }
-        }
-        if !improved {
-            break;
-        }
-    }
-}
-
-/// Dense reconstruction of a fit, for scoring. `f16` rounding of the stored scales is applied, so
-/// this is what the artifact will decode to, not what the fitter intended.
-#[must_use]
-pub fn fit_to_dense(
-    fits: &[(f32, Vec<Vec<i8>>)],
-    rows: usize,
-    cols: usize,
-    group: usize,
-    rotate: bool,
-) -> Vec<f32> {
-    let per_row = cols.div_ceil(group);
-    let mut out = vec![0.0f32; rows * cols];
-    for r in 0..rows {
-        for b in 0..per_row {
-            let (s0, trits) = &fits[r * per_row + b];
-            let lo = b * group;
-            for (p, plane) in trits.iter().enumerate() {
-                let mut scale = f64::from(f16::from_f32(*s0).to_f32());
-                for _ in 0..p {
-                    scale /= 3.0;
-                }
-                for (i, &t) in plane.iter().enumerate() {
-                    out[r * cols + lo + i] += (scale * f64::from(t)) as f32;
-                }
-            }
-        }
-        if rotate {
-            rotate_row(&mut out[r * cols..(r + 1) * cols], group);
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -724,6 +275,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn in_loop_scale_refit_changes_the_sequential_candidate_and_keeps_ladder_codes() {
+        let weights = [0.91, -0.34, 0.72, -0.58];
+        let gram = [
+            1.0, 0.72, 0.11, -0.08, 0.72, 1.0, 0.19, -0.04, 0.11, 0.19, 1.0, 0.61, -0.08, -0.04,
+            0.61, 1.0,
+        ];
+        let base = ActivationAwareConfig {
+            planes: 2,
+            group: 2,
+            grid: 16,
+            damp: 0.01,
+            search_sweeps: 0,
+            refit_scale: true,
+            rotate: false,
+            decay: 1.0,
+            decay_ramp: false,
+        };
+        let post_pass = fit_tensor_with_scale_refit_mode(
+            &weights,
+            1,
+            4,
+            &gram,
+            &base,
+            ScaleRefitMode::PostPass,
+        )
+        .expect("post-pass control");
+        let in_loop =
+            fit_tensor_with_scale_refit_mode(&weights, 1, 4, &gram, &base, ScaleRefitMode::InLoop)
+                .expect("in-loop fit");
+
+        assert_ne!(
+            in_loop, post_pass,
+            "the in-loop arm must execute scale refits"
+        );
+        assert_eq!(in_loop.len(), 2);
+        for (anchor, planes) in &in_loop {
+            assert!(anchor.is_finite() && *anchor >= 0.0);
+            assert_eq!(planes.len(), 2);
+            for (&high, &low) in planes[0].iter().zip(&planes[1]) {
+                let code = high as i32 * 3 + low as i32;
+                assert!((-4..=4).contains(&code), "invalid two-trit code {code}");
+            }
+        }
+    }
+
     /// A tap that saw no signal must degrade to the plain ladder, not to a wrong fit: with an
     /// all-zero Gram the damping leaves a multiple of the identity, whose compensation term is zero.
     /// A Gram with non-finite entries is a different matter and must be refused.
@@ -838,25 +435,5 @@ mod decay_tests {
             plain, decayed,
             "decay 0.5 must alter the codes GPTQ produces"
         );
-    }
-
-    #[test]
-    fn auto_decay_follows_the_measured_ends_and_clamps_outside_them() {
-        // The two measured ends, on down_proj's 1,536-wide input.
-        assert!((auto_decay(4_096, 1_536) - 0.5).abs() < 0.01);
-        assert!((auto_decay(16_384, 1_536) - 0.75).abs() < 0.01);
-        // Clamped past them.
-        assert_eq!(auto_decay(1_024, 1_536), 0.5);
-        assert_eq!(auto_decay(1 << 20, 1_536), 0.75);
-        // Monotone non-decreasing in tokens at fixed width.
-        let mut last = 0.0;
-        for tokens in [512, 1_024, 2_048, 4_096, 8_192, 16_384, 32_768] {
-            let d = auto_decay(tokens, 576);
-            assert!(d >= last, "auto_decay must not fall as tokens grow");
-            last = d;
-        }
-        // Degenerate inputs pick the cautious end rather than NaN.
-        assert_eq!(auto_decay(0, 576), 0.5);
-        assert_eq!(auto_decay(4_096, 0), 0.5);
     }
 }

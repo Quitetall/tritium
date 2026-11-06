@@ -1,6 +1,6 @@
 //! EAT-O: Evidence-Accumulating Ternary Optimizer.
 use super::{
-    model::{Activation, Example, Model},
+    model::{Activation, Example, Model, RawSums},
     numeric::{Bank, Rng, bits, limit, rounded_div},
 };
 use serde::{Deserialize, Serialize};
@@ -36,6 +36,10 @@ pub(crate) struct Config {
     pub(crate) budget: usize,
     pub(crate) replay_limit: usize,
     pub(crate) coordinates: usize,
+    #[serde(default)]
+    pub(crate) incremental: bool,
+    #[serde(default)]
+    pub(crate) raw_cache: bool,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Metrics {
@@ -193,14 +197,50 @@ impl EatOptimizer {
             };
         }
     }
+    fn local_improvement(
+        &mut self,
+        x: &Example,
+        activation: &Activation,
+        raw: Option<&RawSums>,
+        index: usize,
+        direction: i8,
+    ) -> i128 {
+        if let Some(raw) = raw {
+            self.metrics.contraction_terms += self.model.raw_work(index);
+            self.model
+                .raw_improvement(x, activation, raw, index, direction)
+        } else if self.config.incremental {
+            self.metrics.contraction_terms += self.model.candidate_work(index);
+            self.model
+                .cached_improvement(x, activation, index, direction)
+        } else {
+            self.metrics.forward_examples += 2;
+            self.model
+                .improvement(std::slice::from_ref(x), index, direction)
+        }
+    }
     fn replay_improvement(&mut self, index: usize, direction: i8) -> i128 {
         let mut before = 0;
+        let mut incremental_benefit = 0;
         for entry in &mut self.replay {
             if entry.activation.version != self.model.version {
                 entry.activation = self.model.forward(&entry.example);
                 self.metrics.forward_examples += 1;
             }
-            before += self.model.loss_from(&entry.example, &entry.activation);
+            if self.config.incremental {
+                incremental_benefit += self.model.cached_improvement(
+                    &entry.example,
+                    &entry.activation,
+                    index,
+                    direction,
+                );
+                self.metrics.contraction_terms += self.model.candidate_work(index);
+            } else {
+                before += self.model.loss_from(&entry.example, &entry.activation);
+            }
+        }
+        if self.config.incremental {
+            return incremental_benefit;
         }
         let old = self.model.trits[index];
         self.model.trits[index] += direction;
@@ -281,7 +321,12 @@ impl EatOptimizer {
         let forward_before = self.metrics.forward_examples;
         let stride = if self.config.simple { 2 } else { 4 };
         let count = self.config.coordinates.min(n);
-        let mut activation = self.model.forward(x);
+        let (mut activation, mut raw) = if self.config.raw_cache {
+            let (a, r) = self.model.forward_raw(x);
+            (a, Some(r))
+        } else {
+            (self.model.forward(x), None)
+        };
         self.metrics.forward_examples += 1;
         for offset in 0..count {
             let i = (self.cursor + offset) % n;
@@ -307,8 +352,7 @@ impl EatOptimizer {
                     }
                     Route::Probe => {
                         self.metrics.probe_coordinates += 1;
-                        self.metrics.forward_examples += 2;
-                        self.model.improvement(std::slice::from_ref(x), i, dir)
+                        self.local_improvement(x, &activation, raw.as_ref(), i, dir)
                     }
                 };
                 self.prepare_bank(b, signal);
@@ -339,8 +383,7 @@ impl EatOptimizer {
             if let Some((dir, prediction)) = selected {
                 self.metrics.proposals += 1;
                 // Audit predicted local benefit even in statistics-only mode; never use it to accept there.
-                let actual = self.model.improvement(std::slice::from_ref(x), i, dir);
-                self.metrics.forward_examples += 2;
+                let actual = self.local_improvement(x, &activation, raw.as_ref(), i, dir);
                 self.metrics.prediction_absolute_error += (prediction - actual).abs();
                 self.metrics.audited_predictions += 1;
                 if self.config.history != History::Statistics {
@@ -359,6 +402,10 @@ impl EatOptimizer {
                 self.direction[i] = dir;
                 self.age[i] = 0;
                 self.observations[i] = 0;
+                if let Some(raw) = raw.as_mut() {
+                    self.model.apply_raw(x, &mut activation, raw, i, dir);
+                    self.metrics.contraction_terms += self.model.raw_work(i);
+                }
                 self.model.trits[i] += dir;
                 self.model.version += 1;
                 self.metrics.transitions += 1;
@@ -367,8 +414,10 @@ impl EatOptimizer {
                 }
                 // Changes elsewhere invalidate approximate evidence, but not historical observations.
                 // Every subsequent sensitivity/probe is evaluated against the new model version.
-                activation = self.model.forward(x);
-                self.metrics.forward_examples += 1;
+                if raw.is_none() {
+                    activation = self.model.forward(x);
+                    self.metrics.forward_examples += 1;
+                }
             }
             if self.config.history == History::Replay {
                 // Replay-only ablation: no cross-example score history; hysteresis metadata survives.
@@ -468,10 +517,40 @@ mod tests {
                 budget: 65536,
                 replay_limit: 4,
                 coordinates: 8,
+                incremental: false,
+                raw_cache: false,
             },
             7,
         )
         .unwrap()
+    }
+    #[test]
+    fn incremental_scoring_preserves_training_trajectory() {
+        for route in [Route::Backprop, Route::Probe] {
+            let mut reference = fixture();
+            reference.config.route = route;
+            reference.model.input_shift = 0;
+            reference.model.output_shift = 0;
+            reference.model.trits = vec![1, 0, 0, 1, 0, 0, 0, 0];
+            reference.config.hysteresis = false;
+            let mut incremental = reference.clone();
+            incremental.config.incremental = true;
+            incremental.config.raw_cache = true;
+            for _ in 0..200 {
+                let x = Example {
+                    pixels: vec![255, 0],
+                    label: 0,
+                };
+                reference.step(&x);
+                incremental.step(&x);
+                assert_eq!(reference.model, incremental.model);
+                assert_eq!(reference.blocks, incremental.blocks);
+                assert_eq!(reference.replay, incremental.replay);
+                assert_eq!(reference.rng, incremental.rng);
+            }
+            assert!(reference.metrics.proposals > 0);
+            assert!(incremental.metrics.contraction_terms < reference.metrics.contraction_terms);
+        }
     }
     #[test]
     fn hysteresis_and_zero_recovery() {

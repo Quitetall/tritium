@@ -1,0 +1,23 @@
+{"utc": "2026-10-02T19:05:06.665754+00:00", "campaign": "credit-20261002", "run": "backprop-1", "state": "STARTED"}
+{"utc": "2026-10-02T19:05:06.667431+00:00", "campaign": "credit-20261002", "run": "backprop-2", "state": "STARTED"}
+{"utc": "2026-10-02T19:06:01.995968+00:00", "campaign": "credit-20261002", "run": "backprop-2", "state": "VERIFIED", "accuracy_percent": 74.975, "mean_loss": 38972.27225, "work": 3204926422, "state_bytes": 1030176, "growth": 780, "clips": 0}
+{"utc": "2026-10-02T19:06:02.365451+00:00", "campaign": "credit-20261002", "run": "backprop-3", "state": "STARTED"}
+{"utc": "2026-10-02T19:06:02.946971+00:00", "campaign": "credit-20261002", "run": "backprop-1", "state": "VERIFIED", "accuracy_percent": 68.8, "mean_loss": 41047.50675, "work": 3203190434, "state_bytes": 1031840, "growth": 815, "clips": 0}
+{"utc": "2026-10-02T19:06:02.972589+00:00", "campaign": "credit-20261002", "run": "backprop-4", "state": "STARTED"}
+{"utc": "2026-10-02T19:06:45.264322+00:00", "campaign": "credit-20261002", "run": "backprop-4", "state": "VERIFIED", "accuracy_percent": 78.9, "mean_loss": 38616.31075, "work": 3205539815, "state_bytes": 1031008, "growth": 793, "clips": 0}
+{"utc": "2026-10-02T19:06:45.299998+00:00", "campaign": "credit-20261002", "run": "backprop-3", "state": "VERIFIED", "accuracy_percent": 67.575, "mean_loss": 43378.43925, "work": 3205656365, "state_bytes": 1031008, "growth": 783, "clips": 0}
+{"utc": "2026-10-02T19:06:45.311807+00:00", "campaign": "credit-20261002", "run": "backprop-5", "state": "STARTED"}
+{"utc": "2026-10-02T19:06:45.314929+00:00", "campaign": "credit-20261002", "run": "probe-1", "state": "STARTED"}
+{"utc": "2026-10-02T19:07:24.633053+00:00", "campaign": "credit-20261002", "run": "backprop-5", "state": "VERIFIED", "accuracy_percent": 76.25, "mean_loss": 43022.3025, "work": 3204368301, "state_bytes": 1031008, "growth": 793, "clips": 0}
+{"utc": "2026-10-02T19:07:24.641073+00:00", "campaign": "credit-20261002", "run": "probe-2", "state": "STARTED"}
+{"utc": "2026-10-02T19:07:28.339044+00:00", "campaign": "credit-20261002", "run": "probe-1", "state": "VERIFIED", "accuracy_percent": 65.875, "mean_loss": 45707.82075, "work": 3218231688, "state_bytes": 1031008, "growth": 779, "clips": 0}
+{"utc": "2026-10-02T19:07:28.341028+00:00", "campaign": "credit-20261002", "run": "probe-3", "state": "STARTED"}
+{"utc": "2026-10-02T19:08:07.322787+00:00", "campaign": "credit-20261002", "run": "probe-2", "state": "VERIFIED", "accuracy_percent": 67.075, "mean_loss": 46920.28725, "work": 3217787402, "state_bytes": 1031008, "growth": 749, "clips": 0}
+{"utc": "2026-10-02T19:08:07.353780+00:00", "campaign": "credit-20261002", "run": "probe-4", "state": "STARTED"}
+{"utc": "2026-10-02T19:08:10.830114+00:00", "campaign": "credit-20261002", "run": "probe-3", "state": "VERIFIED", "accuracy_percent": 65.5, "mean_loss": 46312.0895, "work": 3217906658, "state_bytes": 1031008, "growth": 732, "clips": 0}
+{"utc": "2026-10-02T19:08:10.833533+00:00", "campaign": "credit-20261002", "run": "probe-5", "state": "STARTED"}
+{"utc": "2026-10-02T19:09:07.559503+00:00", "campaign": "credit-20261002", "run": "probe-4", "state": "VERIFIED", "accuracy_percent": 64.975, "mean_loss": 47099.5865, "work": 3219449162, "state_bytes": 1031008, "growth": 765, "clips": 0}
+{"utc": "2026-10-02T19:09:07.575460+00:00", "campaign": "credit-20261002", "run": "probe_reference-1", "state": "STARTED"}
+{"utc": "2026-10-02T19:09:10.840867+00:00", "campaign": "credit-20261002", "run": "probe-5", "state": "VERIFIED", "accuracy_percent": 68.975, "mean_loss": 46197.26675, "work": 3217402530, "state_bytes": 1031840, "growth": 759, "clips": 0}
+{"utc": "2026-10-02T19:11:21.600237+00:00", "campaign": "credit-20261002", "run": "probe_reference-1", "state": "VERIFIED", "accuracy_percent": 65.875, "mean_loss": 45707.82075, "work": 233401937952, "state_bytes": 1031008, "growth": 779, "clips": 0}
+{"utc": "2026-10-02T19:11:21.677219+00:00", "campaign": "credit-20261002", "run": "campaign", "state": "COMPLETE", "verified_runs": 11}

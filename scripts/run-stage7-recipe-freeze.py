@@ -20,6 +20,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import runpy
 import shutil
 import subprocess
 import tempfile
@@ -261,22 +262,14 @@ def _qualifier(source_root: Path):
     return module
 
 
+_run_git = runpy.run_path(Path(__file__).with_name("_qualification_git.py"))["run_git"]
+
+
 def _source_identity(source_root: Path) -> str:
-    try:
-        top = subprocess.run(
-            ["git", "-C", str(source_root), "rev-parse", "--show-toplevel"],
-            check=True, capture_output=True, text=True,
-        ).stdout.strip()
-        revision = subprocess.run(
-            ["git", "-C", str(source_root), "rev-parse", "HEAD"],
-            check=True, capture_output=True, text=True,
-        ).stdout.strip()
-        dirty = subprocess.run(
-            ["git", "-C", str(source_root), "status", "--porcelain", "--untracked-files=all"],
-            check=True, capture_output=True, text=True,
-        ).stdout
-    except (OSError, subprocess.CalledProcessError) as error:
-        raise Stage7RunError("source repository identity probe failed") from error
+    top = _run_git(source_root, "rev-parse", "--show-toplevel", error_type=Stage7RunError)
+    revision = _run_git(source_root, "rev-parse", "HEAD", error_type=Stage7RunError)
+    dirty = _run_git(source_root, "status", "--porcelain", "--untracked-files=all",
+                     error_type=Stage7RunError)
     if Path(top).resolve() != source_root.resolve():
         raise Stage7RunError("source root must be repository top level")
     if dirty:

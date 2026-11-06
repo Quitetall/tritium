@@ -35,6 +35,7 @@ register = ["wgpu", "dep:linkme"]
 
 [dev-dependencies]
 tritium-testkit = { workspace = true }
+tritium-evidence = { workspace = true }
 pollster = { workspace = true }
 
 [build-dependencies]

@@ -2,22 +2,12 @@ import { blake3 } from "@noble/hashes/blake3.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 
-import {
-  TRAINING_MANIFEST_DIGEST_V2,
-  TRAINING_VECTOR_DIGEST_V2,
-} from "./identity.ts";
-import type {
-  PortableAttributeV1,
-  PortableBufferV1,
-  PortableWasmSourceV1,
-} from "./portable.js";
+import { TRAINING_MANIFEST_DIGEST_V2, TRAINING_VECTOR_DIGEST_V2 } from "./identity.ts";
+import type { PortableAttributeV1, PortableBufferV1, PortableWasmSourceV1 } from "./portable.js";
 import type { CompiledTrainingPlanV1 } from "./session.ts";
 import { WebTrainingError } from "./session.ts";
 import { preparePortableWasmExecutor } from "./wasm.ts";
-import type {
-  WebGpuDevicePortV1,
-  WebGpuResidentTensorV1,
-} from "./webgpu-runtime.ts";
+import type { WebGpuDevicePortV1, WebGpuResidentTensorV1 } from "./webgpu-runtime.ts";
 import { WebGpuResidentRuntimeV1 } from "./webgpu-runtime.ts";
 import { compileWebGpuResidentScheduleV1 } from "./webgpu-schedule.ts";
 
@@ -43,23 +33,23 @@ type VectorAttribute = Readonly<{
 type VectorTolerance =
   | Readonly<{ kind: "bit_exact" }>
   | Readonly<{
-    kind: "absolute_relative";
-    absolute_bits: number;
-    relative_bits: number;
-  }>;
+      kind: "absolute_relative";
+      absolute_bits: number;
+      relative_bits: number;
+    }>;
 
 type VectorExpected =
   | Readonly<{
-    kind: "success";
-    outputs: readonly VectorBuffer[];
-    scratch_bytes_max: number;
-  }>
+      kind: "success";
+      outputs: readonly VectorBuffer[];
+      scratch_bytes_max: number;
+    }>
   | Readonly<{
-    kind: "error";
-    category: string;
-    code: string;
-    outputs: readonly VectorBuffer[];
-  }>;
+      kind: "error";
+      category: string;
+      code: string;
+      outputs: readonly VectorBuffer[];
+    }>;
 
 type VectorCase = Readonly<{
   case_id: string;
@@ -71,9 +61,10 @@ type VectorCase = Readonly<{
   expected: VectorExpected;
 }>;
 
-type SuccessfulVectorCase = VectorCase & Readonly<{
-  expected: Extract<VectorExpected, Readonly<{ kind: "success" }>>;
-}>;
+type SuccessfulVectorCase = VectorCase &
+  Readonly<{
+    expected: Extract<VectorExpected, Readonly<{ kind: "success" }>>;
+  }>;
 
 type VectorCorpus = Readonly<{
   schema_id: string;
@@ -244,8 +235,8 @@ function snapshotOptions(
   const keys = Reflect.ownKeys(value);
   if (
     keys.some((key) => typeof key !== "string") ||
-    (keys as readonly string[]).some((key) =>
-      !["maxPeakBytes", "physicalDevice", "wasmSource"].includes(key)
+    (keys as readonly string[]).some(
+      (key) => !["maxPeakBytes", "physicalDevice", "wasmSource"].includes(key),
     )
   ) {
     fail("options contain an unknown field");
@@ -296,7 +287,11 @@ function align16(value: number): number {
 function product(shape: readonly number[], label: string): number {
   let value = 1;
   for (const dimension of shape) {
-    if (!Number.isSafeInteger(dimension) || dimension < 0 || value > Number.MAX_SAFE_INTEGER / Math.max(1, dimension)) {
+    if (
+      !Number.isSafeInteger(dimension) ||
+      dimension < 0 ||
+      value > Number.MAX_SAFE_INTEGER / Math.max(1, dimension)
+    ) {
       fail(`${label} shape is invalid`);
     }
     value *= dimension;
@@ -347,10 +342,7 @@ function convolutionOutput(
   after: number,
   label: string,
 ): number {
-  const effective = checkedSum([
-    checkedProduct([dilation, kernel - 1], label),
-    1,
-  ], label);
+  const effective = checkedSum([checkedProduct([dilation, kernel - 1], label), 1], label);
   const padded = checkedSum([input, before, after], label);
   if (stride <= 0 || kernel <= 0 || padded < effective) fail(`${label} geometry is invalid`);
   return Math.floor((padded - effective) / stride) + 1;
@@ -366,23 +358,19 @@ function semanticScratchBytes(item: VectorCase): number {
   }
   if (item.operation === "graph.attention") {
     const seq = u64Attribute(item, "seq");
-    const query = checkedProduct([
-      seq,
-      u64Attribute(item, "n_head"),
-      u64Attribute(item, "head_dim"),
-    ], `${item.case_id} query`);
-    const keyValue = checkedProduct([
-      seq,
-      u64Attribute(item, "n_kv_head"),
-      u64Attribute(item, "head_dim"),
-    ], `${item.case_id} key/value`);
+    const query = checkedProduct(
+      [seq, u64Attribute(item, "n_head"), u64Attribute(item, "head_dim")],
+      `${item.case_id} query`,
+    );
+    const keyValue = checkedProduct(
+      [seq, u64Attribute(item, "n_kv_head"), u64Attribute(item, "head_dim")],
+      `${item.case_id} key/value`,
+    );
     const scores = checkedProduct([seq, seq], `${item.case_id} scores`);
-    const elements = item.execution === "vjp"
-      ? checkedSum(
-        [query, keyValue, keyValue, scores, scores],
-        `${item.case_id} scratch`,
-      )
-      : checkedSum([query, scores], `${item.case_id} scratch`);
+    const elements =
+      item.execution === "vjp"
+        ? checkedSum([query, keyValue, keyValue, scores, scores], `${item.case_id} scratch`)
+        : checkedSum([query, scores], `${item.case_id} scratch`);
     return checkedProduct([elements, 4], `${item.case_id} scratch bytes`);
   }
   if (item.operation === "graph.conv1d") {
@@ -409,22 +397,20 @@ function semanticScratchBytes(item: VectorCase): number {
       [outputLength, cOut / groups],
       `${item.case_id} group output`,
     );
-    const elements = item.execution === "forward"
-      ? checkedSum([
-        checkedProduct([batch, cOut, outputLength], `${item.case_id} result`),
-        columns,
-        groupOutput,
-      ], `${item.case_id} scratch`)
-      : checkedSum([
-        input,
-        weight,
-        cOut,
-        columns,
-        groupOutput,
-        columns,
-        weight / groups,
-        cOut / groups,
-      ], `${item.case_id} scratch`);
+    const elements =
+      item.execution === "forward"
+        ? checkedSum(
+            [
+              checkedProduct([batch, cOut, outputLength], `${item.case_id} result`),
+              columns,
+              groupOutput,
+            ],
+            `${item.case_id} scratch`,
+          )
+        : checkedSum(
+            [input, weight, cOut, columns, groupOutput, columns, weight / groups, cOut / groups],
+            `${item.case_id} scratch`,
+          );
     return checkedProduct([elements, 4], `${item.case_id} scratch bytes`);
   }
   if (item.operation === "graph.conv2d") {
@@ -454,41 +440,39 @@ function semanticScratchBytes(item: VectorCase): number {
       u64Attribute(item, "pad_right"),
       `${item.case_id} output width`,
     );
-    const tileRows = Math.min(32, checkedProduct(
-      [outputHeight, outputWidth],
-      `${item.case_id} tile rows`,
-    ));
+    const tileRows = Math.min(
+      32,
+      checkedProduct([outputHeight, outputWidth], `${item.case_id} tile rows`),
+    );
     const patchColumns = checkedProduct(
       [cIn / groups, kernelHeight, kernelWidth],
       `${item.case_id} patch`,
     );
     const groupChannels = cOut / groups;
     const columns = checkedProduct([tileRows, patchColumns], `${item.case_id} columns`);
-    const groupOutput = checkedProduct(
-      [tileRows, groupChannels],
-      `${item.case_id} group output`,
-    );
+    const groupOutput = checkedProduct([tileRows, groupChannels], `${item.case_id} group output`);
     const output = checkedProduct(
       [batch, cOut, outputHeight, outputWidth],
       `${item.case_id} output`,
     );
-    const input = checkedProduct(
-      [batch, cIn, inputHeight, inputWidth],
-      `${item.case_id} input`,
-    );
+    const input = checkedProduct([batch, cIn, inputHeight, inputWidth], `${item.case_id} input`);
     const weight = checkedProduct([cOut, patchColumns], `${item.case_id} weight`);
-    const elements = item.execution === "forward"
-      ? checkedSum([output, columns, groupOutput], `${item.case_id} scratch`)
-      : checkedSum([
-        input,
-        weight,
-        cOut,
-        columns,
-        groupOutput,
-        columns,
-        checkedProduct([groupChannels, patchColumns], `${item.case_id} group weight`),
-        groupChannels,
-      ], `${item.case_id} scratch`);
+    const elements =
+      item.execution === "forward"
+        ? checkedSum([output, columns, groupOutput], `${item.case_id} scratch`)
+        : checkedSum(
+            [
+              input,
+              weight,
+              cOut,
+              columns,
+              groupOutput,
+              columns,
+              checkedProduct([groupChannels, patchColumns], `${item.case_id} group weight`),
+              groupChannels,
+            ],
+            `${item.case_id} scratch`,
+          );
     return checkedProduct([elements, 4], `${item.case_id} scratch bytes`);
   }
   if (item.operation === "optimizer.adamw") {
@@ -506,10 +490,13 @@ function semanticScratchBytes(item: VectorCase): number {
   if (item.operation === "optimizer.int8_adamw") {
     const length = inputElements(item, "parameter");
     const blocks = Math.ceil(length / 256);
-    const stateBytes = checkedSum([
-      checkedProduct([length, 2], `${item.case_id} compact state`),
-      checkedProduct([blocks, 8], `${item.case_id} scales`),
-    ], `${item.case_id} state`);
+    const stateBytes = checkedSum(
+      [
+        checkedProduct([length, 2], `${item.case_id} compact state`),
+        checkedProduct([blocks, 8], `${item.case_id} scales`),
+      ],
+      `${item.case_id} state`,
+    );
     const blockBytes = checkedProduct(
       [Math.min(length, 256), 2, 4],
       `${item.case_id} block workspace`,
@@ -522,10 +509,13 @@ function semanticScratchBytes(item: VectorCase): number {
     const matrix = checkedProduct([rows, cols], `${item.case_id} matrix`);
     const gramAxis = Math.min(rows, cols);
     const gram = checkedProduct([gramAxis, gramAxis], `${item.case_id} gram`);
-    const elements = checkedSum([
-      checkedProduct([matrix, 4], `${item.case_id} matrix workspace`),
-      checkedProduct([gram, 3], `${item.case_id} gram workspace`),
-    ], `${item.case_id} workspace`);
+    const elements = checkedSum(
+      [
+        checkedProduct([matrix, 4], `${item.case_id} matrix workspace`),
+        checkedProduct([gram, 3], `${item.case_id} gram workspace`),
+      ],
+      `${item.case_id} workspace`,
+    );
     return checkedProduct([elements, 4], `${item.case_id} scratch bytes`);
   }
   return 0;
@@ -574,14 +564,25 @@ function portableAttribute(attribute: VectorAttribute): PortableAttributeV1 {
       return Object.freeze({ kind: "text", name: attribute.name, value: attribute.value });
     case "u64_list":
       if (!denseArray(attribute.values)) fail("u64-list attribute is invalid");
-      return Object.freeze({ kind: "u64-list", name: attribute.name, values: [...attribute.values] });
+      return Object.freeze({
+        kind: "u64-list",
+        name: attribute.name,
+        values: [...attribute.values],
+      });
     case "u32_list":
       if (!denseArray(attribute.values)) fail("u32-list attribute is invalid");
-      return Object.freeze({ kind: "u32-list", name: attribute.name, values: [...attribute.values] });
+      return Object.freeze({
+        kind: "u32-list",
+        name: attribute.name,
+        values: [...attribute.values],
+      });
   }
 }
 
-function planAttribute(attribute: VectorAttribute, execution: VectorCase["execution"]): Readonly<{
+function planAttribute(
+  attribute: VectorAttribute,
+  execution: VectorCase["execution"],
+): Readonly<{
   name: string;
   kind: "f32" | "u64" | "bool" | "text" | "u64-list" | "u32-list";
   value: number | boolean | string | readonly number[];
@@ -613,7 +614,9 @@ function bufferBytes(buffer: VectorBuffer): Uint8Array {
   if (values.length !== elements) fail(`${buffer.name} lane count differs`);
   const bytes = new Uint8Array(elements * 4);
   const view = new DataView(bytes.buffer);
-  values.forEach((value, index) => view.setUint32(index * 4, value, true));
+  values.forEach((value, index) => {
+    view.setUint32(index * 4, value, true);
+  });
   return bytes;
 }
 
@@ -656,62 +659,82 @@ function compileComputePlan(): Readonly<{
     for (const buffer of byName.values()) {
       const id = `${prefix}.${buffer.name}`;
       const byteLength = product(buffer.shape, id) * (buffer.data.dtype === "bytes" ? 1 : 4);
-      buffers.push(Object.freeze({
-        id,
-        role: "activation",
-        dtype: buffer.data.dtype,
-        shape: Object.freeze([...buffer.shape]),
-        aliasOf: null,
-        ownerId: id,
-        byteOffset: residentBytes,
-        byteLength,
-        backwardInitialization: "none",
-      }));
+      buffers.push(
+        Object.freeze({
+          id,
+          role: "activation",
+          dtype: buffer.data.dtype,
+          shape: Object.freeze([...buffer.shape]),
+          aliasOf: null,
+          ownerId: id,
+          byteOffset: residentBytes,
+          byteLength,
+          backwardInitialization: "none",
+        }),
+      );
       residentBytes += align16(byteLength);
       const input = inputByName.get(buffer.name);
-      initial.push(Object.freeze({
-        bufferId: id,
-        bytes: input === undefined ? poisonBytes(buffer) : bufferBytes(input),
-      }));
+      initial.push(
+        Object.freeze({
+          bufferId: id,
+          bytes: input === undefined ? poisonBytes(buffer) : bufferBytes(input),
+        }),
+      );
     }
     const operationId = `${prefix}.${item.operation}.${item.execution}`;
     const id = (name: string) => `${prefix}.${name}`;
-    const attributes = Object.freeze(item.attributes.map((attribute) =>
-      planAttribute(attribute, item.execution)));
+    const attributes = Object.freeze(
+      item.attributes.map((attribute) => planAttribute(attribute, item.execution)),
+    );
     if (item.execution === "vjp") {
-      backwardOperations.push(Object.freeze({
-        id: operationId,
-        sourceOperationId: `${prefix}.source`,
-        operation: item.operation,
-        execution: "vjp",
-        inputs: Object.freeze(item.inputs.map((buffer) =>
-          Object.freeze({ role: buffer.name, bufferId: id(buffer.name) }))),
-        outputs: Object.freeze(item.expected.outputs.map((buffer) =>
-          Object.freeze({ role: buffer.name, bufferId: id(buffer.name) }))),
-        attributes,
-      }));
+      backwardOperations.push(
+        Object.freeze({
+          id: operationId,
+          sourceOperationId: `${prefix}.source`,
+          operation: item.operation,
+          execution: "vjp",
+          inputs: Object.freeze(
+            item.inputs.map((buffer) =>
+              Object.freeze({ role: buffer.name, bufferId: id(buffer.name) }),
+            ),
+          ),
+          outputs: Object.freeze(
+            item.expected.outputs.map((buffer) =>
+              Object.freeze({ role: buffer.name, bufferId: id(buffer.name) }),
+            ),
+          ),
+          attributes,
+        }),
+      );
     } else {
-      operations.push(Object.freeze({
-        id: operationId,
-        operation: item.operation,
-        inputs: Object.freeze(item.inputs.map((buffer) => id(buffer.name))),
-        outputs: Object.freeze(item.expected.outputs.map((buffer) => id(buffer.name))),
-        attributes,
-      }));
+      operations.push(
+        Object.freeze({
+          id: operationId,
+          operation: item.operation,
+          inputs: Object.freeze(item.inputs.map((buffer) => id(buffer.name))),
+          outputs: Object.freeze(item.expected.outputs.map((buffer) => id(buffer.name))),
+          attributes,
+        }),
+      );
     }
     const step = item.attributes.find((attribute) => attribute.name === "step")?.value;
     const scratchBytes = admitScratch(item, semanticScratchBytes(item));
-    entries.push(Object.freeze({
-      item: item as SuccessfulVectorCase,
-      phase: item.execution === "vjp" ? "backward" : "forward",
-      operationId,
-      outputIds: Object.freeze(item.expected.outputs.map((buffer) => id(buffer.name))),
-      optimizerStep: item.execution === "step"
-        ? typeof step === "number" && Number.isSafeInteger(step) && step > 0 ? step : 1
-        : undefined,
-      scratchBytes,
-      scratchBytesMax: item.expected.scratch_bytes_max,
-    }));
+    entries.push(
+      Object.freeze({
+        item: item as SuccessfulVectorCase,
+        phase: item.execution === "vjp" ? "backward" : "forward",
+        operationId,
+        outputIds: Object.freeze(item.expected.outputs.map((buffer) => id(buffer.name))),
+        optimizerStep:
+          item.execution === "step"
+            ? typeof step === "number" && Number.isSafeInteger(step) && step > 0
+              ? step
+              : 1
+            : undefined,
+        scratchBytes,
+        scratchBytesMax: item.expected.scratch_bytes_max,
+      }),
+    );
   }
 
   const plan = Object.freeze({
@@ -770,10 +793,9 @@ function portableRequest(item: VectorCase, physicalDevice: string) {
 function u32Bits(bytes: Uint8Array): readonly number[] {
   if (bytes.byteLength % 4 !== 0) fail("f32/u32 output is not lane aligned");
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  return Object.freeze(Array.from(
-    { length: bytes.byteLength / 4 },
-    (_, index) => view.getUint32(index * 4, true),
-  ));
+  return Object.freeze(
+    Array.from({ length: bytes.byteLength / 4 }, (_, index) => view.getUint32(index * 4, true)),
+  );
 }
 
 function actualBuffer(expected: VectorBuffer, bytes: Uint8Array): PortableBufferV1 {
@@ -802,11 +824,7 @@ function numericValues(buffer: PortableBufferV1): readonly number[] {
   return buffer.data.dtype === "f32" ? buffer.data.bits : buffer.data.values;
 }
 
-function compareOutput(
-  item: VectorCase,
-  actual: PortableBufferV1,
-  expected: VectorBuffer,
-): void {
+function compareOutput(item: VectorCase, actual: PortableBufferV1, expected: VectorBuffer): void {
   const wanted = bufferFromVector(expected);
   if (
     actual.name !== wanted.name ||
@@ -818,7 +836,11 @@ function compareOutput(
   const left = numericValues(actual);
   const right = numericValues(wanted);
   if (left.length !== right.length) fail(`${item.case_id} output length differs`);
-  if (actual.data.dtype !== "f32" || wanted.data.dtype !== "f32" || item.tolerance.kind === "bit_exact") {
+  if (
+    actual.data.dtype !== "f32" ||
+    wanted.data.dtype !== "f32" ||
+    item.tolerance.kind === "bit_exact"
+  ) {
     if (left.some((value, index) => value !== right[index])) {
       fail(`${item.case_id} output differs under bit-exact grading`);
     }
@@ -846,9 +868,10 @@ function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   if (value !== null && typeof value === "object") {
     const recordValue = value as Readonly<Record<string, unknown>>;
-    return `{${Object.keys(recordValue).sort().map((key) =>
-      `${JSON.stringify(key)}:${canonicalJson(recordValue[key])}`
-    ).join(",")}}`;
+    return `{${Object.keys(recordValue)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(recordValue[key])}`)
+      .join(",")}}`;
   }
   return JSON.stringify(value);
 }
@@ -891,9 +914,10 @@ export async function runWebGpuVectorConformanceV1(
     let wasmTensorDispatches = 0;
     let wasmCodecCalls = 0;
     let wasmValidationCalls = 0;
-    const executor = captured.wasmSource === undefined
-      ? await preparePortableWasmExecutor()
-      : await preparePortableWasmExecutor(captured.wasmSource);
+    const executor =
+      captured.wasmSource === undefined
+        ? await preparePortableWasmExecutor()
+        : await preparePortableWasmExecutor(captured.wasmSource);
     const executeControlPlane = (item: VectorCase) => {
       if (item.expected.kind === "success" && !item.operation.startsWith("lifecycle.")) {
         wasmTensorDispatches += 1;
@@ -916,13 +940,16 @@ export async function runWebGpuVectorConformanceV1(
         });
         const scratchBytes = admitScratch(item, response.receipt.scratchBytes);
         wasmCodecCalls += 1;
-        traces.set(item.case_id, Object.freeze({
-          caseId: item.case_id,
-          implementation: "wasm-codec",
-          outputDigest: outputDigest(response.outputs),
-          scratchBytes,
-          scratchBytesMax: item.expected.scratch_bytes_max,
-        }));
+        traces.set(
+          item.case_id,
+          Object.freeze({
+            caseId: item.case_id,
+            implementation: "wasm-codec",
+            outputDigest: outputDigest(response.outputs),
+            scratchBytes,
+            scratchBytesMax: item.expected.scratch_bytes_max,
+          }),
+        );
       } else {
         if (
           response.status !== "error" ||
@@ -933,13 +960,16 @@ export async function runWebGpuVectorConformanceV1(
           fail(`${item.case_id} expected-invalid admission differs`);
         }
         wasmValidationCalls += 1;
-        traces.set(item.case_id, Object.freeze({
-          caseId: item.case_id,
-          implementation: "wasm-validation",
-          outputDigest: outputDigest(response.outputs),
-          scratchBytes: null,
-          scratchBytesMax: null,
-        }));
+        traces.set(
+          item.case_id,
+          Object.freeze({
+            caseId: item.case_id,
+            implementation: "wasm-validation",
+            outputDigest: outputDigest(response.outputs),
+            scratchBytes: null,
+            scratchBytesMax: null,
+          }),
+        );
       }
     }
 
@@ -970,13 +1000,16 @@ export async function runWebGpuVectorConformanceV1(
         compareOutput(entry.item, actual, expected);
         outputs.push(actual);
       }
-      traces.set(entry.item.case_id, Object.freeze({
-        caseId: entry.item.case_id,
-        implementation: "webgpu",
-        outputDigest: outputDigest(outputs),
-        scratchBytes: entry.scratchBytes,
-        scratchBytesMax: entry.scratchBytesMax,
-      }));
+      traces.set(
+        entry.item.case_id,
+        Object.freeze({
+          caseId: entry.item.case_id,
+          implementation: "webgpu",
+          outputDigest: outputDigest(outputs),
+          scratchBytes: entry.scratchBytes,
+          scratchBytesMax: entry.scratchBytesMax,
+        }),
+      );
     }
 
     if (
@@ -993,11 +1026,13 @@ export async function runWebGpuVectorConformanceV1(
     const observedWasmCodecCalls = wasmCodecCalls as 4;
     const observedWasmValidationCalls = wasmValidationCalls as 45;
 
-    const ordered = Object.freeze(corpus.cases.map((item) => {
-      const trace = traces.get(item.case_id);
-      if (trace === undefined) fail(`${item.case_id} has no execution trace`);
-      return trace;
-    }));
+    const ordered = Object.freeze(
+      corpus.cases.map((item) => {
+        const trace = traces.get(item.case_id);
+        if (trace === undefined) fail(`${item.case_id} has no execution trace`);
+        return trace;
+      }),
+    );
     const executionDigest = bytesToHex(sha256(UTF8.encode(canonicalJson(ordered))));
     return Object.freeze({
       schemaId: "tritium.webgpu_vector_conformance_trace",

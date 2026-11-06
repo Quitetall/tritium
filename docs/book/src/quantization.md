@@ -90,6 +90,31 @@ strict artifact records each selected weight's plane count. This first generic
 integration allocates at weight granularity; Stage-7 SALT model conversion
 retains finer allocation-tile maps.
 
+## Experimental GPTQ scale-refit placement
+
+The `tritium convert` command has an opt-in L-C experiment switch for the
+activation-aware geometric-ladder fitter. Its default is `post-pass`, which
+fits a group's top scale after the GPTQ pass. `in-loop` refits that scale when
+the group is complete, then propagates the changed quantization error into
+later columns:
+
+```sh
+tritium convert \
+  --model ./dense-model \
+  --out ./ternary-in-loop \
+  --activation-aware \
+  --calib ./calibration.txt \
+  --gptq-scale-refit in-loop
+```
+
+The in-loop mode requires `--activation-aware`; Tritium rejects it otherwise.
+The conversion receipt records `post-pass`, `in-loop`, or `not-applicable` so
+results cannot be confused. Keep model, calibration data, token count, and all
+other options fixed when comparing the two modes. This is an experimental
+selector, not evidence that in-loop refitting improves held-out quality, and it
+does not qualify or alter the frozen Stage-7 recipe. See the current
+[research-record policy](./research-records.md) for the campaign boundary.
+
 ## Stage-7 token evidence
 
 Collect the frozen source rows at the three immutable Hub revisions before
@@ -170,7 +195,20 @@ the complete payload digest, then rechecks the retained file handle after the
 selected read. Its JSON receipt identifies the exact ordered token window; it
 does not claim model execution or quality.
 
-Run the frozen 135M execution seam from the installed wheel:
+First bind a bootstrap campaign plan to the clean source revision. An empty
+receipt list is permitted only for this bootstrap; it cannot pass the final
+recipe qualifier:
+
+```sh
+python scripts/rebind-stage7-campaign.py \
+  --template /evidence/stage7/campaign-template.json \
+  --source-root . \
+  --run-id stage7-smollm2-17b-bootstrap-$(git rev-parse --short HEAD) \
+  --output /evidence/stage7/campaign-bootstrap.json
+```
+
+Run the frozen 135M execution seam from the installed wheel using that
+bootstrap plan:
 
 ```python
 from pathlib import Path
@@ -184,7 +222,7 @@ snapshot = (
 )
 
 result = run_stage7_smollm2_smoke(
-    "./stage7-campaign.json",
+    "/evidence/stage7/campaign-bootstrap.json",
     snapshot,
     "./stage7-smoke",
     device="cuda",
@@ -196,11 +234,53 @@ The driver strictly resumes capture, additive PTQ fitting, allocation, native
 SALT V2 packaging, and causal evaluation. It admits only the campaign-frozen
 model/token prefix and emits qualifier-compatible receipts. A completed smoke
 proves workflow integrity and physical package production, not 1.7B recipe
-quality or Stage-7 qualification. SmolLM matrices requiring G64 use explicit
-SALT V2 package-version 2 scale geometry; G128-only packages remain canonical
-version 1.
+quality or Stage-7 qualification. SmolLM matrices requiring G64 or G256 use
+explicit SALT V2 package-version 2 scale geometry; G128-only packages remain
+canonical version 1. In version 2, geometry tags `0`, `1`, and `2` mean G128,
+G64, and G256 respectively; unknown tags are rejected.
 
 ## Stage-7 full recipe freeze
+
+Produce the native CUDA receipt from the same clean source revision as the
+bootstrap plan. This runs all 144 frozen codec/group/plane/dispatch cases under
+Compute Sanitizer, validates the measurements with the Stage-7 qualifier, and
+publishes the receipt and sanitizer log without replacing existing files:
+
+```sh
+python scripts/run-stage7-native-matrix.py \
+  --output /evidence/stage7/native/native-receipt.json \
+  --device 0 \
+  --target-dir /mnt/4tb/tritium-stage7-target
+```
+
+The host needs the CUDA toolkit and Compute Sanitizer. The command refuses a
+dirty source checkout; the receipt is tied to its exact `HEAD`. Produce the
+HESTIA Gate-C receipt on that same revision:
+
+```sh
+cargo run --locked -p tritium-cli --features cuda -- \
+  salt seal-hestia-gate-c \
+  --release 1.1.0-rc.2 \
+  --source-revision "$(git rev-parse HEAD)" \
+  --output /evidence/stage7/hestia-gate-c.json \
+  --cuda-device 0
+```
+
+Finally assemble the three measured receipts into the executable campaign. The
+rebinder verifies each schema, digest, containment path, and exact source
+revision; it allows same-revision assembly only when all three receipt paths
+are supplied together:
+
+```sh
+python scripts/rebind-stage7-campaign.py \
+  --template /evidence/stage7/campaign-bootstrap.json \
+  --source-root . \
+  --run-id stage7-smollm2-17b-real-$(git rev-parse --short HEAD) \
+  --smoke-receipt /evidence/stage7/smoke/smoke-receipt.json \
+  --native-kernels-receipt /evidence/stage7/native/native-receipt.json \
+  --hestia-gate-c-receipt /evidence/stage7/hestia-gate-c.json \
+  --output /evidence/stage7/campaign.json
+```
 
 The full 1.7B successive-halving campaign is driven by the source-bound
 orchestrator:
@@ -236,20 +316,11 @@ six solver variants, full artifacts, and physical reports. The auxiliary runner
 advertises only baseline/refinement features. Missing or stale capability
 declarations fail before any measurement cache is written.
 
-Campaign templates are pre-evidence plans. When source code changes before a
-run, rebind the template to clean `HEAD` with no-replace output:
-
-```sh
-python scripts/rebind-stage7-campaign.py \
-  --template /evidence/stage7/campaign-template.json \
-  --source-root . \
-  --run-id stage7-smollm2-17b-real-$(git rev-parse --short HEAD) \
-  --output /evidence/stage7/campaign.json
-```
-
-The rebinder changes only top-level `source_revision` and `run_id`; nested
-stale revisions, dirty trees, malformed templates, and existing outputs fail
-closed. It creates no measurements and does not qualify a recipe freeze.
+Campaign templates are pre-evidence plans. Bootstrap rebinding and final
+same-revision receipt assembly both use no-replace output. A partial receipt
+set, stale nested revision, dirty tree, malformed template, or existing output
+fails closed. Rebinding creates no measurements and does not qualify a recipe
+freeze.
 
 ## SALT V2 Qwen master campaigns
 

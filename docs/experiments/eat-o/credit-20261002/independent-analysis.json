@@ -1,0 +1,13 @@
+{
+  "independent_checks": "PASS",
+  "verified_runs": 11,
+  "exact_probe_control_model": true,
+  "probe_loss_difference": 5440.04385,
+  "paired_t_95_ci": [
+    2180.1288119986684,
+    8699.958888001333
+  ],
+  "accuracy_difference_pp": -6.82,
+  "analyzer_sha256": "5ebf17b7c23971a3f655306b0ef264d62c306334afcbff3fcbb345684fbc6981",
+  "qualification": "exploratory reused validation, no matched-work or release qualification"
+}
