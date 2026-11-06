@@ -9,7 +9,21 @@ yanked = "deny"
 # `wgpu` → `wgpu-hal` → `metal` (the macOS/iOS HAL); it is never compiled on the
 # Linux/CUDA path. No maintained drop-in replacement exists upstream yet. Revisit
 # when a future wgpu drops it. Low risk: proc-macro, compile-time only.
-ignore = ["RUSTSEC-2024-0436"]
+#
+# RUSTSEC-2026-0367, -0368, -0369, -0429: `zip` < 9 mishandles permissions and
+# symlinks when EXTRACTING an archive to disk (`ZipArchive::extract`,
+# `ZipStreamReader::extract`). `zip` 8.6 enters the graph only through
+# `candle-core` 0.11 (`^8.6`, its latest release) ← `tritium-candle`, and
+# candle-core only reads `.npz` entries into memory (`by_index`, `by_name`); it
+# never extracts to disk. No workspace crate uses `zip`. Remove all four when a
+# candle release moves to `zip` 9.
+ignore = [
+    "RUSTSEC-2024-0436",
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0429",
+]
 
 [licenses]
 # Unicode-3.0 is the license of `unicode-ident` (a transitive dep of serde/syn etc.),

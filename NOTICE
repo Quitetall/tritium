@@ -26,6 +26,12 @@ the source files of the integrating crates.
   - ExLlamaV2 — (MIT)
       EXL2 quantization + 4-bit kernels.
       https://github.com/turboderp-org/exllamav2
+  - MiniJinja and MiniJinja contrib — Armin Ronacher (Apache-2.0)
+      Fixed no-import WebAssembly chat renderer. Dependency notices (including
+      conservative build-time entries) are packaged in
+      crates/tritium-nn/src/model/chat_renderer.NOTICE.txt; locked build inputs
+      and dependency identities are in chat_renderer.build.json beside it.
+      https://github.com/mitsuhiko/minijinja
 
 Attribution requirement: any crate that vendors or directly ports upstream
 code MUST retain the upstream copyright header in the relevant source file

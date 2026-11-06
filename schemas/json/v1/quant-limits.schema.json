@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "QuantLimits",
+  "description": "Logical byte bounds, not complete memory/RSS or solver admission.",
+  "type": "object",
+  "properties": {
+    "max_asset_bytes": {
+      "description": "Sum of original assets retained in the output.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_package_bytes": {
+      "description": "Complete output package bound, enforced before writer allocation.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_retained_blob_bytes": {
+      "description": "Sum of unique encoded output blob payload bytes.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_source_bytes": {
+      "description": "Sum of actual original tensor payload bytes.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "max_source_bytes",
+    "max_asset_bytes",
+    "max_retained_blob_bytes",
+    "max_package_bytes"
+  ]
+}

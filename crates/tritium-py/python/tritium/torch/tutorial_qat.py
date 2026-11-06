@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib.metadata
 import json
 import math
 import os
@@ -13,8 +12,7 @@ from pathlib import Path
 import torch
 from torch import nn
 
-import tritium
-
+from ._installed_candidate import verify_installed_candidate
 from .config import TernaryConfig
 from .conversion import inspect, prepare
 from .ptq import convert
@@ -38,21 +36,16 @@ class _TinyTiedModel(nn.Module):
         return self.head(self.embed(tokens))
 
 
-def _installed_distribution() -> tuple[str, Path]:
-    try:
-        distribution = importlib.metadata.distribution("pytritium")
-    except importlib.metadata.PackageNotFoundError as error:
-        raise RuntimeError("tutorial requires an installed pytritium distribution") from error
-    module = Path(tritium.__file__).resolve(strict=True)
-    if distribution.files is None:
-        raise RuntimeError("installed pytritium distribution has no file inventory")
-    owned = {
-        distribution.locate_file(item).resolve()
-        for item in distribution.files
-    }
-    if module not in owned:
-        raise RuntimeError("imported tritium package is not owned by pytritium")
-    return distribution.version, module
+def _installed_distribution(
+    *,
+    wheel_artifact: Path | None,
+    source_revision: str,
+    release: str,
+) -> tuple[str, Path]:
+    return verify_installed_candidate(
+        wheel_artifact=wheel_artifact, source_revision=source_revision,
+        release=release, executing_files=(Path(__file__),),
+    )
 
 
 def _sha256_file(path: Path) -> str:
@@ -93,7 +86,9 @@ def run_installed_qat_tutorial(
         raise ValueError("source revision must be 40 lowercase hexadecimal characters")
     if not release or not run_id:
         raise ValueError("release and run id must be non-empty")
-    distribution_version, module_path = _installed_distribution()
+    distribution_version, module_path = _installed_distribution(
+        wheel_artifact=wheel_artifact, source_revision=source_revision, release=release
+    )
     device = torch.device(device_name)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA tutorial requested but torch.cuda.is_available() is false")
@@ -252,7 +247,10 @@ def validate_tutorial_receipt(
         expected_source_revision=expected_source_revision,
         expected_release=expected_release,
     )
-    version, module_path = _installed_distribution()
+    version, module_path = _installed_distribution(
+        wheel_artifact=expected_wheel, source_revision=receipt["source_revision"],
+        release=receipt["release"],
+    )
     if receipt["distribution_version"] != version:
         raise ValueError("tutorial distribution version mismatch")
     if receipt["tritium_module"] != str(module_path):

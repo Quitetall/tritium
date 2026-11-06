@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.metadata
 import json
 import math
 import os
@@ -22,9 +21,9 @@ from torch.distributed.fsdp import FullyShardedDataParallel, MixedPrecision
 from torch.nn.parallel import DistributedDataParallel
 import transformers
 
-import tritium
 from tritium.nn import TernaryLinear
 from tritium.torch import TernaryConfig, prepare_qat
+from tritium.torch._installed_candidate import verify_installed_candidate
 
 
 SEED = 1201
@@ -42,18 +41,15 @@ MODEL_CONFIG = {
 }
 
 
-def require_installed_distribution() -> None:
-    try:
-        distribution = importlib.metadata.distribution("pytritium")
-    except importlib.metadata.PackageNotFoundError as error:
-        raise RuntimeError(
-            "distributed worker requires installed pytritium"
-        ) from error
-    module = Path(tritium.__file__).resolve(strict=True)
-    if distribution.files is None or module not in {
-        distribution.locate_file(item).resolve() for item in distribution.files
-    }:
-        raise RuntimeError("imported tritium package is not owned by pytritium")
+def require_installed_distribution(
+    *, wheel: Path, source_revision: str, release: str,
+) -> None:
+    # This script is frozen by the outer qualifier's clean-source check, not a
+    # wheel member. Bind native/package payloads without misclassifying this
+    # checkout-owned worker as an installed package origin.
+    verify_installed_candidate(
+        wheel_artifact=wheel, source_revision=source_revision, release=release,
+    )
 
 
 def canonical(value: object) -> bytes:
@@ -308,8 +304,13 @@ def main() -> None:
     parser.add_argument("--mode", choices=("ddp", "fsdp"), required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--wheel", type=Path, required=True)
+    parser.add_argument("--source-revision", required=True)
+    parser.add_argument("--release", required=True)
     args = parser.parse_args()
-    require_installed_distribution()
+    require_installed_distribution(
+        wheel=args.wheel, source_revision=args.source_revision, release=args.release,
+    )
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         raise RuntimeError("qualification requires two visible physical CUDA devices")
     dist.init_process_group("nccl")

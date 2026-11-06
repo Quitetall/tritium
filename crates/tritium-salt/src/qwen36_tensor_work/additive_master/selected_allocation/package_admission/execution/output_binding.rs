@@ -689,7 +689,7 @@ fn scope_runtime_error(message: &str) -> Qwen36FinalLogitsOutputBindingError {
     Qwen36FinalLogitsOutputBindingError::Runtime(NnError::Provenance(message.to_owned()))
 }
 
-fn digest_scope_evidence(evidence: &[RuntimeOutputScopeEvidence]) -> [u8; 32] {
+pub(super) fn digest_scope_evidence(evidence: &[RuntimeOutputScopeEvidence]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key(SCOPE_EVIDENCE_SET_CONTEXT);
     hasher.update(&(evidence.len() as u64).to_le_bytes());
     for scope in evidence {
@@ -882,7 +882,7 @@ fn binding_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(value)
 }
 
-fn validate_execution(
+pub(super) fn validate_execution(
     authority: &super::ExecutionAuthority,
     execution: &Qwen36AdmittedExecutionReceipt,
 ) -> Result<(), NnError> {

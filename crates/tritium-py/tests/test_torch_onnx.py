@@ -18,6 +18,7 @@ from tritium.torch import (  # noqa: E402
     QwenOnnxCausalLM,
     OnnxMtpOutput,
     TritiumError,
+    as_transformers_generation_model,
     export_onnx,
     export_module_onnx,
     load_onnx,
@@ -582,6 +583,85 @@ def test_dynamic_model_greedy_generation_reuses_cache_and_stops_on_eos(
         ([2], [[1.0, 2.0]]),
         ([1], [[1.0, 2.0, 3.0]]),
     ]
+
+
+def test_transformers_generation_adapter_uses_tritium_tuple_cache(
+    monkeypatch, tmp_path
+):
+    from transformers import PretrainedConfig
+
+    root = tmp_path / "onnx"
+    _write_onnx_bundle(root, dynamic=True)
+    calls = []
+
+    class Runtime:
+        device = "cpu"
+
+        @staticmethod
+        def load(*args, **kwargs):
+            return Runtime()
+
+        def forward_language(self, token_ids, states):
+            calls.append((token_ids, states))
+            call = len(calls)
+            next_token = {1: 2, 2: 1, 3: 3}[call]
+            cache_rows = len(token_ids) if states is None else len(states[0]) + 1
+            logits = [0.0, 0.0, 0.0, 0.0]
+            logits[next_token] = 1.0
+            return SimpleNamespace(
+                logits_shape=[len(token_ids), 4],
+                logits=logits * len(token_ids),
+                state_names=["present_k.0"],
+                state_shapes=[[cache_rows]],
+                states=[[float(index) for index in range(cache_rows)]],
+            )
+
+    monkeypatch.setattr(onnx._tritium, "QwenOnnxModel", Runtime, raising=False)
+    model = load_onnx(root)
+    config = PretrainedConfig(
+        vocab_size=4,
+        is_encoder_decoder=False,
+        bos_token_id=1,
+        eos_token_id=3,
+        pad_token_id=0,
+    )
+    adapted = as_transformers_generation_model(model, config)
+    output = adapted.generate(input_ids=torch.tensor([[1, 2]]), max_new_tokens=5)
+
+    assert output.tolist() == [[1, 2, 2, 1, 3]]
+    assert calls == [
+        ([1, 2], None),
+        ([2], [[0.0, 1.0]]),
+        ([1], [[0.0, 1.0, 2.0]]),
+    ]
+
+
+def test_transformers_generation_adapter_rejects_beam_and_fixed_cache(
+    monkeypatch, tmp_path
+):
+    from transformers import PretrainedConfig
+
+    fixed_root = tmp_path / "fixed"
+    _write_onnx_bundle(fixed_root)
+    monkeypatch.setattr(
+        onnx._tritium,
+        "QwenOnnxModel",
+        SimpleNamespace(load=lambda *args, **kwargs: SimpleNamespace(device="cpu")),
+        raising=False,
+    )
+    fixed = load_onnx(fixed_root)
+    config = PretrainedConfig(vocab_size=4, is_encoder_decoder=False)
+    with pytest.raises(TritiumError) as caught:
+        as_transformers_generation_model(fixed, config)
+    assert caught.value.code == "dynamic_onnx_generation_unavailable"
+
+    dynamic_root = tmp_path / "dynamic"
+    _write_onnx_bundle(dynamic_root, dynamic=True)
+    dynamic = load_onnx(dynamic_root)
+    adapted = as_transformers_generation_model(dynamic, config)
+    with pytest.raises(TritiumError) as caught:
+        adapted.generate(torch.tensor([[1]]), num_beams=2)
+    assert caught.value.code == "onnx_generation_batch_unavailable"
 
 
 def test_dynamic_generation_zero_budget_and_rejects_sampling(monkeypatch, tmp_path):

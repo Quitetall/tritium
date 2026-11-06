@@ -3,6 +3,13 @@
 Status: experimental implementation; the completed classifier campaign did not
 clear advancement. See [results and limitations](eat-o-classifier-results.md).
 Scaling and SOTA claims remain **UNKNOWN**.
+The [experiment journal](eat-o-experiment-log.md) records campaign protocols and
+individual run outcomes. New experiments must log starts, failures, and verified
+results there, with compact reports and receipts under `docs/experiments/eat-o/`;
+temporary console output alone is not the experiment record.
+The [October follow-up](eat-o-followup-results.md) adds opt-in exact incremental
+scoring and reports an exploratory 73.30% five-seed recipe; matched-work
+qualification remains outstanding.
 This is a private example, not a new production trainer, public API, release gate,
 or checkpoint contract. Production adoption needs an ADR and separate qualification.
 
@@ -96,6 +103,21 @@ Examples are admitted while space permits, then replaced by reservoir-style
 sampling. Changing capacity makes this a bounded history sampler, not a claim of
 uniform reservoir sampling across all training history. Validation never enters
 optimizer state.
+
+With `--incremental yes`, finite-change probes, prediction audits, and replay
+candidate scores recompute only affected raw sums from current activations.
+This preserves exact candidate loss despite activation truncation and ReLU.
+Full recomputation remains the default and stale replay caches still require
+refreshing. The flag is checkpointed and cannot override a resumed experiment.
+
+`--raw-cache yes` additionally retains the current example's raw hidden/output
+sums. Candidate scoring and accepted transitions update only the affected sums,
+preserving integer rounding and ReLU exactly. This uses 138 additional i64 values
+for the MNIST shape, plus container metadata, as transient working memory outside
+the optimizer-state cap. It is not replay history. The option defaults to off and
+cannot override a resumed checkpoint. Both backprop and exact-probe routes can
+use it; the latter supplies actual finite-change loss benefits to the evidence
+banks, without compressing incoming signals to one trit.
 
 MNIST defaults to 12 bytes/parameter for optimizer buffers, metadata, containers,
 and replay. Growth uses spare capacity; replay cannot evict evidence to grow.

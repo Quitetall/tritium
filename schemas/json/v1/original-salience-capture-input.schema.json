@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OriginalSalienceCaptureInput",
+  "description": "Exact ordered inputs. Tokens are all inputs, never next-token targets.",
+  "oneOf": [
+    {
+      "description": "Complete pretokenized nonempty windows.",
+      "type": "object",
+      "properties": {
+        "Tokens": {
+          "type": "object",
+          "properties": {
+            "windows": {
+              "description": "Every token is executed, in this exact order and context partition.",
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "uint32",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "windows"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Tokens"
+      ]
+    },
+    {
+      "description": "Exact private raw text, encoded without special tokens/template/fallback.",
+      "type": "object",
+      "properties": {
+        "RawText": {
+          "type": "object",
+          "properties": {
+            "windows": {
+              "description": "UTF-8 input windows, without padding or truncation.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "windows"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "RawText"
+      ]
+    }
+  ]
+}

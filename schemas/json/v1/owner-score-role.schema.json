@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OwnerScoreRole",
+  "description": "Ordinary owner operation, in canonical source coordinates.",
+  "oneOf": [
+    {
+      "description": "`z = x W^T`, without omitted source uses.",
+      "type": "string",
+      "const": "Matmul"
+    },
+    {
+      "description": "Ordinary lookup, without padding/frequency/custom backward rules.",
+      "type": "string",
+      "const": "Gather"
+    }
+  ]
+}
