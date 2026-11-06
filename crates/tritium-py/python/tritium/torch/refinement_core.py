@@ -32,14 +32,13 @@ def _validate(
     config: RefinementConfig,
     iterations: int,
     max_working_bytes: int,
-) -> None:
+) -> int:
     if (
         not isinstance(master, torch.Tensor)
         or master.ndim != 2
         or not master.dtype.is_floating_point
-        or not bool(torch.isfinite(master).all())
     ):
-        raise ValueError("refinement master must be one finite floating matrix")
+        raise ValueError("refinement master must be one floating matrix")
     if not 1 <= len(planes) <= 3:
         raise ValueError("refinement requires one to three parent planes")
     if not isinstance(config, RefinementConfig):
@@ -49,11 +48,8 @@ def _validate(
         or metric.ndim != 1
         or metric.numel() != master.shape[1]
         or not metric.dtype.is_floating_point
-        or not bool(torch.isfinite(metric).all())
-        or bool((metric < 0).any())
-        or not bool((metric > 0).any())
     ):
-        raise ValueError("refinement metric must be finite nonnegative input curvature")
+        raise ValueError("refinement metric must be a floating input curvature vector")
     group_size = planes[0].group_size
     if type(group_size) is not int or group_size <= 0 or master.shape[1] % group_size:
         raise ValueError("refinement parent plane group size is not aligned")
@@ -68,23 +64,9 @@ def _validate(
             or plane.scales.device != master.device
             or plane.group_size != group_size
             or plane.structure not in {"dense", "s34"}
-            or not bool(torch.all((plane.trits >= -1) & (plane.trits <= 1)))
-            or not bool(torch.isfinite(plane.scales).all())
-            or bool((plane.scales < 0).any())
         ):
             raise ValueError("refinement parent plane is not deployable SALT")
-        if plane.structure == "s34" and (
-            master.shape[1] % 4
-            or not bool(
-                torch.all(
-                    torch.count_nonzero(
-                        plane.trits.reshape(master.shape[0], -1, 4) == 0,
-                        dim=2,
-                    )
-                    == 1
-                )
-            )
-        ):
+        if plane.structure == "s34" and master.shape[1] % 4:
             raise ValueError("refinement parent S34 plane violates one-zero groups")
     if config.structure == "s34" and group_size != master.shape[1]:
         raise ValueError("S34 refinement requires row-scale parent planes")
@@ -100,6 +82,57 @@ def _validate(
         raise ValueError("scale-only refinement must preserve parent structure")
     if metric.device != master.device:
         raise ValueError("refinement metric must share the master device")
+
+    rows, columns = master.shape
+    bytes_per_row = max(1, columns * (24 + 8 * len(planes)))
+    if bytes_per_row > max_working_bytes:
+        raise ValueError(
+            "max_working_bytes cannot fit one refinement row "
+            f"(requires at least {bytes_per_row} bytes)"
+        )
+    groups = columns // group_size
+    validation_bytes_per_row = max(
+        columns * 3,
+        columns + groups * 8,
+        groups * 2,
+        1,
+    )
+    validation_chunk_rows = max(
+        1, min(rows, max_working_bytes // validation_bytes_per_row)
+    )
+    if (
+        not bool(torch.isfinite(metric).all())
+        or bool((metric < 0).any())
+        or not bool((metric > 0).any())
+    ):
+        raise ValueError("refinement metric must be finite nonnegative input curvature")
+    for start in range(0, rows, validation_chunk_rows):
+        end = min(rows, start + validation_chunk_rows)
+        if not bool(torch.isfinite(master[start:end]).all()):
+            raise ValueError("refinement master must be one finite floating matrix")
+        for plane in planes:
+            trit_rows = plane.trits[start:end]
+            if not bool(torch.all((trit_rows >= -1) & (trit_rows <= 1))):
+                raise ValueError("refinement parent plane is not deployable SALT")
+            scale_rows = plane.scales[start:end]
+            if (
+                not bool(torch.isfinite(scale_rows).all())
+                or bool((scale_rows < 0).any())
+            ):
+                raise ValueError("refinement parent plane is not deployable SALT")
+            if plane.structure == "s34" and not bool(
+                torch.all(
+                    torch.count_nonzero(
+                        trit_rows.reshape(end - start, -1, 4) == 0,
+                        dim=2,
+                    )
+                    == 1
+                )
+            ):
+                raise ValueError(
+                    "refinement parent S34 plane violates one-zero groups"
+                )
+    return bytes_per_row
 
 
 def _decoded(
@@ -273,15 +306,11 @@ def refine_weight_diagonal(
 ) -> RefinedWeight:
     """Refine one additive weight under streamed diagonal input curvature."""
 
-    _validate(master, planes, metric, config, iterations, max_working_bytes)
+    bytes_per_row = _validate(
+        master, planes, metric, config, iterations, max_working_bytes
+    )
     rows, columns = master.shape
     plane_count = len(planes)
-    bytes_per_row = max(1, columns * (24 + 8 * plane_count))
-    if bytes_per_row > max_working_bytes:
-        raise ValueError(
-            "max_working_bytes cannot fit one refinement row "
-            f"(requires at least {bytes_per_row} bytes)"
-        )
     chunk_rows = max(1, min(rows, max_working_bytes // bytes_per_row))
     output_trits = [torch.empty_like(plane.trits) for plane in planes]
     output_scales = [
