@@ -80,3 +80,13 @@ exposition has fixed-cardinality labels and schema marker
 Dense per-slot KV reports zero for all four pool metrics. Token gauges describe
 allocator capacity, not serialized/resident model bytes or compression ratio;
 use artifact byte gauges and startup receipt for physical-byte claims.
+
+## OpenTelemetry traces
+
+OTLP trace export is opt-in. Set `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or
+`OTEL_EXPORTER_OTLP_ENDPOINT` to enable the standard OTLP/HTTP protobuf exporter;
+without either variable the server makes no telemetry export connection. The
+server uses parent-based always-on sampling: root requests are sampled, while a
+valid incoming W3C `traceparent` sampling decision is preserved. Export shutdown
+is bounded to five seconds. Prompts, completions, auth tokens, and model names
+are not emitted as trace attributes.

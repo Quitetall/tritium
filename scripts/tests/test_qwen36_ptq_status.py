@@ -29,25 +29,48 @@ class Qwen36PtqStatusTests(unittest.TestCase):
     def test_newest_temp_and_published_state_are_reported(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            old = root / "record.tmp.999999.1.0"
+            campaign_root = root / "nested" / "master-campaigns" / "campaign-a"
+            staging = campaign_root / ".tmp"
+            slots = campaign_root / "additive-slots"
+            staging.mkdir(parents=True)
+            slots.mkdir()
+            (campaign_root / "campaign.tq36p").write_bytes(b"descriptor")
+            old = staging / "record.tmp.999999.1.0"
             old.write_bytes(b"old")
             os.utime(old, (1, 1))
-            nested = root / "nested" / "tensor-work" / ".tmp"
-            nested.mkdir(parents=True)
-            current = nested / f"record.tmp.{os.getpid()}.2.0"
+            current = staging / f"record.tmp.{os.getpid()}.2.0"
             current.write_bytes(b"current")
-            objects = root / "nested" / "objects"
-            objects.mkdir(parents=True)
-            (objects / "master.s2kf").write_bytes(b"master")
+            (slots / "0000-master.tq36mref").write_bytes(b"master receipt")
+            (root / "nested" / "objects").mkdir()
+            (root / "nested" / "objects" / "legacy.s2kf").write_bytes(b"not a campaign master")
             snapshot = MODULE.inspect(root)
         self.assertEqual(snapshot["status"], "running")
         self.assertEqual(
             snapshot["staged_record"]["path"],
-            "nested/tensor-work/.tmp/" + current.name,
+            "nested/master-campaigns/campaign-a/.tmp/" + current.name,
         )
         self.assertEqual(snapshot["staged_record"]["bytes"], 7)
         self.assertTrue(snapshot["staged_record"]["pid_alive"])
         self.assertEqual(snapshot["published_master_count"], 1)
+
+    def test_unrelated_campaign_seal_does_not_complete_selected_campaign(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            campaigns = root / "master-campaigns"
+            completed = campaigns / "campaign-complete"
+            stalled = campaigns / "campaign-stalled"
+            (completed / "additive-slots").mkdir(parents=True)
+            (stalled / ".tmp").mkdir(parents=True)
+            (stalled / "additive-slots").mkdir()
+            (completed / "campaign.tq36p").write_bytes(b"older descriptor")
+            (completed / "workspace.complete.tq36c").write_bytes(b"seal")
+            current = stalled / ".tmp" / "record.tmp.4000000000.1.0"
+            current.write_bytes(b"orphan")
+            (stalled / "campaign.tq36p").write_bytes(b"newer descriptor")
+            snapshot = MODULE.inspect(root)
+
+        self.assertEqual(snapshot["status"], "stalled")
+        self.assertEqual(snapshot["seal_count"], 0)
 
     def test_seal_is_reported_complete_even_without_temp(self):
         with tempfile.TemporaryDirectory() as directory:

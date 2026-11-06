@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Deserialize;
+mod telemetry;
+
 use tritium_serve::{
     AdmissionPolicy, IdPassthroughTokenizer, PrincipalRateLimit, RequestLimits, RunnerGenerator,
     ServeConfig,
@@ -1006,6 +1008,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let addr = std::net::SocketAddr::new(host_ip, port);
+    // OTLP is explicitly opt-in: without a configured standard OTLP endpoint,
+    // serving remains local and emits no telemetry off-box.
+    let _telemetry = telemetry::initialize()?;
     #[cfg(all(feature = "device-loss-qualification", unix))]
     let destructive_signal = if destructive_cuda_loss {
         Some(

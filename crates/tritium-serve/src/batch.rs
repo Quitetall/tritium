@@ -103,7 +103,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Instant;
 
+use opentelemetry::trace::TraceContextExt as _;
 use tokio::sync::mpsc;
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::generator::{
     DraftPolicy, FinishReason, GenRequest, SPEC_COMMITTED, SPEC_COST, SPEC_VERIFIES, Sampling,
@@ -139,6 +141,8 @@ struct Pending {
     done: usize,
     /// Monotonic start used for bounded prefill timing.
     started_at: Instant,
+    /// Request trace retained across chunked prefill.
+    request_span: tracing::Span,
     goal: PendingGoal,
 }
 
@@ -234,6 +238,8 @@ impl Pending {
 /// One live request occupying a slot.
 struct Active {
     tx: mpsc::Sender<GenEvent>,
+    /// Per-request trace parent; shared decode spans link to all active requests.
+    request_span: tracing::Span,
     /// Unique per-admission id (multi-slot spec enrollment validity: a
     /// drafter row enrolled for a RETIRED occupant must never serve the
     /// row's next tenant — see [`SpecSlot::owner`]).
@@ -369,6 +375,8 @@ fn emit(active: &mut Active, token: u32, eos: u32, logits: &[f32]) -> bool {
 /// (a finished sequence is dropped immediately).
 struct SpecSeq {
     tx: mpsc::Sender<GenEvent>,
+    /// Per-request trace parent retained through speculative decode/migration.
+    request_span: tracing::Span,
     /// Prompt + all emitted tokens (see the struct invariant).
     history: Vec<u32>,
     /// Tokens emitted so far (including history's last element).
@@ -618,6 +626,7 @@ fn migrate_spec(
     Some(Pending {
         done: 0,
         started_at: Instant::now(),
+        request_span: s.request_span,
         goal: PendingGoal::Admit {
             tx: s.tx,
             req,
@@ -1518,12 +1527,17 @@ pub(crate) fn run_batched(
             match job {
                 Job::Generate {
                     req,
+                    request_span,
+                    queue_span,
                     mut accepted_at,
                     tx,
                 } => {
                     if let Some(accepted_at) = accepted_at.take() {
-                        telemetry.observe_queue_wait(accepted_at.elapsed());
+                        let elapsed = accepted_at.elapsed();
+                        telemetry.observe_queue_wait(elapsed);
+                        queue_span.record("queue_wait_us", elapsed.as_micros() as u64);
                     }
+                    drop(queue_span);
                     let prompt_len = req.prompt_tokens.len();
                     if prompt_len == 0 || prompt_len >= n_ctx.saturating_sub(1) {
                         let _ = tx.try_send(GenEvent::Error("prompt does not fit".into()));
@@ -1560,6 +1574,8 @@ pub(crate) fn run_batched(
                         if pending.is_some() {
                             parked = Some(Job::Generate {
                                 req,
+                                request_span,
+                                queue_span: tracing::Span::none(),
                                 accepted_at,
                                 tx,
                             });
@@ -1606,6 +1622,7 @@ pub(crate) fn run_batched(
                                 pending = Some(Pending {
                                     done: 0,
                                     started_at: Instant::now(),
+                                    request_span,
                                     goal: PendingGoal::SpecAdmit {
                                         tx,
                                         req,
@@ -1628,6 +1645,8 @@ pub(crate) fn run_batched(
                     let Some(row) = pool.iter().position(Option::is_none) else {
                         parked = Some(Job::Generate {
                             req,
+                            request_span,
+                            queue_span: tracing::Span::none(),
                             accepted_at,
                             tx,
                         });
@@ -1663,6 +1682,8 @@ pub(crate) fn run_batched(
                         if reserve_pages(&mut batch, row, needed, telemetry.as_ref()).is_err() {
                             parked = Some(Job::Generate {
                                 req,
+                                request_span,
+                                queue_span: tracing::Span::none(),
                                 accepted_at,
                                 tx,
                             });
@@ -1678,6 +1699,7 @@ pub(crate) fn run_batched(
                     pending = Some(Pending {
                         done: 0,
                         started_at: Instant::now(),
+                        request_span,
                         goal: PendingGoal::Admit {
                             tx,
                             req,
@@ -1727,6 +1749,7 @@ pub(crate) fn run_batched(
                     pending = Some(Pending {
                         done: 0,
                         started_at: Instant::now(),
+                        request_span: tracing::Span::none(),
                         goal: PendingGoal::TreeOpen { prompt, resp },
                     });
                 }
@@ -1788,7 +1811,13 @@ pub(crate) fn run_batched(
                 let len = p.prompt().len();
                 let end = p.done.saturating_add(chunk).min(len);
                 let positions: Vec<usize> = (p.done..end).collect();
-                match runner.forward(&p.prompt()[p.done..end], &positions) {
+                let prefill_span = tracing::info_span!(
+                    parent: &p.request_span,
+                    "model.prefill.chunk",
+                    chunk_tokens = end - p.done,
+                );
+                match prefill_span.in_scope(|| runner.forward(&p.prompt()[p.done..end], &positions))
+                {
                     Err(e) => {
                         let p = pending.take().expect("pending checked above");
                         let row = p.row();
@@ -1803,6 +1832,7 @@ pub(crate) fn run_batched(
                             let prefill_elapsed = p.started_at.elapsed();
                             let p = pending.take().expect("pending checked above");
                             telemetry.observe_prefill(prefill_elapsed);
+                            let request_span = p.request_span;
                             match p.goal {
                                 // Prompt complete: adopt the KV rows into the
                                 // reserved slot and activate. `logits` is the
@@ -1836,6 +1866,7 @@ pub(crate) fn run_batched(
                                         next_active_id = active_id;
                                         let mut active = Active {
                                             tx,
+                                            request_span,
                                             id: active_id,
                                             logprobs: req.logprobs,
                                             stop_eos: req.stop_eos,
@@ -1925,6 +1956,7 @@ pub(crate) fn run_batched(
                                             let stats = crate::generator::spec_stats_enabled();
                                             spec = Some(SpecSeq {
                                                 tx,
+                                                request_span,
                                                 history,
                                                 emitted: 1,
                                                 max_new,
@@ -1976,7 +2008,9 @@ pub(crate) fn run_batched(
             phase.store(PHASE_DECODE, Ordering::Release);
             let d = draft.as_mut().expect("spec admission requires a drafter");
             let decode_started = Instant::now();
-            match spec_cycle(&mut runner, d, &mut s, eos, n_ctx) {
+            let spec_span =
+                tracing::info_span!(parent: &s.request_span, "model.speculative_decode");
+            match spec_span.in_scope(|| spec_cycle(&mut runner, d, &mut s, eos, n_ctx)) {
                 Ok(SpecOutcome::Continue) => spec = Some(s),
                 Ok(SpecOutcome::Done | SpecOutcome::Cancelled) => s.print_stats(),
                 Err(msg) => {
@@ -2013,17 +2047,30 @@ pub(crate) fn run_batched(
         if multi_eligible {
             let d = draft.as_mut().expect("eligibility requires a drafter");
             let decode_started = Instant::now();
-            let outcome = multi_spec_round(
-                &mut runner,
-                d,
-                &mut batch,
-                &mut multi,
-                &mut pool,
-                eos,
-                n_ctx,
-                &mut multi_log,
-                telemetry.as_ref(),
+            let batch_span = tracing::info_span!(
+                parent: None,
+                "model.batch.speculative_decode",
+                active_requests = pool.iter().flatten().count(),
             );
+            for active in pool.iter().flatten() {
+                let context = active.request_span.context().span().span_context().clone();
+                if context.is_valid() {
+                    batch_span.add_link(context);
+                }
+            }
+            let outcome = batch_span.in_scope(|| {
+                multi_spec_round(
+                    &mut runner,
+                    d,
+                    &mut batch,
+                    &mut multi,
+                    &mut pool,
+                    eos,
+                    n_ctx,
+                    &mut multi_log,
+                    telemetry.as_ref(),
+                )
+            });
             telemetry.observe_decode(decode_started.elapsed());
             match outcome {
                 MultiOutcome::Ran => continue,
@@ -2056,7 +2103,18 @@ pub(crate) fn run_batched(
         }
         let t_p = std::time::Instant::now();
         let decode_started = Instant::now();
-        let step = runner.decode_batch_graph(&mut batch, &tokens);
+        let batch_span = tracing::info_span!(
+            parent: None,
+            "model.batch.decode",
+            active_requests = pool.iter().flatten().count(),
+        );
+        for active in pool.iter().flatten() {
+            let context = active.request_span.context().span().span_context().clone();
+            if context.is_valid() {
+                batch_span.add_link(context);
+            }
+        }
+        let step = batch_span.in_scope(|| runner.decode_batch_graph(&mut batch, &tokens));
         telemetry.observe_decode(decode_started.elapsed());
         let all_logits = match step {
             Ok(l) => {
