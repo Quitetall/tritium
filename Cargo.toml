@@ -133,7 +133,7 @@ ndarray = { version = "=0.17.2", default-features = false, features = ["std"] }
 ort = { version = "=2.0.0-rc.12", default-features = false }
 prost = "0.14"
 # candle interop (tritium-candle, behind its `candle` feature; CPU-only — no cuda/mkl/accelerate)
-candle-core = { version = "0.11", default-features = false }
+candle-core = { version = "0.11.1", default-features = false }
 # burn interop (tritium-burn, behind its `burn` feature; CPU-only NdArray backend in the test).
 # burn-tensor gives Tensor/Backend/TensorData; burn-ndarray is the concrete CPU backend. `std`
 # (needed for NdArray + TensorData::to_vec) pulls the MPL-2.0 `colored` crate (allow-listed in deny.toml).
