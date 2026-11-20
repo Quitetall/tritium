@@ -41,7 +41,7 @@ serde_json = { workspace = true }
 # UX — no sidecar tokenizer.json). Optional so the default build stays lean.
 tokenizers = { workspace = true, optional = true }
 # Fixed no-import chat renderer: model-provided templates never execute natively.
-wasmi = { version = "=2.0.0", default-features = false, features = ["std", "validate", "portable-dispatch"], optional = true }
+wasmi = { version = "=2.0.2", default-features = false, features = ["std", "validate", "portable-dispatch"], optional = true }
 
 [dev-dependencies]
 # Golden vectors pinning the DeltaNet activation kernels, which are duplicated in tritium-onnx

@@ -696,7 +696,6 @@ extern "C" __global__ void salt_v2_forward_warp_fast(
   const uint32_t lane = threadIdx.x & 31U;
   const uint32_t warp_in_block = threadIdx.x >> 5U;
   const uint32_t warps_per_block = blockDim.x >> 5U;
-  const uint32_t slots_per_row = groups_per_row * kMaxPlanesPerTile;
 
   // Block-wide B3 digit table, ahead of the per-warp contribution slots. Entry
   // `c` holds all five radix-3 digits of byte `c` at two bits each, so decoding
@@ -823,6 +822,644 @@ extern "C" __global__ void salt_v2_forward_warp_fast(
   if (lane == 0U) {
     output[output_index] = lane_accumulator;
   }
+}
+
+// Row-streaming SALT V2 GEMV (fast tier, B3 at scale group 128).
+//
+// Every earlier kernel gives each lane its own scale group and lets it walk that
+// group's bytes one at a time, so a warp's 32 addresses are spread by the group
+// stride and every load is a separate transaction. On the Qwen3.6 bundle that
+// ran the MLP's 17408-row projections at ~95 GB/s, 9% of peak.
+//
+// The layout already allows better. A B3 plane-tile is 52 bytes -- exactly
+// thirteen 32-bit words -- at offset `rank * 52`, and one row's plane-tiles are
+// contiguous in rank order. So a row is one aligned run of `13 * plane_tiles`
+// words, and a warp can read it the way any dense GEMV reads a row: lane `i`
+// takes word `i`, then `i + 32`, fully coalesced. The only per-row bookkeeping is
+// which tile each plane-tile belongs to, which the warp derives once from the
+// 2-bit allocation map into a small shared table.
+//
+// Word `w` of a plane-tile holds trits `20w .. 20w + 19`. The 128-trit scale
+// boundary falls inside word 6, at its ninth trit, so two accumulators -- trits
+// 0-7 and 8-19 -- are enough to fold every word into the right scales without a
+// single extra multiply-add. Word 12 carries four padding trits past 256; the
+// codec guarantees they are zero trits, so their activations are never loaded.
+//
+// A trit becomes a float without an int-to-float convert, which runs at a quarter
+// of FFMA rate on this architecture: `digit | 0x4B000000` is the float 2^23 +
+// digit, and subtracting 2^23 + 1 leaves exactly `digit - 1`.
+//
+// The K-sum is reassociated, so this is a fast-tier kernel gated on relative
+// error, never equality. Rows whose metadata is malformed are refused with a NaN
+// for the host's non-finite check, as in `salt_v2_forward_warp_fast`.
+//
+// Requires codec B3, scale group 128, and `k % 256 == 0`; the host checks all three.
+__device__ __forceinline__ float b3_trit(uint32_t packed, uint32_t digit) {
+  return __int_as_float(static_cast<int>(((packed >> (2U * digit)) & 3U) | 0x4B000000U)) -
+         8388609.0f;
+}
+
+// One row of the row-streaming GEMV, shared by the single-tensor and fused
+// multi-tensor kernels. Must be called by a whole warp; `tile_of` is that warp's
+// slice of the per-row plane-tile table and `b3_digits` the block's digit table.
+// Row setup shared by the f32 and A8 row-streaming GEMVs: the row's starting plane
+// rank, and its plane-tile -> tile table in `tile_of`. Returns false, for the whole
+// warp, when the row's metadata is malformed.
+__device__ __forceinline__ bool stream_row_setup(unsigned char* tile_of,
+                                                 uint32_t lane,
+                                                 const unsigned char* __restrict__ index_metadata,
+                                                 uint32_t row,
+                                                 uint32_t k,
+                                                 uint32_t tile_count,
+                                                 uint32_t plane_count,
+                                                 uint32_t allocation_map_bytes,
+                                                 uint32_t rank_prefix_count,
+                                                 uint32_t terminal_map_value,
+                                                 uint32_t tile_table_bytes,
+                                                 uint32_t& row_rank_out,
+                                                 uint32_t& plane_tiles_out) {
+  const uint32_t tiles_per_row = k / kAllocationTile;
+  const uint32_t first_tile = row * tiles_per_row;
+
+  // The row's starting plane rank: the stored prefix for its rank block plus the
+  // planes of the tiles between that block's start and the row.
+  bool malformed = first_tile + tiles_per_row > tile_count;
+  const uint32_t rank_block = first_tile / kRankStrideTiles;
+  uint32_t row_rank = 0U;
+  if (rank_block != 0U) {
+    if (rank_block - 1U < rank_prefix_count) {
+      row_rank = read_rank_prefix(index_metadata, allocation_map_bytes, rank_block - 1U);
+    } else {
+      malformed = true;
+    }
+  }
+  uint32_t before = 0U;
+  for (uint32_t tile = rank_block * kRankStrideTiles + lane; tile < first_tile; tile += 32U) {
+    before += plane_count_for_tile(index_metadata, allocation_map_bytes, terminal_map_value, tile);
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    before += __shfl_xor_sync(0xFFFFFFFFU, before, offset);
+  }
+  row_rank += before;
+
+  // Plane-tile -> tile table for this row, by an exclusive scan of plane counts.
+  uint32_t carried = 0U;
+  for (uint32_t chunk = 0; chunk < tiles_per_row; chunk += 32U) {
+    const uint32_t local = chunk + lane;
+    uint32_t planes = 0U;
+    if (local < tiles_per_row && !malformed) {
+      planes = plane_count_for_tile(
+          index_metadata, allocation_map_bytes, terminal_map_value, first_tile + local);
+      if (planes == 0U) malformed = true;
+    }
+    uint32_t inclusive = planes;
+#pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1) {
+      const uint32_t up = __shfl_up_sync(0xFFFFFFFFU, inclusive, offset);
+      if (lane >= static_cast<uint32_t>(offset)) inclusive += up;
+    }
+    const uint32_t start = carried + inclusive - planes;
+    if (start + planes <= tile_table_bytes) {
+      for (uint32_t plane = 0; plane < planes; ++plane) {
+        tile_of[start + plane] = static_cast<unsigned char>(local);
+      }
+    } else if (planes != 0U) {
+      malformed = true;
+    }
+    carried += __shfl_sync(0xFFFFFFFFU, inclusive, 31);
+  }
+  const uint32_t plane_tiles = carried;
+  if (row_rank + plane_tiles > plane_count) malformed = true;
+  if (__any_sync(0xFFFFFFFFU, malformed)) return false;
+  __syncwarp();
+  row_rank_out = row_rank;
+  plane_tiles_out = plane_tiles;
+  return true;
+
+}
+
+__device__ __forceinline__ void stream_row(const unsigned short* __restrict__ b3_digits,
+                                           unsigned char* tile_of,
+                                           uint32_t lane,
+                                           const float* __restrict__ row_activation,
+                                           const unsigned char* __restrict__ payload,
+                                           const __half* __restrict__ scales,
+                                           const unsigned char* __restrict__ index_metadata,
+                                           float* out_slot,
+                                           uint32_t row,
+                                           uint32_t k,
+                                           uint32_t tile_count,
+                                           uint32_t plane_count,
+                                           uint32_t allocation_map_bytes,
+                                           uint32_t rank_prefix_count,
+                                           uint32_t terminal_map_value,
+                                           uint32_t tile_table_bytes) {
+  uint32_t row_rank = 0U;
+  uint32_t plane_tiles = 0U;
+  if (!stream_row_setup(tile_of, lane, index_metadata, row, k, tile_count, plane_count,
+                        allocation_map_bytes, rank_prefix_count, terminal_map_value,
+                        tile_table_bytes, row_rank, plane_tiles)) {
+    if (lane == 0U) *out_slot = __int_as_float(0x7FC00000);
+    return;
+  }
+
+  const uint32_t* words = reinterpret_cast<const uint32_t*>(payload) +
+                          static_cast<size_t>(row_rank) * 13U;
+  const __half2* scale_pairs = reinterpret_cast<const __half2*>(scales) + row_rank;
+  const uint32_t total_words = plane_tiles * 13U;
+
+  float accumulator = 0.0f;
+  for (uint32_t index = lane; index < total_words; index += 32U) {
+    const uint32_t plane_tile = index / 13U;
+    const uint32_t word = index - plane_tile * 13U;
+    const uint32_t bits = __ldcs(words + index);
+    const float2 scale = __half22float2(scale_pairs[plane_tile]);
+    const float4* chunk = reinterpret_cast<const float4*>(
+        row_activation + static_cast<size_t>(tile_of[plane_tile]) * kAllocationTile +
+        word * 20U);
+    const float4 a0 = __ldg(chunk);
+    const float4 a1 = __ldg(chunk + 1);
+    const float4 a2 = __ldg(chunk + 2);
+    const float4 a3 = __ldg(chunk + 3);
+    // Word 12's last four trits are padding past the tile: zero trits whose
+    // activations belong to the next tile, so they are never read.
+    const float4 a4 = word == 12U ? make_float4(0.0f, 0.0f, 0.0f, 0.0f) : __ldg(chunk + 4);
+    const float a[20] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w, a2.x, a2.y,
+                         a2.z, a2.w, a3.x, a3.y, a3.z, a3.w, a4.x, a4.y, a4.z, a4.w};
+    const uint32_t p0 = b3_digits[bits & 0xFFU];
+    const uint32_t p1 = b3_digits[(bits >> 8U) & 0xFFU];
+    const uint32_t p2 = b3_digits[(bits >> 16U) & 0xFFU];
+    const uint32_t p3 = b3_digits[bits >> 24U];
+    // Trits 0-7 (byte 0, three of byte 1) and 8-19 fold into separate sums, so the
+    // one straddling word can take a different scale on each side.
+    float low = 0.0f;
+    float high = 0.0f;
+#pragma unroll
+    for (uint32_t digit = 0; digit < 5U; ++digit) low = fmaf(b3_trit(p0, digit), a[digit], low);
+#pragma unroll
+    for (uint32_t digit = 0; digit < 3U; ++digit) {
+      low = fmaf(b3_trit(p1, digit), a[5U + digit], low);
+    }
+#pragma unroll
+    for (uint32_t digit = 3; digit < 5U; ++digit) {
+      high = fmaf(b3_trit(p1, digit), a[5U + digit], high);
+    }
+#pragma unroll
+    for (uint32_t digit = 0; digit < 5U; ++digit) {
+      high = fmaf(b3_trit(p2, digit), a[10U + digit], high);
+    }
+#pragma unroll
+    for (uint32_t digit = 0; digit < 5U; ++digit) {
+      high = fmaf(b3_trit(p3, digit), a[15U + digit], high);
+    }
+    // Words 0-5 are wholly group 0, 7-12 wholly group 1; word 6 splits at trit 8.
+    const float low_scale = word <= 6U ? scale.x : scale.y;
+    const float high_scale = word <= 5U ? scale.x : scale.y;
+    accumulator = fmaf(low_scale, low, accumulator);
+    accumulator = fmaf(high_scale, high, accumulator);
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    accumulator += __shfl_xor_sync(0xFFFFFFFFU, accumulator, offset);
+  }
+  if (lane == 0U) *out_slot = accumulator;
+}
+
+extern "C" __global__ void salt_v2_stream_f32(
+    const float* __restrict__ activation,
+    const unsigned char* __restrict__ payload,
+    const __half* __restrict__ scales,
+    const unsigned char* __restrict__ index_metadata,
+    float* __restrict__ output,
+    uint32_t m,
+    uint32_t n,
+    uint32_t k,
+    uint32_t tile_count,
+    uint32_t plane_count,
+    uint32_t allocation_map_bytes,
+    uint32_t rank_prefix_count,
+    uint32_t terminal_map_value,
+    uint32_t tile_table_bytes) {
+  extern __shared__ unsigned char stream_shared[];
+  unsigned short* b3_digits = reinterpret_cast<unsigned short*>(stream_shared);
+  for (uint32_t code = threadIdx.x; code < kB3TableEntries; code += blockDim.x) {
+    b3_digits[code] = static_cast<unsigned short>(
+        (code % 3U) | (((code / 3U) % 3U) << 2U) | (((code / 9U) % 3U) << 4U) |
+        (((code / 27U) % 3U) << 6U) | (((code / 81U) % 3U) << 8U));
+  }
+  // Block-wide barrier before any warp may leave for an out-of-range row.
+  __syncthreads();
+
+  const uint32_t lane = threadIdx.x & 31U;
+  const uint32_t warp_in_block = threadIdx.x >> 5U;
+  const uint32_t warps_per_block = blockDim.x >> 5U;
+  unsigned char* tile_of = stream_shared + kB3TableEntries * sizeof(unsigned short) +
+                           static_cast<size_t>(warp_in_block) * tile_table_bytes;
+
+  const uint64_t output_index =
+      static_cast<uint64_t>(blockIdx.x) * warps_per_block + warp_in_block;
+  if (output_index >= static_cast<uint64_t>(m) * n) return;
+  const uint32_t mi = static_cast<uint32_t>(output_index / n);
+  const uint32_t row = static_cast<uint32_t>(output_index % n);
+  stream_row(b3_digits, tile_of, lane, activation + static_cast<size_t>(mi) * k, payload,
+             scales, index_metadata, output + output_index, row, k, tile_count, plane_count,
+             allocation_map_bytes, rank_prefix_count, terminal_map_value, tile_table_bytes);
+}
+
+// One tensor of a fused row-stream launch. Mirrored field-for-field by
+// `SaltStreamTensor` in `salt_v2_runtime.rs`; any change here must change there.
+struct SaltStreamTensor {
+  unsigned long long payload;
+  unsigned long long scales;
+  unsigned long long index_metadata;
+  unsigned long long output;
+  uint32_t rows;
+  uint32_t tile_count;
+  uint32_t plane_count;
+  uint32_t allocation_map_bytes;
+  uint32_t rank_prefix_count;
+  uint32_t terminal_map_value;
+  uint32_t first_row;
+  uint32_t reserved;
+};
+
+// Several projections of one input in one launch (m = 1).
+//
+// A Qwen3.6 layer feeds the same normalized vector to up to four projections.
+// Launched separately, the small ones cost latency, not bandwidth: DeltaNet's
+// 48-row b and a projections took ~10 us each for almost no bytes, and the
+// attention k and v ~12 us each. Here the tensors share one row space --
+// tensor t owns rows [first_row, first_row + rows) -- and each warp finds its
+// tensor from a four-entry table and streams that row exactly as
+// `salt_v2_stream_f32` would, writing to the tensor's own output buffer.
+extern "C" __global__ void salt_v2_stream_f32_multi(
+    const float* __restrict__ activation,
+    const SaltStreamTensor* __restrict__ tensors,
+    uint32_t tensor_count,
+    uint32_t total_rows,
+    uint32_t k,
+    uint32_t tile_table_bytes) {
+  extern __shared__ unsigned char stream_shared[];
+  unsigned short* b3_digits = reinterpret_cast<unsigned short*>(stream_shared);
+  for (uint32_t code = threadIdx.x; code < kB3TableEntries; code += blockDim.x) {
+    b3_digits[code] = static_cast<unsigned short>(
+        (code % 3U) | (((code / 3U) % 3U) << 2U) | (((code / 9U) % 3U) << 4U) |
+        (((code / 27U) % 3U) << 6U) | (((code / 81U) % 3U) << 8U));
+  }
+  __syncthreads();
+
+  const uint32_t lane = threadIdx.x & 31U;
+  const uint32_t warp_in_block = threadIdx.x >> 5U;
+  const uint32_t warps_per_block = blockDim.x >> 5U;
+  unsigned char* tile_of = stream_shared + kB3TableEntries * sizeof(unsigned short) +
+                           static_cast<size_t>(warp_in_block) * tile_table_bytes;
+  const uint32_t fused_row = blockIdx.x * warps_per_block + warp_in_block;
+  if (fused_row >= total_rows) return;
+
+  uint32_t index = 0U;
+  while (index + 1U < tensor_count && fused_row >= tensors[index + 1U].first_row) ++index;
+  const SaltStreamTensor tensor = tensors[index];
+  const uint32_t row = fused_row - tensor.first_row;
+  stream_row(b3_digits, tile_of, lane, activation,
+             reinterpret_cast<const unsigned char*>(tensor.payload),
+             reinterpret_cast<const __half*>(tensor.scales),
+             reinterpret_cast<const unsigned char*>(tensor.index_metadata),
+             reinterpret_cast<float*>(tensor.output) + row, row, k, tensor.tile_count,
+             tensor.plane_count, tensor.allocation_map_bytes, tensor.rank_prefix_count,
+             tensor.terminal_map_value, tile_table_bytes);
+}
+
+// Multi-row twin of `salt_v2_stream_f32_multi`, for prefill.
+//
+// Decoding T prompt tokens one at a time streams every weight T times. Here a
+// warp streams one weight row once and applies each decoded word to up to
+// `kStreamRowsMax` activation rows; grid.y takes further groups of rows. The
+// per-row arithmetic is `stream_row`'s, statement for statement: the same words
+// per lane in the same order, the same `fmaf` chain into `low`/`high`, the same
+// two scale folds and the same xor reduction. The file is built with
+// `--fmad=false`, so every output is bit-identical to `salt_v2_stream_f32_multi`
+// run on that activation row alone.
+//
+// Activation row r is `activation + r * k`; tensor t writes row r of its output
+// at `output + r * rows_t + row`, so each output buffer is [m, rows_t].
+constexpr uint32_t kStreamRowsMax = 8U;
+
+extern "C" __global__ void salt_v2_stream_rows_f32(
+    const float* __restrict__ activation,
+    const SaltStreamTensor* __restrict__ tensors,
+    uint32_t tensor_count,
+    uint32_t total_rows,
+    uint32_t k,
+    uint32_t tile_table_bytes,
+    uint32_t m) {
+  extern __shared__ unsigned char stream_shared[];
+  unsigned short* b3_digits = reinterpret_cast<unsigned short*>(stream_shared);
+  for (uint32_t code = threadIdx.x; code < kB3TableEntries; code += blockDim.x) {
+    b3_digits[code] = static_cast<unsigned short>(
+        (code % 3U) | (((code / 3U) % 3U) << 2U) | (((code / 9U) % 3U) << 4U) |
+        (((code / 27U) % 3U) << 6U) | (((code / 81U) % 3U) << 8U));
+  }
+  __syncthreads();
+
+  const uint32_t lane = threadIdx.x & 31U;
+  const uint32_t warp_in_block = threadIdx.x >> 5U;
+  const uint32_t warps_per_block = blockDim.x >> 5U;
+  unsigned char* tile_of = stream_shared + kB3TableEntries * sizeof(unsigned short) +
+                           static_cast<size_t>(warp_in_block) * tile_table_bytes;
+  const uint32_t fused_row = blockIdx.x * warps_per_block + warp_in_block;
+  const uint32_t first_act = blockIdx.y * kStreamRowsMax;
+  if (fused_row >= total_rows || first_act >= m) return;
+  const uint32_t acts = min(kStreamRowsMax, m - first_act);
+
+  uint32_t index = 0U;
+  while (index + 1U < tensor_count && fused_row >= tensors[index + 1U].first_row) ++index;
+  const SaltStreamTensor tensor = tensors[index];
+  const uint32_t row = fused_row - tensor.first_row;
+  float* output = reinterpret_cast<float*>(tensor.output) + row;
+  const float* activations = activation + static_cast<size_t>(first_act) * k;
+
+  uint32_t row_rank = 0U;
+  uint32_t plane_tiles = 0U;
+  if (!stream_row_setup(tile_of, lane, reinterpret_cast<const unsigned char*>(tensor.index_metadata),
+                        row, k, tensor.tile_count, tensor.plane_count,
+                        tensor.allocation_map_bytes, tensor.rank_prefix_count,
+                        tensor.terminal_map_value, tile_table_bytes, row_rank, plane_tiles)) {
+    if (lane == 0U) {
+      for (uint32_t r = 0; r < acts; ++r) {
+        output[static_cast<size_t>(first_act + r) * tensor.rows] = __int_as_float(0x7FC00000);
+      }
+    }
+    return;
+  }
+
+  const uint32_t* words = reinterpret_cast<const uint32_t*>(tensor.payload) +
+                          static_cast<size_t>(row_rank) * 13U;
+  const __half2* scale_pairs = reinterpret_cast<const __half2*>(tensor.scales) + row_rank;
+  const uint32_t total_words = plane_tiles * 13U;
+
+  float accumulator[kStreamRowsMax];
+#pragma unroll
+  for (uint32_t r = 0; r < kStreamRowsMax; ++r) accumulator[r] = 0.0f;
+  for (uint32_t index = lane; index < total_words; index += 32U) {
+    const uint32_t plane_tile = index / 13U;
+    const uint32_t word = index - plane_tile * 13U;
+    const uint32_t bits = __ldcs(words + index);
+    const float2 scale = __half22float2(scale_pairs[plane_tile]);
+    const size_t offset = static_cast<size_t>(tile_of[plane_tile]) * kAllocationTile + word * 20U;
+    const uint32_t p0 = b3_digits[bits & 0xFFU];
+    const uint32_t p1 = b3_digits[(bits >> 8U) & 0xFFU];
+    const uint32_t p2 = b3_digits[(bits >> 16U) & 0xFFU];
+    const uint32_t p3 = b3_digits[bits >> 24U];
+    const float low_scale = word <= 6U ? scale.x : scale.y;
+    const float high_scale = word <= 5U ? scale.x : scale.y;
+#pragma unroll
+    for (uint32_t r = 0; r < kStreamRowsMax; ++r) {
+      if (r >= acts) break;
+      const float4* chunk =
+          reinterpret_cast<const float4*>(activations + static_cast<size_t>(r) * k + offset);
+      const float4 a0 = __ldg(chunk);
+      const float4 a1 = __ldg(chunk + 1);
+      const float4 a2 = __ldg(chunk + 2);
+      const float4 a3 = __ldg(chunk + 3);
+      // Word 12's last four trits are padding past the tile: never read.
+      const float4 a4 = word == 12U ? make_float4(0.0f, 0.0f, 0.0f, 0.0f) : __ldg(chunk + 4);
+      const float a[20] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w, a2.x, a2.y,
+                           a2.z, a2.w, a3.x, a3.y, a3.z, a3.w, a4.x, a4.y, a4.z, a4.w};
+      float low = 0.0f;
+      float high = 0.0f;
+#pragma unroll
+      for (uint32_t digit = 0; digit < 5U; ++digit) low = fmaf(b3_trit(p0, digit), a[digit], low);
+#pragma unroll
+      for (uint32_t digit = 0; digit < 3U; ++digit) {
+        low = fmaf(b3_trit(p1, digit), a[5U + digit], low);
+      }
+#pragma unroll
+      for (uint32_t digit = 3; digit < 5U; ++digit) {
+        high = fmaf(b3_trit(p1, digit), a[5U + digit], high);
+      }
+#pragma unroll
+      for (uint32_t digit = 0; digit < 5U; ++digit) {
+        high = fmaf(b3_trit(p2, digit), a[10U + digit], high);
+      }
+#pragma unroll
+      for (uint32_t digit = 0; digit < 5U; ++digit) {
+        high = fmaf(b3_trit(p3, digit), a[15U + digit], high);
+      }
+      accumulator[r] = fmaf(low_scale, low, accumulator[r]);
+      accumulator[r] = fmaf(high_scale, high, accumulator[r]);
+    }
+  }
+#pragma unroll
+  for (uint32_t r = 0; r < kStreamRowsMax; ++r) {
+    if (r >= acts) break;
+    float value = accumulator[r];
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      value += __shfl_xor_sync(0xFFFFFFFFU, value, offset);
+    }
+    if (lane == 0U) output[static_cast<size_t>(first_act + r) * tensor.rows] = value;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// A8 row-streaming GEMV (relaxed tier): int8 activations, dp4a.
+//
+// ncu puts the f32 row-stream kernels at 71-80% L1/TEX throughput, above both
+// DRAM and SM: every 4-byte weight word needs 80 bytes of f32 activations, so
+// the activation loads, not the weights, bind. Quantizing activations to int8
+// per 128-coefficient group -- the same groups the weights are scaled over --
+// cuts that to 20 bytes per word, and `__dp4a` does four multiply-adds per
+// instruction on exact int32.
+//
+// This changes numerics: activations carry ~8 bits instead of 24, so this is a
+// relaxed-tier kernel gated on output quality (RFC 0001's bars), not on its
+// distance from the f32 kernels.
+// ---------------------------------------------------------------------------
+
+// Quantize `rows` rows of `k` activations to int8 with one f32 scale per
+// 128-coefficient group: q = round(x / s), s = absmax / 127. One warp per group.
+extern "C" __global__ void salt_v2_quant_act_g128(const float* __restrict__ input,
+                                                  signed char* __restrict__ quantized,
+                                                  float* __restrict__ group_scale,
+                                                  uint32_t groups) {
+  const uint32_t lane = threadIdx.x & 31U;
+  const uint32_t group = blockIdx.x * (blockDim.x >> 5U) + (threadIdx.x >> 5U);
+  if (group >= groups) return;
+  const float4 values = reinterpret_cast<const float4*>(input + static_cast<size_t>(group) * 128U)[lane];
+  float peak = fmaxf(fmaxf(fabsf(values.x), fabsf(values.y)), fmaxf(fabsf(values.z), fabsf(values.w)));
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    peak = fmaxf(peak, __shfl_xor_sync(0xFFFFFFFFU, peak, offset));
+  }
+  const float scale = peak / 127.0f;
+  const float inverse = peak > 0.0f ? 127.0f / peak : 0.0f;
+  char4 packed;
+  packed.x = static_cast<signed char>(__float2int_rn(values.x * inverse));
+  packed.y = static_cast<signed char>(__float2int_rn(values.y * inverse));
+  packed.z = static_cast<signed char>(__float2int_rn(values.z * inverse));
+  packed.w = static_cast<signed char>(__float2int_rn(values.w * inverse));
+  reinterpret_cast<char4*>(quantized + static_cast<size_t>(group) * 128U)[lane] = packed;
+  if (lane == 0U) group_scale[group] = scale;
+}
+
+// Byte -> its five trits as signed int8, little-endian in the low five bytes.
+__device__ __forceinline__ void build_b3_int8_table(unsigned long long* table) {
+  for (uint32_t code = threadIdx.x; code < kB3TableEntries; code += blockDim.x) {
+    unsigned long long packed = 0ULL;
+    uint32_t value = code;
+#pragma unroll
+    for (uint32_t digit = 0; digit < 5U; ++digit) {
+      const int trit = static_cast<int>(value % 3U) - 1;
+      value /= 3U;
+      packed |= static_cast<unsigned long long>(static_cast<unsigned char>(trit)) << (8U * digit);
+    }
+    table[code] = packed;
+  }
+}
+
+__device__ __forceinline__ void stream_row_i8(const unsigned long long* __restrict__ b3_int8,
+                                              unsigned char* tile_of,
+                                              uint32_t lane,
+                                              const signed char* __restrict__ row_quantized,
+                                              const float* __restrict__ row_group_scale,
+                                              const unsigned char* __restrict__ payload,
+                                              const __half* __restrict__ scales,
+                                              const unsigned char* __restrict__ index_metadata,
+                                              float* out_slot,
+                                              uint32_t row,
+                                              uint32_t k,
+                                              uint32_t tile_count,
+                                              uint32_t plane_count,
+                                              uint32_t allocation_map_bytes,
+                                              uint32_t rank_prefix_count,
+                                              uint32_t terminal_map_value,
+                                              uint32_t tile_table_bytes) {
+  uint32_t row_rank = 0U;
+  uint32_t plane_tiles = 0U;
+  if (!stream_row_setup(tile_of, lane, index_metadata, row, k, tile_count, plane_count,
+                        allocation_map_bytes, rank_prefix_count, terminal_map_value,
+                        tile_table_bytes, row_rank, plane_tiles)) {
+    if (lane == 0U) *out_slot = __int_as_float(0x7FC00000);
+    return;
+  }
+  const uint32_t* words = reinterpret_cast<const uint32_t*>(payload) +
+                          static_cast<size_t>(row_rank) * 13U;
+  const __half2* scale_pairs = reinterpret_cast<const __half2*>(scales) + row_rank;
+  const uint32_t total_words = plane_tiles * 13U;
+
+  float accumulator = 0.0f;
+  for (uint32_t index = lane; index < total_words; index += 32U) {
+    const uint32_t plane_tile = index / 13U;
+    const uint32_t word = index - plane_tile * 13U;
+    const uint32_t bits = __ldcs(words + index);
+    const float2 weight_scale = __half22float2(scale_pairs[plane_tile]);
+    const uint32_t tile = tile_of[plane_tile];
+    const int* chunk = reinterpret_cast<const int*>(
+        row_quantized + static_cast<size_t>(tile) * kAllocationTile + word * 20U);
+    const int a0 = __ldg(chunk);
+    const int a1 = __ldg(chunk + 1);
+    const int a2 = __ldg(chunk + 2);
+    const int a3 = __ldg(chunk + 3);
+    // Word 12's last four trits are zero padding past the tile; never read them.
+    const int a4 = word == 12U ? 0 : __ldg(chunk + 4);
+
+    const unsigned long long t0 = b3_int8[bits & 0xFFU];
+    const unsigned long long t1 = b3_int8[(bits >> 8U) & 0xFFU];
+    const unsigned long long t2 = b3_int8[(bits >> 16U) & 0xFFU];
+    const unsigned long long t3 = b3_int8[bits >> 24U];
+    // Twenty trits, five per byte, regrouped four at a time for dp4a.
+    const int w0 = static_cast<int>(t0);
+    const int w1 = static_cast<int>(((t0 >> 32U) & 0xFFULL) | (t1 << 8U));
+    const int w2 = static_cast<int>(((t1 >> 24U) & 0xFFFFULL) | (t2 << 16U));
+    const int w3 = static_cast<int>(((t2 >> 16U) & 0xFFFFFFULL) | (t3 << 24U));
+    const int w4 = static_cast<int>(t3 >> 8U);
+
+    // Trits 0-7 are dp4a groups 0-1 and 8-19 groups 2-4, so word 6's split at its
+    // ninth trit falls on a group boundary and costs nothing.
+    const int low = __dp4a(w1, a1, __dp4a(w0, a0, 0));
+    const int high = __dp4a(w4, a4, __dp4a(w3, a3, __dp4a(w2, a2, 0)));
+    const uint32_t group_base = tile * 2U;
+    const float low_scale = (word <= 6U ? weight_scale.x : weight_scale.y) *
+                            row_group_scale[group_base + (word <= 6U ? 0U : 1U)];
+    const float high_scale = (word <= 5U ? weight_scale.x : weight_scale.y) *
+                             row_group_scale[group_base + (word <= 5U ? 0U : 1U)];
+    accumulator = fmaf(low_scale, static_cast<float>(low), accumulator);
+    accumulator = fmaf(high_scale, static_cast<float>(high), accumulator);
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    accumulator += __shfl_xor_sync(0xFFFFFFFFU, accumulator, offset);
+  }
+  if (lane == 0U) *out_slot = accumulator;
+}
+
+// Shared layout for the A8 kernels: the 256-entry int8 trit table (2 KiB), then
+// one plane-tile table per warp.
+constexpr uint32_t kB3Int8TableBytes = kB3TableEntries * sizeof(unsigned long long);
+
+extern "C" __global__ void salt_v2_stream_i8(const signed char* __restrict__ quantized,
+                                             const float* __restrict__ group_scale,
+                                             const unsigned char* __restrict__ payload,
+                                             const __half* __restrict__ scales,
+                                             const unsigned char* __restrict__ index_metadata,
+                                             float* __restrict__ output,
+                                             uint32_t m,
+                                             uint32_t n,
+                                             uint32_t k,
+                                             uint32_t tile_count,
+                                             uint32_t plane_count,
+                                             uint32_t allocation_map_bytes,
+                                             uint32_t rank_prefix_count,
+                                             uint32_t terminal_map_value,
+                                             uint32_t tile_table_bytes) {
+  extern __shared__ unsigned long long stream_i8_shared[];
+  build_b3_int8_table(stream_i8_shared);
+  __syncthreads();
+  const uint32_t lane = threadIdx.x & 31U;
+  const uint32_t warp_in_block = threadIdx.x >> 5U;
+  const uint32_t warps_per_block = blockDim.x >> 5U;
+  unsigned char* tile_of = reinterpret_cast<unsigned char*>(stream_i8_shared) +
+                           kB3Int8TableBytes + static_cast<size_t>(warp_in_block) * tile_table_bytes;
+  const uint64_t output_index =
+      static_cast<uint64_t>(blockIdx.x) * warps_per_block + warp_in_block;
+  if (output_index >= static_cast<uint64_t>(m) * n) return;
+  const uint32_t mi = static_cast<uint32_t>(output_index / n);
+  const uint32_t row = static_cast<uint32_t>(output_index % n);
+  stream_row_i8(stream_i8_shared, tile_of, lane, quantized + static_cast<size_t>(mi) * k,
+                group_scale + static_cast<size_t>(mi) * (k / 128U), payload, scales,
+                index_metadata, output + output_index, row, k, tile_count, plane_count,
+                allocation_map_bytes, rank_prefix_count, terminal_map_value, tile_table_bytes);
+}
+
+extern "C" __global__ void salt_v2_stream_i8_multi(const signed char* __restrict__ quantized,
+                                                   const float* __restrict__ group_scale,
+                                                   const SaltStreamTensor* __restrict__ tensors,
+                                                   uint32_t tensor_count,
+                                                   uint32_t total_rows,
+                                                   uint32_t k,
+                                                   uint32_t tile_table_bytes) {
+  extern __shared__ unsigned long long stream_i8_shared[];
+  build_b3_int8_table(stream_i8_shared);
+  __syncthreads();
+  const uint32_t lane = threadIdx.x & 31U;
+  const uint32_t warp_in_block = threadIdx.x >> 5U;
+  const uint32_t warps_per_block = blockDim.x >> 5U;
+  unsigned char* tile_of = reinterpret_cast<unsigned char*>(stream_i8_shared) +
+                           kB3Int8TableBytes + static_cast<size_t>(warp_in_block) * tile_table_bytes;
+  const uint32_t fused_row = blockIdx.x * warps_per_block + warp_in_block;
+  if (fused_row >= total_rows) return;
+  uint32_t index = 0U;
+  while (index + 1U < tensor_count && fused_row >= tensors[index + 1U].first_row) ++index;
+  const SaltStreamTensor tensor = tensors[index];
+  const uint32_t row = fused_row - tensor.first_row;
+  stream_row_i8(stream_i8_shared, tile_of, lane, quantized, group_scale,
+                reinterpret_cast<const unsigned char*>(tensor.payload),
+                reinterpret_cast<const __half*>(tensor.scales),
+                reinterpret_cast<const unsigned char*>(tensor.index_metadata),
+                reinterpret_cast<float*>(tensor.output) + row, row, k, tensor.tile_count,
+                tensor.plane_count, tensor.allocation_map_bytes, tensor.rank_prefix_count,
+                tensor.terminal_map_value, tile_table_bytes);
 }
 
 // Reconstruct selected semantic matrix rows directly from the resident codec
