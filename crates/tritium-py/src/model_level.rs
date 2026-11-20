@@ -6,7 +6,10 @@ use pyo3::{
     prelude::*,
     types::{PyAny, PyBytes},
 };
-use std::{io::Cursor, sync::Mutex};
+use std::{
+    io::Cursor,
+    sync::{Arc, Mutex},
+};
 use tritium_evidence::{EvidenceRecorder, TENSOR_UPLOADED_REGISTRATION};
 use tritium_format::{TritPackageReadLimits, trit_model::TritModelReader};
 use tritium_runtime::{
@@ -35,7 +38,7 @@ fn zeros(count: usize, maximum: usize) -> PyResult<Vec<f32>> {
 /// Native-only immutable packed CPU matrix. No latent/dense master is retained.
 #[pyclass(frozen, module = "tritium._tritium", skip_from_py_object)]
 pub(crate) struct NativePackedMatrix {
-    tensor: Box<dyn DeviceBuffer>,
+    tensor: Arc<dyn DeviceBuffer>,
     #[pyo3(get)]
     rows: usize,
     #[pyo3(get)]
@@ -47,8 +50,70 @@ pub(crate) struct NativePackedMatrix {
     #[pyo3(get)]
     max_output_bytes: usize,
 }
+impl NativePackedMatrix {
+    pub(crate) fn shared_tensor(&self) -> Arc<dyn DeviceBuffer> {
+        Arc::clone(&self.tensor)
+    }
+    pub(crate) fn with_tensor(&self, tensor: Arc<dyn DeviceBuffer>) -> Self {
+        Self {
+            payload_bytes: tensor.len_bytes(),
+            tensor,
+            rows: self.rows,
+            columns: self.columns,
+            storage_json: self.storage_json.clone(),
+            max_output_bytes: self.max_output_bytes,
+        }
+    }
+    pub(crate) fn dimensions(&self) -> (usize, usize, usize) {
+        (self.rows, self.columns, self.max_output_bytes)
+    }
+}
 #[pymethods]
 impl NativePackedMatrix {
+    #[getter]
+    fn scale_count(&self) -> PyResult<usize> {
+        tritium_cpu::CpuBackend::new()
+            .additive_stored_scale_count(&*self.tensor)
+            .map_err(error)
+    }
+    #[getter]
+    fn present_weight_count(&self) -> PyResult<usize> {
+        tritium_cpu::CpuBackend::new()
+            .additive_present_weight_count(&*self.tensor)
+            .map_err(error)
+    }
+    fn pv_vjp(
+        &self,
+        py: Python<'_>,
+        input: &Bound<'_, PyAny>,
+        gradient: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        crate::native_scale::matmul_adjoints(self, py, input, gradient, true)
+    }
+    fn embedding_pv_vjp(
+        &self,
+        py: Python<'_>,
+        indices: &Bound<'_, PyAny>,
+        gradient: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        crate::native_scale::embed_adjoints(self, py, indices, gradient, true)
+    }
+    fn scale_vjp(
+        &self,
+        py: Python<'_>,
+        input: &Bound<'_, PyAny>,
+        gradient: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        crate::native_scale::matmul_vjp(self, py, input, gradient)
+    }
+    fn embedding_scale_vjp(
+        &self,
+        py: Python<'_>,
+        indices: &Bound<'_, PyAny>,
+        gradient: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        crate::native_scale::embed_vjp(self, py, indices, gradient)
+    }
     /// Float32 CPU DLPack input/output; basis and scale law stay in the backend.
     fn matmul(&self, py: Python<'_>, input: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let input: Dlpack = input.extract()?;
@@ -90,6 +155,40 @@ impl NativePackedMatrix {
             .last_mut()
             .ok_or_else(|| error("input rank is zero"))? = self.rows;
         export_array(py, &shape, output, "native matrix output")
+    }
+    /// Float32 CPU input adjoint; no dense or decoded-trit master is created.
+    fn input_vjp(&self, py: Python<'_>, gradient: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let input: Dlpack = gradient.extract()?;
+        let mut shape = tensor_shape(&input, "output gradient")?;
+        if shape.last() != Some(&self.rows) {
+            return Err(error("native output gradient width differs"));
+        }
+        let batch = checked_product(&shape[..shape.len() - 1], "batch")?;
+        let values = cpu_f32(&input, "output gradient")?;
+        let count = batch
+            .checked_mul(self.columns)
+            .ok_or_else(|| error("input adjoint shape overflow"))?;
+        if count
+            .checked_add(self.columns)
+            .and_then(|n| n.checked_mul(4))
+            .is_none_or(|n| n > self.max_output_bytes)
+        {
+            return Err(error(
+                "native input adjoint output/scratch exceeds byte limit",
+            ));
+        }
+        let output = py.detach(|| {
+            let mut output = zeros(count, self.max_output_bytes)?;
+            let mut row = zeros(self.columns, self.max_output_bytes)?;
+            tritium_cpu::CpuBackend::new()
+                .additive_matmul_input_vjp(&*self.tensor, values, batch, &mut row, &mut output)
+                .map_err(error)?;
+            Ok::<_, PyErr>(output)
+        })?;
+        *shape
+            .last_mut()
+            .ok_or_else(|| error("output gradient rank is zero"))? = self.columns;
+        export_array(py, &shape, output, "native input adjoint")
     }
     /// Int64 CPU DLPack indices; only requested embedding rows are materialized.
     fn gather(&self, py: Python<'_>, indices: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
@@ -166,6 +265,19 @@ pub(crate) fn open(
         max_directory_bytes: 64 * 1024 * 1024,
     };
     let reader = TritModelReader::open(Cursor::new(bytes), limits).map_err(error)?;
+    open_reader(reader, level, run, payload, workspace, max_output_bytes)
+}
+pub(crate) fn open_reader(
+    reader: TritModelReader<Cursor<Vec<u8>>>,
+    level: String,
+    run: String,
+    payload: u64,
+    workspace: u64,
+    max_output_bytes: usize,
+) -> PyResult<NativeModelLevel> {
+    if max_output_bytes == 0 {
+        return Err(error("max_output_bytes must be positive"));
+    }
     reader.model_id(&level).map_err(error)?;
     let recorder = EvidenceRecorder::new(run, [TENSOR_UPLOADED_REGISTRATION]).map_err(error)?;
     Ok(NativeModelLevel {
@@ -323,7 +435,7 @@ impl NativeModelLevel {
                 .checked_add(1)
                 .ok_or_else(|| error("upload ordinal overflow"))?;
             Ok(NativePackedMatrix {
-                tensor,
+                tensor: Arc::from(tensor),
                 rows,
                 columns,
                 payload_bytes,

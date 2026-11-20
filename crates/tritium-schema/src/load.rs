@@ -30,6 +30,13 @@ pub enum LoadedSourceIdentity {
         /// Explicit unavailable-identity reason; never a synthetic hash/path ID.
         reason: UnknownReason,
     },
+    /// Checked residual-bearing QTEA carrier, not a typed SALT level or semantic ModelId.
+    Qtea {
+        /// Exact physical carrier bytes, including tokenizer assets.
+        package_id: PackageId,
+        /// Producer's source-model assertion; not authenticated original custody.
+        declared_source_model: [u8; 32],
+    },
 }
 
 /// A successful shared text-load observation, not a qualification verdict.

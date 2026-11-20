@@ -4,7 +4,7 @@ from pathlib import Path
 RELEASE = "1.1.0-rc.0"
 
 
-def chart_source(root: Path) -> Path:
+def chart_source(root: Path, release: str = RELEASE) -> Path:
     source = root / "chart"
     (source / "templates").mkdir(parents=True)
     (source / "Chart.yaml").write_text(
@@ -12,8 +12,8 @@ def chart_source(root: Path) -> Path:
         "name: tritium\n"
         "description: Test Tritium chart\n"
         "type: application\n"
-        f"version: {RELEASE}\n"
-        f"appVersion: {RELEASE}\n"
+        f"version: {release}\n"
+        f"appVersion: {release}\n"
         'kubeVersion: ">=1.29.0-0"\n'
         "annotations:\n"
         '  tritium.ai/artifact-schema: "3"\n'

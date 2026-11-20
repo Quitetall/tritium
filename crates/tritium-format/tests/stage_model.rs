@@ -373,3 +373,32 @@ fn actual_file_spool_and_pending_handle_support_caller_no_clobber_commit() {
     assert!(!root.exists());
     // Test's publication is not a production filesystem/durability/release gate.
 }
+
+#[test]
+fn readonly_admission_extracts_owned_metadata_and_keeps_the_emitted_reader() {
+    use tritium_format::trit_model::stage_trit_model_from_spool_with_admission;
+    let bytes = fixture::fixture(32, 16);
+    let expected = read_trit_model(&bytes).unwrap().package_id();
+    let (manifest, blobs) = prepared(&bytes);
+    let calls = Cell::new(0);
+    let level = manifest.levels[0].name.clone();
+    let (reader, model_id) = stage_trit_model_from_spool_with_admission(
+        &manifest,
+        &blobs,
+        &mut Cursor::new(&bytes),
+        limits(),
+        Cursor::new(Vec::new()),
+        |reader| {
+            calls.set(calls.get() + 1);
+            Ok::<_, ()>(reader.model_id(&level).unwrap())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        reader.package_id(),
+        expected,
+        "retained reader must still name emitted bytes"
+    );
+    assert_eq!(calls.get(), 1);
+    assert_eq!(reader.model_id(&level).unwrap(), model_id);
+}

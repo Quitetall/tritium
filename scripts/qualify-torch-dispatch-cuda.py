@@ -22,6 +22,7 @@ VERIFY = runpy.run_path(
     Path(__file__).with_name("verify-torch-dispatch-cuda-receipt.py")
 )
 SCHEMA = VERIFY["SCHEMA"]
+RELEASE_PATTERN = VERIFY["RELEASE_PATTERN"]
 SOURCE_PATH = VERIFY["SOURCE_PATH"]
 CUDA_TESTS = VERIFY["CUDA_TESTS"]
 MEMCHECK_TESTS = VERIFY["MEMCHECK_TESTS"]
@@ -232,7 +233,7 @@ def assemble(
         raise QualificationError("run id must be non-empty")
     if re.fullmatch(r"[0-9a-f]{40}", source_revision) is None:
         raise QualificationError("source revision must be a full lowercase Git ID")
-    if re.fullmatch(r"1\.1\.0-rc\.(0|[1-9][0-9]*)", release) is None:
+    if RELEASE_PATTERN.fullmatch(release) is None:
         raise QualificationError("release must be a canonical v1.1 candidate")
     if probe.get("source_identity") != f"source-git:{source_revision}":
         raise QualificationError("installed extension source identity differs from candidate")

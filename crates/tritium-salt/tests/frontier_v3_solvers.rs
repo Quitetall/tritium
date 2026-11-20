@@ -56,7 +56,7 @@ fn tensor_fixture() -> (Vec<f32>, Vec<f32>, tritium_quantize::ActivationCache) {
 }
 
 #[test]
-fn builtin_catalog_advertises_only_real_executable_solver() {
+fn builtin_catalog_advertises_only_real_implementations_at_their_actual_tier() {
     let capabilities = builtin_solver_capabilities().unwrap();
     assert_eq!(capabilities.len(), 8);
     assert_eq!(
@@ -72,8 +72,27 @@ fn builtin_catalog_advertises_only_real_executable_solver() {
     );
     assert!(capabilities[0].descriptor().is_some());
 
+    assert_eq!(
+        capabilities[1].id().as_str(),
+        tritium_salt::FRONTIER_QTEA_REFERENCE_SOLVER_ID
+    );
+    assert_eq!(capabilities[1].family(), SolverFamily::QteaSalientResidual);
+    assert_eq!(
+        capabilities[1].status(),
+        BuiltinSolverStatus::Available {
+            trust: SolverTrust::Experimental
+        }
+    );
+    assert_eq!(
+        capabilities[1].descriptor(),
+        Some(
+            tritium_salt::QteaReferenceAdapter::new()
+                .unwrap()
+                .descriptor()
+        )
+    );
+
     let expected_unavailable = [
-        "qtea-salient-residual.v1",
         "externd.v1",
         "twla.v1",
         "twn.v1",
@@ -81,7 +100,7 @@ fn builtin_catalog_advertises_only_real_executable_solver() {
         "sparse-ternary.v1",
         "folded-nine-level.v1",
     ];
-    for (capability, expected_id) in capabilities[1..].iter().zip(expected_unavailable) {
+    for (capability, expected_id) in capabilities[2..].iter().zip(expected_unavailable) {
         assert_eq!(capability.id().as_str(), expected_id);
         assert_eq!(
             capability.status(),

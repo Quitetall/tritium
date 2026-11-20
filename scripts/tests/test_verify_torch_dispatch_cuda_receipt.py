@@ -36,9 +36,10 @@ def junit(names: tuple[str, ...]) -> str:
     )
 
 
-def fixture(root: Path) -> tuple[Path, Path, dict[str, object]]:
+def fixture(root: Path, release="1.1.0-rc.0") -> tuple[Path, Path, dict[str, object]]:
     root.mkdir(parents=True, exist_ok=True)
-    wheel = root / "pytritium-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
+    version = release.replace("-rc.", "rc")
+    wheel = root / f"pytritium-{version}-cp39-abi3-linux_x86_64.whl"
     wheel.write_bytes(b"wheel")
     source = root / "test_torch_dispatch.py"
     source.write_text("def test_native_cuda(): pass\n", encoding="utf-8")
@@ -53,14 +54,14 @@ def fixture(root: Path) -> tuple[Path, Path, dict[str, object]]:
         "schema": "tritium.torch-dispatch-cuda-qualification.v1",
         "receipt_id": "",
         "result": "pass",
-        "release": "1.1.0-rc.0",
+        "release": release,
         "source_revision": "a" * 40,
         "run_id": "cuda-dispatch-17",
         "artifact": {"kind": "python-wheel", **record(wheel)},
         "environment": {
             "python_version": "3.14.6",
             "torch_version": "2.11.0+cu130",
-            "tritium_version": "1.1.0rc0",
+            "tritium_version": version,
             "cuda_runtime": "13.0",
             "cuda_driver": "610.57.04",
             "source_identity": "source-git:" + "a" * 40,
@@ -101,17 +102,26 @@ def fixture(root: Path) -> tuple[Path, Path, dict[str, object]]:
     return receipt, wheel, value
 
 
-def validate_fixture(receipt: Path, wheel: Path, value: dict[str, object]):
+def validate_fixture(receipt: Path, wheel: Path, value: dict[str, object], release="1.1.0-rc.0"):
     return validate(
         receipt,
         "a" * 40,
-        "1.1.0-rc.0",
+        release,
         wheel,
         value["source"]["git_blob"],
     )
 
 
 class VerifyTorchDispatchCudaReceiptTests(unittest.TestCase):
+    def test_final_and_rc_fixture_receipts_refuse_cross_cohort_reload(self):
+        for release in ("1.1.0", "1.2.3-rc.7"):
+            with self.subTest(release=release), tempfile.TemporaryDirectory() as raw:
+                receipt, wheel, value = fixture(Path(raw), release)
+                self.assertEqual(validate_fixture(receipt, wheel, value, release), value)
+                other = "1.1.0-rc.0" if release == "1.1.0" else "1.1.0"
+                with self.assertRaises(ReceiptError):
+                    validate_fixture(receipt, wheel, value, other)
+
     def test_contract_includes_compiled_autocast_backward_gate(self):
         self.assertIn(
             "test_native_cuda_compiled_autocast_preserves_master_cache_and_backward",

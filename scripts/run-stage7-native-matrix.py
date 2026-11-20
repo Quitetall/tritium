@@ -17,9 +17,9 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_REVISION = "effd688a12921b4cc83e3312b6feb579f70f9c71"
-RELEASE = "1.1.0-rc.1"
 QUALIFIER_PATH = ROOT / "scripts/qualify-stage7-recipe-freeze.py"
 _run_git = runpy.run_path(ROOT / "scripts/_qualification_git.py")["run_git"]
+_workspace_version = runpy.run_path(ROOT / "scripts/_release_version.py")["workspace_version"]
 
 
 def _load_qualifier():
@@ -72,6 +72,7 @@ def run(output: Path, *, device: int = 0, target_dir: Path | None = None) -> dic
         raise RuntimeError("HEAD is not a full lowercase Git revision")
     if _git("status", "--porcelain"):
         raise RuntimeError("native qualification requires a clean source worktree")
+    release = _workspace_version(ROOT)
 
     version_result = subprocess.run(
         ["compute-sanitizer", "--version"],
@@ -117,7 +118,7 @@ def run(output: Path, *, device: int = 0, target_dir: Path | None = None) -> dic
         [
             "compute-sanitizer", "--tool", "memcheck", "--error-exitcode", "99",
             "--log-file", str(log_path), str(executable),
-            "--release", RELEASE,
+            "--release", release,
             "--source-revision", revision,
             "--model-revision", MODEL_REVISION,
             "--sanitizer-version", sanitizer_version,
@@ -139,7 +140,7 @@ def run(output: Path, *, device: int = 0, target_dir: Path | None = None) -> dic
     expected = {
         "schema": "tritium.stage7-native-kernels.v1",
         "result": "pass",
-        "release": RELEASE,
+        "release": release,
         "source_revision": revision,
         "model_revision": MODEL_REVISION,
         "sanitizer_version": sanitizer_version,
@@ -153,7 +154,7 @@ def run(output: Path, *, device: int = 0, target_dir: Path | None = None) -> dic
         "sha256": _sha256(log_path),
     }
     campaign = {
-        "release": RELEASE,
+        "release": release,
         "source_revision": revision,
         "model": {"revision": MODEL_REVISION},
     }

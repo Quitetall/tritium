@@ -3,7 +3,10 @@
 
 use half::f16;
 use rayon::prelude::*;
-use tritium_core::{AdditiveView, OwnedPerTileIndex, apply_basis, apply_inverse_basis};
+use tritium_core::{
+    AdditiveScaleVjpPlan, AdditiveView, OwnedPerTileIndex, Trit, UniformPlan, apply_basis,
+    apply_inverse_basis,
+};
 use tritium_format::salt_v2::SaltV2Codec;
 use tritium_schema::{AdditiveLayout, PlaneCodec, PlaneRelation, ScaleAnchor, ScalePrecision};
 use tritium_spec::{
@@ -17,6 +20,14 @@ pub(crate) struct PackedAdditive {
     scale_offset: usize,
     allocation: Allocation,
     packed: Vec<u8>,
+}
+
+/// Borrowed execution over immutable codes with one exact scale version.
+pub(super) struct PackedScaleView<'a> {
+    tensor: &'a PackedAdditive,
+    layout: AdditiveLayout,
+    planes: usize,
+    scales: &'a [u8],
 }
 
 #[derive(Debug)]
@@ -316,6 +327,100 @@ impl PackedAdditive {
         }
     }
 
+    pub(super) fn with_scales<'a>(&'a self, scales: &'a [u8]) -> PackedScaleView<'a> {
+        debug_assert_eq!(scales.len(), self.packed.len() - self.scale_offset);
+        PackedScaleView {
+            tensor: self,
+            layout: self.layout,
+            planes: self.planes,
+            scales,
+        }
+    }
+
+    pub(super) fn view(&self) -> PackedScaleView<'_> {
+        self.with_scales(&self.packed[self.scale_offset..])
+    }
+    pub(super) fn matmul(&self, p: TensorMatmul<'_>) -> Result<(), BackendError> {
+        self.view().matmul(p)
+    }
+    pub(super) fn embed(&self, ids: &[usize], out: &mut [f32]) -> Result<(), BackendError> {
+        self.view().embed(ids, out)
+    }
+
+    pub(super) fn validate_scale_replacement(&self, scales: &[f32]) -> Result<usize, BackendError> {
+        tritium_format::AdditiveTensor::validate_scale_replacement(&self.scale_vjp_plan()?, scales)
+            .map_err(invalid)?;
+        scales
+            .len()
+            .checked_mul(Self::scale_width(self.layout)?)
+            .ok_or_else(|| invalid("scale snapshot byte overflow"))
+    }
+
+    pub(super) fn matches_geometry(&self, view: AdditiveView<'_>) -> bool {
+        let counts = match &self.allocation {
+            Allocation::Uniform { .. } => None,
+            Allocation::PerTile { index, .. } => Some(index.tile_counts()),
+        };
+        self.layout == view.layout()
+            && self.planes == view.plane_count()
+            && counts == view.tile_counts()
+    }
+
+    // Caller has validated exact values and reserved this new buffer's payload.
+    pub(super) fn encode_scales(
+        &self,
+        scales: &[f32],
+        bytes: usize,
+    ) -> Result<Vec<u8>, BackendError> {
+        let mut out = Vec::new();
+        out.try_reserve_exact(bytes)
+            .map_err(|_| BackendError::OutOfMemory { requested: bytes })?;
+        for &scale in scales {
+            match self.layout.law.precision {
+                ScalePrecision::F16 => {
+                    out.extend_from_slice(&f16::from_f32(scale).to_bits().to_le_bytes())
+                }
+                ScalePrecision::F32 => out.extend_from_slice(&scale.to_bits().to_le_bytes()),
+                _ => return Err(BackendError::UnsupportedTensor),
+            }
+        }
+        debug_assert_eq!(out.len(), bytes);
+        Ok(out)
+    }
+}
+
+impl PackedScaleView<'_> {
+    pub(super) fn equals_view(&self, view: AdditiveView<'_>) -> Result<bool, BackendError> {
+        tritium_format::AdditiveTensor::validate_view(view).map_err(invalid)?;
+        if !self.tensor.matches_geometry(view) {
+            return Ok(false);
+        }
+        if view.scales().len() != self.tensor.scale_vjp_plan()?.stored_scale_count() {
+            return Ok(false);
+        }
+        for (index, &value) in view.scales().iter().enumerate() {
+            if self.stored_scale(0, index).to_bits() != value.to_bits() {
+                return Ok(false);
+            }
+        }
+        for plane in 0..self.planes {
+            let offset = match &self.tensor.allocation {
+                Allocation::Uniform { .. } => 0,
+                Allocation::PerTile { starts, .. } => starts[plane].trit,
+            };
+            for (index, value) in view.plane_trits(plane).map_err(invalid)?.iter().enumerate() {
+                if self.tensor.trit(plane, offset + index) != value.get() {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn trit(&self, plane: usize, coefficient: usize) -> i8 {
+        self.tensor.trit(plane, coefficient)
+    }
+
     fn scale(&self, plane: usize, row: usize, col: usize) -> f32 {
         let unit = match self.layout.law.anchor {
             ScaleAnchor::Group => {
@@ -325,11 +430,11 @@ impl PackedAdditive {
             ScaleAnchor::Tensor => 0,
             _ => unreachable!("upload accepts only currently admitted anchors"),
         };
-        let Allocation::Uniform { scale_units, .. } = self.allocation else {
+        let Allocation::Uniform { scale_units, .. } = &self.tensor.allocation else {
             unreachable!("uniform scale geometry only")
         };
         let index = if matches!(self.layout.law.relation, PlaneRelation::Free) {
-            plane * scale_units + unit
+            plane * *scale_units + unit
         } else {
             unit
         };
@@ -337,7 +442,7 @@ impl PackedAdditive {
     }
 
     fn stored_scale(&self, plane: usize, index: usize) -> f32 {
-        let scales = &self.packed[self.scale_offset..];
+        let scales = self.scales;
         let base = match self.layout.law.precision {
             ScalePrecision::F16 => f16::from_bits(u16::from_le_bytes(
                 scales[index * 2..index * 2 + 2]
@@ -367,7 +472,7 @@ impl PackedAdditive {
     }
 
     fn dot(&self, row: usize, act: &[f32]) -> f32 {
-        if let Allocation::PerTile { index, .. } = &self.allocation {
+        if let Allocation::PerTile { index, .. } = &self.tensor.allocation {
             let group = usize::from(self.layout.group);
             let tensor_anchor = self.layout.law.anchor == ScaleAnchor::Tensor;
             let mut sum = 0.0;
@@ -472,34 +577,172 @@ impl PackedAdditive {
             return Err(invalid("gather shape or row out of range"));
         }
         for (&row, output) in ids.iter().zip(out.chunks_exact_mut(cols)) {
-            output.fill(0.0);
-            for plane in 0..self.planes {
-                if let Allocation::PerTile { index, .. } = &self.allocation {
-                    for tile in index
-                        .as_index()
-                        .tiles_in_row(plane, row)
-                        .expect("checked row/plane")
-                    {
-                        for (offset, value) in output[tile.columns()].iter_mut().enumerate() {
-                            let scale = if self.layout.law.anchor == ScaleAnchor::Tensor {
-                                plane
-                            } else {
-                                tile.scale_offset() + offset / usize::from(self.layout.group)
-                            };
-                            *value += f32::from(self.trit(plane, tile.trit_offset() + offset))
-                                * self.stored_scale(plane, scale);
-                        }
-                    }
-                } else {
-                    for (col, value) in output.iter_mut().enumerate() {
-                        *value += f32::from(self.trit(plane, row * cols + col))
-                            * self.scale(plane, row, col);
-                    }
-                }
-            }
+            self.decode_stored_row(row, output);
             apply_inverse_basis(output, self.layout.basis).map_err(invalid)?;
         }
         Ok(())
+    }
+
+    // Row/length have already been checked by the public operation. Keep this
+    // exact stored-basis reconstruction shared by gather and the input adjoint.
+    fn decode_stored_row(&self, row: usize, output: &mut [f32]) {
+        let cols = self.layout.cols as usize;
+        output.fill(0.0);
+        for plane in 0..self.planes {
+            if let Allocation::PerTile { index, .. } = &self.tensor.allocation {
+                for tile in index
+                    .as_index()
+                    .tiles_in_row(plane, row)
+                    .expect("checked row/plane")
+                {
+                    for (offset, value) in output[tile.columns()].iter_mut().enumerate() {
+                        let scale = if self.layout.law.anchor == ScaleAnchor::Tensor {
+                            plane
+                        } else {
+                            tile.scale_offset() + offset / usize::from(self.layout.group)
+                        };
+                        *value += f32::from(self.trit(plane, tile.trit_offset() + offset))
+                            * self.stored_scale(plane, scale);
+                    }
+                }
+            } else {
+                for (col, value) in output.iter_mut().enumerate() {
+                    *value +=
+                        f32::from(self.trit(plane, row * cols + col)) * self.scale(plane, row, col);
+                }
+            }
+        }
+    }
+
+    pub(super) fn input_vjp(
+        &self,
+        output_gradients: &[f32],
+        batch: usize,
+        row_workspace: &mut [f32],
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        let rows = self.layout.rows as usize;
+        let cols = self.layout.cols as usize;
+        let gradients = batch
+            .checked_mul(rows)
+            .ok_or_else(|| invalid("gradient size overflow"))?;
+        let inputs = batch
+            .checked_mul(cols)
+            .ok_or_else(|| invalid("input size overflow"))?;
+        if output_gradients.len() != gradients || row_workspace.len() != cols || out.len() != inputs
+        {
+            return Err(invalid("input adjoint shape mismatch"));
+        }
+        if batch == 0 {
+            return Ok(());
+        }
+        out.fill(0.0);
+        for row in 0..rows {
+            self.decode_stored_row(row, row_workspace);
+            for (batch_row, input_gradient) in out.chunks_exact_mut(cols).enumerate() {
+                let gradient = output_gradients[batch_row * rows + row];
+                for (value, &coefficient) in input_gradient.iter_mut().zip(row_workspace.iter()) {
+                    *value += gradient * coefficient;
+                }
+            }
+        }
+        for input_gradient in out.chunks_exact_mut(cols) {
+            apply_inverse_basis(input_gradient, self.layout.basis).map_err(invalid)?;
+        }
+        Ok(())
+    }
+}
+
+impl PackedAdditive {
+    pub(super) fn scale_vjp_plan(&self) -> Result<AdditiveScaleVjpPlan<'_>, BackendError> {
+        match &self.allocation {
+            Allocation::Uniform { .. } => UniformPlan::new(self.layout, self.planes as u8)
+                .map(AdditiveScaleVjpPlan::from_uniform)
+                .map_err(invalid),
+            Allocation::PerTile { index, .. } => {
+                Ok(AdditiveScaleVjpPlan::from_per_tile(index.as_index()))
+            }
+        }
+    }
+
+    // Shared plans use absolute plane-major offsets. The pre-existing uniform
+    // byte reader instead takes an offset local to the selected packed plane.
+    fn scale_vjp_trit(&self, plane: usize, absolute: usize) -> Trit {
+        let coefficient = match &self.allocation {
+            Allocation::Uniform { .. } => {
+                absolute - plane * self.layout.rows as usize * self.layout.cols as usize
+            }
+            Allocation::PerTile { .. } => absolute,
+        };
+        Trit::from_i8(self.trit(plane, coefficient)).expect("admitted canonical ternary symbol")
+    }
+
+    pub(super) fn matmul_scale_vjp(
+        &self,
+        activations: &[f32],
+        output_gradients: &[f32],
+        batch: usize,
+        row_workspace: &mut [f32],
+        out: &mut [f64],
+    ) -> Result<(), BackendError> {
+        self.scale_vjp_plan()?
+            .matmul(
+                activations,
+                output_gradients,
+                batch,
+                row_workspace,
+                out,
+                |plane, index| self.scale_vjp_trit(plane, index),
+            )
+            .map_err(invalid)
+    }
+
+    pub(super) fn embed_scale_vjp(
+        &self,
+        ids: &[usize],
+        output_gradients: &[f32],
+        row_workspace: &mut [f32],
+        out: &mut [f64],
+    ) -> Result<(), BackendError> {
+        self.scale_vjp_plan()?
+            .embed(ids, output_gradients, row_workspace, out, |plane, index| {
+                self.scale_vjp_trit(plane, index)
+            })
+            .map_err(invalid)
+    }
+
+    pub(super) fn matmul_scale_vjp_span(
+        &self,
+        activations: &[f32],
+        output_gradients: &[f32],
+        batch: usize,
+        row_workspace: &mut [f32],
+        out: tritium_core::AdditiveAdjointSpan<'_>,
+    ) -> Result<(), BackendError> {
+        self.scale_vjp_plan()?
+            .matmul_span(
+                activations,
+                output_gradients,
+                batch,
+                row_workspace,
+                out,
+                |plane, index| self.scale_vjp_trit(plane, index),
+            )
+            .map_err(invalid)
+    }
+
+    pub(super) fn embed_scale_vjp_span(
+        &self,
+        ids: &[usize],
+        output_gradients: &[f32],
+        row_workspace: &mut [f32],
+        out: tritium_core::AdditiveAdjointSpan<'_>,
+    ) -> Result<(), BackendError> {
+        self.scale_vjp_plan()?
+            .embed_span(ids, output_gradients, row_workspace, out, |plane, index| {
+                self.scale_vjp_trit(plane, index)
+            })
+            .map_err(invalid)
     }
 }
 

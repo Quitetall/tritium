@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import runpy
 import sys
 from typing import Any
 
@@ -21,7 +22,7 @@ ARTIFACT_KINDS = {
 }
 ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9_.-]*")
 REVISION_PATTERN = re.compile(r"[0-9a-f]{40}")
-RELEASE_PATTERN = re.compile(r"1\.1\.0-rc\.(0|[1-9][0-9]*)")
+RELEASE_PATTERN = runpy.run_path(Path(__file__).with_name("_release_version.py"))["RELEASE_PATTERN"]
 
 
 class ReleaseInputsError(ValueError):
@@ -87,7 +88,7 @@ def build_inputs(
     if staged.is_symlink() or not staged.is_dir():
         raise ReleaseInputsError("staged path must be an ordinary directory")
     if RELEASE_PATTERN.fullmatch(release) is None:
-        raise ReleaseInputsError("release must be a canonical 1.1.0-rc.N version")
+        raise ReleaseInputsError("release must be a canonical Cargo release or RC version")
     if REVISION_PATTERN.fullmatch(source_revision) is None:
         raise ReleaseInputsError("source revision must be a full lowercase Git object ID")
     builder_id = _required(builder_id, "builder ID")

@@ -69,6 +69,53 @@ fn model_sources_are_mutually_exclusive() {
 }
 
 #[test]
+fn qtea_launch_refuses_incompatible_modes_before_source_or_backend_init() {
+    for (args, expected) in [
+        (
+            vec!["--backend", "metal"],
+            "--qtea requires --backend cpu or cuda",
+        ),
+        (
+            vec!["--host", "0.0.0.0"],
+            "--qtea candidates require loopback",
+        ),
+        (vec!["--raw-tokens"], "--qtea forbids"),
+        (vec!["--spec", "lookup"], "--qtea forbids"),
+        (vec!["--draft-model", "/absent.gguf"], "--qtea forbids"),
+        (vec!["--batch-slots", "2"], "--qtea forbids"),
+        (vec!["--kv-pool-tokens", "8"], "--qtea forbids"),
+        (
+            vec!["--typed", "/absent-typed.json"],
+            "provide exactly one of",
+        ),
+        (vec!["--model", "/absent.gguf"], "provide exactly one of"),
+    ] {
+        let output = clean_command()
+            .args(["--qtea", "/absent-qtea.json"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(expected), "{error}");
+        assert!(!error.contains("No such file"), "{error}");
+    }
+}
+
+#[cfg(not(feature = "host-qtea"))]
+#[test]
+fn qtea_feature_off_is_explicit_before_source_io() {
+    let output = clean_command()
+        .args(["--qtea", "/absent-qtea.json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--qtea requires build feature host-qtea")
+    );
+}
+
+#[test]
 fn typed_source_rejects_bad_launch_and_limits_before_backend_init() {
     let root = Scratch::new("reject");
     let load_path = root.0.join("load.json");
@@ -274,6 +321,168 @@ impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+#[cfg(unix)]
+fn wait_test_child(child: &mut Server) -> Option<std::process::ExitStatus> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+#[cfg(unix)]
+#[test]
+fn actual_typed_binary_refuses_nonregular_sources_without_blocking() {
+    use std::process::Stdio;
+
+    let root = Scratch::new("nonregular");
+    let fifo = root.0.join("source.pipe");
+    let mut make = Server(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("Unix file-source regression requires mkfifo"),
+    );
+    assert!(
+        wait_test_child(&mut make)
+            .expect("mkfifo did not exit")
+            .success()
+    );
+    drop(make);
+    let fifo_alias = root.0.join("pipe-alias");
+    std::os::unix::fs::symlink(&fifo, &fifo_alias).unwrap();
+    let regular = root.0.join("invalid.trit");
+    std::fs::write(&regular, b"not a model").unwrap();
+    let regular_alias = root.0.join("regular-alias.trit");
+    std::os::unix::fs::symlink(&regular, &regular_alias).unwrap();
+    for (source, expected) in [
+        (&fifo, "source must be a regular file"),
+        (&fifo_alias, "source must be a regular file"),
+        (&root.0, "source must be a regular file"),
+        (&regular, "trit package is truncated"),
+        (&regular_alias, "trit package is truncated"),
+    ] {
+        let config_path = root.0.join("load.json");
+        std::fs::write(&config_path, typed_config(source).to_string()).unwrap();
+        let mut child = Server(
+            clean_command()
+                .arg("--typed")
+                .arg(&config_path)
+                .args(["--backend", "cpu", "--host", "127.0.0.1", "--port", "0"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let status = wait_test_child(&mut child).unwrap_or_else(|| {
+            panic!(
+                "typed source open blocked instead of rejecting {}",
+                source.display()
+            )
+        });
+        assert!(!status.success());
+        let mut error = String::new();
+        std::io::Read::read_to_string(&mut child.0.stderr.take().unwrap(), &mut error).unwrap();
+        assert!(error.contains(expected), "{source:?}: {error}");
+        assert!(!error.contains("listening"), "{error}");
+        assert!(!error.contains("typed runtime diagnostics"), "{error}");
+    }
+}
+#[cfg(unix)]
+#[test]
+fn actual_typed_binary_refuses_nonregular_load_json_before_backend_init() {
+    use std::process::Stdio;
+    let root = Scratch::new("load-json");
+    let fifo = root.0.join("load.pipe");
+    let mut make = Server(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    assert!(
+        wait_test_child(&mut make)
+            .expect("mkfifo did not exit")
+            .success()
+    );
+    drop(make);
+    let fifo_alias = root.0.join("pipe-alias");
+    std::os::unix::fs::symlink(&fifo, &fifo_alias).unwrap();
+    let valid = root.0.join("load.json");
+    std::fs::write(
+        &valid,
+        typed_config(&root.0.join("missing.trit")).to_string(),
+    )
+    .unwrap();
+    let valid_alias = root.0.join("load-alias.json");
+    std::os::unix::fs::symlink(&valid, &valid_alias).unwrap();
+    let oversized = root.0.join("oversized.json");
+    std::fs::write(&oversized, vec![b' '; 16 * 1024 + 1]).unwrap();
+    let malformed = root.0.join("malformed.json");
+    std::fs::write(&malformed, b"{").unwrap();
+    for (path, expected) in [
+        (
+            &fifo,
+            "--typed load JSON must be a regular file of at most 16KiB",
+        ),
+        (
+            &fifo_alias,
+            "--typed load JSON must be a regular file of at most 16KiB",
+        ),
+        (
+            &root.0,
+            "--typed load JSON must be a regular file of at most 16KiB",
+        ),
+        (
+            &oversized,
+            "--typed load JSON must be a regular file of at most 16KiB",
+        ),
+        (&malformed, "EOF while parsing"),
+        (&valid, "is not in the registry"),
+        (&valid_alias, "is not in the registry"),
+    ] {
+        let mut child = Server(
+            clean_command()
+                .arg("--typed")
+                .arg(path)
+                .args([
+                    "--backend",
+                    "not-linked",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "0",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let status = wait_test_child(&mut child).unwrap_or_else(|| {
+            panic!(
+                "typed load JSON open blocked instead of rejecting {}",
+                path.display()
+            )
+        });
+        assert!(!status.success());
+        let mut error = String::new();
+        std::io::Read::read_to_string(&mut child.0.stderr.take().unwrap(), &mut error).unwrap();
+        assert!(error.contains(expected), "{path:?}: {error}");
+        assert!(!error.contains("listening"), "{error}");
+        if expected != "is not in the registry" {
+            assert!(!error.contains("is not in the registry"), "{error}");
+        }
     }
 }
 fn http(port: u16, method: &str, path: &str, body: &str) -> std::io::Result<String> {

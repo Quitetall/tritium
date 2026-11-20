@@ -1,7 +1,10 @@
 //! Owned, validated additive-ternary tensors.
 
 use half::{bf16, f16};
-use tritium_core::{AdditiveError, AdditiveView, OwnedPerTileIndex, PerTilePlan, Trit};
+use tritium_core::{
+    AdditiveError, AdditiveScaleVjpPlan, AdditiveView, OwnedPerTileIndex, PerTilePlan, Trit,
+    UniformPlan,
+};
 use tritium_schema::{AdditiveLayout, PlaneCodec, PlaneRelation, ScaleAnchor, ScalePrecision};
 
 use crate::salt_v2::{
@@ -9,7 +12,7 @@ use crate::salt_v2::{
 };
 
 mod payload;
-pub use payload::{AdditivePayload, AdditiveStreamValidator};
+pub use payload::{AdditivePayload, AdditiveStreamDecoder, AdditiveStreamValidator};
 pub(crate) use payload::{PayloadPlan, PayloadSource, RANGE_BYTES};
 
 /// Failure constructing an owned [`AdditiveTensor`].
@@ -38,6 +41,13 @@ pub enum AdditiveTensorError {
     AllocationFailed {
         /// Exact byte or element count requested by the failed reservation.
         requested: usize,
+    },
+    /// Explicit logical decode working cap, not an allocator or RSS failure.
+    DecodeWorkingLimit {
+        /// Required decoded payload and fixed scratch bytes.
+        required: u64,
+        /// Caller-supplied logical working ceiling.
+        limit: u64,
     },
     /// This tensor-level codec does not itself apply the outer entropy transport.
     UnsupportedTransport,
@@ -144,13 +154,33 @@ impl AdditiveTensor {
     ///
     /// Used by capability queries and before reservations in [`Self::from_view`].
     pub fn validate_view(view: AdditiveView<'_>) -> Result<(), AdditiveTensorError> {
-        for (index, scale) in view.scales().iter().copied().enumerate() {
+        Self::validate_precision(view.layout().law.precision, view.scales())
+    }
+
+    /// Validate replacement scales using sealed geometry, without reading trits.
+    ///
+    /// Checks length, finite/nonnegative values, tied derived scales, negative
+    /// zero and exact declared precision. Neither allocates nor silently narrows.
+    pub fn validate_scale_replacement(
+        plan: &AdditiveScaleVjpPlan<'_>,
+        scales: &[f32],
+    ) -> Result<(), AdditiveTensorError> {
+        plan.validate_scales(scales)
+            .map_err(AdditiveTensorError::InvalidView)?;
+        Self::validate_precision(plan.scale_precision(), scales)
+    }
+
+    fn validate_precision(
+        precision: ScalePrecision,
+        scales: &[f32],
+    ) -> Result<(), AdditiveTensorError> {
+        for (index, scale) in scales.iter().copied().enumerate() {
             if scale.to_bits() & 0x8000_0000 != 0 {
                 return Err(AdditiveTensorError::InvalidView(
                     AdditiveError::InvalidScale,
                 ));
             }
-            let roundtrip = match view.layout().law.precision {
+            let roundtrip = match precision {
                 ScalePrecision::F16 => f16::from_f32(scale).to_f32(),
                 ScalePrecision::Bf16 => bf16::from_f32(scale).to_f32(),
                 ScalePrecision::F32 => scale,
@@ -286,6 +316,65 @@ impl AdditiveTensor {
         &self.scales
     }
 
+    /// Validate replacement stored scales without changing coefficients or geometry.
+    ///
+    /// This also checks derived tied-plane scales and exact storage precision.
+    /// No coefficient/index buffers are copied. Failure leaves the tensor unchanged.
+    pub fn validate_scales(&self, scales: &[f32]) -> Result<(), AdditiveTensorError> {
+        let plan = if let Some(index) = &self.per_tile {
+            AdditiveScaleVjpPlan::from_per_tile(index.as_index())
+        } else {
+            AdditiveScaleVjpPlan::from_uniform(
+                UniformPlan::new(self.layout, self.plane_count)
+                    .map_err(AdditiveTensorError::InvalidView)?,
+            )
+        };
+        Self::validate_scale_replacement(&plan, scales)
+    }
+
+    /// Replace actual stored scales transactionally, preserving all other state.
+    ///
+    /// Accepts only finite nonnegative values exactly representable by the
+    /// declared precision. It never silently narrows a scale or changes a law.
+    pub fn replace_scales(&mut self, scales: Vec<f32>) -> Result<(), AdditiveTensorError> {
+        self.validate_scales(&scales)?;
+        self.scales = scales;
+        Ok(())
+    }
+
+    /// Replace coefficients transactionally, preserving scales and geometry.
+    ///
+    /// Checks exact compact/uniform length and complete canonical per-plane
+    /// codec structure with fixed stack buffers, not encoded model allocation.
+    /// In particular S34 must retain exactly one zero in each four-trit block.
+    /// Errors leave all tensor state unchanged. This is not package admission.
+    pub fn replace_trits(&mut self, trits: Vec<Trit>) -> Result<(), AdditiveTensorError> {
+        let view = if let Some(index) = &self.per_tile {
+            AdditiveView::new_per_tile(index.as_index(), &trits, &self.scales)
+        } else {
+            AdditiveView::new(self.layout, self.plane_count, &trits, &self.scales)
+        }
+        .map_err(AdditiveTensorError::InvalidView)?;
+        let codec = salt_codec(self.layout.codec)?;
+        for plane in 0..view.plane_count() {
+            for chunk in view
+                .plane_trits(plane)
+                .map_err(AdditiveTensorError::InvalidView)?
+                .chunks(20)
+            {
+                let bytes = codec
+                    .ledger(chunk.len())
+                    .map_err(AdditiveTensorError::Codec)?
+                    .physical_bytes;
+                codec
+                    .pack_into(chunk, &mut [0; 5][..bytes])
+                    .map_err(AdditiveTensorError::Codec)?;
+            }
+        }
+        self.trits = trits;
+        Ok(())
+    }
+
     /// Borrow row-major compact counts, or `None` for uniform allocation.
     #[must_use]
     pub fn tile_counts(&self) -> Option<&[u8]> {
@@ -295,13 +384,13 @@ impl AdditiveTensor {
     /// Create a zero-copy semantic view over this owned tensor.
     #[must_use]
     pub fn view(&self) -> AdditiveView<'_> {
-        // Constructor established all invariants and fields are immutable.
+        // Constructors and checked scale replacement preserve all invariants.
         let view = if let Some(index) = &self.per_tile {
             AdditiveView::new_per_tile(index.as_index(), &self.trits, &self.scales)
         } else {
             AdditiveView::new(self.layout, self.plane_count, &self.trits, &self.scales)
         };
-        view.expect("AdditiveTensor invariants are immutable after construction")
+        view.expect("AdditiveTensor invariants are maintained by checked mutations")
     }
 }
 

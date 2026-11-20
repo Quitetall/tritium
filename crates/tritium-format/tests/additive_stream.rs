@@ -1,7 +1,8 @@
 //! Canonical incremental format equivalence; not device/model qualification.
 use tritium_core::{PerTilePlan, Trit, UniformPlan};
 use tritium_format::{
-    AdditivePayload, AdditiveStreamValidator, AdditiveTensor, AdditiveTensorError,
+    AdditivePayload, AdditiveStreamDecoder, AdditiveStreamValidator, AdditiveTensor,
+    AdditiveTensorError,
 };
 use tritium_schema::{
     ADMITTED_LAWS, AdditiveLayout, Basis, PlaneAllocation, PlaneCodec, PlaneCounts, Transport,
@@ -86,6 +87,13 @@ fn arbitrary_chunks_match_shared_canonical_validator_all_admitted_profiles() {
                             _ => unreachable!(),
                         };
                         let bytes = tensor.encode_payload().unwrap();
+                        let required =
+                            AdditiveStreamDecoder::working_bytes(layout, &counts, bytes.len())
+                                .unwrap();
+                        assert!(
+                            matches!(AdditiveStreamDecoder::new(layout,&counts,bytes.len(),required-1),
+                            Err(AdditiveTensorError::DecodeWorkingLimit {required:r,limit}) if r==required && limit==required-1)
+                        );
                         assert!(borrowed(layout, &counts, &bytes));
                         for chunk in [1, 2, 3, 7, 159, 160, 161, 65536] {
                             let mut validator = stream(layout, &counts, bytes.len()).unwrap();
@@ -93,6 +101,13 @@ fn arbitrary_chunks_match_shared_canonical_validator_all_admitted_profiles() {
                                 validator.push(part).unwrap();
                             }
                             assert_eq!(validator.finish().unwrap(), if s == 0 { 0. } else { 0.5 });
+                            let mut decoder =
+                                AdditiveStreamDecoder::new(layout, &counts, bytes.len(), required)
+                                    .unwrap();
+                            for part in bytes.chunks(chunk) {
+                                decoder.push(part).unwrap();
+                            }
+                            assert_eq!(decoder.finish().unwrap(), tensor);
                         }
                         for at in [0, bytes.len() / 2, bytes.len().saturating_sub(1)] {
                             if bytes.is_empty() {
@@ -108,6 +123,14 @@ fn arbitrary_chunks_match_shared_canonical_validator_all_admitted_profiles() {
                                 .and_then(|()| validator.finish())
                                 .is_ok();
                             assert_eq!(actual, expected, "codec={codec:?} mode={mode} at={at}");
+                            let mut decoder =
+                                AdditiveStreamDecoder::new(layout, &counts, bytes.len(), required)
+                                    .unwrap();
+                            let decoded = changed
+                                .chunks(1)
+                                .try_for_each(|part| decoder.push(part))
+                                .and_then(|()| decoder.finish());
+                            assert_eq!(decoded.is_ok(), expected);
                         }
                         if !bytes.is_empty() {
                             let mut validator = stream(layout, &counts, bytes.len()).unwrap();
@@ -122,6 +145,18 @@ fn arbitrary_chunks_match_shared_canonical_validator_all_admitted_profiles() {
                         ));
                         assert!(matches!(
                             validator.finish(),
+                            Err(AdditiveTensorError::StreamPoisoned)
+                        ));
+                        let mut decoder =
+                            AdditiveStreamDecoder::new(layout, &counts, bytes.len(), required)
+                                .unwrap();
+                        assert!(decoder.push(&vec![0; bytes.len() + 1]).is_err());
+                        assert!(matches!(
+                            decoder.push(&[]),
+                            Err(AdditiveTensorError::StreamPoisoned)
+                        ));
+                        assert!(matches!(
+                            decoder.finish(),
                             Err(AdditiveTensorError::StreamPoisoned)
                         ));
                         cases += 1;

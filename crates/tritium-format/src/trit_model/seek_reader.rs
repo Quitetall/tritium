@@ -111,6 +111,55 @@ pub struct TritTensorStream<'a, R> {
     index: usize,
 }
 impl<'a, R: Read + Seek> TritTensorStream<'a, R> {
+    /// Logical one-owner decode payload, fixed codec/carry and64KiB source
+    /// window. No decoded or encoded payload is allocated by this query.
+    /// Excludes metadata, allocator slack, caller stream buffers and OS caches.
+    pub fn additive_decode_working_bytes(&self) -> Result<u64, TritModelReadError> {
+        let TensorStorage::Additive { layout, planes } = &self.meta.storage else {
+            return Err(TritModelError::UnsupportedFeature("not additive").into());
+        };
+        let length = usize::try_from(self.encoded_bytes())
+            .map_err(|_| AdditiveTensorError::LengthOverflow)?;
+        crate::AdditiveStreamDecoder::working_bytes(*layout, planes, length)?
+            .checked_add(RANGE_BYTES as u64)
+            .ok_or(AdditiveTensorError::LengthOverflow)
+            .map_err(Into::into)
+    }
+    /// Decode one actual retained raw additive blob without an encoded-owner
+    /// copy. Canonical parsing, complete blob digest/length and explicit working
+    /// cap must pass before an owned tensor is returned. The enclosing package
+    /// still requires terminal verify; this is not source-custody qualification.
+    pub fn decode_additive(
+        &mut self,
+        max_working_bytes: u64,
+    ) -> Result<AdditiveTensor, TritModelReadError> {
+        let required = self.additive_decode_working_bytes()?;
+        if required > max_working_bytes {
+            return Err(AdditiveTensorError::DecodeWorkingLimit {
+                required,
+                limit: max_working_bytes,
+            }
+            .into());
+        }
+        let meta = self.meta;
+        let TensorStorage::Additive { layout, planes } = &meta.storage else {
+            return Err(TritModelError::UnsupportedFeature("not additive").into());
+        };
+        let length = usize::try_from(self.encoded_bytes())
+            .map_err(|_| AdditiveTensorError::LengthOverflow)?;
+        let mut decoder = crate::AdditiveStreamDecoder::new(
+            *layout,
+            planes,
+            length,
+            max_working_bytes - RANGE_BYTES as u64,
+        )?;
+        match self.visit(|bytes| decoder.push(bytes)) {
+            Ok(()) => {}
+            Err(TritModelVisitError::Read(e)) => return Err(e),
+            Err(TritModelVisitError::Visitor(e)) => return Err(e.into()),
+        }
+        decoder.finish().map_err(Into::into)
+    }
     /// Immutable original binding metadata; no manifest or counts cloned.
     pub const fn metadata(&self) -> &'a TensorMeta {
         self.meta
@@ -249,6 +298,20 @@ impl<R: Read + Seek> TritModelReader<R> {
     /// Source mutation/truncation/growth or actual seek/read faults.
     pub fn verify(&mut self) -> Result<(), TritModelReadError> {
         self.package.verify().map_err(Into::into)
+    }
+
+    /// Visit exact original package bytes, not a reconstructed model encoding.
+    ///
+    /// Delegates bounded chunks, visited-byte identity, source-length and final
+    /// source verification to the package reader. Keep visitor effects private
+    /// until success; this is not an atomic snapshot or quality qualification.
+    /// # Errors
+    /// Changed source/length, actual I/O or unchanged visitor failure.
+    pub fn visit_package<E>(
+        &mut self,
+        visitor: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), TritModelVisitError<E>> {
+        self.package.visit_package(visitor).map_err(Into::into)
     }
 }
 

@@ -56,6 +56,29 @@
       "description": "Imported weights without a direct-fit or exact-prefix claim.",
       "type": "string",
       "const": "Imported"
+    },
+    {
+      "description": "Schema1.1 single-level recovery ancestry; not a Direct PTQ claim.",
+      "type": "object",
+      "properties": {
+        "Refined": {
+          "type": "object",
+          "properties": {
+            "ancestry": {
+              "description": "Parent/request/original recovery evidence bindings.",
+              "$ref": "#/$defs/NativeRefinementAncestry"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ancestry"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Refined"
+      ]
     }
   ],
   "$defs": {
@@ -90,6 +113,112 @@
         "span",
         "root"
       ]
+    },
+    "ModelId": {
+      "description": "Content identity for one Tritium model level, not its package or provenance.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "NativeRefinementAncestry": {
+      "description": "Distinct schema1.1 refined ancestry; not Direct or a quality verdict.",
+      "type": "object",
+      "properties": {
+        "evidence": {
+          "description": "Actual recovery log reference; external admission is still required.",
+          "$ref": "#/$defs/EvidenceReference"
+        },
+        "parent": {
+          "description": "Exact parent binding.",
+          "$ref": "#/$defs/NativeRefinementParent"
+        },
+        "plan": {
+          "description": "Separate native request identity, not a legacy PV recipe digest.",
+          "$ref": "#/$defs/NativeRefinementPlanId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "parent",
+        "plan",
+        "evidence"
+      ]
+    },
+    "NativeRefinementParent": {
+      "description": "Exact recorded ancestry of the one explicitly selected parent level.",
+      "type": "object",
+      "properties": {
+        "evidence": {
+          "description": "Original admitted parent run/span/root, never a resealed projection.",
+          "$ref": "#/$defs/EvidenceReference"
+        },
+        "level": {
+          "description": "Explicit parent level; no default or prefix inference.",
+          "type": "string"
+        },
+        "model": {
+          "description": "Actual semantic identity of that selected level.",
+          "$ref": "#/$defs/ModelId"
+        },
+        "package": {
+          "description": "Exact parent file identity, not just its model values.",
+          "$ref": "#/$defs/PackageId"
+        },
+        "source": {
+          "description": "Parent's recorded original observation, not official source authentication.",
+          "$ref": "#/$defs/OriginalSourceId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "package",
+        "level",
+        "model",
+        "source",
+        "evidence"
+      ]
+    },
+    "NativeRefinementPlanId": {
+      "description": "Native recovery request identity in its own versioned domain, not a legacy PV recipe hash.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "OriginalSourceId": {
+      "description": "Candidate identity of original named tensor/asset content, not fitted content or provenance.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "PackageId": {
+      "description": "Content identity for a Tritium package.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
     }
   }
 }

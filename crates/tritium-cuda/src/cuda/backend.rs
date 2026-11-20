@@ -16,11 +16,20 @@ mod decoder;
 mod decoder_plan;
 mod delta_mixer;
 pub(super) mod deltanet;
+mod qtea;
+pub use qtea::{
+    QTEA_DEVICE_SWIGLU_NUMERICAL_ID, QteaCudaAllocationLedger, QteaCudaLimits, QteaResidentTensor,
+    QteaSwiGluAllocationLedger,
+};
 pub(super) mod qwen35_resident;
 mod salt_v2_reader_upload;
 mod salt_v2_runtime;
 mod semantic;
+mod swiglu_workspace;
 pub use salt_v2_runtime::SaltV2GatherReceipt;
+pub use swiglu_workspace::{
+    SwiGluWorkspaceKind, SwiGluWorkspacePlan, SwiGluWorkspaceResources, SwiGluWorkspaceSnapshot,
+};
 
 /// A logical prefix of cudarc page-locked memory.
 ///
@@ -820,12 +829,15 @@ pub struct CudaBackend {
     pub(super) qwen35_decode_module: Arc<CudaModule>,
     pub(super) func_semantic_additive_matmul: CudaFunction,
     pub(super) func_semantic_additive_matmul_ordered_warp: CudaFunction,
+    pub(super) func_semantic_additive_matmul_b3_rows_32: CudaFunction,
+    pub(super) func_semantic_additive_matmul_b3_groups: CudaFunction,
     pub(super) func_semantic_additive_gather: CudaFunction,
     pub(super) func_semantic_additive_validate_finite: CudaFunction,
     pub(super) func_semantic_basis_sign: CudaFunction,
     pub(super) func_semantic_basis_butterfly: CudaFunction,
     pub(super) func_semantic_basis_finish: CudaFunction,
     pub(super) func_semantic_swiglu: CudaFunction,
+    pub(super) func_semantic_activation_check_finite: CudaFunction,
     pub(super) func_semantic_attention: CudaFunction,
     pub(super) func_decoder_dense_gather: CudaFunction,
     pub(super) func_decoder_norm: CudaFunction,
@@ -1071,9 +1083,12 @@ pub struct CudaBackend {
     /// projection path. Qwen prompt/decode invokes hundreds of projections;
     /// retaining these buffers removes a cuMemAlloc/cuMemFree pair per call.
     pub(super) salt_v2_workspace: Mutex<SaltV2Workspace>,
+    /// Loaded only for explicit packed QTEA execution, never for legacy init.
+    qtea_kernels: Mutex<Option<Arc<qtea::QteaKernels>>>,
     pub(super) semantic_swiglu_enabled: bool,
     pub(super) resident_decoder_budget: Option<usize>,
-    pub(super) semantic_swiglu_workspace: Mutex<Option<semantic::SwigluWorkspace>>,
+    swiglu_workspace: Mutex<swiglu_workspace::Cache>,
+    swiglu_workspace_resources: Option<SwiGluWorkspaceResources>,
 }
 
 /// Process-local pool for transient SALT V2 activation/output buffers.
@@ -1147,6 +1162,12 @@ impl CudaBackend {
             self.device_id.push_str(":swiglu-device-f32");
         }
         self
+    }
+    /// Whether explicit device-f32 SwiGLU numerical mode was selected.
+    /// Not a declaration that every graph/activation family executes on device.
+    #[must_use]
+    pub fn device_swiglu_enabled(&self) -> bool {
+        self.semantic_swiglu_enabled
     }
     /// Open CUDA device `ordinal`, load the TQ2_0 add kernel, and return a backend.
     ///
@@ -1556,6 +1577,12 @@ impl CudaBackend {
         let func_semantic_additive_matmul_ordered_warp = semantic_module
             .load_function("semantic_additive_matmul_ordered_warp")
             .map_err(|e| driver_err("resolve ordered packed matmul", &e))?;
+        let func_semantic_additive_matmul_b3_rows_32 = semantic_module
+            .load_function("semantic_additive_matmul_b3_rows_32")
+            .map_err(|e| driver_err("resolve cross-row packed matmul", &e))?;
+        let func_semantic_additive_matmul_b3_groups = semantic_module
+            .load_function("semantic_additive_matmul_b3_groups")
+            .map_err(|e| driver_err("resolve ordered-group packed matmul", &e))?;
         let func_semantic_additive_gather = semantic_module
             .load_function("semantic_additive_gather")
             .map_err(|e| driver_err("resolve semantic additive gather", &e))?;
@@ -1574,6 +1601,9 @@ impl CudaBackend {
         let func_semantic_swiglu = semantic_module
             .load_function("semantic_swiglu")
             .map_err(|e| driver_err("resolve semantic SwiGLU", &e))?;
+        let func_semantic_activation_check_finite = semantic_module
+            .load_function("semantic_activation_check_finite")
+            .map_err(|e| driver_err("resolve semantic activation finite check", &e))?;
         let func_semantic_attention = semantic_module
             .load_function("semantic_causal_attention")
             .map_err(|e| driver_err("resolve semantic causal attention", &e))?;
@@ -1629,12 +1659,15 @@ impl CudaBackend {
             qwen35_decode_module,
             func_semantic_additive_matmul,
             func_semantic_additive_matmul_ordered_warp,
+            func_semantic_additive_matmul_b3_rows_32,
+            func_semantic_additive_matmul_b3_groups,
             func_semantic_additive_gather,
             func_semantic_additive_validate_finite,
             func_semantic_basis_sign,
             func_semantic_basis_butterfly,
             func_semantic_basis_finish,
             func_semantic_swiglu,
+            func_semantic_activation_check_finite,
             func_semantic_attention,
             func_decoder_dense_gather,
             func_decoder_norm,
@@ -1767,9 +1800,11 @@ impl CudaBackend {
             imma_jit: Mutex::new(HashMap::new()),
             tuned_tiles: Mutex::new(HashMap::new()),
             salt_v2_workspace: Mutex::new(SaltV2Workspace::default()),
+            qtea_kernels: Mutex::new(None),
             semantic_swiglu_enabled: false,
             resident_decoder_budget: None,
-            semantic_swiglu_workspace: Mutex::new(None),
+            swiglu_workspace: Mutex::new(swiglu_workspace::Cache::default()),
+            swiglu_workspace_resources: None,
         })
     }
 

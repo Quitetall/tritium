@@ -136,7 +136,9 @@ impl FrontierStageRequest {
         ContentId::of_bytes(&bytes)
     }
 
-    /// Prove this portable request came from the exact in-process admission token.
+    /// Validate portable descriptor/request/estimate values against a selected plan.
+    /// V1 carries no machine/evidence or complete plan ID; exact-admission consumers
+    /// must bind the selected [`AdmittedSolverPlan::content_id`] separately.
     pub fn validate_plan(&self, plan: &AdmittedSolverPlan) -> Result<(), FrontierPlanError> {
         if self.solver != *plan.descriptor() {
             return Err(FrontierPlanError::StageRequestPlanMismatch { field: "solver" });

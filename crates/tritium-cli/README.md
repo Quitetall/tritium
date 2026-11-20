@@ -20,6 +20,25 @@ only—not arguments or a semantic plan fingerprint. Use `--evidence-out` for a
 clean JSONL file; stderr may include diagnostics. `det` replay covers command
 lifecycle events only, not model execution determinism.
 
+## Explicit host QTEA generation (experimental)
+
+Build with `--features host-qtea`, then select `--qtea /absolute/load.json`
+instead of `--typed`/`--model`. The request uses the shared
+[`QteaLoadConfig` contract](../tritium-nn/README.md#explicit-qtea-command-request-experimental).
+
+```text
+tritium --evidence off generate --qtea /absolute/load.json \
+  --backend cpu --prompt "Testing partner" --max-new 3 --eos 3
+```
+
+`--tokens ids.json` gives exact IDs instead. `--prompt` is raw continuation text,
+not automatic chat formatting. EOS is explicit, not inferred. Generation uses
+the existing bounded runner and output grammar. Source choices are exclusive;
+feature-off, non-CPU and unsupported sampling selections refuse. Diagnostics
+record actual PackageId and declared source, not official custody or production
+qualification. QTEA is residual-bearing, not a pure SALT artifact; no GPU/dense
+fallback is introduced. Use the server's chat endpoint for source-bound messages.
+
 Explicit candidate typed-plan conversion uses the shared Rust engine:
 
 ```text

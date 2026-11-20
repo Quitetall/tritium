@@ -1,5 +1,6 @@
 use crate::optim::Optimizer;
 
+use super::continuous::check_optimizer_moments;
 use super::projection::project_units;
 use super::selection::selected_units;
 use super::{PvStepReceipt, PvTernaryWeight, PvTuningConfig, PvTuningError, PvTuningSession};
@@ -45,22 +46,11 @@ impl PvTuningSession {
     /// form Adam proposal, selects largest bounded proposal units, then projects them
     /// onto deployed code space. This reference clones deployed representation and
     /// optimizer state before mutation; device/block adapters use scoped journals at
-    /// model scale.
+    /// model scale. Sequencing, shape and finiteness checks precede that snapshot.
     ///
     /// # Errors
     /// Invalid input or update fails without mutating representation or optimizer state.
     pub fn step(
-        &mut self,
-        gradient: &[f32],
-        optimizer_step: u64,
-    ) -> Result<PvStepReceipt, PvTuningError> {
-        let mut next = self.clone();
-        let receipt = next.step_inner(gradient, optimizer_step)?;
-        *self = next;
-        Ok(receipt)
-    }
-
-    fn step_inner(
         &mut self,
         gradient: &[f32],
         optimizer_step: u64,
@@ -86,6 +76,17 @@ impl PvTuningSession {
             return Err(PvTuningError::step("gradient contains a non-finite value"));
         }
 
+        let mut next = self.clone();
+        let receipt = next.step_inner(gradient, optimizer_step)?;
+        *self = next;
+        Ok(receipt)
+    }
+
+    fn step_inner(
+        &mut self,
+        gradient: &[f32],
+        optimizer_step: u64,
+    ) -> Result<PvStepReceipt, PvTuningError> {
         let changed_scales = self.p_step(gradient, optimizer_step)?;
         let decoded = self.weight.decode();
         let mut proposal = decoded.clone();
@@ -100,6 +101,7 @@ impl PvTuningSession {
                 "code optimizer produced a non-finite proposal",
             ));
         }
+        check_optimizer_moments(&self.code_state, "code")?;
 
         let units = selected_units(
             self.weight.structure,

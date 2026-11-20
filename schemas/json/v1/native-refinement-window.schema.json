@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NativeRefinementWindow",
+  "description": "Ordered declared raw-content window; its identity excludes role and weight.",
+  "type": "object",
+  "properties": {
+    "content": {
+      "description": "Canonical content identity; not proof of semantic dataset decontamination.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "weight": {
+      "description": "Finite positive declared objective weight.",
+      "type": "number",
+      "format": "double"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "content",
+    "weight"
+  ]
+}

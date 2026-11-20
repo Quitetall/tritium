@@ -53,7 +53,8 @@ def _identity(tensor):
     return _state_tensor_identity(tensor) + (tensor.is_conj(), tensor.is_neg())
 
 
-def _inventory(prepared):
+def _inventory(prepared, *, materialized=True):
+    """Check shared state topology; producers additionally require stored values."""
     if not isinstance(prepared, PreparedModel) or not isinstance(prepared.model, nn.Module):
         raise TypeError("native module conversion requires a live PreparedModel")
     if prepared.config.mode != "ptq" or prepared.coverage is None:
@@ -75,7 +76,8 @@ def _inventory(prepared):
     for name, tensor in state.items():
         if (not isinstance(name, str) or not isinstance(tensor, torch.Tensor)
                 or tensor.layout != torch.strided or tensor.is_quantized
-                or tensor.device.type == "meta" or tensor.dtype not in _STATE_DTYPES):
+                or (materialized and tensor.device.type == "meta")
+                or tensor.dtype not in _STATE_DTYPES):
             raise ValueError("native module state must be ordinary materialized tensors")
         slot = _state_slot(prepared.model, name)
         if slot[3] is not tensor:

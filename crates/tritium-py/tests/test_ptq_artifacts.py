@@ -32,6 +32,66 @@ from tritium.torch import (  # noqa: E402
 )
 
 
+def test_public_convert_without_optional_safetensors(tmp_path):
+    import subprocess
+    import sys
+    import textwrap
+
+    import tritium
+
+    program = textwrap.dedent(
+        """
+        import importlib.abc
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, sys.argv[1])
+
+        class MissingSerializer(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == "safetensors" or fullname.startswith("safetensors."):
+                    raise ModuleNotFoundError("optional serializer unavailable", name=fullname)
+
+        sys.meta_path.insert(0, MissingSerializer())
+        import torch
+        from tritium.torch import (
+            TernaryConfig, calibrate, convert, load_module_conversion,
+            load_quantized_module, prepare,
+        )
+
+        torch.set_num_threads(1)
+        torch.manual_seed(169)
+        model = torch.nn.Linear(8, 4).eval()
+        prepared = prepare(
+            model,
+            TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+            inplace=False,
+        )
+        root = Path(sys.argv[2])
+        calibration = calibrate(
+            prepared, (torch.ones(2, 8),), evidence_dir=root / "calibration",
+        )
+        converted = convert(prepared, calibration, work_dir=root / "conversion")
+        reopened = load_module_conversion(converted.artifact_dir)
+        assert reopened == converted
+        hard = load_quantized_module(model, reopened)
+        assert hard(torch.ones(1, 8)).shape == (1, 4)
+        assert "safetensors" not in sys.modules
+        """
+    )
+    completed = subprocess.run(
+        [
+            sys.executable, "-I", "-B", "-c", program,
+            str(Path(tritium.__file__).resolve().parent.parent), str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def _write_bundle(root: Path) -> None:
     root.mkdir()
     (root / "compact.tsalt2").write_bytes(b"compact")

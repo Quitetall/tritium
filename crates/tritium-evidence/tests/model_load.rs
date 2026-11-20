@@ -236,3 +236,63 @@ fn upload_only_log_has_no_invented_load_receipt() {
     .unwrap();
     assert!(ModelLoadReceiptView::fold(&log).unwrap().is_empty());
 }
+
+#[test]
+fn qtea_identity_replays_without_semantic_model_or_qualification_fields() {
+    let mut observed = observation();
+    observed.source = LoadedSourceIdentity::Qtea {
+        package_id: PackageId::from_bytes([7; 32]),
+        declared_source_model: [8; 32],
+    };
+    observed.backend = "qtea-scalar-host".into();
+    let mut recorder = EvidenceRecorder::new("qtea-load", [MODEL_LOADED_REGISTRATION]).unwrap();
+    let view = recorder
+        .emit_model_loaded("load", None, 0, &observed)
+        .unwrap();
+    let payload = serde_json::to_value(&observed).unwrap();
+    assert!(payload["source"]["Qtea"].get("model_id").is_none());
+    assert!(payload.get("verdict").is_none());
+    let log =
+        verify_jsonl_with_registry(&recorder.to_jsonl().unwrap(), [MODEL_LOADED_REGISTRATION])
+            .unwrap();
+    assert_eq!(ModelLoadReceiptView::fold(&log).unwrap(), [view]);
+
+    #[derive(serde::Serialize)]
+    #[serde(transparent)]
+    struct Wrong(serde_json::Value);
+    impl EvidenceEvent for Wrong {
+        const SCHEMA_ID: &'static str = ModelLoaded::SCHEMA_ID;
+        const VERSION: u16 = 1;
+    }
+    for bad in ["model_id", "level", "authenticated"] {
+        let mut changed = payload.clone();
+        changed["source"]["Qtea"][bad] = true.into();
+        let mut recorder =
+            EvidenceRecorder::new("qtea-wrong", [MODEL_LOADED_REGISTRATION]).unwrap();
+        recorder.emit("load", None, 0, &Wrong(changed)).unwrap();
+        let log =
+            verify_jsonl_with_registry(&recorder.to_jsonl().unwrap(), [MODEL_LOADED_REGISTRATION])
+                .unwrap();
+        assert!(matches!(
+            ModelLoadReceiptView::fold(&log),
+            Err(EvidenceError::InvalidPayload { .. })
+        ));
+    }
+}
+
+#[test]
+fn existing_loaded_source_json_shapes_are_unchanged() {
+    use tritium_schema::UnknownReason;
+    let trit = observation().source;
+    assert_eq!(
+        serde_json::to_value(trit).unwrap(),
+        serde_json::json!({"Trit":{"package_id":vec![1;32],"model_id":vec![2;32],"level":"standard"}})
+    );
+    let hf = LoadedSourceIdentity::HuggingFace {
+        reason: UnknownReason::MissingCapability,
+    };
+    assert_eq!(
+        serde_json::to_value(hf).unwrap(),
+        serde_json::json!({"HuggingFace":{"reason":"MissingCapability"}})
+    );
+}

@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NativeRefinementCompleted",
+  "description": "Completed recovery observations, not successful publication or qualification.",
+  "type": "object",
+  "properties": {
+    "checkpoint": {
+      "description": "Must name the exact final durable checkpoint.",
+      "$ref": "#/$defs/BlobId"
+    },
+    "plan": {
+      "description": "Exact native request identity.",
+      "$ref": "#/$defs/NativeRefinementPlanId"
+    },
+    "tensors": {
+      "description": "Complete child stored-byte bindings; no repeated count vectors or\ncaller-supplied replacement layout/precision/basis interpretations.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/NativeRefinementTensorOutput"
+      }
+    },
+    "validation": {
+      "description": "Complete ordered finite observations for the requested validation windows.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/NativeRefinementValidation"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "plan",
+    "checkpoint",
+    "tensors",
+    "validation"
+  ],
+  "$defs": {
+    "BlobId": {
+      "description": "Content identity for stored tensor or asset bytes.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "NativeRefinementPlanId": {
+      "description": "Native recovery request identity in its own versioned domain, not a legacy PV recipe hash.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "NativeRefinementTensorOutput": {
+      "description": "Compact output binding; exact storage interpretation is inherited from parent.",
+      "type": "object",
+      "properties": {
+        "content": {
+          "description": "Exact canonical stored-byte identity, not a semantic model ID.",
+          "$ref": "#/$defs/BlobId"
+        },
+        "name": {
+          "description": "Canonical tensor owner name.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "content"
+      ]
+    },
+    "NativeRefinementValidation": {
+      "description": "Ordered observed objective values, with no acceptance/quality verdict.",
+      "type": "object",
+      "properties": {
+        "child_loss": {
+          "description": "Finite child objective observation; not automatically an improvement.",
+          "type": "number",
+          "format": "double"
+        },
+        "content": {
+          "description": "Declared content actually observed; raw-data verification remains separate.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0
+          },
+          "maxItems": 32,
+          "minItems": 32
+        },
+        "parent_loss": {
+          "description": "Finite parent objective observation.",
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "content",
+        "parent_loss",
+        "child_loss"
+      ]
+    }
+  }
+}

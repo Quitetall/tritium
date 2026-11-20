@@ -6,7 +6,7 @@ use tritium_schema::PlaneCounts;
 
 mod prefix;
 mod stream;
-pub use stream::AdditiveStreamValidator;
+pub use stream::{AdditiveStreamDecoder, AdditiveStreamValidator};
 
 const SCRATCH_TRITS: usize = D2_TRITS_PER_BYTE * B3_TRITS_PER_BYTE * (8 * S34_TRITS_PER_GROUP);
 pub(crate) const RANGE_BYTES: usize = 64 * 1024;
@@ -176,9 +176,7 @@ impl<'a> PayloadPlan<'a> {
         blob: usize,
     ) -> Result<(), S::Error> {
         self.visit_trits(source, blob, |_| Ok(()))?;
-        self.visit_scale_bytes(source, blob, |bytes| {
-            validate_scale_chunk(self.layout, self.planes.len(), bytes).map_err(Into::into)
-        })
+        self.visit_scale_bytes(source, blob, |_| Ok(()))
     }
 
     pub(crate) fn visit_trits<S: PayloadSource>(
@@ -214,6 +212,8 @@ impl<'a> PayloadPlan<'a> {
         Ok(())
     }
 
+    // Every scale window is validated before visitor effects, including semantic
+    // hashing. This lets a semantic pass own validation without a prior reread.
     pub(crate) fn visit_scale_bytes<S: PayloadSource>(
         &self,
         source: &mut S,
@@ -225,6 +225,7 @@ impl<'a> PayloadPlan<'a> {
         while at < self.length {
             let count = (self.length - at).min(scratch.len());
             source.read_range(blob, at, &mut scratch[..count])?;
+            validate_scale_chunk(self.layout, self.planes.len(), &scratch[..count])?;
             visit(&scratch[..count])?;
             at += count;
         }

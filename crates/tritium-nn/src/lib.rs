@@ -48,6 +48,10 @@ pub use error::NnError;
 pub use error::ResidentOpError;
 pub use evaluation::{TeacherForcedPerplexity, teacher_forced_perplexity_windows};
 pub use kv_cache::KvCache;
+#[cfg(feature = "cuda")]
+pub use layers::CudaQteaLinear;
+#[cfg(feature = "host-qtea")]
+pub use layers::HostQteaLinear;
 pub use layers::{
     ActivationPrecision, BlockDump, BlockScratch, DenseLinear, HostSaltV2Linear, Linear, Mlp,
     Projection, ProjectionActivationMode, Q2Linear, Qwen35DeltaNet, Qwen35DeltaNetCache,
@@ -55,9 +59,17 @@ pub use layers::{
     Qwen35FullAttentionWeights, Relu2Mlp, SaltLinear, SwiGluMlp, TensorLoader, TernaryLinear,
     TokenEmbedding, TransformerBlock,
 };
+#[cfg(all(feature = "host-qtea", feature = "cuda"))]
+pub use model::CudaQteaModelLimits;
+#[cfg(all(feature = "host-qtea", feature = "tokenizer"))]
+pub use model::HostQteaHybridModelLimits;
+#[cfg(feature = "host-qtea")]
+pub use model::HostQteaModelLimits;
+#[cfg(all(feature = "host-qtea", feature = "tokenizer"))]
+pub use model::QteaLoadConfig;
 pub use model::{ArchitectureSpec, CacheAdmission, LayerKind, Runner, StreamLimits};
 pub use model::{
-    ForwardDump, LayerWeights, ModelRunner, ModelSource, ModelWeights,
+    ChatRenderOptions, ForwardDump, LayerWeights, ModelRunner, ModelSource, ModelWeights,
     QWEN35_HF_SOURCE_ARCHITECTURE, QWEN35_MTP_UNVERIFIED_REASON, QWEN35_MTP_VLLM_ORACLE_REVISION,
     QWEN35_MTP_VLLM_SOURCE_SHA256, QWEN35_REFERENCE_STATE_MAX_BYTES, Qwen35ContentVerifiedHfSource,
     Qwen35ExecutionBlockOutputBatch, Qwen35ExecutionOutputBatch, Qwen35ExecutionVisitError,
@@ -78,6 +90,7 @@ pub use model::{
     GgufBpeTokenizer, HfJsonTokenizer, LoadedModel, ModelLoadResources, ModelResourceAdmission,
     TypedLoadConfig, load, load_streamed_with_resources, load_with_limits, load_with_resources,
 };
+pub use model::{QteaModelInventory, QteaModelProfile};
 #[cfg(feature = "cuda")]
 pub use model::{
     SaltV2LoadedTensorReceipt, SaltV2ModelAllocationReceipt, SaltV2PreservedTensorReceipt,

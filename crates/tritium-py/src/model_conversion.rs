@@ -6,6 +6,7 @@ use pyo3::{
 };
 use std::{
     collections::BTreeMap,
+    fs::File,
     path::{Path, PathBuf},
 };
 use tritium_evidence::{
@@ -13,11 +14,14 @@ use tritium_evidence::{
     CALIBRATED_QUANTIZATION_STARTED_REGISTRATION, DIRECT_LEVELS_FITTED_REGISTRATION,
     EvidenceRecorder, OWNER_QUANTIZATION_COMPLETED_REGISTRATION,
     OWNER_QUANTIZATION_STARTED_REGISTRATION, OWNER_SCORE_LEVELS_FITTED_REGISTRATION,
-    QUANTIZATION_COMPLETED_REGISTRATION, QUANTIZATION_STARTED_REGISTRATION, verify_jsonl,
+    QUANTIZATION_COMPLETED_REGISTRATION, QUANTIZATION_STARTED_REGISTRATION, VerifiedLog,
+    verify_jsonl,
 };
+use tritium_format::{TritPackageReadLimits, trit_model::TritModelReader};
 use tritium_quantize::engine::{
     DirectoryTensorSink, Engine, FileWeightSource, QuantEngineError, TritOwnerCalibrationSource,
-    file_calibration_source, read_original_file_bounded, verify_package_with_fit_log,
+    file_calibration_source, open_model_reader_with_fit_log, open_original_file,
+    read_original_file_bounded, verify_package_with_fit_log,
 };
 use tritium_schema::{
     CalibratedQuantPlan, ModelQuantPlan, OwnerQuantPlan, QuantPlan, TensorStorage,
@@ -35,6 +39,34 @@ fn paths(input: Option<BTreeMap<String, String>>) -> BTreeMap<String, PathBuf> {
         .into_iter()
         .map(|(name, path)| (name, path.into()))
         .collect()
+}
+
+fn open_bound_model(
+    root: &Path,
+    maximum: u64,
+    evidence_maximum: u64,
+) -> PyResult<(TritModelReader<File>, VerifiedLog, u64)> {
+    if maximum == 0 || evidence_maximum == 0 {
+        return Err(error("package and evidence byte limits must be positive"));
+    }
+    let text = read_original_file_bounded(&root.join("evidence.jsonl"), evidence_maximum)
+        .map_err(error)?;
+    let log = verify_jsonl(std::str::from_utf8(&text).map_err(error)?).map_err(error)?;
+    // Preserve existing package-byte admission for metadata as well. This does
+    // not introduce a hidden lower metadata ceiling or claim a total RSS bound.
+    let metadata_maximum = usize::try_from(maximum).unwrap_or(usize::MAX);
+    let limits = TritPackageReadLimits {
+        max_source_bytes: maximum,
+        max_manifest_bytes: metadata_maximum,
+        max_directory_bytes: metadata_maximum,
+    };
+    let reader = open_model_reader_with_fit_log(
+        open_original_file(&root.join("model.trit")).map_err(error)?,
+        limits,
+        &log,
+    )
+    .map_err(error)?;
+    Ok((reader, log, text.len() as u64))
 }
 
 enum Plan {
@@ -98,8 +130,64 @@ pub(crate) struct NativeModelConversion {
     evidence_bytes: u64,
 }
 impl NativeModelConversion {
+    pub(crate) fn refinement_parent(
+        &self,
+        level: &str,
+    ) -> PyResult<(
+        TritModelReader<File>,
+        tritium_schema::NativeRefinementParent,
+    )> {
+        let (model, parent) = self.refinement_parent_view(level)?;
+        Ok((model, parent.binding().clone()))
+    }
+    pub(crate) fn refinement_parent_view(
+        &self,
+        level: &str,
+    ) -> PyResult<(
+        TritModelReader<File>,
+        tritium_evidence::NativeRefinementParentView,
+    )> {
+        use tritium_evidence::NativeRefinementParentView;
+        let (mut model, log, _) = open_bound_model(
+            Path::new(&self.output_dir),
+            self.max_package_bytes,
+            self.evidence_bytes,
+        )?;
+        if hex(model.package_id().as_bytes()) != self.package_id
+            || log.root_digest != self.evidence_root
+        {
+            return Err(error("conversion package or evidence identity changed"));
+        }
+        let mut parents = Vec::new();
+        for view in tritium_evidence::QuantizationReceiptView::fold(&log).map_err(error)? {
+            parents.push(
+                NativeRefinementParentView::from_quantization(&mut model, level, &view)
+                    .map_err(error)?,
+            );
+        }
+        for view in
+            tritium_evidence::CalibratedQuantizationReceiptView::fold(&log).map_err(error)?
+        {
+            parents.push(
+                NativeRefinementParentView::from_calibrated(&mut model, level, &view)
+                    .map_err(error)?,
+            );
+        }
+        for view in tritium_evidence::OwnerQuantizationReceiptView::fold(&log).map_err(error)? {
+            parents.push(
+                NativeRefinementParentView::from_owner(&mut model, level, &view).map_err(error)?,
+            );
+        }
+        if parents.len() != 1 {
+            return Err(error("exactly one native refinement parent required"));
+        }
+        Ok((model, parents.remove(0)))
+    }
+    pub(crate) fn root(&self) -> &Path {
+        Path::new(&self.output_dir)
+    }
     /// Reopen an engine package/log without trusting caller identity fields.
-    fn open_inner(
+    pub(crate) fn open_inner(
         py: Python<'_>,
         output_dir: String,
         max_package_bytes: u64,
@@ -115,12 +203,8 @@ impl NativeModelConversion {
             .into_string()
             .map_err(|_| error("output path is not UTF-8"))?;
         py.detach(|| {
-            let bytes = read_original_file_bounded(&root.join("model.trit"), max_package_bytes)
-                .map_err(error)?;
-            let text = read_original_file_bounded(&root.join("evidence.jsonl"), max_evidence_bytes)
-                .map_err(error)?;
-            let log = verify_jsonl(std::str::from_utf8(&text).map_err(error)?).map_err(error)?;
-            verify_package_with_fit_log(&bytes, &log).map_err(error)?;
+            let (model, log, evidence_bytes) =
+                open_bound_model(&root, max_package_bytes, max_evidence_bytes)?;
             let mut ids = tritium_evidence::QuantizationReceiptView::fold(&log)
                 .map_err(error)?
                 .into_iter()
@@ -141,7 +225,6 @@ impl NativeModelConversion {
             if ids.len() != 1 {
                 return Err(error("exactly one conversion identity required"));
             }
-            let model = tritium_format::trit_model::read_trit_model(&bytes).map_err(error)?;
             let model_ids = model
                 .manifest()
                 .levels
@@ -168,16 +251,26 @@ impl NativeModelConversion {
                 run_id,
                 publication_warnings: Vec::new(),
                 max_package_bytes,
-                evidence_bytes: text.len() as u64,
+                evidence_bytes,
             })
         })
     }
-    fn verified_bytes(&self) -> PyResult<Vec<u8>> {
-        self.verified_bytes_bounded(self.max_package_bytes)
-    }
-    fn verified_bytes_bounded(&self, maximum: u64) -> PyResult<Vec<u8>> {
-        self.verified_contents_bounded(maximum, self.evidence_bytes)
-            .map(|(bytes, _)| bytes)
+    fn verified_model_bounded(
+        &self,
+        maximum: u64,
+        evidence_maximum: u64,
+    ) -> PyResult<TritModelReader<File>> {
+        let (model, log, _) = open_bound_model(
+            Path::new(&self.output_dir),
+            self.max_package_bytes.min(maximum),
+            self.evidence_bytes.min(evidence_maximum),
+        )?;
+        if hex(model.package_id().as_bytes()) != self.package_id
+            || log.root_digest != self.evidence_root
+        {
+            return Err(error("conversion package or evidence identity changed"));
+        }
+        Ok(model)
     }
     fn verified_contents_bounded(
         &self,
@@ -211,6 +304,68 @@ impl NativeModelConversion {
 }
 #[pymethods]
 impl NativeModelConversion {
+    #[pyo3(signature=(plan_json,matrices,*,max_snapshot_bytes,max_parent_bytes,checkpoint=None,recorded_resume=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn begin_pv_training(
+        &self,
+        py: Python<'_>,
+        plan_json: &str,
+        matrices: Vec<(String, Py<crate::model_level::NativePackedMatrix>)>,
+        max_snapshot_bytes: u64,
+        max_parent_bytes: u64,
+        checkpoint: Option<&Bound<'_, PyBytes>>,
+        recorded_resume: Option<(PyRef<'_, crate::native_pv::NativePvResumeBundle>, String)>,
+    ) -> PyResult<crate::native_pv::NativePvTraining> {
+        crate::native_pv::begin(
+            py,
+            self.clone().into(),
+            matrices,
+            crate::native_pv::BeginOptions {
+                plan_json,
+                max_snapshot_bytes,
+                max_parent_bytes,
+                checkpoint: checkpoint.map(|b| b.as_bytes()),
+                recorded_resume: recorded_resume
+                    .as_ref()
+                    .map(|(bundle, text)| (&**bundle, text.as_str())),
+            },
+        )
+    }
+    /// Actual original parent tuple for an explicit native scale request.
+    fn native_refinement_parent(&self, py: Python<'_>, level: &str) -> PyResult<String> {
+        py.detach(|| serde_json::to_string(&self.refinement_parent(level)?.1).map_err(error))
+    }
+
+    #[pyo3(signature=(plan_json, matrices, *, max_snapshot_bytes, max_parent_bytes, checkpoint=None, recorded_resume=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn begin_scale_training(
+        &self,
+        py: Python<'_>,
+        plan_json: &str,
+        matrices: Vec<(String, Py<crate::model_level::NativePackedMatrix>)>,
+        max_snapshot_bytes: u64,
+        max_parent_bytes: u64,
+        checkpoint: Option<&Bound<'_, PyBytes>>,
+        recorded_resume: Option<(
+            PyRef<'_, crate::native_scale::NativeScaleResumeBundle>,
+            String,
+        )>,
+    ) -> PyResult<crate::native_scale::NativeScaleTraining> {
+        crate::native_scale::begin(
+            py,
+            self.clone().into(),
+            matrices,
+            crate::native_scale::BeginOptions {
+                plan_json,
+                max_snapshot_bytes,
+                max_parent_bytes,
+                checkpoint: checkpoint.map(|b| b.as_bytes()),
+                recorded_resume: recorded_resume
+                    .as_ref()
+                    .map(|(bundle, text)| (&**bundle, text.as_str())),
+            },
+        )
+    }
     #[staticmethod]
     #[pyo3(signature=(output_dir, *, max_package_bytes=8_589_934_592, max_evidence_bytes=16_777_216))]
     fn open(
@@ -230,7 +385,7 @@ impl NativeModelConversion {
         max_evidence_bytes: Option<u64>,
     ) -> PyResult<()> {
         py.detach(|| {
-            self.verified_contents_bounded(
+            self.verified_model_bounded(
                 max_package_bytes.unwrap_or(self.max_package_bytes),
                 max_evidence_bytes.unwrap_or(self.evidence_bytes),
             )
@@ -238,7 +393,7 @@ impl NativeModelConversion {
         })
     }
     /// Export the verified original files without refitting or changing identities.
-    /// Whole-package buffering is bounded, not a full-process RSS guarantee.
+    /// Uses checked bounded package chunks, not a full-process RSS guarantee.
     #[pyo3(signature=(output_dir, *, max_package_bytes=None, max_evidence_bytes=None))]
     fn export(
         &self,
@@ -260,12 +415,36 @@ impl NativeModelConversion {
             .unwrap_or(self.max_package_bytes)
             .min(self.max_package_bytes);
         py.detach(|| {
-            let (bytes, text) = self.verified_contents_bounded(
-                maximum,
-                max_evidence_bytes.unwrap_or(self.evidence_bytes),
-            )?;
+            let evidence_maximum = max_evidence_bytes
+                .unwrap_or(self.evidence_bytes)
+                .min(self.evidence_bytes);
+            if maximum == 0 || evidence_maximum == 0 {
+                return Err(error("package and evidence byte limits must be positive"));
+            }
+            let root = Path::new(&self.output_dir);
+            let text = read_original_file_bounded(&root.join("evidence.jsonl"), evidence_maximum)
+                .map_err(error)?;
+            let text = std::str::from_utf8(&text).map_err(error)?;
+            if verify_jsonl(text).map_err(error)?.root_digest != self.evidence_root {
+                return Err(error("conversion package or evidence identity changed"));
+            }
+            let expected = tritium_format::PackageId::from_digest(
+                *blake3::Hash::from_hex(&self.package_id)
+                    .map_err(error)?
+                    .as_bytes(),
+            );
+            let metadata_maximum = usize::try_from(maximum).unwrap_or(usize::MAX);
             let warnings = DirectoryTensorSink::new(&output_dir)
-                .publish_verified_model(&bytes, std::str::from_utf8(&text).map_err(error)?)
+                .publish_verified_model_reader(
+                    open_original_file(&root.join("model.trit")).map_err(error)?,
+                    TritPackageReadLimits {
+                        max_source_bytes: maximum,
+                        max_manifest_bytes: metadata_maximum,
+                        max_directory_bytes: metadata_maximum,
+                    },
+                    expected,
+                    text,
+                )
                 .map_err(|failure| match failure {
                     QuantEngineError::DestinationExists => {
                         PyFileExistsError::new_err("output directory already exists")
@@ -338,13 +517,22 @@ impl NativeModelConversion {
             return Err(error("max_bytes must be positive"));
         }
         let payload = py.detach(|| {
-            let bytes = self.verified_bytes()?;
-            let model = tritium_format::trit_model::read_trit_model(&bytes).map_err(error)?;
-            let payload = model.asset(name).map_err(error)?;
-            if payload.len() > max_bytes {
+            let mut model =
+                self.verified_model_bounded(self.max_package_bytes, self.evidence_bytes)?;
+            let length = model.asset_byte_len(name).map_err(error)?;
+            if length > max_bytes as u64 {
                 return Err(error("asset exceeds byte limit"));
             }
-            Ok::<_, PyErr>(payload.to_vec())
+            let mut payload = Vec::new();
+            payload.try_reserve_exact(length as usize).map_err(error)?;
+            model
+                .visit_asset(name, |chunk| {
+                    payload.extend_from_slice(chunk);
+                    Ok::<_, std::convert::Infallible>(())
+                })
+                .map_err(error)?;
+            model.verify().map_err(error)?;
+            Ok::<_, PyErr>(payload)
         })?;
         Ok(PyBytes::new(py, &payload))
     }
@@ -361,18 +549,28 @@ impl NativeModelConversion {
             return Err(error("max_bytes must be positive"));
         }
         let (precision, shape, payload) = py.detach(|| {
-            let bytes = self.verified_bytes()?;
-            let model = tritium_format::trit_model::read_trit_model(&bytes).map_err(error)?;
-            let (meta, payload) = model.tensor(level, name).map_err(error)?;
-            if payload.len() > max_bytes {
+            let mut model =
+                self.verified_model_bounded(self.max_package_bytes, self.evidence_bytes)?;
+            let length = model.tensor_byte_len(level, name).map_err(error)?;
+            if length > max_bytes as u64 {
                 return Err(error("preserved tensor exceeds byte limit"));
             }
-            match &meta.storage {
+            let (precision, shape) = match &model.tensor_meta(level, name).map_err(error)?.storage {
                 TensorStorage::Dense { precision, shape } => {
-                    Ok((format!("{precision:?}"), shape.clone(), payload.to_vec()))
+                    (format!("{precision:?}"), shape.clone())
                 }
-                _ => Err(error("requested tensor is not dense-preserved")),
-            }
+                _ => return Err(error("requested tensor is not dense-preserved")),
+            };
+            let mut payload = Vec::new();
+            payload.try_reserve_exact(length as usize).map_err(error)?;
+            model
+                .visit_tensor(level, name, |chunk| {
+                    payload.extend_from_slice(chunk);
+                    Ok::<_, std::convert::Infallible>(())
+                })
+                .map_err(error)?;
+            model.verify().map_err(error)?;
+            Ok((precision, shape, payload))
         })?;
         Ok((precision, shape, PyBytes::new(py, &payload)))
     }

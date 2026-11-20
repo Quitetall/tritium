@@ -47,6 +47,53 @@ def _identity(result):
     return (result.source_id, result.package_id, result.model_ids, result.evidence_root, result.run_id)
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space allowance")
+@pytest.mark.parametrize("operation", ["metadata", "asset", "preserved", "export"])
+def test_native_transient_access_does_not_allocate_a_package_image(tmp_path, operation):
+    import tritium
+    from test_native_module_source import StateModel, _prepared, _convert
+
+    model = StateModel()
+    with torch.no_grad(): model.a.bias.fill_(0.25)
+    prepared = _prepared(model)
+    prepared.model.register_buffer("large_preserved", torch.zeros(16 * 1024 * 1024))
+    result = _convert(
+        tmp_path, prepared,
+        limits=dict(max_source_bytes=128 * 1024**2, max_asset_bytes=32768,
+                    max_retained_blob_bytes=128 * 1024**2, max_package_bytes=128 * 1024**2),
+    )
+    assert (Path(result.output_dir) / "model.trit").stat().st_size > 64 * 1024**2
+    program = '''import importlib.util,json,os,resource,sys
+spec=importlib.util.spec_from_file_location("_tritium",sys.argv[1])
+native=importlib.util.module_from_spec(spec)
+spec.loader.exec_module(native)
+virtual=int(open("/proc/self/statm").read().split()[0])*os.sysconf("SC_PAGE_SIZE")
+soft,hard=resource.getrlimit(resource.RLIMIT_AS)
+limit=virtual+32*1024**2
+if soft!=resource.RLIM_INFINITY: limit=min(limit,soft)
+resource.setrlimit(resource.RLIMIT_AS,(limit,hard))
+opened=native.NativeModelConversion.open(sys.argv[2],max_package_bytes=128*1024**2)
+assert opened.package_id==sys.argv[3]
+opened.verify()
+if sys.argv[4]=="asset": assert opened.asset("config.json",max_bytes=2)==b"{}"
+if sys.argv[4]=="preserved":
+    assert opened.preserved_tensor("full","a.bias",max_bytes=4)==("F32",[1],b"\\x00\\x00\\x80>")
+if sys.argv[4]=="export":
+    copied=opened.export(sys.argv[5])
+    assert copied.package_id==opened.package_id and copied.evidence_root==opened.evidence_root
+    copied.verify()
+print("bounded native transient access",sys.argv[4])
+'''
+    completed = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", program,
+         str(Path(tritium._tritium.__file__).resolve()), result.output_dir, result.package_id,
+         operation, str(tmp_path / "exported")],
+        env=dict(os.environ, CUDA_VISIBLE_DEVICES="", RAYON_NUM_THREADS="1"),
+        capture_output=True, text=True, timeout=90,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 @pytest.mark.parametrize("mode", ["plain", "calibrated", "owner"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_actual_native_exports_preserve_bytes_identities_and_standalone_load(tmp_path, mode, dtype):

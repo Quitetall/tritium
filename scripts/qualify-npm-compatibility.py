@@ -19,7 +19,7 @@ NpmReceiptError = NPM["NpmReceiptError"]
 
 SCHEMA = "tritium.compatibility-receipt.v1"
 TARGET_ID = "node-22"
-RELEASE_PATTERN = re.compile(r"1\.1\.0-rc\.(0|[1-9][0-9]*)")
+RELEASE_PATTERN = runpy.run_path(Path(__file__).with_name("_release_version.py"))["RELEASE_PATTERN"]
 REVISION_PATTERN = re.compile(r"[0-9a-f]{40}")
 FIELDS = {
     "schema",

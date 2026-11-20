@@ -61,6 +61,7 @@ fn main() {
     // The DFlash speculative drafter (int8 weights, f16 tensor cores).
     println!("cargo:rerun-if-changed=kernels/dflash.cu");
     println!("cargo:rerun-if-changed=kernels/semantic_additive.cu");
+    println!("cargo:rerun-if-changed=kernels/qtea.cu");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
@@ -92,6 +93,7 @@ fn main() {
             "salt_v2_mma.ptx",
             "dflash.ptx",
             "semantic_additive.ptx",
+            "qtea.ptx",
         ] {
             std::fs::write(out_dir.join(ptx), "")
                 .expect("tritium-cuda: failed to write check-only placeholder PTX");
@@ -224,6 +226,13 @@ fn main() {
         &out_dir.join("semantic_additive.ptx"),
         add_min_arch,
         &["--fmad=false"],
+    );
+    compile_ptx(
+        &nvcc,
+        Path::new("kernels/qtea.cu"),
+        &out_dir.join("qtea.ptx"),
+        add_min_arch,
+        &["--fmad=false", "--ftz=false", "--prec-div=true"],
     );
 }
 

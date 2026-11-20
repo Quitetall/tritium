@@ -73,6 +73,19 @@ def tar_entry(name: str, payload: bytes, *, kind: bytes = tarfile.REGTYPE) -> ta
 
 
 class DeploymentSbomTests(unittest.TestCase):
+    def test_final_chart_archive_and_sbom_bind_the_final_version(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            release = "1.1.0"
+            source = chart_source(root, release)
+            artifact = root / f"tritium-{release}.tgz"
+            package_chart(source, artifact, release)
+            document = generate(artifact, "tritium-helm", "helm-chart", release,
+                                REVISION, str(fake_tool(root)))
+            self.assertEqual(document["metadata"]["component"]["version"], release)
+            with self.assertRaises(ChartPackageError):
+                package_chart(source, root / f"tritium-{RELEASE}.tgz", RELEASE)
+
     def test_oci_archive_has_complete_closed_attested_inventory(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

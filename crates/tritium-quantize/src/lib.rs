@@ -40,6 +40,7 @@ mod conversion;
 pub mod engine;
 pub mod fisher;
 mod plane;
+pub mod qtea_reference;
 mod quantize;
 mod qwen35_coverage;
 mod recon;
@@ -104,7 +105,8 @@ pub use salt_v2_allocator::{
 };
 pub use salt_v2_curvature::{
     CurvatureError, CurvatureSourceId, IndexedOutputFisherAccumulator, InputGram,
-    InputGramAccumulator, KfacMetric, OutputFisher, OutputFisherAccumulator, build_kfac_metric,
+    InputGramAccumulator, InputGramDecodeError, KfacMetric, OutputFisher, OutputFisherAccumulator,
+    build_kfac_metric,
 };
 pub use salt_v2_evidence::{
     DEFAULT_MAX_KRONECKER_EVIDENCE_BYTES, MAX_KRONECKER_REDUCTION_SEGMENTS,

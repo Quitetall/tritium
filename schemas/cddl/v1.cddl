@@ -364,7 +364,11 @@ level_fit = {
   "ImportedPrefixOf": {
     "level": tstr
   }
-} / "Imported"
+} / "Imported" / {
+  "Refined": {
+    "ancestry": native_refinement_ancestry
+  }
+}
 
 loaded_source_identity = {
   "Trit": {
@@ -375,6 +379,11 @@ loaded_source_identity = {
 } / {
   "HuggingFace": {
     "reason": unknown_reason
+  }
+} / {
+  "Qtea": {
+    "declared_source_model": [32*32 0..255],
+    "package_id": package_id
   }
 }
 
@@ -422,6 +431,154 @@ named_asset_digest = {
 named_tensor_digest = {
   "content": semantic_tensor_digest,
   "name": tstr
+}
+
+native_adam_w_recipe = {
+  "beta1": float,
+  "beta2": float,
+  "eps": float,
+  "lr": float,
+  "weight_decay": float
+}
+
+native_pv_replay_observed = {
+  "checkpoint": blob_id,
+  "checkpoint_bytes": uint,
+  "completed_updates": uint,
+  "journal": blob_id,
+  "journal_bytes": uint,
+  "plan": native_refinement_plan_id
+}
+
+native_pv_resume_manifest = {
+  "plan": native_refinement_plan,
+  "point": native_pv_resume_point
+}
+
+native_pv_resume_point = {
+  "checkpoint": blob_id,
+  "checkpoint_bytes": uint,
+  "completed_updates": uint,
+  "journal_prefix": blob_id,
+  "journal_prefix_bytes": uint,
+  "plan": native_refinement_plan_id
+}
+
+native_recovery_recipe = {
+  "ScaleOnly": {
+    "optimizer": native_adam_w_recipe
+  }
+} / {
+  "AlternatingPv": {
+    "code_optimizer": native_adam_w_recipe,
+    "continuous_optimizer": native_adam_w_recipe,
+    "max_code_change_fraction": float,
+    ? "max_relative_code_change": float / nil
+  }
+}
+
+native_refinement_ancestry = {
+  "evidence": evidence_reference,
+  "parent": native_refinement_parent,
+  "plan": native_refinement_plan_id
+}
+
+native_refinement_checkpointed = {
+  "checkpoint": blob_id,
+  "checkpoint_bytes": uint,
+  "completed_updates": uint,
+  "owners": [* native_refinement_tensor_output],
+  "plan": native_refinement_plan_id,
+  "state": native_refinement_state_id,
+  "state_payload_bytes": uint
+}
+
+native_refinement_completed = {
+  "checkpoint": blob_id,
+  "plan": native_refinement_plan_id,
+  "tensors": [* native_refinement_tensor_output],
+  "validation": [* native_refinement_validation]
+}
+
+native_refinement_execution = {
+  "backend": tstr,
+  "device": tstr,
+  "source_revision": tstr
+}
+
+native_refinement_limits = {
+  "max_checkpoint_bytes": uint,
+  "max_package_bytes": uint,
+  "max_state_bytes": uint,
+  "max_workspace_bytes": uint
+}
+
+native_refinement_parent = {
+  "evidence": evidence_reference,
+  "level": tstr,
+  "model": model_id,
+  "package": package_id,
+  "source": original_source_id
+}
+
+native_refinement_plan = {
+  "child_level": tstr,
+  "limits": native_refinement_limits,
+  "objective": [32*32 0..255],
+  "owners": [* tstr],
+  "parent": native_refinement_parent,
+  "recipe": native_recovery_recipe,
+  ? "teacher_source": original_source_id / nil,
+  "training": [* native_refinement_window],
+  "validation": [* native_refinement_window]
+}
+
+native_refinement_plan_id = [32*32 0..255]
+
+native_refinement_started = {
+  "execution": native_refinement_execution,
+  "plan": native_refinement_plan
+}
+
+native_refinement_state_id = [32*32 0..255]
+
+native_refinement_tensor_output = {
+  "content": blob_id,
+  "name": tstr
+}
+
+native_refinement_validation = {
+  "child_loss": float,
+  "content": [32*32 0..255],
+  "parent_loss": float
+}
+
+native_refinement_window = {
+  "content": [32*32 0..255],
+  "weight": float
+}
+
+native_scale_replay_observed = {
+  "checkpoint": blob_id,
+  "checkpoint_bytes": uint,
+  "completed_updates": uint,
+  "journal": blob_id,
+  "journal_bytes": uint,
+  "plan": native_refinement_plan_id
+}
+
+native_scale_resume_manifest = {
+  "plan": native_refinement_plan,
+  "point": native_scale_resume_point
+}
+
+native_scale_resume_point = {
+  "checkpoint": blob_id,
+  "checkpoint_bytes": uint,
+  "completed_updates": uint,
+  "journal_prefix": blob_id,
+  "journal_prefix_bytes": uint,
+  "plan": native_refinement_plan_id
 }
 
 original_captured_salience_conversion_manifest = {

@@ -12,6 +12,13 @@
       "KroneckerSharedForwardGroup",
       "KroneckerStateError",
       "NativeModelConversion",
+      "NativeModelRefinement",
+      "NativePvPagedGradientLimits",
+      "NativePvPagedResumeBundle",
+      "NativePvPagedTrainingLimits",
+      "NativePvPagedVerificationLimits",
+      "NativePvResumeBundle",
+      "NativeScaleResumeBundle",
       "Qwen36KroneckerCaptureReceipt",
       "Qwen36KroneckerCaptureSession",
       "Qwen36KroneckerCaptureTask",
@@ -36,6 +43,7 @@
       "nn",
       "onnx",
       "portable",
+      "qtea",
       "salt",
       "ste_absmean_scale",
       "ste_quantize_forward",
@@ -48,7 +56,7 @@
       "ternary_matmul"
     ]
   },
-  "report_id": "sha256:7ac118e65654124a24fb3f38afd8d6d202fa54da68eae6e76ad3d0d0bc3e1382",
+  "report_id": "sha256:65cfbf8ca729e510111066fb62b07dde79729af3cd8bb8623a2a9269c503d118",
   "rust": {
     "frozen_crates": [
       "tritium-core",

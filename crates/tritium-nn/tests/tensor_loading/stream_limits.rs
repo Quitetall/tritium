@@ -3,6 +3,172 @@ use super::*;
 use tritium_evidence::{EvidenceEvent, MODEL_LOADED_REGISTRATION};
 use tritium_nn::{ModelSource, StreamLimits};
 
+struct HeadProbe {
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    fail_at: Option<usize>,
+    cancel_at: Option<usize>,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+impl TernaryBackend for HeadProbe {
+    fn device_id(&self) -> &str {
+        "cpu-prefill-head-probe"
+    }
+    fn capabilities(&self) -> tritium_spec::DeviceCaps {
+        tritium_cpu::CpuBackend::new().capabilities()
+    }
+    fn tensor_caps(
+        &self,
+        tensor: TensorView<'_>,
+    ) -> Result<Option<tritium_spec::TensorCaps>, tritium_spec::BackendError> {
+        tritium_cpu::CpuBackend::new().tensor_caps(tensor)
+    }
+    fn upload_tensor(
+        &self,
+        tensor: TensorView<'_>,
+    ) -> Result<Box<dyn tritium_spec::DeviceBuffer>, tritium_spec::BackendError> {
+        tritium_cpu::CpuBackend::new().upload_tensor(tensor)
+    }
+    fn upload_weights(
+        &self,
+        packed: &[u8],
+        shape: tritium_core::GemmShape,
+        format: tritium_core::TernaryFormat,
+    ) -> Result<Box<dyn tritium_spec::DeviceBuffer>, tritium_spec::BackendError> {
+        tritium_cpu::CpuBackend::new().upload_weights(packed, shape, format)
+    }
+    fn mpgemm(&self, p: tritium_spec::MpGemm<'_>) -> Result<(), tritium_spec::BackendError> {
+        tritium_cpu::CpuBackend::new().mpgemm(p)
+    }
+    fn embed_rows(
+        &self,
+        tensor: &dyn tritium_spec::DeviceBuffer,
+        ids: &[usize],
+        out: &mut [f32],
+    ) -> Result<(), tritium_spec::BackendError> {
+        tritium_cpu::CpuBackend::new().embed_rows(tensor, ids, out)
+    }
+    fn matmul(&self, p: tritium_spec::TensorMatmul<'_>) -> Result<(), tritium_spec::BackendError> {
+        use std::sync::atomic::Ordering;
+        // This fixture has vocab10, hidden8, query12, KV6 and FF16: only
+        // the untied final head produces ten values at batch1.
+        let head = p.batch == 1 && p.out.len() == 10;
+        let call = if head {
+            self.calls.fetch_add(1, Ordering::SeqCst) + 1
+        } else {
+            0
+        };
+        if head && self.fail_at == Some(call) {
+            return Err(tritium_spec::BackendError::Backend(
+                "injected prefill head failure".into(),
+            ));
+        }
+        tritium_cpu::CpuBackend::new().matmul(p)?;
+        if head && self.cancel_at == Some(call) {
+            self.cancelled.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn segmented_prefill_head_projection_count_and_transaction_contract() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    let (_hf, package) = fixture_with_tie(false);
+    let bytes = package.bytes();
+    let policy = StreamLimits {
+        max_context: 6,
+        max_segment_tokens: 2,
+        max_host_cache_payload_bytes: 288,
+    };
+    for (fail_at, cancel_at) in [
+        (None, None),
+        (Some(1), None),
+        (Some(2), None),
+        (None, Some(1)),
+        (None, Some(2)),
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let budget = TensorPayloadBudget::new(100_000);
+        let source = ModelSource::Trit {
+            bytes: &bytes,
+            level: "standard",
+        };
+        let mut loaded = bounded(
+            source,
+            Box::new(HeadProbe {
+                calls: calls.clone(),
+                fail_at,
+                cancel_at,
+                cancelled: cancelled.clone(),
+            }),
+            &budget,
+            policy,
+            &mut record(),
+        )
+        .unwrap();
+        let mut oracle = bounded(
+            source,
+            Box::new(tritium_cpu::CpuBackend::new()),
+            &budget,
+            policy,
+            &mut record(),
+        )
+        .unwrap();
+        oracle.runner.forward(&[1, 2], &[0, 1]).unwrap();
+        let expected = oracle.runner.forward(&[3, 4], &[2, 3]).unwrap();
+        assert!(
+            loaded
+                .runner
+                .prefill_segmented_cancellable(&[u32::MAX], &|| true)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let result = loaded
+            .runner
+            .prefill_segmented_cancellable(&[1, 2, 3, 4], &|| cancelled.load(Ordering::SeqCst));
+        if fail_at.is_some() {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected prefill head failure")
+            );
+        } else if cancel_at.is_some() {
+            assert!(result.unwrap().is_none());
+        } else {
+            assert_eq!(result.unwrap().unwrap(), expected);
+        }
+        let boundary = fail_at.or(cancel_at);
+        let prefix = boundary.map_or(4, |n| 2 * (n - 1));
+        assert_eq!(loaded.runner.cache_len(), prefix);
+        // Final-row logits are discarded by the outer loop, but head errors
+        // and cancellation still guard each segment's publication. Deferring
+        // those checks is a contract change, not a local dead-code removal.
+        assert_eq!(calls.load(Ordering::SeqCst), boundary.unwrap_or(2));
+        cancelled.store(false, Ordering::SeqCst);
+        if prefix == 0 {
+            loaded.runner.forward(&[1, 2], &[0, 1]).unwrap();
+        }
+        if prefix != 4 {
+            assert_eq!(loaded.runner.forward(&[3, 4], &[2, 3]).unwrap(), expected);
+        }
+        for token in [5, 6] {
+            assert_eq!(
+                loaded.runner.step(token).unwrap(),
+                oracle.runner.step(token).unwrap()
+            );
+        }
+        drop(loaded);
+        drop(oracle);
+        assert_eq!(budget.used_bytes(), 0);
+    }
+}
+
 pub(super) fn tokenizer() -> Vec<u8> {
     let vocabulary = (0..10).map(|i| (format!("t{i}"), i as u32)).collect();
     let model = tokenizers::models::wordlevel::WordLevel::builder()

@@ -119,6 +119,33 @@ For QAT, Hugging Face, refinement, ONNX, and browser workflows, use the
 headless-testable, but its clean candidate-wheel/Colab receipt is still a release
 gate rather than a published quick-start claim.
 
+### Owner-paged native training (source API)
+
+With `tritium-train/native-cpu`, `NativeCpuPvPagedSession` binds seek-backed
+P/V optimizer state to exact current immutable CPU packed handles. It stages
+owner-by-owner packed Matmul/Embed updates and a standard recorded checkpoint and
+gradient frame. Let the original-parent source scope finish successfully before
+committing the opaque update to the journal; then explicitly switch to the
+returned complete driver. The previous driver and graph handles remain unchanged
+recovery views, and handles retained by old graphs continue to consume their
+packed-payload budget.
+
+Numerical owner scratch, consumer reduction, recorded disk/scratch, original
+source decoding and packed payloads have separate limits. This is not within-owner
+paging, GPU training or a physical RSS/VRAM measurement. Python/Torch callers can
+explicitly select `native_pv_paged_training` with `NativePvPagedTrainingLimits`
+and a new private workspace for recorded updates, streamed resume bundles and
+child publication. Optional `NativePvPagedGradientLimits` capture uses scalar
+autograd tokens and a bounded private adjoint spool instead of all-owner Torch
+gradient leaves. Capture streams stored-coordinate adjoints with at most16MiB
+of f64 contribution scratch rather than exporting a full owner VJP. One numerical
+optimizer owner, step-transfer buffers, activations, packed models and disk/I/O
+costs still remain; this is not whole-model memory qualification. The high-level
+teacher/data `refine` workflow explicitly selects this storage with
+`NativePvPagedRefinementConfig` and mandatory bounded capture. Default resident
+controllers/configuration retain their existing semantics. See [training](docs/book/src/training.md)
+for the storage/graph limits; model qualification remains open.
+
 ## Native inference from source
 
 The default workspace build is CPU-only and uses Cargo—no CMake:

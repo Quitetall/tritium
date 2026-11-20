@@ -7,6 +7,13 @@ PyTorch is installed — the :mod:`tritium.torch` research facade, :mod:`tritium
 
 from ._tritium import (
     NativeModelConversion,
+    NativeModelRefinement,
+    NativePvPagedVerificationLimits,
+    NativePvPagedTrainingLimits,
+    NativePvPagedGradientLimits,
+    NativePvPagedResumeBundle,
+    NativeScaleResumeBundle,
+    NativePvResumeBundle,
     convert_model_plan,
     KroneckerConflictError,
     KroneckerContractError,
@@ -41,10 +48,17 @@ from ._tritium import (
     ste_quantize_vjp,
     ternary_matmul,
 )
-from . import onnx, portable, salt
+from . import onnx, portable, qtea, salt
 
 __all__ = [
     "NativeModelConversion",
+    "NativeModelRefinement",
+    "NativePvPagedVerificationLimits",
+    "NativePvPagedTrainingLimits",
+    "NativePvPagedGradientLimits",
+    "NativePvPagedResumeBundle",
+    "NativeScaleResumeBundle",
+    "NativePvResumeBundle",
     "convert_model_plan",
     "KroneckerConflictError",
     "KroneckerContractError",
@@ -81,6 +95,7 @@ __all__ = [
     "salt",
     "onnx",
     "portable",
+    "qtea",
 ]
 
 # The torch wrappers are optional: importing them requires PyTorch. Inference (Model/ternary_matmul)

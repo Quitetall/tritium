@@ -12,6 +12,7 @@ import math
 import os
 import platform
 import re
+import runpy
 import tempfile
 import time
 from pathlib import Path
@@ -19,6 +20,9 @@ from urllib.parse import unquote, urlparse
 
 
 SCHEMA = "tritium.wheel-functional-smoke.v1"
+_VERSION_POLICY = runpy.run_path(Path(__file__).with_name("_release_version.py"))
+RELEASE_PATTERN = _VERSION_POLICY["RELEASE_PATTERN"]
+_pypi_version = _VERSION_POLICY["pypi_version"]
 RECEIPT_SCHEMA = "tritium.wheel-functional-qualification.v1"
 RECEIPT_FIELDS = {
     "schema", "receipt_id", "release", "run_id", "started_at_utc",
@@ -331,7 +335,7 @@ def build_receipt(
     evidence: dict[str, object], wheel: Path, release: str, run_id: str,
     started_at_utc: str, duration_ms: float,
 ) -> dict[str, object]:
-    if re.fullmatch(r"1\.1\.0-rc\.(0|[1-9][0-9]*)", release) is None:
+    if RELEASE_PATTERN.fullmatch(release) is None:
         raise SmokeError("release must be a canonical v1.1 candidate")
     if not run_id:
         raise SmokeError("run id must be non-empty")
@@ -411,7 +415,7 @@ def validate_receipt(
         raise SmokeError("functional evidence source revision mismatch")
     if evidence["wheel"] != wheel.name or evidence["wheel_sha256"] != expected_artifact["sha256"]:
         raise SmokeError("functional evidence wheel identity mismatch")
-    expected_version = release.replace("1.1.0-rc.", "1.1.0rc")
+    expected_version = _pypi_version(release)
     if evidence["distribution_version"] != expected_version:
         raise SmokeError("functional evidence package version mismatch")
     for field in (

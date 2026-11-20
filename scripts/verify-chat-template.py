@@ -35,17 +35,25 @@ def main():
         ("invalid-role", [{"role": "invalid", "content": "Hi"}]),
     ]
     results = []
-    for name, messages in fixtures:
+    for name, messages, thinking in [
+        (name, messages, thinking)
+        for name, messages in fixtures
+        for thinking in [None, True, False]
+    ]:
+        if thinking is not None:
+            name = f"{name}-thinking-{str(thinking).lower()}"
+        options = {} if thinking is None else {"enable_thinking": thinking}
         try:
-            prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            encoded = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+            prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, **options)
+            encoded = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, **options)
             ids = encoded["input_ids"] if isinstance(encoded, Mapping) else encoded
             hf_error = None
         except Exception as error:
             hf_error = type(error).__name__
         probe = subprocess.run(
             [str(args.probe_bin.resolve()), str(args.source_dir / "tokenizer.json"),
-             str(args.source_dir / "tokenizer_config.json"), json.dumps(messages, ensure_ascii=False)],
+             str(args.source_dir / "tokenizer_config.json"), json.dumps(messages, ensure_ascii=False)]
+            + ([] if thinking is None else [str(thinking).lower()]),
             capture_output=True, text=True, timeout=30, check=False,
         )
         if hf_error:

@@ -34,6 +34,179 @@ fn parent() -> PvTernaryWeight {
 }
 
 #[test]
+fn accepted_extreme_finite_gradient_steps_must_reopen_their_own_checkpoint() {
+    let parent = PvTernaryWeight::new(
+        1,
+        2,
+        2,
+        PvTernaryStructure::Dense,
+        vec![PvTernaryPlane::new(vec![1, -1], vec![f16::ONE])],
+    )
+    .unwrap();
+    let config = recipe(0.5, None);
+    let mut ordinary = PvTuningSession::new(parent.clone(), config).unwrap();
+    ordinary.step(&[1e18, 1e18], 1).unwrap();
+    assert_eq!(ordinary.weight().digest(), parent.digest());
+    let valid_checkpoint = ordinary.checkpoint_bytes().unwrap();
+    assert!(PvTuningSession::resume(parent.clone(), config, &valid_checkpoint).is_ok());
+    let mut blocked = PvTuningSession::new(parent.clone(), config).unwrap();
+    blocked.begin_blockwise_step(1, 2).unwrap();
+    let before_block = blocked.blockwise_checkpoint_bytes().unwrap();
+    assert!(matches!(
+        blocked.apply_gradient_block(0, &[f32::MAX, f32::MAX]),
+        Err(PvTuningError::Step(_))
+    ));
+    assert_eq!(blocked.blockwise_checkpoint_bytes().unwrap(), before_block);
+    let mut session = PvTuningSession::new(parent.clone(), config).unwrap();
+    let before = session.checkpoint_bytes().unwrap();
+    // Equal gradients cancel in the scale derivative for these opposite trits.
+    // Both input elements themselves remain finite.
+    let result = session.step(&[f32::MAX, f32::MAX], 1);
+    match result {
+        Ok(receipt) => {
+            assert_eq!(session.weight().digest(), parent.digest());
+            let checkpoint = session.checkpoint_bytes().unwrap();
+            let reopened = PvTuningSession::resume(parent, config, &checkpoint);
+            assert!(
+                reopened.is_ok(),
+                "accepted step {receipt:?} produced an unreopenable checkpoint: {reopened:?}"
+            );
+        }
+        Err(PvTuningError::Step(message)) => {
+            assert_eq!(message, "code optimizer moment update became non-finite");
+            assert_eq!(session.completed_step(), 0);
+            assert_eq!(session.checkpoint_bytes().unwrap(), before);
+            let restored = PvTuningSession::resume(parent, config, &before).unwrap();
+            assert_eq!(restored.state_digest(), session.state_digest());
+            session.step(&[1e18, 1e18], 1).unwrap();
+            assert_eq!(session.checkpoint_bytes().unwrap(), valid_checkpoint);
+        }
+        Err(other) => panic!("unexpected step failure: {other:?}"),
+    }
+}
+
+fn scale_moment_checkpoint_safety(blockwise: bool) {
+    let parent = PvTernaryWeight::new(
+        1,
+        2,
+        2,
+        PvTernaryStructure::Dense,
+        vec![PvTernaryPlane::new(vec![1, -1], vec![f16::ONE])],
+    )
+    .unwrap();
+    let config = recipe(0.5, None);
+    let mut ordinary = PvTuningSession::new(parent.clone(), config).unwrap();
+    ordinary.step(&[1e18, -1e18], 1).unwrap();
+    let valid_checkpoint = ordinary.checkpoint_bytes().unwrap();
+    assert!(PvTuningSession::resume(parent.clone(), config, &valid_checkpoint).is_ok());
+
+    let mut session = PvTuningSession::new(parent.clone(), config).unwrap();
+    let before_step = session.checkpoint_bytes().unwrap();
+    let before_attempt = if blockwise {
+        session.begin_blockwise_step(1, 2).unwrap();
+        // Individual code moments remain finite; their trit-weighted scale
+        // derivative is larger and can overflow its squared moment.
+        session.apply_gradient_block(0, &[1e19, -1e19]).unwrap();
+        session.blockwise_checkpoint_bytes().unwrap()
+    } else {
+        before_step.clone()
+    };
+    let result = if blockwise {
+        session.finish_blockwise_step()
+    } else {
+        session.step(&[1e19, -1e19], 1)
+    };
+    match result {
+        Ok(receipt) => {
+            let checkpoint = session.checkpoint_bytes().unwrap();
+            let reopened = PvTuningSession::resume(parent, config, &checkpoint);
+            assert!(
+                reopened.is_ok(),
+                "accepted scale update blockwise={blockwise} {receipt:?} produced an unreopenable checkpoint: {reopened:?}"
+            );
+        }
+        Err(PvTuningError::Step(message)) => {
+            assert_eq!(
+                message,
+                "continuous optimizer moment update became non-finite"
+            );
+            assert_eq!(session.completed_step(), 0);
+            if blockwise {
+                assert_eq!(
+                    session.blockwise_checkpoint_bytes().unwrap(),
+                    before_attempt
+                );
+                let restored =
+                    PvTuningSession::resume_blockwise(parent.clone(), config, &before_attempt)
+                        .unwrap();
+                assert_eq!(restored.state_digest(), session.state_digest());
+            } else {
+                assert_eq!(session.checkpoint_bytes().unwrap(), before_step);
+            }
+            let mut retry = PvTuningSession::resume(parent, config, &before_step).unwrap();
+            retry.step(&[1e18, -1e18], 1).unwrap();
+            assert_eq!(retry.checkpoint_bytes().unwrap(), valid_checkpoint);
+        }
+        Err(other) => panic!("unexpected scale update failure: {other:?}"),
+    }
+}
+
+#[test]
+fn whole_scale_moment_overflow_does_not_commit_unreopenable_state() {
+    scale_moment_checkpoint_safety(false);
+}
+
+#[test]
+fn blockwise_scale_moment_overflow_does_not_commit_unreopenable_state() {
+    scale_moment_checkpoint_safety(true);
+}
+
+#[test]
+fn moment_overflow_after_resume_preserves_last_good_step_and_retry() {
+    let parent = PvTernaryWeight::new(
+        1,
+        2,
+        2,
+        PvTernaryStructure::Dense,
+        vec![PvTernaryPlane::new(vec![1, -1], vec![f16::ONE])],
+    )
+    .unwrap();
+    let optimizer = AdamW {
+        lr: 0.001,
+        beta1: 0.9,
+        beta2: 0.99,
+        eps: 1e-8,
+        weight_decay: 0.0,
+    };
+    let config = PvTuningConfig::builder(optimizer, optimizer)
+        .max_code_change_fraction(0.5)
+        .build()
+        .unwrap();
+    let mut session = PvTuningSession::new(parent.clone(), config).unwrap();
+    for step in 1..=3 {
+        session.step(&[1e20, 1e20], step).unwrap();
+    }
+    let last_good = session.checkpoint_bytes().unwrap();
+    let mut resumed = PvTuningSession::resume(parent.clone(), config, &last_good).unwrap();
+    assert_eq!(resumed.completed_step(), 3);
+    assert_eq!(
+        resumed.step(&[1e20, 1e20], 4),
+        Err(PvTuningError::Step(
+            "code optimizer moment update became non-finite".into()
+        ))
+    );
+    assert_eq!(resumed.completed_step(), 3);
+    assert_eq!(resumed.checkpoint_bytes().unwrap(), last_good);
+    let mut control = PvTuningSession::resume(parent.clone(), config, &last_good).unwrap();
+    let expected = control.step(&[1e18, 1e18], 4).unwrap();
+    assert_eq!(resumed.step(&[1e18, 1e18], 4).unwrap(), expected);
+    let final_bytes = resumed.checkpoint_bytes().unwrap();
+    assert_eq!(final_bytes, control.checkpoint_bytes().unwrap());
+    let reopened = PvTuningSession::resume(parent, config, &final_bytes).unwrap();
+    assert_eq!(reopened.state_digest(), resumed.state_digest());
+}
+
+#[test]
 fn checkpoint_resume_is_bit_identical_and_identity_bound() {
     let parent = parent();
     let config = recipe(0.5, Some(0.75));

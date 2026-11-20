@@ -1309,6 +1309,89 @@ validator suites passed locally (22 tests and 10 subtests). They validate
 software behavior with fixtures; they do not provide a real native reopen or
 admit the recovered legacy captures.
 
+### Hosted package evidence from PR #51 (2026-10-01)
+
+PR #51 (`bbbafd99cada6dab821cea63e5cdf971f1ce79fb`) has successful hosted
+package workflows. Its artifacts are retained under
+`/mnt/2tb/tritium-release-evidence/ci-bbbafd99/`. The workflows ran against
+the PR synthetic merge revision
+`fb670342ee85e340397c68705127b0268648261b`, not the branch head. The
+`crate-archive`, `npm-archive`, `compatibility-matrix`, and `clean-install`
+receipts each pass their owning validator at that exact revision. The
+compatibility receipt covers 16 CPython/platform cells; the clean-install
+receipt validates an installed Linux CPU wheel with PyTorch QAT forward and
+backward, optimizer update and resume, Hugging Face safetensors save/reload,
+and tied-weight identity checks.
+
+This harvest does **not** close the `packages` release gate: these receipts
+are not registered against a candidate manifest, and their synthetic merge
+revision differs from the checked-out branch head. Do not transplant them into
+the older `release/v1.1` candidate or registry. Rebuild/harvest from the final
+release revision and validate all four receipt kinds against one candidate
+before recording a gate pass. Hosted CUDA, Metal, ROCm, wgpu, real-model
+serving, fuzz, and performance-regression lanes were skipped by runner policy;
+those remain unqualified.
+
+### Local exact-source CUDA dispatcher evidence (`577bdb2e`)
+
+At source revision `577bdb2e21faf2b43ff35dd1101a5079d5dbf331`, the portable
+`manylinux_2_28_x86_64` CUDA wheel passed the physical RTX 4090 dispatcher
+qualifier: 8/8 native CUDA tests passed, and the two selected tail-path tests
+passed Compute Sanitizer 2026.3.0 with zero errors. The independently verified
+receipt is
+`sha256:f2f8b3c62503e419ae9ff8ea5b7195f2d9132e5c0fa3c06f9bc9b381cd25afaf`;
+it binds wheel SHA-256
+`295b3bb9f6a22c9276bfffb346e28179a6f2cc6c1aa94f80554da1ee439d93d9`, CUDA
+13.0, driver 615.71.09, Torch 2.11.0+cu130, and RTX 4090 UUID
+`1790118a-a6d7-4eaf-fcac-dcacac5f4351`. The verifier passed against that exact
+source worktree and wheel. Receipt and raw outputs are retained in the local
+candidate workspace at `release/v1.1/evidence/torch-dispatch-cuda-577bdb2/`.
+
+This run used Python 3.14.7, while the hosted CUDA workflow is pinned to
+Python 3.13. It is local, source-bound hardware evidence; it is not registered
+to a candidate manifest, does not replace the hosted pinned-environment run,
+and does not close the release gate. Re-run and register against the final
+release candidate before making a release claim.
+
+### Exact pushed-head CUDA rerun (`08a52cba`)
+
+The receipt was rebuilt and rerun on the exact pushed PR head
+`08a52cba8b8104018cc427500f43b708ba829ae9`, eliminating the source-revision
+gap from the earlier `577bdb2e` run. The portable CUDA wheel passed all eight
+native CUDA dispatcher tests on the RTX 4090; both selected tail-path tests
+passed Compute Sanitizer 2026.3.0 with zero errors. The independently verified
+receipt is
+`sha256:49ea0d53fe3417bcaa93fc69af71a6183a9a035eae53ba9782d28b636dec10a9`.
+It binds wheel SHA-256
+`0556e947831803a67597e4718600655aa4e3c387812c06e631e80c86ecbccb9a`, CUDA
+13.0, driver 615.71.09, Torch 2.11.0+cu130, and the same RTX 4090 UUID. Raw
+outputs are retained under
+`release/v1.1/evidence/torch-dispatch-cuda-08a52cba/` in the local candidate
+workspace.
+
+The wheel was built in the pinned manylinux/Python 3.13 image, but qualification
+executed with the host's Python 3.14.7. The hosted Python 3.13 CUDA job remains
+skipped. This exact-source local receipt is not registered to a candidate
+manifest and does not close the release gate.
+
+### Physical native-wgpu training corpus (`b3a556d1`)
+
+The native wgpu receipt sealer ran from a clean detached worktree at
+`b3a556d1c6eec85772ea2ed9aa95018705aece57` on the physical RTX 4090 via
+Vulkan. The receipt binds manifest digest
+`9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098`, vector
+digest `38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7`,
+36 operations and all 117 frozen cases. The reopened development capability
+table reports 4,192 peak resident bytes and 132,032 peak scratch bytes. Receipt
+digest:
+`adeeeff34a2c3a7b8fe3952af9aa2144492aaf7e9583849baf0f42afa40ecb08`.
+
+This is physical development evidence, not candidate-registry admission or
+the seven-backend release gate. The hosted/self-hosted wgpu CI lane was skipped;
+candidate artifact binding, release admission, and the other required backend
+receipts remain separate obligations. The receipt is retained at
+`/mnt/2tb/tritium-wgpu-b3a-receipts/` in the local candidate workspace.
+
 ### Durable campaign workspace relocation (2026-10-03)
 
 The discovered PTQ work directory, legacy S2KF records, and token pack were

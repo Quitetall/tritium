@@ -1,14 +1,20 @@
 //! Actual raw source -> shared fitter -> sealed log -> checked package -> sinks.
 #[path = "model_engine/calibrated.rs"]
 mod calibrated;
+#[path = "model_engine/companions.rs"]
+mod companions;
 #[path = "model_engine/observed.rs"]
 mod observed;
 #[path = "model_engine/owner.rs"]
 mod owner;
 #[path = "model_engine/republish.rs"]
 mod republish;
+#[path = "model_engine/seek_admission.rs"]
+mod seek_admission;
 #[path = "model_engine/spool_publish.rs"]
 mod spool_publish;
+#[path = "model_engine/stream_export.rs"]
+mod stream_export;
 use std::{collections::BTreeMap, io::Cursor};
 use tritium_evidence::{
     DIRECT_LEVELS_FITTED_REGISTRATION, EvidenceRecorder, QUANTIZATION_COMPLETED_REGISTRATION,

@@ -91,6 +91,9 @@ ciborium = "0.2.2"
 serde_json_canonicalizer = "=0.4.1"
 getrandom = "0.4.3"
 half = "2"
+# Unix retained-source admission uses safe std OpenOptions with platform flags.
+# Reuse the already locked version; no project-owned raw FFI is introduced.
+libc = "0.2.189"
 linkme = "0.3"
 opentelemetry = { version = "=0.33.1", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "=0.33.0", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"] }
@@ -146,7 +149,9 @@ anyhow = "1"
 # multi-GB (50GB+ sharded) model fully into RAM — pages fault in per touched tensor.
 memmap2 = "0.9"
 # serve (OpenAI HTTP/SSE server; all behind tritium-serve's `serve` feature)
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "macros", "signal", "time", "sync"] }
+# RUSTSEC-2026-0386: require the patched AsyncFd I/O-safety release for
+# downstream registry consumers too, not only this workspace's lockfile.
+tokio = { version = "1.53.3", default-features = false, features = ["rt-multi-thread", "net", "macros", "signal", "time", "sync"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 async-stream = "0.3"
 futures-core = "0.3"

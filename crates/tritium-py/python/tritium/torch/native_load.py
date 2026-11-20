@@ -4,7 +4,6 @@ import json
 from types import MethodType
 import torch
 from torch import nn
-from safetensors.torch import load as load_safetensors
 from .. import _tritium
 from .config import TernaryConfig
 from .conversion import PreparedModel
@@ -29,11 +28,72 @@ def _compact(value):
     return value
 
 
+def _check_input_autograd(value):
+    if value.device.type != "cpu" or value.dtype not in {torch.float16, torch.bfloat16, torch.float32}:
+        raise ValueError("native input gradients require CPU float16, bfloat16 or float32")
+    if torch.is_autocast_enabled("cpu"):
+        raise RuntimeError("native input gradients do not support autocast")
+
+
+def _matmul_output(value, handle, *, admit_backward=False):
+    if value.ndim == 0 or value.shape[-1] != handle.columns:
+        raise ValueError("native matrix input width differs")
+    batch = value.numel() // handle.columns
+    if batch * (handle.columns + handle.rows) * 4 > handle.max_output_bytes:
+        raise ValueError("native output/scratch exceeds byte limit")
+    if admit_backward and (batch + 1) * handle.columns * 4 > handle.max_output_bytes:
+        raise ValueError("native input adjoint output/scratch exceeds byte limit")
+    source = _compact(value.detach().to(dtype=torch.float32))
+    return torch.utils.dlpack.from_dlpack(handle.matmul(source)).to(dtype=value.dtype)
+
+
+def _input_vjp_output(value, handle):
+    _check_input_autograd(value)
+    if value.ndim == 0 or value.shape[-1] != handle.rows:
+        raise ValueError("native output gradient width differs")
+    batch = value.numel() // handle.rows
+    if ((batch + 1) * handle.columns * 4 > handle.max_output_bytes
+            or batch * (handle.columns + handle.rows) * 4 > handle.max_output_bytes):
+        raise ValueError("native input adjoint output/scratch exceeds byte limit")
+    source = _compact(value.detach().to(dtype=torch.float32))
+    return torch.utils.dlpack.from_dlpack(handle.input_vjp(source)).to(dtype=value.dtype)
+
+
+class _NativeMatmul(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value, handle):
+        _check_input_autograd(value)
+        output = _matmul_output(value, handle, admit_backward=True)
+        ctx.handle = handle
+        ctx.set_materialize_grads(False)
+        return output
+
+    @staticmethod
+    def backward(ctx, gradient):
+        return (None if gradient is None else _NativeInputVjp.apply(gradient, ctx.handle)), None
+
+
+class _NativeInputVjp(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, gradient, handle):
+        output = _input_vjp_output(gradient, handle)
+        ctx.handle = handle
+        ctx.set_materialize_grads(False)
+        return output
+
+    @staticmethod
+    def backward(ctx, gradient):
+        return (None if gradient is None else _NativeMatmul.apply(gradient, ctx.handle)), None
+
+
 class NativeTernaryWeight(nn.Module):
-    """One immutable native CPU owner shared by all its consumers."""
-    def __init__(self, handle):
+    """Immutable native CPU owner, with optional input-only eager autograd."""
+    def __init__(self, handle, *, input_gradients=False):
         super().__init__()
+        if type(input_gradients) is not bool:
+            raise TypeError("input_gradients must be bool")
         self.handle = handle
+        self.input_gradients = input_gradients
         self.out_features, self.in_features = handle.rows, handle.columns
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
@@ -46,20 +106,27 @@ class NativeTernaryWeight(nn.Module):
         return self
 
     def matmul(self, value):
+        training = getattr(self, "_native_training", None)
+        if training is not None:
+            trainer = training[0]()
+            if trainer is None:
+                raise RuntimeError("native training context is closed")
+            return trainer.matmul(training[1], value)
         if value.device.type != "cpu" or not value.dtype.is_floating_point:
             raise ValueError("native packed matmul requires CPU floating activations")
         if torch.is_grad_enabled() and value.requires_grad:
-            raise RuntimeError("native packed CPU adapter is inference-only")
-        if value.ndim == 0 or value.shape[-1] != self.in_features:
-            raise ValueError("native matrix input width differs")
-        batch = value.numel() // self.in_features
-        if batch * (self.in_features + self.out_features) * 4 > self.handle.max_output_bytes:
-            raise ValueError("native output/scratch exceeds byte limit")
-        source = _compact(value.detach().to(dtype=torch.float32))
-        output = torch.utils.dlpack.from_dlpack(self.handle.matmul(source))
-        return output.to(dtype=value.dtype)
+            if not self.input_gradients:
+                raise RuntimeError("native packed CPU adapter is inference-only")
+            return _NativeMatmul.apply(value, self.handle)
+        return _matmul_output(value, self.handle)
 
-    def gather(self, indices, dtype):
+    def gather(self, indices, dtype, padding=None):
+        training = getattr(self, "_native_training", None)
+        if training is not None:
+            trainer = training[0]()
+            if trainer is None:
+                raise RuntimeError("native training context is closed")
+            return trainer.gather(training[1], indices, dtype, padding)
         if indices.device.type != "cpu" or indices.dtype not in {torch.int32, torch.int64}:
             raise ValueError("native packed gather requires CPU integer indices")
         if indices.numel() * (self.in_features * 4 + 8) > self.handle.max_output_bytes:
@@ -99,7 +166,7 @@ class NativeTernaryEmbedding(nn.Module):
         return super()._apply(fn, recurse)
 
     def forward(self, indices):
-        return self.packed_weight.gather(indices, self.output_dtype)
+        return self.packed_weight.gather(indices, self.output_dtype, self.padding_idx)
 
 
 def _catalog(snapshot):
@@ -159,13 +226,20 @@ def _guarded_apply(model, fn, recurse=True):
 def load_native_module(model, artifact, *, level, load_run_id, inplace,
                        max_package_bytes=8*1024**3, max_payload_bytes=2*1024**3,
                        max_workspace_bytes=64*1024**2, max_output_bytes=64*1024**2,
-                       max_evidence_bytes=None):
+                       max_evidence_bytes=None, input_gradients=False):
     """Validate topology and privately stage native CPU weights plus original state.
 
-    Artifact may be an actual NativeModelConversion or an engine output directory.
-    This is inference-only eager CPU execution; it does not imply torch.compile,
-    autograd, ordinary state_dict export, device portability or release qualification.
+    Artifact may be an actual native conversion/refinement result or an engine
+    output directory. Refined admission stays record-consistent and unqualified.
+    Persistent shell state may be CPU or meta; nonpersistent buffers must already
+    be materialized on CPU. Package access still retains a complete byte image.
+    Defaults to inference-only eager CPU execution. Explicit input_gradients=True
+    enables f16/bf16/f32 input derivatives through immutable Linear weights, not
+    owner/scale/code updates or native refinement. It does not imply torch.compile,
+    autocast, ordinary state_dict export, device portability or release qualification.
     """
+    if type(input_gradients) is not bool:
+        raise TypeError("input_gradients must be bool")
     if not isinstance(model, nn.Module) or type(inplace) is not bool:
         raise TypeError("native model load requires nn.Module and explicit inplace")
     if any(type(limit) is not int or limit <= 0 for limit in
@@ -174,7 +248,7 @@ def load_native_module(model, artifact, *, level, load_run_id, inplace,
     if max_evidence_bytes is not None and (type(max_evidence_bytes) is not int or max_evidence_bytes <= 0):
         raise ValueError("native evidence byte limit must be a positive integer")
     evidence_options = {} if max_evidence_bytes is None else dict(max_evidence_bytes=max_evidence_bytes)
-    result = artifact if isinstance(artifact, _tritium.NativeModelConversion) else _tritium.NativeModelConversion.open(
+    result = artifact if isinstance(artifact, (_tritium.NativeModelConversion, _tritium.NativeModelRefinement)) else _tritium._open_native_model(
         str(artifact), max_package_bytes=max_package_bytes, **evidence_options)
     snapshot = result.open_level(level, load_run_id, max_payload_bytes=max_payload_bytes,
                                  max_workspace_bytes=max_workspace_bytes, max_output_bytes=max_output_bytes,
@@ -182,7 +256,7 @@ def load_native_module(model, artifact, *, level, load_run_id, inplace,
     data = _catalog(snapshot)
     config = TernaryConfig.from_dict(data["source_preparation_config"])
     coverage = CoverageReport.from_dict(data["coverage"])
-    observed = _inventory(PreparedModel(model, config, coverage))
+    observed = _inventory(PreparedModel(model, config, coverage), materialized=False)
     expected = [dict(owner=owner, aliases=aliases, dtype=str(tensor.dtype), shape=list(tensor.shape),
                      kind=kind, disposition="fitted" if targeted else "preserved",
                      storage="tensor" if native else "tritium-torch-preserved.safetensors")
@@ -191,8 +265,13 @@ def load_native_module(model, artifact, *, level, load_run_id, inplace,
         raise ValueError("native catalog differs from complete model shell state")
     if _graph_contract(model, observed) != data["graph"]:
         raise ValueError("native graph contract differs from model shell")
-    if any(tensor.device.type != "cpu" for _, _, tensor, _, _, _ in observed):
-        raise ValueError("native model shell must be on CPU")
+    if any(tensor.device.type not in {"cpu", "meta"} for _, _, tensor, _, _, _ in observed):
+        raise ValueError("native model shell state must be on CPU or meta")
+    for module in model.modules():
+        for name, value in module._buffers.items():
+            if (name in module._non_persistent_buffers_set and value is not None
+                    and value.device.type != "cpu"):
+                raise ValueError("native model shell nonpersistent buffers must be materialized on CPU")
     descriptors = {item["name"]: item["storage"] for item in json.loads(snapshot.descriptors())}
     native_entries = {entry["owner"]: entry for entry in expected if entry["storage"] == "tensor"}
     if set(descriptors) != set(native_entries):
@@ -209,7 +288,11 @@ def load_native_module(model, artifact, *, level, load_run_id, inplace,
               or _PRECISIONS[storage["Dense"]["precision"]] != _DTYPES[entry["dtype"]]):
             raise ValueError("native preserved geometry/precision differs from catalog")
     opaque_entries = {entry["owner"]: entry for entry in expected if entry["storage"] != "tensor"}
-    opaque = load_safetensors(snapshot.asset("tritium-torch-preserved.safetensors")) if opaque_entries else {}
+    opaque = {}
+    if opaque_entries:
+        from safetensors.torch import load as load_safetensors
+
+        opaque = load_safetensors(snapshot.asset("tritium-torch-preserved.safetensors"))
     if set(opaque) != set(opaque_entries):
         raise ValueError("native preserved asset inventory differs from catalog")
     for name, tensor in opaque.items():
@@ -222,7 +305,8 @@ def load_native_module(model, artifact, *, level, load_run_id, inplace,
     replacements = {}
     for entry in expected:
         if entry["disposition"] != "fitted": continue
-        weight = NativeTernaryWeight(snapshot.packed_tensor(entry["owner"]))
+        weight = NativeTernaryWeight(snapshot.packed_tensor(entry["owner"]), input_gradients=input_gradients)
+        weight._native_owner = entry["owner"]
         by_module = {}
         owner = True
         for alias in entry["aliases"]:
@@ -264,6 +348,7 @@ def load_native_module(model, artifact, *, level, load_run_id, inplace,
     root.eval()
     root._tritium_native_artifact = result
     root._tritium_native_level = level
+    root._tritium_native_input_gradients = input_gradients
     root._tritium_native_upload_log = upload_log
     root._tritium_native_preserved_aliases = tuple(tuple(entry["aliases"]) for entry in expected
                                                   if entry["disposition"] == "preserved")

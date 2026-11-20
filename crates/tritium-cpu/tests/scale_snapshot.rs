@@ -1,0 +1,438 @@
+//! Exact CPU snapshot/version/lease fixtures; not model-quality or memory acceptance.
+use std::sync::Arc;
+use tritium_core::Trit;
+use tritium_cpu::CpuBackend;
+use tritium_format::AdditiveTensor;
+use tritium_runtime::TensorPayloadBudget;
+use tritium_schema::{ADMITTED_LAWS, Basis, PlaneCodec, ScalePrecision};
+use tritium_spec::{
+    AdditiveMetadata, BackendError, DeviceBuffer, TensorMatmul, TensorMetadata,
+    TensorStreamEncoding, TensorView, TernaryBackend,
+};
+#[path = "common/snapshot_fixture.rs"]
+mod snapshot_fixture;
+#[path = "common/stream_source.rs"]
+mod stream_source;
+use snapshot_fixture::{check, tensor};
+
+#[test]
+fn direct_and_stream_snapshots_preserve_old_versions_and_match_exact_new_references() {
+    let mut cases = 0;
+    for (law, admitted) in ADMITTED_LAWS.iter().enumerate() {
+        for planes in 1..=admitted.max_planes {
+            for group in [32, 128] {
+                for codec in [PlaneCodec::D2, PlaneCodec::B3, PlaneCodec::S34] {
+                    for basis in [
+                        Basis::Identity,
+                        Basis::Hadamard { block: 128 },
+                        Basis::SignedRht {
+                            block: 128,
+                            seed: 19,
+                            domain: 7,
+                        },
+                    ] {
+                        for mode in 0..3 {
+                            let source = tensor(law, codec, basis, mode, group, planes);
+                            let cpu = CpuBackend::new();
+                            let encoded = source.encode_payload().unwrap();
+                            let stream = stream_source::Source::new(
+                                TensorMetadata::Additive(AdditiveMetadata::from_view(
+                                    source.view(),
+                                )),
+                                TensorStreamEncoding::CanonicalRawAdditive,
+                                &encoded,
+                            );
+                            let direct: Arc<dyn DeviceBuffer> = Arc::from(
+                                cpu.upload_tensor(TensorView::Additive(source.view()))
+                                    .unwrap(),
+                            );
+                            let streamed: Arc<dyn DeviceBuffer> =
+                                Arc::from(cpu.upload_tensor_stream(&stream).unwrap());
+                            for root in [direct, streamed] {
+                                let mut a = source.clone();
+                                let exact = if source.layout().law.precision == ScalePrecision::F32
+                                {
+                                    f32::from_bits(0x3f00_0001)
+                                } else {
+                                    0.75
+                                };
+                                a.replace_scales(
+                                    (0..source.scales().len())
+                                        .map(|i| [exact, 0.0, 0.25, 1.25][i % 4])
+                                        .collect(),
+                                )
+                                .unwrap();
+                                let mut b = source.clone();
+                                b.replace_scales(
+                                    (0..source.scales().len())
+                                        .map(|i| [0.125, 0.5, 1.0, 0.0][i % 4])
+                                        .collect(),
+                                )
+                                .unwrap();
+                                let size = source.scales().len()
+                                    * if source.layout().law.precision == ScalePrecision::F16 {
+                                        2
+                                    } else {
+                                        4
+                                    };
+                                let budget = TensorPayloadBudget::new((2 * size) as u64);
+                                let (sa, info) = cpu
+                                    .snapshot_additive_scales(&root, a.scales(), &budget)
+                                    .unwrap();
+                                assert_eq!(info.shared_root_bytes, root.len_bytes());
+                                assert_eq!(info.owned_scale_bytes, size);
+                                assert_eq!(info.reachable_bytes, root.len_bytes() + size);
+                                assert_eq!(sa.len_bytes(), info.reachable_bytes);
+                                let (sb, second) = cpu
+                                    .snapshot_additive_scales(&sa, b.scales(), &budget)
+                                    .unwrap();
+                                assert_eq!(info, second);
+                                assert_eq!(budget.used_bytes(), (2 * size) as u64);
+                                check(&*root, source.view());
+                                check(&*sa, a.view());
+                                check(&*sb, b.view());
+                                let weak_a = Arc::downgrade(&sa);
+                                drop(sa);
+                                assert!(weak_a.upgrade().is_none());
+                                assert_eq!(budget.used_bytes(), size as u64);
+                                let weak_root = Arc::downgrade(&root);
+                                drop(root);
+                                assert!(weak_root.upgrade().is_some());
+                                check(&*sb, b.view());
+                                let last = Arc::clone(&sb);
+                                drop(sb);
+                                assert_eq!(budget.used_bytes(), size as u64);
+                                drop(last);
+                                assert_eq!(budget.used_bytes(), 0);
+                                assert!(weak_root.upgrade().is_none());
+                                cases += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 1080);
+}
+
+#[test]
+fn invalid_values_and_budget_failures_do_not_mutate_parent_or_retain_new_storage() {
+    let source = tensor(0, PlaneCodec::D2, Basis::Identity, 0, 128, 3);
+    let cpu = CpuBackend::new();
+    let parent: Arc<dyn DeviceBuffer> = Arc::from(
+        cpu.upload_tensor(TensorView::Additive(source.view()))
+            .unwrap(),
+    );
+    let count = source.scales().len();
+    let budget = TensorPayloadBudget::new((count * 4) as u64);
+    for value in [f32::NAN, f32::INFINITY, -1.0, -0.0, 0.50001, 65536.0, 1e-30] {
+        assert!(
+            cpu.snapshot_additive_scales(&parent, &vec![value; count], &budget)
+                .is_err()
+        );
+        assert_eq!(budget.used_bytes(), 0);
+        assert_eq!(Arc::strong_count(&parent), 1);
+    }
+    assert!(cpu.snapshot_additive_scales(&parent, &[], &budget).is_err());
+    let too_small = TensorPayloadBudget::new((count * 2 - 1) as u64);
+    assert!(matches!(
+        cpu.snapshot_additive_scales(&parent, &vec![0.75; count], &too_small),
+        Err(BackendError::TensorPayloadBudgetExceeded { .. })
+    ));
+    assert_eq!(too_small.used_bytes(), 0);
+    check(&*parent, source.view());
+    assert_eq!(Arc::strong_count(&parent), 1);
+}
+
+#[test]
+fn admitted_root_lease_is_retained_once_and_obsolete_overlays_release() {
+    use tritium_evidence::{EvidenceRecorder, TENSOR_UPLOADED_REGISTRATION};
+    use tritium_runtime::{TensorUploadContext, upload_tensor_logged_admitted};
+    let source = tensor(1, PlaneCodec::B3, Basis::Identity, 1, 128, 3);
+    let cpu = CpuBackend::new();
+    let count = source.scales().len();
+    let caps = cpu
+        .tensor_caps(TensorView::Additive(source.view()))
+        .unwrap()
+        .unwrap();
+    let budget = TensorPayloadBudget::new(caps.payload_bytes + (count * 8) as u64);
+    let mut recorder =
+        EvidenceRecorder::new("snapshot-fixture", [TENSOR_UPLOADED_REGISTRATION]).unwrap();
+    let (handle, _) = upload_tensor_logged_admitted(
+        &cpu,
+        TensorView::Additive(source.view()),
+        tritium_schema::TensorUploadPolicy {
+            native_only: true,
+            max_payload_bytes: None,
+        },
+        "owner",
+        TensorUploadContext {
+            recorder: &mut recorder,
+            span: "upload",
+            parent: None,
+            logical_time: 0,
+        },
+        &budget,
+    )
+    .unwrap();
+    let root: Arc<dyn DeviceBuffer> = Arc::from(handle);
+    let root_bytes = root.len_bytes();
+    let before = recorder.to_jsonl().unwrap();
+    let (a, _) = cpu
+        .snapshot_additive_scales(&root, &vec![0.75; count], &budget)
+        .unwrap();
+    let (b, bytes) = cpu
+        .snapshot_additive_scales(&a, &vec![0.25; count], &budget)
+        .unwrap();
+    assert_eq!(budget.used_bytes(), root_bytes as u64 + (count * 8) as u64);
+    assert_eq!(bytes.shared_root_bytes, root_bytes);
+    drop(root);
+    drop(a);
+    assert_eq!(budget.used_bytes(), root_bytes as u64 + (count * 4) as u64);
+    assert_eq!(recorder.to_jsonl().unwrap(), before);
+    let mut expected = source;
+    expected.replace_scales(vec![0.25; count]).unwrap();
+    check(&*b, expected.view());
+    drop(b);
+    assert_eq!(budget.used_bytes(), 0);
+}
+
+struct Foreign;
+impl DeviceBuffer for Foreign {
+    fn len_bytes(&self) -> usize {
+        0
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+struct Misreported {
+    inner: Arc<dyn DeviceBuffer>,
+}
+impl DeviceBuffer for Misreported {
+    fn len_bytes(&self) -> usize {
+        usize::MAX
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self.inner.as_any()
+    }
+}
+
+#[test]
+fn foreign_dense_legacy_and_misreported_handles_are_refused() {
+    let cpu = CpuBackend::new();
+    let budget = TensorPayloadBudget::new(1000);
+    let dense: Arc<dyn DeviceBuffer> = Arc::from(
+        cpu.upload_tensor(TensorView::Dense {
+            rows: 1,
+            cols: 4,
+            values: &[1.0; 4],
+        })
+        .unwrap(),
+    );
+    let foreign: Arc<dyn DeviceBuffer> = Arc::new(Foreign);
+    let mut raw = vec![0; tritium_format::TQ2_0_BLOCK_BYTES];
+    tritium_format::pack_tq2_0_row(&[Trit::POS; 4], &[half::f16::ONE], &mut raw).unwrap();
+    let legacy: Arc<dyn DeviceBuffer> = Arc::from(
+        cpu.upload_weights(
+            &raw,
+            tritium_core::GemmShape { m: 1, n: 1, k: 4 },
+            tritium_core::TernaryFormat::Tq2_0,
+        )
+        .unwrap(),
+    );
+    let source = tensor(1, PlaneCodec::D2, Basis::Identity, 0, 128, 3);
+    let inner: Arc<dyn DeviceBuffer> = Arc::from(
+        cpu.upload_tensor(TensorView::Additive(source.view()))
+            .unwrap(),
+    );
+    let bad: Arc<dyn DeviceBuffer> = Arc::new(Misreported { inner });
+    for (i, parent) in [dense, foreign, legacy, bad].into_iter().enumerate() {
+        assert!(
+            cpu.snapshot_additive_weights(&parent, source.view(), &budget)
+                .is_err()
+        );
+        let mut row = [17.0; 4];
+        let mut out = [19.0; 12];
+        assert!(cpu.additive_present_weight_count(&*parent).is_err());
+        assert!(
+            cpu.accumulate_additive_matmul_weight_vjp(
+                &*parent, &[0.25; 4], &[0.25; 3], 1, &mut row, &mut out
+            )
+            .is_err()
+        );
+        assert!(
+            cpu.accumulate_additive_embed_weight_vjp(
+                &*parent,
+                &[0],
+                &[0.25; 4],
+                &mut row,
+                &mut out
+            )
+            .is_err()
+        );
+        assert_eq!(row, [17.0; 4]);
+        assert_eq!(out, [19.0; 12]);
+        let result = cpu.snapshot_additive_scales(&parent, &[0.5], &budget);
+        let error = match result {
+            Err(e) => e,
+            Ok(_) => panic!("invalid parent accepted"),
+        };
+        assert!(if i == 0 {
+            matches!(error, BackendError::UnsupportedTensor)
+        } else {
+            matches!(error, BackendError::InvalidInput(_))
+        });
+        assert_eq!(budget.used_bytes(), 0);
+    }
+}
+
+#[test]
+fn concurrent_snapshot_creation_cannot_overcommit_incremental_budget() {
+    let source = tensor(3, PlaneCodec::D2, Basis::Identity, 0, 128, 1);
+    let root: Arc<dyn DeviceBuffer> = Arc::from(
+        CpuBackend::new()
+            .upload_tensor(TensorView::Additive(source.view()))
+            .unwrap(),
+    );
+    let budget = TensorPayloadBudget::new(4);
+    let start = std::sync::Barrier::new(9);
+    let finish = std::sync::Barrier::new(9);
+    std::thread::scope(|scope| {
+        let jobs = (0..8)
+            .map(|_| {
+                let root = &root;
+                let budget = &budget;
+                let start = &start;
+                let finish = &finish;
+                scope.spawn(move || {
+                    start.wait();
+                    let snapshot =
+                        CpuBackend::new().snapshot_additive_scales(root, &[0.75], budget);
+                    finish.wait();
+                    snapshot.is_ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        finish.wait();
+        assert_eq!(
+            jobs.into_iter()
+                .map(|job| job.join().unwrap())
+                .filter(|ok| *ok)
+                .count(),
+            1
+        );
+    });
+    assert_eq!(budget.used_bytes(), 0);
+    assert_eq!(Arc::strong_count(&root), 1);
+}
+
+struct SwitchingRoot {
+    first: Arc<dyn DeviceBuffer>,
+    second: Arc<dyn DeviceBuffer>,
+    select: Arc<std::sync::atomic::AtomicBool>,
+}
+impl DeviceBuffer for SwitchingRoot {
+    fn len_bytes(&self) -> usize {
+        self.first.len_bytes()
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        if self.select.load(std::sync::atomic::Ordering::Acquire) {
+            self.second.as_any()
+        } else {
+            self.first.as_any()
+        }
+    }
+}
+#[test]
+fn snapshot_refuses_a_wrapper_that_switches_its_backend_root() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let cpu = CpuBackend::new();
+    let source = tensor(3, PlaneCodec::D2, Basis::Identity, 0, 128, 1);
+    let changed = AdditiveTensor::new(
+        source.layout(),
+        1,
+        vec![Trit::NEG; source.trits().len()],
+        source.scales().to_vec(),
+    )
+    .unwrap();
+    let first: Arc<dyn DeviceBuffer> = Arc::from(
+        cpu.upload_tensor(TensorView::Additive(source.view()))
+            .unwrap(),
+    );
+    let second: Arc<dyn DeviceBuffer> = Arc::from(
+        cpu.upload_tensor(TensorView::Additive(changed.view()))
+            .unwrap(),
+    );
+    assert_eq!(first.len_bytes(), second.len_bytes());
+    let select = Arc::new(AtomicBool::new(false));
+    let parent: Arc<dyn DeviceBuffer> = Arc::new(SwitchingRoot {
+        first,
+        second,
+        select: select.clone(),
+    });
+    let budget = TensorPayloadBudget::new(8);
+    let (snapshot, _) = cpu
+        .snapshot_additive_scales(&parent, &[0.75], &budget)
+        .unwrap();
+    let full_budget = TensorPayloadBudget::new(parent.len_bytes() as u64);
+    let full = cpu
+        .snapshot_additive_weights(&parent, source.view(), &full_budget)
+        .unwrap();
+    select.store(true, Ordering::Release);
+    assert!(
+        matches!(cpu.snapshot_additive_weights(&snapshot, source.view(), &full_budget),
+        Err(BackendError::InvalidInput(message)) if message.contains("original backend root changed"))
+    );
+    check(&*full, source.view());
+    let mut row = vec![17.0; 260];
+    let mut weight_out = vec![19.0; 780];
+    assert!(cpu.additive_present_weight_count(&*snapshot).is_err());
+    assert!(
+        cpu.accumulate_additive_matmul_weight_vjp(
+            &*snapshot,
+            &[0.25; 260],
+            &[0.25; 3],
+            1,
+            &mut row,
+            &mut weight_out
+        )
+        .is_err()
+    );
+    assert!(
+        cpu.accumulate_additive_embed_weight_vjp(
+            &*snapshot,
+            &[0],
+            &[0.25; 260],
+            &mut row,
+            &mut weight_out
+        )
+        .is_err()
+    );
+    assert!(weight_out.iter().all(|&v| v == 19.0));
+    let mut out = [19.0; 3];
+    assert!(
+        cpu.matmul(TensorMatmul {
+            act: &[0.25; 260],
+            tensor: &*snapshot,
+            batch: 1,
+            transformed_act: &mut row,
+            out: &mut out
+        })
+        .is_err(),
+        "snapshot silently switched coefficients"
+    );
+    assert!(row.iter().all(|&v| v == 17.0));
+    assert_eq!(out, [19.0; 3]);
+    assert!(
+        cpu.snapshot_additive_scales(&snapshot, &[0.25], &budget)
+            .is_err()
+    );
+    assert_eq!(budget.used_bytes(), 4);
+    select.store(false, Ordering::Release);
+    let mut expected = source;
+    expected.replace_scales(vec![0.75]).unwrap();
+    check(&*snapshot, expected.view());
+}

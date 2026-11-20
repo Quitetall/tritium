@@ -11,6 +11,19 @@ use tritium_schema::{
 use crate::per_tile::{ActiveTile, ActiveTiles};
 use crate::{PerTileIndex, Trit};
 
+mod adjoint_span;
+mod code_projection;
+mod scale_adjoint;
+mod weight_adjoint;
+pub use adjoint_span::AdditiveAdjointSpan;
+pub use code_projection::{CodeProjectionError, CodeProjectionStats, project_additive_code_unit};
+pub use scale_adjoint::{
+    AdditiveScaleVjpPlan, accumulate_embed_scale_vjp, accumulate_ternary_matmul_scale_vjp,
+};
+pub use weight_adjoint::{
+    AdditiveWeightVjpPlan, accumulate_embed_weight_vjp, accumulate_ternary_matmul_weight_vjp,
+};
+
 /// Consumer marker: rotate activations before additive matrix multiplication.
 #[derive(Clone, Copy, Debug)]
 pub enum Matmul {}
@@ -856,6 +869,66 @@ pub fn reference_ternary_matmul(
         for output_row in 0..rows {
             out[batch_row * rows + output_row] = weights.dot_row(output_row, activation)?;
         }
+    }
+    Ok(())
+}
+
+/// Input vector-Jacobian product of the shared additive matmul operator.
+///
+/// For stored weights `A = W B^T`, forward computes `A B x`; this returns
+/// `B^T A^T dy` in the original input coordinates. In particular, signed RHT
+/// requires the inverse basis, not a second application of its forward basis.
+/// This is a linear-operator adjoint, not a scale/code gradient or an STE.
+///
+/// `output_gradients` has `batch * rows` values, `out` has `batch * cols`, and
+/// `row_workspace` has exactly `cols`. All products/lengths are checked before
+/// mutation. Zero batch still requires that row workspace but leaves it untouched.
+/// Output rows accumulate in ascending order using f32 multiply/add; each stored
+/// row is decoded once through the existing scale/allocation interpretation.
+/// Only caller-owned memory is used; no dense matrix or heap scratch is allocated.
+/// The view already contains decoded trits: this is not a packed backend kernel.
+/// As with forward reference math, finite-value/overflow policy is the caller's.
+///
+/// ```compile_fail
+/// use tritium_core::{AdditiveView, reference_ternary_matmul_input_vjp};
+/// fn wrong_consumer(view: AdditiveView<'_>) {
+///     reference_ternary_matmul_input_vjp(&[1.0], &view.bind_gather(), 1,
+///         &mut [0.0; 4], &mut [0.0; 4]).unwrap();
+/// }
+/// ```
+pub fn reference_ternary_matmul_input_vjp(
+    output_gradients: &[f32],
+    weights: &BasisBound<AdditiveView<'_>, Matmul>,
+    batch: usize,
+    row_workspace: &mut [f32],
+    out: &mut [f32],
+) -> Result<(), AdditiveError> {
+    let weights = &weights.tensor;
+    let rows = usize::try_from(weights.layout().rows).map_err(|_| AdditiveError::SizeOverflow)?;
+    let cols = usize::try_from(weights.layout().cols).map_err(|_| AdditiveError::SizeOverflow)?;
+    let gradient_count = batch.checked_mul(rows).ok_or(AdditiveError::SizeOverflow)?;
+    let input_count = batch.checked_mul(cols).ok_or(AdditiveError::SizeOverflow)?;
+    if output_gradients.len() != gradient_count
+        || row_workspace.len() != cols
+        || out.len() != input_count
+    {
+        return Err(AdditiveError::MatmulShape);
+    }
+    if batch == 0 {
+        return Ok(());
+    }
+    out.fill(0.0);
+    for row in 0..rows {
+        weights.dequant_row_into(row, row_workspace)?;
+        for (batch_row, input_gradient) in out.chunks_exact_mut(cols).enumerate() {
+            let gradient = output_gradients[batch_row * rows + row];
+            for (value, &coefficient) in input_gradient.iter_mut().zip(row_workspace.iter()) {
+                *value += gradient * coefficient;
+            }
+        }
+    }
+    for input_gradient in out.chunks_exact_mut(cols) {
+        apply_inverse_basis(input_gradient, weights.layout().basis)?;
     }
     Ok(())
 }

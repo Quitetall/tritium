@@ -44,6 +44,250 @@ fn dense(rows: usize, cols: usize, seed: usize) -> Weight {
     }
 }
 
+#[test]
+#[ignore = "explicit physical CUDA nonfinite shared-region regression; no silent skip"]
+fn physical_shared_region_refuses_nan_without_publishing_output() {
+    let backend = CudaBackend::new(0)
+        .expect("physical CUDA required")
+        .with_device_swiglu();
+    let tensor = backend
+        .upload_tensor(TensorView::Dense {
+            rows: 1,
+            cols: 1,
+            values: &[1.],
+        })
+        .unwrap();
+    let mut out = [19.];
+    for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1e30] {
+        let result = backend.try_tensor_swiglu(TensorSwiGlu {
+            act: &[value],
+            gate: &*tensor,
+            up: &*tensor,
+            down: &*tensor,
+            batch: 1,
+            out: &mut out,
+        });
+        assert!(
+            result.is_err(),
+            "nonfinite region must refuse, got {result:?}; output_bits={:?}",
+            out.map(f32::to_bits)
+        );
+        assert_eq!(out, [19.]);
+    }
+    assert!(
+        backend
+            .try_tensor_swiglu(TensorSwiGlu {
+                act: &[1.],
+                gate: &*tensor,
+                up: &*tensor,
+                down: &*tensor,
+                batch: 1,
+                out: &mut out
+            })
+            .unwrap()
+    );
+    assert!(out[0].is_finite() && out[0] > 0.7 && out[0] < 0.8);
+    let diagnostic = format!("{backend:?}");
+    assert!(diagnostic.contains("host_output_capacity_elements"));
+    assert!(
+        !diagnostic.contains("host_output: ["),
+        "backend diagnostics must not dump private activations"
+    );
+    out.fill(19.);
+    let ordinary = CudaBackend::new(0).expect("physical CUDA required");
+    assert!(
+        !ordinary
+            .try_tensor_swiglu(TensorSwiGlu {
+                act: &[f32::NAN],
+                gate: &*tensor,
+                up: &*tensor,
+                down: &*tensor,
+                batch: 1,
+                out: &mut out
+            })
+            .unwrap()
+    );
+    assert_eq!(out, [19.]);
+    let mlp = mlp(&backend, &[dense(1, 1, 1), dense(1, 1, 2), dense(1, 1, 3)]);
+    assert!(mlp.forward(&backend, &[f32::NAN], 1, &mut out).is_err());
+    assert_eq!(out, [19.]);
+}
+
+#[test]
+#[ignore = "explicit physical CUDA intermediate overflow masked by a pruned down projection"]
+fn physical_shared_region_refuses_overflow_even_when_down_is_pruned() {
+    let backend = CudaBackend::new(0)
+        .expect("physical CUDA required")
+        .with_device_swiglu();
+    let values = vec![1.; 32 * 32];
+    let gate = backend
+        .upload_tensor(TensorView::Dense {
+            rows: 32,
+            cols: 32,
+            values: &values,
+        })
+        .unwrap();
+    let pruned = additive(
+        AdditiveLayout {
+            rows: 32,
+            cols: 32,
+            tile: 256,
+            group: 32,
+            max_planes: 2,
+            allocation: PlaneAllocation::PerTile,
+            codec: PlaneCodec::B3,
+            law: ADMITTED_LAWS[0].law,
+            basis: Basis::Identity,
+            transport: Transport::Raw,
+        },
+        true,
+        true,
+    );
+    let down = backend.upload_tensor(pruned.view()).unwrap();
+    let mut output = [19.; 32];
+    let result = backend.try_tensor_swiglu(TensorSwiGlu {
+        act: &[1e20; 32],
+        gate: &*gate,
+        up: &*gate,
+        down: &*down,
+        batch: 1,
+        out: &mut output,
+    });
+    assert!(
+        result.is_err(),
+        "overflow must refuse even if pruned down masks it: {result:?}, finite_output={}",
+        output.iter().all(|x| x.is_finite())
+    );
+    assert_eq!(output, [19.; 32]);
+    assert!(
+        backend
+            .try_tensor_swiglu(TensorSwiGlu {
+                act: &[0.; 32],
+                gate: &*gate,
+                up: &*gate,
+                down: &*down,
+                batch: 1,
+                out: &mut output
+            })
+            .unwrap()
+    );
+    assert_eq!(output, [0.; 32], "valid retry must reset the error flag");
+}
+
+#[test]
+#[ignore = "explicit physical CUDA transformed overflow cannot be masked by pruned matrices"]
+fn physical_shared_region_refuses_masked_basis_overflow_and_recovers() {
+    let backend = CudaBackend::new(0)
+        .expect("physical CUDA required")
+        .with_device_swiglu();
+    let layout = AdditiveLayout {
+        rows: 4,
+        cols: 4,
+        tile: 256,
+        group: 32,
+        max_planes: 2,
+        allocation: PlaneAllocation::PerTile,
+        codec: PlaneCodec::B3,
+        law: ADMITTED_LAWS[0].law,
+        basis: Basis::Hadamard { block: 4 },
+        transport: Transport::Raw,
+    };
+    let pruned = additive(layout, true, true);
+    for down_basis in [false, true] {
+        let values = vec![if down_basis { 2.5e18 } else { 1. }; 16];
+        let plain = backend
+            .upload_tensor(TensorView::Dense {
+                rows: 4,
+                cols: 4,
+                values: &values,
+            })
+            .unwrap();
+        let rotated = backend.upload_tensor(pruned.view()).unwrap();
+        let (gate, down) = if down_basis {
+            (&*plain, &*rotated)
+        } else {
+            (&*rotated, &*plain)
+        };
+        let input = [if down_basis { 1. } else { f32::MAX }; 4];
+        let mut output = [19.; 4];
+        assert!(
+            backend
+                .try_tensor_swiglu(TensorSwiGlu {
+                    act: &input,
+                    gate,
+                    up: gate,
+                    down,
+                    batch: 1,
+                    out: &mut output
+                })
+                .is_err()
+        );
+        assert_eq!(output, [19.; 4]);
+        assert!(
+            backend
+                .try_tensor_swiglu(TensorSwiGlu {
+                    act: &[0.; 4],
+                    gate,
+                    up: gate,
+                    down,
+                    batch: 1,
+                    out: &mut output
+                })
+                .unwrap()
+        );
+        assert_eq!(output, [0.; 4]);
+    }
+}
+
+#[test]
+#[ignore = "explicit physical CUDA output-only overflow refuses without poisoning a retry"]
+fn physical_shared_region_refuses_nonfinite_final_output_and_recovers() {
+    let backend = CudaBackend::new(0)
+        .expect("physical CUDA required")
+        .with_device_swiglu();
+    let gate = backend
+        .upload_tensor(TensorView::Dense {
+            rows: 1,
+            cols: 1,
+            values: &[1.],
+        })
+        .unwrap();
+    let down = backend
+        .upload_tensor(TensorView::Dense {
+            rows: 1,
+            cols: 1,
+            values: &[f32::MAX],
+        })
+        .unwrap();
+    let mut output = [19.];
+    assert!(
+        backend
+            .try_tensor_swiglu(TensorSwiGlu {
+                act: &[2.],
+                gate: &*gate,
+                up: &*gate,
+                down: &*down,
+                batch: 1,
+                out: &mut output
+            })
+            .is_err()
+    );
+    assert_eq!(output, [19.]);
+    assert!(
+        backend
+            .try_tensor_swiglu(TensorSwiGlu {
+                act: &[0.],
+                gate: &*gate,
+                up: &*gate,
+                down: &*down,
+                batch: 1,
+                out: &mut output
+            })
+            .unwrap()
+    );
+    assert_eq!(output, [0.]);
+}
+
 fn additive(mut layout: AdditiveLayout, compact: bool, pruned: bool) -> Weight {
     let planes = layout.max_planes;
     layout.allocation = PlaneAllocation::PerTile;

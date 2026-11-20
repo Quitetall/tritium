@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import tempfile
 from dataclasses import dataclass
+from contextlib import nullcontext
 import torch
 from torch import nn
 from .. import _tritium
@@ -160,7 +161,7 @@ def calibrate_native_module(source, windows, objective, *, objective_bytes, cach
         raise ValueError("native Torch capture is explicitly CPU-only")
     model = source.prepared.model
     modules = dict(model.named_modules(remove_duplicate=False))
-    consumers = {}; builders = {}; totals={}; sample_totals={}; window_totals={}
+    consumers = {}
     for owner,aliases,tensor,_,targeted,_ in entries:
         if not targeted: continue
         for alias in aliases:
@@ -172,20 +173,58 @@ def calibrate_native_module(source, windows, objective, *, objective_bytes, cach
         if any(type(cache_limits.get(k)) is not int or cache_limits[k]<=0 for k in
                ("max_payload_bytes","max_samples","max_windows")):
             raise ValueError("native cache limits must be positive integers")
-    # Admit the complete declared ceiling, including duplicated recipe/tokenizer.
-    if sum(cache_limits["max_payload_bytes"] for _ in {owner for _,owner in consumers.values()}) > max_total_payload_bytes:
-        raise ValueError("aggregate declared cache payload exceeds byte limit")
     options=json.loads(source.options_json)
     with Path(options["asset_paths"]["tokenizer.json"]).open("rb") as stream:
         tokenizer=stream.read(options["limits"]["max_asset_bytes"]+1)
     if len(tokenizer)>options["limits"]["max_asset_bytes"]:
         raise ValueError("tokenizer exceeds original asset byte limit")
+    caches=_capture_matmul(model,source.observation,source.verify,consumers,windows,objective,
+        tokenizer=tokenizer,objective_bytes=objective_bytes,cache_limits=cache_limits,
+        max_total_payload_bytes=max_total_payload_bytes,output=output)
+    return NativeModuleCalibration(source,caches,max_total_payload_bytes)
+
+
+def _capture_matmul(model, observation, verify_source, consumers, windows, objective, *,
+                    tokenizer, objective_bytes, cache_limits, max_total_payload_bytes,
+                    output, guard_reads=False):
+    """One actual cache producer. Caller validates source/consumer selection first."""
+    if (not callable(objective) or output not in {"None","DenseFisher"}
+            or not isinstance(objective_bytes,bytes) or not objective_bytes
+            or type(max_total_payload_bytes) is not int or max_total_payload_bytes<=0
+            or not isinstance(cache_limits,dict) or set(cache_limits)!={"max_payload_bytes","max_samples","max_windows"}
+            or any(type(v) is not int or v<=0 for v in cache_limits.values()) or not consumers):
+        raise ValueError("capture requires objective, consumers and positive explicit cache limits")
+    if len({owner for _,owner in consumers.values()})*cache_limits["max_payload_bytes"]>max_total_payload_bytes:
+        raise ValueError("aggregate declared cache payload exceeds byte limit")
+    if guard_reads and torch.is_inference_mode_enabled():
+        raise ValueError("guarded capture cannot use inference mode")
+    builders={}; totals={}; sample_totals={}; window_totals={}
     for owner in {owner for _,owner in consumers.values()}:
-        builders[owner] = source.observation.cache_builder(owner,tokenizer,objective_bytes,_encoded(output),_encoded(cache_limits))
+        builders[owner] = observation.cache_builder(owner,tokenizer,objective_bytes,_encoded(output),_encoded(cache_limits))
         totals[owner]=len(tokenizer)+len(objective_bytes); sample_totals[owner]=0; window_totals[owner]=0
-    records=[]; hooks=[]; current={}
+    records=[]; hooks=[]; current={}; active=[]
+    mode=nullcontext()
+    if guard_reads:
+        from .owner_capture import _OwnerReads, _storage
+        protected={_storage(m.weight):owner for m,owner in consumers.values()}
+        def admit(frame,values,role):
+            if role!="matmul": raise ValueError("QTEA capture requires Matmul reads")
+            frame["input"]=values
+        mode=_OwnerReads(protected,active,admit)
+        for module,_ in consumers.values():
+            if (type(module) is not nn.Linear or getattr(module.forward,"__func__",None) is not nn.Linear.forward
+                    or module._forward_hooks or module._forward_pre_hooks or module._backward_hooks or module._backward_pre_hooks):
+                raise ValueError("guarded capture requires exact unhooked Linear forwards")
+        def pre(module,args):
+            active.append(dict(module=module))
     def hook(owner,module,args,value):
         inputs=args[0]
+        if guard_reads:
+            if not active or active[-1]["module"] is not module: raise ValueError("guarded invocation stack differs")
+            frame=active.pop(); observed=frame.get("operator_output")
+            if (observed is None or frame.get("input") is None or _storage(value)!=_storage(observed)
+                    or value._version!=frame["output_version"]):
+                raise ValueError("guarded invocation output differs")
         tokens=current["tokens"]
         if (not isinstance(inputs,torch.Tensor) or not isinstance(value,torch.Tensor)
                 or inputs.device.type!="cpu" or value.device.type!="cpu"
@@ -202,6 +241,7 @@ def calibrate_native_module(source, windows, objective, *, objective_bytes, cach
         records.append((owner,id(module),_compact(inputs.detach().to(dtype=torch.float32).reshape(n,module.in_features).clone()),value))
     try:
         for module,owner in consumers.values():
+            if guard_reads: hooks.append(module.register_forward_pre_hook(pre))
             hooks.append(module.register_forward_hook(lambda m,a,v,owner=owner: hook(owner,m,a,v)))
         for window in windows:
             tokens=window["input_ids"]
@@ -229,7 +269,7 @@ def calibrate_native_module(source, windows, objective, *, objective_bytes, cach
                      ("calibration_weights", None if weights is None else (weights.dtype,weights.shape), selection.get("weights")),
                      ("calibration_mask", None if mask is None else (mask.dtype,mask.shape), selection.get("mask"))]
             records.clear()
-            with (torch.enable_grad() if output=="DenseFisher" else torch.no_grad()):
+            with (torch.enable_grad() if output=="DenseFisher" else torch.no_grad()), mode:
                 loss=objective(model,window)
                 _check_window_context(window, specs)
                 if {module_id for _,module_id,_,_ in records} != set(consumers): raise ValueError("required native consumers did not execute")
@@ -242,12 +282,12 @@ def calibrate_native_module(source, windows, objective, *, objective_bytes, cach
                 kwargs={} if gradient is None else {"gradients":_compact(gradient.detach().to(dtype=torch.float32).reshape(inputs.shape[0],-1))}
                 builders[owner].capture(current["tokens"],inputs,**selection,**kwargs)
             records.clear()
-        source.verify()
+        verify_source()
         caches=tuple((name,builders[name].finish()) for name in sorted(builders))
-        return NativeModuleCalibration(source,caches,max_total_payload_bytes)
+        return caches
     finally:
         for handle in hooks: handle.remove()
-        records.clear(); current.clear()
+        records.clear(); current.clear(); active.clear()
 
 
 def convert_calibrated_native_module(calibration, output_dir, run_id, *, partition,

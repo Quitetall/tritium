@@ -21,7 +21,7 @@ use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, Tra
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing_futures::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use tritium_nn::Tokenizer;
+use tritium_nn::{ChatRenderOptions, Tokenizer};
 
 use crate::admission::{Admission, AdmissionDecision, AdmissionPolicy};
 use crate::dto::{
@@ -1684,18 +1684,42 @@ async fn chat_completions(
         .iter()
         .map(|m| (m.role.as_str(), m.content.as_str()))
         .collect();
-    let prompt_text = match st.tok.render_chat_prompt(&messages, st.max_prompt_bytes) {
-        Ok(Some(prompt)) => prompt,
-        Ok(None) => st.chat_template.render(messages.iter().copied()),
-        Err(error) => {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                error.to_string(),
-                Some("messages"),
-            );
-        }
+    let thinking = req
+        .chat_template_kwargs
+        .as_ref()
+        .and_then(|args| args.enable_thinking);
+    let render_options = thinking.map_or_else(ChatRenderOptions::default, |enabled| {
+        ChatRenderOptions::default().with_thinking(enabled)
+    });
+    let render_param = if thinking.is_some() {
+        "chat_template_kwargs"
+    } else {
+        "messages"
     };
+    let prompt_text =
+        match st
+            .tok
+            .render_chat_prompt_with_options(&messages, render_options, st.max_prompt_bytes)
+        {
+            Ok(Some(prompt)) => prompt,
+            Ok(None) if thinking.is_none() => st.chat_template.render(messages.iter().copied()),
+            Ok(None) => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "explicit chat_template_kwargs require a source-rendered prompt",
+                    Some("chat_template_kwargs"),
+                );
+            }
+            Err(error) => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    error.to_string(),
+                    Some(render_param),
+                );
+            }
+        };
     let tokenization_span = tracing::info_span!("model.tokenize");
     let tokenized = {
         let _entered = tokenization_span.enter();

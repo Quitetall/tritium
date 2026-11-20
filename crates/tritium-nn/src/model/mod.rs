@@ -15,9 +15,29 @@ mod hf_shards;
 #[cfg(feature = "tokenizer")]
 mod host;
 mod limits;
+mod qtea_inventory;
+pub use qtea_inventory::{QteaModelInventory, QteaModelProfile};
 #[cfg(feature = "tokenizer")]
 mod load_config;
+#[cfg(feature = "host-qtea")]
+mod qtea;
+#[cfg(feature = "host-qtea")]
+mod qtea_execution;
+#[cfg(all(feature = "host-qtea", feature = "tokenizer"))]
+mod qtea_hybrid;
+#[cfg(all(feature = "host-qtea", feature = "tokenizer"))]
+mod qtea_load_config;
+#[cfg(feature = "host-qtea")]
+mod qtea_owners;
+#[cfg(all(feature = "host-qtea", feature = "cuda"))]
+pub use qtea_execution::CudaQteaModelLimits;
+#[cfg(all(feature = "host-qtea", feature = "tokenizer"))]
+pub use qtea_hybrid::HostQteaHybridModelLimits;
+#[cfg(all(feature = "host-qtea", feature = "tokenizer"))]
+pub use qtea_load_config::QteaLoadConfig;
 mod qwen35;
+#[cfg(feature = "host-qtea")]
+pub use qtea::HostQteaModelLimits;
 mod qwen35_execution;
 mod qwen35_hf;
 mod qwen35_hf_source;
@@ -108,7 +128,7 @@ pub use source::{
     LoadedModel, load, load_streamed_with_resources, load_with_limits, load_with_resources,
 };
 pub(crate) use staged_calibration::{dense_source_weights, dense_stage_weights};
-pub use tokenizer::Tokenizer;
+pub use tokenizer::{ChatRenderOptions, Tokenizer};
 pub use training_salt::{
     TRAINING_SALT_COMPLETED_STEP_KEY, TRAINING_SALT_FORMAT_KEY, TRAINING_SALT_FORMAT_VALUE,
     TRAINING_SALT_GROWTH_RECEIPT_KEY, TRAINING_SALT_HF_CONFIG_KEY,

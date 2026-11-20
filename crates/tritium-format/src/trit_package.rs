@@ -66,6 +66,7 @@ const TRIT_FEATURES_SUPPORTED: u32 = 0;
 const TRIT_BLOB_KIND_ADDITIVE: u64 = 0;
 const TRIT_BLOB_KIND_DENSE: u64 = 1;
 const TRIT_BLOB_KIND_ASSET: u64 = 2;
+const TRIT_BLOB_KIND_QTEA: u64 = 3;
 const TRIT_DTYPE_TEXT: &[(&str, DType)] = &[
     ("ternary", DType::Ternary),
     ("i4", DType::I4),
@@ -146,6 +147,8 @@ pub fn trit_package_layout_spec() -> String {
 pub enum TritBlobKind {
     /// Additive ternary tensor payload.
     AdditiveTensor,
+    /// Complete residual-bearing QTEA V1 tensor, never additive SALT.
+    QteaTensor,
     /// Dense tensor payload with its element dtype.
     DenseTensor(DType),
     /// Model asset such as config, tokenizer, or chat template.
@@ -175,6 +178,31 @@ pub struct TritSpoolBlob {
     pub offset: u64,
     /// Exact source byte length.
     pub length: u64,
+}
+
+/// Exact canonical layout from known blob identities/lengths, not source-byte proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TritSpoolLayoutSize {
+    /// Complete canonical container length including alignment and deduplication.
+    pub package_bytes: u64,
+    /// Exact supplied canonical manifest bytes.
+    pub manifest_bytes: u64,
+    /// Exact owning encoder's deduplicated typed directory bytes.
+    pub directory_bytes: u64,
+}
+
+/// Inspect the owning spool encoder's exact metadata layout without source/output I/O.
+/// Actual payload identities/ranges/collisions remain checked by the writer.
+pub fn inspect_trit_spool_layout(
+    manifest_cbor: &[u8],
+    blobs: &[TritSpoolBlob],
+) -> Result<TritSpoolLayoutSize, TritPackageError> {
+    let plan = prepare_spool_layout(manifest_cbor, blobs, usize::MAX)?;
+    Ok(TritSpoolLayoutSize {
+        package_bytes: plan.size as u64,
+        manifest_bytes: plan.manifest.len() as u64,
+        directory_bytes: plan.directory.len() as u64,
+    })
 }
 
 /// Indexed package entry for one blob kind.
@@ -469,16 +497,7 @@ pub fn write_trit_package_from_spool(
     max_bytes: usize,
     destination: &mut impl std::io::Write,
 ) -> Result<PackageId, TritPackageWriteError> {
-    let entries = blob_metadata(manifest_cbor, blobs.len(), |index| {
-        let blob = &blobs[index];
-        Ok(BlobMetadata {
-            id: blob.id,
-            kind: blob.kind.clone(),
-            length: as_usize(blob.length)?,
-        })
-    })
-    .map_err(TritPackageWriteError::Package)?;
-    let plan = prepare_layout(manifest_cbor, &entries, max_bytes)
+    let plan = prepare_spool_layout(manifest_cbor, blobs, max_bytes)
         .map_err(TritPackageWriteError::Package)?;
     let source_len = source
         .seek(std::io::SeekFrom::End(0))
@@ -514,6 +533,22 @@ pub fn write_trit_package_from_spool(
         },
     )?;
     Ok(hash.finalize())
+}
+
+fn prepare_spool_layout<'a>(
+    manifest_cbor: &'a [u8],
+    blobs: &[TritSpoolBlob],
+    max_bytes: usize,
+) -> Result<PackageWritePlan<'a>, TritPackageError> {
+    let entries = blob_metadata(manifest_cbor, blobs.len(), |index| {
+        let blob = &blobs[index];
+        Ok(BlobMetadata {
+            id: blob.id,
+            kind: blob.kind.clone(),
+            length: as_usize(blob.length)?,
+        })
+    })?;
+    prepare_layout(manifest_cbor, &entries, max_bytes)
 }
 
 fn seek_spool(source: &mut impl std::io::Seek, offset: u64) -> Result<(), TritPackageWriteError> {
@@ -1071,6 +1106,7 @@ fn decode_borrowed_directory(bytes: &[u8]) -> Result<Option<Vec<TritBlobInfo>>, 
         };
         let kind = match (entry.kind, entry.aux) {
             (TRIT_BLOB_KIND_ADDITIVE, None) => TritBlobKind::AdditiveTensor,
+            (TRIT_BLOB_KIND_QTEA, None) => TritBlobKind::QteaTensor,
             (TRIT_BLOB_KIND_DENSE, Some(name)) => match dtype_from_str(name) {
                 Ok(dtype) => TritBlobKind::DenseTensor(dtype),
                 Err(_) => return Ok(None),
@@ -1160,6 +1196,7 @@ fn decode_reference_directory(bytes: &[u8]) -> Result<Vec<TritBlobInfo>, TritPac
 fn encode_kind(kind: &TritBlobKind) -> (u64, Value) {
     match kind {
         TritBlobKind::AdditiveTensor => (TRIT_BLOB_KIND_ADDITIVE, Value::Null),
+        TritBlobKind::QteaTensor => (TRIT_BLOB_KIND_QTEA, Value::Null),
         TritBlobKind::DenseTensor(dtype) => (TRIT_BLOB_KIND_DENSE, Value::Text(dtype.to_string())),
         TritBlobKind::Asset(name) => (TRIT_BLOB_KIND_ASSET, Value::Text(name.clone())),
     }
@@ -1168,6 +1205,7 @@ fn encode_kind(kind: &TritBlobKind) -> (u64, Value) {
 fn decode_kind(tag: u64, value: &Value) -> Result<TritBlobKind, TritPackageError> {
     match (tag, value) {
         (TRIT_BLOB_KIND_ADDITIVE, Value::Null) => Ok(TritBlobKind::AdditiveTensor),
+        (TRIT_BLOB_KIND_QTEA, Value::Null) => Ok(TritBlobKind::QteaTensor),
         (TRIT_BLOB_KIND_DENSE, Value::Text(name)) => {
             dtype_from_str(name).map(TritBlobKind::DenseTensor)
         }
@@ -1290,6 +1328,7 @@ fn integer(value: &Value) -> Result<u64, TritPackageError> {
 fn kind_sort_key(kind: &TritBlobKind) -> (u8, String) {
     match kind {
         TritBlobKind::AdditiveTensor => (0, String::new()),
+        TritBlobKind::QteaTensor => (3, String::new()),
         TritBlobKind::DenseTensor(dtype) => (1, dtype.to_string()),
         TritBlobKind::Asset(name) => (2, name.clone()),
     }

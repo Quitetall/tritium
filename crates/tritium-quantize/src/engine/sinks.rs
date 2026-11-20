@@ -1,5 +1,8 @@
 //! No-overwrite destinations for a checked package and actual sealed fit log.
+mod candidate;
+use super::companions::{TritModelCompanions, TritModelSpool, copy_companion, verify_companion};
 use super::{PublicationWarning, QuantEngineError, TensorSink};
+pub use candidate::{CandidatePublicationError, UnqualifiedCandidateRecord};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, Write},
@@ -7,7 +10,7 @@ use std::{
 };
 use tritium_evidence::SealedEvidence;
 use tritium_format::trit_model::{
-    TritModelReader, TritModelStageError, stage_trit_model_from_spool,
+    TritModelReader, TritModelStageError, stage_trit_model_from_spool_with_admission,
 };
 use tritium_format::{TritPackageReadLimits, TritSpoolBlob};
 use tritium_schema::ModelManifest;
@@ -41,6 +44,20 @@ impl<E: std::error::Error + 'static> std::error::Error for TritModelPublicationE
 enum WriteFailure<E> {
     Emitter(E),
     Publication(QuantEngineError),
+}
+
+#[derive(Clone, Copy)]
+enum PublicationRecord<'a> {
+    Sealed(&'a str),
+    Candidate,
+}
+impl PublicationRecord<'_> {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Sealed(_) => "evidence.jsonl",
+            Self::Candidate => "candidate.json",
+        }
+    }
 }
 impl<E> From<std::io::Error> for WriteFailure<E> {
     fn from(error: std::io::Error) -> Self {
@@ -135,6 +152,47 @@ impl DirectoryTensorSink {
         })
     }
 
+    /// Republish exact retained-source bytes without a complete package buffer.
+    ///
+    /// Admits the canonical original log, complete typed source binding and the
+    /// expected exact PackageId before creating output. Copies checked bounded
+    /// chunks into the common owned pending file, admits that file through the
+    /// same checker and verifies the retained source before no-clobber commit.
+    /// No recorder seal, rewritten log, refit or distribution approval is made.
+    /// Caller owns immutable source and parent-directory custody; this is not an
+    /// atomic external-writer snapshot, process-RSS or power-loss/security gate.
+    /// # Errors
+    /// Invalid binding/identity, changed source, byte limits, original source or
+    /// destination I/O, existing output or other pre-commit publication failure.
+    pub fn publish_verified_model_reader<R: Read + Seek>(
+        &mut self,
+        source: R,
+        limits: TritPackageReadLimits,
+        expected: tritium_format::PackageId,
+        original_jsonl: &str,
+    ) -> Result<Vec<PublicationWarning>, QuantEngineError> {
+        let log = tritium_evidence::verify_jsonl(original_jsonl)?;
+        let mut model = super::open_model_reader_with_fit_log(source, limits, &log)?;
+        if model.package_id() != expected {
+            return Err(QuantEngineError::Binding("export package identity changed"));
+        }
+        self.publish_with_emitter(original_jsonl, true, |file| {
+            model
+                .visit_package(|chunk| file.write_all(chunk))
+                .map_err(QuantEngineError::ModelVisit)?;
+            let staged = super::open_model_reader_with_fit_log(file, limits, &log)?;
+            if staged.package_id() != expected {
+                return Err(QuantEngineError::Binding("staged export identity changed"));
+            }
+            model.verify()?;
+            Ok(())
+        })
+        .map(|(_, warnings)| warnings)
+        .map_err(|error| match error {
+            WriteFailure::Emitter(error) | WriteFailure::Publication(error) => error,
+        })
+    }
+
     /// Validate bounded spool output before the existing sync/no-clobber commit.
     ///
     /// Uses the same publisher as ordinary/recorded-stage writers and the format
@@ -160,10 +218,101 @@ impl DirectoryTensorSink {
         source_guard: impl FnOnce() -> Result<(), E>,
     ) -> Result<(TritModelReader<File>, Vec<PublicationWarning>), TritModelPublicationError<E>>
     {
-        self.publish_with_emitter(evidence.jsonl(), true, |file| {
+        self.publish_spooled_model_with_companions(
+            TritModelSpool {
+                manifest,
+                blobs,
+                source: spool,
+                limits,
+            },
+            evidence,
+            TritModelCompanions {
+                files: Vec::new(),
+                max_bytes: 0,
+            },
+            |_| source_guard(),
+        )
+        .map(|(model, (), warnings)| (model, warnings))
+    }
+
+    /// Stage a complete typed model and bounded hashed companions in one commit.
+    /// Companions are copied/synced before staging; retained handles are rechecked
+    /// after the source guard and before the no-clobber model hard link. Caller
+    /// owns exclusive source/directory custody; not adversarial-writer, RSS,
+    /// power-loss/security, lineage or distribution qualification.
+    pub fn publish_spooled_model_with_companions<S: Read + Seek, E, T>(
+        &mut self,
+        staging: TritModelSpool<'_, S>,
+        evidence: &SealedEvidence,
+        companions: TritModelCompanions<'_>,
+        admit: impl FnOnce(&TritModelReader<File>) -> Result<T, E>,
+    ) -> Result<(TritModelReader<File>, T, Vec<PublicationWarning>), TritModelPublicationError<E>>
+    {
+        self.publish_original_spooled_model_with_companions(
+            staging,
+            evidence.jsonl(),
+            companions,
+            admit,
+        )
+    }
+
+    /// Copy original verified log bytes without manufacturing a new recorder seal.
+    /// Caller admission must bind actual typed contents/companions to that original
+    /// lineage; generic log verification alone is not model/replay qualification.
+    pub fn publish_original_spooled_model_with_companions<S: Read + Seek, E, T>(
+        &mut self,
+        staging: TritModelSpool<'_, S>,
+        original_jsonl: &str,
+        companions: TritModelCompanions<'_>,
+        admit: impl FnOnce(&TritModelReader<File>) -> Result<T, E>,
+    ) -> Result<(TritModelReader<File>, T, Vec<PublicationWarning>), TritModelPublicationError<E>>
+    {
+        tritium_evidence::verify_jsonl(original_jsonl)
+            .map_err(|e| TritModelPublicationError::Publication(QuantEngineError::Evidence(e)))?;
+        {
+            use tritium_format::trit_model::{TritModelError, encode_model_manifest};
+            use tritium_format::{TritPackageError, inspect_trit_spool_layout};
+            let metadata = encode_model_manifest(staging.manifest).map_err(|error| {
+                TritModelPublicationError::Staging(TritModelStageError::Model(error))
+            })?;
+            let size = inspect_trit_spool_layout(&metadata, staging.blobs).map_err(|error| {
+                TritModelPublicationError::Staging(TritModelStageError::Model(
+                    TritModelError::Package(error),
+                ))
+            })?;
+            if size.package_bytes > staging.limits.max_source_bytes {
+                return Err(TritModelPublicationError::Staging(
+                    TritModelStageError::Model(TritModelError::Package(
+                        TritPackageError::PackageLimitExceeded {
+                            requested: usize::try_from(size.package_bytes).unwrap_or(usize::MAX),
+                            limit: usize::try_from(staging.limits.max_source_bytes)
+                                .unwrap_or(usize::MAX),
+                        },
+                    )),
+                ));
+            }
+            if size.manifest_bytes > staging.limits.max_manifest_bytes as u64
+                || size.directory_bytes > staging.limits.max_directory_bytes as u64
+            {
+                return Err(TritModelPublicationError::Staging(
+                    TritModelStageError::Model(TritModelError::Package(
+                        TritPackageError::MetadataLimitExceeded,
+                    )),
+                ));
+            }
+        }
+        self.publish_with_companions(original_jsonl, true, companions, |file| {
             let destination = file.try_clone().map_err(TritModelStageError::Destination)?;
-            stage_trit_model_from_spool(manifest, blobs, spool, limits, destination, source_guard)
+            stage_trit_model_from_spool_with_admission(
+                staging.manifest,
+                staging.blobs,
+                staging.source,
+                staging.limits,
+                destination,
+                admit,
+            )
         })
+        .map(|((model, value), warnings)| (model, value, warnings))
         .map_err(|error| match error {
             WriteFailure::Emitter(error) => TritModelPublicationError::Staging(error),
             WriteFailure::Publication(error) => TritModelPublicationError::Publication(error),
@@ -176,6 +325,44 @@ impl DirectoryTensorSink {
         readable: bool,
         emit: impl FnOnce(&mut File) -> Result<R, E>,
     ) -> Result<(R, Vec<PublicationWarning>), WriteFailure<E>> {
+        self.publish_with_companions(
+            original_jsonl,
+            readable,
+            TritModelCompanions {
+                files: Vec::new(),
+                max_bytes: 0,
+            },
+            emit,
+        )
+    }
+
+    fn publish_with_companions<R, E>(
+        &mut self,
+        original_jsonl: &str,
+        readable: bool,
+        companions: TritModelCompanions<'_>,
+        emit: impl FnOnce(&mut File) -> Result<R, E>,
+    ) -> Result<(R, Vec<PublicationWarning>), WriteFailure<E>> {
+        self.publish_transaction(
+            PublicationRecord::Sealed(original_jsonl),
+            readable,
+            companions,
+            |file| emit(file).map(|value| (value, None)),
+        )
+    }
+
+    fn publish_transaction<R, E>(
+        &mut self,
+        record: PublicationRecord<'_>,
+        readable: bool,
+        mut companions: TritModelCompanions<'_>,
+        emit: impl FnOnce(&mut File) -> Result<(R, Option<Vec<u8>>), E>,
+    ) -> Result<(R, Vec<PublicationWarning>), WriteFailure<E>> {
+        companions.validate().map_err(WriteFailure::Publication)?;
+        let mut owned_companions = Vec::new();
+        owned_companions
+            .try_reserve_exact(companions.files.len())
+            .map_err(|_| WriteFailure::Publication(QuantEngineError::Allocation))?;
         fs::create_dir(&self.directory).map_err(|e| {
             WriteFailure::Publication(if e.kind() == std::io::ErrorKind::AlreadyExists {
                 QuantEngineError::DestinationExists
@@ -183,24 +370,54 @@ impl DirectoryTensorSink {
                 QuantEngineError::Io(e)
             })
         })?;
-        let log = self.directory.join("evidence.jsonl");
+        let log = self.directory.join(record.name());
         let pending = self.directory.join(".pending.trit");
         let model = self.directory.join("model.trit");
         let mut owned_log = false;
         let mut owned_pending = false;
         let result = (|| {
-            let mut file = OpenOptions::new().write(true).create_new(true).open(&log)?;
+            let mut log_file = OpenOptions::new().write(true).create_new(true).open(&log)?;
             owned_log = true;
-            file.write_all(original_jsonl.as_bytes())?;
-            file.sync_all()?;
+            if let PublicationRecord::Sealed(original_jsonl) = record {
+                log_file.write_all(original_jsonl.as_bytes())?;
+                log_file.sync_all()?;
+            }
+            for companion in &mut companions.files {
+                let path = self.directory.join(companion.name);
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)?;
+                owned_companions.push((path, file, companion.bytes, companion.content));
+                let file = &mut owned_companions.last_mut().expect("just inserted").1;
+                copy_companion(companion.source, file, companion.bytes, companion.content)
+                    .map_err(WriteFailure::Publication)?;
+            }
             let mut file = OpenOptions::new()
                 .read(readable)
                 .write(true)
                 .create_new(true)
                 .open(&pending)?;
             owned_pending = true;
-            let value = emit(&mut file).map_err(WriteFailure::Emitter)?;
+            let (value, deferred) = emit(&mut file).map_err(WriteFailure::Emitter)?;
+            match (record, deferred) {
+                (PublicationRecord::Sealed(_), None) => {}
+                (PublicationRecord::Candidate, Some(bytes)) => {
+                    log_file.write_all(&bytes)?;
+                    log_file.sync_all()?;
+                }
+                _ => {
+                    return Err(WriteFailure::Publication(QuantEngineError::Binding(
+                        "publication metadata mode mismatch",
+                    )));
+                }
+            }
             file.sync_all()?;
+            for (_, companion, bytes, content) in &mut owned_companions {
+                verify_companion(companion, *bytes, *content).map_err(WriteFailure::Publication)?;
+            }
+            drop(log_file);
             fs::hard_link(&pending, &model)?;
             Ok::<R, WriteFailure<E>>(value)
         })();
@@ -212,6 +429,10 @@ impl DirectoryTensorSink {
                 }
                 if owned_log {
                     let _ = fs::remove_file(&log);
+                }
+                for (path, file, _, _) in owned_companions {
+                    drop(file);
+                    let _ = fs::remove_file(path);
                 }
                 // Never recursively remove unexpected/foreign files injected here.
                 let _ = fs::remove_dir(&self.directory);

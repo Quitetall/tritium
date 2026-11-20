@@ -191,12 +191,22 @@ extern "C" __global__ void semantic_causal_attention(
     if (lane < dim) output[q_at + lane] = accumulator / shared[blockDim.x + 2];
 }
 
-extern "C" __global__ void semantic_swiglu(float *gate, const float *up, uint32_t count) {
+extern "C" __global__ void semantic_swiglu(float *gate, const float *up, uint32_t *invalid, uint32_t count) {
     uint64_t at = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (at < count) {
         float z = gate[at];
-        gate[at] = (z / (1.0f + expf(-z))) * up[at];
+        float u = up[at];
+        float value = (z / (1.0f + expf(-z))) * u;
+        if (!isfinite(z) || !isfinite(u) || !isfinite(value)) atomicOr(invalid, 1u);
+        gate[at] = value;
     }
+}
+
+// Preserve invalid transformed input even when a pruned matrix masks it.
+extern "C" __global__ void semantic_activation_check_finite(
+    const float *values, uint32_t *invalid, uint32_t count) {
+    uint64_t at = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (at < count && !isfinite(values[at])) atomicOr(invalid, 1u);
 }
 
 __device__ __forceinline__ uint64_t semantic_splitmix(uint64_t value) {
@@ -385,6 +395,101 @@ extern "C" __global__ void semantic_additive_matmul_ordered_warp(
     if (at >= uint64_t(batch) * rows) return;
     float sum = semantic_additive_dot<true>(p, act + (at / rows) * cols, at % rows);
     if ((threadIdx.x & 31) == 0) out[at] = sum;
+}
+// Private cross-row kernels. Dispatch selects the measured 32-row geometry
+// only; the 8-row variant remains an explicit comparison diagnostic.
+// Uniform B3, free F16 group-128 only. Cooperative lanes stage at most 27
+// canonical bytes per row/group (28-byte stride avoids a 32-byte bank stride).
+// One consumer thread owns each row and retains *all* scalar column, group and
+// plane accumulation order. No parallel reduction, repacked weights, dense
+// shadow or retained workspace. Every thread reaches both group barriers,
+// including ragged row/column tails and partially occupied final blocks.
+template<uint32_t tile_rows>
+__device__ __forceinline__ void semantic_b3_rows(
+    const uint8_t *p, const float *act, float *out, uint32_t batch, float *shared
+) {
+    uint32_t rows = h(p, 0), cols = h(p, 1), planes = h(p, 2);
+    if (h(p, 13) || h(p, 4) != 1 || h(p, 3) != 128 ||
+        h(p, 5) != 2 || h(p, 6) != 1 || h(p, 7) || blockIdx.y >= batch) return;
+    float *values = shared;
+    uint8_t *codes = reinterpret_cast<uint8_t *>(shared + 128);
+    uint32_t lane = threadIdx.x, first_row = blockIdx.x * tile_rows;
+    uint32_t row = first_row + lane;
+    float sum = 0.0f;
+    for (uint32_t plane = 0; plane < planes; ++plane) {
+        const uint8_t *data = p + plane_start(p, plane);
+        for (uint32_t start = 0; start < cols; start += 128) {
+            uint32_t len = min(128u, cols - start);
+            values[lane] = lane < len ? act[uint64_t(blockIdx.y) * cols + start + lane] : 0.0f;
+            for (uint32_t i = lane; i < tile_rows * 28; i += 128) {
+                uint32_t local_row = i / 28, byte = i % 28;
+                uint32_t coefficient = (first_row + local_row) * cols + start;
+                uint32_t needed = (coefficient % 5 + len + 4) / 5;
+                codes[i] = first_row + local_row < rows && byte < needed
+                    ? data[coefficient / 5 + byte] : 0;
+            }
+            __syncthreads();
+            if (lane < tile_rows && row < rows) {
+                uint32_t phase = (row * cols + start) % 5;
+                const uint8_t *row_codes = codes + lane * 28;
+                float partial = 0.0f;
+                for (uint32_t col = 0; col < len; ++col)
+                    partial = add_digit(partial, values[col], digit(row_codes, 1, phase + col));
+                uint32_t unit = row * ((cols + 127) / 128) + start / 128;
+                sum += partial * scale(p, plane, plane * h(p, 14) + unit);
+            }
+            __syncthreads();
+        }
+    }
+    if (lane < tile_rows && row < rows) out[uint64_t(blockIdx.y) * rows + row] = sum;
+}
+extern "C" __global__ void semantic_additive_matmul_b3_rows_8(
+    const uint8_t *p, const float *act, float *out, uint32_t batch
+) {
+    extern __shared__ float shared[];
+    semantic_b3_rows<8>(p, act, out, batch, shared);
+}
+extern "C" __global__ void semantic_additive_matmul_b3_rows_32(
+    const uint8_t *p, const float *act, float *out, uint32_t batch
+) {
+    extern __shared__ float shared[];
+    semantic_b3_rows<32>(p, act, out, batch, shared);
+}
+// Group-parallel kernel, selected only for measured decode families. Each group starts at +0 and folds
+// its columns in the original order. After a CTA-wide barrier, thread zero
+// folds the completed partials in the original plane/group order, including
+// the separate f32 multiply/add (--fmad=false). This is NOT a tree reduction.
+// At most 3 * ceil(17408/128) = 408 partials fit the 512-float shared scratch;
+// no persistent/global partial buffer, repacking or dense shadow is needed.
+extern "C" __global__ void semantic_additive_matmul_b3_groups(
+    const uint8_t *p, const float *act, float *out, uint32_t batch
+) {
+    uint32_t rows = h(p, 0), cols = h(p, 1), planes = h(p, 2);
+    if (blockDim.x != 128 || blockIdx.x >= rows || blockIdx.y >= batch ||
+        !cols || cols > 17408 || !planes || planes > 3 || h(p, 13) ||
+        h(p, 4) != 1 || h(p, 3) != 128 || h(p, 5) != 2 ||
+        h(p, 6) != 1 || h(p, 7)) return;
+    extern __shared__ float partials[];
+    uint32_t row = blockIdx.x, groups = (cols + 127) / 128;
+    const float *a = act + uint64_t(blockIdx.y) * cols;
+    for (uint32_t unit = threadIdx.x; unit < planes * groups; unit += blockDim.x) {
+        uint32_t plane = unit / groups, group = unit - plane * groups;
+        const uint8_t *data = p + plane_start(p, plane);
+        uint32_t start = group * 128, end = min(start + 128, cols);
+        float partial = 0.0f;
+        for (uint32_t col = start; col < end; ++col)
+            partial = add_digit(partial, a[col], digit(data, 1, row * cols + col));
+        partials[unit] = partial;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float sum = 0.0f;
+        for (uint32_t plane = 0; plane < planes; ++plane)
+            for (uint32_t group = 0; group < groups; ++group)
+                sum += partials[plane * groups + group] *
+                    scale(p, plane, plane * h(p, 14) + row * groups + group);
+        out[uint64_t(blockIdx.y) * rows + row] = sum;
+    }
 }
 __device__ __forceinline__ float semantic_stored_weight(const uint8_t *p, uint32_t row, uint32_t col) {
     uint32_t cols = h(p, 1), planes = h(p, 2), group = h(p, 3), codec = h(p, 4);

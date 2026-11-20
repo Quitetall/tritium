@@ -147,6 +147,36 @@ impl Optimizer for AdamW {
     }
 
     fn step(&self, t: u64, param: &mut [f32], grad: &[f32], state: &mut AdamState) {
+        self.step_mapped(t, param, grad, state, |gradient| gradient);
+    }
+
+    fn write_state(&self, state: &AdamState, out: &mut Vec<u8>) {
+        for &x in &state.m {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        for &x in &state.v {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+
+    fn read_state(&self, len: usize, cursor: &mut Cursor) -> Result<AdamState, CheckpointError> {
+        let m = cursor.f32_vec(len)?;
+        let v = cursor.f32_vec(len)?;
+        Ok(AdamState { m, v })
+    }
+}
+
+impl AdamW {
+    // Keep the element math and serial/parallel split shared. Native P/V maps
+    // already-preflighted window weights here without a full gradient copy.
+    pub(crate) fn step_mapped(
+        &self,
+        t: u64,
+        param: &mut [f32],
+        grad: &[f32],
+        state: &mut AdamState,
+        map: impl Fn(f32) -> f32 + Sync,
+    ) {
         debug_assert!(t >= 1, "step index t is 1-based; t=0 gives bc=0 ⇒ NaN");
         assert_eq!(param.len(), grad.len(), "param/grad length mismatch");
         assert_eq!(param.len(), state.m.len(), "param/state m length mismatch");
@@ -163,6 +193,7 @@ impl Optimizer for AdamW {
         // Each element updates independently, so the parallel and serial results are bit-identical.
         // Big leaves (every trained 2D weight) go parallel; tiny ones stay serial (rayon overhead).
         let elem = |p: &mut f32, g: f32, mi: &mut f32, vi: &mut f32| {
+            let g = map(g);
             let m = self.beta1 * *mi + (1.0 - self.beta1) * g;
             let v = self.beta2 * *vi + (1.0 - self.beta2) * g * g;
             *mi = m;
@@ -187,21 +218,6 @@ impl Optimizer for AdamW {
                 elem(p, g, mi, vi);
             }
         }
-    }
-
-    fn write_state(&self, state: &AdamState, out: &mut Vec<u8>) {
-        for &x in &state.m {
-            out.extend_from_slice(&x.to_le_bytes());
-        }
-        for &x in &state.v {
-            out.extend_from_slice(&x.to_le_bytes());
-        }
-    }
-
-    fn read_state(&self, len: usize, cursor: &mut Cursor) -> Result<AdamState, CheckpointError> {
-        let m = cursor.f32_vec(len)?;
-        let v = cursor.f32_vec(len)?;
-        Ok(AdamState { m, v })
     }
 }
 
@@ -573,6 +589,36 @@ impl Optimizer for Muon {
 #[cfg(test)]
 mod muon_tests {
     use super::*;
+
+    #[test]
+    fn mapped_adamw_matches_materialized_gradients_serial_and_parallel() {
+        let optimizer = AdamW::new(0.017);
+        for len in [0, 19, PAR_MIN_ELEMS - 1, PAR_MIN_ELEMS, PAR_MIN_ELEMS + 3] {
+            let mut expected = seeded(43, len);
+            let mut actual = expected.clone();
+            let mut expected_state = optimizer.init_state(len);
+            let mut actual_state = expected_state.clone();
+            let gradient = seeded(97, len);
+            for (step, weight) in [(1, 0.125), (2, 3.125), (31, 1.0), (u64::MAX, 0.0)] {
+                let weighted: Vec<_> = gradient
+                    .iter()
+                    .map(|&g| (f64::from(g) * weight) as f32)
+                    .collect();
+                optimizer.step(step, &mut expected, &weighted, &mut expected_state);
+                optimizer.step_mapped(step, &mut actual, &gradient, &mut actual_state, |g| {
+                    (f64::from(g) * weight) as f32
+                });
+                for (left, right) in expected
+                    .iter()
+                    .chain(&expected_state.m)
+                    .chain(&expected_state.v)
+                    .zip(actual.iter().chain(&actual_state.m).chain(&actual_state.v))
+                {
+                    assert_eq!(left.to_bits(), right.to_bits());
+                }
+            }
+        }
+    }
 
     fn seeded(seed: u64, n: usize) -> Vec<f32> {
         let mut s = seed | 1;

@@ -131,6 +131,15 @@ fn rejected_steps_are_transactional() {
     ));
     assert_eq!(session.checkpoint_bytes().unwrap(), before);
     assert_eq!(session.completed_step(), 0);
+
+    // Finite inputs can still overflow during scale-gradient reduction. This
+    // later failure must retain the transaction snapshot and leave no updates.
+    assert!(matches!(
+        session.step(&[f32::MAX, -f32::MAX, f32::MAX, -f32::MAX], 1),
+        Err(PvTuningError::Step(_))
+    ));
+    assert_eq!(session.checkpoint_bytes().unwrap(), before);
+    assert_eq!(session.completed_step(), 0);
 }
 
 #[test]

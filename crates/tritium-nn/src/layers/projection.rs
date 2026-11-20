@@ -1,6 +1,6 @@
 //! `Projection`: a linear projection backed by a deployed BitNet ternary weight,
 //! host-packed additive SALT planes, a physically encoded resident SALT V2
-//! allocation, or a dense fp32 reference weight.
+//! allocation, a residual-bearing host QTEA tensor, or a dense fp32 reference weight.
 //!
 //! All variants expose the same `forward(backend, act, m, out)`, so a
 //! [`TransformerBlock`](crate::layers::TransformerBlock) runs either without
@@ -15,6 +15,8 @@ use tritium_format::salt_v2_package::SaltV2ScaleUpdate;
 use tritium_spec::TernaryBackend;
 
 use crate::error::NnError;
+#[cfg(feature = "host-qtea")]
+use crate::layers::HostQteaLinear;
 use crate::layers::{DenseLinear, HostSaltV2Linear, Linear, Q2Linear, SaltLinear, TernaryLinear};
 
 /// Activation arithmetic performed before a projection's weight contraction.
@@ -30,7 +32,7 @@ pub enum ProjectionActivationMode {
     A8,
 }
 
-/// A linear projection: deployed ternary, additive SALT, or dense fp32.
+/// A linear projection: deployed ternary, additive SALT, host QTEA, or dense fp32.
 ///
 /// `#[non_exhaustive]`: the `SaltV2` variant only exists under the `cuda`
 /// feature, so a downstream exhaustive match would compile cpu-only and
@@ -47,6 +49,12 @@ pub enum Projection {
     Salt(SaltLinear),
     /// Compact SALT V2 codec payload executed on portable host arithmetic.
     HostSaltV2(Arc<HostSaltV2Linear>),
+    /// Residual-bearing QTEA bytes, explicitly executed on the scalar host path.
+    #[cfg(feature = "host-qtea")]
+    HostQtea(Arc<HostQteaLinear>),
+    /// Direct packed ordered CUDA QTEA, with host-orchestrated activations.
+    #[cfg(feature = "cuda")]
+    CudaQtea(Arc<crate::CudaQteaLinear>),
     /// A SALT V2 matrix retained in its physical codec on a CUDA device.
     #[cfg(feature = "cuda")]
     SaltV2(Arc<tritium_cuda::SaltV2ResidentTensor>),
@@ -139,6 +147,10 @@ impl Projection {
                 ProjectionActivationMode::A8
             }
             Projection::HostSaltV2(_) | Projection::Tensor(_) => ProjectionActivationMode::F32,
+            #[cfg(feature = "host-qtea")]
+            Projection::HostQtea(_) => ProjectionActivationMode::F32,
+            #[cfg(feature = "cuda")]
+            Projection::CudaQtea(_) => ProjectionActivationMode::F32,
             #[cfg(feature = "cuda")]
             Projection::SaltV2(_) => ProjectionActivationMode::F32,
             Projection::Dense(linear) => {
@@ -158,6 +170,10 @@ impl Projection {
             Projection::Q2(linear) => linear.validate_retained_geometry(),
             Projection::Dense(linear) => linear.validate_retained_geometry(),
             Projection::Salt(_) | Projection::HostSaltV2(_) | Projection::Tensor(_) => Ok(()),
+            #[cfg(feature = "host-qtea")]
+            Projection::HostQtea(_) => Ok(()),
+            #[cfg(feature = "cuda")]
+            Projection::CudaQtea(_) => Ok(()),
             #[cfg(feature = "cuda")]
             Projection::SaltV2(_) => Ok(()),
         }
@@ -195,6 +211,12 @@ impl Projection {
             Projection::HostSaltV2(_) => {
                 // Strict package decode validates payload and scales before construction.
             }
+            #[cfg(feature = "host-qtea")]
+            Projection::HostQtea(_) => {
+                // Immutable QTEA construction validates geometry and every parameter.
+            }
+            #[cfg(feature = "cuda")]
+            Projection::CudaQtea(_) => { /* Immutable checked upload. */ }
             Projection::Tensor(_) => {
                 // Private loader construction validates immutable geometry and parameters.
             }
@@ -208,7 +230,8 @@ impl Projection {
 
     /// Forward through whichever projection this is. Deployed ternary and resident
     /// SALT V2 and shared tensor weights use `backend`; legacy host-packed SALT
-    /// and inspectable dense masters run on the host.
+    /// and inspectable dense masters run on the host. `HostQtea` always executes
+    /// the packed scalar host kernel, not the supplied backend.
     ///
     /// # Errors
     /// Propagates the underlying projection's [`NnError`]. Resident SALT V2 returns
@@ -225,6 +248,10 @@ impl Projection {
             Projection::Q2(l) => l.forward(act, m, out),
             Projection::Salt(l) => l.forward(act, m, out),
             Projection::HostSaltV2(l) => l.forward(act, m, out),
+            #[cfg(feature = "host-qtea")]
+            Projection::HostQtea(l) => l.forward(act, m, out),
+            #[cfg(feature = "cuda")]
+            Projection::CudaQtea(l) => l.forward(backend, act, m, out),
             #[cfg(feature = "cuda")]
             Projection::SaltV2(tensor) => salt_v2_forward_exact(backend, tensor, act, m, out),
             Projection::Dense(l) => l.forward(act, m, out),
@@ -239,6 +266,10 @@ impl Projection {
             Projection::Q2(l) => l.n_out(),
             Projection::Salt(l) => l.n_out(),
             Projection::HostSaltV2(l) => l.rows(),
+            #[cfg(feature = "host-qtea")]
+            Projection::HostQtea(l) => l.rows(),
+            #[cfg(feature = "cuda")]
+            Projection::CudaQtea(l) => l.rows(),
             #[cfg(feature = "cuda")]
             Projection::SaltV2(tensor) => tensor.rows(),
             Projection::Dense(l) => l.n_out,
@@ -253,6 +284,10 @@ impl Projection {
             Projection::Q2(l) => l.k_in(),
             Projection::Salt(l) => l.k_in(),
             Projection::HostSaltV2(l) => l.columns(),
+            #[cfg(feature = "host-qtea")]
+            Projection::HostQtea(l) => l.columns(),
+            #[cfg(feature = "cuda")]
+            Projection::CudaQtea(l) => l.columns(),
             #[cfg(feature = "cuda")]
             Projection::SaltV2(tensor) => tensor.columns(),
             Projection::Dense(l) => l.k_in,
@@ -270,6 +305,10 @@ impl Projection {
             | Projection::HostSaltV2(_)
             | Projection::Dense(_)
             | Projection::Tensor(_) => None,
+            #[cfg(feature = "host-qtea")]
+            Projection::HostQtea(_) => None,
+            #[cfg(feature = "cuda")]
+            Projection::CudaQtea(_) => None,
             #[cfg(feature = "cuda")]
             Projection::SaltV2(_) => None,
         }
@@ -285,6 +324,10 @@ impl Projection {
             | Projection::HostSaltV2(_)
             | Projection::Dense(_)
             | Projection::Tensor(_) => None,
+            #[cfg(feature = "host-qtea")]
+            Projection::HostQtea(_) => None,
+            #[cfg(feature = "cuda")]
+            Projection::CudaQtea(_) => None,
             #[cfg(feature = "cuda")]
             Projection::SaltV2(_) => None,
         }
@@ -413,6 +456,58 @@ mod tests {
             shared_projection
                 .apply_salt_v2_scale_updates(0, std::slice::from_ref(&update))
                 .is_err()
+        );
+    }
+
+    #[cfg(all(feature = "tokenizer", feature = "host-qtea"))]
+    #[test]
+    fn host_qtea_is_not_a_resident_matrix() {
+        use tritium_format::qtea::*;
+        let tensor = QteaTensor::from_parts(
+            QteaMetadata {
+                rows: 4,
+                columns: 2,
+                recipe: QteaRecipe {
+                    group_size: 2,
+                    salient_ratio: 0.,
+                    delta_coefficient: 0.96,
+                    fit_iterations: 1,
+                    rescale_iterations: 2,
+                    damping: 0.007,
+                    decay: 1.,
+                    relative_pivot_floor: 1e-7,
+                },
+                bindings: QteaBindings {
+                    weights: [1; 32],
+                    gram: [2; 32],
+                    source_model: [3; 32],
+                    activation_cache: [4; 32],
+                    token_stream: [5; 32],
+                },
+            },
+            &[tritium_core::Trit::POS; 8],
+            &[1.; 2],
+            &[0, 1],
+            std::iter::once(QteaGroupRef {
+                alpha: &[1.; 4],
+                beta: &[0.; 4],
+            }),
+            std::iter::empty(),
+            QteaLimits {
+                max_tensor_bytes: 4096,
+                max_validation_bytes: 4096,
+            },
+        )
+        .unwrap();
+        let projection =
+            Projection::HostQtea(Arc::new(crate::HostQteaLinear::from_tensor(tensor, 4096)));
+        let Err(error) = crate::model::resident::matrix(&projection) else {
+            panic!("host QTEA is not a DeviceBuffer")
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("requires admitted tensor handles")
         );
     }
 }
