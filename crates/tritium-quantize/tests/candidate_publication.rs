@@ -8,7 +8,7 @@ use tritium_format::{
     PackageId, TritBlob, TritBlobKind, TritPackageReadLimits, write_trit_package_bounded,
 };
 use tritium_quantize::engine::{
-    CandidatePublicationError, DirectoryTensorSink, UnqualifiedCandidateRecord,
+    CandidatePublicationError, DirectoryTensorSink, PublicationWarning, UnqualifiedCandidateRecord,
 };
 struct Scratch(PathBuf);
 impl Scratch {
@@ -60,7 +60,12 @@ fn publishes_actual_identity_without_sealed_evidence_and_never_overwrites() {
         })
         .unwrap();
     assert_eq!(value, 42);
-    assert!(warnings.is_empty());
+    let expected_warnings = if fs::File::open(&dir).and_then(|f| f.sync_all()).is_err() {
+        vec![PublicationWarning::DirectorySync]
+    } else {
+        Vec::new()
+    };
+    assert_eq!(warnings, expected_warnings);
     assert_eq!(fs::read(dir.join("model.trit")).unwrap(), bytes);
     assert!(!dir.join("evidence.jsonl").exists());
     assert!(!dir.join(".pending.trit").exists());
