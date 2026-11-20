@@ -177,6 +177,22 @@ impl fmt::Display for SaltV2CodecError {
 impl core::error::Error for SaltV2CodecError {}
 
 impl SaltV2Codec {
+    /// Encode a canonical plane into an exactly sized caller-owned buffer.
+    ///
+    /// Performs no allocation. Wrong destination length or invalid S34 source
+    /// structure is rejected before modifying the destination. Tail trits/bits
+    /// use the same canonical padding as the allocating pack functions.
+    ///
+    /// # Errors
+    /// Returns a ledger, exact-length or S34-structure error.
+    pub fn pack_into(self, trits: &[Trit], packed: &mut [u8]) -> Result<(), SaltV2CodecError> {
+        match self {
+            Self::D2 => pack_d2_into(trits, packed),
+            Self::B3 => pack_b3_into(trits, packed),
+            Self::S34 => pack_s34_into(trits, packed),
+        }
+    }
+
     /// Return the exact codec-only physical byte ledger for `logical_trits`.
     ///
     /// # Errors
@@ -268,13 +284,23 @@ impl SaltV2Codec {
 pub fn pack_d2(trits: &[Trit]) -> Result<Vec<u8>, SaltV2CodecError> {
     let ledger = SaltV2Codec::D2.ledger(trits.len())?;
     let mut packed = vec![0x55; ledger.physical_bytes];
+    pack_d2_into(trits, &mut packed)?;
+    Ok(packed)
+}
+
+/// Encode canonical D2 into an exactly sized caller-owned buffer, without allocation.
+/// Returns a length error before modifying an incorrectly sized destination.
+fn pack_d2_into(trits: &[Trit], packed: &mut [u8]) -> Result<(), SaltV2CodecError> {
+    let ledger = SaltV2Codec::D2.ledger(trits.len())?;
+    require_exact_length(SaltV2Codec::D2, packed, ledger.physical_bytes)?;
+    packed.fill(0x55);
     for (index, trit) in trits.iter().enumerate() {
         let shift = 2 * (index % D2_TRITS_PER_BYTE);
         let code = (trit.get() + 1) as u8;
         packed[index / D2_TRITS_PER_BYTE] &= !(0b11 << shift);
         packed[index / D2_TRITS_PER_BYTE] |= code << shift;
     }
-    Ok(packed)
+    Ok(())
 }
 
 /// Canonically decode a contiguous D2 payload.
@@ -332,8 +358,17 @@ pub(crate) fn unpack_d2_into(
 /// represented by `usize`.
 pub fn pack_b3(trits: &[Trit]) -> Result<Vec<u8>, SaltV2CodecError> {
     let ledger = SaltV2Codec::B3.ledger(trits.len())?;
-    let mut packed = Vec::with_capacity(ledger.physical_bytes);
-    for byte_index in 0..ledger.physical_bytes {
+    let mut packed = vec![0; ledger.physical_bytes];
+    pack_b3_into(trits, &mut packed)?;
+    Ok(packed)
+}
+
+/// Encode canonical B3 into an exactly sized caller-owned buffer, without allocation.
+/// Returns a length error before modifying an incorrectly sized destination.
+fn pack_b3_into(trits: &[Trit], packed: &mut [u8]) -> Result<(), SaltV2CodecError> {
+    let ledger = SaltV2Codec::B3.ledger(trits.len())?;
+    require_exact_length(SaltV2Codec::B3, packed, ledger.physical_bytes)?;
+    for (byte_index, output) in packed.iter_mut().enumerate() {
         let mut code = 0u16;
         let mut place = 1u16;
         for slot in 0..B3_TRITS_PER_BYTE {
@@ -345,9 +380,9 @@ pub fn pack_b3(trits: &[Trit]) -> Result<Vec<u8>, SaltV2CodecError> {
             place *= 3;
         }
         debug_assert!(code < B3_CODE_COUNT);
-        packed.push(code as u8);
+        *output = code as u8;
     }
-    Ok(packed)
+    Ok(())
 }
 
 /// Canonically decode a five-trit-per-byte B3 payload.
@@ -411,6 +446,15 @@ pub(crate) fn unpack_b3_into(
 pub fn pack_s34(trits: &[Trit]) -> Result<Vec<u8>, SaltV2CodecError> {
     let ledger = SaltV2Codec::S34.ledger(trits.len())?;
     let mut packed = vec![0u8; ledger.physical_bytes];
+    pack_s34_into(trits, &mut packed)?;
+    Ok(packed)
+}
+
+/// Encode canonical S34 into an exactly sized caller-owned buffer, without allocation.
+/// Invalid length or source structure is rejected before modifying the destination.
+fn pack_s34_into(trits: &[Trit], packed: &mut [u8]) -> Result<(), SaltV2CodecError> {
+    let ledger = SaltV2Codec::S34.ledger(trits.len())?;
+    require_exact_length(SaltV2Codec::S34, packed, ledger.physical_bytes)?;
     for (group_index, group) in trits
         .as_chunks::<S34_TRITS_PER_GROUP>()
         .0
@@ -424,6 +468,14 @@ pub fn pack_s34(trits: &[Trit]) -> Result<Vec<u8>, SaltV2CodecError> {
                 zero_count,
             });
         }
+    }
+    packed.fill(0);
+    for (group_index, group) in trits
+        .as_chunks::<S34_TRITS_PER_GROUP>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let zero_index = group
             .iter()
             .position(|trit| trit.is_zero())
@@ -439,9 +491,9 @@ pub fn pack_s34(trits: &[Trit]) -> Result<Vec<u8>, SaltV2CodecError> {
             }
             sign_index += 1;
         }
-        write_s34_code(&mut packed, group_index, code);
+        write_s34_code(packed, group_index, code);
     }
-    Ok(packed)
+    Ok(())
 }
 
 /// Canonically decode a structured 3:4 five-bit payload.
@@ -547,6 +599,41 @@ fn require_exact_length(
 mod tests {
     use super::*;
     use tritium_core::Trit;
+
+    #[test]
+    fn caller_owned_codec_buffers_match_frozen_bytes_and_reject_before_mutation() {
+        for (codec, input, expected) in [
+            (SaltV2Codec::D2, trits(&[-1, 0, 1, -1, 1]), vec![0x24, 0x56]),
+            (
+                SaltV2Codec::B3,
+                trits(&[-1, 0, 1, -1, 1, 1]),
+                vec![0xb7, 0x7a],
+            ),
+            (
+                SaltV2Codec::S34,
+                trits(&[0, 1, -1, 1, -1, 0, 1, -1]),
+                vec![0x34, 0x01],
+            ),
+        ] {
+            let mut output = vec![0xff; expected.len()];
+            codec.pack_into(&input, &mut output).unwrap();
+            assert_eq!(output, expected);
+            for len in [expected.len() - 1, expected.len() + 1] {
+                let mut wrong = vec![0xff; len];
+                assert!(codec.pack_into(&input, &mut wrong).is_err());
+                assert_eq!(wrong, vec![0xff; len]);
+            }
+            codec.pack_into(&[], &mut []).unwrap();
+        }
+        let mut destination = [0xaa; 2];
+        let invalid = trits(&[0, 1, -1, 1, 1, 1, -1, 1]);
+        assert!(
+            SaltV2Codec::S34
+                .pack_into(&invalid, &mut destination)
+                .is_err()
+        );
+        assert_eq!(destination, [0xaa; 2]);
+    }
 
     fn trits(values: &[i8]) -> Vec<Trit> {
         values

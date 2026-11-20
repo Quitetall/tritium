@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CalibrationCaptureLimits",
+  "description": "Logical model/input/cache bounds, NOT tape/parser/package/evidence/full RSS.",
+  "type": "object",
+  "properties": {
+    "max_config_bytes": {
+      "description": "Actual config input-byte cap before model parsing.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_dense_bytes": {
+      "description": "Retained widened-f32 master matrix/vector cap before decoding.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_text_bytes": {
+      "description": "Aggregate raw UTF-8 text bytes; zero for pretokenized capture.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_tokenizer_config_bytes": {
+      "description": "tokenizer_config.json bytes; zero for pretokenized capture.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_total_payload_bytes": {
+      "description": "Aggregate retained payload, including duplicated context bytes.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_window_tokens": {
+      "description": "Effective maximum input tokens per context (excluding final label).",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "per_cache": {
+      "description": "Existing per-cache payload/sample/window admission.",
+      "$ref": "#/$defs/CalibrationCacheLimits"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "max_config_bytes",
+    "max_dense_bytes",
+    "max_window_tokens",
+    "per_cache",
+    "max_total_payload_bytes",
+    "max_text_bytes",
+    "max_tokenizer_config_bytes"
+  ],
+  "$defs": {
+    "CalibrationCacheLimits": {
+      "description": "Logical retained cache bounds, separate from reducer workspace or process RSS.",
+      "type": "object",
+      "properties": {
+        "max_payload_bytes": {
+          "description": "Exact retained scalar/token/mask and recipe bytes; excludes metadata/capacity overhead.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_samples": {
+          "description": "Maximum observed samples, including masked samples.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_windows": {
+          "description": "Maximum declared model-context windows, not reduction replay chunks.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max_payload_bytes",
+        "max_samples",
+        "max_windows"
+      ]
+    }
+  }
+}

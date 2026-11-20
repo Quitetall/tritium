@@ -17,6 +17,23 @@ run_installed_worker = MODULE["run_installed_worker"]
 
 
 class QualifyOnnxInferenceTests(unittest.TestCase):
+    def test_archive_path_comes_from_candidate_inventory_not_basename(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            candidate, _, _ = fixture(root)
+            nested = root / "archives"
+            nested.mkdir()
+            (root / "qwen-onnx.tar.zst").rename(nested / "qwen-onnx.tar.zst")
+            document = json.loads(candidate.read_bytes())
+            for artifact in document["artifacts"]:
+                if artifact["id"] == "onnx":
+                    artifact["path"] = "archives/qwen-onnx.tar.zst"
+            candidate.write_bytes(MODULE["canonical"](document))
+            self.assertEqual(
+                MODULE["candidate_archive"](candidate, "onnx"),
+                nested / "qwen-onnx.tar.zst",
+            )
+
     def test_installed_worker_isolated_offline_and_candidate_bound(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -59,6 +76,15 @@ class QualifyOnnxInferenceTests(unittest.TestCase):
             )
             self.assertEqual(observed["kwargs"]["env"]["HF_HUB_OFFLINE"], "1")
             self.assertIn("tritium.torch.qualify_onnx", observed["command"])
+            for flag, expected in (
+                ("--onnx-archive", root / "qwen-onnx.tar.zst"),
+                ("--native-archive", root / "qwen.salt"),
+            ):
+                self.assertIn(flag, observed["command"])
+                self.assertEqual(
+                    observed["command"][observed["command"].index(flag) + 1],
+                    str(expected),
+                )
             self.assertTrue(target.is_file())
 
     def test_aggregates_raw_execution_and_self_validates(self):

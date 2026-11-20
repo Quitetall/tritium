@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
+import multiprocessing
 import os
 from pathlib import Path
 import platform
@@ -34,6 +35,15 @@ SCHEMA = "tritium.oci-runtime-qualification.v4"
 HEX = frozenset("0123456789abcdef")
 MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_SSE_RESPONSE_BYTES = 1024 * 1024
+MAX_QUEUE_WORKER_MESSAGE_BYTES = 4092
+QUEUE_WORKER_REAP_GRACE_SECONDS = 1.0
+QUEUE_RESULT_FIELDS = frozenset({
+    "queue_rejections_before", "queue_rejections_after", "disconnects_before",
+    "disconnects_after", "accepted_streams", "rejected_streams",
+    "settled_queue_depth", "worker_alive", "queue_capacity", "saturated_queue_depth",
+    "slow_hold_ms", "tokens_out_before_hold", "tokens_out_after_hold",
+    "recovery_status", "recovery_ms", "recovery_timeout_ms",
+})
 CHECKS = (
     "production-readiness", "models", "buffered-generation", "sse-generation",
     "auth-required", "malformed-json", "principal-rate-limit",
@@ -72,16 +82,38 @@ def exact_hex(value: Any, length: int, label: str) -> str:
     return value
 
 
+def exact_package_id(value: Any, label: str) -> str:
+    if (not isinstance(value, str) or not value.startswith("trp1_")
+            or len(value) != 69 or any(c not in HEX for c in value[5:])):
+        raise QualificationError(f"{label} must be a Tritium trp1 package ID")
+    return value
+
+
 def run(command: list[str], *, env: dict[str, str] | None = None,
         timeout: float = 120.0) -> str:
+    # Command arguments and subprocess stderr are untrusted diagnostic inputs:
+    # Compose receives transient bearer credentials through its environment,
+    # and a failed tool may echo them (or private paths/prompt data). Retain only
+    # a fixed allowlisted tool label and the failure category/exit status.
+    tool = Path(command[0]).name if command else ""
+    if tool not in {"docker", "nvidia-smi", "run-oci-compose", "tritium"}:
+        tool = "external-tool"
     try:
         result = subprocess.run(command, env=env, text=True, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, timeout=timeout, check=False)
     except (OSError, subprocess.SubprocessError) as error:
-        raise QualificationError(f"command failed: {command[0]}: {error}") from error
+        reason = (
+            "timeout" if isinstance(error, subprocess.TimeoutExpired)
+            else "launch failure" if isinstance(error, OSError)
+            else "subprocess failure"
+        )
+        # Suppress rendered exception context as well as the message: timeout
+        # exceptions retain the original argv and captured subprocess output.
+        raise QualificationError(f"command failed: {tool}: {reason}") from None
     if result.returncode != 0:
-        detail = result.stderr.strip()[-2000:]
-        raise QualificationError(f"command failed ({result.returncode}): {' '.join(command)}: {detail}")
+        raise QualificationError(
+            f"command failed ({result.returncode}): {tool}; subprocess diagnostics withheld"
+        )
     return result.stdout.strip()
 
 
@@ -96,12 +128,12 @@ def request_json(url: str, token: str, body: dict[str, Any] | None = None,
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = response.read(MAX_JSON_RESPONSE_BYTES + 1)
             if len(payload) > MAX_JSON_RESPONSE_BYTES:
-                raise QualificationError(f"response exceeds byte limit: {url}")
+                raise QualificationError("response exceeds byte limit")
             value = json.loads(payload)
-    except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
-        raise QualificationError(f"request failed: {url}: {error}") from error
+    except (OSError, urllib.error.URLError, UnicodeDecodeError, json.JSONDecodeError):
+        raise QualificationError("JSON request failed; transport diagnostics withheld") from None
     if not isinstance(value, dict):
-        raise QualificationError(f"response is not a JSON object: {url}")
+        raise QualificationError("response is not a JSON object")
     return value
 
 
@@ -120,19 +152,23 @@ def request_response(
             headers = dict(response.headers.items())
             payload = response.read(MAX_JSON_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as error:
-        status = error.code
-        headers = dict(error.headers.items())
-        payload = error.read(MAX_JSON_RESPONSE_BYTES + 1)
-    except (OSError, urllib.error.URLError) as error:
-        raise QualificationError(f"request failed: {url}: {error}") from error
+        try:
+            with error:
+                status = error.code
+                headers = dict(error.headers.items())
+                payload = error.read(MAX_JSON_RESPONSE_BYTES + 1)
+        except (OSError, urllib.error.URLError):
+            raise QualificationError("error response body read failed") from None
+    except (OSError, urllib.error.URLError):
+        raise QualificationError("request failed; transport diagnostics withheld") from None
     if len(payload) > MAX_JSON_RESPONSE_BYTES:
-        raise QualificationError(f"error response exceeds byte limit: {url}")
+        raise QualificationError("error response exceeds byte limit")
     try:
         value = json.loads(payload)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise QualificationError(f"error response is not UTF-8 JSON: {url}") from error
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise QualificationError("error response is not UTF-8 JSON") from None
     if not isinstance(value, dict):
-        raise QualificationError(f"error response is not a JSON object: {url}")
+        raise QualificationError("error response is not a JSON object")
     return status, value, {key.lower(): value for key, value in headers.items()}
 
 
@@ -146,9 +182,7 @@ def request_error(
     )
     expected = {"error": {"message": expected_message, "type": expected_type}}
     if status != expected_status or value != expected:
-        raise QualificationError(
-            f"error response differs: {url}: status={status}, body={value!r}"
-        )
+        raise QualificationError("error response differs from expected status/envelope")
     return value, headers
 
 
@@ -158,14 +192,14 @@ def metric_value(base_url: str, token: str, name: str, timeout: float) -> int:
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = response.read(MAX_SSE_RESPONSE_BYTES + 1)
-    except (OSError, urllib.error.URLError) as error:
-        raise QualificationError(f"metrics request failed: {error}") from error
+    except (OSError, urllib.error.URLError):
+        raise QualificationError("metrics request failed; transport diagnostics withheld") from None
     if len(payload) > MAX_SSE_RESPONSE_BYTES:
         raise QualificationError("metrics response exceeds byte limit")
     try:
         text = payload.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise QualificationError("metrics response is not UTF-8") from error
+    except UnicodeDecodeError:
+        raise QualificationError("metrics response is not UTF-8") from None
     match = re.search(rf"(?m)^{re.escape(name)} ([0-9]+)$", text)
     if match is None:
         raise QualificationError(f"metrics response lacks integer {name}")
@@ -235,29 +269,136 @@ def slow_stream_attempt(
             raise QualificationError("slow SSE request did not start streaming")
         return "accepted", response
     except urllib.error.HTTPError as error:
-        with error:
-            body = error.read(MAX_JSON_RESPONSE_BYTES + 1)
+        try:
+            with error:
+                body = error.read(MAX_JSON_RESPONSE_BYTES + 1)
+        except (OSError, urllib.error.URLError):
+            raise QualificationError("queue rejection body read failed") from None
         if len(body) > MAX_JSON_RESPONSE_BYTES:
-            raise QualificationError("queue rejection response exceeds byte limit")
+            raise QualificationError("queue rejection response exceeds byte limit") from None
         try:
             value = json.loads(body)
-        except (UnicodeDecodeError, json.JSONDecodeError) as decode_error:
-            raise QualificationError("queue rejection is not UTF-8 JSON") from decode_error
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise QualificationError("queue rejection is not UTF-8 JSON") from None
         expected = {"error": {
             "message": "server is at capacity; retry shortly",
             "type": "rate_limit_exceeded",
         }}
         if (error.code != 429 or value != expected
                 or error.headers.get("Retry-After") != "1"):
-            raise QualificationError("queue rejection envelope differs")
+            raise QualificationError("queue rejection envelope differs") from None
         return "rejected", None
-    except (OSError, urllib.error.URLError, threading.BrokenBarrierError) as error:
+    except (OSError, urllib.error.URLError, threading.BrokenBarrierError):
         if response is not None:
             response.close()
-        raise QualificationError(f"slow SSE request failed: {error}") from error
+        raise QualificationError("slow SSE request failed; transport diagnostics withheld") from None
 
 
 def exercise_queue_disconnects(
+    *, base_url: str, token: str, metric_token: str, model_id: str,
+    prompt: str, clients: int, max_tokens: int, timeout: float,
+    hold_seconds: float, recovery_timeout: float, wall_timeout: float = 600.0,
+) -> dict[str, int]:
+    """Own and reap the entire workload, including noncooperative HTTP threads."""
+    for name, duration in (("wall timeout", wall_timeout), ("request timeout", timeout),
+                           ("hold", hold_seconds), ("recovery timeout", recovery_timeout)):
+        positive_finite_duration(duration, name)
+    if hold_seconds < 1:
+        raise QualificationError("slow-reader hold must be >= 1s")
+    if type(clients) is not int or not 3 <= clients <= 32:
+        raise QualificationError("queue flood clients must be in [3, 32]")
+    if type(max_tokens) is not int or not 32 <= max_tokens <= 4096:
+        raise QualificationError("slow reader tokens must be in [32, 4096]")
+    deadline = time.monotonic() + wall_timeout
+    try:
+        context = multiprocessing.get_context("fork")
+    except ValueError as error:
+        raise QualificationError("queue workload requires fork process isolation") from error
+    receive, send = context.Pipe(duplex=False)
+    process = None
+    try:
+        try:
+            process = context.Process(target=_queue_disconnect_worker, args=(send, {
+                "base_url": base_url, "token": token, "metric_token": metric_token,
+                "model_id": model_id, "prompt": prompt, "clients": clients,
+                "max_tokens": max_tokens, "timeout": timeout, "hold_seconds": hold_seconds,
+                "recovery_timeout": recovery_timeout,
+            }), daemon=True)
+            process.start()
+        except (OSError, RuntimeError) as error:
+            raise QualificationError("queue workload worker could not start") from error
+        send.close()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not receive.poll(remaining):
+            raise QualificationError("queue workload wall deadline exceeded")
+        try:
+            message = json.loads(receive.recv_bytes(MAX_QUEUE_WORKER_MESSAGE_BYTES))
+        except (EOFError, OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise QualificationError("queue workload returned missing or invalid evidence") from error
+        process.join(max(0.0, deadline - time.monotonic()))
+        if process.is_alive() or time.monotonic() >= deadline:
+            raise QualificationError("queue workload wall deadline exceeded")
+        if process.exitcode != 0:
+            raise QualificationError("queue workload worker exited unsuccessfully")
+        if not isinstance(message, dict) or type(message.get("ok")) is not bool:
+            raise QualificationError("queue workload returned invalid evidence envelope")
+        if not message["ok"]:
+            if (set(message) != {"ok", "detail"} or not isinstance(message["detail"], str)
+                    or len(message["detail"]) > 1024):
+                raise QualificationError("queue workload returned invalid failure envelope")
+            raise QualificationError(f"queue workload failed: {message['detail']}")
+        result = message.get("result")
+        if (set(message) != {"ok", "result"} or not isinstance(result, dict)
+                or set(result) != QUEUE_RESULT_FIELDS
+                or any(type(value) is not int or value < 0 for value in result.values())):
+            raise QualificationError("queue workload returned invalid evidence fields")
+        return result
+    finally:
+        try:
+            if process is not None and process.is_alive():
+                process.terminate()
+                process.join(QUEUE_WORKER_REAP_GRACE_SECONDS)
+            if process is not None and process.is_alive():
+                process.kill()
+                process.join(QUEUE_WORKER_REAP_GRACE_SECONDS)
+            if process is not None and process.is_alive():
+                raise QualificationError("queue workload worker could not be reaped")
+        finally:
+            receive.close()
+            send.close()
+            if process is not None and not process.is_alive():
+                process.close()
+
+
+def positive_finite_duration(value: float, label: str) -> None:
+    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+        raise QualificationError(f"{label} must be positive and finite")
+
+
+def _queue_disconnect_worker(connection: Any, arguments: dict[str, Any]) -> None:
+    try:
+        try:
+            message = {"ok": True, "result": _exercise_queue_disconnects(**arguments)}
+        except BaseException as error:
+            detail = str(error)
+            for sensitive in sorted({arguments["token"], arguments["metric_token"],
+                                     arguments["prompt"]}, key=len, reverse=True):
+                if sensitive:
+                    detail = detail.replace(sensitive, "[redacted]")
+            message = {"ok": False, "detail": detail[:1024]}
+        data = canonical(message)
+        # Keep header + payload within one atomic pipe write, so poll/recv cannot
+        # strand the parent on a partial message from a stopped child.
+        limit = min(MAX_QUEUE_WORKER_MESSAGE_BYTES,
+                    os.fpathconf(connection.fileno(), "PC_PIPE_BUF") - 4)
+        if len(data) > limit:
+            data = canonical({"ok": False, "detail": "queue workload evidence exceeds IPC limit"})
+        connection.send_bytes(data)
+    finally:
+        connection.close()
+
+
+def _exercise_queue_disconnects(
     *, base_url: str, token: str, metric_token: str, model_id: str,
     prompt: str, clients: int, max_tokens: int, timeout: float,
     hold_seconds: float, recovery_timeout: float,
@@ -491,8 +632,14 @@ def validate_ready(value: dict[str, Any], revision: str, flavor: str,
         raise QualificationError("startup receipt release build identity differs")
     if receipt.get("backend_policy") != flavor or receipt.get("effective_backend") != flavor:
         raise QualificationError("startup receipt backend policy differs")
-    if receipt.get("profile") != profile or receipt.get("manifest_package_id") != manifest_blake3:
+    expected_manifest_id = exact_hex(manifest_blake3, 64, "expected manifest BLAKE3")
+    receipt_manifest_id = exact_hex(
+        receipt.get("manifest_package_id"), 64, "manifest package digest"
+    )
+    if receipt.get("profile") != profile or receipt_manifest_id != expected_manifest_id:
         raise QualificationError("startup receipt artifact identity differs")
+    for field in ("salt_package_id", "preserved_package_id", "config_package_id"):
+        exact_package_id(receipt.get(field), field)
     if type(receipt.get("loaded_bundle_bytes")) is not int or receipt["loaded_bundle_bytes"] <= 0:
         raise QualificationError("startup receipt loaded byte ledger is invalid")
     if type(receipt.get("resident_bytes")) is not int or receipt["resident_bytes"] <= 0:
@@ -545,14 +692,15 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         raise QualificationError("release must be a canonical 1.1.0 release candidate")
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", args.run_id) is None:
         raise QualificationError("run ID is not a safe canonical identifier")
-    if min(args.startup_timeout, args.request_timeout, args.shutdown_timeout) <= 0:
-        raise QualificationError("timeouts must be positive")
+    for name in ("startup_timeout", "request_timeout", "shutdown_timeout",
+                 "slow_reader_hold", "disconnect_recovery_timeout", "queue_workload_timeout"):
+        positive_finite_duration(getattr(args, name), name.replace("_", " "))
     if not 3 <= args.queue_flood_clients <= 32:
         raise QualificationError("queue flood clients must be in [3, 32]")
     if not 32 <= args.slow_reader_tokens <= 4096:
         raise QualificationError("slow reader tokens must be in [32, 4096]")
-    if args.slow_reader_hold < 1 or args.disconnect_recovery_timeout <= 0:
-        raise QualificationError("slow-reader hold must be >= 1s and recovery timeout positive")
+    if args.slow_reader_hold < 1:
+        raise QualificationError("slow-reader hold must be >= 1s")
     if not 256 <= args.sigterm_prefill_repetitions <= 8192:
         raise QualificationError("SIGTERM prefill repetitions must be in [256, 8192]")
     if not 100 <= args.phase_signal_latency_ms <= 10000:
@@ -659,6 +807,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             clients=args.queue_flood_clients, max_tokens=args.slow_reader_tokens,
             timeout=args.request_timeout, hold_seconds=args.slow_reader_hold,
             recovery_timeout=args.disconnect_recovery_timeout,
+            wall_timeout=args.queue_workload_timeout,
         )
         request_error(
             f"http://127.0.0.1:{port}/v1/chat/completions", 400,
@@ -767,9 +916,9 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             )
             if cleanup.returncode != 0 and not active_error:
                 raise QualificationError("Compose cleanup failed")
-        except (OSError, subprocess.SubprocessError) as error:
+        except (OSError, subprocess.SubprocessError):
             if not active_error:
-                raise QualificationError(f"Compose cleanup failed: {error}") from error
+                raise QualificationError("Compose cleanup failed; subprocess diagnostics withheld") from None
 
     machine_source = Path("/etc/machine-id").read_text(encoding="utf-8").strip()
     machine = hashlib.sha256(machine_source.encode()).hexdigest()
@@ -1089,6 +1238,8 @@ def main() -> int:
     parser.add_argument("--slow-reader-tokens", type=int, default=4096)
     parser.add_argument("--slow-reader-hold", type=float, default=2.0)
     parser.add_argument("--disconnect-recovery-timeout", type=float, default=60.0)
+    parser.add_argument("--queue-workload-timeout", type=float, default=600.0,
+                        help="absolute queue/disconnect worker wall budget in seconds")
     parser.add_argument("--sigterm-prefill-repetitions", type=int, default=1024)
     parser.add_argument("--phase-signal-latency-ms", type=int, default=2000)
     args = parser.parse_args()

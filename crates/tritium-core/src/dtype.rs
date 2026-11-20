@@ -84,7 +84,11 @@ impl DType {
 ///
 /// Both follow ggml's 256-element super-block with one fp16 block scale.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_nostd::Serialize, serde_nostd::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "serde_nostd"))]
 #[non_exhaustive]
 pub enum TernaryFormat {
     /// llama.cpp **TQ1_0** — 5 trits per byte (`3^5 = 243 < 256`). 1.6875 bpw incl.

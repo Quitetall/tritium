@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 from pathlib import Path
 import runpy
+import subprocess
+import sys
 import tempfile
+import time
+import traceback
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -13,6 +19,92 @@ SecurityScanError = MODULE["SecurityScanError"]
 canonical = MODULE["canonical"]
 report_findings = MODULE["report_findings"]
 validate_receipt = MODULE["validate_receipt"]
+
+
+class ScannerExecutionTests(unittest.TestCase):
+    def test_real_scanner_failure_withholds_untrusted_stderr(self):
+        marker = "fixture-only-sensitive-scanner-output"
+        command = [sys.executable, "-c", "import sys; sys.stderr.write(sys.argv[1]); sys.exit(7)", marker]
+        with self.assertRaises(SecurityScanError) as caught:
+            MODULE["run"](command, timeout=5)
+        self.assertIn("7", str(caught.exception))
+        self.assertNotIn(marker, "".join(traceback.format_exception(caught.exception)))
+
+    def test_launch_and_timeout_errors_withhold_exception_context(self):
+        marker = "fixture-only-sensitive-scanner-exception"
+        command = ["/private/fixture-only-scanner", marker]
+        failures = (
+            OSError(marker),
+            subprocess.TimeoutExpired(command, 1, output=marker.encode(), stderr=marker.encode()),
+            subprocess.SubprocessError(marker),
+        )
+        for failure in failures:
+            with self.subTest(kind=type(failure).__name__):
+                with mock.patch.object(MODULE["subprocess"], "run", side_effect=failure):
+                    with self.assertRaises(SecurityScanError) as caught:
+                        MODULE["run"](command, timeout=1)
+                diagnostic = "".join(traceback.format_exception(caught.exception))
+                self.assertNotIn(marker, diagnostic)
+                self.assertNotIn(command[0], diagnostic)
+
+    def test_real_timeout_is_bounded_and_withholds_captured_output(self):
+        marker = "fixture-only-sensitive-timeout-output"
+        command = [
+            sys.executable, "-c",
+            "import sys,time; print(sys.argv[1], flush=True); "
+            "sys.stderr.write(sys.argv[1]); sys.stderr.flush(); time.sleep(10)",
+            marker,
+        ]
+        started = time.monotonic()
+        with self.assertRaises(SecurityScanError) as caught:
+            MODULE["run"](command, timeout=0.1)
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertNotIn(marker, "".join(traceback.format_exception(caught.exception)))
+
+    def test_successful_scanner_metadata_is_unchanged(self):
+        self.assertEqual(
+            MODULE["run"]([sys.executable, "-c", "print('fixture-scanner-metadata')"], timeout=5),
+            "fixture-scanner-metadata\n",
+        )
+
+    def test_successful_scanner_report_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as raw:
+            report = Path(raw) / "report.json"
+            content = '{"SchemaVersion":2,"Results":[]}\n'
+            report.write_text(content, encoding="utf-8")
+            command = ["fixture-scanner", "--output", str(report)]
+            result = subprocess.CompletedProcess(command, 0, None, "")
+            with mock.patch.object(MODULE["subprocess"], "run", return_value=result) as launch:
+                self.assertEqual(MODULE["run"](command, timeout=5, output=report), content)
+            self.assertEqual(launch.call_args.kwargs["stdout"], subprocess.DEVNULL)
+
+    def test_invalid_timeout_is_rejected_before_launch(self):
+        for timeout in (float("nan"), float("inf"), float("-inf"), 0, -1, True):
+            with self.subTest(timeout=timeout):
+                with mock.patch.object(MODULE["subprocess"], "run") as launch:
+                    with self.assertRaisesRegex(SecurityScanError, "timeout"):
+                        MODULE["run"](["fixture-scanner"], timeout=timeout)
+                    launch.assert_not_called()
+
+    def test_invalid_qualification_limits_fail_before_artifact_or_scanner_work(self):
+        qualify = MODULE["qualify"]
+        for field, values in (
+            ("timeout", (float("nan"), float("inf"), float("-inf"), 0, -1, True)),
+            ("max_db_age_hours", (float("nan"), float("inf"), 0, -1, 25, True)),
+        ):
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    args = argparse.Namespace(
+                        flavor="cpu", release="1.1.0-rc.2", run_id="fixture-only-scan",
+                        source_revision="a" * 40, timeout=1, max_db_age_hours=24,
+                        archive=Path("/fixture-only-not-read.oci.tar"),
+                    )
+                    setattr(args, field, value)
+                    ordinary = mock.Mock(side_effect=SecurityScanError("unexpected artifact access"))
+                    with mock.patch.dict(qualify.__globals__, {"ordinary": ordinary}):
+                        with self.assertRaisesRegex(SecurityScanError, "scan limits"):
+                            qualify(args)
+                        ordinary.assert_not_called()
 
 
 def receipt(artifact: Path) -> dict:

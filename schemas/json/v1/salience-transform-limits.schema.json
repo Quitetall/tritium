@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SalienceTransformLimits",
+  "description": "Logical payload/numeric-vector budgets, not process RSS admission.",
+  "type": "object",
+  "properties": {
+    "max_asset_bytes": {
+      "description": "Complete unchanged asset payload total.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_derived_bytes": {
+      "description": "Complete derived tensor payload total, including touched tensors widened to F32.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_pair_working_bytes": {
+      "description": "Pair decoded vectors, replacement bytes and RMS/scales; excludes metadata and RSS.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_source_bytes": {
+      "description": "Complete consumed original tensor payload total.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_statistics_bytes": {
+      "description": "Complete supplied moment vectors, in raw f64 bytes.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "max_source_bytes",
+    "max_asset_bytes",
+    "max_derived_bytes",
+    "max_statistics_bytes",
+    "max_pair_working_bytes"
+  ]
+}

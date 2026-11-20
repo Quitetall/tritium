@@ -3,8 +3,11 @@
 use std::fmt;
 
 use crate::generator::{
-    FinishReason, GenError, GenRequest, Generator, Sampling, Step, top_logprobs,
+    CancellationCapabilitiesV1, CancellationCheckpoint, GenError, GenRequest, Generator, Step,
+    stream_steps,
 };
+#[cfg(feature = "cuda")]
+use crate::generator::{FinishReason, Sampling, sample, top_logprobs};
 
 /// Which numerics tier a Qwen bundle is served at.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -142,18 +145,6 @@ impl QwenGenerator {
             false
         }
     }
-
-    fn sample(logits: &[f32], sampling: &Sampling, step: u64) -> Option<u32> {
-        match *sampling {
-            Sampling::Greedy => tritium_nn::sample_greedy(logits),
-            Sampling::TopK { k, temp, seed } => {
-                tritium_nn::sample_top_k(logits, k, temp, seed.wrapping_add(step))
-            }
-            Sampling::TopP { p, temp, seed } => {
-                tritium_nn::sample_top_p(logits, p, temp, seed.wrapping_add(step))
-            }
-        }
-    }
 }
 
 impl fmt::Debug for QwenGenerator {
@@ -167,6 +158,7 @@ impl fmt::Debug for QwenGenerator {
 }
 
 /// One emitted token as a streamed [`Step`].
+#[cfg(feature = "cuda")]
 fn step_for(
     token: u32,
     index: usize,
@@ -409,7 +401,7 @@ impl QwenGenerator {
         resident.kv_tokens.push(final_prompt);
         resident.checkpoint(false, prompt)?;
         for index in 0..max_new {
-            let token = Self::sample(&logits, &request.sampling, index as u64)
+            let token = sample(&logits, &request.sampling, index as u64)
                 .ok_or_else(|| GenError::Backend("sampler produced no token".into()))?;
             let (step, last) = step_for(token, index, max_new, eos, request, Some(&logits));
             if !on_step(step) || last {
@@ -483,11 +475,33 @@ impl QwenGenerator {
 }
 
 impl Generator for QwenGenerator {
+    fn cancellation_capabilities(&self) -> CancellationCapabilitiesV1 {
+        CancellationCapabilitiesV1 {
+            generation: CancellationCheckpoint::CooperativeBoundaries,
+            tree_session_open: CancellationCheckpoint::NotEnabled,
+            tree_verify: CancellationCheckpoint::NotEnabled,
+            model_draft: CancellationCheckpoint::NotEnabled,
+            ..CancellationCapabilitiesV1::default()
+        }
+    }
+
     fn generate(
         &mut self,
         request: &GenRequest,
         on_step: &mut dyn FnMut(Step) -> bool,
     ) -> Result<(), GenError> {
+        self.generate_cancellable(request, on_step, &|| false)
+    }
+
+    fn generate_cancellable(
+        &mut self,
+        request: &GenRequest,
+        on_step: &mut dyn FnMut(Step) -> bool,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), GenError> {
+        if is_cancelled() {
+            return Ok(());
+        }
         #[cfg(feature = "cuda")]
         if let Some(resident) = self.resident.as_mut() {
             let resident_context = resident.context;
@@ -498,7 +512,15 @@ impl Generator for QwenGenerator {
             // A request that fits the executor's context runs there; a longer one
             // falls through to the exact host path below.
             if prompt_len != 0 && prompt_len + request.max_new <= resident_context {
-                return Self::generate_resident(resident, self.eos, request, max_new, on_step);
+                // Cancellation is observed at token boundaries, as the exact path's
+                // `stream_steps` does.
+                return Self::generate_resident(
+                    resident,
+                    self.eos,
+                    request,
+                    max_new,
+                    &mut |step| !is_cancelled() && on_step(step),
+                );
             }
         }
         let runner = self.model.runner();
@@ -514,22 +536,26 @@ impl Generator for QwenGenerator {
         let mut cache = runner
             .new_cache(capacity)
             .map_err(|error| GenError::Backend(error.to_string()))?;
-        let mut output = runner
-            .forward(&request.prompt_tokens, &mut cache)
-            .map_err(|error| GenError::Backend(error.to_string()))?;
-        for index in 0..max_new {
-            let logits = output.last_logits();
-            let token = Self::sample(logits, &request.sampling, index as u64)
-                .ok_or_else(|| GenError::Backend("sampler produced no token".into()))?;
-            let (step, last) = step_for(token, index, max_new, self.eos, request, Some(logits));
-            let keep_going = on_step(step);
-            if last || !keep_going {
-                break;
-            }
-            output = runner
-                .forward(&[token], &mut cache)
-                .map_err(|error| GenError::Backend(error.to_string()))?;
-        }
+        let Some(output) = runner
+            .forward_cancellable(&request.prompt_tokens, &mut cache, is_cancelled)
+            .map_err(|error| GenError::Backend(error.to_string()))?
+        else {
+            return Ok(());
+        };
+        stream_steps(
+            output.into_last_logits(),
+            request,
+            max_new,
+            self.eos,
+            on_step,
+            is_cancelled,
+            |token, _position| {
+                runner
+                    .forward_cancellable(&[token], &mut cache, is_cancelled)
+                    .map(|output| output.map(tritium_nn::Qwen35TextOutput::into_last_logits))
+                    .map_err(|error| GenError::Backend(error.to_string()))
+            },
+        )?;
         Ok(())
     }
 

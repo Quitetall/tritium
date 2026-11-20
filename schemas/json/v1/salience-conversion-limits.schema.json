@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SalienceConversionLimits",
+  "description": "Explicit receiving/producer byte ceilings, not complete process RSS.",
+  "type": "object",
+  "properties": {
+    "max_manifest_bytes": {
+      "description": "Canonical encoded mandatory carrier metadata, before typed allocation.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_package_bytes": {
+      "description": "Complete physical C package, including metadata, directory and alignment.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "max_package_bytes",
+    "max_manifest_bytes"
+  ]
+}

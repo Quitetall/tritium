@@ -5,14 +5,80 @@ use std::path::Path;
 use serde_json::Value;
 use tokenizers::Tokenizer as InnerTokenizer;
 
+use super::chat_renderer::SourceChatTemplate;
 use crate::error::NnError;
 use crate::model::Tokenizer;
+
+// serde_json::Value normally keeps the last duplicate map key. Tokenizer and
+// named-template selection must not depend on that ambiguous interpretation.
+struct UniqueJson(Value);
+
+impl<'de> serde::Deserialize<'de> for UniqueJson {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = UniqueJson;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("JSON with unique object keys")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<UniqueJson, M::Error> {
+                let mut object = serde_json::Map::new();
+                while let Some((key, value)) = map.next_entry::<String, UniqueJson>()? {
+                    if object.insert(key, value.0).is_some() {
+                        return Err(serde::de::Error::custom(
+                            "duplicate tokenizer configuration key",
+                        ));
+                    }
+                }
+                Ok(UniqueJson(Value::Object(object)))
+            }
+            fn visit_seq<S: serde::de::SeqAccess<'de>>(
+                self,
+                mut sequence: S,
+            ) -> Result<UniqueJson, S::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = sequence.next_element::<UniqueJson>()? {
+                    items.push(item.0);
+                }
+                Ok(UniqueJson(Value::Array(items)))
+            }
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<UniqueJson, E> {
+                Ok(UniqueJson(Value::String(text.into())))
+            }
+            fn visit_string<E: serde::de::Error>(self, text: String) -> Result<UniqueJson, E> {
+                Ok(UniqueJson(Value::String(text)))
+            }
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<UniqueJson, E> {
+                Ok(UniqueJson(value.into()))
+            }
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<UniqueJson, E> {
+                Ok(UniqueJson(value.into()))
+            }
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<UniqueJson, E> {
+                Ok(UniqueJson(value.into()))
+            }
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<UniqueJson, E> {
+                serde_json::Number::from_f64(value)
+                    .map(|number| UniqueJson(Value::Number(number)))
+                    .ok_or_else(|| E::custom("non-finite JSON number"))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<UniqueJson, E> {
+                Ok(UniqueJson(Value::Null))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
 
 /// Tokenizer loaded from exact Hugging Face tokenizer assets.
 pub struct HfJsonTokenizer {
     inner: InnerTokenizer,
     bos: u32,
     eos: u32,
+    chat_template: Option<SourceChatTemplate>,
 }
 
 impl std::fmt::Debug for HfJsonTokenizer {
@@ -22,6 +88,7 @@ impl std::fmt::Debug for HfJsonTokenizer {
             .field("vocab", &self.inner.get_vocab_size(true))
             .field("bos", &self.bos)
             .field("eos", &self.eos)
+            .field("source_chat_template", &self.chat_template.is_some())
             .finish()
     }
 }
@@ -57,10 +124,16 @@ impl HfJsonTokenizer {
 
     /// Parse already-authenticated tokenizer assets without reopening paths.
     pub fn from_bytes(tokenizer_json: &[u8], tokenizer_config: &[u8]) -> Result<Self, NnError> {
+        if tokenizer_config.len() > 1024 * 1024 {
+            return Err(NnError::Tokenizer(
+                "tokenizer_config.json exceeds 1 MiB".into(),
+            ));
+        }
         let inner = InnerTokenizer::from_bytes(tokenizer_json)
             .map_err(|error| NnError::Tokenizer(format!("load tokenizer.json: {error}")))?;
-        let config: Value = serde_json::from_slice(tokenizer_config)
-            .map_err(|error| NnError::Tokenizer(format!("parse tokenizer_config.json: {error}")))?;
+        let config = serde_json::from_slice::<UniqueJson>(tokenizer_config)
+            .map_err(|error| NnError::Tokenizer(format!("parse tokenizer_config.json: {error}")))?
+            .0;
         let object = config
             .as_object()
             .ok_or_else(|| NnError::Tokenizer("tokenizer_config.json must be an object".into()))?;
@@ -75,11 +148,52 @@ impl HfJsonTokenizer {
             })?,
             None => eos,
         };
-        Ok(Self { inner, bos, eos })
+        let chat_template = SourceChatTemplate::from_config(object)?;
+        Ok(Self {
+            inner,
+            bos,
+            eos,
+            chat_template,
+        })
+    }
+
+    pub(crate) fn validate_model_vocab(&self, rows: usize) -> Result<(), NnError> {
+        if rows == 0
+            || self
+                .inner
+                .get_vocab(true)
+                .values()
+                .any(|&id| usize::try_from(id).map_or(true, |id| id >= rows))
+        {
+            return Err(NnError::Tokenizer(
+                "tokenizer id exceeds the model embedding vocabulary".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_capture_windows(&self) -> Result<(), NnError> {
+        if self.inner.get_truncation().is_some() || self.inner.get_padding().is_some() {
+            return Err(NnError::Tokenizer(
+                "staged capture forbids configured tokenizer truncation/padding".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
 impl Tokenizer for HfJsonTokenizer {
+    fn render_chat_prompt(
+        &self,
+        messages: &[(&str, &str)],
+        max_output_bytes: usize,
+    ) -> Result<Option<String>, NnError> {
+        self.chat_template
+            .as_ref()
+            .map(|template| template.render(messages, max_output_bytes))
+            .transpose()
+    }
+
     fn encode(&self, text: &str) -> Result<Vec<u32>, NnError> {
         self.inner
             .encode(text, false)
@@ -111,6 +225,17 @@ mod tests {
     use tokenizers::pre_tokenizers::whitespace::Whitespace;
 
     use super::*;
+
+    #[test]
+    fn duplicate_configuration_and_named_template_keys_refuse() {
+        for config in [
+            r#"{"eos_token":"x","chat_template":"x","chat_template":"y"}"#,
+            r#"{"chat_template":{"default":"x","default":"y"}}"#,
+            r#"{"chat_template":[{"name":"default","name":"other","template":"x"}]}"#,
+        ] {
+            assert!(serde_json::from_str::<UniqueJson>(config).is_err());
+        }
+    }
 
     #[test]
     fn loads_special_tokens_and_does_not_inject_bos() {

@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EvidenceEnvelope",
+  "description": "Shared metadata envelope for one typed evidence payload.\n\nPayload schemas remain event-specific; this type supplies the common\nversion, identity, span, logical-time, and digest fields.",
+  "type": "object",
+  "properties": {
+    "digest": {
+      "description": "Lowercase hexadecimal BLAKE3 digest of this event and its span predecessor.",
+      "type": "string"
+    },
+    "parent": {
+      "description": "Parent span, if this span is nested.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "payload": {
+      "description": "Typed, event-specific payload."
+    },
+    "run": {
+      "description": "Stable run identifier.",
+      "type": "string"
+    },
+    "schema": {
+      "description": "Registered event schema identifier, such as `tritium.quantize.fit`.",
+      "type": "string"
+    },
+    "seq": {
+      "description": "Monotonic sequence number within this span, starting at zero.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "span": {
+      "description": "Stable span identifier.",
+      "type": "string"
+    },
+    "t": {
+      "description": "Logical time within the run; wall-clock timing is intentionally separate.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "v": {
+      "description": "Version of this event schema.",
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    }
+  },
+  "required": [
+    "schema",
+    "v",
+    "run",
+    "seq",
+    "span",
+    "t",
+    "payload",
+    "digest"
+  ]
+}

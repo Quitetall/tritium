@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DirectFitLevel",
+  "description": "One requested direct fit; plane counts need not be sorted or nested.",
+  "type": "object",
+  "properties": {
+    "name": {
+      "description": "Unique nonempty level name within this request.",
+      "type": "string"
+    },
+    "planes": {
+      "description": "Positive plane count bounded by the layout and its admitted law.",
+      "type": "integer",
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "planes"
+  ]
+}

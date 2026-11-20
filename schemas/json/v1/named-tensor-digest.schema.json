@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NamedTensorDigest",
+  "description": "Named logical tensor binding in the candidate model preimage.",
+  "type": "object",
+  "properties": {
+    "content": {
+      "description": "Logical tensor digest, never its packed blob identity.",
+      "$ref": "#/$defs/SemanticTensorDigest"
+    },
+    "name": {
+      "description": "Logical architecture tensor name.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "content"
+  ],
+  "$defs": {
+    "SemanticTensorDigest": {
+      "description": "Identity for a tensor's semantic values independent of its container.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    }
+  }
+}

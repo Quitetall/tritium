@@ -47,7 +47,7 @@ pub use optim::{
     AdamState, AdamW, CautiousAdamW, INT8_ADAM_BLOCK, Int8AdamState, Int8AdamW, Muon, MuonState,
     Optimizer, Sgd, SgdState, newton_schulz,
 };
-pub use portable::CpuTrainBackendV1;
+pub use portable::{CpuTrainBackendV1, CpuTrainBackendV2};
 pub use pv_tuning::{
     PvStepReceipt, PvTernaryPlane, PvTernaryStructure, PvTernaryWeight, PvTuningConfig,
     PvTuningConfigBuilder, PvTuningError, PvTuningSession, PvTuningSizeLedger,

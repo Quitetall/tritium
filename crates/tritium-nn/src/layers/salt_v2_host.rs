@@ -10,7 +10,7 @@ use tritium_format::{
     salt_v2_package::{
         PackedSaltV2PlaneRef, SALT_V2_ALLOCATION_TILE_SIZE,
         SALT_V2_INDEXED_RUNTIME_RANK_STRIDE_TILES, SALT_V2_MAX_PLANES, SaltV2PackageReader,
-        SaltV2TensorInfo, SaltV2Transform, unpack_salt_v2_plane_into,
+        SaltV2ScaleUpdate, SaltV2TensorInfo, SaltV2Transform, unpack_salt_v2_plane_into,
     },
 };
 
@@ -24,6 +24,7 @@ use crate::NnError;
 /// per-tile or per-plane heap descriptors.
 #[derive(Clone, Debug)]
 pub struct HostSaltV2Linear {
+    tensor_index: usize,
     codec: SaltV2Codec,
     rows: usize,
     columns: usize,
@@ -53,6 +54,10 @@ impl HostSaltV2Linear {
         reader: &mut SaltV2PackageReader<R>,
         name: &str,
     ) -> Result<Self, NnError> {
+        let tensor_index = reader
+            .tensor_names_encoded_order()
+            .position(|candidate| candidate == name)
+            .ok_or_else(|| NnError::MissingTensor(name.to_owned()))?;
         let info = reader
             .tensor_info(name)
             .cloned()
@@ -135,6 +140,7 @@ impl HostSaltV2Linear {
         }
 
         Ok(Self {
+            tensor_index,
             codec,
             rows,
             columns,
@@ -148,6 +154,15 @@ impl HostSaltV2Linear {
             rank_prefixes: rank_prefixes.into_boxed_slice(),
             terminal_map_value,
         })
+    }
+
+    /// Physical record index of this matrix in its source package.
+    ///
+    /// Updates are bound to this identity so a same-shaped tensor cannot
+    /// accidentally receive another tensor's scale candidates.
+    #[must_use]
+    pub const fn tensor_index(&self) -> usize {
+        self.tensor_index
     }
 
     /// Output rows.
@@ -190,6 +205,90 @@ impl HostSaltV2Linear {
     #[must_use]
     pub fn scales(&self) -> &[f16] {
         &self.scales
+    }
+
+    /// Apply canonically ordered package scale updates to this resident matrix.
+    ///
+    /// The caller supplies the matrix's package tensor index. Updates are fully
+    /// validated—including zero scales against the fixed trits—before any
+    /// resident scale changes. Packed trits and index metadata remain untouched.
+    /// This supports sequential candidate evaluation without rebuilding the
+    /// resident packed-weight arenas.
+    ///
+    /// # Errors
+    /// Rejects an empty, out-of-order, duplicate, mis-targeted, malformed, or
+    /// trit-erasing update set without partial mutation.
+    pub fn apply_scale_updates(
+        &mut self,
+        tensor_index: usize,
+        updates: &[SaltV2ScaleUpdate],
+    ) -> Result<(), NnError> {
+        if updates.is_empty() {
+            return Err(invalid("<resident>", "scale update set is empty"));
+        }
+        let mut previous = None;
+        let mut decoded = Vec::new();
+        for update in updates {
+            let target = (
+                update.tensor_index(),
+                update.tile_index(),
+                update.plane_index(),
+            );
+            if target.0 != tensor_index || previous.is_some_and(|previous| target <= previous) {
+                return Err(invalid(
+                    "<resident>",
+                    "scale update target is mismatched, duplicated, or out of order",
+                ));
+            }
+            previous = Some(target);
+            let logical_len = self.tile_logical_len(target.1)?;
+            if target.2 >= self.tile_plane_count(target.1)? {
+                return Err(invalid("<resident>", "scale update plane is out of range"));
+            }
+            let (packed, current_scales) = self.plane(target.1, target.2, logical_len)?;
+            let replacements = update.scales();
+            if replacements.len() != current_scales.len()
+                || replacements
+                    .iter()
+                    .any(|scale| !scale.is_finite() || scale.to_f32() < 0.0)
+            {
+                return Err(invalid("<resident>", "replacement scales are malformed"));
+            }
+            unpack_salt_v2_plane_into(self.codec, packed, logical_len, &mut decoded).map_err(
+                |error| invalid("<resident>", &format!("decode update target: {error}")),
+            )?;
+            for (group, scale) in decoded
+                .chunks(self.scale_group_size)
+                .zip(replacements.iter())
+            {
+                if *scale == f16::ZERO && group.iter().any(|trit| trit.get() != 0) {
+                    return Err(invalid(
+                        "<resident>",
+                        "zero replacement scale would erase nonzero trits",
+                    ));
+                }
+            }
+        }
+
+        for update in updates {
+            let tile_index = update.tile_index();
+            let plane_index = update.plane_index();
+            let logical_len = self.tile_logical_len(tile_index)?;
+            let rank = self.plane_rank_before(tile_index)?;
+            let scale_count = logical_len.div_ceil(self.scale_group_size);
+            let scale_start = rank
+                .checked_mul(SALT_V2_ALLOCATION_TILE_SIZE / self.scale_group_size)
+                .and_then(|offset| offset.checked_add(plane_index.checked_mul(scale_count)?))
+                .ok_or_else(|| invalid("<resident>", "scale update offset overflows"))?;
+            let scale_end = scale_start
+                .checked_add(scale_count)
+                .ok_or_else(|| invalid("<resident>", "scale update end overflows"))?;
+            self.scales
+                .get_mut(scale_start..scale_end)
+                .ok_or_else(|| invalid("<resident>", "scale update range is absent"))?
+                .copy_from_slice(update.scales());
+        }
+        Ok(())
     }
 
     /// Complete bytes of the two-bit plane-count map.
@@ -641,8 +740,8 @@ mod tests {
     use tritium_format::{
         salt_v2::SaltV2Codec,
         salt_v2_package::{
-            SaltV2Package, SaltV2PackageReader, SaltV2Plane, SaltV2Tensor, SaltV2Tile,
-            SaltV2Transform, write_salt_v2_package,
+            SaltV2Package, SaltV2PackageReader, SaltV2Plane, SaltV2ScaleUpdate, SaltV2Tensor,
+            SaltV2Tile, SaltV2Transform, write_salt_v2_package,
         },
     };
 
@@ -670,6 +769,76 @@ mod tests {
         let mut reader = SaltV2PackageReader::new_strict(Cursor::new(encoded.bytes)).unwrap();
         let linear = HostSaltV2Linear::from_reader(&mut reader, tensor.name()).unwrap();
         (package, linear)
+    }
+
+    #[test]
+    fn resident_scale_updates_match_package_execution_and_reject_partial_mutation() {
+        let tensor = SaltV2Tensor::new(
+            "weight",
+            vec![2, 128],
+            vec![
+                SaltV2Tile::new(vec![
+                    SaltV2Plane::new(vec![1; 256], vec![f16::ONE, f16::ONE]).unwrap(),
+                ])
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let (mut package, mut linear) = resident(SaltV2Codec::D2, &tensor);
+        let baseline_scales = linear.scales().to_vec();
+        let activation = vec![1.0; 128];
+        let mut baseline = [0.0; 2];
+        linear.forward(&activation, 1, &mut baseline).unwrap();
+        assert_eq!(baseline, [128.0, 128.0]);
+
+        let update = SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::from_f32(2.0), f16::ONE]).unwrap();
+        linear
+            .apply_scale_updates(0, std::slice::from_ref(&update))
+            .unwrap();
+        package
+            .apply_scale_updates(std::slice::from_ref(&update))
+            .unwrap();
+        let mut resident_output = [0.0; 2];
+        linear
+            .forward(&activation, 1, &mut resident_output)
+            .unwrap();
+        let mut package_output = [0.0; 2];
+        salt_v2_matvec_into(&package, 0, &activation, &mut package_output).unwrap();
+        assert_eq!(resident_output, package_output);
+        assert_eq!(resident_output, [256.0, 128.0]);
+
+        let before_invalid = linear.scales().to_vec();
+        let invalid = SaltV2ScaleUpdate::new(0, 0, 0, vec![f16::ZERO, f16::ONE]).unwrap();
+        assert!(
+            linear
+                .apply_scale_updates(0, std::slice::from_ref(&invalid))
+                .is_err()
+        );
+        assert_eq!(linear.scales(), before_invalid);
+        assert_ne!(linear.scales(), baseline_scales);
+    }
+
+    #[test]
+    fn resident_tensor_identity_follows_physical_package_order() {
+        let one = |name: &str| {
+            SaltV2Tensor::new(
+                name,
+                vec![1, 1],
+                vec![
+                    SaltV2Tile::new(vec![SaltV2Plane::new(vec![1], vec![f16::ONE]).unwrap()])
+                        .unwrap(),
+                ],
+            )
+            .unwrap()
+        };
+        let package =
+            SaltV2Package::new(SaltV2Codec::D2, vec![one("first"), one("second")]).unwrap();
+        let encoded = write_salt_v2_package(&package).unwrap();
+        let mut reader = SaltV2PackageReader::new_strict(Cursor::new(encoded.bytes)).unwrap();
+        let first = HostSaltV2Linear::from_reader(&mut reader, "first").unwrap();
+        let second = HostSaltV2Linear::from_reader(&mut reader, "second").unwrap();
+        assert_eq!(first.tensor_index(), 0);
+        assert_eq!(second.tensor_index(), 1);
     }
 
     fn g64_plane(seed: usize) -> SaltV2Plane {

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ScaleAnchor",
+  "description": "Grouping axis to which an additive scale is anchored.",
+  "oneOf": [
+    {
+      "description": "One scale per declared group.",
+      "type": "string",
+      "const": "Group"
+    },
+    {
+      "description": "One scale per matrix row.",
+      "type": "string",
+      "const": "Row"
+    },
+    {
+      "description": "One scale for the complete tensor.",
+      "type": "string",
+      "const": "Tensor"
+    },
+    {
+      "description": "One scale per output channel.",
+      "type": "string",
+      "const": "Channel"
+    }
+  ]
+}

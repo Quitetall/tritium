@@ -17,6 +17,10 @@
 //! spelling means a mistyped path fails as "not a model" instead of being silently treated as the
 //! other kind.
 //!
+//! Explicit original-captured `.trit` generation additionally admits the supplied B stage and
+//! mandatory capture/transform/conversion logs before using the common CPU runner. It does not
+//! infer ancestry, a model level, a payload budget or an EOS policy from nearby files.
+//!
 //! # Prompts
 //!
 //! `--tokens <file.json>` remains the reproducible path: exact ids in, exact ids out, no tokenizer
@@ -30,10 +34,237 @@
 //! unreadable token file, malformed JSON, or a model that is missing weights all yield a clean
 //! message and a non-zero exit — never a panic.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use crate::stage_input::{DEFAULT_MAX_JSON_BYTES, StageArgs, read_bounded, required};
 use anyhow::{Context as _, bail};
-use tritium_nn::{GgufBpeTokenizer, HfJsonTokenizer, ModelRunner, Tokenizer};
+use clap::Args;
+use tritium_nn::{GgufBpeTokenizer, HfJsonTokenizer, ModelRunner, Runner, Tokenizer};
+
+// Private bridge for legacy GGUF/SALT commands until their loader migration.
+enum CliRunner {
+    Legacy(Box<ModelRunner>),
+    Shared(Box<Runner>),
+    Bounded(Box<Runner>),
+}
+impl From<ModelRunner> for CliRunner {
+    fn from(runner: ModelRunner) -> Self {
+        Self::Legacy(Box::new(runner))
+    }
+}
+impl From<Runner> for CliRunner {
+    fn from(runner: Runner) -> Self {
+        Self::Shared(Box::new(runner))
+    }
+}
+impl CliRunner {
+    fn generate(
+        &mut self,
+        prompt: &[u32],
+        max_new: usize,
+        eos: u32,
+    ) -> Result<Vec<u32>, tritium_nn::NnError> {
+        match self {
+            Self::Legacy(runner) => runner.generate(prompt, max_new, eos),
+            Self::Shared(runner) => runner.generate(prompt, max_new, eos),
+            Self::Bounded(runner) => runner.generate_bounded(prompt, max_new, eos),
+        }
+    }
+}
+
+/// Explicit typed generation; same load JSON and common streaming path as serving.
+pub(crate) fn run_typed(
+    path: &Path,
+    backend_name: &str,
+    token_file: Option<&Path>,
+    text: Option<&str>,
+    max_new: usize,
+    greedy: bool,
+    eos: u32,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        greedy,
+        "--greedy=false: sampling is not implemented in this subcommand"
+    );
+    let config = tritium_nn::TypedLoadConfig::read(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    config
+        .require_encoded_streaming()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let limits = config
+        .stream_limits()
+        .context("typed generation requires stream_limits")?;
+    anyhow::ensure!(
+        max_new <= limits.max_context,
+        "--max-new exceeds admitted context"
+    );
+    let ids = token_file
+        .map(|path| -> anyhow::Result<Vec<u32>> {
+            let bytes = read_bounded(path, DEFAULT_MAX_JSON_BYTES)?;
+            let ids: Vec<u32> = serde_json::from_slice(&bytes).context("typed prompt token IDs")?;
+            anyhow::ensure!(
+                ids.len()
+                    .checked_add(max_new)
+                    .is_some_and(|n| n <= limits.max_context),
+                "prompt and --max-new exceed admitted context"
+            );
+            Ok(ids)
+        })
+        .transpose()?;
+    let prompt = match (&ids, text) {
+        (Some(ids), None) => Prompt::Ids(ids),
+        (None, Some(text)) => Prompt::Text(text),
+        _ => bail!("typed generation requires exactly one of --tokens or --prompt"),
+    };
+    let model_path = config.path().to_path_buf();
+    let init = tritium_runtime::BACKENDS
+        .iter()
+        .find(|b| b.name == backend_name)
+        .map(|b| b.init)
+        .with_context(|| format!("backend `{backend_name}` is not in the registry"))?;
+    let backend =
+        init().map_err(|e| anyhow::anyhow!("backend `{backend_name}` failed to init: {e}"))?;
+    let mut recorder = tritium_evidence::EvidenceRecorder::new(
+        "typed-generation-load",
+        [
+            tritium_evidence::TENSOR_UPLOADED_REGISTRATION,
+            tritium_evidence::MODEL_LOADED_REGISTRATION,
+        ],
+    )?;
+    let context = tritium_runtime::TensorUploadContext {
+        recorder: &mut recorder,
+        span: "load",
+        parent: None,
+        logical_time: 0,
+    };
+    let loaded = config
+        .load(backend, context)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    anyhow::ensure!(
+        loaded.runner.resource_admission().is_some(),
+        "typed generation missing mandatory resource admission"
+    );
+    eprintln!(
+        "typed candidate, not production-qualified: execution={:?}, resource_admission={:?}",
+        loaded.runner.execution(),
+        loaded.runner.resource_admission()
+    );
+    recorder.seal()?;
+    decode_and_print(
+        CliRunner::Bounded(Box::new(loaded.runner)),
+        Some(Box::new(loaded.tokenizer)),
+        &model_path,
+        &prompt,
+        max_new,
+        eos,
+    )
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct JoinedArgs {
+    #[command(flatten)]
+    stage: StageArgs,
+    /// Complete canonical actual C conversion JSONL log; included in aggregate evidence bound.
+    #[arg(long, requires = "original_captured_stage")]
+    conversion_evidence: Option<PathBuf>,
+    /// Explicit complete model level; no prefix/default inference.
+    #[arg(long, requires = "original_captured_stage")]
+    level: Option<String>,
+    /// Positive backend tensor payload ceiling; not total process or KV/tokenizer RSS.
+    #[arg(long, requires = "original_captured_stage")]
+    max_payload_bytes: Option<u64>,
+    /// Positive bound on each limits JSON file (default 16MiB).
+    #[arg(long, requires = "original_captured_stage")]
+    max_limits_bytes: Option<u64>,
+    /// Require native tensor execution; default allows the shared explicit emulated tier.
+    #[arg(long, requires = "original_captured_stage")]
+    native_only: bool,
+}
+impl JoinedArgs {
+    pub(crate) fn enabled(&self) -> bool {
+        self.stage.enabled()
+    }
+}
+
+pub(crate) fn run_joined(
+    model_path: &Path,
+    args: &JoinedArgs,
+    prompt: &Prompt<'_>,
+    max_new: usize,
+    greedy: bool,
+    eos: u32,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        greedy,
+        "--greedy=false: sampling is not implemented in this subcommand"
+    );
+    let level = args
+        .level
+        .as_deref()
+        .context("joined generation requires --level")?;
+    anyhow::ensure!(!level.is_empty(), "--level must not be empty");
+    let maximum = args
+        .max_payload_bytes
+        .context("joined generation requires --max-payload-bytes")?;
+    anyhow::ensure!(maximum > 0, "--max-payload-bytes must be positive");
+    // All cold-admission buffers leave scope before decoding. Backend payload
+    // leases and the real tokenizer are owned by the returned runtime objects.
+    let (runner, tokenizer) = {
+        let mut inputs = args
+            .stage
+            .read(args.max_limits_bytes.unwrap_or(DEFAULT_MAX_JSON_BYTES))?;
+        let fit = inputs.read_conversion_log(required(&args.conversion_evidence)?)?;
+        let bytes = read_bounded(model_path, inputs.conversion_limits.max_package_bytes)?;
+        let stage = inputs.open()?;
+        let joined = tritium_quantize::engine::JoinedSalienceModel::open_original_captured(
+            &bytes,
+            &stage,
+            &inputs.capture,
+            &fit,
+            inputs.conversion_limits,
+        )?;
+        let source = tritium_nn::ModelSource::JoinedSalience {
+            model: &joined,
+            level,
+        };
+        let budget = tritium_runtime::TensorPayloadBudget::new(maximum);
+        let policy = tritium_schema::TensorUploadPolicy {
+            native_only: args.native_only,
+            max_payload_bytes: Some(maximum),
+        };
+        let mut recorder = tritium_evidence::EvidenceRecorder::new(
+            "joined-generation-load",
+            [
+                tritium_evidence::TENSOR_UPLOADED_REGISTRATION,
+                tritium_evidence::MODEL_LOADED_REGISTRATION,
+            ],
+        )?;
+        let context = tritium_runtime::TensorUploadContext {
+            recorder: &mut recorder,
+            span: "load",
+            parent: None,
+            logical_time: 0,
+        };
+        let backend = Box::new(tritium_cpu::CpuBackend::new());
+        let result = match prompt {
+            Prompt::Ids(_) => (
+                CliRunner::from(ModelRunner::from_source_admitted(
+                    source, backend, policy, &budget, context,
+                )?),
+                None,
+            ),
+            Prompt::Text(_) => {
+                let loaded = tritium_nn::load(source, backend, policy, &budget, context)?;
+                (
+                    CliRunner::from(loaded.runner),
+                    Some(Box::new(loaded.tokenizer) as Box<dyn Tokenizer>),
+                )
+            }
+        };
+        recorder.seal()?;
+        result
+    };
+    decode_and_print(runner, tokenizer, model_path, prompt, max_new, eos)
+}
 
 /// Parse a JSON file of input token IDs.
 ///
@@ -79,10 +310,9 @@ pub(crate) fn render_output(tokens: &[u32]) -> String {
 /// Load `model_path`, greedily generate up to `max_new` tokens continuing
 /// `tokens`, and print the resulting IDs.
 ///
-/// The `eos` token (defaults to the BitNet/LLaMA-3 end-of-text id when `None`) is
-/// passed to [`ModelRunner::generate`]; generation also stops at `max_new`. When
-/// `greedy` is `false` the function still decodes greedily for v0.20 (sampling is a
-/// later wave) but records the intent in a note on stderr so the flag is honest.
+/// The explicit `eos` token is passed to [`ModelRunner::generate`]; generation
+/// also stops at `max_new`. The legacy CLI supplies its historical EOS default
+/// when omitted. `greedy = false` rejects because sampling is unsupported.
 ///
 /// # Errors
 /// Returns an [`anyhow::Error`] if the model file cannot be read or parsed, no
@@ -103,8 +333,19 @@ pub(crate) fn run(
         );
     }
 
-    let (mut runner, tokenizer) = load(model_path)?;
+    let (runner, tokenizer) = load(model_path)?;
+    decode_and_print(runner, tokenizer, model_path, prompt, max_new, eos)
+}
 
+fn decode_and_print(
+    runner: impl Into<CliRunner>,
+    tokenizer: Option<Box<dyn Tokenizer>>,
+    model_path: &Path,
+    prompt: &Prompt<'_>,
+    max_new: usize,
+    eos: u32,
+) -> anyhow::Result<()> {
+    let mut runner = runner.into();
     let tokens = match prompt {
         Prompt::Ids(ids) => (*ids).to_vec(),
         Prompt::Text(text) => {
@@ -199,6 +440,12 @@ fn load(model_path: &Path) -> anyhow::Result<(ModelRunner, Option<Box<dyn Tokeni
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runner_bridge_does_not_embed_backend_resident_state() {
+        // Neither graph owner should be copied into every CLI bridge value.
+        assert!(std::mem::size_of::<CliRunner>() <= 2 * std::mem::size_of::<usize>());
+    }
 
     #[test]
     fn render_output_is_json_then_lines() {

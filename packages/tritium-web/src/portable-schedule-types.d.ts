@@ -1,13 +1,8 @@
 import type { PortableTrainingRequestV1 } from "./portable.js";
 
-export type PortableScheduleTensorV1 =
-  | Float32Array
-  | Uint32Array
-  | Uint8Array;
+export type PortableScheduleTensorV1 = Float32Array | Uint32Array | Uint8Array;
 
-export type PortableScheduleTensorStoreV1 = Readonly<
-  Record<string, PortableScheduleTensorV1>
->;
+export type PortableScheduleTensorStoreV1 = Readonly<Record<string, PortableScheduleTensorV1>>;
 
 export type PortableSchedulePlanErrorCode =
   | "buffer_mismatch"

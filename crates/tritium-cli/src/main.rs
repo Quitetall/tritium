@@ -1,6 +1,6 @@
 //! The `tritium` command-line tool.
 //!
-//! One binary, fourteen subcommands, grouped by concern:
+//! One binary, fifteen subcommands, grouped by concern:
 //! - **inspect / list-backends / generate** — parse a GGUF and print its
 //!   metadata + tensor table, enumerate the discovered compute backends,
 //!   greedily decode from a reproducible JSON token file.
@@ -38,6 +38,7 @@ use tritium_rocm as _;
 #[cfg(feature = "wgpu")]
 use tritium_wgpu as _;
 
+use anyhow::Context as _;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -49,11 +50,15 @@ mod campaign_artifact;
 #[cfg(feature = "nccl")]
 mod campaign_world;
 mod convert;
+mod convert_plan;
+mod evidence;
 mod generate;
 #[cfg(feature = "cuda")]
 mod hestia_gate;
 mod hex;
 mod inspect;
+mod inspect_trit;
+mod migrate;
 #[cfg(feature = "cuda")]
 mod nvml_probe;
 mod pull;
@@ -64,6 +69,7 @@ mod repack;
 mod report;
 mod salt;
 mod stage7_evidence;
+mod stage_input;
 mod transport;
 
 /// BitNet 2B4T uses the LLaMA-3 tokenizer, whose end-of-text token is `128001`.
@@ -78,6 +84,15 @@ const DEFAULT_EOS: u32 = 128_001;
     version
 )]
 struct Cli {
+    /// Evidence detail level. Events go to stderr unless `--evidence-out` is supplied.
+    #[arg(long, global = true, value_enum, default_value_t = evidence::EvidenceMode::Summary)]
+    evidence: evidence::EvidenceMode,
+    /// Write evidence JSONL to a new file instead of stderr; existing files are never replaced.
+    #[arg(long, global = true)]
+    evidence_out: Option<PathBuf>,
+    /// Stable identifier for this evidence run; required by deterministic mode.
+    #[arg(long, global = true)]
+    run_id: Option<String>,
     /// The subcommand to run.
     #[command(subcommand)]
     command: Command,
@@ -86,10 +101,20 @@ struct Cli {
 /// The `tritium` subcommands.
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Import legacy originals and replay their actual prepared evidence.
+    Migrate {
+        #[command(subcommand)]
+        migrate: migrate::MigrateCommand,
+    },
     /// Parse a GGUF file and print its version, metadata, and tensor table.
     Inspect {
         /// Path to the `.gguf` file to inspect.
         path: PathBuf,
+    },
+    /// Prepare an actual typed text source without loading backend weights.
+    InspectTrit {
+        #[command(flatten)]
+        args: Box<inspect_trit::InspectTritArgs>,
     },
     /// List every backend the runtime discovered, with its capabilities.
     ListBackends,
@@ -120,11 +145,28 @@ enum Command {
         #[arg(long, default_value = "main")]
         revision: String,
     },
-    /// Load a GGUF model and greedily generate tokens from a JSON file of input IDs.
+    /// Load a model and greedily generate from exact token IDs or its own tokenizer.
+    #[command(group(clap::ArgGroup::new("joined_generation")
+        .args(["original_captured_stage"])
+        .requires_all(["model", "conversion_evidence", "level", "max_payload_bytes", "eos"])))]
     Generate {
-        /// A `.gguf` model file, or a directory written by `tritium convert`.
-        #[arg(long, alias = "input")]
-        model: PathBuf,
+        /// A `.gguf` file, a legacy converted directory, or explicit joined C `.trit`.
+        #[arg(
+            long,
+            alias = "input",
+            required_unless_present = "typed",
+            conflicts_with = "typed"
+        )]
+        model: Option<PathBuf>,
+        /// Shared typed load JSON; requires encoded resource admission and explicit EOS.
+        #[arg(long, requires = "eos", conflicts_with = "original_captured_stage")]
+        typed: Option<PathBuf>,
+        /// Registry backend for typed generation only (defaults to cpu).
+        #[arg(long, requires = "typed")]
+        backend: Option<String>,
+        /// Explicit original-captured joined admission; ordinary readers never unwrap it.
+        #[command(flatten)]
+        joined: Box<generate::JoinedArgs>,
         /// Path to a JSON file holding the input token IDs, e.g. `[1, 128000, 9906]`. The
         /// reproducible path: no tokenizer is consulted, so the same ids always go in and out.
         #[arg(long, conflicts_with = "prompt", required_unless_present = "prompt")]
@@ -142,9 +184,9 @@ enum Command {
         /// OpenAI API); the flag exists so scripts can be explicit.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         greedy: bool,
-        /// End-of-sequence token ID that stops generation early.
-        #[arg(long, default_value_t = DEFAULT_EOS)]
-        eos: u32,
+        /// Stop token ID; legacy defaults to 128001, joined mode requires an explicit policy.
+        #[arg(long)]
+        eos: Option<u32>,
     },
     /// Emit reproducible benchmark/validation reports.
     Report {
@@ -157,6 +199,12 @@ enum Command {
         /// Release evidence operation.
         #[command(subcommand)]
         release: release::ReleaseCommand,
+    },
+    /// Inspect and verify canonical, hash-chained evidence JSONL.
+    Evidence {
+        /// Evidence operation.
+        #[command(subcommand)]
+        evidence: evidence::EvidenceCommand,
     },
     /// Repack ternary GGUF tensors while preserving dequantized weight values.
     Repack {
@@ -182,11 +230,24 @@ enum Command {
     /// fold (`--calib`) — the lever every published SALT number was measured under — and it writes
     /// the folded norms alongside the bundle. Writing only a bundle would produce a model whose
     /// weights carry the fold and whose norms do not.
+    #[command(group(clap::ArgGroup::new("conversion_source")
+        .args(["source_shard", "original_captured_stage"])
+        .requires("conversion_plan")
+        .multiple(false)))]
+    #[command(group(clap::ArgGroup::new("conversion_plan")
+        .args(["plan", "calibrated_plan", "owner_plan"])
+        .multiple(false)
+        .conflicts_with_all(["model", "calib", "calib_tokens", "fold_alpha",
+            "no_rotation", "activation_aware", "gptq_decay", "gptq_scale_refit",
+            "gptq_decay_ramp", "dense_container", "planes", "group", "grid"])))]
     Convert {
         /// Hugging Face model directory (config.json + safetensors shards).
-        #[arg(long, alias = "input")]
-        model: PathBuf,
-        /// Output directory: config.json + model.safetensors (folded norms) + model.tslb.
+        #[arg(long, alias = "input", required_unless_present = "conversion_plan")]
+        model: Option<PathBuf>,
+        /// Explicit typed-plan conversion through the shared engine (ADR0063 candidate).
+        #[command(flatten)]
+        plan: Box<convert_plan::PlanArgs>,
+        /// New output directory: legacy files, or model.trit + evidence.jsonl with --plan.
         #[arg(long, alias = "output")]
         out: PathBuf,
         /// Calibration corpus for the salience fold: either a corpus JSON with a `train_ids`
@@ -257,6 +318,13 @@ enum Command {
         /// Pass `1` for plain GPTQ.
         #[arg(long, default_value = "auto", value_parser = parse_decay)]
         gptq_decay: DecayArg,
+        /// Where to perform the one-scale-per-group GPTQ scale refit.
+        ///
+        /// `post-pass` is the existing default. `in-loop` refits a completed group before
+        /// propagating errors into later groups; it is an experimental L-C arm and requires
+        /// `--activation-aware`.
+        #[arg(long, value_enum, default_value_t = ScaleRefitArg::PostPass)]
+        gptq_scale_refit: ScaleRefitArg,
         /// Ramp the decay over the column order — full propagation at the first column, the decay
         /// only at the last — instead of applying it uniformly. Wins by a further ~1% at 16k
         /// calibration tokens and loses at 4k; leave it off unless calibration is generous.
@@ -280,12 +348,24 @@ enum Command {
         #[arg(long, default_value_t = 16)]
         grid: usize,
     },
-    /// SALT-quantize an fp safetensors model to a SALT bundle.
+    /// Quantize through an explicit typed model plan, or write a legacy SALT bundle.
+    #[command(group(clap::ArgGroup::new("conversion_source")
+        .args(["source_shard", "original_captured_stage"])
+        .requires("conversion_plan")
+        .multiple(false)))]
+    #[command(group(clap::ArgGroup::new("conversion_plan")
+        .args(["plan", "calibrated_plan", "owner_plan"])
+        .multiple(false)
+        .conflicts_with_all(["input", "bpw", "scale_group", "sensitivity", "fisher",
+            "format", "ladder", "planes", "group", "grid", "rotate"])))]
     Quantize {
         /// Path to the fp16/bf16/f32 `.safetensors` source model.
-        #[arg(long, alias = "model")]
-        input: PathBuf,
-        /// Path to write the SALT bundle (`.tslb`).
+        #[arg(long, alias = "model", required_unless_present = "conversion_plan")]
+        input: Option<PathBuf>,
+        /// Explicit typed-plan receiver shared with convert; no legacy recipe remapping.
+        #[command(flatten)]
+        plan: Box<convert_plan::PlanArgs>,
+        /// Legacy SALT bundle file, or a new model.trit/evidence.jsonl directory with a plan.
         #[arg(long, alias = "out")]
         output: PathBuf,
         /// Target average bits-per-weight (`1.585` = all base ternary … `~4.75` at T=3).
@@ -343,6 +423,36 @@ enum Command {
         #[arg(long)]
         rotate: bool,
     },
+}
+
+impl Command {
+    fn evidence_name(&self) -> &'static str {
+        match self {
+            Self::Inspect { .. } => "inspect",
+            Self::InspectTrit { .. } => "inspect-trit",
+            Self::Migrate { .. } => "migrate",
+            Self::ListBackends => "list-backends",
+            Self::Campaign { .. } => "campaign",
+            Self::Salt { .. } => "salt",
+            Self::Pull { .. } => "pull",
+            Self::Generate { .. } => "generate",
+            Self::Report { report } => match report {
+                ReportCommand::Sparsity { .. } => "report.sparsity",
+                ReportCommand::Decode { .. } => "report.decode",
+                ReportCommand::Compare { .. } => "report.compare",
+                ReportCommand::Ttft { .. } => "report.ttft",
+                ReportCommand::Parity { .. } => "report.parity",
+                ReportCommand::Salt { .. } => "report.salt",
+                ReportCommand::SaltModel { .. } => "report.salt-model",
+            },
+            Self::Release { .. } => "release",
+            Self::Evidence { .. } => "evidence",
+            Self::Repack { .. } => "repack",
+            Self::Transport { .. } => "transport",
+            Self::Convert { .. } => "convert",
+            Self::Quantize { .. } => "quantize",
+        }
+    }
 }
 
 /// Benchmark/validation reports.
@@ -518,186 +628,261 @@ pub(crate) enum SaltSensitivityArg {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    match cli.command {
-        Command::Inspect { path } => inspect::run(&path)?,
-        Command::ListBackends => backends::run(),
-        Command::Campaign { campaign: command } => campaign::run(command)?,
-        Command::Salt { salt: command } => salt::run(command)?,
-        Command::Pull {
-            repo,
-            file,
-            revision,
-        } => pull::run(&repo, file.as_deref(), &revision)?,
-        Command::Generate {
-            model,
-            tokens,
-            prompt,
-            max_new,
-            greedy,
-            eos,
-        } => {
-            // clap guarantees exactly one of the two is present.
-            let ids = tokens.map(|p| generate::read_token_file(&p)).transpose()?;
-            let source = match (&ids, &prompt) {
-                (Some(ids), _) => generate::Prompt::Ids(ids),
-                (None, Some(text)) => generate::Prompt::Text(text),
-                (None, None) => unreachable!("clap requires --tokens or --prompt"),
-            };
-            generate::run(&model, &source, max_new, greedy, eos)?;
-        }
-        Command::Repack { input, output, to } => repack::run(&input, &output, to)?,
-        Command::Transport { transport: command } => transport::run(command)?,
-        Command::Release { release: command } => release::run(command)?,
-        Command::Report { report: command } => match command {
-            ReportCommand::Sparsity { model } => report::sparsity(&model)?,
-            ReportCommand::Decode {
+    let command_name = cli.command.evidence_name();
+    let evidence =
+        evidence::EvidenceSession::start(cli.evidence, cli.evidence_out, cli.run_id, command_name)?;
+    let command_result = (|| -> anyhow::Result<()> {
+        match cli.command {
+            Command::Inspect { path } => inspect::run(&path)?,
+            Command::InspectTrit { args } => inspect_trit::run(*args)?,
+            Command::Migrate { migrate: command } => migrate::run(command)?,
+            Command::ListBackends => backends::run(),
+            Command::Campaign { campaign: command } => campaign::run(command)?,
+            Command::Salt { salt: command } => salt::run(command)?,
+            Command::Pull {
+                repo,
+                file,
+                revision,
+            } => pull::run(&repo, file.as_deref(), &revision)?,
+            Command::Generate {
                 model,
-                tokens,
+                typed,
                 backend,
-                decode_steps,
-                warmup,
-                format,
+                joined,
+                tokens,
+                prompt,
+                max_new,
+                greedy,
+                eos,
             } => {
-                let ids = generate::read_token_file(&tokens)?;
-                report::decode(&model, &ids, &backend, decode_steps, warmup, format)?;
+                if let Some(path) = typed {
+                    generate::run_typed(
+                        &path,
+                        backend.as_deref().unwrap_or("cpu"),
+                        tokens.as_deref(),
+                        prompt.as_deref(),
+                        max_new,
+                        greedy,
+                        eos.context("typed generation requires --eos")?,
+                    )?;
+                } else {
+                    // Compatibility token-file behavior is intentionally unchanged.
+                    let ids = tokens.map(|p| generate::read_token_file(&p)).transpose()?;
+                    let source = match (&ids, &prompt) {
+                        (Some(ids), _) => generate::Prompt::Ids(ids),
+                        (None, Some(text)) => generate::Prompt::Text(text),
+                        (None, None) => unreachable!("clap requires --tokens or --prompt"),
+                    };
+                    if joined.enabled() {
+                        generate::run_joined(
+                            model
+                                .as_deref()
+                                .context("joined generation requires --model")?,
+                            &joined,
+                            &source,
+                            max_new,
+                            greedy,
+                            eos.context("joined generation requires --eos")?,
+                        )?;
+                    } else {
+                        generate::run(
+                            model.as_deref().context("generation requires --model")?,
+                            &source,
+                            max_new,
+                            greedy,
+                            eos.unwrap_or(DEFAULT_EOS),
+                        )?;
+                    }
+                }
             }
-            ReportCommand::Compare {
-                model,
-                tokens,
-                backend,
-                prompt_len,
-                decode_steps,
-                warmup,
-                reps,
-                runs,
-                format,
-            } => {
-                let ids = generate::read_token_file(&tokens)?;
-                report::compare(
-                    &model,
-                    &ids,
-                    &backend,
+            Command::Repack { input, output, to } => repack::run(&input, &output, to)?,
+            Command::Transport { transport: command } => transport::run(command)?,
+            Command::Release { release: command } => release::run(command)?,
+            Command::Evidence { evidence: command } => evidence::run(command)?,
+            Command::Report { report: command } => match command {
+                ReportCommand::Sparsity { model } => report::sparsity(&model)?,
+                ReportCommand::Decode {
+                    model,
+                    tokens,
+                    backend,
+                    decode_steps,
+                    warmup,
+                    format,
+                } => {
+                    let ids = generate::read_token_file(&tokens)?;
+                    report::decode(&model, &ids, &backend, decode_steps, warmup, format)?;
+                }
+                ReportCommand::Compare {
+                    model,
+                    tokens,
+                    backend,
                     prompt_len,
                     decode_steps,
                     warmup,
                     reps,
                     runs,
                     format,
-                )?
-            }
-            ReportCommand::Ttft {
+                } => {
+                    let ids = generate::read_token_file(&tokens)?;
+                    report::compare(
+                        &model,
+                        &ids,
+                        &backend,
+                        prompt_len,
+                        decode_steps,
+                        warmup,
+                        reps,
+                        runs,
+                        format,
+                    )?
+                }
+                ReportCommand::Ttft {
+                    model,
+                    tokens,
+                    backend,
+                    runs,
+                    format,
+                } => {
+                    let ids = generate::read_token_file(&tokens)?;
+                    report::ttft(&model, &ids, &backend, runs, format)?;
+                }
+                ReportCommand::Parity {
+                    model,
+                    tokens,
+                    max_new,
+                    eos,
+                    format,
+                } => {
+                    let ids = generate::read_token_file(&tokens)?;
+                    report::parity(&model, &ids, max_new, eos, format)?;
+                }
+                ReportCommand::Salt {
+                    input,
+                    rows,
+                    k,
+                    budgets,
+                    sensitivity,
+                    format,
+                } => report::salt(&input, rows, k, &budgets, sensitivity, format)?,
+                ReportCommand::SaltModel {
+                    input,
+                    budgets,
+                    sensitivity,
+                    scale_group,
+                    limit,
+                    per_tensor,
+                    format,
+                } => report::salt_model(
+                    &input,
+                    &budgets,
+                    sensitivity,
+                    scale_group,
+                    limit,
+                    per_tensor,
+                    format,
+                )?,
+            },
+            Command::Convert {
                 model,
-                tokens,
-                backend,
-                runs,
-                format,
-            } => {
-                let ids = generate::read_token_file(&tokens)?;
-                report::ttft(&model, &ids, &backend, runs, format)?;
-            }
-            ReportCommand::Parity {
-                model,
-                tokens,
-                max_new,
-                eos,
-                format,
-            } => {
-                let ids = generate::read_token_file(&tokens)?;
-                report::parity(&model, &ids, max_new, eos, format)?;
-            }
-            ReportCommand::Salt {
-                input,
-                rows,
-                k,
-                budgets,
-                sensitivity,
-                format,
-            } => report::salt(&input, rows, k, &budgets, sensitivity, format)?,
-            ReportCommand::SaltModel {
-                input,
-                budgets,
-                sensitivity,
-                scale_group,
-                limit,
-                per_tensor,
-                format,
-            } => report::salt_model(
-                &input,
-                &budgets,
-                sensitivity,
-                scale_group,
-                limit,
-                per_tensor,
-                format,
-            )?,
-        },
-        Command::Convert {
-            model,
-            out,
-            calib,
-            calib_tokens,
-            fold_alpha,
-            no_rotation,
-            activation_aware,
-            gptq_decay,
-            gptq_decay_ramp,
-            dense_container,
-            planes,
-            group,
-            grid,
-        } => convert::run(
-            &model,
-            &out,
-            &convert::ConvertConfig {
+                plan,
+                out,
                 calib,
                 calib_tokens,
                 fold_alpha,
-                ladder: quantize_ladder::LadderConfig {
-                    planes,
-                    group,
-                    grid,
-                    rotate: !no_rotation,
-                },
-                dense_container,
+                no_rotation,
                 activation_aware,
-                gptq_decay: gptq_decay.0,
+                gptq_decay,
+                gptq_scale_refit,
                 gptq_decay_ramp,
-            },
-        )?,
-        Command::Quantize {
-            input,
-            output,
-            bpw,
-            scale_group,
-            sensitivity,
-            fisher,
-            format,
-            ladder,
-            planes,
-            group,
-            grid,
-            rotate,
-        } => quantize::run(
-            &input,
-            &output,
-            bpw,
-            scale_group,
-            sensitivity,
-            fisher.as_deref(),
-            format,
-            ladder,
-            quantize_ladder::LadderConfig {
+                dense_container,
                 planes,
                 group,
                 grid,
-                // Opt-in here, unlike `convert`: two of this command's three containers cannot
-                // record a rotation, so the default has to be the one every format can express.
-                // `quantize::run` refuses the combination rather than writing it silently wrong.
+            } => {
+                if plan.enabled() {
+                    convert_plan::run(&plan, &out)?;
+                } else {
+                    convert::run(
+                        model.as_deref().expect("clap requires legacy --model"),
+                        &out,
+                        &convert::ConvertConfig {
+                            calib,
+                            calib_tokens,
+                            fold_alpha,
+                            ladder: quantize_ladder::LadderConfig {
+                                planes,
+                                group,
+                                grid,
+                                rotate: !no_rotation,
+                            },
+                            dense_container,
+                            activation_aware,
+                            gptq_decay: gptq_decay.0,
+                            gptq_scale_refit: match gptq_scale_refit {
+                                ScaleRefitArg::PostPass => {
+                                    tritium_nn::salt_fit::ScaleRefitMode::PostPass
+                                }
+                                ScaleRefitArg::InLoop => {
+                                    tritium_nn::salt_fit::ScaleRefitMode::InLoop
+                                }
+                            },
+                            gptq_decay_ramp,
+                        },
+                    )?;
+                }
+            }
+            Command::Quantize {
+                input,
+                plan,
+                output,
+                bpw,
+                scale_group,
+                sensitivity,
+                fisher,
+                format,
+                ladder,
+                planes,
+                group,
+                grid,
                 rotate,
-            },
-        )?,
+            } => {
+                if plan.enabled() {
+                    convert_plan::run(&plan, &output)?;
+                } else {
+                    quantize::run(
+                        input
+                            .as_deref()
+                            .context("legacy quantize requires --input")?,
+                        &output,
+                        bpw,
+                        scale_group,
+                        sensitivity,
+                        fisher.as_deref(),
+                        format,
+                        ladder,
+                        quantize_ladder::LadderConfig {
+                            planes,
+                            group,
+                            grid,
+                            // Opt-in here: two legacy containers cannot record rotation.
+                            // The existing quantizer refuses those combinations.
+                            rotate,
+                        },
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    })();
+    let evidence_result = evidence.finish(command_name, command_result.is_ok());
+    match (command_result, evidence_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(command_error), Ok(())) => Err(command_error),
+        (Ok(()), Err(evidence_error)) => Err(evidence_error),
+        (Err(command_error), Err(evidence_error)) => Err(anyhow::anyhow!(
+            "command failed ({command_error}); evidence recording also failed ({evidence_error})"
+        )),
     }
-    Ok(())
 }
 
 /// `--gptq-decay`: `None` is `auto` (per tensor from the calibration size), else a value in (0, 1].
@@ -723,9 +908,180 @@ fn parse_decay(value: &str) -> Result<DecayArg, String> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum ScaleRefitArg {
+    #[default]
+    PostPass,
+    InLoop,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_convert_requires_bindings_and_refuses_every_legacy_override() {
+        let base = [
+            "tritium",
+            "convert",
+            "--plan",
+            "plan.json",
+            "--source-shard",
+            "weights.safetensors",
+            "--conversion-run-id",
+            "stable",
+            "--out",
+            "out",
+        ];
+        let cli = Cli::try_parse_from(base).expect("typed convert");
+        assert!(
+            matches!(cli.command, Command::Convert { model: None, plan, .. } if plan.enabled())
+        );
+        for extra in [
+            vec!["--model", "model"],
+            vec!["--calib", "corpus"],
+            vec!["--calib-tokens", "4096"],
+            vec!["--fold-alpha", "0.75"],
+            vec!["--no-rotation"],
+            vec!["--activation-aware"],
+            vec!["--gptq-decay", "auto"],
+            vec!["--gptq-scale-refit", "post-pass"],
+            vec!["--gptq-decay-ramp"],
+            vec!["--dense-container"],
+            vec!["--planes", "4"],
+            vec!["--group", "256"],
+            vec!["--grid", "16"],
+            vec!["--calibrated-plan", "cal.json"],
+            vec!["--calibration-cache", "weight=cache.trit"],
+        ] {
+            assert!(
+                Cli::try_parse_from(base.into_iter().chain(extra.iter().copied())).is_err(),
+                "typed plan accepted forbidden legacy arguments: {extra:?}"
+            );
+        }
+        for missing in ["--source-shard", "--conversion-run-id"] {
+            let mut args = base.to_vec();
+            let i = args.iter().position(|a| *a == missing).unwrap();
+            args.drain(i..i + 2);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        for extra in [
+            vec!["--asset", "config.json=config.json"],
+            vec!["--max-plan-bytes", "10"],
+            vec!["--input-gram", "weight=gram.bin"],
+        ] {
+            assert!(
+                Cli::try_parse_from(
+                    ["tritium", "convert", "--model", "model", "--out", "out"]
+                        .into_iter()
+                        .chain(extra)
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn typed_quantize_reuses_plan_contract_and_rejects_legacy_overrides() {
+        let base = [
+            "tritium",
+            "quantize",
+            "--plan",
+            "plan.json",
+            "--source-shard",
+            "weights.safetensors",
+            "--conversion-run-id",
+            "stable",
+            "--output",
+            "out",
+        ];
+        let cli = Cli::try_parse_from(base).expect("typed quantize");
+        assert!(
+            matches!(cli.command, Command::Quantize { input: None, plan, .. } if plan.enabled())
+        );
+        for extra in [
+            vec!["--input", "weights"],
+            vec!["--model", "weights"],
+            vec!["--bpw", "2"],
+            vec!["--scale-group", "block"],
+            vec!["--sensitivity", "uniform"],
+            vec!["--fisher", "fisher"],
+            vec!["--format", "sidecar"],
+            vec!["--ladder", "geometric"],
+            vec!["--planes", "4"],
+            vec!["--group", "256"],
+            vec!["--grid", "16"],
+            vec!["--rotate"],
+            vec!["--calibrated-plan", "cal.json"],
+            vec!["--calibration-cache", "weight=cache.trit"],
+        ] {
+            assert!(
+                Cli::try_parse_from(base.into_iter().chain(extra.iter().copied())).is_err(),
+                "typed quantize accepted legacy/mixed flag: {extra:?}"
+            );
+        }
+        for missing in [
+            "--plan",
+            "--source-shard",
+            "--conversion-run-id",
+            "--output",
+        ] {
+            let mut args = base.to_vec();
+            let i = args.iter().position(|a| *a == missing).unwrap();
+            args.drain(i..i + 2);
+            assert!(Cli::try_parse_from(args).is_err(), "missing {missing}");
+        }
+        let legacy = [
+            "tritium", "quantize", "--input", "weights", "--output", "bundle",
+        ];
+        assert!(matches!(Cli::try_parse_from(legacy).unwrap().command,
+            Command::Quantize { input: Some(_), plan, .. } if !plan.enabled()));
+        for extra in [
+            vec!["--asset", "config.json=config.json"],
+            vec!["--max-plan-bytes", "10"],
+            vec!["--input-gram", "weight=gram"],
+            vec!["--calibration-cache", "weight=cache"],
+            vec!["--conversion-run-id", "stable"],
+            vec!["--source-shard", "weights"],
+            vec!["--max-evidence-bytes", "10"],
+        ] {
+            assert!(Cli::try_parse_from(legacy.into_iter().chain(extra.iter().copied())).is_err());
+        }
+    }
+
+    #[test]
+    fn convert_cli_accepts_explicit_gptq_scale_refit_mode() {
+        let cli = Cli::try_parse_from([
+            "tritium",
+            "convert",
+            "--model",
+            "model",
+            "--out",
+            "out",
+            "--activation-aware",
+            "--calib",
+            "tokens.json",
+            "--gptq-scale-refit",
+            "in-loop",
+            "--gptq-decay",
+            "0.5",
+            "--evidence",
+            "det",
+            "--run-id",
+            "convert-merge-probe",
+        ])
+        .expect("convert CLI with in-loop scale refit");
+        assert_eq!(cli.evidence, evidence::EvidenceMode::Det);
+        assert_eq!(cli.run_id.as_deref(), Some("convert-merge-probe"));
+        assert!(matches!(
+            cli.command,
+            Command::Convert {
+                gptq_scale_refit: ScaleRefitArg::InLoop,
+                gptq_decay: DecayArg(Some(decay)),
+                ..
+            } if decay.to_bits() == 0.5_f64.to_bits()
+        ));
+    }
 
     #[test]
     fn campaign_teacher_cache_cli_parses_fixed_window_inputs() {
@@ -763,6 +1119,21 @@ mod tests {
                 campaign: campaign::CampaignCommand::Run { config }
             } if config == std::path::Path::new("campaign.json")
         ));
+    }
+
+    #[test]
+    fn evidence_flags_are_global_and_deterministic_mode_accepts_run_id() {
+        let cli = Cli::try_parse_from([
+            "tritium",
+            "list-backends",
+            "--evidence",
+            "det",
+            "--run-id",
+            "stable-run",
+        ])
+        .expect("global evidence flags after the command");
+        assert_eq!(cli.evidence, evidence::EvidenceMode::Det);
+        assert_eq!(cli.run_id.as_deref(), Some("stable-run"));
     }
 
     #[test]

@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlaneCodec",
+  "description": "Compact code used for each additive ternary plane.",
+  "oneOf": [
+    {
+      "description": "Two-bit ternary packing.",
+      "type": "string",
+      "const": "D2"
+    },
+    {
+      "description": "Base-3 packing of five ternary coefficients per byte.",
+      "type": "string",
+      "const": "B3"
+    },
+    {
+      "description": "Structured sparse 3-of-4 encoding.",
+      "type": "string",
+      "const": "S34"
+    }
+  ]
+}

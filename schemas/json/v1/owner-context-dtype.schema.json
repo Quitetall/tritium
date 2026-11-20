@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OwnerContextDtype",
+  "description": "Context scalar interpretation; payload bytes are contiguous logical values.",
+  "oneOf": [
+    {
+      "description": "IEEE binary16.",
+      "type": "string",
+      "const": "F16"
+    },
+    {
+      "description": "Brain float16.",
+      "type": "string",
+      "const": "Bf16"
+    },
+    {
+      "description": "IEEE binary32.",
+      "type": "string",
+      "const": "F32"
+    },
+    {
+      "description": "IEEE binary64.",
+      "type": "string",
+      "const": "F64"
+    },
+    {
+      "description": "Signed 8-bit integer.",
+      "type": "string",
+      "const": "I8"
+    },
+    {
+      "description": "Signed 16-bit integer.",
+      "type": "string",
+      "const": "I16"
+    },
+    {
+      "description": "Signed 32-bit integer.",
+      "type": "string",
+      "const": "I32"
+    },
+    {
+      "description": "Signed 64-bit integer.",
+      "type": "string",
+      "const": "I64"
+    },
+    {
+      "description": "Unsigned 8-bit integer.",
+      "type": "string",
+      "const": "U8"
+    },
+    {
+      "description": "Boolean bytes, exactly 0/1.",
+      "type": "string",
+      "const": "Bool"
+    },
+    {
+      "description": "Complex pair of binary32 components.",
+      "type": "string",
+      "const": "C64"
+    },
+    {
+      "description": "Complex pair of binary64 components.",
+      "type": "string",
+      "const": "C128"
+    }
+  ]
+}

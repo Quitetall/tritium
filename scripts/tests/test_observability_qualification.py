@@ -49,6 +49,17 @@ class ObservabilityQualificationTests(unittest.TestCase):
         self.assertIn("compiler_absent", source)
         self.assertIn("repository_absent", source)
 
+    def test_both_entry_points_bind_the_executing_candidate(self):
+        source = (
+            ROOT
+            / "crates/tritium-py/python/tritium/torch/qualify_observability.py"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(source.count("    verify_installed_candidate("), 2)
+        self.assertEqual(source.count("executing_files=(Path(__file__),)"), 2)
+        workflow = (ROOT / ".github/workflows/wheels.yml").read_text(encoding="utf-8")
+        self.assertIn("TRITIUM_TEST_CANDIDATE_WHEEL_DIR: dist", workflow)
+        self.assertIn("test_observability_candidate_provenance.py", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()

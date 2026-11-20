@@ -95,7 +95,7 @@ fn cuda_backend(ordinal: usize) -> PyResult<Arc<tritium_cuda::CudaBackend>> {
     Ok(backend)
 }
 
-fn tensor_shape(tensor: &Dlpack, label: &str) -> PyResult<Vec<usize>> {
+pub(crate) fn tensor_shape(tensor: &Dlpack, label: &str) -> PyResult<Vec<usize>> {
     tensor
         .shape()
         .map_err(|error| {
@@ -113,7 +113,7 @@ fn tensor_shape(tensor: &Dlpack, label: &str) -> PyResult<Vec<usize>> {
         .collect()
 }
 
-fn cpu_f32<'a>(tensor: &'a Dlpack, label: &str) -> PyResult<&'a [f32]> {
+pub(crate) fn cpu_f32<'a>(tensor: &'a Dlpack, label: &str) -> PyResult<&'a [f32]> {
     tensor.cpu_data_slice::<f32>().map_err(|error| {
         PyValueError::new_err(format!(
             "{label} must be a compact CPU float32 DLPack tensor: {error}"
@@ -121,7 +121,7 @@ fn cpu_f32<'a>(tensor: &'a Dlpack, label: &str) -> PyResult<&'a [f32]> {
     })
 }
 
-fn checked_product(dimensions: &[usize], label: &str) -> PyResult<usize> {
+pub(crate) fn checked_product(dimensions: &[usize], label: &str) -> PyResult<usize> {
     dimensions.iter().try_fold(1usize, |product, &dimension| {
         product.checked_mul(dimension).ok_or_else(|| {
             PyValueError::new_err(format!(
@@ -176,7 +176,7 @@ fn projection_scale_values(scales: Option<&Dlpack>, n: usize) -> PyResult<Option
     }
 }
 
-fn export_array(
+pub(crate) fn export_array(
     py: Python<'_>,
     shape: &[usize],
     values: Vec<f32>,

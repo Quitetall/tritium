@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OwnerScoreWindowMeta",
+  "description": "Complete context/invocation metadata supplied alongside actual buffers.",
+  "type": "object",
+  "properties": {
+    "context": {
+      "description": "Sorted logical context keys.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/OwnerContextMeta"
+      }
+    },
+    "invocations": {
+      "description": "Strictly ordered invocations for this owner.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/OwnerInvocationMeta"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "context",
+    "invocations"
+  ],
+  "$defs": {
+    "OwnerContextDtype": {
+      "description": "Context scalar interpretation; payload bytes are contiguous logical values.",
+      "oneOf": [
+        {
+          "description": "IEEE binary16.",
+          "type": "string",
+          "const": "F16"
+        },
+        {
+          "description": "Brain float16.",
+          "type": "string",
+          "const": "Bf16"
+        },
+        {
+          "description": "IEEE binary32.",
+          "type": "string",
+          "const": "F32"
+        },
+        {
+          "description": "IEEE binary64.",
+          "type": "string",
+          "const": "F64"
+        },
+        {
+          "description": "Signed 8-bit integer.",
+          "type": "string",
+          "const": "I8"
+        },
+        {
+          "description": "Signed 16-bit integer.",
+          "type": "string",
+          "const": "I16"
+        },
+        {
+          "description": "Signed 32-bit integer.",
+          "type": "string",
+          "const": "I32"
+        },
+        {
+          "description": "Signed 64-bit integer.",
+          "type": "string",
+          "const": "I64"
+        },
+        {
+          "description": "Unsigned 8-bit integer.",
+          "type": "string",
+          "const": "U8"
+        },
+        {
+          "description": "Boolean bytes, exactly 0/1.",
+          "type": "string",
+          "const": "Bool"
+        },
+        {
+          "description": "Complex pair of binary32 components.",
+          "type": "string",
+          "const": "C64"
+        },
+        {
+          "description": "Complex pair of binary64 components.",
+          "type": "string",
+          "const": "C128"
+        }
+      ]
+    },
+    "OwnerContextMeta": {
+      "description": "Declared logical tensor context, not proof that a callback used it.",
+      "type": "object",
+      "properties": {
+        "conjugated": {
+          "description": "Original conjugate-view flag; stored values are resolved.",
+          "type": "boolean"
+        },
+        "dtype": {
+          "description": "Exact original scalar dtype.",
+          "$ref": "#/$defs/OwnerContextDtype"
+        },
+        "name": {
+          "description": "Unique nonempty context key.",
+          "type": "string"
+        },
+        "negated": {
+          "description": "Original negative-view flag; stored values are resolved.",
+          "type": "boolean"
+        },
+        "shape": {
+          "description": "Original logical dimensions; scalar rank zero is allowed.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "dtype",
+        "shape",
+        "conjugated",
+        "negated"
+      ]
+    },
+    "OwnerInvocationMeta": {
+      "description": "One declared actual invocation; bytes/coverage are verified separately.",
+      "type": "object",
+      "properties": {
+        "ordinal": {
+          "description": "Global operator-entry ordinal, not renumbered per owner.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "paths": {
+          "description": "Sorted unique alias paths of one actual module; root path may be empty.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "role": {
+          "description": "Actual ordinary operation.",
+          "$ref": "#/$defs/OwnerScoreRole"
+        },
+        "samples": {
+          "description": "Positive flattened invocation sample count.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ordinal",
+        "paths",
+        "role",
+        "samples"
+      ]
+    },
+    "OwnerScoreRole": {
+      "description": "Ordinary owner operation, in canonical source coordinates.",
+      "oneOf": [
+        {
+          "description": "`z = x W^T`, without omitted source uses.",
+          "type": "string",
+          "const": "Matmul"
+        },
+        {
+          "description": "Ordinary lookup, without padding/frequency/custom backward rules.",
+          "type": "string",
+          "const": "Gather"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SalienceOperationOutput",
+  "description": "Actual stored scales for one executed pair; bits are JSON-safe byte arrays.",
+  "type": "object",
+  "properties": {
+    "operation": {
+      "description": "Exact operation name in executed order.",
+      "type": "string"
+    },
+    "scale_bits": {
+      "description": "Actual finite positive f32 scale bits, in channel order.",
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "maxItems": 4,
+        "minItems": 4
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "operation",
+    "scale_bits"
+  ]
+}

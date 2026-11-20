@@ -7,7 +7,7 @@ import os
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 from torch import nn
 
@@ -15,6 +15,9 @@ from .config import TernaryConfig
 from .coverage import CoverageEntry, CoverageReport
 from .errors import TritiumError
 from .estimators import AdditiveEstimator, Estimator, create_estimator
+
+if TYPE_CHECKING:
+    from .native_calibration import NativeModulePreparation
 
 
 @dataclass(frozen=True)
@@ -263,13 +266,27 @@ def prepare(
     *,
     strict: bool = True,
     inplace: bool,
-) -> PreparedModel:
-    """Validate a complete graph, then prepare it with explicit ownership."""
+    native_options: Optional[dict] = None,
+) -> Union[PreparedModel, "NativeModulePreparation"]:
+    """Validate a complete graph, then prepare it with explicit ownership.
+
+    Explicit native_options opt a live PTQ module into actual-source observation;
+    native actions/levels then govern fitting, not legacy deployment profiles.
+    """
 
     if not isinstance(config, TernaryConfig):
         raise TypeError("prepare requires a TernaryConfig")
     if not isinstance(inplace, bool):
         raise TypeError("prepare inplace must be a bool")
+    if native_options is not None:
+        fields = {"actions", "levels", "limits", "work_dir", "asset_paths"}
+        if (not isinstance(native_options, dict)
+                or set(native_options) - {"architecture"} != fields):
+            raise ValueError("native_options require explicit actions, levels, limits, work_dir and asset_paths")
+        if config.mode != "ptq" or not isinstance(model, nn.Module):
+            raise TypeError("native preparation requires a live PTQ torch module")
+        if config.target_bpw is not None:
+            raise ValueError("native preparation requires explicit native fit/storage limits, not target_bpw")
     if config.mode == "ptq" and isinstance(model, (str, os.PathLike)):
         if inplace:
             raise TritiumError(
@@ -312,7 +329,12 @@ def prepare(
             target_disposition="selected",
         )
         target._tritium_coverage = coverage
-    return PreparedModel(model=target, config=config, coverage=coverage)
+    prepared = PreparedModel(model=target, config=config, coverage=coverage)
+    if native_options is not None:
+        from .native_calibration import prepare_native_module
+
+        return prepare_native_module(prepared, **native_options)
+    return prepared
 
 
 def prepare_qat(
@@ -345,9 +367,14 @@ def _current_qat_coverage(model: nn.Module) -> Optional[CoverageReport]:
     return _parameter_coverage(model, converted_weights)
 
 
-def inspect(model: Union[nn.Module, PreparedModel]) -> CoverageReport:
+def inspect(model: Union[nn.Module, PreparedModel, "NativeModulePreparation"]) -> CoverageReport:
     """Return the immutable coverage receipt for a prepared model."""
 
+    from .native_calibration import NativeModulePreparation
+
+    if isinstance(model, NativeModulePreparation):
+        model.verify()
+        model = model.prepared
     if isinstance(model, PreparedModel):
         if model.coverage is not None:
             return model.coverage

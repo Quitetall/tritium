@@ -30,13 +30,15 @@ function plan() {
     schemaVersion: 1,
     manifestDigest: "unused-by-low-level-runtime",
     buffers: [buffer("left", 0), buffer("right", 16), buffer("result", 32)],
-    operations: [{
-      id: "add",
-      operation: "graph.add",
-      inputs: ["left", "right"],
-      outputs: ["result"],
-      attributes: [],
-    }],
+    operations: [
+      {
+        id: "add",
+        operation: "graph.add",
+        inputs: ["left", "right"],
+        outputs: ["result"],
+        attributes: [],
+      },
+    ],
     backwardOperations: [],
     residentBytes: 48,
     batchStagingBytes: 0,
@@ -72,11 +74,16 @@ test("resident WebGPU transactions cache bindings and never map or read back", a
   assert.equal(device.maps, 0, "dispatch cannot map a GPU buffer");
   assert.equal(device.submits, 2);
   let commandReads = 0;
-  await runtime.dispatchTransactions([{
-    get commands() { commandReads += 1; return [command]; },
-    copies: [],
-    commitCopies: [],
-  }]);
+  await runtime.dispatchTransactions([
+    {
+      get commands() {
+        commandReads += 1;
+        return [command];
+      },
+      copies: [],
+      commitCopies: [],
+    },
+  ]);
   assert.equal(commandReads, 1);
   const fieldReads = new Map();
   const accessorCommand = {};
@@ -89,27 +96,43 @@ test("resident WebGPU transactions cache bindings and never map or read back", a
       },
     });
   }
-  await runtime.dispatchTransactions([{
-    commands: [accessorCommand], copies: [], commitCopies: [],
-  }]);
-  assert.deepEqual([...fieldReads.values()], Array(fieldReads.size).fill(1));
-  assert.throws(
-    () => runtime.dispatchTransactions([{
-      get commands() { throw new Error("hostile"); },
+  await runtime.dispatchTransactions([
+    {
+      commands: [accessorCommand],
       copies: [],
       commitCopies: [],
-    }]),
+    },
+  ]);
+  assert.deepEqual([...fieldReads.values()], Array(fieldReads.size).fill(1));
+  assert.throws(
+    () =>
+      runtime.dispatchTransactions([
+        {
+          get commands() {
+            throw new Error("hostile");
+          },
+          copies: [],
+          commitCopies: [],
+        },
+      ]),
     (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
   );
   assert.throws(
-    () => runtime.dispatchTransactions([{
-      commands: [{
-        ...command,
-        get operation() { throw new Error("hostile"); },
-      }],
-      copies: [],
-      commitCopies: [],
-    }]),
+    () =>
+      runtime.dispatchTransactions([
+        {
+          commands: [
+            {
+              ...command,
+              get operation() {
+                throw new Error("hostile");
+              },
+            },
+          ],
+          copies: [],
+          commitCopies: [],
+        },
+      ]),
     (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
   );
 
@@ -137,10 +160,13 @@ test("resident replacement preserves every owner when one candidate upload fails
     write(target, offset, data);
   };
   await assert.rejects(
-    runtime.replace([
-      { bufferId: "left", bytes: Uint8Array.of(13, 14, 15, 16) },
-      { bufferId: "right", bytes: Uint8Array.of(17, 18, 19, 20) },
-    ], { residentPeakBytes: 12, maxPeakBytes: 20 }),
+    runtime.replace(
+      [
+        { bufferId: "left", bytes: Uint8Array.of(13, 14, 15, 16) },
+        { bufferId: "right", bytes: Uint8Array.of(17, 18, 19, 20) },
+      ],
+      { residentPeakBytes: 12, maxPeakBytes: 20 },
+    ),
     (error) => error instanceof WebTrainingError && error.code === "adapter_failure",
   );
   assert.deepEqual(await runtime.read("left"), Uint8Array.of(1, 2, 3, 4));
@@ -157,10 +183,10 @@ test("resident replacement rejects over-budget candidates before allocation", as
   ]);
   const allocatedBefore = device.buffers.size;
   await assert.rejects(
-    runtime.replace(
-      [{ bufferId: "left", bytes: Uint8Array.of(13, 14, 15, 16) }],
-      { residentPeakBytes: 12, maxPeakBytes: 15 },
-    ),
+    runtime.replace([{ bufferId: "left", bytes: Uint8Array.of(13, 14, 15, 16) }], {
+      residentPeakBytes: 12,
+      maxPeakBytes: 15,
+    }),
     (error) => error instanceof WebTrainingError && error.code === "memory_limit",
   );
   assert.equal(device.buffers.size, allocatedBefore);
@@ -208,18 +234,17 @@ test("auxiliary resources stay resident and receive same-submission GPU copies",
   const runtime = await preparing;
   runtime.dispatch(
     [{ ...command, storageBindings: { ...command.storageBindings, 3: "scratch" } }],
-    [{
-      source: "left",
-      sourceOffset: 0,
-      destination: "scratch",
-      destinationOffset: 4,
-      byteLength: 4,
-    }],
+    [
+      {
+        source: "left",
+        sourceOffset: 0,
+        destination: "scratch",
+        destinationOffset: 4,
+        byteLength: 4,
+      },
+    ],
   );
-  assert.deepEqual(
-    await runtime.read("scratch"),
-    Uint8Array.of(9, 10, 11, 12, 1, 2, 3, 4),
-  );
+  assert.deepEqual(await runtime.read("scratch"), Uint8Array.of(9, 10, 11, 12, 1, 2, 3, 4));
   assert.equal(device.submits, 2, "copy and dispatch share one submission; read is explicit");
   runtime.dispose();
 });
@@ -238,14 +263,24 @@ test("candidate commits encode after compute in one submission", async () => {
   device.events.length = 0;
   runtime.dispatch(
     [command],
-    [{
-      source: "left", sourceOffset: 0,
-      destination: "candidate", destinationOffset: 0, byteLength: 4,
-    }],
-    [{
-      source: "candidate", sourceOffset: 0,
-      destination: "right", destinationOffset: 0, byteLength: 4,
-    }],
+    [
+      {
+        source: "left",
+        sourceOffset: 0,
+        destination: "candidate",
+        destinationOffset: 0,
+        byteLength: 4,
+      },
+    ],
+    [
+      {
+        source: "candidate",
+        sourceOffset: 0,
+        destination: "right",
+        destinationOffset: 0,
+        byteLength: 4,
+      },
+    ],
   );
   assert.deepEqual(device.events, [
     "copy:tritium:resident:left>tritium:auxiliary:candidate",
@@ -266,20 +301,19 @@ test("candidate commits reject duplicate and chained physical destinations", asy
   };
   const aliasedPlan = { ...plan(), buffers: [...plan().buffers, alias] };
   const device = new FakeDevice();
-  const runtime = await WebGpuResidentRuntimeV1.prepare(
-    device,
-    aliasedPlan,
-    [],
-    {
-      maxBytes: 8,
-      resources: [
-        { id: "candidate-a", byteLength: 4, initialBytes: null },
-        { id: "candidate-b", byteLength: 4, initialBytes: null },
-      ],
-    },
-  );
+  const runtime = await WebGpuResidentRuntimeV1.prepare(device, aliasedPlan, [], {
+    maxBytes: 8,
+    resources: [
+      { id: "candidate-a", byteLength: 4, initialBytes: null },
+      { id: "candidate-b", byteLength: 4, initialBytes: null },
+    ],
+  });
   const copy = (source, destination) => ({
-    source, sourceOffset: 0, destination, destinationOffset: 0, byteLength: 4,
+    source,
+    sourceOffset: 0,
+    destination,
+    destinationOffset: 0,
+    byteLength: 4,
   });
   for (const commits of [
     [copy("candidate-a", "right"), copy("candidate-b", "right_alias")],
@@ -307,25 +341,39 @@ test("signalled commits reject ordered dependencies and exclude concurrent mutat
   );
   const stage = Object.freeze({
     commands: Object.freeze([command]),
-    copies: Object.freeze([{
-      source: "left", sourceOffset: 0,
-      destination: "candidate", destinationOffset: 0, byteLength: 4,
-    }]),
-    commitCopies: Object.freeze([{
-      source: "candidate", sourceOffset: 0,
-      destination: "right", destinationOffset: 0, byteLength: 4,
-    }]),
+    copies: Object.freeze([
+      {
+        source: "left",
+        sourceOffset: 0,
+        destination: "candidate",
+        destinationOffset: 0,
+        byteLength: 4,
+      },
+    ]),
+    commitCopies: Object.freeze([
+      {
+        source: "candidate",
+        sourceOffset: 0,
+        destination: "right",
+        destinationOffset: 0,
+        byteLength: 4,
+      },
+    ]),
   });
   assert.throws(
-    () => runtime.dispatchTransactions([
-      stage,
-      { commands: [command], copies: [], commitCopies: [] },
-    ], [], new AbortController().signal),
+    () =>
+      runtime.dispatchTransactions(
+        [stage, { commands: [command], copies: [], commitCopies: [] }],
+        [],
+        new AbortController().signal,
+      ),
     (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
   );
 
   let releaseWork;
-  const work = new Promise((resolve) => { releaseWork = resolve; });
+  const work = new Promise((resolve) => {
+    releaseWork = resolve;
+  });
   let barriers = 0;
   device.queue.onSubmittedWorkDone = () => {
     barriers += 1;
@@ -374,9 +422,7 @@ test("auxiliary getters are captured exactly once before preparation awaits", as
     maxBytes: once("set.maxBytes", 4),
     resources: once("set.resources", [resource]),
   });
-  const runtime = await WebGpuResidentRuntimeV1.prepare(
-    new FakeDevice(), plan(), [], auxiliary,
-  );
+  const runtime = await WebGpuResidentRuntimeV1.prepare(new FakeDevice(), plan(), [], auxiliary);
   assert.deepEqual([...reads.values()], [1, 1, 1, 1, 1]);
   assert.deepEqual(await runtime.read("scratch"), Uint8Array.of(1, 2, 3, 4));
   runtime.dispose();
@@ -408,10 +454,7 @@ test("auxiliary and copy admission reject collisions, drift, and unsafe ranges",
   );
   const forgedAliasPlan = {
     ...plan(),
-    buffers: [
-      ...plan().buffers,
-      { ...buffer("forged", 48), ownerId: "scratch" },
-    ],
+    buffers: [...plan().buffers, { ...buffer("forged", 48), ownerId: "scratch" }],
   };
   await assert.rejects(
     WebGpuResidentRuntimeV1.prepare(new FakeDevice(), forgedAliasPlan, [], {
@@ -421,19 +464,32 @@ test("auxiliary and copy admission reject collisions, drift, and unsafe ranges",
     (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
   );
   const device = new FakeDevice();
-  const runtime = await WebGpuResidentRuntimeV1.prepare(
-    device,
-    plan(),
-    [],
-    {
-      maxBytes: 8,
-      resources: [{ id: "scratch", byteLength: 8, initialBytes: null }],
-    },
-  );
+  const runtime = await WebGpuResidentRuntimeV1.prepare(device, plan(), [], {
+    maxBytes: 8,
+    resources: [{ id: "scratch", byteLength: 8, initialBytes: null }],
+  });
   for (const copy of [
-    { source: "missing", sourceOffset: 0, destination: "scratch", destinationOffset: 0, byteLength: 4 },
-    { source: "left", sourceOffset: 0, destination: "scratch", destinationOffset: 6, byteLength: 4 },
-    { source: "scratch", sourceOffset: 0, destination: "scratch", destinationOffset: 4, byteLength: 4 },
+    {
+      source: "missing",
+      sourceOffset: 0,
+      destination: "scratch",
+      destinationOffset: 0,
+      byteLength: 4,
+    },
+    {
+      source: "left",
+      sourceOffset: 0,
+      destination: "scratch",
+      destinationOffset: 6,
+      byteLength: 4,
+    },
+    {
+      source: "scratch",
+      sourceOffset: 0,
+      destination: "scratch",
+      destinationOffset: 4,
+      byteLength: 4,
+    },
   ]) {
     assert.throws(
       () => runtime.dispatch([command], [copy]),
@@ -446,11 +502,7 @@ test("auxiliary and copy admission reject collisions, drift, and unsafe ranges",
 
 test("resident WebGPU admission and loss fail closed", async () => {
   await assert.rejects(
-    WebGpuResidentRuntimeV1.prepare(
-      new FakeDevice({ maxBindingsPerBindGroup: 1 }),
-      plan(),
-      [],
-    ),
+    WebGpuResidentRuntimeV1.prepare(new FakeDevice({ maxBindingsPerBindGroup: 1 }), plan(), []),
     (error) => error instanceof WebTrainingError && error.code === "capability_mismatch",
   );
   const device = new FakeDevice();
@@ -462,9 +514,7 @@ test("resident WebGPU admission and loss fail closed", async () => {
     (error) => error instanceof WebTrainingError && error.code === "device_lost",
   );
   const rejectingDevice = new FakeDevice();
-  const rejectingRuntime = await WebGpuResidentRuntimeV1.prepare(
-    rejectingDevice, plan(), [],
-  );
+  const rejectingRuntime = await WebGpuResidentRuntimeV1.prepare(rejectingDevice, plan(), []);
   rejectingDevice.queue.onSubmittedWorkDone = async () => {
     rejectingDevice.lose({ reason: "queue-rejected" });
     throw new Error("raw device loss");
@@ -499,8 +549,14 @@ test("dispatch rejects binding drift before submission", async () => {
   const device = new FakeDevice();
   const runtime = await WebGpuResidentRuntimeV1.prepare(device, plan(), []);
   assert.throws(
-    () => runtime.dispatch([{ ...command, storageBindings: { ...command.storageBindings, 9: "left" } }]),
-    (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
+    () =>
+      runtime.dispatch([
+        { ...command, storageBindings: { ...command.storageBindings, 9: "left" } },
+      ]),
+    (error) =>
+      error instanceof WebTrainingError &&
+      error.code === "invalid_schema" &&
+      error.message.includes("graph.add/forward stage 0: expected [1,2,3,4], got [1,2,3,4,9]"),
   );
   assert.equal(device.submits, 0);
   runtime.dispose();
@@ -515,26 +571,52 @@ test("GPU transfers pad byte tensors and clear reused uniform tails", async () =
     byteLength: 3,
   };
   const tinyPlan = { ...plan(), buffers: [...plan().buffers, tiny], residentBytes: 64 };
-  const runtime = await WebGpuResidentRuntimeV1.prepare(device, tinyPlan, [
-    { bufferId: "tiny", bytes: Uint8Array.of(4, 5, 6) },
-  ], {
-    maxBytes: 4,
-    resources: [{
-      id: "packed-candidate", byteLength: 4, initialBytes: Uint8Array.of(7, 8, 9, 0),
-    }],
-  });
+  const runtime = await WebGpuResidentRuntimeV1.prepare(
+    device,
+    tinyPlan,
+    [{ bufferId: "tiny", bytes: Uint8Array.of(4, 5, 6) }],
+    {
+      maxBytes: 4,
+      resources: [
+        {
+          id: "packed-candidate",
+          byteLength: 4,
+          initialBytes: Uint8Array.of(7, 8, 9, 0),
+        },
+      ],
+    },
+  );
   assert.deepEqual(await runtime.read("tiny"), Uint8Array.of(4, 5, 6));
 
-  runtime.dispatch([], [], [{
-    source: "packed-candidate", sourceOffset: 0,
-    destination: "tiny", destinationOffset: 0, byteLength: 4,
-  }]);
+  runtime.dispatch(
+    [],
+    [],
+    [
+      {
+        source: "packed-candidate",
+        sourceOffset: 0,
+        destination: "tiny",
+        destinationOffset: 0,
+        byteLength: 4,
+      },
+    ],
+  );
   assert.deepEqual(await runtime.read("tiny"), Uint8Array.of(7, 8, 9));
   assert.throws(
-    () => runtime.dispatch([], [], [{
-      source: "packed-candidate", sourceOffset: 0,
-      destination: "tiny", destinationOffset: 0, byteLength: 8,
-    }]),
+    () =>
+      runtime.dispatch(
+        [],
+        [],
+        [
+          {
+            source: "packed-candidate",
+            sourceOffset: 0,
+            destination: "tiny",
+            destinationOffset: 0,
+            byteLength: 8,
+          },
+        ],
+      ),
     (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
   );
 
@@ -567,12 +649,22 @@ test("resident writes and same-submission clears stay root-owned and ordered", a
 
 test("ordered phase submission copies a produced value only after its producer dispatch", async () => {
   const specs = [
-    ["left", [1, 1]], ["right", [1, 1]], ["produced", [1, 1]],
-    ["other", [1, 1]], ["joined", [1, 2]],
+    ["left", [1, 1]],
+    ["right", [1, 1]],
+    ["produced", [1, 1]],
+    ["other", [1, 1]],
+    ["joined", [1, 2]],
   ];
   const buffers = specs.map(([id, shape], index) => ({
-    id, role: "activation", dtype: "f32", shape, aliasOf: null, ownerId: id,
-    byteOffset: index * 16, byteLength: shape[1] * 4, backwardInitialization: "none",
+    id,
+    role: "activation",
+    dtype: "f32",
+    shape,
+    aliasOf: null,
+    ownerId: id,
+    byteOffset: index * 16,
+    byteLength: shape[1] * 4,
+    backwardInitialization: "none",
   }));
   const dependentPlan = {
     schemaId: "tritium.compiled_training_plan",
@@ -580,9 +672,18 @@ test("ordered phase submission copies a produced value only after its producer d
     manifestDigest: TRAINING_MANIFEST_DIGEST_V2,
     buffers,
     operations: [
-      { id: "produce", operation: "graph.add", inputs: ["left", "right"], outputs: ["produced"], attributes: [] },
       {
-        id: "join", operation: "graph.concat_cols", inputs: ["produced", "other"], outputs: ["joined"],
+        id: "produce",
+        operation: "graph.add",
+        inputs: ["left", "right"],
+        outputs: ["produced"],
+        attributes: [],
+      },
+      {
+        id: "join",
+        operation: "graph.concat_cols",
+        inputs: ["produced", "other"],
+        outputs: ["joined"],
         attributes: [
           { name: "rows", kind: "u64", value: 1 },
           { name: "lens", kind: "u64-list", value: [1, 1] },
@@ -598,12 +699,13 @@ test("ordered phase submission copies a produced value only after its producer d
     exportPeakBytes: 72,
     peakBytes: 72,
   };
-  const schedule = compileWebGpuResidentScheduleV1(
-    dependentPlan, { maxPeakBytes: 1 << 20 },
-  );
+  const schedule = compileWebGpuResidentScheduleV1(dependentPlan, { maxPeakBytes: 1 << 20 });
   const device = new FakeDevice();
   const runtime = await WebGpuResidentRuntimeV1.prepare(
-    device, dependentPlan, [], schedule.auxiliaryResources(),
+    device,
+    dependentPlan,
+    [],
+    schedule.auxiliaryResources(),
   );
   await runtime.dispatchTransactions([
     schedule.transaction("forward", "produce", 0),
@@ -634,10 +736,25 @@ function adapterTrainingFixture() {
         { id: "loss", dtype: "f32", shape: [], role: "result", aliasOf: null },
       ],
       operations: [
-        { id: "add", operation: "graph.add", inputs: ["x", "weight"], outputs: ["sum"], attributes: [] },
-        { id: "mse", operation: "loss.mse", inputs: ["sum", "target"], outputs: ["loss"], attributes: [] },
         {
-          id: "sgd", operation: "optimizer.sgd", inputs: ["weight", "gradient"], outputs: ["weight"],
+          id: "add",
+          operation: "graph.add",
+          inputs: ["x", "weight"],
+          outputs: ["sum"],
+          attributes: [],
+        },
+        {
+          id: "mse",
+          operation: "loss.mse",
+          inputs: ["sum", "target"],
+          outputs: ["loss"],
+          attributes: [],
+        },
+        {
+          id: "sgd",
+          operation: "optimizer.sgd",
+          inputs: ["weight", "gradient"],
+          outputs: ["weight"],
           attributes: [
             { name: "step", kind: "u64", value: 0 },
             { name: "lr", kind: "f32", value: 0.1 },
@@ -714,9 +831,13 @@ function adapterOptimizerFixture(optimizer) {
       const index = tensors.findIndex((tensor) => tensor.id === id);
       tensors[index] = { ...tensors[index], shape: [1, 1] };
     }
-    tensors.push(
-      { id: "momentum", dtype: "f32", shape: [1, 1], role: "optimizer-state", aliasOf: null },
-    );
+    tensors.push({
+      id: "momentum",
+      dtype: "f32",
+      shape: [1, 1],
+      role: "optimizer-state",
+      aliasOf: null,
+    });
     payload.momentum = new Float32Array([0]);
     Object.assign(operation, {
       id: optimizer,
@@ -768,16 +889,28 @@ function adapterSaltFixture() {
       ],
       operations: [
         {
-          id: "salt", operation: "graph.salt_ste", inputs: ["weight"], outputs: ["quant"],
+          id: "salt",
+          operation: "graph.salt_ste",
+          inputs: ["weight"],
+          outputs: ["quant"],
           attributes: [
             { name: "rows", kind: "u64", value: 1 },
             { name: "cols", kind: "u64", value: width },
             { name: "planes", kind: "u64", value: 2 },
           ],
         },
-        { id: "mse", operation: "loss.mse", inputs: ["quant", "target"], outputs: ["loss"], attributes: [] },
         {
-          id: "sgd", operation: "optimizer.sgd", inputs: ["weight", "gradient"], outputs: ["weight"],
+          id: "mse",
+          operation: "loss.mse",
+          inputs: ["quant", "target"],
+          outputs: ["loss"],
+          attributes: [],
+        },
+        {
+          id: "sgd",
+          operation: "optimizer.sgd",
+          inputs: ["weight", "gradient"],
+          outputs: ["weight"],
           attributes: [
             { name: "step", kind: "u64", value: 0 },
             { name: "lr", kind: "f32", value: 0.1 },
@@ -786,7 +919,7 @@ function adapterSaltFixture() {
       ],
     },
     payload: encodeWebTrainingPayload({
-      weight: Float32Array.from({ length: width }, (_, index) => (index % 9 - 4) / 8),
+      weight: Float32Array.from({ length: width }, (_, index) => ((index % 9) - 4) / 8),
     }),
   };
   const config = {
@@ -795,7 +928,11 @@ function adapterSaltFixture() {
     maxResidentBytes: 1 << 20,
     seed: 7,
     requiredOperations: [
-      "graph.salt_ste", "loss.mse", "optimizer.sgd", "lifecycle.export", "lifecycle.reload",
+      "graph.salt_ste",
+      "loss.mse",
+      "optimizer.sgd",
+      "lifecycle.export",
+      "lifecycle.reload",
     ],
   };
   return { model, config };
@@ -868,7 +1005,9 @@ test("resident WebGPU step cancellation after compute submission preserves commi
     return [owner, Uint8Array.from(owner.bytes)];
   });
   let releaseWork;
-  const work = new Promise((resolve) => { releaseWork = resolve; });
+  const work = new Promise((resolve) => {
+    releaseWork = resolve;
+  });
   device.queue.onSubmittedWorkDone = () => work;
   const cancellation = new AbortController();
   const submitted = device.submits;
@@ -933,7 +1072,9 @@ test("resident WebGPU compute and loss-read cancellation leave forward and backw
   );
 
   let releaseMap;
-  device.mapGate = new Promise((resolve) => { releaseMap = resolve; });
+  device.mapGate = new Promise((resolve) => {
+    releaseMap = resolve;
+  });
   const forwardCancellation = new AbortController();
   const cancelledForward = session.forward(
     { inputs: { x: new Float32Array([3]), target: new Float32Array([0]) } },
@@ -953,7 +1094,9 @@ test("resident WebGPU compute and loss-read cancellation leave forward and backw
   });
 
   let releaseWork;
-  const work = new Promise((resolve) => { releaseWork = resolve; });
+  const work = new Promise((resolve) => {
+    releaseWork = resolve;
+  });
   device.queue.onSubmittedWorkDone = () => work;
   const backwardCancellation = new AbortController();
   const cancelledBackward = session.backward(result, { signal: backwardCancellation.signal });
@@ -1046,9 +1189,9 @@ test("resident WebGPU resume honors the session ceiling before candidate allocat
     createWebGpuTrainingAdapter(new FakeDevice(), { maxResidentBytes: 1 << 20 }),
   );
   const saved = await probe.checkpoint();
-  const schedulePeak = compileWebGpuResidentScheduleV1(
-    probe.plan, { maxPeakBytes: 1 << 20 },
-  ).peakBytes();
+  const schedulePeak = compileWebGpuResidentScheduleV1(probe.plan, {
+    maxPeakBytes: 1 << 20,
+  }).peakBytes();
   await probe.dispose();
 
   const device = new FakeDevice();
@@ -1101,7 +1244,9 @@ test("resident WebGPU lifecycle matches portable WASM for every optimizer layout
 test("resident WebGPU checkpoint cancellation leaves the public session reusable", async () => {
   const device = new FakeDevice();
   let releaseMap;
-  device.mapGate = new Promise((resolve) => { releaseMap = resolve; });
+  device.mapGate = new Promise((resolve) => {
+    releaseMap = resolve;
+  });
   const { model, config } = adapterTrainingFixture();
   const session = await prepareTraining(
     model,
@@ -1162,7 +1307,9 @@ test("prepareTraining acquires WebGPU and preserves strict fallback policy", asy
         async requestAdapter(options) {
           assert.deepEqual(options, { powerPreference: "high-performance" });
           return {
-            async requestDevice() {
+            async requestDevice(descriptor) {
+              assert.equal(descriptor.requiredLimits.maxStorageBuffersPerShaderStage, 9);
+              assert.equal(descriptor.requiredLimits.maxUniformBuffersPerShaderStage, 1);
               requested += 1;
               return automaticDevice;
             },
@@ -1195,7 +1342,9 @@ test("prepareTraining acquires WebGPU and preserves strict fallback policy", asy
     globalThis.navigator.gpu.requestAdapter = async () => ({
       async requestDevice() {
         return {
-          destroy() { destroyedInvalidDevice = true; },
+          destroy() {
+            destroyedInvalidDevice = true;
+          },
         };
       },
     });
@@ -1207,7 +1356,9 @@ test("prepareTraining acquires WebGPU and preserves strict fallback policy", asy
 
     const undersizedDevice = new FakeDevice({ maxBufferSize: 1024 });
     globalThis.navigator.gpu.requestAdapter = async () => ({
-      async requestDevice() { return undersizedDevice; },
+      async requestDevice() {
+        return undersizedDevice;
+      },
     });
     await assert.rejects(
       prepareTraining(model, config),
@@ -1230,14 +1381,26 @@ test("resident WebGPU adapter rejects malformed factory inputs with stable error
     (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
   );
   assert.throws(
-    () => createWebGpuTrainingAdapter(new FakeDevice(), new Proxy({}, {
-      ownKeys() { throw new Error("hostile"); },
-    })),
+    () =>
+      createWebGpuTrainingAdapter(
+        new FakeDevice(),
+        new Proxy(
+          {},
+          {
+            ownKeys() {
+              throw new Error("hostile");
+            },
+          },
+        ),
+      ),
     (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
   );
   let reads = 0;
   const adapter = createWebGpuTrainingAdapter(new FakeDevice(), {
-    get maxResidentBytes() { reads += 1; return 4096; },
+    get maxResidentBytes() {
+      reads += 1;
+      return 4096;
+    },
   });
   assert.equal(reads, 1);
   assert.equal(adapter.capabilities.maxResidentBytes, 4096);
@@ -1259,8 +1422,15 @@ test("resident int8 AdamW binds each auto-layout entry point exactly", async () 
   let byteOffset = 0;
   const buffers = specs.map(([id, dtype, shape, byteLength]) => {
     const result = {
-      id, role: "activation", dtype, shape, aliasOf: null, ownerId: id,
-      byteOffset, byteLength, backwardInitialization: "none",
+      id,
+      role: "activation",
+      dtype,
+      shape,
+      aliasOf: null,
+      ownerId: id,
+      byteOffset,
+      byteLength,
+      backwardInitialization: "none",
     };
     byteOffset += 16;
     return result;
@@ -1270,20 +1440,22 @@ test("resident int8 AdamW binds each auto-layout entry point exactly", async () 
     schemaVersion: 1,
     manifestDigest: TRAINING_MANIFEST_DIGEST_V2,
     buffers,
-    operations: [{
-      id: "int8-step",
-      operation: "optimizer.int8_adamw",
-      inputs: specs.map(([id]) => id),
-      outputs: ["parameter", "moment1_q8", "moment2_q8", "moment1_scale", "moment2_scale"],
-      attributes: [
-        { name: "step", kind: "u64", value: 0 },
-        { name: "lr", kind: "f32", value: Math.fround(0.01) },
-        { name: "beta1", kind: "f32", value: Math.fround(0.9) },
-        { name: "beta2", kind: "f32", value: Math.fround(0.95) },
-        { name: "eps", kind: "f32", value: Math.fround(1e-8) },
-        { name: "weight_decay", kind: "f32", value: Math.fround(0.01) },
-      ],
-    }],
+    operations: [
+      {
+        id: "int8-step",
+        operation: "optimizer.int8_adamw",
+        inputs: specs.map(([id]) => id),
+        outputs: ["parameter", "moment1_q8", "moment2_q8", "moment1_scale", "moment2_scale"],
+        attributes: [
+          { name: "step", kind: "u64", value: 0 },
+          { name: "lr", kind: "f32", value: Math.fround(0.01) },
+          { name: "beta1", kind: "f32", value: Math.fround(0.9) },
+          { name: "beta2", kind: "f32", value: Math.fround(0.95) },
+          { name: "eps", kind: "f32", value: Math.fround(1e-8) },
+          { name: "weight_decay", kind: "f32", value: Math.fround(0.01) },
+        ],
+      },
+    ],
     backwardOperations: [],
     residentBytes: byteOffset,
     batchStagingBytes: 0,
@@ -1293,9 +1465,7 @@ test("resident int8 AdamW binds each auto-layout entry point exactly", async () 
     exportPeakBytes: byteOffset,
     peakBytes: byteOffset,
   };
-  const schedule = compileWebGpuResidentScheduleV1(
-    int8Plan, { maxPeakBytes: 1 << 20 },
-  );
+  const schedule = compileWebGpuResidentScheduleV1(int8Plan, { maxPeakBytes: 1 << 20 });
   const device = new FakeDevice();
   const runtime = await WebGpuResidentRuntimeV1.prepare(
     device,
@@ -1320,15 +1490,19 @@ test("bind-group cache keys cannot collide through tensor IDs", async () => {
     residentBytes: ids.length * 16,
   };
   const runtime = await WebGpuResidentRuntimeV1.prepare(device, collisionPlan, []);
-  runtime.dispatch([{
-    ...command,
-    storageBindings: { 1: ids[0], 2: ids[1], 3: "extra", 4: "result" },
-  }]);
+  runtime.dispatch([
+    {
+      ...command,
+      storageBindings: { 1: ids[0], 2: ids[1], 3: "extra", 4: "result" },
+    },
+  ]);
   const first = device.bindGroups;
-  runtime.dispatch([{
-    ...command,
-    storageBindings: { 1: ids[2], 2: ids[3], 3: "extra", 4: "result" },
-  }]);
+  runtime.dispatch([
+    {
+      ...command,
+      storageBindings: { 1: ids[2], 2: ids[3], 3: "extra", 4: "result" },
+    },
+  ]);
   assert.equal(device.bindGroups, first + 1);
   runtime.dispose();
 });
@@ -1351,13 +1525,19 @@ test("malformed and partially reachable plans fail before GPU work", async () =>
     null,
     { ...plan(), buffers: [{ ...buffer("bad", 0), shape: null }] },
     { ...plan(), operations: [null] },
-    { ...plan(), operations: [...plan().operations, {
-      id: "unknown",
-      operation: "graph.not_real",
-      inputs: [],
-      outputs: ["result"],
-      attributes: [],
-    }] },
+    {
+      ...plan(),
+      operations: [
+        ...plan().operations,
+        {
+          id: "unknown",
+          operation: "graph.not_real",
+          inputs: [],
+          outputs: ["result"],
+          attributes: [],
+        },
+      ],
+    },
   ]) {
     const device = new FakeDevice();
     await assert.rejects(

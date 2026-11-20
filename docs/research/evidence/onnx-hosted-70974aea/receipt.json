@@ -1,0 +1,55 @@
+{
+  "coverage": {
+    "preserved_parameters": 61,
+    "selected_parameters": 211,
+    "total_numel": 134515008
+  },
+  "device": "cpu",
+  "distribution_version": "1.1.0rc2",
+  "elapsed_seconds_excluding_download": 98.794800962,
+  "generated_text": "Ternary models make efficient inference interpre interpre interpre interpre interpre place interpre interpre",
+  "generated_token_ids": [
+    68,
+    869,
+    529,
+    2859,
+    919,
+    3758,
+    23630,
+    3418,
+    3418,
+    3418,
+    3418,
+    3418,
+    1379,
+    3418,
+    3418
+  ],
+  "max_seconds": 300.0,
+  "model_id": "HuggingFaceTB/SmolLM2-135M-Instruct",
+  "native_checkpoint_digest": "sha256:0f510ee6f0541e691af0a9e39419ff2b4856775e4cc6a436a789f13f3f1780bb",
+  "onnx_artifact_id": "sha256:3d64c258fe8708409d7a2091d8001edf8072d7ef8a0ebfd0061334539fec8490",
+  "onnx_graph_optimization_level": "ORT_DISABLE_ALL",
+  "onnx_parity_atol": 0.0001,
+  "onnx_parity_rtol": 0.0001,
+  "onnx_replay_max_abs_error": 8.738040924072266e-05,
+  "onnx_replay_max_tolerance_ratio": 0.6461082696914673,
+  "passed": true,
+  "ptq_artifact_id": "sha256:e8558ba5bf7a3291e13061a0cac5e5a771c805a08c22657f9b42aad705fa83cb",
+  "qat_loss": 15.129698753356934,
+  "qat_optimizer_state_entries": 272,
+  "schema": "tritium.smollm2-five-minute.v2",
+  "source_revision": "12fd25f77366fa6b3b4b768ec3050bf629380bac",
+  "storage": {
+    "compact_checkpoint_bytes": 30824451,
+    "selected_dense_bytes": 537919488,
+    "selected_dense_to_checkpoint_ratio": 17.45106467589642
+  },
+  "trits": {
+    "negative": 33626197,
+    "planes": 211,
+    "positive": 33508381,
+    "zero": 67345294,
+    "zero_rate": 0.5007834480984634
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TensorExecution",
+  "description": "How a backend executes one semantic tensor combination (ADR 0044 D8/D9).",
+  "oneOf": [
+    {
+      "description": "Executes additive coefficients directly, or an originally dense tensor.\nThis does not assert SIMD, accelerator speed, or empirical qualification.",
+      "type": "string",
+      "const": "Native"
+    },
+    {
+      "description": "Materializes an additive tensor as dense weights for plain GEMM.\nRequires explicit evidence and memory admission before production use.",
+      "type": "string",
+      "const": "Emulated"
+    }
+  ]
+}

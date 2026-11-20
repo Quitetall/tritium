@@ -2,10 +2,7 @@ import {
   canonicalTrainingManifestJson,
   parseTrainingManifest,
 } from "../../../bindings/typescript/src/training_manifest.ts";
-import {
-  TRAINING_MANIFEST_DIGEST_V2,
-  TRAINING_VECTOR_DIGEST_V2,
-} from "./identity.ts";
+import { TRAINING_MANIFEST_DIGEST_V2, TRAINING_VECTOR_DIGEST_V2 } from "./identity.ts";
 import {
   compilePortableCheckpointRequest,
   compilePortableResumeRequest,
@@ -20,10 +17,7 @@ import type {
   PortableMuonLeafV1,
   PortableSgdLeafV1,
 } from "./lifecycle-types.js";
-import {
-  decodeWebTrainingPayload,
-  WebTrainingPayloadError,
-} from "./payload.ts";
+import { decodeWebTrainingPayload, WebTrainingPayloadError } from "./payload.ts";
 import {
   admittedCompiledBufferMap,
   compilePortableBackwardOperationRequest,
@@ -56,13 +50,9 @@ import type {
   WebTrainingModelV1,
   WebTrainingReceiptV1,
 } from "./session.ts";
-import {
-  WebTrainingError,
-} from "./session.ts";
+import { WebTrainingError } from "./session.ts";
 import type { WebTrainingErrorCode } from "./session.ts";
-import {
-  preparePortableWasmExecutor,
-} from "./wasm.ts";
+import { preparePortableWasmExecutor } from "./wasm.ts";
 import type { PreparedPortableWasmExecutor } from "./wasm.ts";
 
 const PHYSICAL_DEVICE = "wasm32:browser";
@@ -74,10 +64,7 @@ function adapterFail(code: WebTrainingErrorCode, message: string): never {
 
 function normalizeCompilerError(error: unknown): never {
   if (error instanceof WebTrainingError) throw error;
-  if (
-    error instanceof PortableSchedulePlanError ||
-    error instanceof PortableLifecyclePlanError
-  ) {
+  if (error instanceof PortableSchedulePlanError || error instanceof PortableLifecyclePlanError) {
     adapterFail(error.code === "capacity" ? "memory_limit" : "invalid_schema", error.message);
   }
   throw error;
@@ -92,11 +79,12 @@ function compileChecked<T>(compile: () => T): T {
 }
 
 function probeRequest(): PortableTrainingRequestV1 {
-  const scalar = (name: string): PortableBufferV1 => Object.freeze({
-    name,
-    shape: Object.freeze([]),
-    data: Object.freeze({ dtype: "f32", bits: Object.freeze([0]) }),
-  });
+  const scalar = (name: string): PortableBufferV1 =>
+    Object.freeze({
+      name,
+      shape: Object.freeze([]),
+      data: Object.freeze({ dtype: "f32", bits: Object.freeze([0]) }),
+    });
   return Object.freeze({
     schemaId: "tritium.portable_training_request",
     schemaVersion: 1,
@@ -159,9 +147,7 @@ function rawF32Bits(tensor: PortableScheduleTensorV1, name: string): readonly nu
 }
 
 function optimizerKind(operation: string): PortableCheckpointOptimizerV1 {
-  const kind = operation.startsWith("optimizer.")
-    ? operation.slice("optimizer.".length)
-    : "";
+  const kind = operation.startsWith("optimizer.") ? operation.slice("optimizer.".length) : "";
   if (
     kind === "sgd" ||
     kind === "adamw" ||
@@ -175,11 +161,7 @@ function optimizerKind(operation: string): PortableCheckpointOptimizerV1 {
 }
 
 function decodeStepOutput(output: PortableBufferV1 | undefined): number {
-  if (
-    output?.name !== "step" ||
-    output.data.dtype !== "bytes" ||
-    output.data.values.length !== 8
-  ) {
+  if (output?.name !== "step" || output.data.dtype !== "bytes" || output.data.values.length !== 8) {
     adapterFail("invalid_receipt", "portable WASM resume returned invalid step output");
   }
   let step = 0n;
@@ -219,10 +201,7 @@ export function validatePortableWasmPlan(plan: CompiledTrainingPlanV1): void {
       if (!operation.operation.startsWith("optimizer.")) continue;
       const current = optimizerKind(operation.operation);
       if (kind !== null && current !== kind) {
-        adapterFail(
-          "capability_mismatch",
-          "portable WASM sessions require one optimizer kind",
-        );
+        adapterFail("capability_mismatch", "portable WASM sessions require one optimizer kind");
       }
       kind = current;
       const parameter = buffers.get(operation.inputs[0]!);
@@ -249,10 +228,8 @@ class PortableWasmTrainingAdapter implements WebTrainingAdapterV1 {
 
   constructor(executor: PreparedPortableWasmExecutor) {
     this.#executor = executor;
-    const supportedOperations = parseTrainingManifest(
-      canonicalTrainingManifestJson(),
-    ).operations
-      .filter((operation) => operation.category !== "lifecycle")
+    const supportedOperations = parseTrainingManifest(canonicalTrainingManifestJson())
+      .operations.filter((operation) => operation.category !== "lifecycle")
       .map((operation) => operation.id);
     supportedOperations.push(
       "lifecycle.checkpoint",
@@ -323,14 +300,9 @@ class PortableWasmTrainingAdapter implements WebTrainingAdapterV1 {
     outputBufferIds: readonly string[],
   ): Promise<readonly PendingTensorWrite[]> {
     const { store } = this.#ready();
-    const response = requireSuccess(
-      await this.#executor.execute(request),
-    );
+    const response = requireSuccess(await this.#executor.execute(request));
     if (response.outputs.length !== outputBufferIds.length) {
-      adapterFail(
-        "invalid_receipt",
-        "portable WASM output count differs from compiled schedule",
-      );
+      adapterFail("invalid_receipt", "portable WASM output count differs from compiled schedule");
     }
     return response.outputs.map((output, index) => {
       const buffer = this.#buffers.get(outputBufferIds[index]!);
@@ -339,7 +311,11 @@ class PortableWasmTrainingAdapter implements WebTrainingAdapterV1 {
       }
       const target = store[buffer.ownerId];
       const candidate = tensorFromOutput(output);
-      if (target === undefined || !sameTensorType(target, candidate) || target.length !== candidate.length) {
+      if (
+        target === undefined ||
+        !sameTensorType(target, candidate) ||
+        target.length !== candidate.length
+      ) {
         adapterFail(
           "invalid_receipt",
           `portable WASM output ${buffer.id} differs from prepared buffer`,
@@ -365,7 +341,11 @@ class PortableWasmTrainingAdapter implements WebTrainingAdapterV1 {
     for (const [id, value] of Object.entries(batch.inputs)) {
       const buffer = this.#buffers.get(id);
       const target = buffer === undefined ? undefined : store[buffer.ownerId];
-      if (target === undefined || !sameTensorType(target, value) || target.length !== value.length) {
+      if (
+        target === undefined ||
+        !sameTensorType(target, value) ||
+        target.length !== value.length
+      ) {
         adapterFail("invalid_schema", `batch tensor ${id} differs from prepared buffer`);
       }
       target.set(value as never);
@@ -377,14 +357,14 @@ class PortableWasmTrainingAdapter implements WebTrainingAdapterV1 {
       );
       await this.#dispatch(dispatch.request, dispatch.outputBufferIds);
     }
-    const lossOperation = [...plan.operations].reverse().find((operation) => operation.operation.startsWith("loss."));
-    const lossBuffer = lossOperation === undefined ? undefined : this.#buffers.get(lossOperation.outputs[0]!);
+    const lossOperation = [...plan.operations]
+      .reverse()
+      .find((operation) => operation.operation.startsWith("loss."));
+    const lossBuffer =
+      lossOperation === undefined ? undefined : this.#buffers.get(lossOperation.outputs[0]!);
     const lossTensor = lossBuffer === undefined ? undefined : store[lossBuffer.ownerId];
     if (!(lossTensor instanceof Float32Array) || lossTensor.length !== 1) {
-      adapterFail(
-        "invalid_receipt",
-        "compiled schedule did not produce one scalar f32 loss",
-      );
+      adapterFail("invalid_receipt", "compiled schedule did not produce one scalar f32 loss");
     }
     return Object.freeze({
       loss: lossTensor[0]!,
@@ -410,12 +390,7 @@ class PortableWasmTrainingAdapter implements WebTrainingAdapterV1 {
       );
       await this.#dispatch(dispatch.request, dispatch.outputBufferIds);
     }
-    return webReceipt(
-      this.capabilities,
-      "session.backward",
-      this.#completedSteps,
-      plan.peakBytes,
-    );
+    return webReceipt(this.capabilities, "session.backward", this.#completedSteps, plan.peakBytes);
   }
 
   async step(): Promise<WebTrainingReceiptV1> {
@@ -440,12 +415,7 @@ class PortableWasmTrainingAdapter implements WebTrainingAdapterV1 {
     }
     this.#commit(writes);
     this.#completedSteps += 1;
-    return webReceipt(
-      this.capabilities,
-      "session.step",
-      this.#completedSteps,
-      plan.peakBytes,
-    );
+    return webReceipt(this.capabilities, "session.step", this.#completedSteps, plan.peakBytes);
   }
 
   async checkpoint(): Promise<WebBinaryResultV1> {
@@ -485,16 +455,11 @@ class PortableWasmTrainingAdapter implements WebTrainingAdapterV1 {
     }
     const optimizer = optimizerKind(operations[0]!.operation);
     if (operations.some((operation) => optimizerKind(operation.operation) !== optimizer)) {
-      adapterFail(
-        "capability_mismatch",
-        "portable WASM sessions require one optimizer kind",
-      );
+      adapterFail("capability_mismatch", "portable WASM sessions require one optimizer kind");
     }
     const parameterBits = (operation: CompiledTrainingOperationV1): readonly number[] => {
       const parameterBuffer = this.#buffers.get(operation.inputs[0]!);
-      const parameter = parameterBuffer === undefined
-        ? undefined
-        : store[parameterBuffer.ownerId];
+      const parameter = parameterBuffer === undefined ? undefined : store[parameterBuffer.ownerId];
       return rawF32Bits(parameter!, operation.inputs[0]!);
     };
     let state: PortableCheckpointStateV1;
@@ -590,10 +555,7 @@ class PortableWasmTrainingAdapter implements WebTrainingAdapterV1 {
         }
         const candidate = tensorFromOutput(output);
         if (!sameTensorType(target, candidate) || target.length !== candidate.length) {
-          adapterFail(
-            "invalid_receipt",
-            `portable WASM resume changed ${targetId} layout`,
-          );
+          adapterFail("invalid_receipt", `portable WASM resume changed ${targetId} layout`);
         }
         writes.push({ target, candidate });
         outputIndex += 1;
@@ -604,12 +566,7 @@ class PortableWasmTrainingAdapter implements WebTrainingAdapterV1 {
     }
     this.#commit(writes);
     this.#completedSteps = completedSteps;
-    return webReceipt(
-      this.capabilities,
-      "session.resume",
-      completedSteps,
-      plan.peakBytes,
-    );
+    return webReceipt(this.capabilities, "session.resume", completedSteps, plan.peakBytes);
   }
 
   async export(): Promise<WebBinaryResultV1> {
@@ -620,10 +577,7 @@ class PortableWasmTrainingAdapter implements WebTrainingAdapterV1 {
       artifact = encodeStateDerivedSaltV2(targets, store);
     } catch (error) {
       if (error instanceof SaltExportError) {
-        adapterFail(
-          error.code === "capacity" ? "memory_limit" : error.code,
-          error.message,
-        );
+        adapterFail(error.code === "capacity" ? "memory_limit" : error.code, error.message);
       }
       throw error;
     }
@@ -680,10 +634,7 @@ export async function createPortableWasmTrainingAdapter(
   const executor = await preparePortableWasmExecutor(source);
   const probe = requireSuccess(await executor.execute(probeRequest()));
   if (probe.receipt.backendBuild !== executor.buildId) {
-    adapterFail(
-      "invalid_receipt",
-      "portable WASM probe returned different build identity",
-    );
+    adapterFail("invalid_receipt", "portable WASM probe returned different build identity");
   }
   return new PortableWasmTrainingAdapter(executor);
 }

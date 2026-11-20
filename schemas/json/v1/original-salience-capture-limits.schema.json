@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OriginalSalienceCaptureLimits",
+  "description": "Logical input/master/moment caps, not parser, tape, filesystem or full RSS admission.",
+  "type": "object",
+  "properties": {
+    "max_asset_bytes": {
+      "description": "Complete raw asset payload cap for actual source observation.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_config_bytes": {
+      "description": "Config bytes before parsing.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_dense_bytes": {
+      "description": "Aggregate retained widened f32 master bytes.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_moment_bytes": {
+      "description": "Aggregate retained raw f64 moment-vector bytes.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_source_bytes": {
+      "description": "Complete raw tensor payload cap for actual source observation.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_text_bytes": {
+      "description": "Aggregate exact UTF-8 text bytes; zero for token-ID input.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_tokenizer_config_bytes": {
+      "description": "Actual tokenizer_config.json bytes; zero for token-ID input.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_total_tokens": {
+      "description": "Aggregate executed tokens/rows, without shared-consumer multiplication.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_window_tokens": {
+      "description": "Every token in one context, including its final token.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "max_windows": {
+      "description": "Complete number of ordered contexts.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "max_source_bytes",
+    "max_asset_bytes",
+    "max_config_bytes",
+    "max_dense_bytes",
+    "max_window_tokens",
+    "max_windows",
+    "max_total_tokens",
+    "max_moment_bytes",
+    "max_text_bytes",
+    "max_tokenizer_config_bytes"
+  ]
+}

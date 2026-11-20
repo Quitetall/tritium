@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlaneCounts",
+  "description": "Actual plane allocation, including future pruned per-tile payloads.",
+  "oneOf": [
+    {
+      "description": "All tiles have this nonzero plane count, equal to layout maximum.",
+      "type": "object",
+      "properties": {
+        "Uniform": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Uniform"
+      ]
+    },
+    {
+      "description": "Row-major counts for every 256-coefficient tile; zero prunes a tile.",
+      "type": "object",
+      "properties": {
+        "PerTile": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "PerTile"
+      ]
+    }
+  ]
+}

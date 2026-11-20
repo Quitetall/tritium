@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LevelFit",
+  "description": "Recorded level provenance; external verification still governs claims.",
+  "oneOf": [
+    {
+      "description": "Fitted directly from source weights; a nonempty evidence list is required.",
+      "type": "object",
+      "properties": {
+        "Direct": {
+          "type": "object",
+          "properties": {
+            "evidence": {
+              "description": "Ancestry references, not proof that the referenced logs are available/admitted.",
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/EvidenceReference"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "evidence"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "Direct"
+      ]
+    },
+    {
+      "description": "Imported exact prefix of another level in this manifest.",
+      "type": "object",
+      "properties": {
+        "ImportedPrefixOf": {
+          "type": "object",
+          "properties": {
+            "level": {
+              "description": "Named parent level; cycles, self-links and absent parents are rejected.",
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "level"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ImportedPrefixOf"
+      ]
+    },
+    {
+      "description": "Imported weights without a direct-fit or exact-prefix claim.",
+      "type": "string",
+      "const": "Imported"
+    }
+  ],
+  "$defs": {
+    "EvidenceReference": {
+      "description": "Evidence ancestry reference, not a self-approved quality/release verdict.",
+      "type": "object",
+      "properties": {
+        "root": {
+          "description": "BLAKE3 evidence root, not a blob id or package digest.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0
+          },
+          "maxItems": 32,
+          "minItems": 32
+        },
+        "run": {
+          "description": "Run identity of the evidence producer.",
+          "type": "string"
+        },
+        "span": {
+          "description": "Evidence span within that run.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "run",
+        "span",
+        "root"
+      ]
+    }
+  }
+}

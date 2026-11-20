@@ -1,0 +1,26 @@
+[package]
+name = "tritium-chat-renderer-guest"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+publish = false
+
+# A separate locked build: normal consumers use the packaged, fixed Wasm bytes.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+minijinja = { version = "=3.0.0", default-features = false, features = ["builtins", "serde", "macros", "multi_template", "adjacent_loop_items", "fuel", "loop_controls", "preserve_order"] }
+minijinja-contrib = { version = "=3.0.0", default-features = false, features = ["pycompat"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
