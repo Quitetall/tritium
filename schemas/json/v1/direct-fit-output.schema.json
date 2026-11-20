@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DirectFitOutput",
+  "description": "One independently fitted output's actual logical identity.",
+  "type": "object",
+  "properties": {
+    "content": {
+      "description": "Existing candidate additive semantic digest, not stored codec bytes.",
+      "$ref": "#/$defs/SemanticTensorDigest"
+    },
+    "level": {
+      "description": "Level label from the executed plan.",
+      "type": "string"
+    },
+    "planes": {
+      "description": "Actual uniform plane count of the fitted tensor.",
+      "type": "integer",
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "level",
+    "planes",
+    "content"
+  ],
+  "$defs": {
+    "SemanticTensorDigest": {
+      "description": "Identity for a tensor's semantic values independent of its container.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    }
+  }
+}

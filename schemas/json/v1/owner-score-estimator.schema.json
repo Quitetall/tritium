@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OwnerScoreEstimator",
+  "description": "Estimator unit; no Fisher/GGN interpretation is inferred from scalar adjoints.",
+  "oneOf": [
+    {
+      "description": "One declared scalar objective's complete owner-row gradient.",
+      "type": "string",
+      "const": "ScalarWindowGradient"
+    }
+  ]
+}

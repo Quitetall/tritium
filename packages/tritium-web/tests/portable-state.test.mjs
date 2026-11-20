@@ -2,10 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-import {
-  PortableWasmLifecycleError,
-  PortableWasmLifecycleState,
-} from "../dist/index.js";
+import { PortableWasmLifecycleError, PortableWasmLifecycleState } from "../dist/index.js";
 
 const initial = {
   optimizer: "adamw",
@@ -20,9 +17,7 @@ const initial = {
 };
 
 async function guestResponse() {
-  const bytes = await readFile(
-    new URL("../dist/tritium_wasm_bg.wasm", import.meta.url),
-  );
+  const bytes = await readFile(new URL("../dist/tritium_wasm_bg.wasm", import.meta.url));
   return new Response(bytes);
 }
 
@@ -68,17 +63,18 @@ test("portable lifecycle state owns and atomically resumes optimizer planes", as
   });
 
   lifecycle.dispose();
-  assert.throws(() => lifecycle.state, (error) => {
-    assert.ok(error instanceof PortableWasmLifecycleError);
-    assert.equal(error.code, "disposed");
-    return true;
-  });
+  assert.throws(
+    () => lifecycle.state,
+    (error) => {
+      assert.ok(error instanceof PortableWasmLifecycleError);
+      assert.equal(error.code, "disposed");
+      return true;
+    },
+  );
 });
 
 test("portable lifecycle create snapshots before awaiting the guest", async () => {
-  const bytes = await readFile(
-    new URL("../dist/tritium_wasm_bg.wasm", import.meta.url),
-  );
+  const bytes = await readFile(new URL("../dist/tritium_wasm_bg.wasm", import.meta.url));
   let release;
   const delayed = new Response(bytes);
   delayed.arrayBuffer = () =>
@@ -133,10 +129,7 @@ test("portable lifecycle export is admitted by strict reload before release", as
     physicalDevice: "node:owned-export",
   });
   const vectors = JSON.parse(
-    await readFile(
-      new URL("../../../spec/training/v2/vectors/v2.json", import.meta.url),
-      "utf8",
-    ),
+    await readFile(new URL("../../../spec/training/v2/vectors/v2.json", import.meta.url), "utf8"),
   );
   const exportCase = vectors.cases.find(
     (candidate) => candidate.case_id === "lifecycle.export.salt_v2_package",

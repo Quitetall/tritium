@@ -26,12 +26,15 @@
 pub mod dto;
 pub mod generator;
 mod qwen_generator;
+#[cfg(all(test, feature = "cuda"))]
+mod test_support;
 pub mod tokenizer_passthrough;
 
 #[cfg(feature = "serve")]
 mod admission;
 #[cfg(feature = "cuda")]
 mod batch;
+mod portable_generator;
 #[cfg(feature = "serve")]
 mod router;
 #[cfg(feature = "serve")]
@@ -42,9 +45,11 @@ mod startup;
 mod worker;
 
 pub use generator::{
-    FinishReason, GenError, GenRequest, Generator, MockGenerator, RunnerGenerator, Sampling, Step,
+    CancellationCapabilitiesV1, CancellationCheckpoint, FinishReason, GenError, GenRequest,
+    Generator, MockGenerator, RunnerResourceAdmission, RunnerRuntimeInfo, Sampling, Step,
     TreeOpError,
 };
+pub use portable_generator::RunnerGenerator;
 pub use qwen_generator::QwenGenerator;
 pub use tokenizer_passthrough::IdPassthroughTokenizer;
 

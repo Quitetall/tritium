@@ -17,3 +17,4 @@
 - [Benchmarks](./benchmarks.md)
 - [Conformance](./conformance.md)
 - [Contributing](./contributing.md)
+- [Research records](./research-records.md)

@@ -1,0 +1,292 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CalibrationFactors",
+  "description": "Actual collector output view, not a registered receipt or release verdict.",
+  "type": "object",
+  "properties": {
+    "inputs": {
+      "description": "Original-input group order, with each actual width recorded.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/CalibrationFactor"
+      }
+    },
+    "output": {
+      "description": "Actual output factor, absent for input-only statistics.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CalibrationFactor"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "plan": {
+      "description": "Request actually used by this collector.",
+      "$ref": "#/$defs/CalibrationPlan"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "plan",
+    "inputs"
+  ],
+  "$defs": {
+    "CalibrationConsumer": {
+      "description": "Consumer whose original-source values are being calibrated.",
+      "oneOf": [
+        {
+          "description": "Raw original-input activations of a linear projection.",
+          "type": "string",
+          "const": "Matmul"
+        },
+        {
+          "description": "Gather with the explicitly declared hidden-space identity approximation.\nRequires indexed output factors; does not materialize vocabulary one-hots.",
+          "type": "string",
+          "const": "GatherIdentity"
+        }
+      ]
+    },
+    "CalibrationFactor": {
+      "description": "View of one actual normalized factor and its existing numerical digest domain.",
+      "type": "object",
+      "properties": {
+        "content": {
+          "description": "Existing InputGram or OutputFisher content digest, not a raw Gram digest.",
+          "$ref": "#/$defs/FitInputDigest"
+        },
+        "dimension": {
+          "description": "Gram input width or Fisher output-row count.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "samples": {
+          "description": "Observed samples, including masked samples.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "selected": {
+          "description": "Selected samples, including selected zero-weight samples.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "selection": {
+          "description": "Exact source/ordinal/weight/mask selection digest.",
+          "$ref": "#/$defs/FitInputDigest"
+        },
+        "total_weight": {
+          "description": "Sum of selected weights used to normalize the factor.",
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "dimension",
+        "samples",
+        "selected",
+        "total_weight",
+        "selection",
+        "content"
+      ]
+    },
+    "CalibrationOutput": {
+      "description": "Declared output factor encoding; no gradients are inferred from activations.",
+      "oneOf": [
+        {
+          "description": "Input Gram only, without a Fisher claim.",
+          "type": "string",
+          "const": "None"
+        },
+        {
+          "description": "One dense output-gradient vector per sample.",
+          "type": "string",
+          "const": "DenseFisher"
+        },
+        {
+          "description": "One named output-row factor per sample, zeros in other rows.",
+          "type": "string",
+          "const": "IndexedFisher"
+        }
+      ]
+    },
+    "CalibrationPartition": {
+      "description": "Input statistics partition, independent of scale groups and basis blocks.",
+      "oneOf": [
+        {
+          "description": "Full original-input covariance, including cross-group correlations.",
+          "type": "string",
+          "const": "Full"
+        },
+        {
+          "description": "Explicit block-diagonal approximation; final group may be ragged.",
+          "type": "object",
+          "properties": {
+            "Groups": {
+              "type": "object",
+              "properties": {
+                "columns": {
+                  "description": "Positive block width, not a weight-format admission constraint.",
+                  "type": "integer",
+                  "format": "uint32",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "columns"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Groups"
+          ]
+        }
+      ]
+    },
+    "CalibrationPlan": {
+      "description": "Candidate request for one tensor's original-basis calibration factors.",
+      "type": "object",
+      "properties": {
+        "consumer": {
+          "description": "Actual consuming operation and approximation.",
+          "$ref": "#/$defs/CalibrationConsumer"
+        },
+        "damping": {
+          "description": "Absolute diagonal damping after output-factor scaling.",
+          "type": "number",
+          "format": "double"
+        },
+        "max_numeric_bytes": {
+          "description": "Bound on numerical reducer/transaction/finalization workspace bytes.\nExcludes caller buffers, metadata/allocator overhead and full process RSS.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "output": {
+          "description": "Actual output encoding required for every batch.",
+          "$ref": "#/$defs/CalibrationOutput"
+        },
+        "partition": {
+          "description": "Explicit statistics partition.",
+          "$ref": "#/$defs/CalibrationPartition"
+        },
+        "sample_start": {
+          "description": "Canonical global ordinal of the first sample in this shard.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "source": {
+          "description": "Declared finalized source/cache/token binding.",
+          "$ref": "#/$defs/CalibrationSource"
+        },
+        "tensor": {
+          "description": "Exact original matrix interpretation, not fitted weights.",
+          "$ref": "#/$defs/QuantSourceTensor"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "tensor",
+        "source",
+        "partition",
+        "output",
+        "consumer",
+        "sample_start",
+        "damping",
+        "max_numeric_bytes"
+      ]
+    },
+    "CalibrationSource": {
+      "description": "Declared identities of the already finalized calibration source/cache.\nThe collector binds them; cache/source producers must independently verify them.",
+      "type": "object",
+      "properties": {
+        "cache": {
+          "description": "Finalized activation/gradient cache manifest and content identity.",
+          "$ref": "#/$defs/FitInputDigest"
+        },
+        "model": {
+          "description": "Original source content identity, not a fitted model/package identity.",
+          "$ref": "#/$defs/FitInputDigest"
+        },
+        "tokens": {
+          "description": "Ordered token stream and tokenizer provenance identity.",
+          "$ref": "#/$defs/FitInputDigest"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "model",
+        "cache",
+        "tokens"
+      ]
+    },
+    "FitInputDigest": {
+      "description": "Exact original fitting input bits under a named candidate digest domain.\nNot a stored blob, package, HF identity or calibration dataset identity.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "QuantSourceTensor": {
+      "description": "Original tensor interpretation, never an adapter-supplied content hash.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Exact logical tensor name.",
+          "type": "string"
+        },
+        "precision": {
+          "description": "Original stored float precision, before widening or fitting.",
+          "$ref": "#/$defs/ScalePrecision"
+        },
+        "shape": {
+          "description": "Positive row-major dimensions in the original source.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "shape",
+        "precision"
+      ]
+    },
+    "ScalePrecision": {
+      "description": "Precision used to store additive plane scales.",
+      "oneOf": [
+        {
+          "description": "IEEE binary16.",
+          "type": "string",
+          "const": "F16"
+        },
+        {
+          "description": "Brain floating-point 16-bit.",
+          "type": "string",
+          "const": "Bf16"
+        },
+        {
+          "description": "IEEE binary32.",
+          "type": "string",
+          "const": "F32"
+        }
+      ]
+    }
+  }
+}

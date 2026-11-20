@@ -3,7 +3,8 @@
 use std::fmt;
 
 use crate::generator::{
-    FinishReason, GenError, GenRequest, Generator, Sampling, Step, top_logprobs,
+    CancellationCapabilitiesV1, CancellationCheckpoint, GenError, GenRequest, Generator, Step,
+    stream_steps,
 };
 
 /// Generator owning one content-bound Qwen language-plus-MTP bundle.
@@ -18,18 +19,6 @@ impl QwenGenerator {
     pub const fn new(model: tritium_nn::Qwen35SaltV2LanguageMtpModel, eos: u32) -> Self {
         Self { model, eos }
     }
-
-    fn sample(logits: &[f32], sampling: &Sampling, step: u64) -> Option<u32> {
-        match *sampling {
-            Sampling::Greedy => tritium_nn::sample_greedy(logits),
-            Sampling::TopK { k, temp, seed } => {
-                tritium_nn::sample_top_k(logits, k, temp, seed.wrapping_add(step))
-            }
-            Sampling::TopP { p, temp, seed } => {
-                tritium_nn::sample_top_p(logits, p, temp, seed.wrapping_add(step))
-            }
-        }
-    }
 }
 
 impl fmt::Debug for QwenGenerator {
@@ -43,11 +32,33 @@ impl fmt::Debug for QwenGenerator {
 }
 
 impl Generator for QwenGenerator {
+    fn cancellation_capabilities(&self) -> CancellationCapabilitiesV1 {
+        CancellationCapabilitiesV1 {
+            generation: CancellationCheckpoint::CooperativeBoundaries,
+            tree_session_open: CancellationCheckpoint::NotEnabled,
+            tree_verify: CancellationCheckpoint::NotEnabled,
+            model_draft: CancellationCheckpoint::NotEnabled,
+            ..CancellationCapabilitiesV1::default()
+        }
+    }
+
     fn generate(
         &mut self,
         request: &GenRequest,
         on_step: &mut dyn FnMut(Step) -> bool,
     ) -> Result<(), GenError> {
+        self.generate_cancellable(request, on_step, &|| false)
+    }
+
+    fn generate_cancellable(
+        &mut self,
+        request: &GenRequest,
+        on_step: &mut dyn FnMut(Step) -> bool,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), GenError> {
+        if is_cancelled() {
+            return Ok(());
+        }
         let runner = self.model.runner();
         let context = self.model.config().text.max_position_embeddings as usize;
         let prompt_len = request.prompt_tokens.len();
@@ -61,36 +72,26 @@ impl Generator for QwenGenerator {
         let mut cache = runner
             .new_cache(capacity)
             .map_err(|error| GenError::Backend(error.to_string()))?;
-        let mut output = runner
-            .forward(&request.prompt_tokens, &mut cache)
-            .map_err(|error| GenError::Backend(error.to_string()))?;
-        for index in 0..max_new {
-            let logits = output.last_logits();
-            let token = Self::sample(logits, &request.sampling, index as u64)
-                .ok_or_else(|| GenError::Backend("sampler produced no token".into()))?;
-            let eos = request.stop_eos && token == self.eos;
-            let last = eos || index + 1 == max_new;
-            let keep_going = on_step(Step {
-                token,
-                finished: last,
-                finish_reason: if eos {
-                    Some(FinishReason::Stop)
-                } else if last {
-                    Some(FinishReason::Length)
-                } else {
-                    None
-                },
-                logprobs: request
-                    .logprobs
-                    .map(|count| top_logprobs(logits, token, count)),
-            });
-            if last || !keep_going {
-                break;
-            }
-            output = runner
-                .forward(&[token], &mut cache)
-                .map_err(|error| GenError::Backend(error.to_string()))?;
-        }
+        let Some(output) = runner
+            .forward_cancellable(&request.prompt_tokens, &mut cache, is_cancelled)
+            .map_err(|error| GenError::Backend(error.to_string()))?
+        else {
+            return Ok(());
+        };
+        stream_steps(
+            output.into_last_logits(),
+            request,
+            max_new,
+            self.eos,
+            on_step,
+            is_cancelled,
+            |token, _position| {
+                runner
+                    .forward_cancellable(&[token], &mut cache, is_cancelled)
+                    .map(|output| output.map(tritium_nn::Qwen35TextOutput::into_last_logits))
+                    .map_err(|error| GenError::Backend(error.to_string()))
+            },
+        )?;
         Ok(())
     }
 

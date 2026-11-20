@@ -1,0 +1,212 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LegacySaltV2BundleDescriptor",
+  "description": "Original provisional schema-v3 bundle descriptor, shared with the legacy loader.\nIdentity strings retain their legacy domains; deserialization authenticates nothing.",
+  "type": "object",
+  "properties": {
+    "admission_id": {
+      "description": "Original admission identity.",
+      "type": "string"
+    },
+    "artifact_kind": {
+      "description": "Exact legacy bundle kind.",
+      "type": "string"
+    },
+    "campaign_id": {
+      "description": "Original campaign identity.",
+      "type": "string"
+    },
+    "complete_model": {
+      "description": "Original provisional completeness status, never promoted by import.",
+      "type": "boolean"
+    },
+    "completion_id": {
+      "description": "Original completion identity.",
+      "type": "string"
+    },
+    "hf_assets": {
+      "description": "Canonical complete HF asset catalog.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/LegacySaltV2AssetDescriptor"
+      }
+    },
+    "official_payload_authenticated": {
+      "description": "Original authentication claim, not verified by migration.",
+      "type": "boolean"
+    },
+    "packing": {
+      "description": "Original SALT codec name.",
+      "type": "string"
+    },
+    "preserved": {
+      "description": "Exact preserved-container descriptor.",
+      "$ref": "#/$defs/LegacySaltV2PreservedDescriptor"
+    },
+    "profiles": {
+      "description": "Both legacy quality profile descriptors.",
+      "$ref": "#/$defs/LegacySaltV2ProfileSet"
+    },
+    "schema_version": {
+      "description": "Original schema version (only 3 is admitted).",
+      "type": "integer",
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0
+    },
+    "selection_id": {
+      "description": "Original selection identity.",
+      "type": "string"
+    },
+    "source_identity_status": {
+      "description": "Original official-identity status.",
+      "type": "string"
+    },
+    "source_model_id": {
+      "description": "Original claimed model identity, not independent authentication.",
+      "type": "string"
+    },
+    "source_revision": {
+      "description": "Original source revision.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_kind",
+    "complete_model",
+    "packing",
+    "completion_id",
+    "campaign_id",
+    "admission_id",
+    "selection_id",
+    "source_model_id",
+    "source_revision",
+    "source_identity_status",
+    "official_payload_authenticated",
+    "preserved",
+    "hf_assets",
+    "profiles"
+  ],
+  "$defs": {
+    "LegacySaltV2AssetDescriptor": {
+      "description": "Original HF asset physical identity and size.",
+      "type": "object",
+      "properties": {
+        "bytes": {
+          "description": "Exact encoded file size.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "file": {
+          "description": "Canonical asset basename.",
+          "type": "string"
+        },
+        "package_id": {
+          "description": "Original namespaced container identity.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "file",
+        "package_id",
+        "bytes"
+      ]
+    },
+    "LegacySaltV2PreservedDescriptor": {
+      "description": "Original preserved safetensors container ledger.",
+      "type": "object",
+      "properties": {
+        "file": {
+          "description": "Canonical preserved.safetensors basename.",
+          "type": "string"
+        },
+        "package_id": {
+          "description": "Original namespaced container identity.",
+          "type": "string"
+        },
+        "payload_bytes": {
+          "description": "Exact raw data section size.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "serialized_bytes": {
+          "description": "Exact encoded container size.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "tensors": {
+          "description": "Complete preserved tensor count.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "file",
+        "package_id",
+        "tensors",
+        "payload_bytes",
+        "serialized_bytes"
+      ]
+    },
+    "LegacySaltV2ProfileDescriptor": {
+      "description": "Original SALT V2 profile physical ledger.",
+      "type": "object",
+      "properties": {
+        "file": {
+          "description": "Canonical profile basename.",
+          "type": "string"
+        },
+        "package_id": {
+          "description": "Original namespaced container identity.",
+          "type": "string"
+        },
+        "resident_bytes": {
+          "description": "Original indexed resident-byte ledger, not measured process RSS.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "serialized_bytes": {
+          "description": "Exact encoded container size.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "file",
+        "package_id",
+        "serialized_bytes",
+        "resident_bytes"
+      ]
+    },
+    "LegacySaltV2ProfileSet": {
+      "description": "Both named legacy profiles; selecting one does not admit the other payload.",
+      "type": "object",
+      "properties": {
+        "compact-v1": {
+          "description": "Original compact profile.",
+          "$ref": "#/$defs/LegacySaltV2ProfileDescriptor"
+        },
+        "near-lossless-v1": {
+          "description": "Original near-lossless profile.",
+          "$ref": "#/$defs/LegacySaltV2ProfileDescriptor"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "compact-v1",
+        "near-lossless-v1"
+      ]
+    }
+  }
+}

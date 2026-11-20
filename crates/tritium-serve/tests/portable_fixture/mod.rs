@@ -1,0 +1,188 @@
+//! Shared authored miniature graphs; no official-model qualification.
+use serde_json::{Value, json};
+use tritium_core::{DType, Trit};
+use tritium_format::{AdditiveTensor, TritBlob, TritBlobKind, write_trit_package};
+use tritium_nn::{Qwen35CheckpointConfig, Qwen35TensorSchemaRole};
+use tritium_schema::*;
+
+fn config(hybrid: bool) -> Value {
+    if !hybrid {
+        return json!({"model_type":"llama", "hidden_size":4, "intermediate_size":6,
+        "num_hidden_layers":1, "num_attention_heads":2, "num_key_value_heads":1,
+        "max_position_embeddings":32, "rope_theta":10000.0, "rms_norm_eps":1e-6,
+        "hidden_act":"silu", "tie_word_embeddings":false, "vocab_size":7});
+    }
+    json!({"architectures":["Qwen3_5ForConditionalGeneration"], "language_model_only":false,
+        "model_type":"qwen3_5", "tie_word_embeddings":false, "vision_config":{"model_type":"qwen3_5"},
+        "text_config":{"attention_bias":false,"attention_dropout":0.0,"attn_output_gate":true,
+        "dtype":"bfloat16","full_attention_interval":2,"head_dim":4,"hidden_act":"silu",
+        "hidden_size":4,"intermediate_size":6,"layer_types":["linear_attention","full_attention"],
+        "linear_conv_kernel_dim":4,"linear_key_head_dim":2,"linear_num_key_heads":1,
+        "linear_num_value_heads":2,"linear_value_head_dim":2,"mamba_ssm_dtype":"float32",
+        "max_position_embeddings":32,"model_type":"qwen3_5_text","mtp_num_hidden_layers":1,
+        "mtp_use_dedicated_embeddings":false,"num_attention_heads":2,"num_hidden_layers":2,
+        "num_key_value_heads":1,"output_gate_type":"swish","partial_rotary_factor":0.5,
+        "rms_norm_eps":1e-6,"rope_parameters":{"mrope_interleaved":true,"mrope_section":[1,0,0],
+        "partial_rotary_factor":0.5,"rope_theta":10000.0,"rope_type":"default"},
+        "tie_word_embeddings":false,"use_cache":true,"vocab_size":7}})
+}
+pub(crate) fn package(hybrid: bool, additive: bool) -> Vec<u8> {
+    let cfg = config(hybrid);
+    let schema: Vec<(String, Vec<usize>, bool)> = if hybrid {
+        tritium_nn::qwen35_language_mtp_tensor_schema(
+            &Qwen35CheckpointConfig::from_hf_config(&cfg.to_string())
+                .unwrap()
+                .text,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|s| (s.name, s.shape, s.role == Qwen35TensorSchemaRole::Matrix))
+        .collect()
+    } else {
+        [
+            ("model.embed_tokens.weight", vec![7, 4]),
+            ("model.layers.0.input_layernorm.weight", vec![4]),
+            ("model.layers.0.post_attention_layernorm.weight", vec![4]),
+            ("model.layers.0.self_attn.q_proj.weight", vec![4, 4]),
+            ("model.layers.0.self_attn.k_proj.weight", vec![2, 4]),
+            ("model.layers.0.self_attn.v_proj.weight", vec![2, 4]),
+            ("model.layers.0.self_attn.o_proj.weight", vec![4, 4]),
+            ("model.layers.0.mlp.gate_proj.weight", vec![6, 4]),
+            ("model.layers.0.mlp.up_proj.weight", vec![6, 4]),
+            ("model.layers.0.mlp.down_proj.weight", vec![4, 6]),
+            ("model.norm.weight", vec![4]),
+            ("lm_head.weight", vec![7, 4]),
+        ]
+        .into_iter()
+        .map(|(name, shape)| (name.into(), shape.clone(), shape.len() == 2))
+        .collect()
+    };
+    let vocab = ["[UNK]", "hello", "partner", "[EOS]", "[BOS]", "t5", "t6"]
+        .into_iter()
+        .enumerate()
+        .map(|(id, w)| (w.to_owned(), id as u32))
+        .collect();
+    let wordlevel = tokenizers::models::wordlevel::WordLevel::builder()
+        .vocab(vocab)
+        .unk_token("[UNK]".into())
+        .build()
+        .unwrap();
+    let mut tokenizer = tokenizers::Tokenizer::new(wordlevel);
+    tokenizer.with_pre_tokenizer(Some(tokenizers::pre_tokenizers::whitespace::Whitespace));
+    let mut blobs = vec![
+        (
+            TritBlobKind::Asset("config.json".into()),
+            cfg.to_string().into_bytes(),
+        ),
+        (
+            TritBlobKind::Asset("tokenizer.json".into()),
+            tokenizer.to_string(false).unwrap().into_bytes(),
+        ),
+        (
+            TritBlobKind::Asset("tokenizer_config.json".into()),
+            br#"{"bos_token":"[BOS]","eos_token":"[EOS]"}"#.to_vec(),
+        ),
+    ];
+    let reference = |bytes: &[u8]| BlobReference {
+        id: BlobId::from_bytes(*blake3::hash(bytes).as_bytes()),
+        shard: None,
+    };
+    let assets = blobs
+        .iter()
+        .map(|(kind, bytes)| {
+            let TritBlobKind::Asset(name) = kind else {
+                unreachable!()
+            };
+            ManifestAsset {
+                name: name.clone(),
+                blob: reference(bytes),
+            }
+        })
+        .collect();
+    let mut tensors = Vec::new();
+    for (name, shape, matrix) in schema {
+        let length = shape.iter().product();
+        let values = (0..length)
+            .map(|i| {
+                if matrix {
+                    ((i % 3) as f32 - 1.0) / 16.0
+                } else if name.contains("norm") {
+                    if hybrid { 0.0 } else { 1.0 }
+                } else {
+                    0.125
+                }
+            })
+            .collect::<Vec<_>>();
+        let (kind, storage, bytes) = if matrix && additive {
+            let layout = AdditiveLayout {
+                rows: shape[0] as u64,
+                cols: shape[1] as u64,
+                tile: 256,
+                group: 32,
+                max_planes: 1,
+                allocation: PlaneAllocation::Uniform,
+                codec: PlaneCodec::B3,
+                law: ADMITTED_LAWS[0].law,
+                basis: Basis::Identity,
+                transport: Transport::Raw,
+            };
+            let tensor = AdditiveTensor::new(
+                layout,
+                1,
+                values
+                    .iter()
+                    .map(|&v| Trit::from_i8((v * 16.0) as i8).unwrap())
+                    .collect(),
+                vec![1.0 / 16.0; shape[0] * shape[1].div_ceil(32)],
+            )
+            .unwrap();
+            (
+                TritBlobKind::AdditiveTensor,
+                TensorStorage::Additive {
+                    layout,
+                    planes: PlaneCounts::Uniform(1),
+                },
+                tensor.encode_payload().unwrap(),
+            )
+        } else {
+            (
+                TritBlobKind::DenseTensor(DType::F32),
+                TensorStorage::Dense {
+                    shape: shape.iter().map(|&n| n as u64).collect(),
+                    precision: ScalePrecision::F32,
+                },
+                values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            )
+        };
+        tensors.push(TensorMeta {
+            name,
+            blob: reference(&bytes),
+            storage,
+        });
+        blobs.push((kind, bytes));
+    }
+    let manifest = ModelManifest {
+        schema: SchemaId { major: 1, minor: 0 },
+        architecture: if hybrid { "qwen3_5" } else { "llama" }.into(),
+        assets,
+        levels: vec![Level {
+            name: "test".into(),
+            fit: LevelFit::Imported,
+            tensors,
+        }],
+        shards: vec![],
+        legacy_ids: vec![],
+    };
+    let borrowed = blobs
+        .iter()
+        .map(|(kind, bytes)| TritBlob {
+            kind: kind.clone(),
+            bytes,
+        })
+        .collect::<Vec<_>>();
+    write_trit_package(
+        &tritium_format::trit_model::encode_model_manifest(&manifest).unwrap(),
+        &borrowed,
+    )
+    .unwrap()
+}

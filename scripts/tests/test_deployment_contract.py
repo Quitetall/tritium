@@ -96,8 +96,17 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertRegex(image, DIGEST)
         self.assertIn("--network none", checker)
         self.assertIn("--pull=never", checker)
+        self.assertIn('docker pull "$image"', checker)
         self.assertIn("backend=cuda", checker)
         self.assertIn("scientific notation", checker)
+
+    def test_deployment_manifest_gate_runs_in_ci_and_release_tiers(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn("deployment-manifests:", workflow)
+        self.assertIn('TRITIUM_PULL_HELM_IMAGE: "1"', workflow)
+        self.assertIn("run: ./scripts/check-deployment-manifests", workflow)
+        gates = (ROOT / "scripts/verify-gates.sh").read_text(encoding="utf-8")
+        self.assertEqual(gates.count("run ./scripts/check-deployment-manifests"), 2)
 
     def test_kubernetes_qualifier_is_fail_closed_and_content_addressed(self):
         qualifier = (ROOT / "scripts/qualify-kubernetes-deployment.py").read_text(

@@ -90,11 +90,11 @@ jobs:
   # "leaks" there are by design and would be noise.
   asan:
     name: AddressSanitizer (build-std)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       RUSTFLAGS: "-Zsanitizer=address"
       ASAN_OPTIONS: "detect_leaks=0"
-      # build-std needs an explicit target; the host triple on ubuntu-latest.
+      # build-std needs an explicit target; the host triple on ubuntu-24.04.
       TARGET: x86_64-unknown-linux-gnu
     strategy:
       fail-fast: false
@@ -126,7 +126,7 @@ jobs:
   # raw/uninit memory (SIMD + FFI).
   msan:
     name: MemorySanitizer (build-std)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       RUSTFLAGS: "-Zsanitizer=memory -Zsanitizer-memory-track-origins"
       TARGET: x86_64-unknown-linux-gnu
@@ -157,7 +157,7 @@ jobs:
   # is intentionally not in this matrix.
   tsan:
     name: ThreadSanitizer (build-std)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       RUSTFLAGS: "-Zsanitizer=thread"
       TARGET: x86_64-unknown-linux-gnu
@@ -215,7 +215,7 @@ jobs:
   #                       integration tests carry the parser/logic coverage.
   miri:
     name: miri (core + format parsers)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       # Cap the parser proptests so the interpreter stays within a sane
       # wall-clock without dropping any parser path.

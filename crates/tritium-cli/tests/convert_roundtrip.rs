@@ -62,12 +62,7 @@ const RUNTIME_RATIO_T4: f64 = 1.0560;
 const RATIO_TOLERANCE: f64 = 0.005;
 
 fn tritium_bin() -> PathBuf {
-    let mut p = std::env::current_exe().expect("test exe");
-    p.pop();
-    if p.ends_with("deps") {
-        p.pop();
-    }
-    p.join("tritium")
+    PathBuf::from(env!("CARGO_BIN_EXE_tritium"))
 }
 
 fn eval_tokens(path: &Path) -> Vec<u32> {

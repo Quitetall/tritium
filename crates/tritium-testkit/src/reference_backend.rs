@@ -13,7 +13,10 @@ use tritium_core::{GemmShape, TernaryFormat, Trit, reference_mpgemm};
 use tritium_format::{
     TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row, unpack_tq2_0_row,
 };
-use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, MpGemm, TernaryBackend};
+use tritium_spec::{
+    BackendError, DeviceBuffer, DeviceCaps, MpGemm, TensorCaps, TensorMatmul, TensorView,
+    TernaryBackend,
+};
 
 /// Device buffer for [`ReferenceBackend`]: the unpacked trits plus the shape they
 /// came from, so `mpgemm` needs no re-derivation.
@@ -35,7 +38,10 @@ impl DeviceBuffer for RefBuffer {
     }
 }
 
-/// A reference backend: unpacks with `tritium-format`, runs `reference_mpgemm`.
+/// Conformance compatibility adapter with the production semantic reference.
+///
+/// Only the harness's unit-block legacy TQ path is implemented here. Semantic
+/// ownership, admission, matmul and gather all use `tritium-runtime` directly.
 #[derive(Debug, Default)]
 pub struct ReferenceBackend;
 
@@ -54,6 +60,27 @@ impl TernaryBackend for ReferenceBackend {
 
     fn capabilities(&self) -> DeviceCaps {
         DeviceCaps::new("reference", "tritium-testkit reference backend")
+    }
+
+    fn tensor_caps(&self, tensor: TensorView<'_>) -> Result<Option<TensorCaps>, BackendError> {
+        tritium_runtime::ReferenceBackend::new().tensor_caps(tensor)
+    }
+
+    fn upload_tensor(&self, tensor: TensorView<'_>) -> Result<Box<dyn DeviceBuffer>, BackendError> {
+        tritium_runtime::ReferenceBackend::new().upload_tensor(tensor)
+    }
+
+    fn matmul(&self, p: TensorMatmul<'_>) -> Result<(), BackendError> {
+        tritium_runtime::ReferenceBackend::new().matmul(p)
+    }
+
+    fn embed_rows(
+        &self,
+        tensor: &dyn DeviceBuffer,
+        ids: &[usize],
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        tritium_runtime::ReferenceBackend::new().embed_rows(tensor, ids, out)
     }
 
     fn upload_weights(

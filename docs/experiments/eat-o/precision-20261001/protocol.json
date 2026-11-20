@@ -1,0 +1,72 @@
+{
+  "campaign": "precision-20261001",
+  "started_utc": "2026-10-01T18:47:02.539761+00:00",
+  "variants": {
+    "adaptive12": [
+      "adaptive",
+      12
+    ],
+    "adaptive24": [
+      "adaptive",
+      24
+    ],
+    "fixed8": [
+      "fixed8",
+      24
+    ],
+    "fixed24": [
+      "fixed24",
+      24
+    ],
+    "integer32": [
+      "integer32",
+      24
+    ]
+  },
+  "seeds": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "steps": 20000,
+  "common": {
+    "history": "statistics",
+    "replay": 0,
+    "coordinates": 4096,
+    "hysteresis": true,
+    "threshold": 0,
+    "incremental": true
+  },
+  "evaluation_offset": 1000,
+  "evaluation_count": 4000,
+  "split": "reused validation",
+  "selection": "none; report all variants",
+  "workers": 2,
+  "primary_comparator": "adaptive24",
+  "interval": "paired 95% t, df=4; exploratory, no multiplicity adjustment",
+  "source_revision": "679a570cb113ea21a804387c13e054645735c826",
+  "source_dirty": true,
+  "binary_sha256": "e183bf7c5ccb675995ce5f068a2e8f211ea046c8d5337ed7d2a6a405dd49880e",
+  "source_sha256": {
+    "scripts/run-eat-o-followup.py": "e3fc037003ae74c2c9359ff92993ac52a8d692c221efefa3e5b7a7bef5e5a32e",
+    "scripts/run-ternary-lab.py": "1e3473b354fb72b8c2937234aab96a0e37bcfd90cf126bd48e3aa69d252e5e5e",
+    "scripts/verify-ternary-lab.py": "7560588a1cc3bc5188e1c327e86fdf0c63d42c044c087bcb285c3b5876eee06d",
+    "crates/tritium-train/examples/ternary_lab.rs": "338d86c846d5f423c236bd8607a746d78d19a5c4888121e29a591db79ddbd48b",
+    "crates/tritium-train/examples/ternary_lab/engine.rs": "7e53a7c3e65a46414089020e2a6e64aca4ec97b68e5851490407d7432cffd958",
+    "crates/tritium-train/examples/ternary_lab/model.rs": "263e3e36ff58f8bceedd1e186ce88a16f0150a8360caf1c382a114e58712f3da",
+    "crates/tritium-train/examples/ternary_lab/numeric.rs": "eb604b620c6943965cdad494681d7d48fd26dd73d9354d2a813521f3d29dd43f"
+  },
+  "runner_sha256": "53e6334dd9beae80be03743c65c465c17b62eac40625e4c7009a1c3e29ff1197",
+  "data_sha256": {
+    "train-images-idx3-ubyte": "ba891046e6505d7aadcbbe25680a0738ad16aec93bde7f9b65e87a2fc25776db",
+    "train-labels-idx1-ubyte": "65a50cbbf4e906d70832878ad85ccda5333a97f0f4c3dd2ef09a8a9eef7101c5"
+  },
+  "machine": "Linux-7.2.8-1-cachyos-x86_64-with-glibc2.44",
+  "cpu": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           46 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  32\nOn-line CPU(s) list:                     0-31\nVendor ID:                               GenuineIntel\nModel name:                              Intel(R) Core(TM) i9-14900K\nCPU family:                              6\nModel:                                   183\nThread(s) per core:                      2\nCore(s) per socket:                      24\nSocket(s):                               1\nStepping:                                1\nMicrocode version:                       0x137\nCPU(s) scaling MHz:                      75%\nCPU max MHz:                             6000.0000\nCPU min MHz:                             800.0000\nBogoMIPS:                                6374.40\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid movdiri movdir64b fsrm md_clear serialize pconfig arch_lbr ibt flush_l1d arch_capabilities\nVirtualization:                          VT-x\nL1d cache:                               896 KiB (24 instances)\nL1i cache:                               1.3 MiB (24 instances)\nL2 cache:                                32 MiB (12 instances)\nL3 cache:                                36 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-31\nVulnerability Gather data sampling:      Not affected\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Mitigation; Clear Register File\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI BHI_DIS_S\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Mitigation; IBPB before exit to userspace\n",
+  "python": "3.14.7 (main, Aug 14 2026, 06:38:32) [GCC 16.2.1 20260810]",
+  "artifact_directory": "/home/brianklam/Desktop/Tritium/target/eat-o-campaigns/precision-20261001",
+  "checkpoint_retention": "local target only; hashes durable",
+  "advance_to_language_model": false
+}

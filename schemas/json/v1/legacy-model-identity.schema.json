@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LegacyModelIdentity",
+  "description": "Legacy model identity retained for later verified migration resolution.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "description": "Original namespaced identity; never reinterpreted as a new digest.",
+      "type": "string"
+    },
+    "level": {
+      "description": "Level holding the imported model.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "level"
+  ]
+}

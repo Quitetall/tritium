@@ -36,13 +36,16 @@ tritium-cpu = { workspace = true }
 tritium-cuda = { workspace = true, optional = true }
 # Used by the low-level `ternary_matmul` helper to express problem geometry.
 tritium-core = { workspace = true }
+tritium-schema = { workspace = true, features = ["serde"] }
 tritium-format = { workspace = true }
+tritium-evidence = { workspace = true }
 tritium-onnx = { workspace = true, optional = true, features = ["qwen-package", "onnx"] }
 # The autograd tape ops (ternary Conv1d, FSQ, STE) exposed to PyTorch via `src/ops.rs` (ADR 0030).
 tritium-train = { workspace = true }
 # Production SALT V2 evidence and resumable Qwen master-campaign orchestration.
 tritium-quantize = { workspace = true }
 tritium-salt = { workspace = true }
+rayon = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }

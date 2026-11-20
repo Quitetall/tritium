@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WeightedOwnerWindow",
+  "description": "One explicitly ordered expected scalar-loss window; repetition is intentional.",
+  "type": "object",
+  "properties": {
+    "cache": {
+      "description": "Finalized cache content ID, not a declared bootstrap identity.",
+      "$ref": "#/$defs/OwnerScoreCacheId"
+    },
+    "weight": {
+      "description": "Nonnegative finite scalar-window weight, normalized by their sum.",
+      "type": "number",
+      "format": "double"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "cache",
+    "weight"
+  ],
+  "$defs": {
+    "OwnerScoreCacheId": {
+      "description": "Candidate identity of one scalar-window owner snapshot, not a fit or qualification.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    }
+  }
+}

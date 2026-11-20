@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LegacyModelImportBoundPrepared",
+  "description": "Compact preparation bound to actual full canonical manifest bytes.\nNo embedded count vectors or fit/publication/source-truth verdict is implied.",
+  "type": "object",
+  "properties": {
+    "companion_assets": {
+      "description": "Complete companion asset content identities.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/NamedAssetDigest"
+      }
+    },
+    "companion_source": {
+      "description": "Actual observed raw dense/asset source identity.",
+      "$ref": "#/$defs/OriginalSourceId"
+    },
+    "companion_tensors": {
+      "description": "Complete companion interpretations and raw-byte content identities.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/QuantSourceBinding"
+      }
+    },
+    "legacy_id": {
+      "description": "Actual original namespaced legacy container identity.",
+      "type": "string"
+    },
+    "manifest_bytes": {
+      "description": "Actual encoded canonical manifest byte length, not a sizing bound.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "manifest_digest": {
+      "description": "Plain BLAKE3 of the exact canonical manifest CBOR, not a package/model ID.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "legacy_id",
+    "companion_source",
+    "companion_tensors",
+    "companion_assets",
+    "manifest_bytes",
+    "manifest_digest"
+  ],
+  "$defs": {
+    "BlobId": {
+      "description": "Content identity for stored tensor or asset bytes.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "NamedAssetDigest": {
+      "description": "Exact named asset-content binding in the candidate model preimage.",
+      "type": "object",
+      "properties": {
+        "content": {
+          "description": "Exact stored asset-content digest, not a shard/package identity.",
+          "$ref": "#/$defs/BlobId"
+        },
+        "name": {
+          "description": "Asset basename; names affect model semantics.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "content"
+      ]
+    },
+    "OriginalSourceId": {
+      "description": "Candidate identity of original named tensor/asset content, not fitted content or provenance.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    },
+    "QuantSourceBinding": {
+      "description": "Actual original raw tensor-byte binding computed by the engine itself.",
+      "type": "object",
+      "properties": {
+        "content": {
+          "description": "BLAKE3 of exact original raw bytes; not original container/HF identity.",
+          "$ref": "#/$defs/BlobId"
+        },
+        "source": {
+          "description": "Original interpretation, not fitted layout.",
+          "$ref": "#/$defs/QuantSourceTensor"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "content"
+      ]
+    },
+    "QuantSourceTensor": {
+      "description": "Original tensor interpretation, never an adapter-supplied content hash.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Exact logical tensor name.",
+          "type": "string"
+        },
+        "precision": {
+          "description": "Original stored float precision, before widening or fitting.",
+          "$ref": "#/$defs/ScalePrecision"
+        },
+        "shape": {
+          "description": "Positive row-major dimensions in the original source.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "shape",
+        "precision"
+      ]
+    },
+    "ScalePrecision": {
+      "description": "Precision used to store additive plane scales.",
+      "oneOf": [
+        {
+          "description": "IEEE binary16.",
+          "type": "string",
+          "const": "F16"
+        },
+        {
+          "description": "Brain floating-point 16-bit.",
+          "type": "string",
+          "const": "Bf16"
+        },
+        {
+          "description": "IEEE binary32.",
+          "type": "string",
+          "const": "F32"
+        }
+      ]
+    }
+  }
+}

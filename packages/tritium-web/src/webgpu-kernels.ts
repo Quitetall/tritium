@@ -28,9 +28,7 @@ export interface WebGpuKernelCandidateBundleV1 {
   readonly schemaVersion: 1;
   readonly bundleSha256: string;
   readonly modules: Readonly<Record<string, WebGpuKernelModuleV1>>;
-  readonly candidateOperationModuleDependencies: Readonly<
-    Record<string, readonly string[]>
-  >;
+  readonly candidateOperationModuleDependencies: Readonly<Record<string, readonly string[]>>;
 }
 
 export type WebGpuDispatchExecutionV1 = "forward" | "vjp" | "step";
@@ -100,10 +98,7 @@ export function webGpuDispatchFormV1(
   const key = `${operation}|${execution}`;
   const form = DISPATCH_CATALOG.forms[key];
   if (form === undefined) {
-    throw new WebTrainingError(
-      "capability_mismatch",
-      `no WebGPU dispatch form exists for ${key}`,
-    );
+    throw new WebTrainingError("capability_mismatch", `no WebGPU dispatch form exists for ${key}`);
   }
   return form;
 }

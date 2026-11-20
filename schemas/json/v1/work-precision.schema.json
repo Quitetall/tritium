@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WorkPrecision",
+  "description": "Arithmetic of sequential feedback, not the storage precision or memory footprint.",
+  "oneOf": [
+    {
+      "description": "f32 working values/residuals, with f64 metric and correction accumulation.",
+      "type": "string",
+      "const": "F32Accum64"
+    },
+    {
+      "description": "Existing f64 feedback oracle; a selected fitter may still accept f32 inputs.",
+      "type": "string",
+      "const": "F64"
+    }
+  ]
+}

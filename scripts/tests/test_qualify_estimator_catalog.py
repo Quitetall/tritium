@@ -71,6 +71,15 @@ def fixture(root: Path):
 
 
 class QualifyEstimatorCatalogTests(unittest.TestCase):
+    def test_installed_worker_admits_candidate_before_catalog(self):
+        source = (ROOT / "crates/tritium-py/python/tritium/torch/qualify_estimators.py").read_text()
+        self.assertIn("executing_files=(Path(__file__),)", source)
+        self.assertLess(source.index("    verify_installed_candidate("), source.index("    cases = [_case("))
+        workflow = (ROOT / ".github/workflows/wheels.yml").read_text()
+        self.assertIn("test_estimator_candidate_provenance.py", workflow)
+        self.assertIn("python -I -m tritium.torch.qualify_estimators", workflow)
+        self.assertIn("evidence/estimator-clean/**", workflow)
+
     def test_preserves_venv_style_python_entrypoint(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

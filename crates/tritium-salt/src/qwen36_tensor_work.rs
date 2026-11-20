@@ -19,9 +19,11 @@ pub use additive_master::{
     Qwen36AdmittedExecutionReceipt, Qwen36AdmittedExecutionSession, Qwen36ExecutionBackend,
     Qwen36ExecutionReplayError, Qwen36ExecutionSessionOpenError, Qwen36ExecutionVisitError,
     Qwen36FinalLogitsOutputBindingError, Qwen36FinalLogitsOutputBindingReceipt,
-    Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt, Qwen36PackageAdmittedCampaignStore,
-    Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger, Qwen36PackageScaleOnlyCampaignStore,
-    Qwen36PackageVisitError, Qwen36PvParentContext,
+    Qwen36OutputScopeBindingReceipt, Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt,
+    Qwen36PackageAdmittedCampaignStore, Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger,
+    Qwen36PackageScaleOnlyCampaignStore, Qwen36PackageVisitError, Qwen36PvParentContext,
+    Qwen36RefinedCandidateExecutionReceipt, Qwen36RefinedCandidateReplay,
+    Qwen36ScaleRefitWindowError,
 };
 #[cfg(all(unix, feature = "cuda"))]
 pub use additive_master::{
@@ -2003,39 +2005,43 @@ mod tests {
     fn workspace_manifest_round_trips_all_preserved_receipts_canonically() {
         let proof = test_fixture_source_proof();
         let plan = WorkspacePlan::from_proof(&proof).unwrap();
-        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
-            "tritium-qwen36-workspace-manifest-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        let store = TensorWorkStore::open(&root).unwrap();
-        let zeros = [0_u8; STREAM_CHUNK_BYTES];
+        // This tests the complete pinned manifest codec, not publication of 360
+        // opaque payloads. Keep every real descriptor/shape/length while using
+        // explicitly synthetic receipts; durable record and resumed-workspace
+        // tests below exercise publication and verified reopening separately.
+        assert_eq!(plan.preserved.len(), 360);
+        assert_eq!(plan.additive.len(), 506);
         let receipts = plan
             .preserved
             .iter()
-            .map(|entry| {
-                store
-                    .put(&entry.spec, |writer| -> io::Result<()> {
-                        let mut remaining = entry.spec.payload_bytes();
-                        while remaining != 0 {
-                            let count = usize::try_from(remaining.min(zeros.len() as u64)).unwrap();
-                            writer.write_all(&zeros[..count])?;
-                            remaining -= count as u64;
-                        }
-                        Ok(())
-                    })
-                    .unwrap()
-            })
+            .map(|entry| TensorRecordReceipt::fixture_for_codec_test(&entry.spec))
             .collect::<Vec<_>>();
         let manifest = WorkspaceManifest::from_plan(&plan, receipts).unwrap();
         let bytes = manifest.canonical_bytes().unwrap();
         let decoded = WorkspaceManifest::from_canonical_bytes(&bytes).unwrap();
 
         assert_eq!(decoded, manifest);
+        assert_eq!(decoded.canonical_bytes().unwrap(), bytes);
         decoded.validate(&plan).unwrap();
         let receipt = decoded.receipt(&bytes).unwrap();
         assert_eq!(receipt.workspace_id(), ContentId::of_bytes(&bytes));
         assert_eq!(receipt.summary(), plan.summary);
+        let mut missing = decoded.clone();
+        missing.preserved.pop();
+        assert!(matches!(
+            missing.validate(&plan),
+            Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                "workspace source or policy binding"
+            ))
+        ));
+        let mut reordered = decoded.clone();
+        reordered.preserved.swap(0, 1);
+        assert!(matches!(
+            reordered.validate(&plan),
+            Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                "workspace preserved tensor"
+            ))
+        ));
         let mut corrupt = bytes;
         corrupt[20] ^= 1;
         assert!(matches!(
@@ -2044,7 +2050,6 @@ mod tests {
                 "workspace checksum"
             ))
         ));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[derive(Debug)]

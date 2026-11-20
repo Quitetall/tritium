@@ -71,13 +71,14 @@ class TernaryConfig:
         *,
         profile: str,
         target_modules: Tuple[str, ...] = ("Linear", "Embedding", "Conv1d"),
+        planes: int = 3,
         target_bpw: Optional[float] = None,
     ) -> "TernaryConfig":
         return cls(
             mode="ptq",
             estimator="salt-v2",
             target_modules=tuple(target_modules),
-            planes=3,
+            planes=planes,
             profile=profile,
             target_bpw=target_bpw,
         )

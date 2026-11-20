@@ -1,8 +1,5 @@
 import { PORTABLE_OPERATION_BINDINGS_V1 } from "./operation-bindings.ts";
-import {
-  admittedCompiledBufferMap,
-  PortableSchedulePlanError,
-} from "./portable-schedule.ts";
+import { admittedCompiledBufferMap, PortableSchedulePlanError } from "./portable-schedule.ts";
 import type {
   CompiledBackwardOperationV1,
   CompiledTrainingOperationV1,
@@ -12,10 +9,7 @@ import type {
 import { WebTrainingError } from "./session.ts";
 import { webGpuDispatchFormV1 } from "./webgpu-kernels.ts";
 import type { WebGpuDispatchExecutionV1 } from "./webgpu-kernels.ts";
-import {
-  webGpuUniformSlotCapacityV1,
-  type WebGpuResidentDispatchV1,
-} from "./webgpu-runtime.ts";
+import { webGpuUniformSlotCapacityV1, type WebGpuResidentDispatchV1 } from "./webgpu-runtime.ts";
 
 type Binding = Readonly<{
   inputs: readonly string[];
@@ -77,17 +71,18 @@ function record(value: unknown): value is Readonly<Record<string, unknown>> {
 }
 
 function roleMap(roles: readonly string[], ids: readonly string[], name: string) {
-  if (!Array.isArray(ids) || !dense(ids) || ids.length !== roles.length ||
-      ids.some((id) => typeof id !== "string" || id.length === 0)) {
+  if (
+    !Array.isArray(ids) ||
+    !dense(ids) ||
+    ids.length !== roles.length ||
+    ids.some((id) => typeof id !== "string" || id.length === 0)
+  ) {
     fail("invalid_schema", `compiled ${name} bindings differ from WebGPU registry`);
   }
   return Object.freeze(Object.fromEntries(roles.map((role, index) => [role, ids[index]!])));
 }
 
-function attributeMap(
-  expected: Binding["attributes"],
-  actual: readonly TrainingAttributeSpecV1[],
-) {
+function attributeMap(expected: Binding["attributes"], actual: readonly TrainingAttributeSpecV1[]) {
   if (!Array.isArray(actual) || !dense(actual) || actual.length !== expected.length) {
     fail("invalid_schema", "compiled attributes differ from WebGPU registry");
   }
@@ -107,19 +102,31 @@ export function compiledWebGpuInvocationV1(
   phase: "forward" | "backward",
   operationId: string,
 ): WebGpuLoweringInvocationV1 {
-  const validForward = plan.operations.every((operation) =>
-    record(operation) && typeof operation.id === "string" &&
-    typeof operation.operation === "string" && Array.isArray(operation.inputs) &&
-    Array.isArray(operation.outputs) && Array.isArray(operation.attributes)
+  const validForward = plan.operations.every(
+    (operation) =>
+      record(operation) &&
+      typeof operation.id === "string" &&
+      typeof operation.operation === "string" &&
+      Array.isArray(operation.inputs) &&
+      Array.isArray(operation.outputs) &&
+      Array.isArray(operation.attributes),
   );
-  const validBackward = plan.backwardOperations.every((operation) =>
-    record(operation) && typeof operation.id === "string" &&
-    typeof operation.operation === "string" &&
-    (operation.execution === "forward" || operation.execution === "vjp") &&
-    Array.isArray(operation.inputs) && Array.isArray(operation.outputs) &&
-    Array.isArray(operation.attributes)
+  const validBackward = plan.backwardOperations.every(
+    (operation) =>
+      record(operation) &&
+      typeof operation.id === "string" &&
+      typeof operation.operation === "string" &&
+      (operation.execution === "forward" || operation.execution === "vjp") &&
+      Array.isArray(operation.inputs) &&
+      Array.isArray(operation.outputs) &&
+      Array.isArray(operation.attributes),
   );
-  if (!validForward || !validBackward || typeof operationId !== "string" || operationId.length === 0) {
+  if (
+    !validForward ||
+    !validBackward ||
+    typeof operationId !== "string" ||
+    operationId.length === 0
+  ) {
     fail("invalid_schema", "compiled WebGPU operation entries are invalid");
   }
   if (phase === "forward") {
@@ -174,10 +181,7 @@ export function compiledWebGpuInvocationV1(
   });
 }
 
-export function requiredWebGpuRoleV1(
-  map: Readonly<Record<string, string>>,
-  role: string,
-): string {
+export function requiredWebGpuRoleV1(map: Readonly<Record<string, string>>, role: string): string {
   const value = map[role];
   if (value === undefined) fail("invalid_schema", `WebGPU lowering omits role ${role}`);
   return value;
@@ -210,10 +214,7 @@ export function admittedWebGpuBuffersV1(
     return admittedCompiledBufferMap(plan);
   } catch (error) {
     if (error instanceof PortableSchedulePlanError) {
-      fail(
-        error.code === "capacity" ? "memory_limit" : "invalid_schema",
-        error.message,
-      );
+      fail(error.code === "capacity" ? "memory_limit" : "invalid_schema", error.message);
     }
     throw error;
   }
@@ -225,9 +226,12 @@ function validatePointwiseGeometry(
 ): void {
   const expect = (bufferId: string, expected: readonly number[], role: string) => {
     const actual = buffers.get(bufferId);
-    if (actual === undefined || actual.dtype !== "f32" ||
-        actual.shape.length !== expected.length ||
-        actual.shape.some((dimension, index) => dimension !== expected[index])) {
+    if (
+      actual === undefined ||
+      actual.dtype !== "f32" ||
+      actual.shape.length !== expected.length ||
+      actual.shape.some((dimension, index) => dimension !== expected[index])
+    ) {
       fail("invalid_schema", `${invocation.operation} ${role} geometry differs from WebGPU ABI`);
     }
   };
@@ -237,17 +241,27 @@ function validatePointwiseGeometry(
     const source = required(input, inputRole);
     expect(required(output, outputRole), buffers.get(source)?.shape ?? [-1], outputRole);
   };
-  const rowsCols = () => [
-    u32(invocation.attributes.rows, "rows"),
-    u32(invocation.attributes.cols, "cols"),
-  ] as const;
+  const rowsCols = () =>
+    [u32(invocation.attributes.rows, "rows"), u32(invocation.attributes.cols, "cols")] as const;
   switch (`${invocation.operation}|${invocation.execution}`) {
-    case "graph.detach|forward": same("x", "result"); return;
-    case "graph.detach|vjp": same("grad_output", "grad_x"); return;
-    case "graph.scale_const|forward": same("x", "result"); return;
-    case "graph.scale_const|vjp": same("grad_output", "grad_x"); return;
+    case "graph.detach|forward":
+      same("x", "result");
+      return;
+    case "graph.detach|vjp":
+      same("grad_output", "grad_x");
+      return;
+    case "graph.scale_const|forward":
+      same("x", "result");
+      return;
+    case "graph.scale_const|vjp":
+      same("grad_output", "grad_x");
+      return;
     case "graph.add|forward":
-      expect(required(input, "right"), buffers.get(required(input, "left"))?.shape ?? [-1], "right");
+      expect(
+        required(input, "right"),
+        buffers.get(required(input, "left"))?.shape ?? [-1],
+        "right",
+      );
       same("left", "result");
       return;
     case "graph.add|vjp":
@@ -255,7 +269,11 @@ function validatePointwiseGeometry(
       same("grad_output", "grad_right");
       return;
     case "graph.mul|forward":
-      expect(required(input, "right"), buffers.get(required(input, "left"))?.shape ?? [-1], "right");
+      expect(
+        required(input, "right"),
+        buffers.get(required(input, "left"))?.shape ?? [-1],
+        "right",
+      );
       same("left", "result");
       return;
     case "graph.mul|vjp": {
@@ -267,7 +285,9 @@ function validatePointwiseGeometry(
       return;
     }
     case "graph.relu2|forward":
-    case "graph.silu|forward": same("x", "result"); return;
+    case "graph.silu|forward":
+      same("x", "result");
+      return;
     case "graph.relu2|vjp":
     case "graph.silu|vjp": {
       const shape = buffers.get(required(input, "x"))?.shape ?? [-1];
@@ -409,7 +429,11 @@ function validatePointwiseGeometry(
       } else {
         expect(required(input, "grad_output"), [rows, cols], "grad_output");
         expect(required(output, "grad_weight"), [rows, cols], "grad_weight");
-        expect(required(output, invocation.operation === "graph.lsq_ste" ? "grad_alpha" : "grad_scale"), [rows], "scale gradient");
+        expect(
+          required(output, invocation.operation === "graph.lsq_ste" ? "grad_alpha" : "grad_scale"),
+          [rows],
+          "scale gradient",
+        );
       }
       return;
     }
@@ -518,19 +542,22 @@ export function lowerPointwiseWebGpuOperationV1(
       const source = required(input, invocation.execution === "forward" ? "x" : "grad_output");
       const target = required(output, invocation.execution === "forward" ? "result" : "grad_x");
       return Object.freeze([
-        stage(0, source, source, source, target, elements(target),
-          f32(invocation.attributes.scale, "scale")),
+        stage(
+          0,
+          source,
+          source,
+          source,
+          target,
+          elements(target),
+          f32(invocation.attributes.scale, "scale"),
+        ),
       ]);
     }
     case "graph.add|forward": {
       const left = required(input, "left");
-      return Object.freeze([stage(
-        0,
-        left,
-        required(input, "right"),
-        left,
-        required(output, "result"),
-      )]);
+      return Object.freeze([
+        stage(0, left, required(input, "right"), left, required(output, "result")),
+      ]);
     }
     case "graph.add|vjp": {
       const gradient = required(input, "grad_output");
@@ -541,13 +568,9 @@ export function lowerPointwiseWebGpuOperationV1(
     }
     case "graph.mul|forward": {
       const left = required(input, "left");
-      return Object.freeze([stage(
-        0,
-        left,
-        required(input, "right"),
-        left,
-        required(output, "result"),
-      )]);
+      return Object.freeze([
+        stage(0, left, required(input, "right"), left, required(output, "result")),
+      ]);
     }
     case "graph.mul|vjp": {
       const gradient = required(input, "grad_output");
@@ -564,66 +587,70 @@ export function lowerPointwiseWebGpuOperationV1(
     case "graph.relu2|vjp":
     case "graph.silu|vjp": {
       const x = required(input, "x");
-      return Object.freeze([stage(
-        0,
-        x,
-        required(input, "grad_output"),
-        x,
-        required(output, "grad_x"),
-      )]);
+      return Object.freeze([
+        stage(0, x, required(input, "grad_output"), x, required(output, "grad_x")),
+      ]);
     }
     case "graph.causal_mask|forward":
     case "graph.causal_mask|vjp": {
       const source = required(input, invocation.execution === "forward" ? "x" : "grad_output");
-      return Object.freeze([stage(
-        0,
-        source,
-        source,
-        source,
-        required(output, invocation.execution === "forward" ? "result" : "grad_x"),
-        elements(source),
-        0,
-        u32(invocation.attributes.cols, "cols"),
-      )]);
+      return Object.freeze([
+        stage(
+          0,
+          source,
+          source,
+          source,
+          required(output, invocation.execution === "forward" ? "result" : "grad_x"),
+          elements(source),
+          0,
+          u32(invocation.attributes.cols, "cols"),
+        ),
+      ]);
     }
     case "graph.softmax|forward": {
       const x = required(input, "x");
-      return Object.freeze([stage(
-        0,
-        x,
-        x,
-        x,
-        required(output, "result"),
-        elements(x),
-        0,
-        u32(invocation.attributes.cols, "cols"),
-      )]);
+      return Object.freeze([
+        stage(
+          0,
+          x,
+          x,
+          x,
+          required(output, "result"),
+          elements(x),
+          0,
+          u32(invocation.attributes.cols, "cols"),
+        ),
+      ]);
     }
     case "graph.softmax|vjp": {
       const x = required(input, "x");
-      return Object.freeze([stage(
-        0,
-        x,
-        required(input, "grad_output"),
-        x,
-        required(output, "grad_x"),
-        elements(x),
-        0,
-        u32(invocation.attributes.cols, "cols"),
-      )]);
+      return Object.freeze([
+        stage(
+          0,
+          x,
+          required(input, "grad_output"),
+          x,
+          required(output, "grad_x"),
+          elements(x),
+          0,
+          u32(invocation.attributes.cols, "cols"),
+        ),
+      ]);
     }
     case "graph.rmsnorm|forward": {
       const x = required(input, "x");
-      return Object.freeze([stage(
-        0,
-        x,
-        required(input, "weight"),
-        x,
-        required(output, "result"),
-        elements(x),
-        f32(invocation.attributes.eps, "eps"),
-        u32(invocation.attributes.cols, "cols"),
-      )]);
+      return Object.freeze([
+        stage(
+          0,
+          x,
+          required(input, "weight"),
+          x,
+          required(output, "result"),
+          elements(x),
+          f32(invocation.attributes.eps, "eps"),
+          u32(invocation.attributes.cols, "cols"),
+        ),
+      ]);
     }
     case "graph.rmsnorm|vjp": {
       const x = required(input, "x");
@@ -639,38 +666,44 @@ export function lowerPointwiseWebGpuOperationV1(
     }
     case "loss.mse|forward": {
       const prediction = required(input, "prediction");
-      return Object.freeze([stage(
-        0,
-        prediction,
-        required(input, "target"),
-        prediction,
-        required(output, "result"),
-        elements(prediction),
-      )]);
+      return Object.freeze([
+        stage(
+          0,
+          prediction,
+          required(input, "target"),
+          prediction,
+          required(output, "result"),
+          elements(prediction),
+        ),
+      ]);
     }
     case "loss.mse|vjp": {
       const prediction = required(input, "prediction");
-      return Object.freeze([stage(
-        0,
-        prediction,
-        required(input, "target"),
-        required(input, "grad_output"),
-        required(output, "grad_prediction"),
-        elements(prediction),
-      )]);
+      return Object.freeze([
+        stage(
+          0,
+          prediction,
+          required(input, "target"),
+          required(input, "grad_output"),
+          required(output, "grad_prediction"),
+          elements(prediction),
+        ),
+      ]);
     }
     case "graph.bias|forward": {
       const x = required(input, "x");
-      return Object.freeze([stage(
-        0,
-        x,
-        required(input, "bias"),
-        x,
-        required(output, "result"),
-        elements(x),
-        0,
-        u32(invocation.attributes.cols, "cols"),
-      )]);
+      return Object.freeze([
+        stage(
+          0,
+          x,
+          required(input, "bias"),
+          x,
+          required(output, "result"),
+          elements(x),
+          0,
+          u32(invocation.attributes.cols, "cols"),
+        ),
+      ]);
     }
     case "graph.bias|vjp": {
       const x = required(input, "x");
@@ -686,54 +719,54 @@ export function lowerPointwiseWebGpuOperationV1(
     case "graph.transpose|forward":
     case "graph.transpose|vjp": {
       const source = required(input, invocation.execution === "forward" ? "x" : "grad_output");
-      return Object.freeze([stage(
-        0,
-        source,
-        source,
-        source,
-        required(output, invocation.execution === "forward" ? "result" : "grad_x"),
-        elements(source),
-        0,
-        u32(invocation.attributes.cols, "cols"),
-      )]);
+      return Object.freeze([
+        stage(
+          0,
+          source,
+          source,
+          source,
+          required(output, invocation.execution === "forward" ? "result" : "grad_x"),
+          elements(source),
+          0,
+          u32(invocation.attributes.cols, "cols"),
+        ),
+      ]);
     }
     case "graph.slice_cols|forward":
     case "graph.slice_cols|vjp": {
-      const source = required(
-        input,
-        invocation.execution === "forward" ? "x" : "grad_output",
-      );
-      const target = required(
-        output,
-        invocation.execution === "forward" ? "result" : "grad_x",
-      );
-      return Object.freeze([stage(
-        0,
-        source,
-        source,
-        source,
-        target,
-        elements(target),
-        0,
-        u32(invocation.attributes.cols, "cols"),
-        u32(invocation.attributes.start, "start"),
-        u32(invocation.attributes.len, "len"),
-      )]);
+      const source = required(input, invocation.execution === "forward" ? "x" : "grad_output");
+      const target = required(output, invocation.execution === "forward" ? "result" : "grad_x");
+      return Object.freeze([
+        stage(
+          0,
+          source,
+          source,
+          source,
+          target,
+          elements(target),
+          0,
+          u32(invocation.attributes.cols, "cols"),
+          u32(invocation.attributes.start, "start"),
+          u32(invocation.attributes.len, "len"),
+        ),
+      ]);
     }
     case "graph.dense_matmul|forward": {
       const x = required(input, "x");
-      return Object.freeze([stage(
-        0,
-        x,
-        required(input, "weight"),
-        x,
-        required(output, "result"),
-        elements(required(output, "result")),
-        0,
-        u32(invocation.attributes.m, "m"),
-        u32(invocation.attributes.n, "n"),
-        u32(invocation.attributes.k, "k"),
-      )]);
+      return Object.freeze([
+        stage(
+          0,
+          x,
+          required(input, "weight"),
+          x,
+          required(output, "result"),
+          elements(required(output, "result")),
+          0,
+          u32(invocation.attributes.m, "m"),
+          u32(invocation.attributes.n, "n"),
+          u32(invocation.attributes.k, "k"),
+        ),
+      ]);
     }
     case "graph.dense_matmul|vjp": {
       const x = required(input, "x");
@@ -760,18 +793,20 @@ export function lowerPointwiseWebGpuOperationV1(
     }
     case "graph.ternary_matmul|forward": {
       const activation = required(input, "activation");
-      return Object.freeze([stage(
-        0,
-        activation,
-        required(input, "weight"),
-        required(input, "scale"),
-        required(output, "result"),
-        elements(required(output, "result")),
-        0,
-        u32(invocation.attributes.m, "m"),
-        u32(invocation.attributes.n, "n"),
-        u32(invocation.attributes.k, "k"),
-      )]);
+      return Object.freeze([
+        stage(
+          0,
+          activation,
+          required(input, "weight"),
+          required(input, "scale"),
+          required(output, "result"),
+          elements(required(output, "result")),
+          0,
+          u32(invocation.attributes.m, "m"),
+          u32(invocation.attributes.n, "n"),
+          u32(invocation.attributes.k, "k"),
+        ),
+      ]);
     }
     case "graph.ternary_matmul|vjp": {
       const activation = required(input, "activation");
@@ -822,16 +857,18 @@ export function lowerPointwiseWebGpuOperationV1(
     }
     case "graph.ste_surrogate|forward": {
       const weight = required(input, "weight");
-      return Object.freeze([stage(
-        0,
-        weight,
-        required(input, "scale"),
-        weight,
-        required(output, "result"),
-        elements(weight),
-        0,
-        u32(invocation.attributes.cols, "cols"),
-      )]);
+      return Object.freeze([
+        stage(
+          0,
+          weight,
+          required(input, "scale"),
+          weight,
+          required(output, "result"),
+          elements(weight),
+          0,
+          u32(invocation.attributes.cols, "cols"),
+        ),
+      ]);
     }
     case "graph.ste_surrogate|vjp": {
       const weight = required(input, "weight");
@@ -852,16 +889,18 @@ export function lowerPointwiseWebGpuOperationV1(
     }
     case "graph.lsq_ste|forward": {
       const weight = required(input, "weight");
-      return Object.freeze([stage(
-        0,
-        weight,
-        required(input, "alpha"),
-        weight,
-        required(output, "result"),
-        elements(weight),
-        0,
-        u32(invocation.attributes.cols, "cols"),
-      )]);
+      return Object.freeze([
+        stage(
+          0,
+          weight,
+          required(input, "alpha"),
+          weight,
+          required(output, "result"),
+          elements(weight),
+          0,
+          u32(invocation.attributes.cols, "cols"),
+        ),
+      ]);
     }
     case "graph.lsq_ste|vjp": {
       const weight = required(input, "weight");
@@ -869,7 +908,16 @@ export function lowerPointwiseWebGpuOperationV1(
       const gradient = required(input, "grad_output");
       const cols = u32(invocation.attributes.cols, "cols");
       return Object.freeze([
-        stage(0, weight, alpha, gradient, required(output, "grad_weight"), elements(weight), 0, cols),
+        stage(
+          0,
+          weight,
+          alpha,
+          gradient,
+          required(output, "grad_weight"),
+          elements(weight),
+          0,
+          cols,
+        ),
         stage(1, weight, alpha, gradient, required(output, "grad_alpha"), elements(alpha), 0, cols),
       ]);
     }

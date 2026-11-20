@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CalibrationConsumer",
+  "description": "Consumer whose original-source values are being calibrated.",
+  "oneOf": [
+    {
+      "description": "Raw original-input activations of a linear projection.",
+      "type": "string",
+      "const": "Matmul"
+    },
+    {
+      "description": "Gather with the explicitly declared hidden-space identity approximation.\nRequires indexed output factors; does not materialize vocabulary one-hots.",
+      "type": "string",
+      "const": "GatherIdentity"
+    }
+  ]
+}

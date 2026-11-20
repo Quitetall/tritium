@@ -18,6 +18,7 @@ from torch import nn
 
 import tritium
 
+from ._installed_candidate import verify_installed_candidate
 from .config import TernaryConfig
 from .conversion import prepare_qat
 from .observability import (
@@ -225,6 +226,10 @@ def run_installed_observability(
 
     wheel_artifact = _validate_inputs(
         output_dir, wheel_artifact, source_revision, release, run_id
+    )
+    verify_installed_candidate(
+        wheel_artifact=wheel_artifact, source_revision=source_revision,
+        release=release, executing_files=(Path(__file__),),
     )
     wheel_inventory = wheel_identity(wheel_artifact)
     distribution_version, module_path, installed_identity = _installed_distribution(
@@ -474,6 +479,10 @@ def main() -> int:
     args = parser.parse_args()
     if args.check_receipt is not None:
         wheel = args.wheel_artifact.absolute()
+        verify_installed_candidate(
+            wheel_artifact=wheel, source_revision=args.source_revision,
+            release=args.release, executing_files=(Path(__file__),),
+        )
         inventory = wheel_identity(wheel)
         version, module, installed = _installed_distribution(inventory)
         receipt = validate_receipt(

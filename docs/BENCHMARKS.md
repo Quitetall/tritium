@@ -53,6 +53,31 @@ box they are a distance from a named reference point, **not** a claim about the 
   - llama.cpp: `llama-bench -m <model.gguf> -p 512 -n 128 -ngl 99`
   - bitnet.cpp (CPU): `llama-bench -m <i2s.gguf> -p 512 -n 128 -t 14`
 
+### ADR 0044 P0 — RTX 4090 decode gate
+
+This gate records the hardware-specific baseline required before the schema/backend
+consolidation begins. It refuses to run off an RTX 4090 or when the model cannot use
+the CUDA-resident TQ2_0 path. The matrix is contexts 128 and 2048 × batch sizes 1 and
+8 for decode and tree verification. Decode measures 32 tokens; tree verification
+uses six draft nodes per sequence (eight slots stay within the 48-node batch limit).
+Each result retains five sample timings and the median. The JSON also records model
+SHA-256 and geometry, source revision/dirty state, GPU identity/activity before and at
+run end, relevant runtime options, and visible GPU processes before and at run end. The
+end sample can include the benchmark process itself (its PID is in the JSON). This is a
+performance baseline only, not a model-quality or release qualification receipt.
+
+Run from the repository root on the pinned RTX 4090 box:
+
+```sh
+TRITIUM_KV=f32 \
+TRITIUM_DECODE_GATE_OUT=benches/baselines/decode_gate_4090.json \
+cargo bench --locked -p tritium-benches --bench decode_gate --features cuda
+```
+
+The committed JSON is evidence for that exact run; rebaseline only with a separately
+reviewed measurement and retain the prior run in Git history. Keep `TRITIUM_KV=f32`
+fixed because batch-slot tree verification is admitted only on the f32/f16 KV rung.
+
 ## Ledger
 
 ### 2026-08-20 dual-graph dispatch + the stacked long-ctx headline @ 431b837f

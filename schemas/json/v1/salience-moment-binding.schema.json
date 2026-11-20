@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SalienceMomentBinding",
+  "description": "Exact actual moment content plus explicitly declared interpretation.",
+  "type": "object",
+  "properties": {
+    "channels": {
+      "description": "One moment per projection input column and partner output channel.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "content": {
+      "description": "BLAKE3 of row-major little-endian f64 second-moment sums, not an activation hash.",
+      "$ref": "#/$defs/BlobId"
+    },
+    "rows": {
+      "description": "Declared positive sample count; not proof of observed row execution.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "content",
+    "channels",
+    "rows"
+  ],
+  "$defs": {
+    "BlobId": {
+      "description": "Content identity for stored tensor or asset bytes.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 32,
+      "minItems": 32
+    }
+  }
+}

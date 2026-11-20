@@ -10,6 +10,23 @@
 use core::any::Any;
 
 use tritium_core::{GemmShape, TernaryFormat, Trit};
+
+#[test]
+fn core_optional_serde_keeps_canonical_format_tokens() {
+    for (format, token) in [
+        (TernaryFormat::Tq1_0, "tq1_0"),
+        (TernaryFormat::Tq2_0, "tq2_0"),
+        (TernaryFormat::I2sInt8, "i2s_int8"),
+    ] {
+        let json = format!("\"{token}\"");
+        assert_eq!(serde_json::to_string(&format).unwrap(), json);
+        assert_eq!(
+            serde_json::from_str::<TernaryFormat>(&json).unwrap(),
+            format
+        );
+    }
+    assert!(serde_json::from_str::<TernaryFormat>("\"unknown\"").is_err());
+}
 use tritium_format::{
     TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row, unpack_tq2_0_row,
 };

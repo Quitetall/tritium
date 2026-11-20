@@ -1,0 +1,16 @@
+{
+  "schema": "tritium.wheel-smoke.v1",
+  "cell_id": "macos-arm64-cpu-cp3.13",
+  "target_id": "macos-arm64-cpu",
+  "source_revision": "70974aeaba2924d7d864f5f961dd91e421e97bc7",
+  "passed": true,
+  "python_implementation": "CPython",
+  "python_version": "3.13.15",
+  "host_os": "darwin",
+  "host_arch": "arm64",
+  "wheel": "pytritium-1.1.0rc2-cp39-abi3-macosx_11_0_arm64.whl",
+  "sha256": "4534d0834e790af92b974e5ab0313da711ddd225968de6a85ce5120af20bc97a",
+  "bytes": 9392228,
+  "version": "1.1.0rc2",
+  "platform_tag": "macosx_11_0_arm64"
+}

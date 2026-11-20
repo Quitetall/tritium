@@ -211,3 +211,117 @@ pub(crate) fn pack_group_fits(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use tritium_format::{
+        AdditiveTensor, SaltTensorImportLimits, import_salt_rows, salt_rows_to_dense,
+    };
+    use tritium_schema::{
+        AdditiveLayout, Basis, PlaneAllocation, PlaneCodec, PlaneRelation, ScaleAnchor, ScaleLaw,
+        ScalePrecision, Transport,
+    };
+
+    #[test]
+    fn actual_ladder_artifact_keeps_independent_fp16_scales_on_import() {
+        let width = 512;
+        let weights: Vec<_> = (0..width)
+            .map(|i| (i as f32 / 173.7).sin() * 1.0004)
+            .collect();
+        let mut gram = vec![0.0; width * width];
+        for col in 0..width {
+            gram[col * width + col] = 1.0 + (col % 11) as f64;
+        }
+        let limits = SaltTensorImportLimits {
+            max_source_bytes: 100_000,
+            max_trits: 100_000,
+            max_scales: 100_000,
+            max_owned_bytes: 100_000,
+        };
+        let mut witnessed_difference = false;
+        for rotate in [false, true] {
+            let cfg = LadderConfig {
+                planes: 3,
+                group: 256,
+                grid: 4,
+                rotate,
+            };
+            cfg.validate().unwrap();
+            let nearest = quantize_tensor_ladder(&weights, 1, width, &cfg).unwrap();
+            for mode in [
+                None,
+                Some(tritium_nn::salt_fit::ScaleRefitMode::PostPass),
+                Some(tritium_nn::salt_fit::ScaleRefitMode::InLoop),
+            ] {
+                let original = if let Some(mode) = mode {
+                    let fits = tritium_nn::salt_fit::fit_tensor_with_scale_refit_mode(
+                        &weights,
+                        1,
+                        width,
+                        &gram,
+                        &tritium_nn::salt_fit::ActivationAwareConfig {
+                            planes: 3,
+                            group: 256,
+                            grid: 4,
+                            rotate,
+                            search_sweeps: 1,
+                            refit_scale: true,
+                            damp: 0.01,
+                            decay: 0.5,
+                            decay_ramp: true,
+                        },
+                        mode,
+                    )
+                    .unwrap();
+                    pack_group_fits(&fits, 1, width, &cfg).unwrap()
+                } else {
+                    nearest.clone()
+                };
+                let layout = AdditiveLayout {
+                    rows: 1,
+                    cols: width as u64,
+                    tile: 256,
+                    group: 128,
+                    max_planes: 3,
+                    allocation: PlaneAllocation::Uniform,
+                    codec: PlaneCodec::D2,
+                    transport: Transport::Raw,
+                    basis: if rotate {
+                        Basis::Hadamard { block: 256 }
+                    } else {
+                        Basis::Identity
+                    },
+                    law: ScaleLaw {
+                        anchor: ScaleAnchor::Group,
+                        relation: PlaneRelation::Free,
+                        precision: ScalePrecision::F16,
+                    },
+                };
+                let imported = import_salt_rows(&original, layout, limits).unwrap();
+                let mut decoded = vec![0.0; width];
+                imported.view().dequant_row_into(0, &mut decoded).unwrap();
+                assert_eq!(decoded, salt_rows_to_dense(&original).unwrap());
+                let mut tied_layout = layout;
+                tied_layout.law.relation = PlaneRelation::Tied { num: 1, den: 3 };
+                let tied = AdditiveTensor::new(
+                    tied_layout,
+                    3,
+                    imported.trits().to_vec(),
+                    imported.scales()[..4].to_vec(),
+                )
+                .unwrap();
+                let mut tied_decoded = vec![0.0; width];
+                tied.view().dequant_row_into(0, &mut tied_decoded).unwrap();
+                witnessed_difference |= decoded
+                    .iter()
+                    .zip(&tied_decoded)
+                    .any(|(a, b)| a.to_bits() != b.to_bits());
+            }
+        }
+        assert!(
+            witnessed_difference,
+            "fixture did not exercise the stored-scale distinction"
+        );
+    }
+}

@@ -14,6 +14,7 @@ from tritium.torch import (  # noqa: E402
     convert,
     export,
     load,
+    load_module_conversion,
     prepare,
     refine,
 )
@@ -52,7 +53,10 @@ def _parent(tmp_path):
         evidence,
         work_dir=tmp_path / "parent",
     )
-    return teacher, parent
+    reopened = load_module_conversion(parent.artifact_dir)
+    assert reopened.artifact_id == parent.artifact_id
+    assert reopened.weight_names == parent.weight_names
+    return teacher, reopened
 
 
 def _datasets():

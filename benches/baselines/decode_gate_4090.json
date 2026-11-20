@@ -1,0 +1,176 @@
+{
+  "schema": "tritium.decode-gate.v1",
+  "run_id": "decode-gate-1790808891563-1589732",
+  "source_revision": "61ddf72f8f048edc90179900c874dff2c4fdd1e3",
+  "source_dirty": false,
+  "started_unix_ms": 1790808891563,
+  "benchmark_pid": 1589732,
+  "device": "NVIDIA GeForce RTX 4090, GPU-1790118a-a6d7-4eaf-fcac-dcacac5f4351, 615.71.09, 24564 MiB",
+  "gpu_activity_before": "39 %, 1298 MiB",
+  "gpu_activity_at_end": "100 %, 10489 MiB",
+  "gpu_processes_before": "2908, /usr/bin/kwin_wayland, 128 MiB",
+  "gpu_processes_at_end": "2908, /usr/bin/kwin_wayland, 127 MiB\n1589732, /mnt/4tb/tritium-p0-cargo-target/release/deps/decode_gate-a86a24aba0d6a64c, 9140 MiB",
+  "model_path": "/home/brianklam/.cache/tritium-models/bitnet-2b4t-gguf/ggml-model-i2_s.gguf",
+  "model_bytes": 1187801280,
+  "model_sha256": "4221b252fdd5fd25e15847adfeb5ee88886506ba50b8a34548374492884c2162",
+  "model_architecture": "bitnet-b1.58",
+  "model_layers": 30,
+  "model_context_limit": 4096,
+  "artifact_quantization": "GGUF I2_S",
+  "execution_quantization": "TQ2_0 CUDA resident decode",
+  "runtime_options": {
+    "CUDA_VISIBLE_DEVICES": "<unset>",
+    "TRITIUM_KERNEL_TIER": "<unset>",
+    "TRITIUM_KV": "f32",
+    "TRITIUM_KV_F16": "<unset>",
+    "TRITIUM_LM_HEAD": "<unset>",
+    "TRITIUM_TREE_NB": "<unset>"
+  },
+  "contexts": [
+    128,
+    2048
+  ],
+  "decode_steps": 32,
+  "tree_nodes_per_sequence": 6,
+  "warmups": 2,
+  "samples": 5,
+  "results": [
+    {
+      "workload": "decode",
+      "context_tokens": 128,
+      "batch_size": 1,
+      "samples_ms": [
+        119.60319199999999,
+        114.313703,
+        114.75246899999999,
+        115.945223,
+        115.148707
+      ],
+      "median_ms": 115.148707,
+      "work_unit": "token",
+      "aggregate_work_units_per_second": 277.9015139093138,
+      "per_sequence_work_units_per_second": 277.9015139093138,
+      "tree_nodes_per_verify": null
+    },
+    {
+      "workload": "decode",
+      "context_tokens": 128,
+      "batch_size": 8,
+      "samples_ms": [
+        606.789255,
+        603.340378,
+        603.025314,
+        609.43994,
+        593.875204
+      ],
+      "median_ms": 603.340378,
+      "work_unit": "token",
+      "aggregate_work_units_per_second": 424.30443798342964,
+      "per_sequence_work_units_per_second": 53.038054747928705,
+      "tree_nodes_per_verify": null
+    },
+    {
+      "workload": "tree_verify",
+      "context_tokens": 128,
+      "batch_size": 1,
+      "samples_ms": [
+        7.633704,
+        7.703451,
+        8.939756000000001,
+        7.613268000000001,
+        7.785089999999999
+      ],
+      "median_ms": 7.703451,
+      "work_unit": "draft_node",
+      "aggregate_work_units_per_second": 778.8717030847603,
+      "per_sequence_work_units_per_second": 778.8717030847603,
+      "tree_nodes_per_verify": 6
+    },
+    {
+      "workload": "tree_verify",
+      "context_tokens": 128,
+      "batch_size": 8,
+      "samples_ms": [
+        29.790827,
+        29.737875,
+        28.589914,
+        29.678228,
+        28.459924
+      ],
+      "median_ms": 29.678228,
+      "work_unit": "draft_node",
+      "aggregate_work_units_per_second": 1617.3472351516405,
+      "per_sequence_work_units_per_second": 202.16840439395506,
+      "tree_nodes_per_verify": 6
+    },
+    {
+      "workload": "decode",
+      "context_tokens": 2048,
+      "batch_size": 1,
+      "samples_ms": [
+        292.499561,
+        280.284586,
+        277.062278,
+        278.619187,
+        279.72544100000005
+      ],
+      "median_ms": 279.72544100000005,
+      "work_unit": "token",
+      "aggregate_work_units_per_second": 114.39788917876795,
+      "per_sequence_work_units_per_second": 114.39788917876795,
+      "tree_nodes_per_verify": null
+    },
+    {
+      "workload": "decode",
+      "context_tokens": 2048,
+      "batch_size": 8,
+      "samples_ms": [
+        1181.740052,
+        1219.121533,
+        1208.615971,
+        1232.372515,
+        1212.00372
+      ],
+      "median_ms": 1212.00372,
+      "work_unit": "token",
+      "aggregate_work_units_per_second": 211.22047381174707,
+      "per_sequence_work_units_per_second": 26.402559226468384,
+      "tree_nodes_per_verify": null
+    },
+    {
+      "workload": "tree_verify",
+      "context_tokens": 2048,
+      "batch_size": 1,
+      "samples_ms": [
+        35.286538,
+        36.54879,
+        37.662619,
+        39.518139,
+        41.620559
+      ],
+      "median_ms": 37.662619,
+      "work_unit": "draft_node",
+      "aggregate_work_units_per_second": 159.30915478819995,
+      "per_sequence_work_units_per_second": 159.30915478819995,
+      "tree_nodes_per_verify": 6
+    },
+    {
+      "workload": "tree_verify",
+      "context_tokens": 2048,
+      "batch_size": 8,
+      "samples_ms": [
+        82.960937,
+        81.899528,
+        81.506205,
+        81.259783,
+        82.91590000000001
+      ],
+      "median_ms": 81.899528,
+      "work_unit": "draft_node",
+      "aggregate_work_units_per_second": 586.0839637561769,
+      "per_sequence_work_units_per_second": 73.26049546952211,
+      "tree_nodes_per_verify": 6
+    }
+  ],
+  "claim_boundary": "performance baseline only; not model-quality or release qualification"
+}
