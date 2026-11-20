@@ -61,6 +61,20 @@ fn rotate_row(row: &mut [f32], group: usize) {
 }
 
 impl TokenEmbedding {
+    /// The resident SALT V2 table, when this embedding is one and needs no rotation.
+    ///
+    /// A rotated table must be rotated back after gather, which the resident
+    /// executor does not do, so it is offered only an unrotated one.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn unrotated_salt_v2_resident(
+        &self,
+    ) -> Option<&Arc<tritium_cuda::SaltV2ResidentTensor>> {
+        match (&self.storage, self.rotation) {
+            (Storage::SaltV2(tensor), None) => Some(tensor),
+            _ => None,
+        }
+    }
+
     #[cfg(feature = "tokenizer")]
     pub(crate) fn shared_linear(&self) -> Option<&Linear> {
         match &self.storage {

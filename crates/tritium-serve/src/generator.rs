@@ -2127,6 +2127,122 @@ impl LegacyRunnerGenerator {
     }
 }
 
+/// Largest device-side chain the plain greedy path asks for. Chains ramp
+/// `2, 4, 8, 16`: short first chains stream the first tokens promptly, longer
+/// later ones amortize the host round trip. A chain that hits EOS stops
+/// feeding on the device, but the remaining graph replays of that chain still
+/// run (idempotently), so the cap also bounds that wasted work.
+#[cfg(feature = "cuda")]
+const GREEDY_CHAIN_MAX: usize = 16;
+
+/// `TRITIUM_GREEDY_CHAIN=0` keeps the plain greedy path on the per-token host
+/// argmax (the reference and A/B baseline). Loud-reject on anything else.
+#[cfg(feature = "cuda")]
+fn greedy_chain_from_env() -> Result<bool, GenError> {
+    match std::env::var("TRITIUM_GREEDY_CHAIN") {
+        Err(std::env::VarError::NotPresent) => Ok(true),
+        Ok(v) if v == "1" => Ok(true),
+        Ok(v) if v == "0" => Ok(false),
+        Ok(v) => Err(GenError::Backend(format!(
+            "TRITIUM_GREEDY_CHAIN={v:?} -- use 1 (default) or 0"
+        ))),
+        Err(e) => Err(GenError::Backend(format!("TRITIUM_GREEDY_CHAIN: {e}"))),
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl LegacyRunnerGenerator {
+    /// Greedy decode with the per-token host round trip removed.
+    ///
+    /// The per-token plain loop pays two stream syncs, a full logits download
+    /// (~513 KB at the LLaMA-3 vocabulary) into a fresh `Vec`, and a host scan
+    /// for every token. Here the captured decode graph replays `k` times on
+    /// the device, each step's device argmax feeding the next step's control
+    /// block (`decode_greedy_chain_cancellable`), and the host reads back `k`
+    /// token ids. The tokens are identical to the plain loop's: the same graph,
+    /// and the device argmax's tie and NaN rules equal `sample_greedy`'s (gated
+    /// by `cuda_greedy_chain_matches_plain_greedy`). Cancellation is observed
+    /// before every emitted token and inside each device chain, and reported
+    /// like [`stream_steps`] reports it.
+    fn generate_greedy_chain(
+        &mut self,
+        req: &GenRequest,
+        prompt_len: usize,
+        max_new: usize,
+        prefill_logits: &[f32],
+        on_step: &mut dyn FnMut(Step) -> bool,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<StreamEnd, GenError> {
+        if max_new == 0 {
+            return Ok(StreamEnd::Completed);
+        }
+        let eos = self.eos;
+        let stop_eos = req.stop_eos;
+        // Emit one token; `Some` ends the stream.
+        let mut emit = |token: u32, emitted: usize| -> Option<StreamEnd> {
+            if is_cancelled() {
+                return Some(StreamEnd::Cancelled);
+            }
+            let is_eos = stop_eos && token == eos;
+            let last = is_eos || emitted == max_new;
+            let finish_reason = if is_eos {
+                Some(FinishReason::Stop)
+            } else if last {
+                Some(FinishReason::Length)
+            } else {
+                None
+            };
+            let keep_going = on_step(Step {
+                token,
+                finished: last,
+                finish_reason,
+                logprobs: None,
+            });
+            if !keep_going {
+                Some(StreamEnd::Stopped)
+            } else if last {
+                Some(StreamEnd::Completed)
+            } else {
+                None
+            }
+        };
+        let mut pending = tritium_nn::sample_greedy(prefill_logits)
+            .ok_or_else(|| GenError::Backend("sampler produced no token".into()))?;
+        let mut emitted = 1;
+        if let Some(end) = emit(pending, emitted) {
+            return Ok(end);
+        }
+        // A request that does not stop on EOS gives the device chain no halt
+        // token: u32::MAX reaches the kernel as -1, which no argmax equals.
+        let device_eos = if stop_eos { eos } else { u32::MAX };
+        let mut k = 2;
+        loop {
+            // `pending` has been emitted but not yet fed; it goes in at the
+            // position after everything already in the KV cache.
+            let position = prompt_len + emitted - 1;
+            let chain = k.min(max_new - emitted).min(GREEDY_CHAIN_MAX);
+            let Some(ids) = self
+                .runner
+                .decode_greedy_chain_cancellable(pending, position, chain, device_eos, is_cancelled)
+                .map_err(|e| GenError::Backend(e.to_string()))?
+            else {
+                return Ok(StreamEnd::Cancelled);
+            };
+            if ids.is_empty() {
+                return Err(GenError::Backend("device chain produced no token".into()));
+            }
+            for &id in &ids {
+                emitted += 1;
+                if let Some(end) = emit(id, emitted) {
+                    return Ok(end);
+                }
+                pending = id;
+            }
+            k = (k * 2).min(GREEDY_CHAIN_MAX);
+        }
+    }
+}
+
 impl Generator for LegacyRunnerGenerator {
     fn cancellation_capabilities(&self) -> CancellationCapabilitiesV1 {
         use CancellationCheckpoint::{CooperativeBoundaries, CooperativeIfAvailable, NotEnabled};
@@ -2247,6 +2363,28 @@ impl Generator for LegacyRunnerGenerator {
                 }
                 return result;
             }
+        }
+
+        // Plain greedy without logprobs: chain decode steps on the device
+        // instead of downloading every logits row for a host argmax.
+        #[cfg(feature = "cuda")]
+        if matches!(req.sampling, Sampling::Greedy)
+            && req.logprobs.is_none()
+            && greedy_chain_from_env()?
+            && self.runner.has_resident_decoder()
+        {
+            let end = self.generate_greedy_chain(
+                req,
+                prompt_len,
+                max_new,
+                &logits,
+                on_step,
+                is_cancelled,
+            )?;
+            if end != StreamEnd::Completed {
+                self.reset_cancelled_generation();
+            }
+            return Ok(());
         }
 
         let end = stream_steps(

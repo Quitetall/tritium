@@ -530,6 +530,10 @@ __global__ void act_quant_tiled_f32(const float* __restrict__ act, const int k,
 // every decode shape (all BitNet dims are multiples of 256).
 
 // i8 sibling of `rmsnorm_quant_f32` (fused RMSNorm + A8 quant, M=1).
+// Per-thread register slots for the norm weights in `rmsnorm_quant_i8`: covers
+// every BitNet width (2560 and 6912) at 512 threads.
+constexpr int kRmsnormQuantWeightSlots = 14;
+
 __global__ void rmsnorm_quant_i8(const float* __restrict__ x,
                                  const float* __restrict__ w,
                                  const float eps,
@@ -541,6 +545,16 @@ __global__ void rmsnorm_quant_i8(const float* __restrict__ x,
   __shared__ float s_gamma;
   __shared__ float s_red[1024];
 
+  // The norm weights are read into registers up front, alongside x, so the
+  // normalize pass below does not wait on a global load after the reductions.
+  // Same values, so the result is unchanged; rows above
+  // kRmsnormQuantWeightSlots * blockDim.x read `w` in that pass as before.
+  float w_reg[kRmsnormQuantWeightSlots];
+#pragma unroll
+  for (int j = 0; j < kRmsnormQuantWeightSlots; ++j) {
+    const int i = threadIdx.x + j * blockDim.x;
+    w_reg[j] = i < n ? w[i] : 0.0f;
+  }
   for (int i = threadIdx.x; i < n; i += blockDim.x) {
     s_x[i] = x[i];
   }
@@ -592,8 +606,9 @@ __global__ void rmsnorm_quant_i8(const float* __restrict__ x,
 
   const float inv = s_inv;
   float local_max = 0.0f;
-  for (int i = threadIdx.x; i < n; i += blockDim.x) {
-    const float yi = __fmul_rn(__fmul_rn(s_x[i], inv), w[i]);
+  for (int i = threadIdx.x, j = 0; i < n; i += blockDim.x, ++j) {
+    const float wi = j < kRmsnormQuantWeightSlots ? w_reg[j] : w[i];
+    const float yi = __fmul_rn(__fmul_rn(s_x[i], inv), wi);
     s_x[i] = yi;
     const float a = fabsf(yi);
     if (a > local_max) local_max = a;
@@ -5926,6 +5941,8 @@ __global__ void gqa_attention_combine_f32(const float* __restrict__ partials,
 //                   Later replays re-run with a STALE ctrl — they rewrite the
 //                   same KV row with the same values (deterministic kernels),
 //                   which is idempotent and unobserved past the watermark.
+//   eos < 0      -> never halts on a token (a caller that does not stop on
+//                   EOS passes -1; no argmax result is negative here).
 //   id == eos    -> store the id, then halt BEFORE advancing ctrl (matches
 //                   the host loop's "the draft believes the turn ends here"
 //                   early break: the EOS itself is drafted, never fed).
@@ -5943,7 +5960,10 @@ __global__ void draft_chain_advance(int* __restrict__ ctrl,
     chain_out[step] = -1;
     return;
   }
-  const int t = am_out[0];
+  // An all-NaN logits row leaves the argmax at -1; the host `sample_greedy`
+  // returns index 0 there, so map it the same way (and never feed -1 into
+  // ctrl, where the next replay would gather an out-of-range embedding row).
+  const int t = am_out[0] < 0 ? 0 : am_out[0];
   chain_out[step] = t;
   if (t == eos) {
     halt[0] = 1;
