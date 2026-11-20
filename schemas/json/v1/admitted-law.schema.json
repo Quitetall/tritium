@@ -16,6 +16,7 @@
       "minimum": 0
     }
   },
+  "additionalProperties": false,
   "required": [
     "law",
     "max_planes"

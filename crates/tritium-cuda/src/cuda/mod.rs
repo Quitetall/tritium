@@ -257,6 +257,10 @@ mod backend;
 // Lib code no longer references backend items directly (post-P2a/A2 churn),
 // but cuda::tests reaches them through `use super::*` via this glob.
 pub use backend::deltanet::DeltaNetResidentState;
+pub use backend::qwen35_resident::{
+    DFlashConfig, DFlashFetch, QWEN35_RESIDENT_MAX_CONTEXT, QWEN35_VERIFY_MAX, Qwen35Resident,
+    Qwen35ResidentLayerSpec, Qwen35ResidentMixerSpec, Qwen35ResidentSnapshot, Qwen35ResidentSpec,
+};
 #[cfg_attr(not(test), allow(unused_imports))]
 use backend::*;
 pub use backend::{
@@ -1876,7 +1880,8 @@ impl CudaDecodeModel {
             return Ok(None); // dtoh already settled the producing stream
         }
         self.cache_len += 1;
-        Ok(Some(id[0] as u32))
+        // All-NaN row: the device argmax yields -1, the host `sample_greedy` 0.
+        Ok(Some(id[0].max(0) as u32))
     }
 
     /// The shared [`step_graph`]/[`step_graph_argmax`] core: guards, lazy

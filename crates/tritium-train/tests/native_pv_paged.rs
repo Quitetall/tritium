@@ -778,7 +778,7 @@ fn file_backed_residency_tracks_largest_owner_not_owner_count_and_caps_precede_e
         );
         assert!(
             step_peak as u64 <= ledger.max_owner_payload_bytes + 65536,
-            "peak {step_peak} exceeds ledger {ledger:?}"
+            "step peak exceeds the ledger bound"
         );
         let source = next.into_checkpoint();
         let reopened =
@@ -810,12 +810,6 @@ fn file_backed_residency_tracks_largest_owner_not_owner_count_and_caps_precede_e
         assert!(
             rejected_peak < 1_000_000,
             "rejected cap allocated owner moments: {rejected_peak}"
-        );
-        eprintln!(
-            "OWNER_PAGED owners={owners} init_peak_live_requests={peak} retained_requests={retained} step_peak_live_requests={step_peak} step_retained_requests={step_retained} max_owner_payload={} total_logical_state={} checkpoint_bytes={}",
-            ledger.max_owner_payload_bytes,
-            ledger.logical.state_payload_bytes,
-            ledger.logical.checkpoint_bytes
         );
     }
 }

@@ -139,7 +139,4 @@ fn file_backed_visit_and_canonical_encoding_peak_at_one_owner_not_checkpoint_siz
     );
     assert!((peak as u64) < checkpoint_bytes);
     assert!(retained < 65536);
-    eprintln!(
-        "PAGED_VISIT owners=8 checkpoint_bytes={checkpoint_bytes} encoded_owner_bytes={encoded_bytes} peak_live_allocator_requests={peak} retained_allocator_requests={retained}"
-    );
 }

@@ -1392,6 +1392,137 @@ candidate artifact binding, release admission, and the other required backend
 receipts remain separate obligations. The receipt is retained at
 `/mnt/2tb/tritium-wgpu-b3a-receipts/` in the local candidate workspace.
 
+### Durable campaign workspace relocation (2026-10-03)
+
+The discovered PTQ work directory, legacy S2KF records, and token pack were
+moved out of `/mnt/4tb/tmp` to
+`/mnt/4tb/tritium-qwen36-campaign-20260813/{ptq-work,s2kf-evidence,token-pack}`.
+The pinned Qwen source snapshot remains at
+`/mnt/4tb/qwen36-27b-source-6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`.
+The move preserved the campaign descriptor and its incomplete temporary
+record; a fresh read-only status probe still reports `stalled`, zero of 506
+published additive masters, no seal, and a dead owner PID for the
+447,083,070-byte temporary record.
+
+The durable S2KF directory contains 506 records. A byte comparison against the
+remaining `/mnt/4tb/tmp/qwen36-evidence-a417374-1seq-clean-20260821` alias
+found no differing record files; the durable directory additionally retains
+`.staging` and `source-admission.json`. The two record-name sets share hardlinked
+files on the same filesystem, so moving one directory did not free the record
+payload blocks while the other alias remains.
+
+This relocation is preservation only. The legacy S2KF set still has the
+calibration token-stream mismatch documented above and is not admissible for
+master fitting. Do not resume fitting from it. The verified token pack and
+replay contract still need a real native capture, a persisted source-bound
+capture receipt, and a fresh reopen of all 506 records before fitting may
+start. No compute was started during the relocation.
+
+### Hosted package evidence from PR #51 (2026-10-01)
+
+PR #51 (`bbbafd99cada6dab821cea63e5cdf971f1ce79fb`) has successful hosted
+package workflows. Its artifacts are retained under
+`/mnt/2tb/tritium-release-evidence/ci-bbbafd99/`. The workflows ran against
+the PR synthetic merge revision
+`fb670342ee85e340397c68705127b0268648261b`, not the branch head. The
+`crate-archive`, `npm-archive`, `compatibility-matrix`, and `clean-install`
+receipts each pass their owning validator at that exact revision. The
+compatibility receipt covers 16 CPython/platform cells; the clean-install
+receipt validates an installed Linux CPU wheel with PyTorch QAT forward and
+backward, optimizer update and resume, Hugging Face safetensors save/reload,
+and tied-weight identity checks.
+
+This harvest does **not** close the `packages` release gate: these receipts
+are not registered against a candidate manifest, and their synthetic merge
+revision differs from the checked-out branch head. Do not transplant them into
+the older `release/v1.1` candidate or registry. Rebuild/harvest from the final
+release revision and validate all four receipt kinds against one candidate
+before recording a gate pass. Hosted CUDA, Metal, ROCm, wgpu, real-model
+serving, fuzz, and performance-regression lanes were skipped by runner policy;
+those remain unqualified.
+
+### Local exact-source CUDA dispatcher evidence (`577bdb2e`)
+
+At source revision `577bdb2e21faf2b43ff35dd1101a5079d5dbf331`, the portable
+`manylinux_2_28_x86_64` CUDA wheel passed the physical RTX 4090 dispatcher
+qualifier: 8/8 native CUDA tests passed, and the two selected tail-path tests
+passed Compute Sanitizer 2026.3.0 with zero errors. The independently verified
+receipt is
+`sha256:f2f8b3c62503e419ae9ff8ea5b7195f2d9132e5c0fa3c06f9bc9b381cd25afaf`;
+it binds wheel SHA-256
+`295b3bb9f6a22c9276bfffb346e28179a6f2cc6c1aa94f80554da1ee439d93d9`, CUDA
+13.0, driver 615.71.09, Torch 2.11.0+cu130, and RTX 4090 UUID
+`1790118a-a6d7-4eaf-fcac-dcacac5f4351`. The verifier passed against that exact
+source worktree and wheel. Receipt and raw outputs are retained in the local
+candidate workspace at `release/v1.1/evidence/torch-dispatch-cuda-577bdb2/`.
+
+This run used Python 3.14.7, while the hosted CUDA workflow is pinned to
+Python 3.13. It is local, source-bound hardware evidence; it is not registered
+to a candidate manifest, does not replace the hosted pinned-environment run,
+and does not close the release gate. Re-run and register against the final
+release candidate before making a release claim.
+
+### Exact pushed-head CUDA rerun (`08a52cba`)
+
+The receipt was rebuilt and rerun on the exact pushed PR head
+`08a52cba8b8104018cc427500f43b708ba829ae9`, eliminating the source-revision
+gap from the earlier `577bdb2e` run. The portable CUDA wheel passed all eight
+native CUDA dispatcher tests on the RTX 4090; both selected tail-path tests
+passed Compute Sanitizer 2026.3.0 with zero errors. The independently verified
+receipt is
+`sha256:49ea0d53fe3417bcaa93fc69af71a6183a9a035eae53ba9782d28b636dec10a9`.
+It binds wheel SHA-256
+`0556e947831803a67597e4718600655aa4e3c387812c06e631e80c86ecbccb9a`, CUDA
+13.0, driver 615.71.09, Torch 2.11.0+cu130, and the same RTX 4090 UUID. Raw
+outputs are retained under
+`release/v1.1/evidence/torch-dispatch-cuda-08a52cba/` in the local candidate
+workspace.
+
+The wheel was built in the pinned manylinux/Python 3.13 image, but qualification
+executed with the host's Python 3.14.7. The hosted Python 3.13 CUDA job remains
+skipped. This exact-source local receipt is not registered to a candidate
+manifest and does not close the release gate.
+
+### Physical native-wgpu training corpus (`b3a556d1`)
+
+The native wgpu receipt sealer ran from a clean detached worktree at
+`b3a556d1c6eec85772ea2ed9aa95018705aece57` on the physical RTX 4090 via
+Vulkan. The receipt binds manifest digest
+`9093a1a7f9a3422c399943782aadf4df6b11833cf2253db0db56ff2d9dedb098`, vector
+digest `38b17f4c76c1d2f85cb35c713652a3d77627d02ba47933d2c8f31a88e0c594a7`,
+36 operations and all 117 frozen cases. The reopened development capability
+table reports 4,192 peak resident bytes and 132,032 peak scratch bytes. Receipt
+digest:
+`adeeeff34a2c3a7b8fe3952af9aa2144492aaf7e9583849baf0f42afa40ecb08`.
+
+This is physical development evidence, not candidate-registry admission or
+the seven-backend release gate. The hosted/self-hosted wgpu CI lane was skipped;
+candidate artifact binding, release admission, and the other required backend
+receipts remain separate obligations. The receipt is retained at
+`/mnt/2tb/tritium-wgpu-b3a-receipts/` in the local candidate workspace.
+
+### Latest same-revision CI and package evidence (2026-09-29, `7a4d1589`)
+
+CI run [`36523067787`](https://github.com/Quitetall/tritium/actions/runs/36523067787)
+completed successfully at source revision
+`7a4d15891ee77496ad4e54f691823a58b5d0452e`: 20 jobs passed and six were
+skipped (CUDA, ROCm, wgpu, real-model serving, fuzzing, and performance
+regression). CodeQL (`36523067788`) and the CPU capstone smoke
+(`36523067744`) also passed at that revision. Skipped hardware, real-model, and
+performance lanes remain unqualified; these workflow results do not close their
+release gates.
+
+The saved CI crate and npm archives were independently rechecked with the
+repository receipt validators. The crate archive receipt passes for all 23
+publishable crates (`sha256:1557bef43c69a60a5dbeafdcb145c4a9becba9d23bb1ff17dc29823d9f4e052d`);
+the npm archive receipt passes for `@tritium-ai/web@1.1.0-rc.2`
+(`sha256:36b7d0c914f36a1935fb6d382365bdef608b912a0f6598ce562dd414b90636bc`).
+Artifacts and receipts are retained locally under the ignored
+`release/v1.1/evidence/current-head-ci-36523067787/` directory. They are
+revision-bound validation evidence, but have not been assembled into a
+candidate manifest or admitted to a candidate-bound release registry; this
+does not satisfy the coherent `packages` gate or authorize publication.
+
 ### Latest local verification (2026-09-18, `570a8802`)
 
 `scripts/verify-gates.sh release` completed with exit status 0 after the
@@ -1656,6 +1787,32 @@ Verification requires:
 - digest-bound CycloneDX/SPDX SBOM tied to exact artifact ID;
 - digest-bound in-toto/SLSA v1 provenance tied to artifact SHA-256, source
   revision and builder identity.
+
+### Pre-tag candidate assembly (artifact-only)
+
+The `release-candidate` workflow builds the release package set from one exact
+commit and assembles the same candidate manifest before a release tag exists.
+Dispatch it from the default branch with a full commit SHA:
+
+```bash
+gh workflow run release-candidate.yml --ref main \
+  --field source_revision="$(git rev-parse HEAD)"
+```
+
+The workflow validates the checked-out commit and RC version, runs the reusable
+wheel matrix plus crate/npm qualification, and strictly reopens the assembled
+candidate with `scripts/release-status`. Download
+`tritium-candidate-<revision>` for the candidate directory and
+`tritium-candidate-evidence-<revision>` for the exact input document and
+qualification receipts. The evidence directory is intentionally separate from
+the candidate payload: release-status rejects unmanifested files inside that
+payload.
+
+This workflow has read-only repository permissions and does not publish to
+PyPI, crates.io, npm, or GitHub Releases, create or move tags, or claim whole-
+model, hardware, quality, independent-review, or release readiness. It makes
+exact-source packaging evidence available before a maintainer decides whether
+to proceed with a public release.
 
 For the browser package, build the exact npm archive first, then generate its
 closed CycloneDX inventory from archive bytes. The generator rejects path
