@@ -76,6 +76,12 @@ class LevelFitVariant1(TypedDict):
 class LevelFitVariant1ImportedPrefixOf(TypedDict):
     level: str
 
+class LevelFitVariant3(TypedDict):
+    Refined: LevelFitVariant3Refined
+
+class LevelFitVariant3Refined(TypedDict):
+    ancestry: NativeRefinementAncestry
+
 class LoadedSourceIdentityVariant0(TypedDict):
     Trit: LoadedSourceIdentityVariant0Trit
 
@@ -89,6 +95,28 @@ class LoadedSourceIdentityVariant1(TypedDict):
 
 class LoadedSourceIdentityVariant1HuggingFace(TypedDict):
     reason: UnknownReason
+
+class LoadedSourceIdentityVariant2(TypedDict):
+    Qtea: LoadedSourceIdentityVariant2Qtea
+
+class LoadedSourceIdentityVariant2Qtea(TypedDict):
+    declared_source_model: tuple[int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int]
+    package_id: PackageId
+
+class NativeRecoveryRecipeVariant0(TypedDict):
+    ScaleOnly: NativeRecoveryRecipeVariant0ScaleOnly
+
+class NativeRecoveryRecipeVariant0ScaleOnly(TypedDict):
+    optimizer: NativeAdamWRecipe
+
+class NativeRecoveryRecipeVariant1(TypedDict):
+    AlternatingPv: NativeRecoveryRecipeVariant1AlternatingPv
+
+class NativeRecoveryRecipeVariant1AlternatingPv(TypedDict):
+    code_optimizer: NativeAdamWRecipe
+    continuous_optimizer: NativeAdamWRecipe
+    max_code_change_fraction: float
+    max_relative_code_change: NotRequired[Union[None, float]]
 
 class OriginalSalienceCaptureInputVariant0(TypedDict):
     Tokens: OriginalSalienceCaptureInputVariant0Tokens
@@ -485,9 +513,9 @@ class Level(TypedDict):
     name: str
     tensors: list[TensorMeta]
 
-LevelFit: TypeAlias = Union[LevelFitVariant0, LevelFitVariant1, Literal["Imported"]]
+LevelFit: TypeAlias = Union[LevelFitVariant0, LevelFitVariant1, LevelFitVariant3, Literal["Imported"]]
 
-LoadedSourceIdentity: TypeAlias = Union[LoadedSourceIdentityVariant0, LoadedSourceIdentityVariant1]
+LoadedSourceIdentity: TypeAlias = Union[LoadedSourceIdentityVariant0, LoadedSourceIdentityVariant1, LoadedSourceIdentityVariant2]
 
 class ManifestAsset(TypedDict):
     blob: BlobReference
@@ -527,6 +555,125 @@ class NamedAssetDigest(TypedDict):
 class NamedTensorDigest(TypedDict):
     content: SemanticTensorDigest
     name: str
+
+class NativeAdamWRecipe(TypedDict):
+    beta1: float
+    beta2: float
+    eps: float
+    lr: float
+    weight_decay: float
+
+class NativePvReplayObserved(TypedDict):
+    checkpoint: BlobId
+    checkpoint_bytes: int
+    completed_updates: int
+    journal: BlobId
+    journal_bytes: int
+    plan: NativeRefinementPlanId
+
+class NativePvResumeManifest(TypedDict):
+    plan: NativeRefinementPlan
+    point: NativePvResumePoint
+
+class NativePvResumePoint(TypedDict):
+    checkpoint: BlobId
+    checkpoint_bytes: int
+    completed_updates: int
+    journal_prefix: BlobId
+    journal_prefix_bytes: int
+    plan: NativeRefinementPlanId
+
+NativeRecoveryRecipe: TypeAlias = Union[NativeRecoveryRecipeVariant0, NativeRecoveryRecipeVariant1]
+
+class NativeRefinementAncestry(TypedDict):
+    evidence: EvidenceReference
+    parent: NativeRefinementParent
+    plan: NativeRefinementPlanId
+
+class NativeRefinementCheckpointed(TypedDict):
+    checkpoint: BlobId
+    checkpoint_bytes: int
+    completed_updates: int
+    owners: list[NativeRefinementTensorOutput]
+    plan: NativeRefinementPlanId
+    state: NativeRefinementStateId
+    state_payload_bytes: int
+
+class NativeRefinementCompleted(TypedDict):
+    checkpoint: BlobId
+    plan: NativeRefinementPlanId
+    tensors: list[NativeRefinementTensorOutput]
+    validation: list[NativeRefinementValidation]
+
+class NativeRefinementExecution(TypedDict):
+    backend: str
+    device: str
+    source_revision: str
+
+class NativeRefinementLimits(TypedDict):
+    max_checkpoint_bytes: int
+    max_package_bytes: int
+    max_state_bytes: int
+    max_workspace_bytes: int
+
+class NativeRefinementParent(TypedDict):
+    evidence: EvidenceReference
+    level: str
+    model: ModelId
+    package: PackageId
+    source: OriginalSourceId
+
+class NativeRefinementPlan(TypedDict):
+    child_level: str
+    limits: NativeRefinementLimits
+    objective: tuple[int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int]
+    owners: list[str]
+    parent: NativeRefinementParent
+    recipe: NativeRecoveryRecipe
+    teacher_source: NotRequired[Union[None, OriginalSourceId]]
+    training: list[NativeRefinementWindow]
+    validation: list[NativeRefinementWindow]
+
+NativeRefinementPlanId: TypeAlias = tuple[int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int]
+
+class NativeRefinementStarted(TypedDict):
+    execution: NativeRefinementExecution
+    plan: NativeRefinementPlan
+
+NativeRefinementStateId: TypeAlias = tuple[int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int]
+
+class NativeRefinementTensorOutput(TypedDict):
+    content: BlobId
+    name: str
+
+class NativeRefinementValidation(TypedDict):
+    child_loss: float
+    content: tuple[int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int]
+    parent_loss: float
+
+class NativeRefinementWindow(TypedDict):
+    content: tuple[int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int]
+    weight: float
+
+class NativeScaleReplayObserved(TypedDict):
+    checkpoint: BlobId
+    checkpoint_bytes: int
+    completed_updates: int
+    journal: BlobId
+    journal_bytes: int
+    plan: NativeRefinementPlanId
+
+class NativeScaleResumeManifest(TypedDict):
+    plan: NativeRefinementPlan
+    point: NativeScaleResumePoint
+
+class NativeScaleResumePoint(TypedDict):
+    checkpoint: BlobId
+    checkpoint_bytes: int
+    completed_updates: int
+    journal_prefix: BlobId
+    journal_prefix_bytes: int
+    plan: NativeRefinementPlanId
 
 class OriginalCapturedSalienceConversionManifest(TypedDict):
     lineage: CapturedSalienceConversionManifest

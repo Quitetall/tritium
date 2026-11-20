@@ -315,9 +315,9 @@ export interface Level {
   readonly tensors: ReadonlyArray<TensorMeta>;
 }
 
-export type LevelFit = "Imported" | { readonly Direct: { readonly evidence: ReadonlyArray<EvidenceReference> } } | { readonly ImportedPrefixOf: { readonly level: string } };
+export type LevelFit = "Imported" | { readonly Direct: { readonly evidence: ReadonlyArray<EvidenceReference> } } | { readonly ImportedPrefixOf: { readonly level: string } } | { readonly Refined: { readonly ancestry: NativeRefinementAncestry } };
 
-export type LoadedSourceIdentity = { readonly HuggingFace: { readonly reason: UnknownReason } } | { readonly Trit: { readonly level: string; readonly model_id: ModelId; readonly package_id: PackageId } };
+export type LoadedSourceIdentity = { readonly HuggingFace: { readonly reason: UnknownReason } } | { readonly Qtea: { readonly declared_source_model: [number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number]; readonly package_id: PackageId } } | { readonly Trit: { readonly level: string; readonly model_id: ModelId; readonly package_id: PackageId } };
 
 export interface ManifestAsset {
   readonly blob: BlobReference;
@@ -363,6 +363,143 @@ export interface NamedAssetDigest {
 export interface NamedTensorDigest {
   readonly content: SemanticTensorDigest;
   readonly name: string;
+}
+
+export interface NativeAdamWRecipe {
+  readonly beta1: number;
+  readonly beta2: number;
+  readonly eps: number;
+  readonly lr: number;
+  readonly weight_decay: number;
+}
+
+export interface NativePvReplayObserved {
+  readonly checkpoint: BlobId;
+  readonly checkpoint_bytes: number;
+  readonly completed_updates: number;
+  readonly journal: BlobId;
+  readonly journal_bytes: number;
+  readonly plan: NativeRefinementPlanId;
+}
+
+export interface NativePvResumeManifest {
+  readonly plan: NativeRefinementPlan;
+  readonly point: NativePvResumePoint;
+}
+
+export interface NativePvResumePoint {
+  readonly checkpoint: BlobId;
+  readonly checkpoint_bytes: number;
+  readonly completed_updates: number;
+  readonly journal_prefix: BlobId;
+  readonly journal_prefix_bytes: number;
+  readonly plan: NativeRefinementPlanId;
+}
+
+export type NativeRecoveryRecipe = { readonly AlternatingPv: { readonly code_optimizer: NativeAdamWRecipe; readonly continuous_optimizer: NativeAdamWRecipe; readonly max_code_change_fraction: number; readonly max_relative_code_change?: null | number } } | { readonly ScaleOnly: { readonly optimizer: NativeAdamWRecipe } };
+
+export interface NativeRefinementAncestry {
+  readonly evidence: EvidenceReference;
+  readonly parent: NativeRefinementParent;
+  readonly plan: NativeRefinementPlanId;
+}
+
+export interface NativeRefinementCheckpointed {
+  readonly checkpoint: BlobId;
+  readonly checkpoint_bytes: number;
+  readonly completed_updates: number;
+  readonly owners: ReadonlyArray<NativeRefinementTensorOutput>;
+  readonly plan: NativeRefinementPlanId;
+  readonly state: NativeRefinementStateId;
+  readonly state_payload_bytes: number;
+}
+
+export interface NativeRefinementCompleted {
+  readonly checkpoint: BlobId;
+  readonly plan: NativeRefinementPlanId;
+  readonly tensors: ReadonlyArray<NativeRefinementTensorOutput>;
+  readonly validation: ReadonlyArray<NativeRefinementValidation>;
+}
+
+export interface NativeRefinementExecution {
+  readonly backend: string;
+  readonly device: string;
+  readonly source_revision: string;
+}
+
+export interface NativeRefinementLimits {
+  readonly max_checkpoint_bytes: number;
+  readonly max_package_bytes: number;
+  readonly max_state_bytes: number;
+  readonly max_workspace_bytes: number;
+}
+
+export interface NativeRefinementParent {
+  readonly evidence: EvidenceReference;
+  readonly level: string;
+  readonly model: ModelId;
+  readonly package: PackageId;
+  readonly source: OriginalSourceId;
+}
+
+export interface NativeRefinementPlan {
+  readonly child_level: string;
+  readonly limits: NativeRefinementLimits;
+  readonly objective: [number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number];
+  readonly owners: ReadonlyArray<string>;
+  readonly parent: NativeRefinementParent;
+  readonly recipe: NativeRecoveryRecipe;
+  readonly teacher_source?: OriginalSourceId | null;
+  readonly training: ReadonlyArray<NativeRefinementWindow>;
+  readonly validation: ReadonlyArray<NativeRefinementWindow>;
+}
+
+export type NativeRefinementPlanId = [number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number];
+
+export interface NativeRefinementStarted {
+  readonly execution: NativeRefinementExecution;
+  readonly plan: NativeRefinementPlan;
+}
+
+export type NativeRefinementStateId = [number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number];
+
+export interface NativeRefinementTensorOutput {
+  readonly content: BlobId;
+  readonly name: string;
+}
+
+export interface NativeRefinementValidation {
+  readonly child_loss: number;
+  readonly content: [number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number];
+  readonly parent_loss: number;
+}
+
+export interface NativeRefinementWindow {
+  readonly content: [number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number, number];
+  readonly weight: number;
+}
+
+export interface NativeScaleReplayObserved {
+  readonly checkpoint: BlobId;
+  readonly checkpoint_bytes: number;
+  readonly completed_updates: number;
+  readonly journal: BlobId;
+  readonly journal_bytes: number;
+  readonly plan: NativeRefinementPlanId;
+}
+
+export interface NativeScaleResumeManifest {
+  readonly plan: NativeRefinementPlan;
+  readonly point: NativeScaleResumePoint;
+}
+
+export interface NativeScaleResumePoint {
+  readonly checkpoint: BlobId;
+  readonly checkpoint_bytes: number;
+  readonly completed_updates: number;
+  readonly journal_prefix: BlobId;
+  readonly journal_prefix_bytes: number;
+  readonly plan: NativeRefinementPlanId;
 }
 
 export interface OriginalCapturedSalienceConversionManifest {
